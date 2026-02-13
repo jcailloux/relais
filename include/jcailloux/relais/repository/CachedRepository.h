@@ -5,15 +5,15 @@
 #include <chrono>
 #include <memory>
 #include <type_traits>
-#include "jcailloux/drogon/smartrepo/RedisRepository.h"
+#include "jcailloux/relais/repository/RedisRepository.h"
 #include <jcailloux/shardmap/ShardMap.h>
-#include "jcailloux/drogon/config/repository_config.h"
+#include "jcailloux/relais/config/repository_config.h"
 
-#ifdef SMARTREPO_BUILDING_TESTS
-namespace smartrepo_test { struct TestInternals; }
+#ifdef RELAIS_BUILDING_TESTS
+namespace relais_test { struct TestInternals; }
 #endif
 
-namespace jcailloux::drogon::smartrepo {
+namespace jcailloux::relais {
 
 /// Metadata stored alongside each entity in the L1 cache.
 /// When RefreshOnGet is true, uses std::atomic<int64_t> for thread-safe
@@ -343,11 +343,11 @@ protected:
                     Metadata{Clock::now() + l1Ttl()});
     }
 
-#ifdef SMARTREPO_BUILDING_TESTS
-    friend struct ::smartrepo_test::TestInternals;
+#ifdef RELAIS_BUILDING_TESTS
+    friend struct ::relais_test::TestInternals;
 #endif
 };
 
-}  // namespace jcailloux::drogon::smartrepo
+}  // namespace jcailloux::relais
 
 #endif //JCX_DROGON_CACHEDREPOSITORY_H

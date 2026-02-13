@@ -1,4 +1,4 @@
-# drogon-smartrepo
+# relais
 
 A header-only C++23 repository pattern library for [Drogon](https://github.com/drogonframework/drogon) with integrated multi-tier caching.
 
@@ -18,13 +18,13 @@ A header-only C++23 repository pattern library for [Drogon](https://github.com/d
 - **PartialKey auto-detection**: `makeKeyCriteria` generated into Mapping when PK is `db_managed`
 - **Type-safe**: Hierarchical concepts (`ReadableEntity`, `CacheableEntity`, `MutableEntity`, `CreatableEntity`)
 - **Read-only enforcement**: Compile-time `requires` clause prevents create/update/delete on read-only repositories
-- **Annotation-based generator**: Auto-generate ORM mappings from `@smartrepo` annotations in struct headers
+- **Annotation-based generator**: Auto-generate ORM mappings from `@relais` annotations in struct headers
 
 ## Requirements
 
 - C++23 compiler (GCC 13+, Clang 17+)
 - Drogon framework with PostgreSQL ORM
-- [shardmap](../shardmap) (in-memory TTL cache with callback-based validation)
+- [shardmap](../jcailloux-shardmap) (in-memory TTL cache with callback-based validation)
 - Redis (optional, for L2 caching)
 
 ## Installation
@@ -41,40 +41,40 @@ FetchContent_Declare(shardmap
 )
 FetchContent_MakeAvailable(shardmap)
 
-# Then add smartrepo
-FetchContent_Declare(drogon-smartrepo
-    GIT_REPOSITORY https://github.com/jcailloux/drogon-smartrepo.git
+# Then add relais
+FetchContent_Declare(relais
+    GIT_REPOSITORY https://github.com/jcailloux/relais.git
     GIT_TAG main
 )
-FetchContent_MakeAvailable(drogon-smartrepo)
+FetchContent_MakeAvailable(relais)
 
-target_link_libraries(my_app PRIVATE jcailloux::drogon-smartrepo)
+target_link_libraries(my_app PRIVATE jcailloux::relais)
 ```
 
 ### As a subdirectory
 
 ```cmake
 add_subdirectory(lib/shardmap)
-add_subdirectory(lib/jcailloux-drogon-smartrepo)
-target_link_libraries(my_app PRIVATE jcailloux::drogon-smartrepo)
+add_subdirectory(lib/jcailloux-relais)
+target_link_libraries(my_app PRIVATE jcailloux::relais)
 ```
 
 ## Quick Start
 
 ### 1. Define your entity
 
-Entities are pure C++ structs with `@smartrepo` inline annotations. The Python generator reads these annotations and produces a standalone Mapping struct. At the API layer, `EntityWrapper<Struct, Mapping>` combines the struct with its ORM mapping and provides thread-safe lazy serialization.
+Entities are pure C++ structs with `@relais` inline annotations. The Python generator reads these annotations and produces a standalone Mapping struct. At the API layer, `EntityWrapper<Struct, Mapping>` combines the struct with its ORM mapping and provides thread-safe lazy serialization.
 
 ```cpp
 // 1. Pure data struct (framework-agnostic, shareable)
-// @smartrepo model=drogon_model::User
-// @smartrepo output=entities/generated/UserWrapper.h
+// @relais model=drogon_model::User
+// @relais output=entities/generated/UserWrapper.h
 struct User {
-    int64_t id = 0;    // @smartrepo primary_key db_managed
+    int64_t id = 0;    // @relais primary_key db_managed
     std::string username;
     std::string email;
     int32_t balance = 0;
-    std::string created_at;  // @smartrepo timestamp
+    std::string created_at;  // @relais timestamp
 };
 
 // glz::meta for JSON/BEVE serialization
@@ -104,24 +104,24 @@ using UserWrapper = jcailloux::drogon::wrapper::EntityWrapper<User, generated::U
 ### 2. Create your repository
 
 ```cpp
-#include <jcailloux/drogon/smartrepo/Repository.h>
+#include <jcailloux/relais/repository/Repository.h>
 
-namespace smartrepo = jcailloux::drogon::smartrepo;
-namespace config = smartrepo::config;
+namespace relais = jcailloux::relais;
+namespace config = relais::config;
 
 // Simple — L1 RAM cache (default)
-using UserRepository = smartrepo::Repository<UserWrapper, "User">;
+using UserRepository = relais::Repository<UserWrapper, "User">;
 
 // Custom cache preset
-using MetricsRepository = smartrepo::Repository<MetricsWrapper, "Metrics", config::Both>;
+using MetricsRepository = relais::Repository<MetricsWrapper, "Metrics", config::Both>;
 
 // Customized preset with fluent chaining
-using SessionRepository = smartrepo::Repository<
+using SessionRepository = relais::Repository<
     SessionWrapper, "Session",
     config::Local.with_l1_ttl(std::chrono::minutes{30}).with_read_only()>;
 
 // With cross-invalidation
-using PurchaseRepository = smartrepo::Repository<
+using PurchaseRepository = relais::Repository<
     PurchaseWrapper, "Purchase", config::Local,
     cache::Invalidate<UserStatsRepo, &Purchase::user_id>>;
 ```
@@ -157,10 +157,10 @@ For tables with composite primary keys (e.g., PostgreSQL partitioned tables), th
 
 ```cpp
 // Entity struct
-// @smartrepo model=drogon_model::Event
-// @smartrepo output=entities/generated/EventWrapper.h
+// @relais model=drogon_model::Event
+// @relais output=entities/generated/EventWrapper.h
 struct Event {
-    int64_t id = 0;         // @smartrepo primary_key db_managed
+    int64_t id = 0;         // @relais primary_key db_managed
     std::string region;
     std::string title;
 };
@@ -172,7 +172,7 @@ struct Event {
 //   }
 
 // Repository — no special configuration needed
-using EventRepository = smartrepo::Repository<EventWrapper, "Event", config::Both>;
+using EventRepository = relais::Repository<EventWrapper, "Event", config::Both>;
 // Key = int64_t (from getPrimaryKey), Model PK = tuple<int64_t, string>
 // PartialKey path auto-detected (Key != Model::PrimaryKeyType)
 ```
@@ -254,7 +254,7 @@ struct glz::meta<Product> {
 Configuration uses a **structural aggregate** passed as a Non-Type Template Parameter (NTTP). All fields have sensible defaults; only override what differs.
 
 ```cpp
-namespace config = jcailloux::drogon::smartrepo::config;
+namespace config = jcailloux::relais::config;
 
 struct CacheConfig {
     CacheLevel cache_level = CacheLevel::None;
@@ -485,16 +485,16 @@ The list cache provides paginated query results with lazy validation via modific
 Annotate fields with `filterable` and `sortable` in the struct header. The generator embeds the `ListDescriptor` inside the Mapping:
 
 ```cpp
-// @smartrepo model=drogon_model::codibot::AuditLogs
-// @smartrepo output=entities/generated/AuditLogWrapper.h
-// @smartrepo_list limits=10,25,50,100
+// @relais model=drogon_model::codibot::AuditLogs
+// @relais output=entities/generated/AuditLogWrapper.h
+// @relais_list limits=10,25,50,100
 struct AuditLog {
-    int64_t id = 0;            // @smartrepo primary_key db_managed sortable:asc
-    int64_t guild_id = 0;      // @smartrepo filterable
-    int64_t user_id = 0;       // @smartrepo filterable
-    std::string module;        // @smartrepo filterable
-    std::string action_type;   // @smartrepo filterable
-    std::string created_at;    // @smartrepo timestamp sortable:desc
+    int64_t id = 0;            // @relais primary_key db_managed sortable:asc
+    int64_t guild_id = 0;      // @relais filterable
+    int64_t user_id = 0;       // @relais filterable
+    std::string module;        // @relais filterable
+    std::string action_type;   // @relais filterable
+    std::string created_at;    // @relais timestamp sortable:desc
 };
 
 // Generated in the Mapping:
@@ -517,7 +517,7 @@ struct AuditLog {
 using AuditLogRepository = Repository<AuditLogWrapper, "AuditLog">;
 
 // In controller:
-#include <jcailloux/drogon/list/decl/HttpQueryParser.h>
+#include <jcailloux/relais/list/decl/HttpQueryParser.h>
 
 Task<HttpResponsePtr> AuditLogsCtrl::list(const HttpRequestPtr req) {
     // Parse and validate query parameters against the ListDescriptor
@@ -557,22 +557,22 @@ Modifications are validated lazily on `get()` — cache entries affected by rece
 
 ## Python Entity Mapping Generator
 
-Generates standalone ORM Mapping structs from `@smartrepo` annotations in C++ struct headers.
+Generates standalone ORM Mapping structs from `@relais` annotations in C++ struct headers.
 
 ### Annotations
 
 Annotations are inline comments on struct declarations and data members:
 
 ```cpp
-// @smartrepo model=drogon_model::codibot::AuditLogs
-// @smartrepo output=entities/generated/AuditLogWrapper.h
-// @smartrepo_list limits=10,25,50,100
+// @relais model=drogon_model::codibot::AuditLogs
+// @relais output=entities/generated/AuditLogWrapper.h
+// @relais_list limits=10,25,50,100
 struct AuditLog {
-    int64_t id = 0;            // @smartrepo primary_key db_managed sortable:asc
-    int64_t guild_id = 0;      // @smartrepo filterable
-    std::string module;        // @smartrepo filterable
-    std::string action_type;   // @smartrepo filterable
-    std::string created_at;    // @smartrepo timestamp sortable:desc
+    int64_t id = 0;            // @relais primary_key db_managed sortable:asc
+    int64_t guild_id = 0;      // @relais filterable
+    std::string module;        // @relais filterable
+    std::string action_type;   // @relais filterable
+    std::string created_at;    // @relais timestamp sortable:desc
 };
 ```
 
@@ -597,18 +597,18 @@ struct AuditLog {
 
 #### Declarative list annotations
 
-Filter and sort capabilities are declared per-field. Pagination limits stay at class level via `@smartrepo_list`:
+Filter and sort capabilities are declared per-field. Pagination limits stay at class level via `@relais_list`:
 
 ```cpp
-// @smartrepo model=drogon_model::Article
-// @smartrepo output=entities/generated/ArticleWrapper.h
-// @smartrepo_list limits=10,25,50
+// @relais model=drogon_model::Article
+// @relais output=entities/generated/ArticleWrapper.h
+// @relais_list limits=10,25,50
 struct Article {
-    int64_t id = 0;            // @smartrepo primary_key db_managed
-    std::string category;       // @smartrepo filterable
-    int64_t author_id = 0;     // @smartrepo filterable
-    int32_t view_count = 0;    // @smartrepo sortable:desc
-    std::string created_at;    // @smartrepo timestamp sortable:desc
+    int64_t id = 0;            // @relais primary_key db_managed
+    std::string category;       // @relais filterable
+    int64_t author_id = 0;     // @relais filterable
+    int32_t view_count = 0;    // @relais sortable:desc
+    std::string created_at;    // @relais timestamp sortable:desc
 };
 ```
 
@@ -625,7 +625,7 @@ Known operators: `eq`, `ne`, `gt`, `ge`/`gte`, `lt`, `le`/`lte`.
 
 Multiple filters on the same field (e.g. range queries):
 ```cpp
-std::string created_at;  // @smartrepo timestamp filterable:date_from:gte filterable:date_to:lte sortable:desc
+std::string created_at;  // @relais timestamp filterable:date_from:gte filterable:date_to:lte sortable:desc
 ```
 
 **`sortable` syntax:**
@@ -653,7 +653,7 @@ For each entity:
 ### Usage
 
 ```bash
-# Scan a directory for @smartrepo annotations
+# Scan a directory for @relais annotations
 python scripts/generate_entities.py --scan src/entities/ --output-dir src/
 
 # Or specify files directly
@@ -705,8 +705,8 @@ When `Invalidations...` is non-empty, the mixin intercepts `create()`, `update()
 Build and run tests:
 
 ```bash
-cd lib/jcailloux-drogon-smartrepo
-cmake -B build -DCMAKE_PREFIX_PATH=/path/to/drogon -DSMARTREPO_BUILD_TESTS=ON
+cd lib/jcailloux-relais
+cmake -B build -DCMAKE_PREFIX_PATH=/path/to/drogon -DRELAIS_BUILD_TESTS=ON
 cmake --build build
 ctest --test-dir build --output-on-failure
 ```
@@ -725,13 +725,13 @@ ctest --test-dir build --output-on-failure
 
 ```bash
 # Run only L2 selective invalidation tests
-./test_smartrepo_redis "[list-selective]"
+./test_relais_redis "[list-selective]"
 
 # Run only enriched resolver tests
-./test_smartrepo_redis "[list-resolver]"
+./test_relais_redis "[list-resolver]"
 
 # Run only base list tests
-./test_smartrepo_base "[list]"
+./test_relais_base "[list]"
 ```
 
 ## Further Reading

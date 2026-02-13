@@ -16,7 +16,7 @@
 #include "fixtures/test_helper.h"
 #include "fixtures/TestRepositories.h"
 
-using namespace smartrepo_test;
+using namespace relais_test;
 
 // #############################################################################
 //
@@ -24,9 +24,9 @@ using namespace smartrepo_test;
 //
 // #############################################################################
 
-namespace smartrepo_test::l2_config_test {
+namespace relais_test::l2_config_test {
 
-using namespace jcailloux::drogon::smartrepo::config;
+using namespace jcailloux::relais::config;
 
 // --- l2_ttl ---
 inline constexpr auto ShortTTL = Redis
@@ -54,9 +54,9 @@ inline constexpr auto PopImmediate = Redis
 // --- read_only ---
 inline constexpr auto ReadOnlyL2 = Redis.with_read_only();
 
-} // namespace smartrepo_test::l2_config_test
+} // namespace relais_test::l2_config_test
 
-namespace smartrepo_test {
+namespace relais_test {
 
 namespace l2ct = l2_config_test;
 
@@ -75,7 +75,7 @@ using L2PopImmediateRepo = Repository<TestItemWrapper, "cfg:l2:pop",   l2ct::Pop
 // Read-only repo
 using L2ReadOnlyCfgRepo = Repository<TestItemWrapper, "cfg:l2:ro", l2ct::ReadOnlyL2>;
 
-} // namespace smartrepo_test
+} // namespace relais_test
 
 
 // #############################################################################

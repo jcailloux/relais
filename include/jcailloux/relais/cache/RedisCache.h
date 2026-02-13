@@ -12,7 +12,7 @@
 #include <drogon/utils/coroutine.h>
 #include <trantor/utils/Logger.h>
 #include <glaze/glaze.hpp>
-#include <jcailloux/drogon/list/ListCache.h>
+#include <jcailloux/relais/list/ListCache.h>
 
 namespace jcailloux::drogon::cache {
     /**
@@ -293,7 +293,7 @@ namespace jcailloux::drogon::cache {
             // - std::vector<uint8_t> toBinary() const
 
             /// Get a FlatBuffer list entity from binary cache.
-            /// Automatically skips the ListBoundsHeader if present (magic bytes 0x53 0x52).
+            /// Automatically skips the ListBoundsHeader if present (magic bytes 0x52 0x4C).
             /// @tparam ListEntity Must have static fromBinary(span<const uint8_t>) method
             template<typename ListEntity>
             static ::drogon::Task<std::optional<ListEntity>> getListBinary(const std::string& key)

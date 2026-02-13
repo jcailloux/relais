@@ -2,9 +2,9 @@
 #define JCX_DROGON_INVALIDATION_MIXIN_H
 
 #include <drogon/utils/coroutine.h>
-#include "jcailloux/drogon/cache/InvalidateOn.h"
+#include "jcailloux/relais/cache/InvalidateOn.h"
 
-namespace jcailloux::drogon::smartrepo {
+namespace jcailloux::relais {
 
 namespace detail {
 /// Detect whether Base is (or derives from) ListMixin.
@@ -130,6 +130,6 @@ public:
     }
 };
 
-}  // namespace jcailloux::drogon::smartrepo
+}  // namespace jcailloux::relais
 
 #endif  // JCX_DROGON_INVALIDATION_MIXIN_H

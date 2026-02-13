@@ -1,14 +1,14 @@
 #!/bin/bash
 # =============================================================================
-# Initialize the smartrepo test database
+# Initialize the relais test database
 # =============================================================================
 #
 # Usage: ./scripts/init_test_db.sh
 #
 # Fixed values:
-#   Database: smartrepo_test
-#   User: smartrepo_test
-#   Password: smartrepo_test
+#   Database: relais_test
+#   User: relais_test
+#   Password: relais_test
 #
 # =============================================================================
 
@@ -18,11 +18,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 MIGRATIONS_DIR="$PROJECT_DIR/tests/migrations"
 
-DB_NAME="smartrepo_test"
-DB_USER="smartrepo_test"
-DB_PASS="smartrepo_test"
+DB_NAME="relais_test"
+DB_USER="relais_test"
+DB_PASS="relais_test"
 
-echo "=== Smartrepo Test Database Setup ==="
+echo "=== Relais Test Database Setup ==="
 echo "Database: $DB_NAME"
 echo "User: $DB_USER"
 echo ""

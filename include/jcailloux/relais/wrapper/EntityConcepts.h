@@ -4,9 +4,9 @@
 #include <concepts>
 #include <optional>
 
-#include "jcailloux/drogon/wrapper/SerializationTraits.h"
+#include "jcailloux/relais/wrapper/SerializationTraits.h"
 
-namespace jcailloux::drogon::smartrepo {
+namespace jcailloux::relais {
 
 // =============================================================================
 // Entity Wrapper Concepts
@@ -94,6 +94,6 @@ concept HasListDescriptor = requires {
     typename Entity::MappingType::ListDescriptor;
 };
 
-}  // namespace jcailloux::drogon::smartrepo
+}  // namespace jcailloux::relais
 
 #endif  // JCX_DROGON_WRAPPER_ENTITY_CONCEPTS_H

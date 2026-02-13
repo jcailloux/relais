@@ -1,7 +1,7 @@
 /**
  * test_concurrency.cpp
  *
- * Concurrency stress tests for the smartrepo cache hierarchy.
+ * Concurrency stress tests for the relais cache hierarchy.
  * Verifies that concurrent reads, writes, and invalidations don't crash
  * or corrupt internal state across all cache levels.
  *
@@ -32,7 +32,7 @@
 #include "fixtures/test_helper.h"
 #include "fixtures/TestRepositories.h"
 #include "fixtures/TestQueryHelpers.h"
-#include "fixtures/SmartrepoTestAccessors.h"
+#include "fixtures/RelaisTestAccessors.h"
 
 #include <thread>
 #include <vector>
@@ -40,7 +40,7 @@
 #include <atomic>
 #include <random>
 
-using namespace smartrepo_test;
+using namespace relais_test;
 
 // #############################################################################
 //

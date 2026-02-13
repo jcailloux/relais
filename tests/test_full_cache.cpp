@@ -21,7 +21,7 @@
 #include "fixtures/TestRepositories.h"
 #include "fixtures/TestQueryHelpers.h"
 
-using namespace smartrepo_test;
+using namespace relais_test;
 
 // #############################################################################
 //
@@ -29,11 +29,11 @@ using namespace smartrepo_test;
 //
 // #############################################################################
 
-namespace smartrepo_test {
+namespace relais_test {
 
 // Config presets for L1+L2 tests
 namespace test_both {
-using namespace jcailloux::drogon::smartrepo::config;
+using namespace jcailloux::relais::config;
 
 /// Short L1 TTL for expiration tests — L1 expires quickly, L2 stays
 inline constexpr auto ShortL1 = Both
@@ -67,7 +67,7 @@ using FullCachePurchaseRepo = Repository<TestPurchaseWrapper, "test:purchase:bot
 using jcailloux::drogon::wrapper::set;
 using F = TestUserWrapper::Field;
 
-} // namespace smartrepo_test
+} // namespace relais_test
 
 
 // #############################################################################

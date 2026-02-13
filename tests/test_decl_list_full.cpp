@@ -16,8 +16,8 @@
 #include "fixtures/test_helper.h"
 #include "fixtures/TestRepositories.h"
 #include "fixtures/TestQueryHelpers.h"
-#include "fixtures/SmartrepoTestAccessors.h"
-using namespace smartrepo_test;
+#include "fixtures/RelaisTestAccessors.h"
+using namespace relais_test;
 
 // #############################################################################
 //
@@ -25,7 +25,7 @@ using namespace smartrepo_test;
 //
 // #############################################################################
 
-namespace smartrepo_test {
+namespace relais_test {
 
 using FullCacheArticleListRepo = Repository<TestArticleWrapper, "test:article:list:both", cfg::Both>;
 using FullCachePurchaseListRepo = Repository<TestPurchaseWrapper, "test:purchase:list:both", cfg::Both>;
@@ -33,7 +33,7 @@ using FullCachePurchaseListRepo = Repository<TestPurchaseWrapper, "test:purchase
 using FullArticleListQuery = FullCacheArticleListRepo::ListQuery;
 using FullPurchaseListQuery = FullCachePurchaseListRepo::ListQuery;
 
-} // namespace smartrepo_test
+} // namespace relais_test
 
 // =============================================================================
 // L1+L2 query helpers

@@ -2,9 +2,9 @@
 #define JCX_DROGON_REPOSITORY_CONFIG_H
 
 #include <chrono>
-#include "jcailloux/drogon/config/Duration.h"
+#include "jcailloux/relais/config/Duration.h"
 
-namespace jcailloux::drogon::smartrepo::config {
+namespace jcailloux::relais::config {
     using namespace std::chrono_literals;
 
     // =========================================================================
@@ -101,6 +101,6 @@ namespace jcailloux::drogon::smartrepo::config {
         .l2_ttl = std::chrono::hours(1),
     };
 
-}  // namespace jcailloux::drogon::smartrepo::config
+}  // namespace jcailloux::relais::config
 
 #endif //JCX_DROGON_REPOSITORY_CONFIG_H

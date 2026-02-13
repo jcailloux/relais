@@ -19,9 +19,9 @@
 
 #include "fixtures/test_helper.h"
 #include "fixtures/TestRepositories.h"
-#include "fixtures/SmartrepoTestAccessors.h"
+#include "fixtures/RelaisTestAccessors.h"
 
-using namespace smartrepo_test;
+using namespace relais_test;
 
 // #############################################################################
 //
@@ -29,9 +29,9 @@ using namespace smartrepo_test;
 //
 // #############################################################################
 
-namespace smartrepo_test::config_test {
+namespace relais_test::config_test {
 
-using namespace jcailloux::drogon::smartrepo::config;
+using namespace jcailloux::relais::config;
 
 // --- l1_ttl ---
 inline constexpr auto TTL50ms = Local
@@ -109,9 +109,9 @@ inline constexpr auto CleanupIntervalLong = Local
 // --- read_only ---
 inline constexpr auto ReadOnlyL1 = Local.with_read_only();
 
-} // namespace smartrepo_test::config_test
+} // namespace relais_test::config_test
 
-namespace smartrepo_test {
+namespace relais_test {
 
 namespace ct = config_test;
 
@@ -146,7 +146,7 @@ using CleanupIntervalLongRepo = Repository<TestItemWrapper, "cfg:l1:cilong", ct:
 // Read-only repo
 using ReadOnlyCfgRepo = Repository<TestItemWrapper, "cfg:l1:ro", ct::ReadOnlyL1>;
 
-} // namespace smartrepo_test
+} // namespace relais_test
 
 
 // #############################################################################

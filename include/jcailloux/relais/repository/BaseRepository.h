@@ -9,12 +9,12 @@
 #include <drogon/HttpAppFramework.h>
 #include <drogon/orm/CoroMapper.h>
 #include <trantor/utils/Logger.h>
-#include "jcailloux/drogon/config/repository_config.h"
-#include "jcailloux/drogon/config/FixedString.h"
-#include "jcailloux/drogon/wrapper/EntityConcepts.h"
-#include "jcailloux/drogon/wrapper/FieldUpdate.h"
+#include "jcailloux/relais/config/repository_config.h"
+#include "jcailloux/relais/config/FixedString.h"
+#include "jcailloux/relais/wrapper/EntityConcepts.h"
+#include "jcailloux/relais/wrapper/FieldUpdate.h"
 
-namespace jcailloux::drogon::smartrepo {
+namespace jcailloux::relais {
 
 // =========================================================================
 // Wrapper pointer type - immutable shared pointer to entity
@@ -117,7 +117,7 @@ public:
                 // Partial key path - for partitioned tables where Key is a subset of PK
                 static_assert(HasPartialKey<Entity, Model, Key>,
                     "Entity must provide makeKeyCriteria when Key differs from "
-                    "Model::PrimaryKeyType. Add '@smartrepo primary_key db_managed' "
+                    "Model::PrimaryKeyType. Add '@relais primary_key db_managed' "
                     "to the PK field.");
 
                 // Use LIMIT 2 to detect non-unique results
@@ -238,7 +238,7 @@ protected:
                 // Partial key path - for partitioned tables
                 static_assert(HasPartialKey<Entity, Model, Key>,
                     "Entity must provide makeKeyCriteria when Key differs from "
-                    "Model::PrimaryKeyType. Add '@smartrepo primary_key db_managed' "
+                    "Model::PrimaryKeyType. Add '@relais primary_key db_managed' "
                     "to the PK field.");
 
                 if (cachedHint) {
@@ -480,6 +480,6 @@ protected:
     }
 };
 
-}  // namespace jcailloux::drogon::smartrepo
+}  // namespace jcailloux::relais
 
 #endif //JCX_DROGON_BASEREPOSITORY_H

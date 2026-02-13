@@ -31,7 +31,7 @@
 #include "fixtures/generated/TestArticleWrapper.h"
 #include "fixtures/generated/TestPurchaseWrapper.h"
 #include "fixtures/generated/TestOrderWrapper.h"
-#include <jcailloux/drogon/wrapper/ListWrapper.h>
+#include <jcailloux/relais/wrapper/ListWrapper.h>
 
 // Shadow raw struct names with EntityWrapper types for testing
 using TestItem = entity::generated::TestItemWrapper;
@@ -39,11 +39,11 @@ using TestUser = entity::generated::TestUserWrapper;
 using TestArticle = entity::generated::TestArticleWrapper;
 using TestPurchase = entity::generated::TestPurchaseWrapper;
 using TestOrder = entity::generated::TestOrderWrapper;
-using smartrepo_test::TestAddress;
-using smartrepo_test::TestGeoLocation;
-using smartrepo_test::TestCoordinateMetadata;
-using smartrepo_test::Priority;
-using smartrepo_test::Status;
+using relais_test::TestAddress;
+using relais_test::TestGeoLocation;
+using relais_test::TestCoordinateMetadata;
+using relais_test::Priority;
+using relais_test::Status;
 using ListWrapperArticle = jcailloux::drogon::wrapper::ListWrapper<TestArticle>;
 using ListWrapperItem = jcailloux::drogon::wrapper::ListWrapper<TestItem>;
 
@@ -141,7 +141,7 @@ TEST_CASE("TestUser - JSON round-trip", "[wrapper][json][user]") {
 
 TEST_CASE("TestUser - fromModel / toModel", "[wrapper][model][user]") {
 
-    smartrepo_test::TestUserModel model;
+    relais_test::TestUserModel model;
     model.setId(99);
     model.setUsername("bob");
     model.setEmail("bob@example.com");
@@ -198,7 +198,7 @@ TEST_CASE("TestUser - fromModel / toModel", "[wrapper][model][user]") {
 
 TEST_CASE("TestArticle - boolean and timestamp fields", "[wrapper][struct][article]") {
 
-    smartrepo_test::TestArticleModel model;
+    relais_test::TestArticleModel model;
     model.setId(42);
     model.setCategory("tech");
     model.setAuthorId(7);
@@ -296,7 +296,7 @@ TEST_CASE("TestArticle - nullable fields", "[wrapper][struct][article][nullable]
 
 TEST_CASE("TestArticle - nullable from model", "[wrapper][model][article][nullable]") {
 
-    smartrepo_test::TestArticleModel model;
+    relais_test::TestArticleModel model;
     model.setId(20);
     model.setCategory("tech");
     model.setAuthorId(1);
@@ -331,7 +331,7 @@ TEST_CASE("TestArticle - nullable from model", "[wrapper][model][article][nullab
 
 TEST_CASE("TestPurchase - fromModel / toModel / toJson", "[wrapper][struct][purchase]") {
 
-    smartrepo_test::TestPurchaseModel model;
+    relais_test::TestPurchaseModel model;
     model.setId(1);
     model.setUserId(42);
     model.setProductName("Widget");
@@ -450,9 +450,9 @@ TestOrder buildMinimalTestOrder() {
 }
 
 /// Build a Drogon model with all scalar/string/enum fields set.
-drogon_model::smartrepo_test::Mock_SmartrepoTestOrders buildTestOrderModel(
+drogon_model::relais_test::Mock_RelaisTestOrders buildTestOrderModel(
         int64_t id = 1, const std::string& priority = "low") {
-    drogon_model::smartrepo_test::Mock_SmartrepoTestOrders model;
+    drogon_model::relais_test::Mock_RelaisTestOrders model;
     model.setId(id);
     model.setUserId(1);
     model.setAmount(100);
@@ -790,7 +790,7 @@ TEST_CASE("TestOrder - nullable discount", "[wrapper][struct][order][nullable]")
 
 TEST_CASE("TestOrder - fromModel / toModel round-trip", "[wrapper][model][order]") {
 
-    drogon_model::smartrepo_test::Mock_SmartrepoTestOrders model;
+    drogon_model::relais_test::Mock_RelaisTestOrders model;
     model.setId(55);
     model.setUserId(42);
     model.setAmount(999);
@@ -938,7 +938,7 @@ TEST_CASE("ListWrapper<TestArticle> - construction and accessors", "[wrapper][li
         REQUIRE(list.nextCursor().empty());
     }
 
-    smartrepo_test::TestArticleModel m1;
+    relais_test::TestArticleModel m1;
     m1.setId(1);
     m1.setCategory("tech");
     m1.setAuthorId(7);
@@ -947,7 +947,7 @@ TEST_CASE("ListWrapper<TestArticle> - construction and accessors", "[wrapper][li
     m1.setViewCount(10);
     m1.setCreatedAt(trantor::Date::fromDbStringLocal("2025-06-01 00:00:00"));
 
-    smartrepo_test::TestArticleModel m2;
+    relais_test::TestArticleModel m2;
     m2.setId(2);
     m2.setCategory("science");
     m2.setAuthorId(3);
@@ -1043,7 +1043,7 @@ TEST_CASE("ListWrapper<TestArticle> - toJson", "[wrapper][list][article][json]")
         REQUIRE(json->find("\"items\":[]") != std::string::npos);
     }
 
-    smartrepo_test::TestArticleModel m;
+    relais_test::TestArticleModel m;
     m.setId(1);
     m.setCategory("tech");
     m.setAuthorId(7);
@@ -1070,7 +1070,7 @@ TEST_CASE("ListWrapper<TestArticle> - toJson", "[wrapper][list][article][json]")
 
 TEST_CASE("ListWrapper<TestArticle> - JSON round-trip", "[wrapper][list][article][json]") {
 
-    smartrepo_test::TestArticleModel m;
+    relais_test::TestArticleModel m;
     m.setId(1);
     m.setCategory("tech");
     m.setAuthorId(7);
@@ -1102,14 +1102,14 @@ TEST_CASE("ListWrapper<TestArticle> - JSON round-trip", "[wrapper][list][article
 
 TEST_CASE("Glaze vector round-trip - TestUser", "[wrapper][glaze][user]") {
 
-    smartrepo_test::TestUserModel m1;
+    relais_test::TestUserModel m1;
     m1.setId(1);
     m1.setUsername("alice");
     m1.setEmail("alice@test.com");
     m1.setBalance(100);
     m1.setCreatedAt(trantor::Date::fromDbStringLocal("2025-01-01 00:00:00"));
 
-    smartrepo_test::TestUserModel m2;
+    relais_test::TestUserModel m2;
     m2.setId(2);
     m2.setUsername("bob");
     m2.setEmail("bob@test.com");
@@ -1148,7 +1148,7 @@ TEST_CASE("Glaze vector round-trip - TestUser", "[wrapper][glaze][user]") {
 
 TEST_CASE("Glaze vector round-trip - TestArticle (nullable)", "[wrapper][glaze][article]") {
 
-    smartrepo_test::TestArticleModel m1;
+    relais_test::TestArticleModel m1;
     m1.setId(10);
     m1.setCategory("tech");
     m1.setAuthorId(7);
@@ -1158,7 +1158,7 @@ TEST_CASE("Glaze vector round-trip - TestArticle (nullable)", "[wrapper][glaze][
     m1.setPublishedAt(trantor::Date::fromDbStringLocal("2025-06-01 12:00:00"));
     m1.setCreatedAt(trantor::Date::fromDbStringLocal("2025-05-30 09:00:00"));
 
-    smartrepo_test::TestArticleModel m2;
+    relais_test::TestArticleModel m2;
     m2.setId(20);
     m2.setCategory("science");
     m2.setAuthorId(3);
@@ -1207,7 +1207,7 @@ TEST_CASE("Glaze vector round-trip - TestArticle (nullable)", "[wrapper][glaze][
 
 TEST_CASE("Glaze vector round-trip - TestItem", "[wrapper][glaze][item]") {
 
-    smartrepo_test::TestItemModel m;
+    relais_test::TestItemModel m;
     m.setId(5);
     m.setName("Widget");
     m.setValue(999);
@@ -1305,11 +1305,11 @@ namespace custom_json_test {
 /// Minimal hand-written mapping for testing.
 /// Its glaze_value uses snake_case — this should NOT be used when glz::meta<Product> exists.
 struct ProductMapping {
-    using Model = smartrepo_test::TestItemModel;
+    using Model = relais_test::TestItemModel;
     static constexpr bool read_only = true;
 
     struct TraitsType {
-        using Model = smartrepo_test::TestItemModel;
+        using Model = relais_test::TestItemModel;
         enum class Field : uint8_t {};
     };
 
@@ -1469,7 +1469,7 @@ TEST_CASE("releaseCaches() frees serialization data while callers retain copies"
 
 TEST_CASE("Entities without glz::meta<Struct> still use Mapping::glaze_value", "[wrapper][json][custom-names]") {
 
-    // TestUser has NO glz::meta<smartrepo_test::TestUser> specialization,
+    // TestUser has NO glz::meta<relais_test::TestUser> specialization,
     // so Mapping::glaze_value (member names) should be used.
     TestUser user;
     user.id = 1;

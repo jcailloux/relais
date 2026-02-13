@@ -4,7 +4,7 @@
 #include <algorithm>
 #include <cstddef>
 
-namespace jcailloux::drogon::smartrepo::config {
+namespace jcailloux::relais::config {
 
 /// Structural string wrapper for use as NTTP (Non-Type Template Parameter).
 /// Allows passing string literals directly as template arguments:
@@ -23,6 +23,6 @@ struct FixedString {
     constexpr auto operator<=>(const FixedString&) const = default;
 };
 
-}  // namespace jcailloux::drogon::smartrepo::config
+}  // namespace jcailloux::relais::config
 
 #endif //JCX_DROGON_FIXEDSTRING_H

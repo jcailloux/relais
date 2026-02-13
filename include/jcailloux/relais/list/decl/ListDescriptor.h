@@ -5,8 +5,8 @@
 #include <tuple>
 #include <type_traits>
 
-#include "jcailloux/drogon/config/repository_config.h"
-#include "jcailloux/drogon/wrapper/EntityConcepts.h"
+#include "jcailloux/relais/config/repository_config.h"
+#include "jcailloux/relais/wrapper/EntityConcepts.h"
 
 namespace jcailloux::drogon::cache::list::decl {
 
@@ -41,7 +41,7 @@ concept ValidListDescriptor =
     HasEntityAndModel<Descriptor> &&
     HasFilters<Descriptor> &&
     HasSorts<Descriptor> &&
-    smartrepo::Readable<typename Descriptor::Entity, typename Descriptor::Model>;
+    relais::Readable<typename Descriptor::Entity, typename Descriptor::Model>;
 
 // =============================================================================
 // Helper to count filters and sorts

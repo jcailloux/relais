@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# Generate test fixtures for smartrepo
+# Generate test fixtures for relais
 # =============================================================================
 #
 # This script generates:
@@ -28,9 +28,9 @@ FIXTURES_DIR="$TESTS_DIR/fixtures"
 GENERATED_DIR="$FIXTURES_DIR/generated"
 
 # Database config (must match init_test_db.sh)
-DB_NAME="smartrepo_test"
-DB_USER="smartrepo_test"
-DB_PASS="smartrepo_test"
+DB_NAME="relais_test"
+DB_USER="relais_test"
+DB_PASS="relais_test"
 DB_HOST="localhost"
 DB_PORT="5432"
 
@@ -83,7 +83,7 @@ else
     "dbname": "$DB_NAME",
     "user": "$DB_USER",
     "passwd": "$DB_PASS",
-    "tables": ["smartrepo_test_items"]
+    "tables": ["relais_test_items"]
 }
 EOF
 

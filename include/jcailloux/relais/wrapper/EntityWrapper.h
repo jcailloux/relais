@@ -12,7 +12,7 @@
 
 #include <glaze/glaze.hpp>
 
-#include "jcailloux/drogon/wrapper/Format.h"
+#include "jcailloux/relais/wrapper/Format.h"
 
 namespace jcailloux::drogon::wrapper {
 
@@ -33,7 +33,7 @@ namespace jcailloux::drogon::wrapper {
 template<typename Struct, typename Mapping>
 class EntityWrapper : public Struct {
 public:
-    using Format = jcailloux::drogon::smartrepo::StructFormat;
+    using Format = jcailloux::relais::StructFormat;
     using Model = typename Mapping::Model;
     using TraitsType = typename Mapping::TraitsType;
     using Field = typename TraitsType::Field;

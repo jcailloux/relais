@@ -4,7 +4,7 @@
 #include <chrono>
 #include <cstdint>
 
-namespace jcailloux::drogon::smartrepo::config {
+namespace jcailloux::relais::config {
 
 /// Structural duration wrapper for use as NTTP field.
 /// std::chrono::duration has private members and is not structural,
@@ -37,6 +37,6 @@ struct Duration {
     constexpr auto operator<=>(const Duration&) const = default;
 };
 
-}  // namespace jcailloux::drogon::smartrepo::config
+}  // namespace jcailloux::relais::config
 
 #endif //JCX_DROGON_DURATION_H

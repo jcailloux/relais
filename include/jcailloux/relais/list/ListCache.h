@@ -11,10 +11,10 @@
 #include "ListQuery.h"
 #include "ListCacheTraits.h"
 #include "ModificationTracker.h"
-#include "jcailloux/drogon/wrapper/ListWrapper.h"
+#include "jcailloux/relais/wrapper/ListWrapper.h"
 
-#ifdef SMARTREPO_BUILDING_TESTS
-namespace smartrepo_test { struct TestInternals; }
+#ifdef RELAIS_BUILDING_TESTS
+namespace relais_test { struct TestInternals; }
 #endif
 
 namespace jcailloux::drogon::cache::list {
@@ -85,7 +85,7 @@ struct SortBounds {
 //
 // Format (little-endian):
 //   Offset  Size  Field
-//   0       2     Magic bytes: 0x53 0x52 ("SR" = SmartRepo)
+//   0       2     Magic bytes: 0x52 0x4C ("SR" = Relais)
 //   2       8     first_value (int64_t LE)
 //   10      8     last_value (int64_t LE)
 //   18      1     flags:
@@ -492,8 +492,8 @@ public:
     [[nodiscard]] static constexpr size_t shardCount() { return ShardCount; }
     [[nodiscard]] const ListCacheConfig& config() const { return config_; }
 
-#ifdef SMARTREPO_BUILDING_TESTS
-    friend struct ::smartrepo_test::TestInternals;
+#ifdef RELAIS_BUILDING_TESTS
+    friend struct ::relais_test::TestInternals;
 #endif
 
 private:

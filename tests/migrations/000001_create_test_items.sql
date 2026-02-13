@@ -1,7 +1,7 @@
--- Test table for smartrepo integration tests
+-- Test table for relais integration tests
 -- Contains various field types to test different scenarios
 
-CREATE TABLE IF NOT EXISTS smartrepo_test_items (
+CREATE TABLE IF NOT EXISTS relais_test_items (
     id BIGSERIAL PRIMARY KEY,
     name VARCHAR(100) NOT NULL,
     value INTEGER NOT NULL DEFAULT 0,
@@ -11,5 +11,5 @@ CREATE TABLE IF NOT EXISTS smartrepo_test_items (
 );
 
 -- Index for common queries
-CREATE INDEX IF NOT EXISTS idx_smartrepo_test_items_name ON smartrepo_test_items(name);
-CREATE INDEX IF NOT EXISTS idx_smartrepo_test_items_is_active ON smartrepo_test_items(is_active);
+CREATE INDEX IF NOT EXISTS idx_relais_test_items_name ON relais_test_items(name);
+CREATE INDEX IF NOT EXISTS idx_relais_test_items_is_active ON relais_test_items(is_active);

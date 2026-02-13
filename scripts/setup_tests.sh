@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# Setup everything needed for smartrepo tests
+# Setup everything needed for relais tests
 # =============================================================================
 #
 # Usage: ./scripts/setup_tests.sh
@@ -16,7 +16,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 echo "============================================="
-echo "  Smartrepo Test Setup"
+echo "  Relais Test Setup"
 echo "============================================="
 echo ""
 

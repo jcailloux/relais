@@ -1,7 +1,7 @@
 #ifndef JCX_DROGON_WRAPPER_FORMAT_H
 #define JCX_DROGON_WRAPPER_FORMAT_H
 
-namespace jcailloux::drogon::smartrepo {
+namespace jcailloux::relais {
 
 // =============================================================================
 // Format tags - explicit type tags for wrapper format detection
@@ -12,6 +12,6 @@ namespace jcailloux::drogon::smartrepo {
 /// Tag type for plain C++ struct wrappers (BEVE/JSON via Glaze)
 struct StructFormat {};
 
-}  // namespace jcailloux::drogon::smartrepo
+}  // namespace jcailloux::relais
 
 #endif  // JCX_DROGON_WRAPPER_FORMAT_H

@@ -13,9 +13,9 @@
 #include "fixtures/test_helper.h"
 #include "fixtures/TestRepositories.h"
 #include "fixtures/TestQueryHelpers.h"
-#include "fixtures/SmartrepoTestAccessors.h"
+#include "fixtures/RelaisTestAccessors.h"
 
-using namespace smartrepo_test;
+using namespace relais_test;
 
 
 // #############################################################################

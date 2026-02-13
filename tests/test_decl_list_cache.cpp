@@ -18,8 +18,8 @@
 #include "fixtures/test_helper.h"
 #include "fixtures/TestRepositories.h"
 #include "fixtures/TestQueryHelpers.h"
-#include "fixtures/SmartrepoTestAccessors.h"
-using namespace smartrepo_test;
+#include "fixtures/RelaisTestAccessors.h"
+using namespace relais_test;
 
 namespace decl = jcailloux::drogon::cache::list::decl;
 
@@ -417,7 +417,7 @@ TEST_CASE("[DeclListRepository] SortBounds invalidation precision",
 
         // Find article with view_count=70 to update
         auto result_70 = getDb()->execSqlSync(
-            "SELECT id FROM smartrepo_test_articles WHERE view_count = 70 AND author_id = $1 LIMIT 1",
+            "SELECT id FROM relais_test_articles WHERE view_count = 70 AND author_id = $1 LIMIT 1",
             alice_id
         );
         REQUIRE(result_70.size() > 0);
@@ -450,7 +450,7 @@ TEST_CASE("[DeclListRepository] SortBounds invalidation precision",
 
         // Find article with view_count=40 to delete
         auto result_40 = getDb()->execSqlSync(
-            "SELECT id FROM smartrepo_test_articles WHERE view_count = 40 AND author_id = $1 LIMIT 1",
+            "SELECT id FROM relais_test_articles WHERE view_count = 40 AND author_id = $1 LIMIT 1",
             alice_id
         );
         REQUIRE(result_40.size() > 0);

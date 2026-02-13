@@ -7,7 +7,7 @@
 #include <drogon/HttpAppFramework.h>
 #include <trantor/utils/Logger.h>
 
-namespace jcailloux::drogon::smartrepo {
+namespace jcailloux::relais {
 
 /**
  * Validation utilities for partial key repositories.
@@ -213,6 +213,6 @@ public:
     }
 };
 
-}  // namespace jcailloux::drogon::smartrepo
+}  // namespace jcailloux::relais
 
 #endif  // JCX_DROGON_PARTIALKEYVALIDATOR_H

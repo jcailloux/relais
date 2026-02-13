@@ -17,8 +17,8 @@
 #include "fixtures/test_helper.h"
 #include "fixtures/TestRepositories.h"
 #include "fixtures/TestQueryHelpers.h"
-#include "fixtures/SmartrepoTestAccessors.h"
-using namespace smartrepo_test;
+#include "fixtures/RelaisTestAccessors.h"
+using namespace relais_test;
 
 namespace decl = jcailloux::drogon::cache::list::decl;
 
@@ -28,7 +28,7 @@ namespace decl = jcailloux::drogon::cache::list::decl;
 //
 // #############################################################################
 
-namespace smartrepo_test {
+namespace relais_test {
 
 using L2DeclArticleListRepo = Repository<TestArticleWrapper, "test:article:list:l2:decl", cfg::Redis>;
 using L2DeclPurchaseListRepo = Repository<TestPurchaseWrapper, "test:purchase:list:l2:decl", cfg::Redis>;
@@ -41,7 +41,7 @@ using L2PurchaseListQuery = L2DeclPurchaseListRepo::ListQuery;
 using L2ArticleDecl = L2DeclArticleListRepo::ListDescriptorType;
 using L2ArticleDescQuery = decl::ListDescriptorQuery<L2ArticleDecl>;
 
-} // namespace smartrepo_test
+} // namespace relais_test
 
 // =============================================================================
 // Helper: build a TestArticleWrapper from raw values (for SortBounds tests)
@@ -306,7 +306,7 @@ TEST_CASE("[DeclList L2] SortBounds invalidation",
         REQUIRE(r1->size() == 10);
 
         auto result_70 = getDb()->execSqlSync(
-            "SELECT id FROM smartrepo_test_articles WHERE view_count = 70 AND author_id = $1 LIMIT 1",
+            "SELECT id FROM relais_test_articles WHERE view_count = 70 AND author_id = $1 LIMIT 1",
             alice_id);
         REQUIRE(result_70.size() > 0);
         auto article_70_id = result_70[0]["id"].as<int64_t>();
@@ -327,7 +327,7 @@ TEST_CASE("[DeclList L2] SortBounds invalidation",
         REQUIRE(r1->size() == 8);
 
         auto result_40 = getDb()->execSqlSync(
-            "SELECT id FROM smartrepo_test_articles WHERE view_count = 40 AND author_id = $1 LIMIT 1",
+            "SELECT id FROM relais_test_articles WHERE view_count = 40 AND author_id = $1 LIMIT 1",
             alice_id);
         REQUIRE(result_40.size() > 0);
         auto article_40_id = result_40[0]["id"].as<int64_t>();

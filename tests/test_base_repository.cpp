@@ -24,7 +24,7 @@
 #include "fixtures/test_helper.h"
 #include "fixtures/TestRepositories.h"
 
-using namespace smartrepo_test;
+using namespace relais_test;
 
 // #############################################################################
 //

@@ -11,7 +11,7 @@
 #include "GeneratedFilters.h"
 #include "GeneratedTraits.h"
 #include "ListDescriptorQuery.h"
-#include "jcailloux/drogon/cache/QueryParser.h"
+#include "jcailloux/relais/cache/QueryParser.h"
 
 namespace jcailloux::drogon::cache::list::decl {
 

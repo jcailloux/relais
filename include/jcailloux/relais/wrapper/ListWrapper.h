@@ -12,7 +12,7 @@
 
 #include <glaze/glaze.hpp>
 
-#include "jcailloux/drogon/wrapper/Format.h"
+#include "jcailloux/relais/wrapper/Format.h"
 
 namespace jcailloux::drogon::wrapper {
 
@@ -28,7 +28,7 @@ namespace jcailloux::drogon::wrapper {
 template<typename Item>
 class ListWrapper {
 public:
-    using Format = jcailloux::drogon::smartrepo::StructFormat;
+    using Format = jcailloux::relais::StructFormat;
     using ItemType = Item;
     using Model = typename Item::Model;
     static constexpr bool read_only = true;

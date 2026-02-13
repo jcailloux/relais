@@ -1,6 +1,6 @@
 # Test Internals
 
-Technical details about the smartrepo test infrastructure.
+Technical details about the relais test infrastructure.
 
 ## Architecture Overview
 
@@ -21,7 +21,7 @@ Technical details about the smartrepo test infrastructure.
 │  Configs: Uncached, L1Only, L2Only, Both, ShortTTL, WriteThrough…  │
 │  Entity repos: L2TestItemRepo, L1TestUserRepo, L2TestPurchaseRepo… │
 │  List repos: TestArticleListRepository, TestPurchaseListRepository  │
-│  (inherit from smartrepo::Repository<...> + ListCacheRepository)    │
+│  (inherit from relais::Repository<...> + ListCacheRepository)    │
 └─────────────────────────────────────────────────────────────────────┘
                               │
                     ┌─────────┴─────────┐
@@ -117,7 +117,7 @@ Minimal Drogon ORM model implementation. Implements the interface required by `d
 
 Each test entity has two layers:
 
-1. **Pure data struct** (e.g., `TestItem.h`): Framework-agnostic struct with `@smartrepo` annotations and `glz::meta` specialization
+1. **Pure data struct** (e.g., `TestItem.h`): Framework-agnostic struct with `@relais` annotations and `glz::meta` specialization
 2. **EntityWrapper alias** (in `TestEntities.h`): `EntityWrapper<Struct, Mapping>` combining the struct with its generated ORM mapping
 
 ```cpp
@@ -165,7 +165,7 @@ All entity types are `EntityWrapper<Struct, Mapping>` aliases defined in `TestEn
 ## Test Database Schema
 
 ```sql
-CREATE TABLE smartrepo_test_items (
+CREATE TABLE relais_test_items (
     id BIGSERIAL PRIMARY KEY,
     name VARCHAR(100) NOT NULL,
     value INTEGER NOT NULL DEFAULT 0,
@@ -249,7 +249,7 @@ L1Repository::clearCache();
 
 ### Test Single Case
 ```bash
-./test_smartrepo_base "[BaseRepository] CRUD Operations" -s
+./test_relais_base "[BaseRepository] CRUD Operations" -s
 ```
 
 ## Redis Repository Tests (`test_redis_repository.cpp`)
@@ -383,7 +383,7 @@ Tests for repositories where `Key` differs from `Model::PrimaryKeyType` — typi
 
 ### Test Entity: `TestEvent`
 
-- **Table**: `smartrepo_test_events` — range-partitioned by `region` (eu, us, ap)
+- **Table**: `relais_test_events` — range-partitioned by `region` (eu, us, ap)
 - **Composite PK**: `(id BIGINT, region VARCHAR)` — `id` from shared sequence, `region` as partition key
 - **Repository Key**: `int64_t` (partial — only `id`)
 - **Config requires**: `key_is_unique = true` + `makeKeyCriteria<Model>(id)`

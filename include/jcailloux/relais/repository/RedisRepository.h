@@ -1,11 +1,11 @@
 #ifndef JCX_DROGON_REDISREPOSITORY_H
 #define JCX_DROGON_REDISREPOSITORY_H
 
-#include "jcailloux/drogon/smartrepo/BaseRepository.h"
-#include "jcailloux/drogon/cache/RedisCache.h"
-#include "jcailloux/drogon/config/repository_config.h"
+#include "jcailloux/relais/repository/BaseRepository.h"
+#include "jcailloux/relais/cache/RedisCache.h"
+#include "jcailloux/relais/config/repository_config.h"
 
-namespace jcailloux::drogon::smartrepo {
+namespace jcailloux::relais {
 
 /**
  * Repository with L2 Redis caching on top of L3 database.
@@ -509,6 +509,6 @@ class RedisRepository : public BaseRepository<Entity, Name, Cfg, Key> {
         }
 };
 
-}  // namespace jcailloux::drogon::smartrepo
+}  // namespace jcailloux::relais
 
 #endif //JCX_DROGON_REDISREPOSITORY_H

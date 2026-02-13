@@ -3,13 +3,13 @@
 
 #include <span>
 #include <type_traits>
-#include "jcailloux/drogon/smartrepo/CachedRepository.h"
-#include "jcailloux/drogon/smartrepo/InvalidationMixin.h"
-#include "jcailloux/drogon/smartrepo/ListMixin.h"
-#include "jcailloux/drogon/config/FixedString.h"
-#include "jcailloux/drogon/wrapper/EntityConcepts.h"
+#include "jcailloux/relais/repository/CachedRepository.h"
+#include "jcailloux/relais/repository/InvalidationMixin.h"
+#include "jcailloux/relais/repository/ListMixin.h"
+#include "jcailloux/relais/config/FixedString.h"
+#include "jcailloux/relais/wrapper/EntityConcepts.h"
 
-namespace jcailloux::drogon::smartrepo {
+namespace jcailloux::relais {
 
 // =============================================================================
 // RepositoryBuilder — assembles the mixin chain from template parameters
@@ -156,6 +156,6 @@ public:
     }
 };
 
-}  // namespace jcailloux::drogon::smartrepo
+}  // namespace jcailloux::relais
 
 #endif  // JCX_DROGON_REPOSITORY_H

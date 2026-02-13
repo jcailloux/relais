@@ -45,9 +45,9 @@
 #include "fixtures/test_helper.h"
 #include "fixtures/TestRepositories.h"
 #include "fixtures/TestQueryHelpers.h"
-#include "fixtures/SmartrepoTestAccessors.h"
+#include "fixtures/RelaisTestAccessors.h"
 
-using namespace smartrepo_test;
+using namespace relais_test;
 
 // #############################################################################
 //
@@ -55,7 +55,7 @@ using namespace smartrepo_test;
 //
 // #############################################################################
 
-namespace smartrepo_test {
+namespace relais_test {
 
 // =============================================================================
 // L1 repos for cross-invalidation testing
@@ -86,7 +86,7 @@ struct L1UserArticleResolver {
     static ::drogon::Task<std::vector<int64_t>> resolve(int64_t user_id) {
         auto db = ::drogon::app().getDbClient();
         auto result = co_await db->execSqlCoro(
-            "SELECT id FROM smartrepo_test_articles WHERE author_id = $1", user_id);
+            "SELECT id FROM relais_test_articles WHERE author_id = $1", user_id);
         std::vector<int64_t> ids;
         for (const auto& row : result) {
             ids.push_back(row["id"].as<int64_t>());
@@ -178,7 +178,7 @@ struct L1PerPageResolver {
     static ::drogon::Task<std::vector<L1MockTarget>> resolve(int64_t user_id) {
         auto db = ::drogon::app().getDbClient();
         auto rows = co_await db->execSqlCoro(
-            "SELECT category, view_count FROM smartrepo_test_articles WHERE author_id = $1",
+            "SELECT category, view_count FROM relais_test_articles WHERE author_id = $1",
             user_id);
         std::vector<L1MockTarget> targets;
         for (const auto& row : rows) {
@@ -198,7 +198,7 @@ struct L1PerGroupResolver {
     static ::drogon::Task<std::vector<L1MockTarget>> resolve(int64_t user_id) {
         auto db = ::drogon::app().getDbClient();
         auto rows = co_await db->execSqlCoro(
-            "SELECT DISTINCT category FROM smartrepo_test_articles WHERE author_id = $1",
+            "SELECT DISTINCT category FROM relais_test_articles WHERE author_id = $1",
             user_id);
         std::vector<L1MockTarget> targets;
         for (const auto& row : rows) {
@@ -229,7 +229,7 @@ struct L1MixedResolver {
     static ::drogon::Task<std::vector<L1MockTarget>> resolve(int64_t user_id) {
         auto db = ::drogon::app().getDbClient();
         auto rows = co_await db->execSqlCoro(
-            "SELECT category, view_count FROM smartrepo_test_articles WHERE author_id = $1",
+            "SELECT category, view_count FROM relais_test_articles WHERE author_id = $1",
             user_id);
         std::vector<L1MockTarget> targets;
         std::set<std::string> seen;
@@ -280,7 +280,7 @@ using L1MixedPurchaseRepo = Repository<TestPurchaseWrapper, "test:purchase:l1:mi
 
 // CacheConfig presets for read-only tests
 namespace test_local {
-using namespace jcailloux::drogon::smartrepo::config;
+using namespace jcailloux::relais::config;
 inline constexpr auto ReadOnlyL1 = Local.with_read_only();
 inline constexpr auto ReadOnlyUserL1 = Local.with_read_only();
 } // namespace test_local
@@ -298,7 +298,7 @@ using L1ReadOnlyInvPurchaseRepository = Repository<TestPurchaseWrapper, "test:pu
     cfg::Local,
     cache::Invalidate<ReadOnlyL1TestUserRepository, purchaseUserId>>;
 
-} // namespace smartrepo_test
+} // namespace relais_test
 
 using jcailloux::drogon::wrapper::set;
 using F = TestUserWrapper::Field;
@@ -1158,7 +1158,7 @@ TEST_CASE("CachedRepository - read-only",
     // Compile-time checks
     static_assert(test_local::ReadOnlyL1.read_only == true);
     static_assert(test_local::ReadOnlyL1.cache_level
-                  == jcailloux::drogon::smartrepo::config::CacheLevel::L1);
+                  == jcailloux::relais::config::CacheLevel::L1);
 
     SECTION("[readonly] findById works and caches in L1") {
         auto id = insertTestItem("ReadOnly L1", 42);

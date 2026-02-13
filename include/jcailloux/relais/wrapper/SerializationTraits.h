@@ -10,7 +10,7 @@
 #include <string_view>
 #include <vector>
 
-namespace jcailloux::drogon::smartrepo {
+namespace jcailloux::relais {
 
 // =============================================================================
 // Serialization Capability Concepts
@@ -36,6 +36,6 @@ concept HasBinarySerialization = requires(const Entity& e, std::span<const uint8
     { Entity::fromBinary(data) } -> std::convertible_to<std::optional<Entity>>;
 };
 
-}  // namespace jcailloux::drogon::smartrepo
+}  // namespace jcailloux::relais
 
 #endif  // JCX_DROGON_WRAPPER_SERIALIZATION_TRAITS_H

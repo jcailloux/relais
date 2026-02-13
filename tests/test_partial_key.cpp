@@ -10,9 +10,9 @@
 #include <catch2/catch_section_info.hpp>
 #include "fixtures/test_helper.h"
 #include "fixtures/TestRepositories.h"
-#include <jcailloux/drogon/smartrepo/PartialKeyValidator.h>
+#include <jcailloux/relais/repository/PartialKeyValidator.h>
 
-using namespace smartrepo_test;
+using namespace relais_test;
 
 // =============================================================================
 // Local configs and repos for cross-invalidation tests
@@ -36,7 +36,7 @@ struct PurchaseToEventResolver {
     static ::drogon::Task<std::vector<int64_t>> resolve(int64_t user_id) {
         auto db = ::drogon::app().getDbClient();
         auto result = co_await db->execSqlCoro(
-            "SELECT id FROM smartrepo_test_events WHERE user_id = $1", user_id);
+            "SELECT id FROM relais_test_events WHERE user_id = $1", user_id);
         std::vector<int64_t> ids;
         for (const auto& row : result) {
             ids.push_back(row["id"].as<int64_t>());
@@ -461,31 +461,31 @@ TEST_CASE("PartialKeyValidator",
 {
     TransactionGuard tx;
 
-    using Validator = jcailloux::drogon::smartrepo::PartialKeyValidator;
+    using Validator = jcailloux::relais::PartialKeyValidator;
 
     SECTION("[validator] validateKeyUsesSequenceOrUuid passes for events.id") {
         auto result = sync(Validator::validateKeyUsesSequenceOrUuid(
-            "smartrepo_test_events", "id"));
+            "relais_test_events", "id"));
         CHECK(result.valid);
         CHECK(result.reason.find("SEQUENCE") != std::string::npos);
     }
 
     SECTION("[validator] validatePartitionColumns passes for events table") {
         auto result = sync(Validator::validatePartitionColumns(
-            "smartrepo_test_events", {"id"}));
+            "relais_test_events", {"id"}));
         CHECK(result.valid);
         CHECK(result.reason.find("partition") != std::string::npos);
     }
 
     SECTION("[validator] validateAll passes") {
         auto result = sync(Validator::validateAll(
-            "smartrepo_test_events", "id"));
+            "relais_test_events", "id"));
         CHECK(result == true);
     }
 
     SECTION("[validator] rejects non-sequence column") {
         auto result = sync(Validator::validateKeyUsesSequenceOrUuid(
-            "smartrepo_test_events", "region"));
+            "relais_test_events", "region"));
         CHECK_FALSE(result.valid);
     }
 }
@@ -595,7 +595,7 @@ TEST_CASE("PartialKey<TestEvent> - updateBy (Uncached)",
 
         // Independent verification via raw SQL
         auto dbResult = getDb()->execSqlSync(
-            "SELECT region FROM smartrepo_test_events WHERE id = $1", eventId);
+            "SELECT region FROM relais_test_events WHERE id = $1", eventId);
         REQUIRE(dbResult.size() == 1);
         CHECK(dbResult[0]["region"].as<std::string>() == "eu");
     }

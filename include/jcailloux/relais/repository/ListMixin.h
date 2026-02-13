@@ -7,21 +7,21 @@
 #include <drogon/utils/coroutine.h>
 #include <trantor/utils/Logger.h>
 
-#include "jcailloux/drogon/list/ListCache.h"
-#include "jcailloux/drogon/list/ListQuery.h"
-#include "jcailloux/drogon/list/decl/ListDescriptor.h"
-#include "jcailloux/drogon/list/decl/ListDescriptorQuery.h"
-#include "jcailloux/drogon/list/decl/GeneratedFilters.h"
-#include "jcailloux/drogon/list/decl/GeneratedTraits.h"
-#include "jcailloux/drogon/list/decl/GeneratedCriteria.h"
-#include "jcailloux/drogon/wrapper/EntityConcepts.h"
-#include "jcailloux/drogon/wrapper/ListWrapper.h"
+#include "jcailloux/relais/list/ListCache.h"
+#include "jcailloux/relais/list/ListQuery.h"
+#include "jcailloux/relais/list/decl/ListDescriptor.h"
+#include "jcailloux/relais/list/decl/ListDescriptorQuery.h"
+#include "jcailloux/relais/list/decl/GeneratedFilters.h"
+#include "jcailloux/relais/list/decl/GeneratedTraits.h"
+#include "jcailloux/relais/list/decl/GeneratedCriteria.h"
+#include "jcailloux/relais/wrapper/EntityConcepts.h"
+#include "jcailloux/relais/wrapper/ListWrapper.h"
 
-#ifdef SMARTREPO_BUILDING_TESTS
-namespace smartrepo_test { struct TestInternals; }
+#ifdef RELAIS_BUILDING_TESTS
+namespace relais_test { struct TestInternals; }
 #endif
 
-namespace jcailloux::drogon::smartrepo {
+namespace jcailloux::relais {
 
 /**
  * Optional mixin layer for declarative list caching.
@@ -324,8 +324,8 @@ public:
         if (entity) listCache().onEntityDeleted(std::move(entity));
     }
 
-#ifdef SMARTREPO_BUILDING_TESTS
-    friend struct ::smartrepo_test::TestInternals;
+#ifdef RELAIS_BUILDING_TESTS
+    friend struct ::relais_test::TestInternals;
 #endif
 
 protected:
@@ -455,6 +455,6 @@ protected:
     }
 };
 
-}  // namespace jcailloux::drogon::smartrepo
+}  // namespace jcailloux::relais
 
 #endif  // JCX_DROGON_LIST_MIXIN_H

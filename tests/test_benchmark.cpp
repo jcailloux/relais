@@ -1,15 +1,15 @@
 /**
  * test_benchmark.cpp
  *
- * Performance benchmarks for the smartrepo cache hierarchy.
+ * Performance benchmarks for the relais cache hierarchy.
  * Uses a custom micro-benchmarker for consistent, human-readable output
  * regardless of Catch2 reporter (console or XML).
  *
  * Run with:
- *   ./test_smartrepo_benchmark                    # all benchmarks
- *   ./test_smartrepo_benchmark "[l1]"             # L1 only
- *   ./test_smartrepo_benchmark "[throughput]"      # multi-threaded only
- *   BENCH_SAMPLES=500 ./test_smartrepo_benchmark  # 500 samples per benchmark
+ *   ./test_relais_benchmark                    # all benchmarks
+ *   ./test_relais_benchmark "[l1]"             # L1 only
+ *   ./test_relais_benchmark "[throughput]"      # multi-threaded only
+ *   BENCH_SAMPLES=500 ./test_relais_benchmark  # 500 samples per benchmark
  *
  * Covers:
  *   1. L1 cache hit latency (findById, findByIdAsJson)
@@ -26,7 +26,7 @@
 #include "fixtures/test_helper.h"
 #include "fixtures/TestRepositories.h"
 #include "fixtures/TestQueryHelpers.h"
-#include "fixtures/SmartrepoTestAccessors.h"
+#include "fixtures/RelaisTestAccessors.h"
 
 #include <thread>
 #include <vector>
@@ -40,7 +40,7 @@
 #include <fstream>
 #include <sched.h>
 
-using namespace smartrepo_test;
+using namespace relais_test;
 
 // =============================================================================
 // Benchmark environment setup (runs before main via static init)

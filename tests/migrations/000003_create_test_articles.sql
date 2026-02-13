@@ -1,7 +1,7 @@
--- Test table for smartrepo list caching tests
+-- Test table for relais list caching tests
 -- Contains fields for filtering, sorting, and pagination scenarios
 
-CREATE TABLE IF NOT EXISTS smartrepo_test_articles (
+CREATE TABLE IF NOT EXISTS relais_test_articles (
     id BIGSERIAL PRIMARY KEY,
     category VARCHAR(50) NOT NULL,
     author_id BIGINT NOT NULL,
@@ -12,8 +12,8 @@ CREATE TABLE IF NOT EXISTS smartrepo_test_articles (
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS idx_smartrepo_test_articles_category ON smartrepo_test_articles(category);
-CREATE INDEX IF NOT EXISTS idx_smartrepo_test_articles_author_id ON smartrepo_test_articles(author_id);
-CREATE INDEX IF NOT EXISTS idx_smartrepo_test_articles_created_at ON smartrepo_test_articles(created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_smartrepo_test_articles_published
-    ON smartrepo_test_articles(published_at DESC) WHERE is_published = true;
+CREATE INDEX IF NOT EXISTS idx_relais_test_articles_category ON relais_test_articles(category);
+CREATE INDEX IF NOT EXISTS idx_relais_test_articles_author_id ON relais_test_articles(author_id);
+CREATE INDEX IF NOT EXISTS idx_relais_test_articles_created_at ON relais_test_articles(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_relais_test_articles_published
+    ON relais_test_articles(published_at DESC) WHERE is_published = true;

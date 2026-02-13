@@ -1,6 +1,6 @@
 # Internals
 
-This document describes the internal architecture of drogon-smartrepo for contributors and advanced users.
+This document describes the internal architecture of relais for contributors and advanced users.
 
 ## Repository Mixin Chain
 
@@ -182,7 +182,7 @@ inline constexpr CacheConfig Both{ .cache_level = CacheLevel::L1_L2, .l1_ttl = 1
 
 ## L1 Cache: shardmap Integration
 
-The L1 (RAM) cache uses [shardmap](../shardmap), a thread-safe concurrent hash map with TTL-based expiration and callback-based validation.
+The L1 (RAM) cache uses [shardmap](../jcailloux-shardmap), a thread-safe concurrent hash map with TTL-based expiration and callback-based validation.
 
 ### Cache Storage with Metadata
 
@@ -556,7 +556,7 @@ list/
 ├── ListQuery.h              # Query and result types
 ├── ModificationTracker.h    # Unified modification tracking
 └── decl/
-    ├── ListMixin.h          # High-level mixin (in smartrepo/ namespace, part of mixin chain)
+    ├── ListMixin.h          # High-level mixin (in relais/ namespace, part of mixin chain)
     ├── ListDescriptor.h     # HasListDescriptor concept, descriptor requirements
     ├── ListDescriptorQuery.h # ListDescriptorQuery<Descriptor> — query type for parsers
     ├── HttpQueryParser.h    # parseListQueryStrict<Descriptor>(req)
@@ -658,7 +658,7 @@ For Redis L2 list caching, each cached page value is prefixed with a 19-byte bin
 
 | Offset | Size | Field |
 |--------|------|-------|
-| 0 | 2 | Magic bytes: `0x53 0x52` ("SR" = SmartRepo) |
+| 0 | 2 | Magic bytes: `0x52 0x4C` ("SR" = Relais) |
 | 2 | 8 | `first_value` (int64_t, little-endian) |
 | 10 | 8 | `last_value` (int64_t, little-endian) |
 | 18 | 1 | Flags byte (see below) |
@@ -673,7 +673,7 @@ For Redis L2 list caching, each cached page value is prefixed with a 19-byte bin
 | 3 | `pagination_mode` (0=Offset, 1=Cursor) |
 | 4-7 | Reserved |
 
-**Backward compatibility:** If the first 2 bytes != `0x53 0x52`, the value is treated as old format (no header) and always invalidated conservatively.
+**Backward compatibility:** If the first 2 bytes != `0x52 0x4C`, the value is treated as old format (no header) and always invalidated conservatively.
 
 ### Lua-Based Selective Invalidation
 
@@ -1066,9 +1066,9 @@ For PartialKey repos, `Entity::toModel(*entity)` produces a model where `db_mana
 ## Namespace Organization
 
 ```
-jcailloux::drogon::smartrepo::          # Repository, BaseRepository, RedisRepository,
+jcailloux::relais::          # Repository, BaseRepository, RedisRepository,
                                         # CachedRepository, ListMixin, InvalidationMixin
-jcailloux::drogon::smartrepo::config::  # CacheConfig, CacheLevel, UpdateStrategy,
+jcailloux::relais::config::  # CacheConfig, CacheLevel, UpdateStrategy,
                                         # Duration, FixedString, presets
 jcailloux::drogon::wrapper::            # EntityWrapper<Struct, Mapping>, ListWrapper<Item>
                                         # FieldUpdate, set<F>(), setNull<F>()
@@ -1113,11 +1113,11 @@ wrapper/
 
 ## Entity Mapping Generator
 
-The `scripts/generate_entities.py` script generates standalone ORM Mapping structs from `@smartrepo` annotations in C++ struct headers.
+The `scripts/generate_entities.py` script generates standalone ORM Mapping structs from `@relais` annotations in C++ struct headers.
 
 ### How It Works
 
-1. Scans `.h` files for `// @smartrepo` annotations on struct declarations and data members
+1. Scans `.h` files for `// @relais` annotations on struct declarations and data members
 2. Parses data members via regex (type, name, default value, inline annotations)
 3. Deduces Drogon getter/setter names from field names (`field_name` -> `getValueOfFieldName` / `setFieldName`)
 4. Deduces Drogon column pointers from field names (`field_name` -> `&Cols::_field_name`)
@@ -1163,7 +1163,7 @@ The `scripts/generate_entities.py` script generates standalone ORM Mapping struc
 | `filterable[:param[:op]]` | List filter (see README) |
 | `sortable[:direction]` | List sort (see README) |
 
-**Class-level list config** (`@smartrepo_list`): `limits=10,25,50`
+**Class-level list config** (`@relais_list`): `limits=10,25,50`
 
 ### Field Type Handling
 
@@ -1177,12 +1177,12 @@ The `scripts/generate_entities.py` script generates standalone ORM Mapping struc
 
 ### Test Mock Models
 
-Test Drogon models are hand-maintained in `tests/fixtures/mocks/` with a `Mock_` prefix (e.g., `Mock_SmartrepoTestOrders`). These are separate from the auto-generated models and are safe from being overwritten by `setup_tests.sh`.
+Test Drogon models are hand-maintained in `tests/fixtures/mocks/` with a `Mock_` prefix (e.g., `Mock_RelaisTestOrders`). These are separate from the auto-generated models and are safe from being overwritten by `setup_tests.sh`.
 
 ### Usage
 
 ```bash
-# Scan directory for @smartrepo annotations
+# Scan directory for @relais annotations
 python scripts/generate_entities.py --scan src/entities/ --output-dir src/
 
 # Or specific files

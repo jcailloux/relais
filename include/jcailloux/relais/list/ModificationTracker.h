@@ -9,8 +9,8 @@
 #include <type_traits>
 #include <vector>
 
-#ifdef SMARTREPO_BUILDING_TESTS
-namespace smartrepo_test { struct TestInternals; }
+#ifdef RELAIS_BUILDING_TESTS
+namespace relais_test { struct TestInternals; }
 #endif
 
 namespace jcailloux::drogon::cache::list {
@@ -277,8 +277,8 @@ public:
 
     [[nodiscard]] static constexpr BitmapType initialBitmap() { return initial_bitmap_; }
 
-#ifdef SMARTREPO_BUILDING_TESTS
-    friend struct ::smartrepo_test::TestInternals;
+#ifdef RELAIS_BUILDING_TESTS
+    friend struct ::relais_test::TestInternals;
 #endif
 };
 

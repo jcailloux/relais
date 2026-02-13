@@ -2,7 +2,7 @@
 """
 Struct Entity Wrapper Generator
 
-Scans C++ header files for @smartrepo annotations, parses struct data members,
+Scans C++ header files for @relais annotations, parses struct data members,
 and generates:
   - Standalone Mapping structs with fromModel/toModel/TraitsType/FieldInfo
   - EntityWrapper<Struct, Mapping> type aliases (public API)
@@ -80,7 +80,7 @@ class SortConfig:
 
 @dataclass
 class EntityAnnotation:
-    """Parsed @smartrepo annotations for an entity."""
+    """Parsed @relais annotations for an entity."""
     model: str = ""
     primary_key: str = "id"
     db_managed: list[str] = field(default_factory=list)
@@ -116,13 +116,13 @@ class ParsedEntity:
 # =============================================================================
 
 class StructParser:
-    """Parse C++ headers for @smartrepo annotations and struct data members."""
+    """Parse C++ headers for @relais annotations and struct data members."""
 
-    # Regex: @smartrepo or @smartrepo_list annotations in comments
-    ANNOTATION_RE = re.compile(r'//\s*@smartrepo(?:_list)?\s+(.*)')
+    # Regex: @relais or @relais_list annotations in comments
+    ANNOTATION_RE = re.compile(r'//\s*@relais(?:_list)?\s+(.*)')
     # Regex: class/struct Name [: public ...] {
     CLASS_RE = re.compile(r'(?:class|struct)\s+(\w+)')
-    # Regex: data member — type name [= default]; [// @smartrepo ...]
+    # Regex: data member — type name [= default]; [// @relais ...]
     MEMBER_RE = re.compile(
         r'^\s+([\w:<>,\s]+?)\s+(\w+)\s*(?:=\s*([^;]+))?\s*;(.*)',
         re.MULTILINE
@@ -135,16 +135,16 @@ class StructParser:
         content = filepath.read_text()
         entities = []
 
-        # Find all @smartrepo annotation blocks followed by a class/struct declaration
+        # Find all @relais annotation blocks followed by a class/struct declaration
         lines = content.split('\n')
         i = 0
         while i < len(lines):
-            # Look for @smartrepo annotation block
+            # Look for @relais annotation block
             annotations = []
             while i < len(lines) and self.ANNOTATION_RE.match(lines[i].strip()):
                 m = self.ANNOTATION_RE.match(lines[i].strip())
                 annotations.append((
-                    '@smartrepo_list' in lines[i],
+                    '@relais_list' in lines[i],
                     m.group(1).strip()
                 ))
                 i += 1
@@ -259,7 +259,7 @@ class StructParser:
 
     def _apply_member_annotations(self, annot: EntityAnnotation,
                                     members: list[DataMember]):
-        """Populate EntityAnnotation fields from inline member @smartrepo tags."""
+        """Populate EntityAnnotation fields from inline member @relais tags."""
         for m in members:
             if 'primary_key' in m.tags:
                 annot.primary_key = m.name
@@ -379,7 +379,7 @@ class StructParser:
             if not stripped or stripped == "};":
                 continue
 
-            # Try to match a data member (with optional inline @smartrepo annotation)
+            # Try to match a data member (with optional inline @relais annotation)
             m = self.MEMBER_RE.match(line)
             if m:
                 cpp_type = m.group(1).strip()
@@ -390,8 +390,8 @@ class StructParser:
                 flt_configs = []
                 srt_configs = []
                 trailing = m.group(4).strip() if m.group(4) else ""
-                if '@smartrepo' in trailing:
-                    idx = trailing.index('@smartrepo') + len('@smartrepo')
+                if '@relais' in trailing:
+                    idx = trailing.index('@relais') + len('@relais')
                     tag_text = trailing[idx:].strip()
                     for tag in tag_text.split():
                         if tag.startswith('enum='):
@@ -518,7 +518,7 @@ class MappingGenerator:
             lines.append("#include <glaze/glaze.hpp>")
 
         # EntityWrapper (always needed for the wrapper alias)
-        lines.append("#include <jcailloux/drogon/wrapper/EntityWrapper.h>")
+        lines.append("#include <jcailloux/relais/wrapper/EntityWrapper.h>")
 
         # Struct header (needed for the EntityWrapper alias)
         struct_include = self._find_struct_include(entity)
@@ -532,9 +532,9 @@ class MappingGenerator:
         # List includes
         if a.has_list:
             lines.append("#include <array>")
-            lines.append("#include <jcailloux/drogon/wrapper/ListWrapper.h>")
-            lines.append("#include <jcailloux/drogon/list/decl/FilterDescriptor.h>")
-            lines.append("#include <jcailloux/drogon/list/decl/SortDescriptor.h>")
+            lines.append("#include <jcailloux/relais/wrapper/ListWrapper.h>")
+            lines.append("#include <jcailloux/relais/list/decl/FilterDescriptor.h>")
+            lines.append("#include <jcailloux/relais/list/decl/SortDescriptor.h>")
 
         return lines
 
@@ -1031,7 +1031,7 @@ class MappingGenerator:
 
         Scans the source header for existing glz::meta<EnumType> specializations.
         If found, the developer owns it — skip generation. Otherwise, generate
-        from the @smartrepo enum= annotation pairs.
+        from the @relais enum= annotation pairs.
         """
         a = entity.annotation
         lines = []
@@ -1068,7 +1068,7 @@ class MappingGenerator:
     # =========================================================================
 
     def _resolve_auto_enums(self, entity: ParsedEntity, source_content: str):
-        """Resolve enum pairs from glz::meta<EnumType> for @smartrepo enum (without explicit mapping)."""
+        """Resolve enum pairs from glz::meta<EnumType> for @relais enum (without explicit mapping)."""
         for enum in entity.annotation.enums:
             if enum.pairs:
                 continue  # Explicit mapping provided, skip
@@ -1079,7 +1079,7 @@ class MappingGenerator:
             else:
                 enum_fqn = self._qualify_type(entity, enum.cpp_type)
                 raise ValueError(
-                    f"@smartrepo enum on field '{enum.field_name}': "
+                    f"@relais enum on field '{enum.field_name}': "
                     f"no glz::meta<{enum_fqn}> with glz::enumerate() found in "
                     f"{entity.source_file.name}. "
                     f"Either define glz::meta<{enum_fqn}> in the source header, "
@@ -1170,7 +1170,7 @@ def main():
         description="Generate standalone Mapping structs from annotated C++ structs")
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--scan", nargs="+",
-                       help="Directories to scan for @smartrepo annotated headers")
+                       help="Directories to scan for @relais annotated headers")
     group.add_argument("--files", nargs="+",
                        help="Specific header files to process")
     parser.add_argument("--output-dir", required=True,

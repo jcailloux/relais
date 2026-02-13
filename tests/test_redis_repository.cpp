@@ -45,7 +45,7 @@
 #include "fixtures/test_helper.h"
 #include "fixtures/TestRepositories.h"
 
-using namespace smartrepo_test;
+using namespace relais_test;
 
 // #############################################################################
 //
@@ -53,11 +53,11 @@ using namespace smartrepo_test;
 //
 // #############################################################################
 
-namespace smartrepo_test {
+namespace relais_test {
 
 // CacheConfig presets for L2 tests with custom TTL
 namespace test_l2 {
-using namespace jcailloux::drogon::smartrepo::config;
+using namespace jcailloux::relais::config;
 inline constexpr auto RedisShortTTL = Redis.with_l2_ttl(std::chrono::seconds{6});
 } // namespace test_l2
 
@@ -90,7 +90,7 @@ struct UserArticleResolver {
     static ::drogon::Task<std::vector<int64_t>> resolve(int64_t user_id) {
         auto db = ::drogon::app().getDbClient();
         auto result = co_await db->execSqlCoro(
-            "SELECT id FROM smartrepo_test_articles WHERE author_id = $1", user_id);
+            "SELECT id FROM relais_test_articles WHERE author_id = $1", user_id);
         std::vector<int64_t> ids;
         for (const auto& row : result) {
             ids.push_back(row["id"].as<int64_t>());
@@ -259,7 +259,7 @@ struct PurchaseToArticleCategoryResolver {
     static ::drogon::Task<std::vector<std::string>> resolve(int64_t user_id) {
         auto db = ::drogon::app().getDbClient();
         auto result = co_await db->execSqlCoro(
-            "SELECT DISTINCT category FROM smartrepo_test_articles WHERE author_id = $1",
+            "SELECT DISTINCT category FROM relais_test_articles WHERE author_id = $1",
             user_id);
         std::vector<std::string> categories;
         for (const auto& row : result) {
@@ -382,7 +382,7 @@ using L2TrackedListPurchaseRepo = Repository<TestPurchaseWrapper, "test:purchase
     cache::Invalidate<L2InvTestUserRepository, purchaseUserId>,
     cache::InvalidateVia<L2TrackedArticleCategoryInvalidator, purchaseUserId, &PurchaseToArticleCategoryResolver::resolve>>;
 
-} // namespace smartrepo_test
+} // namespace relais_test
 
 
 // #############################################################################
@@ -674,7 +674,7 @@ TEST_CASE("RedisRepository - read-only", "[integration][db][redis][readonly]") {
 
     // Compile-time checks
     static_assert(test_config::ReadOnlyL2.read_only == true);
-    static_assert(test_config::ReadOnlyL2.cache_level == jcailloux::drogon::smartrepo::config::CacheLevel::L2);
+    static_assert(test_config::ReadOnlyL2.cache_level == jcailloux::relais::config::CacheLevel::L2);
 
     SECTION("[readonly] findById works and caches in Redis") {
         auto id = insertTestItem("ReadOnly L2", 42);
@@ -1478,7 +1478,7 @@ TEST_CASE("RedisRepository - tracked list Redis tracking data",
 //
 // #############################################################################
 
-namespace smartrepo_test {
+namespace relais_test {
 
 namespace list = jcailloux::drogon::cache::list;
 
@@ -1568,7 +1568,7 @@ public:
     }
 };
 
-} // namespace smartrepo_test
+} // namespace relais_test
 
 namespace {
 
@@ -1767,7 +1767,7 @@ TEST_CASE("RedisRepository - selective list invalidation with SortBounds",
 //
 // #############################################################################
 
-namespace smartrepo_test {
+namespace relais_test {
 
 using ArticleGroupKey = L2SelectiveArticleListRepo::GroupKey;
 using ArticleListTarget = jcailloux::drogon::cache::ListInvalidationTarget<ArticleGroupKey>;
@@ -1783,7 +1783,7 @@ struct PurchaseToArticleSelectiveResolver {
     static ::drogon::Task<std::vector<ArticleListTarget>> resolve(int64_t user_id) {
         auto db = ::drogon::app().getDbClient();
         auto rows = co_await db->execSqlCoro(
-            "SELECT category, view_count FROM smartrepo_test_articles WHERE author_id = $1",
+            "SELECT category, view_count FROM relais_test_articles WHERE author_id = $1",
             user_id);
 
         std::vector<ArticleListTarget> targets;
@@ -1811,7 +1811,7 @@ using L2SelectiveListPurchaseRepo = Repository<TestPurchaseWrapper, "test:purcha
         &PurchaseToArticleSelectiveResolver::resolve
     >>;
 
-} // namespace smartrepo_test
+} // namespace relais_test
 
 
 TEST_CASE("RedisRepository - InvalidateListVia enriched resolver",
@@ -1958,7 +1958,7 @@ TEST_CASE("RedisRepository - InvalidateListVia enriched resolver",
 //
 // #############################################################################
 
-namespace smartrepo_test {
+namespace relais_test {
 
 /**
  * Per-group resolver: returns targets WITHOUT sort_value (per-group invalidation).
@@ -1968,7 +1968,7 @@ struct PerGroupResolver {
     static ::drogon::Task<std::vector<ArticleListTarget>> resolve(int64_t user_id) {
         auto db = ::drogon::app().getDbClient();
         auto rows = co_await db->execSqlCoro(
-            "SELECT DISTINCT category FROM smartrepo_test_articles WHERE author_id = $1",
+            "SELECT DISTINCT category FROM relais_test_articles WHERE author_id = $1",
             user_id);
 
         std::vector<ArticleListTarget> targets;
@@ -2002,7 +2002,7 @@ struct MixedResolver {
     static ::drogon::Task<std::vector<ArticleListTarget>> resolve(int64_t user_id) {
         auto db = ::drogon::app().getDbClient();
         auto rows = co_await db->execSqlCoro(
-            "SELECT category, view_count FROM smartrepo_test_articles WHERE author_id = $1",
+            "SELECT category, view_count FROM relais_test_articles WHERE author_id = $1",
             user_id);
 
         std::vector<ArticleListTarget> targets;
@@ -2044,7 +2044,7 @@ using L2MixedPurchaseRepo = Repository<TestPurchaseWrapper, "test:purchase:l2:mi
     cfg::Redis,
     cache::InvalidateListVia<L2SelectiveArticleListRepo, purchaseUserId, &MixedResolver::resolve>>;
 
-} // namespace smartrepo_test
+} // namespace relais_test
 
 
 TEST_CASE("RedisRepository - InvalidateListVia per-group invalidation",
