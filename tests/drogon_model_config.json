@@ -1,0 +1,9 @@
+{
+    "rdbms": "postgresql",
+    "host": "localhost",
+    "port": 5432,
+    "dbname": "smartrepo_test",
+    "user": "smartrepo_test",
+    "password": "smartrepo_test",
+    "tables": ["smartrepo_test_orders"]
+}
