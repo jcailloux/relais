@@ -1,5 +1,5 @@
-#ifndef JCX_DROGON_REDISREPOSITORY_H
-#define JCX_DROGON_REDISREPOSITORY_H
+#ifndef JCX_RELAIS_REDISREPOSITORY_H
+#define JCX_RELAIS_REDISREPOSITORY_H
 
 #include "jcailloux/relais/repository/BaseRepository.h"
 #include "jcailloux/relais/cache/RedisCache.h"
@@ -19,14 +19,13 @@ namespace jcailloux::relais {
  * Cross-invalidation is not handled here; it belongs in InvalidationMixin.
  */
 template<typename Entity, config::FixedString Name, config::CacheConfig Cfg, typename Key>
-requires CacheableEntity<Entity, typename Entity::Model>
+requires CacheableEntity<Entity>
 class RedisRepository : public BaseRepository<Entity, Name, Cfg, Key> {
     using Base = BaseRepository<Entity, Name, Cfg, Key>;
-    using Model = typename Base::ModelType;
+    using Mapping = typename Entity::MappingType;
 
     public:
         using typename Base::EntityType;
-        using typename Base::ModelType;
         using typename Base::KeyType;
         using typename Base::WrapperType;
         using typename Base::WrapperPtrType;
@@ -36,7 +35,7 @@ class RedisRepository : public BaseRepository<Entity, Name, Cfg, Key> {
 
         /// Find by ID with L2 (Redis) -> L3 (DB) fallback.
         /// Returns shared_ptr to immutable entity (nullptr if not found).
-        static ::drogon::Task<WrapperPtrType> findById(const Key& id) {
+        static pqcoro::Task<WrapperPtrType> findById(const Key& id) {
             auto redisKey = makeRedisKey(id);
 
             std::optional<Entity> cached = co_await getFromCache(redisKey);
@@ -53,7 +52,7 @@ class RedisRepository : public BaseRepository<Entity, Name, Cfg, Key> {
 
         /// Find by ID and return raw JSON string.
         /// Returns shared_ptr to JSON string (nullptr if not found).
-        static ::drogon::Task<std::shared_ptr<const std::string>> findByIdAsJson(const Key& id) {
+        static pqcoro::Task<std::shared_ptr<const std::string>> findByIdAsJson(const Key& id) {
             auto redisKey = makeRedisKey(id);
 
             std::optional<std::string> cached;
@@ -79,13 +78,11 @@ class RedisRepository : public BaseRepository<Entity, Name, Cfg, Key> {
 
         /// Create entity in database with L2 cache population.
         /// Returns shared_ptr to immutable entity (nullptr on error).
-        /// Compile-time error if read_only is true.
-        static ::drogon::Task<WrapperPtrType> create(WrapperPtrType wrapper)
-            requires CreatableEntity<Entity, Model, Key> && (!Cfg.read_only)
+        static pqcoro::Task<WrapperPtrType> create(WrapperPtrType wrapper)
+            requires CreatableEntity<Entity, Key> && (!Cfg.read_only)
         {
             auto inserted = co_await Base::create(wrapper);
             if (inserted) {
-                // Populate L2 cache with the new entity
                 co_await setInCache(makeRedisKey(inserted->getPrimaryKey()), *inserted);
             }
             co_return inserted;
@@ -93,15 +90,13 @@ class RedisRepository : public BaseRepository<Entity, Name, Cfg, Key> {
 
         /// Update entity in database with L2 cache handling.
         /// Returns true on success, false on error.
-        /// Compile-time error if read_only is true.
-        static ::drogon::Task<bool> update(const Key& id, WrapperPtrType wrapper)
-            requires MutableEntity<Entity, Model> && (!Cfg.read_only)
+        static pqcoro::Task<bool> update(const Key& id, WrapperPtrType wrapper)
+            requires MutableEntity<Entity> && (!Cfg.read_only)
         {
             using enum config::UpdateStrategy;
 
             bool success = co_await Base::update(id, wrapper);
             if (success) {
-                // Update L2 cache based on configured strategy
                 if constexpr (Cfg.update_strategy == InvalidateAndLazyReload) {
                     co_await invalidateRedis(id);
                 } else {
@@ -114,7 +109,7 @@ class RedisRepository : public BaseRepository<Entity, Name, Cfg, Key> {
         /// Partial update: invalidates Redis then delegates to Base::updateBy.
         /// Returns the re-fetched entity (nullptr on error or not found).
         template<typename... Updates>
-        static ::drogon::Task<WrapperPtrType> updateBy(const Key& id, Updates&&... updates)
+        static pqcoro::Task<WrapperPtrType> updateBy(const Key& id, Updates&&... updates)
             requires HasFieldUpdate<Entity> && (!Cfg.read_only)
         {
             co_await invalidateRedis(id);
@@ -124,25 +119,24 @@ class RedisRepository : public BaseRepository<Entity, Name, Cfg, Key> {
         /// Remove entity by ID.
         /// Returns: rows deleted (0 if not found), or nullopt on DB error.
         /// Invalidates Redis cache unless DB error occurred.
-        /// Compile-time error if read_only is true.
-        static ::drogon::Task<std::optional<size_t>> remove(const Key& id)
+        static pqcoro::Task<std::optional<size_t>> remove(const Key& id)
             requires (!Cfg.read_only)
         {
             co_return co_await removeImpl(id, nullptr);
         }
 
     protected:
-        /// Internal remove with optional entity hint for PartialKey optimization.
-        /// For PartialKey repos, tries L2 cache if no L1 hint was provided.
-        static ::drogon::Task<std::optional<size_t>> removeImpl(
+        /// Internal remove with optional entity hint.
+        /// For CompositeKey entities: if L1 didn't provide a hint,
+        /// try L2 (Redis) as a near-free fallback (~0.1-1ms).
+        static pqcoro::Task<std::optional<size_t>> removeImpl(
             const Key& id, typename Base::WrapperPtrType cachedHint = nullptr)
             requires (!Cfg.read_only)
         {
-            // For PartialKey: try L2 if no L1 hint (~0.1-1ms)
-            if constexpr (!std::is_same_v<Key, typename Model::PrimaryKeyType>) {
+            // L2 hint fallback for partition pruning
+            if constexpr (HasPartitionKey<Entity>) {
                 if (!cachedHint) {
-                    auto redisKey = makeRedisKey(id);
-                    auto cached = co_await getFromCache(redisKey);
+                    auto cached = co_await getFromCache(makeRedisKey(id));
                     if (cached) {
                         cachedHint = std::make_shared<const Entity>(std::move(*cached));
                     }
@@ -160,14 +154,12 @@ class RedisRepository : public BaseRepository<Entity, Name, Cfg, Key> {
 
         /// Invalidate Redis cache for a key and return void.
         /// Used as cross-invalidation target interface.
-        static ::drogon::Task<void> invalidate(const Key& id) {
+        static pqcoro::Task<void> invalidate(const Key& id) {
             co_await invalidateRedis(id);
         }
 
         /// Invalidate Redis cache for a key.
-        /// @param id The entity key to invalidate
-        /// @return true if cache was invalidated successfully
-        static ::drogon::Task<bool> invalidateRedis(const Key& id) {
+        static pqcoro::Task<bool> invalidateRedis(const Key& id) {
             co_return co_await cache::RedisCache::invalidate(makeRedisKey(id));
         }
 
@@ -180,15 +172,13 @@ class RedisRepository : public BaseRepository<Entity, Name, Cfg, Key> {
         }
 
         /// Build a group key from key parts.
-        /// Public wrapper for use by InvalidateListVia resolvers.
         template<typename... GroupArgs>
         static std::string makeGroupKey(GroupArgs&&... groupParts) {
             return makeListGroupKey(std::forward<GroupArgs>(groupParts)...);
         }
 
         /// Selectively invalidate list pages for a pre-built group key.
-        /// Used by InvalidateListVia for cross-invalidation through enriched resolvers.
-        static ::drogon::Task<size_t> invalidateListGroupByKey(
+        static pqcoro::Task<size_t> invalidateListGroupByKey(
             const std::string& groupKey, int64_t entity_sort_val)
         {
             co_return co_await cache::RedisCache::invalidateListGroupSelective(
@@ -196,9 +186,7 @@ class RedisRepository : public BaseRepository<Entity, Name, Cfg, Key> {
         }
 
         /// Invalidate all list cache groups for this repository.
-        /// Uses SCAN with pattern "name:list:*" to find and delete all list keys.
-        /// Used by InvalidateListVia when resolver returns nullopt (full pattern).
-        static ::drogon::Task<size_t> invalidateAllListGroups()
+        static pqcoro::Task<size_t> invalidateAllListGroups()
         {
             std::string pattern = std::string(name()) + ":list:*";
             co_return co_await cache::RedisCache::invalidatePatternSafe(pattern);
@@ -210,7 +198,7 @@ class RedisRepository : public BaseRepository<Entity, Name, Cfg, Key> {
         // =====================================================================
 
         /// Get entity from cache using its native serialization format.
-        static ::drogon::Task<std::optional<Entity>> getFromCache(const std::string& key) {
+        static pqcoro::Task<std::optional<Entity>> getFromCache(const std::string& key) {
             if constexpr (HasBinarySerialization<Entity>) {
                 std::optional<std::vector<uint8_t>> data;
                 if constexpr (Cfg.l2_refresh_on_get) {
@@ -233,24 +221,23 @@ class RedisRepository : public BaseRepository<Entity, Name, Cfg, Key> {
         }
 
         /// Set entity in cache using its native serialization format.
-        static ::drogon::Task<bool> setInCache(const std::string& key, const Entity& entity) {
+        static pqcoro::Task<bool> setInCache(const std::string& key, const Entity& entity) {
             if constexpr (HasBinarySerialization<Entity>) {
                 co_return co_await cache::RedisCache::setRawBinary(key, *entity.toBinary(), l2Ttl());
             } else {
-                // JSON mode (default)
                 co_return co_await cache::RedisCache::set(key, entity, l2Ttl());
             }
         }
 
         template<typename E = Entity>
-        static ::drogon::Task<std::optional<std::vector<E>>> getListFromRedis(const std::string& key)
+        static pqcoro::Task<std::optional<std::vector<E>>> getListFromRedis(const std::string& key)
             requires HasJsonSerialization<E>
         {
             co_return co_await cache::RedisCache::getList<E>(key);
         }
 
         template<typename E = Entity, typename Rep, typename Period>
-        static ::drogon::Task<bool> setListInRedis(const std::string& key,
+        static pqcoro::Task<bool> setListInRedis(const std::string& key,
                                                   const std::vector<E>& entities,
                                                   std::chrono::duration<Rep, Period> ttl)
             requires HasJsonSerialization<E>
@@ -267,7 +254,7 @@ class RedisRepository : public BaseRepository<Entity, Name, Cfg, Key> {
 
         /// Execute a list query with Redis caching.
         template<typename QueryFn, typename... KeyArgs>
-        static ::drogon::Task<std::vector<Entity>> cachedList(QueryFn&& query, KeyArgs&&... keyParts) {
+        static pqcoro::Task<std::vector<Entity>> cachedList(QueryFn&& query, KeyArgs&&... keyParts) {
             auto cacheKey = makeListCacheKey(std::forward<KeyArgs>(keyParts)...);
 
             std::optional<std::vector<Entity>> cached;
@@ -300,13 +287,8 @@ class RedisRepository : public BaseRepository<Entity, Name, Cfg, Key> {
         }
 
         /// Execute a list query with Redis caching and group tracking.
-        /// Unlike cachedList(), this tracks cache keys for efficient O(M) invalidation.
-        /// @param query The database query function
-        /// @param limit Pagination limit
-        /// @param offset Pagination offset
-        /// @param groupParts Key parts that identify the group (e.g., "user", user_id)
         template<typename QueryFn, typename... GroupArgs>
-        static ::drogon::Task<std::vector<Entity>> cachedListTracked(
+        static pqcoro::Task<std::vector<Entity>> cachedListTracked(
             QueryFn&& query,
             int limit,
             int offset,
@@ -318,29 +300,18 @@ class RedisRepository : public BaseRepository<Entity, Name, Cfg, Key> {
         }
 
         /// Execute a list query with Redis caching, group tracking, and sort bounds header.
-        /// The headerBuilder lambda constructs a ListBoundsHeader from the query results,
-        /// enabling fine-grained Lua-based invalidation instead of full group invalidation.
-        ///
-        /// @param query The database query function
-        /// @param limit Pagination limit
-        /// @param offset Pagination offset
-        /// @param headerBuilder Lambda: (const vector<Entity>&, int limit, int offset)
-        ///                      -> optional<ListBoundsHeader>. Pass nullptr for no header.
-        /// @param groupParts Key parts that identify the group
         template<typename QueryFn, typename HeaderBuilder, typename... GroupArgs>
-        static ::drogon::Task<std::vector<Entity>> cachedListTrackedWithHeader(
+        static pqcoro::Task<std::vector<Entity>> cachedListTrackedWithHeader(
             QueryFn&& query,
             int limit,
             int offset,
             HeaderBuilder&& headerBuilder,
             GroupArgs&&... groupParts)
         {
-            // Build group key (for tracking) and full cache key (with pagination)
             std::string groupKey = makeListGroupKey(std::forward<GroupArgs>(groupParts)...);
             std::string cacheKey = groupKey + ":limit:" + std::to_string(limit)
                                             + ":offset:" + std::to_string(offset);
 
-            // Try to get from cache
             std::optional<std::vector<Entity>> cached;
             if constexpr (Cfg.l2_refresh_on_get) {
                 cached = co_await cache::RedisCache::getListEx<Entity>(cacheKey, l2Ttl());
@@ -352,37 +323,29 @@ class RedisRepository : public BaseRepository<Entity, Name, Cfg, Key> {
                 co_return std::move(*cached);
             }
 
-            // Cache miss: execute query
             auto results = co_await query();
 
-            // Build header if headerBuilder is provided (not nullptr)
             std::optional<cache::list::ListBoundsHeader> header;
             if constexpr (!std::is_null_pointer_v<std::decay_t<HeaderBuilder>>) {
                 header = headerBuilder(results, limit, offset);
             }
 
-            // Store in cache (with optional header) and track the key
             co_await cache::RedisCache::setList(cacheKey, results, l2Ttl(), header);
             co_await cache::RedisCache::trackListKey(groupKey, cacheKey, l2Ttl());
 
             co_return results;
         }
 
-        /// Invalidate all cached list pages for a group (full invalidation).
-        /// Use for manual/bulk invalidation. For entity CRUD, prefer selective overloads.
-        /// O(M) where M is the number of cached pages (typically small).
+        /// Invalidate all cached list pages for a group.
         template<typename... GroupArgs>
-        static ::drogon::Task<size_t> invalidateListGroup(GroupArgs&&... groupParts) {
+        static pqcoro::Task<size_t> invalidateListGroup(GroupArgs&&... groupParts) {
             std::string groupKey = makeListGroupKey(std::forward<GroupArgs>(groupParts)...);
             co_return co_await cache::RedisCache::invalidateListGroup(groupKey);
         }
 
         /// Selectively invalidate list pages for a group based on a sort value.
-        /// Only pages whose sort range is affected by the create/delete are invalidated.
-        /// @param entity_sort_val Sort value of the created/deleted entity
-        /// @param groupParts Key parts that identify the group
         template<typename... GroupArgs>
-        static ::drogon::Task<size_t> invalidateListGroupSelective(
+        static pqcoro::Task<size_t> invalidateListGroupSelective(
             int64_t entity_sort_val,
             GroupArgs&&... groupParts)
         {
@@ -392,12 +355,8 @@ class RedisRepository : public BaseRepository<Entity, Name, Cfg, Key> {
         }
 
         /// Selectively invalidate list pages for a group based on old and new sort values.
-        /// Uses interval overlap for offset mode, localized check for cursor mode.
-        /// @param old_sort_val Sort value before the update
-        /// @param new_sort_val Sort value after the update
-        /// @param groupParts Key parts that identify the group
         template<typename... GroupArgs>
-        static ::drogon::Task<size_t> invalidateListGroupSelectiveUpdate(
+        static pqcoro::Task<size_t> invalidateListGroupSelectiveUpdate(
             int64_t old_sort_val,
             int64_t new_sort_val,
             GroupArgs&&... groupParts)
@@ -412,20 +371,13 @@ class RedisRepository : public BaseRepository<Entity, Name, Cfg, Key> {
         // =====================================================================
 
         /// Execute a list query and cache the result as a binary list entity.
-        ///
-        /// @tparam ListEntity The list wrapper type (e.g., ListWrapper<User>).
-        ///         Must support fromBinary, toBinary, and fromModels.
-        ///
-        /// @param query Database query function returning vector<ListEntity::Model>
-        /// @param keyParts Cache key components
         template<typename ListEntity, typename QueryFn, typename... KeyArgs>
-        static ::drogon::Task<ListEntity> cachedListAs(
+        static pqcoro::Task<ListEntity> cachedListAs(
             QueryFn&& query,
             KeyArgs&&... keyParts)
         {
             auto cacheKey = makeListCacheKey(std::forward<KeyArgs>(keyParts)...);
 
-            // Try L2 cache (binary)
             std::optional<ListEntity> cached;
             if constexpr (Cfg.l2_refresh_on_get) {
                 cached = co_await cache::RedisCache::getListBinaryEx<ListEntity>(cacheKey, l2Ttl());
@@ -438,8 +390,7 @@ class RedisRepository : public BaseRepository<Entity, Name, Cfg, Key> {
             }
 
             // Cache miss: query DB and build list entity
-            auto models = co_await query();
-            auto listEntity = ListEntity::fromModels(models);
+            auto listEntity = co_await query();
 
             // Store in L2 (binary)
             co_await cache::RedisCache::setListBinary(cacheKey, listEntity, l2Ttl());
@@ -448,9 +399,8 @@ class RedisRepository : public BaseRepository<Entity, Name, Cfg, Key> {
         }
 
         /// Execute a list query with group tracking, returning a binary list entity.
-        /// Combines cachedListAs with group tracking for efficient O(M) invalidation.
         template<typename ListEntity, typename QueryFn, typename... GroupArgs>
-        static ::drogon::Task<ListEntity> cachedListAsTracked(
+        static pqcoro::Task<ListEntity> cachedListAsTracked(
             QueryFn&& query,
             int limit,
             int offset,
@@ -461,25 +411,19 @@ class RedisRepository : public BaseRepository<Entity, Name, Cfg, Key> {
                 std::forward<GroupArgs>(groupParts)...);
         }
 
-        /// Execute a list query with group tracking + sort bounds header, returning a binary list entity.
-        /// The headerBuilder enables fine-grained Lua-based invalidation.
-        ///
-        /// @param headerBuilder Lambda: (const ListEntity&, int limit, int offset)
-        ///                      -> optional<ListBoundsHeader>. Pass nullptr for no header.
+        /// Execute a list query with group tracking + sort bounds header.
         template<typename ListEntity, typename QueryFn, typename HeaderBuilder, typename... GroupArgs>
-        static ::drogon::Task<ListEntity> cachedListAsTrackedWithHeader(
+        static pqcoro::Task<ListEntity> cachedListAsTrackedWithHeader(
             QueryFn&& query,
             int limit,
             int offset,
             HeaderBuilder&& headerBuilder,
             GroupArgs&&... groupParts)
         {
-            // Build group key (for tracking) and full cache key (with pagination)
             std::string groupKey = makeListGroupKey(std::forward<GroupArgs>(groupParts)...);
             std::string cacheKey = groupKey + ":limit:" + std::to_string(limit)
                                             + ":offset:" + std::to_string(offset);
 
-            // Try L2 cache (binary)
             std::optional<ListEntity> cached;
             if constexpr (Cfg.l2_refresh_on_get) {
                 cached = co_await cache::RedisCache::getListBinaryEx<ListEntity>(cacheKey, l2Ttl());
@@ -492,8 +436,7 @@ class RedisRepository : public BaseRepository<Entity, Name, Cfg, Key> {
             }
 
             // Cache miss: query DB and build list entity
-            auto models = co_await query();
-            auto listEntity = ListEntity::fromModels(models);
+            auto listEntity = co_await query();
 
             // Build header if headerBuilder is provided
             std::optional<cache::list::ListBoundsHeader> header;
@@ -511,4 +454,4 @@ class RedisRepository : public BaseRepository<Entity, Name, Cfg, Key> {
 
 }  // namespace jcailloux::relais
 
-#endif //JCX_DROGON_REDISREPOSITORY_H
+#endif //JCX_RELAIS_REDISREPOSITORY_H

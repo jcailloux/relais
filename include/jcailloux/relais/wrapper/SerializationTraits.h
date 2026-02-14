@@ -1,5 +1,5 @@
-#ifndef JCX_DROGON_WRAPPER_SERIALIZATION_TRAITS_H
-#define JCX_DROGON_WRAPPER_SERIALIZATION_TRAITS_H
+#ifndef JCX_RELAIS_WRAPPER_SERIALIZATION_TRAITS_H
+#define JCX_RELAIS_WRAPPER_SERIALIZATION_TRAITS_H
 
 #include <concepts>
 #include <cstdint>
@@ -38,4 +38,4 @@ concept HasBinarySerialization = requires(const Entity& e, std::span<const uint8
 
 }  // namespace jcailloux::relais
 
-#endif  // JCX_DROGON_WRAPPER_SERIALIZATION_TRAITS_H
+#endif  // JCX_RELAIS_WRAPPER_SERIALIZATION_TRAITS_H

@@ -1,5 +1,5 @@
-#ifndef JCX_DROGON_WRAPPER_ENTITY_WRAPPER_H
-#define JCX_DROGON_WRAPPER_ENTITY_WRAPPER_H
+#ifndef JCX_RELAIS_WRAPPER_ENTITY_WRAPPER_H
+#define JCX_RELAIS_WRAPPER_ENTITY_WRAPPER_H
 
 #include <cstdint>
 #include <memory>
@@ -12,20 +12,22 @@
 
 #include <glaze/glaze.hpp>
 
+#include "pqcoro/pg/PgResult.h"
+#include "pqcoro/pg/PgParams.h"
 #include "jcailloux/relais/wrapper/Format.h"
 
-namespace jcailloux::drogon::wrapper {
+namespace jcailloux::relais::wrapper {
 
 // =============================================================================
 // EntityWrapper<Struct, Mapping> — API-side wrapper for pure data structs
 //
 // Inherits from Struct (pure declarative data) and adds:
 // - Thread-safe lazy BEVE/JSON serialization via std::call_once
-// - ORM mapping (fromModel/toModel) delegated to Mapping
+// - SQL row mapping (fromRow/toInsertParams) delegated to Mapping
 // - Primary key access delegated to Mapping
 //
 // Struct is framework-agnostic and can be shared across projects.
-// Mapping is generated and Drogon-specific (API-only).
+// Mapping is generated and contains SQL column definitions.
 //
 // Satisfies: HasBinarySerialization, HasJsonSerialization, HasFormat
 // =============================================================================
@@ -34,7 +36,6 @@ template<typename Struct, typename Mapping>
 class EntityWrapper : public Struct {
 public:
     using Format = jcailloux::relais::StructFormat;
-    using Model = typename Mapping::Model;
     using TraitsType = typename Mapping::TraitsType;
     using Field = typename TraitsType::Field;
     static constexpr bool read_only = Mapping::read_only;
@@ -65,26 +66,15 @@ public:
     }
 
     // =========================================================================
-    // ORM mapping — delegated to Mapping
+    // SQL row mapping — delegated to Mapping
     // =========================================================================
 
-    static std::optional<EntityWrapper> fromModel(const Model& model) {
-        return Mapping::template fromModel<EntityWrapper>(model);
+    static std::optional<EntityWrapper> fromRow(const pqcoro::PgResult::Row& row) {
+        return Mapping::template fromRow<EntityWrapper>(row);
     }
 
-    static Model toModel(const EntityWrapper& e) {
-        return Mapping::template toModel<EntityWrapper>(e);
-    }
-
-    // =========================================================================
-    // Partial key — conditionally delegated to Mapping
-    // =========================================================================
-
-    template<typename M>
-    static auto makeKeyCriteria(const auto& key)
-        requires requires { Mapping::template makeKeyCriteria<M>(key); }
-    {
-        return Mapping::template makeKeyCriteria<M>(key);
+    static pqcoro::PgParams toInsertParams(const EntityWrapper& e) {
+        return Mapping::template toInsertParams<EntityWrapper>(e);
     }
 
     // =========================================================================
@@ -158,7 +148,7 @@ private:
     mutable std::shared_ptr<const std::string> json_cache_;
 };
 
-}  // namespace jcailloux::drogon::wrapper
+}  // namespace jcailloux::relais::wrapper
 
 // =============================================================================
 // Glaze metadata: prefer glz::meta<Struct> when available, else use Mapping
@@ -173,8 +163,8 @@ private:
 // =============================================================================
 
 template<typename Struct, typename Mapping>
-struct glz::meta<jcailloux::drogon::wrapper::EntityWrapper<Struct, Mapping>> {
-    using T = jcailloux::drogon::wrapper::EntityWrapper<Struct, Mapping>;
+struct glz::meta<jcailloux::relais::wrapper::EntityWrapper<Struct, Mapping>> {
+    using T = jcailloux::relais::wrapper::EntityWrapper<Struct, Mapping>;
     static constexpr auto value = [] {
         if constexpr (requires { glz::meta<Struct>::value; }) {
             return glz::meta<Struct>::value;
@@ -184,4 +174,4 @@ struct glz::meta<jcailloux::drogon::wrapper::EntityWrapper<Struct, Mapping>> {
     }();
 };
 
-#endif  // JCX_DROGON_WRAPPER_ENTITY_WRAPPER_H
+#endif  // JCX_RELAIS_WRAPPER_ENTITY_WRAPPER_H

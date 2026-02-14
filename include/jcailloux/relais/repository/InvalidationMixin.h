@@ -1,7 +1,7 @@
-#ifndef JCX_DROGON_INVALIDATION_MIXIN_H
-#define JCX_DROGON_INVALIDATION_MIXIN_H
+#ifndef JCX_RELAIS_INVALIDATION_MIXIN_H
+#define JCX_RELAIS_INVALIDATION_MIXIN_H
 
-#include <drogon/utils/coroutine.h>
+#include "pqcoro/Task.h"
 #include "jcailloux/relais/cache/InvalidateOn.h"
 
 namespace jcailloux::relais {
@@ -28,12 +28,10 @@ template<typename Base, typename... Invalidations>
 class InvalidationMixin : public Base {
     using Entity = typename Base::EntityType;
     using Key = typename Base::KeyType;
-    using Model = typename Base::ModelType;
     using InvList = cache::InvalidateOn<Invalidations...>;
 
 public:
     using typename Base::EntityType;
-    using typename Base::ModelType;
     using typename Base::KeyType;
     using typename Base::WrapperType;
     using typename Base::WrapperPtrType;
@@ -44,8 +42,8 @@ public:
     using Invalidates = InvList;
 
     /// Create entity and propagate cross-invalidation to dependent caches.
-    static ::drogon::Task<WrapperPtrType> create(WrapperPtrType wrapper)
-        requires MutableEntity<Entity, Model> && (!Base::config.read_only)
+    static pqcoro::Task<WrapperPtrType> create(WrapperPtrType wrapper)
+        requires MutableEntity<Entity> && (!Base::config.read_only)
     {
         auto result = co_await Base::create(std::move(wrapper));
         if (result) {
@@ -57,8 +55,8 @@ public:
     /// Update entity and propagate cross-invalidation with old/new data.
     /// When Base is ListMixin, reuses the pre-fetched old entity via WithContext
     /// to avoid a redundant L1 lookup.
-    static ::drogon::Task<bool> update(const Key& id, WrapperPtrType wrapper)
-        requires MutableEntity<Entity, Model> && (!Base::config.read_only)
+    static pqcoro::Task<bool> update(const Key& id, WrapperPtrType wrapper)
+        requires MutableEntity<Entity> && (!Base::config.read_only)
     {
         auto old = co_await Base::findById(id);
         auto new_entity = wrapper;
@@ -79,7 +77,7 @@ public:
 
     /// Remove entity and propagate cross-invalidation with deleted data.
     /// When Base is ListMixin, reuses the pre-fetched entity via WithContext.
-    static ::drogon::Task<std::optional<size_t>> remove(const Key& id)
+    static pqcoro::Task<std::optional<size_t>> remove(const Key& id)
         requires (!Base::config.read_only)
     {
         auto entity = co_await Base::findById(id);
@@ -100,7 +98,7 @@ public:
     /// Partial update with cross-invalidation.
     /// When Base is ListMixin, reuses the pre-fetched old entity via WithContext.
     template<typename... Updates>
-    static ::drogon::Task<WrapperPtrType> updateBy(const Key& id, Updates&&... updates)
+    static pqcoro::Task<WrapperPtrType> updateBy(const Key& id, Updates&&... updates)
         requires HasFieldUpdate<Entity> && (!Base::config.read_only)
     {
         auto old = co_await Base::findById(id);
@@ -121,7 +119,7 @@ public:
     }
 
     /// Invalidate all caches (L1 + L2) and propagate cross-invalidation.
-    static ::drogon::Task<void> invalidate(const Key& id) {
+    static pqcoro::Task<void> invalidate(const Key& id) {
         auto entity = co_await Base::findById(id);
         if (entity) {
             co_await cache::propagateDelete<Entity, InvList>(std::move(entity));
@@ -132,4 +130,4 @@ public:
 
 }  // namespace jcailloux::relais
 
-#endif  // JCX_DROGON_INVALIDATION_MIXIN_H
+#endif  // JCX_RELAIS_INVALIDATION_MIXIN_H

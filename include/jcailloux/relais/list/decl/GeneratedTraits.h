@@ -12,14 +12,12 @@
 #include <utility>
 #include <vector>
 
-#include <trantor/utils/Date.h>
-
 #include "FilterDescriptor.h"
 #include "SortDescriptor.h"
 #include "ListDescriptor.h"
 #include "GeneratedFilters.h"
 
-namespace jcailloux::drogon::cache::list::decl {
+namespace jcailloux::relais::cache::list::decl {
 
 // =============================================================================
 // Cursor for keyset pagination
@@ -37,25 +35,6 @@ struct Cursor {
 // =============================================================================
 
 namespace detail {
-
-/// Check a single filter against entity value
-template<typename FilterType, typename Entity, typename FiltersStruct>
-[[nodiscard]] bool checkSingleFilter(
-    const Entity& entity,
-    const FiltersStruct& filters,
-    size_t filter_idx
-) noexcept {
-    // Get the filter value (std::optional<T>)
-    const auto& filter_value = [&]() -> const auto& {
-        // We need to access by index at runtime, but we know the type at compile time
-        // This is called with the correct filter_idx from a fold expression
-        return filters.template get<0>();  // Placeholder - actual access below
-    };
-
-    // Filter not active -> always matches
-    // (Actual implementation uses fold expression with correct index)
-    return true;
-}
 
 /// Compare values with the given operator
 template<Op op, typename T>
@@ -93,14 +72,11 @@ template<typename Descriptor>
 
             // Handle optional entity members
             if constexpr (FilterType::is_optional_member) {
-                // Optional entity member: compare if both have value
                 if (!entity_value.has_value()) {
-                    // Entity has no value but filter expects a value
-                    return FilterType::op == Op::NE;  // Only NE matches
+                    return FilterType::op == Op::NE;
                 }
                 return detail::compareWithOp<FilterType::op>(*entity_value, *filter_value);
             } else {
-                // Non-optional entity member: direct comparison
                 return detail::compareWithOp<FilterType::op>(entity_value, *filter_value);
             }
         }()) && ...);
@@ -118,9 +94,7 @@ namespace detail {
 /// Compare two values, returns <0, 0, >0
 template<typename T>
 [[nodiscard]] int compareValues(const T& a, const T& b) noexcept {
-    if constexpr (std::is_same_v<std::remove_cvref_t<T>, trantor::Date>) {
-        return (a < b) ? -1 : (a > b) ? 1 : 0;
-    } else if constexpr (std::is_integral_v<std::remove_cvref_t<T>>) {
+    if constexpr (std::is_integral_v<std::remove_cvref_t<T>>) {
         return (a < b) ? -1 : (a > b) ? 1 : 0;
     } else if constexpr (std::is_enum_v<std::remove_cvref_t<T>>) {
         using U = std::underlying_type_t<std::remove_cvref_t<T>>;
@@ -147,7 +121,6 @@ template<typename Descriptor>
     [&]<size_t... Is>(std::index_sequence<Is...>) {
         ((sort.field_index == Is ? [&] {
             using SortType = sort_at<Descriptor, Is>;
-            // Use extractMemberValue to support both data members and member functions
             const auto va = detail::extractMemberValue<SortType::entity_ptr>(a);
             const auto vb = detail::extractMemberValue<SortType::entity_ptr>(b);
             result = detail::compareValues(va, vb);
@@ -167,17 +140,13 @@ namespace detail {
 /// Extract sort value as int64 for cursor encoding
 template<typename T>
 [[nodiscard]] int64_t toInt64ForCursor(const T& value) noexcept {
-    if constexpr (std::is_same_v<std::remove_cvref_t<T>, trantor::Date>) {
-        return value.microSecondsSinceEpoch();
-    } else if constexpr (std::is_enum_v<std::remove_cvref_t<T>>) {
+    if constexpr (std::is_enum_v<std::remove_cvref_t<T>>) {
         return static_cast<int64_t>(value);
     } else if constexpr (std::is_integral_v<std::remove_cvref_t<T>>) {
         return static_cast<int64_t>(value);
     } else if constexpr (requires { value.has_value(); *value; }) {
-        // Handle optional types (std::optional, etc.)
         return value.has_value() ? toInt64ForCursor(*value) : 0;
     } else {
-        // For non-numeric types (strings, etc.), return 0
         return 0;
     }
 }
@@ -199,7 +168,6 @@ template<typename Descriptor>
     [&]<size_t... Is>(std::index_sequence<Is...>) {
         ((sort.field_index == Is ? [&] {
             using SortType = sort_at<Descriptor, Is>;
-            // Use extractMemberValue to support both data members and member functions
             const auto value = detail::extractMemberValue<SortType::entity_ptr>(entity);
             sort_value = detail::toInt64ForCursor(value);
             return true;
@@ -209,42 +177,6 @@ template<typename Descriptor>
     // Encode: sort_value, then entity id (supports both member and method)
     std::memcpy(cursor.data.data(), &sort_value, sizeof(sort_value));
     int64_t id = detail::extractEntityId(entity);
-    std::memcpy(cursor.data.data() + sizeof(sort_value), &id, sizeof(id));
-
-    return cursor;
-}
-
-/// Extract cursor from Drogon Model for pagination
-/// Uses model_ptr (Model getter) instead of entity_ptr to avoid Model→Entity conversion.
-/// ID is extracted via Model::getPrimaryKey() (standard Drogon ORM method).
-template<typename Descriptor>
-    requires ValidListDescriptor<Descriptor>
-[[nodiscard]] Cursor extractCursorFromModel(
-    const typename Descriptor::Model& model,
-    const SortSpec<Descriptor>& sort
-) noexcept {
-    Cursor cursor;
-    cursor.data.resize(sizeof(int64_t) * 2);  // sort_value + id
-
-    int64_t sort_value = 0;
-
-    [&]<size_t... Is>(std::index_sequence<Is...>) {
-        ((sort.field_index == Is ? [&] {
-            using SortType = sort_at<Descriptor, Is>;
-            const auto value = detail::extractMemberValue<SortType::model_ptr>(model);
-            sort_value = detail::toInt64ForCursor(value);
-            return true;
-        }() : false) || ...);
-    }(std::make_index_sequence<sort_count<Descriptor>>{});
-
-    std::memcpy(cursor.data.data(), &sort_value, sizeof(sort_value));
-    int64_t id;
-    if constexpr (requires { { model.getPrimaryKey() } -> std::convertible_to<int64_t>; }) {
-        id = static_cast<int64_t>(model.getPrimaryKey());
-    } else {
-        // Composite PK (e.g., partitioned tables): extract first element
-        id = static_cast<int64_t>(std::get<0>(model.getPrimaryKey()));
-    }
     std::memcpy(cursor.data.data() + sizeof(sort_value), &id, sizeof(id));
 
     return cursor;
@@ -273,7 +205,6 @@ template<typename Descriptor>
     [&]<size_t... Is>(std::index_sequence<Is...>) {
         ((sort.field_index == Is ? [&] {
             using SortType = sort_at<Descriptor, Is>;
-            // Use extractMemberValue to support both data members and member functions
             const auto value = detail::extractMemberValue<SortType::entity_ptr>(entity);
             entity_sort_value = detail::toInt64ForCursor(value);
             return true;
@@ -285,15 +216,13 @@ template<typename Descriptor>
 
     // Compare based on direction
     if (sort.direction == SortDirection::Desc) {
-        // DESC: entity is before cursor if sort_value > cursor_sort_value
         if (entity_sort_value > cursor_sort_value) return true;
         if (entity_sort_value < cursor_sort_value) return false;
-        return entity_id >= cursor_id;  // Tie-break by id DESC
+        return entity_id >= cursor_id;
     } else {
-        // ASC: entity is before cursor if sort_value < cursor_sort_value
         if (entity_sort_value < cursor_sort_value) return true;
         if (entity_sort_value > cursor_sort_value) return false;
-        return entity_id <= cursor_id;  // Tie-break by id ASC
+        return entity_id <= cursor_id;
     }
 }
 
@@ -330,15 +259,14 @@ template<typename Descriptor>
 /// Get sort column name from index (for DB query)
 template<typename Descriptor>
     requires ValidListDescriptor<Descriptor>
-[[nodiscard]] const std::string& sortColumnName(size_t field_index) noexcept {
-    static const std::string empty;
-    const std::string* result = &empty;
+[[nodiscard]] std::string_view sortColumnName(size_t field_index) noexcept {
+    std::string_view result;
 
     [&]<size_t... Is>(std::index_sequence<Is...>) {
-        ((field_index == Is ? (result = &sort_at<Descriptor, Is>::column(), true) : false) || ...);
+        ((field_index == Is ? (result = sort_at<Descriptor, Is>::column(), true) : false) || ...);
     }(std::make_index_sequence<sort_count<Descriptor>>{});
 
-    return *result;
+    return result;
 }
 
 // =============================================================================
@@ -373,10 +301,6 @@ template<typename Descriptor>
 // =============================================================================
 // extractSortValue - Extract sort field value from entity
 // =============================================================================
-//
-// Extracts the sort field value from an entity as int64_t for comparison.
-// Used for cache invalidation range checks.
-//
 
 /// Extract sort field value from entity as int64_t
 template<typename Descriptor>
@@ -399,34 +323,10 @@ template<typename Descriptor>
     return result;
 }
 
-/// Extract sort field value from Drogon Model as int64_t
-/// Uses model_ptr (Model getter) instead of entity_ptr to avoid Model→Entity conversion.
-template<typename Descriptor>
-    requires ValidListDescriptor<Descriptor>
-[[nodiscard]] int64_t extractSortValueFromModel(
-    const typename Descriptor::Model& model,
-    size_t field_index
-) noexcept {
-    int64_t result = 0;
-
-    [&]<size_t... Is>(std::index_sequence<Is...>) {
-        ((field_index == Is ? [&] {
-            using SortType = sort_at<Descriptor, Is>;
-            const auto value = detail::extractMemberValue<SortType::model_ptr>(model);
-            result = detail::toInt64ForCursor(value);
-            return true;
-        }() : false) || ...);
-    }(std::make_index_sequence<sort_count<Descriptor>>{});
-
-    return result;
-}
-
 // =============================================================================
 // compareSortValues - Compare sort values with direction
 // =============================================================================
 
-/// Compare two sort values with direction
-/// Returns: <0 if a < b, 0 if equal, >0 if a > b (adjusted for direction)
 [[nodiscard]] inline int compareSortValues(int64_t a, int64_t b, SortDirection dir) noexcept {
     int cmp = (a < b) ? -1 : (a > b) ? 1 : 0;
     return (dir == SortDirection::Desc) ? -cmp : cmp;
@@ -435,39 +335,18 @@ template<typename Descriptor>
 // =============================================================================
 // isInSortRange - Check if entity falls within sort range of a list
 // =============================================================================
-//
-// Checks if an entity's sort value is between the first and last items
-// of a cached list. Used for determining if a modification affects a cached page.
-//
-// Parameters:
-//   - entity_sort_value: The sort field value of the entity being checked
-//   - first_sort_value: The sort field value of the first item in cached list
-//   - last_sort_value: The sort field value of the last item in cached list
-//   - direction: Sort direction (Asc/Desc)
-//
-// For descending sort: first has highest value, last has lowest
-// For ascending sort: first has lowest value, last has highest
-//
 
-/// Check if entity sort value is within the range [first, last]
-/// Returns true if the entity would appear within this page
 [[nodiscard]] inline bool isInSortRange(
     int64_t entity_sort_value,
     int64_t first_sort_value,
     int64_t last_sort_value,
     SortDirection direction
 ) noexcept {
-    // Compare entity with first and last items
     int cmp_first = compareSortValues(entity_sort_value, first_sort_value, direction);
     int cmp_last = compareSortValues(entity_sort_value, last_sort_value, direction);
-
-    // Entity is in range if:
-    // - cmp_first >= 0 (entity >= first in sort order)
-    // - cmp_last <= 0 (entity <= last in sort order)
     return cmp_first >= 0 && cmp_last <= 0;
 }
 
-/// Check if entity is in sort range using Descriptor and SortSpec
 template<typename Descriptor>
     requires ValidListDescriptor<Descriptor>
 [[nodiscard]] bool isInSortRange(
@@ -483,22 +362,17 @@ template<typename Descriptor>
 // =============================================================================
 // Query Validation
 // =============================================================================
-//
-// Functions to validate query parameters (filters, sorts, limits) against
-// the allowed values defined in the Descriptor.
-//
 
-/// Error type for query validation failures
 struct QueryValidationError {
     enum class Type : uint8_t {
-        InvalidFilter,    // Filter name not in Descriptor::filters
-        InvalidSort,      // Sort field not in Descriptor::sorts
-        InvalidLimit      // Limit not in Descriptor::allowedLimits
+        InvalidFilter,
+        InvalidSort,
+        InvalidLimit
     };
 
     Type type;
-    std::string field;    // Name of invalid filter/sort field
-    uint16_t limit{0};    // Invalid limit value (if type == InvalidLimit)
+    std::string field;
+    uint16_t limit{0};
 
     [[nodiscard]] std::string message() const {
         switch (type) {
@@ -513,13 +387,11 @@ struct QueryValidationError {
     }
 };
 
-/// Concept to check if Descriptor has allowedLimits
 template<typename Descriptor>
 concept HasAllowedLimits = requires {
     { Descriptor::allowedLimits } -> std::convertible_to<decltype(Descriptor::allowedLimits)>;
 };
 
-/// Check if a limit value is allowed for a Descriptor
 template<typename Descriptor>
 [[nodiscard]] bool isLimitAllowed(uint16_t limit) noexcept {
     if constexpr (HasAllowedLimits<Descriptor>) {
@@ -528,7 +400,6 @@ template<typename Descriptor>
         }
         return false;
     } else {
-        // Default allowed limits if not specified
         constexpr std::array<uint16_t, 4> default_limits = {10, 25, 50, 100};
         for (auto allowed : default_limits) {
             if (limit == allowed) return true;
@@ -537,19 +408,17 @@ template<typename Descriptor>
     }
 }
 
-/// Check if a sort field index is valid for a Descriptor
 template<typename Descriptor>
     requires ValidListDescriptor<Descriptor>
 [[nodiscard]] bool isSortFieldValid(size_t field_index) noexcept {
     return field_index < sort_count<Descriptor>;
 }
 
-/// Validate sort field by name
 template<typename Descriptor>
     requires ValidListDescriptor<Descriptor>
 [[nodiscard]] std::optional<QueryValidationError> validateSortField(std::string_view field_name) noexcept {
     if (parseSortField<Descriptor>(field_name).has_value()) {
-        return std::nullopt;  // Valid
+        return std::nullopt;
     }
     return QueryValidationError{
         .type = QueryValidationError::Type::InvalidSort,
@@ -558,11 +427,10 @@ template<typename Descriptor>
     };
 }
 
-/// Validate limit value
 template<typename Descriptor>
 [[nodiscard]] std::optional<QueryValidationError> validateLimit(uint16_t limit) noexcept {
     if (isLimitAllowed<Descriptor>(limit)) {
-        return std::nullopt;  // Valid
+        return std::nullopt;
     }
     return QueryValidationError{
         .type = QueryValidationError::Type::InvalidLimit,
@@ -571,7 +439,6 @@ template<typename Descriptor>
     };
 }
 
-/// Get allowed limits as a comma-separated string (for error messages)
 template<typename Descriptor>
 [[nodiscard]] std::string getAllowedLimitsString() {
     std::string result;
@@ -586,6 +453,6 @@ template<typename Descriptor>
     return result;
 }
 
-}  // namespace jcailloux::drogon::cache::list::decl
+}  // namespace jcailloux::relais::cache::list::decl
 
 #endif  // CODIBOT_CACHE_LIST_DECL_GENERATEDTRAITS_H

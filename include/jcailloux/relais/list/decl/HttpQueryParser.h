@@ -1,9 +1,11 @@
 #ifndef CODIBOT_CACHE_LIST_DECL_HTTPQUERYPARSER_H
 #define CODIBOT_CACHE_LIST_DECL_HTTPQUERYPARSER_H
 
-#include <drogon/HttpRequest.h>
 #include <xxhash.h>
 #include <expected>
+#include <string>
+#include <string_view>
+#include <unordered_map>
 
 #include "FilterDescriptor.h"
 #include "SortDescriptor.h"
@@ -13,7 +15,7 @@
 #include "ListDescriptorQuery.h"
 #include "jcailloux/relais/cache/QueryParser.h"
 
-namespace jcailloux::drogon::cache::list::decl {
+namespace jcailloux::relais::cache::list::decl {
 
 // =============================================================================
 // HTTP Query Parser - Auto-parse filters from HTTP request
@@ -61,8 +63,6 @@ std::optional<T> parseValue(const std::string& str) {
             return str;
         }
         return std::nullopt;
-    } else if constexpr (std::is_same_v<T, trantor::Date>) {
-        return trantor::Date(cache::parse::toInt64(str));
     } else if constexpr (std::is_enum_v<T>) {
         // Use ADL to find parseEnum
         return parseEnum(str, static_cast<T*>(nullptr));
@@ -118,13 +118,12 @@ size_t computeQueryHash(const ListDescriptorQuery<Descriptor>& query) {
     return XXH3_64bits(buf.data(), buf.size());
 }
 
-/// Parse ListQuery from HTTP request parameters
-template<typename Descriptor>
+/// Parse ListQuery from a parameter map (e.g. req->getParameters())
+template<typename Descriptor, typename Map = std::unordered_map<std::string, std::string>>
     requires ValidListDescriptor<Descriptor>
-ListDescriptorQuery<Descriptor> parseListQuery(const ::drogon::HttpRequestPtr& req) {
+ListDescriptorQuery<Descriptor> parseListQuery(const Map& params) {
     using Query = ListDescriptorQuery<Descriptor>;
 
-    const auto& params = req->getParameters();
     Query query;
 
     // Parse each filter by iterating over the declaration
@@ -183,14 +182,13 @@ ListDescriptorQuery<Descriptor> parseListQuery(const ::drogon::HttpRequestPtr& r
 
 /// Parse and validate ListQuery from HTTP request parameters
 /// Returns error if any parameter is invalid (unknown filter, invalid sort, bad limit)
-template<typename Descriptor>
+template<typename Descriptor, typename Map = std::unordered_map<std::string, std::string>>
     requires ValidListDescriptor<Descriptor>
 std::expected<ListDescriptorQuery<Descriptor>, QueryValidationError> parseListQueryStrict(
-    const ::drogon::HttpRequestPtr& req
+    const Map& params
 ) {
     using Query = ListDescriptorQuery<Descriptor>;
 
-    const auto& params = req->getParameters();
     Query query;
 
     // Collect declared filter names for validation
@@ -295,6 +293,6 @@ std::expected<ListDescriptorQuery<Descriptor>, QueryValidationError> parseListQu
     return query;
 }
 
-}  // namespace jcailloux::drogon::cache::list::decl
+}  // namespace jcailloux::relais::cache::list::decl
 
 #endif  // CODIBOT_CACHE_LIST_DECL_HTTPQUERYPARSER_H

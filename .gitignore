@@ -1,2 +1,2 @@
-tests/fixtures/*.h
-tests/fixtures/generated/
+tests/fixtures/generated/*
+.idea/*

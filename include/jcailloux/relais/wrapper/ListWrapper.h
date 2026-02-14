@@ -1,5 +1,5 @@
-#ifndef JCX_DROGON_WRAPPER_LIST_WRAPPER_H
-#define JCX_DROGON_WRAPPER_LIST_WRAPPER_H
+#ifndef JCX_RELAIS_WRAPPER_LIST_WRAPPER_H
+#define JCX_RELAIS_WRAPPER_LIST_WRAPPER_H
 
 #include <cstdint>
 #include <memory>
@@ -12,9 +12,10 @@
 
 #include <glaze/glaze.hpp>
 
+#include "pqcoro/pg/PgResult.h"
 #include "jcailloux/relais/wrapper/Format.h"
 
-namespace jcailloux::drogon::wrapper {
+namespace jcailloux::relais::wrapper {
 
 // =============================================================================
 // ListWrapper<Item> — Generic list wrapper for any entity type
@@ -30,7 +31,6 @@ class ListWrapper {
 public:
     using Format = jcailloux::relais::StructFormat;
     using ItemType = Item;
-    using Model = typename Item::Model;
     static constexpr bool read_only = true;
 
     std::vector<Item> items;
@@ -142,11 +142,11 @@ public:
     // Factory methods
     // =========================================================================
 
-    static ListWrapper fromModels(const std::vector<Model>& models) {
+    static ListWrapper fromRows(const pqcoro::PgResult& result) {
         ListWrapper list;
-        list.items.reserve(models.size());
-        for (const auto& m : models) {
-            if (auto item = Item::fromModel(m))
+        list.items.reserve(result.rows());
+        for (int i = 0; i < result.rows(); ++i) {
+            if (auto item = Item::fromRow(result[i]))
                 list.items.push_back(std::move(*item));
         }
         list.total_count = static_cast<int64_t>(list.items.size());
@@ -174,15 +174,15 @@ private:
     mutable std::shared_ptr<const std::string> json_cache_;
 };
 
-}  // namespace jcailloux::drogon::wrapper
+}  // namespace jcailloux::relais::wrapper
 
 // =============================================================================
 // Glaze metadata for ListWrapper<Item>
 // =============================================================================
 
 template<typename Item>
-struct glz::meta<jcailloux::drogon::wrapper::ListWrapper<Item>> {
-    using T = jcailloux::drogon::wrapper::ListWrapper<Item>;
+struct glz::meta<jcailloux::relais::wrapper::ListWrapper<Item>> {
+    using T = jcailloux::relais::wrapper::ListWrapper<Item>;
     static constexpr auto value = glz::object(
         "items", &T::items,
         "total_count", &T::total_count,
@@ -190,4 +190,4 @@ struct glz::meta<jcailloux::drogon::wrapper::ListWrapper<Item>> {
     );
 };
 
-#endif  // JCX_DROGON_WRAPPER_LIST_WRAPPER_H
+#endif  // JCX_RELAIS_WRAPPER_LIST_WRAPPER_H

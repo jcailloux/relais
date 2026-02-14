@@ -64,7 +64,7 @@ using FullCachePurchaseRepo = Repository<TestPurchaseWrapper, "test:purchase:bot
     cfg::Both,
     cache::Invalidate<FullCacheInvUserRepo, purchaseUserId>>;
 
-using jcailloux::drogon::wrapper::set;
+using jcailloux::relais::wrapper::set;
 using F = TestUserWrapper::Field;
 
 } // namespace relais_test
@@ -200,7 +200,7 @@ TEST_CASE("FullCache<TestItem> - cascade invalidation",
         // Populate caches
         sync(FullCacheTestItemRepository::findById(id));
 
-        auto updated = makeTestItem("after_update", 20, std::nullopt, true, id);
+        auto updated = makeTestItem("after_update", 20, "", true, id);
         sync(FullCacheTestItemRepository::update(id, updated));
 
         // Next read should get updated value
@@ -296,7 +296,7 @@ TEST_CASE("FullCache<TestItem> - write-through at L1+L2",
         sync(WriteThroughBothItemRepo::findById(id));
 
         // Update via write-through
-        auto updated = makeTestItem("wt_after", 20, std::nullopt, true, id);
+        auto updated = makeTestItem("wt_after", 20, "", true, id);
         sync(WriteThroughBothItemRepo::update(id, updated));
 
         // L1 should immediately have the new value

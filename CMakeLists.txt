@@ -12,7 +12,6 @@ target_include_directories(jcailloux-relais INTERFACE
 target_compile_features(jcailloux-relais INTERFACE cxx_std_23)
 
 # Workaround for GCC 15 bug with AVX2 intrinsics in avx2intrin.h
-# Remove this when GCC fixes the issue (likely GCC 15.1 or 15.2)
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL "15")
     target_compile_options(jcailloux-relais INTERFACE -mno-avx2)
 endif()
@@ -20,41 +19,30 @@ endif()
 # =============================================================================
 # Dependencies
 # =============================================================================
-
 include(FetchContent)
 
-# shardmap (required)
-# Try to find it, or fetch it if standalone
-if(NOT TARGET jcailloux::shardmap AND NOT TARGET shardmap)
-    # Check if shardmap is available locally (sibling directory)
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../jcailloux-shardmap/CMakeLists.txt")
-        add_subdirectory(
-                ${CMAKE_CURRENT_SOURCE_DIR}/../jcailloux-shardmap
-            ${CMAKE_CURRENT_BINARY_DIR}/shardmap
-        )
-    else()
-        message(FATAL_ERROR "jcailloux-relais: shardmap is required. Add it before this library or place it in ../shardmap/")
-    endif()
-endif()
-
-# Drogon - web framework (system dependency, not fetched)
-find_package(Drogon REQUIRED)
-
-# glaze - JSON serialization (header-only)
-# FIND_PACKAGE_ARGS: prefer system/parent-provided version if available
-# Disable AVX2 to avoid GCC 15 bug with avx2intrin.h
-#set(glaze_ENABLE_AVX2 OFF CACHE BOOL "" FORCE)
-FetchContent_Declare(glaze
+FetchContent_Declare(
+    shardmap
+    GIT_REPOSITORY https://github.com/jcailloux/shardmap
+    GIT_TAG        ad69bd2909c9425260a8b36cb16053d72d837cb8
+)
+FetchContent_Declare(
+    pqcoro
+    GIT_REPOSITORY https://github.com/jcailloux/pqcoro.git
+    GIT_TAG        75d5a0b573bb77b7851fa0440d23d5927bf80eca
+)
+FetchContent_Declare(
+    glaze
     GIT_REPOSITORY https://github.com/stephenberry/glaze.git
-    GIT_TAG        v4.2.3
+    GIT_TAG        v7.0.2
     FIND_PACKAGE_ARGS
 )
-FetchContent_MakeAvailable(glaze)
+FetchContent_MakeAvailable(shardmap pqcoro glaze)
 
 # Link all dependencies
 target_link_libraries(jcailloux-relais INTERFACE
-    $<IF:$<TARGET_EXISTS:jcailloux::shardmap>,jcailloux::shardmap,shardmap>
-    Drogon::Drogon
+    shardmap
+    pqcoro
     glaze::glaze
 )
 
@@ -104,7 +92,6 @@ if(RELAIS_BUILD_TESTS)
 
     add_executable(relais_tests
         tests/test_generated_wrapper.cpp
-        tests/fixtures/mocks/Mock_RelaisTestOrders.cc
     )
 
     target_compile_definitions(relais_tests
@@ -114,7 +101,6 @@ if(RELAIS_BUILD_TESTS)
 
     target_include_directories(relais_tests PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/tests
-            ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/mocks
     )
 
     target_link_libraries(relais_tests
@@ -129,12 +115,16 @@ if(RELAIS_BUILD_TESTS)
     include(Catch)
     catch_discover_tests(relais_tests)
 
+    # pqcoro test include path (EpollIoContext.h, TestRunner.h)
+    set(PQCORO_TEST_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../pqcoro/tests)
+
     # Test: BaseRepository (no caching, direct DB access)
     add_executable(test_relais_base
         tests/test_base_repository.cpp
     )
     target_include_directories(test_relais_base PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/tests
+        ${PQCORO_TEST_INCLUDE_DIR}
     )
     target_compile_definitions(test_relais_base PRIVATE RELAIS_BUILDING_TESTS)
     target_link_libraries(test_relais_base PRIVATE
@@ -151,6 +141,7 @@ if(RELAIS_BUILD_TESTS)
     )
     target_include_directories(test_relais_redis PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/tests
+        ${PQCORO_TEST_INCLUDE_DIR}
     )
     target_compile_definitions(test_relais_redis PRIVATE RELAIS_BUILDING_TESTS)
     target_link_libraries(test_relais_redis PRIVATE
@@ -167,6 +158,7 @@ if(RELAIS_BUILD_TESTS)
     )
     target_include_directories(test_relais_decl_list_cache PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/tests
+        ${PQCORO_TEST_INCLUDE_DIR}
     )
     target_compile_definitions(test_relais_decl_list_cache PRIVATE RELAIS_BUILDING_TESTS)
     target_link_libraries(test_relais_decl_list_cache PRIVATE
@@ -183,6 +175,7 @@ if(RELAIS_BUILD_TESTS)
     )
     target_include_directories(test_relais_cached PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/tests
+        ${PQCORO_TEST_INCLUDE_DIR}
     )
     target_compile_definitions(test_relais_cached PRIVATE RELAIS_BUILDING_TESTS)
     target_link_libraries(test_relais_cached PRIVATE
@@ -199,6 +192,7 @@ if(RELAIS_BUILD_TESTS)
     )
     target_include_directories(test_relais_partial_key PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/tests
+        ${PQCORO_TEST_INCLUDE_DIR}
     )
     target_compile_definitions(test_relais_partial_key PRIVATE RELAIS_BUILDING_TESTS)
     target_link_libraries(test_relais_partial_key PRIVATE
@@ -215,6 +209,7 @@ if(RELAIS_BUILD_TESTS)
     )
     target_include_directories(test_relais_full_cache PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/tests
+        ${PQCORO_TEST_INCLUDE_DIR}
     )
     target_compile_definitions(test_relais_full_cache PRIVATE RELAIS_BUILDING_TESTS)
     target_link_libraries(test_relais_full_cache PRIVATE
@@ -231,6 +226,7 @@ if(RELAIS_BUILD_TESTS)
     )
     target_include_directories(test_relais_decl_list_redis PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/tests
+        ${PQCORO_TEST_INCLUDE_DIR}
     )
     target_compile_definitions(test_relais_decl_list_redis PRIVATE RELAIS_BUILDING_TESTS)
     target_link_libraries(test_relais_decl_list_redis PRIVATE
@@ -247,6 +243,7 @@ if(RELAIS_BUILD_TESTS)
     )
     target_include_directories(test_relais_decl_list_full PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/tests
+        ${PQCORO_TEST_INCLUDE_DIR}
     )
     target_compile_definitions(test_relais_decl_list_full PRIVATE RELAIS_BUILDING_TESTS)
     target_link_libraries(test_relais_decl_list_full PRIVATE
@@ -263,6 +260,7 @@ if(RELAIS_BUILD_TESTS)
     )
     target_include_directories(test_relais_warmup PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/tests
+        ${PQCORO_TEST_INCLUDE_DIR}
     )
     target_compile_definitions(test_relais_warmup PRIVATE RELAIS_BUILDING_TESTS)
     target_link_libraries(test_relais_warmup PRIVATE
@@ -279,6 +277,7 @@ if(RELAIS_BUILD_TESTS)
     )
     target_include_directories(test_relais_l1_config PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/tests
+        ${PQCORO_TEST_INCLUDE_DIR}
     )
     target_compile_definitions(test_relais_l1_config PRIVATE RELAIS_BUILDING_TESTS)
     target_link_libraries(test_relais_l1_config PRIVATE
@@ -295,6 +294,7 @@ if(RELAIS_BUILD_TESTS)
     )
     target_include_directories(test_relais_l2_config PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/tests
+        ${PQCORO_TEST_INCLUDE_DIR}
     )
     target_compile_definitions(test_relais_l2_config PRIVATE RELAIS_BUILDING_TESTS)
     target_link_libraries(test_relais_l2_config PRIVATE
@@ -311,6 +311,7 @@ if(RELAIS_BUILD_TESTS)
     )
     target_include_directories(test_relais_concurrency PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/tests
+        ${PQCORO_TEST_INCLUDE_DIR}
     )
     target_compile_definitions(test_relais_concurrency PRIVATE RELAIS_BUILDING_TESTS)
     target_link_libraries(test_relais_concurrency PRIVATE
@@ -336,6 +337,7 @@ if(RELAIS_BUILD_TESTS)
     )
     target_include_directories(test_relais_benchmark PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/tests
+        ${PQCORO_TEST_INCLUDE_DIR}
     )
     target_compile_definitions(test_relais_benchmark PRIVATE RELAIS_BUILDING_TESTS)
     target_link_libraries(test_relais_benchmark PRIVATE
@@ -380,11 +382,10 @@ if(RELAIS_BUILD_TESTS)
         tests/config/test_l1_config.cpp
         tests/config/test_l2_config.cpp
         tests/test_concurrency.cpp
-        tests/fixtures/mocks/Mock_RelaisTestOrders.cc
     )
     target_include_directories(test_relais_all PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/tests
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/mocks
+        ${PQCORO_TEST_INCLUDE_DIR}
     )
     target_compile_definitions(test_relais_all PRIVATE
         RELAIS_BUILDING_TESTS
@@ -395,4 +396,26 @@ if(RELAIS_BUILD_TESTS)
         Catch2::Catch2WithMain
     )
     catch_discover_tests(test_relais_all)
+
+    # -------------------------------------------------------------------------
+    # DbProvider + Log tests (depends on pqcoro, NOT on Drogon)
+    # -------------------------------------------------------------------------
+    # Only built when pqcoro target is available (e.g., from parent project)
+
+    if(TARGET pqcoro::pqcoro OR TARGET pqcoro)
+        add_executable(test_relais_dbprovider_log
+            tests/test_dbprovider_log.cpp
+        )
+        target_include_directories(test_relais_dbprovider_log PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/../pqcoro/tests
+        )
+        target_link_libraries(test_relais_dbprovider_log PRIVATE
+            $<IF:$<TARGET_EXISTS:pqcoro::pqcoro>,pqcoro::pqcoro,pqcoro>
+            Catch2::Catch2WithMain
+        )
+        catch_discover_tests(test_relais_dbprovider_log
+            PROPERTIES LABELS "integration;pqcoro"
+        )
+    endif()
 endif()

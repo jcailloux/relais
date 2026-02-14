@@ -17,7 +17,7 @@
 namespace relais_test { struct TestInternals; }
 #endif
 
-namespace jcailloux::drogon::cache::list {
+namespace jcailloux::relais::cache::list {
 
 // =============================================================================
 // PaginationMode - Distinguishes offset-based and cursor-based pagination
@@ -256,7 +256,7 @@ public:
     using FilterSet = typename Traits::Filters;
     using SortFieldEnum = typename Traits::SortField;
     using Query = ListQuery<FilterSet, SortFieldEnum>;
-    using Result = jcailloux::drogon::wrapper::ListWrapper<Entity>;
+    using Result = jcailloux::relais::wrapper::ListWrapper<Entity>;
     using ResultPtr = std::shared_ptr<const Result>;
     using Modification = EntityModification<Entity>;
     using Clock = std::chrono::steady_clock;
@@ -626,6 +626,6 @@ private:
     }
 };
 
-}  // namespace jcailloux::drogon::cache::list
+}  // namespace jcailloux::relais::cache::list
 
 #endif  // CODIBOT_LISTCACHE_H
