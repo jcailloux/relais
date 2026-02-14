@@ -1,14 +1,16 @@
-#ifndef JCX_DROGON_BASEREPOSITORY_H
-#define JCX_DROGON_BASEREPOSITORY_H
+#ifndef JCX_RELAIS_BASEREPOSITORY_H
+#define JCX_RELAIS_BASEREPOSITORY_H
 
 #include <optional>
-#include <span>
+#include <string>
 #include <vector>
-#include <chrono>
-#include <drogon/utils/coroutine.h>
-#include <drogon/HttpAppFramework.h>
-#include <drogon/orm/CoroMapper.h>
-#include <trantor/utils/Logger.h>
+
+#include "pqcoro/Task.h"
+#include "pqcoro/pg/PgError.h"
+#include "pqcoro/pg/PgParams.h"
+#include "pqcoro/pg/PgResult.h"
+#include "jcailloux/relais/DbProvider.h"
+#include "jcailloux/relais/Log.h"
 #include "jcailloux/relais/config/repository_config.h"
 #include "jcailloux/relais/config/FixedString.h"
 #include "jcailloux/relais/wrapper/EntityConcepts.h"
@@ -27,12 +29,11 @@ using WrapperPtr = std::shared_ptr<const Entity>;
 // Concepts
 // =========================================================================
 
-/// Entity supports partial field updates (has TraitsType with Field enum and setPrimaryKeyOnModel)
+/// Entity supports partial field updates (has TraitsType with Field enum)
 template<typename E>
-concept HasFieldUpdate = requires(typename E::TraitsType::Model& m, int64_t k) {
+concept HasFieldUpdate = requires {
     typename E::TraitsType;
     typename E::TraitsType::Field;
-    E::TraitsType::setPrimaryKeyOnModel(m, k);
 };
 
 // =========================================================================
@@ -42,7 +43,8 @@ concept HasFieldUpdate = requires(typename E::TraitsType::Model& m, int64_t k) {
 namespace detail {
 
 /// Build: UPDATE "table" SET "col1"=$1, "col2"=$2 WHERE "pk"=$N RETURNING *
-/// table_name and columns are expected pre-quoted; pk_column is unquoted.
+/// table_name is used as-is; pk_column is wrapped in double quotes;
+/// columns are expected pre-quoted (e.g. "\"name\"").
 inline std::string buildUpdateReturning(
     std::string_view table_name,
     std::string_view pk_column,
@@ -81,15 +83,18 @@ inline std::string buildUpdateReturning(
 // No CRTP. Config is a CacheConfig NTTP. Cross-invalidation is handled
 // by InvalidationMixin at a higher layer.
 //
+// All DB access goes through DbProvider (type-erased PgClient).
+// SQL queries come from Entity::MappingType::SQL.
+// Entity IS the model — no Drogon ORM Model intermediary.
+//
 
 template<typename Entity, config::FixedString Name, config::CacheConfig Cfg, typename Key>
-requires ReadableEntity<Entity, typename Entity::Model>
+requires ReadableEntity<Entity>
 class BaseRepository {
-    using Model = typename Entity::Model;
+    using Mapping = typename Entity::MappingType;
 
 public:
     using EntityType = Entity;
-    using ModelType = Model;
     using KeyType = Key;
     using WrapperType = Entity;
     using WrapperPtrType = WrapperPtr<Entity>;
@@ -103,43 +108,15 @@ public:
 
     /// Find by ID with L3 (database) access only.
     /// Returns shared_ptr to immutable entity (nullptr if not found).
-    static ::drogon::Task<WrapperPtrType> findById(const Key& id) {
+    static pqcoro::Task<WrapperPtrType> findById(const Key& id) {
         try {
-            auto db = ::drogon::app().getDbClient();
-            ::drogon::orm::CoroMapper<Model> mapper(db);
-
-            if constexpr (std::is_same_v<Key, typename Model::PrimaryKeyType>) {
-                // Standard path - Key matches Model's PK type
-                auto row = co_await mapper.findByPrimaryKey(id);
-                auto entity = Entity::fromModel(row);
-                co_return entity ? std::make_shared<const Entity>(std::move(*entity)) : nullptr;
-            } else {
-                // Partial key path - for partitioned tables where Key is a subset of PK
-                static_assert(HasPartialKey<Entity, Model, Key>,
-                    "Entity must provide makeKeyCriteria when Key differs from "
-                    "Model::PrimaryKeyType. Add '@relais primary_key db_managed' "
-                    "to the PK field.");
-
-                // Use LIMIT 2 to detect non-unique results
-                auto rows = co_await mapper.limit(2).findBy(
-                    Entity::template makeKeyCriteria<Model>(id)
-                );
-
-                if (rows.size() > 1) {
-                    LOG_ERROR << name() << ": Non-unique partial key! "
-                              << "Expected 1 row but query returned " << rows.size()
-                              << ". This indicates a data integrity issue.";
-                }
-
-                if (rows.empty()) co_return nullptr;
-                auto entity = Entity::fromModel(rows[0]);
-                co_return entity ? std::make_shared<const Entity>(std::move(*entity)) : nullptr;
-            }
-
-        } catch (const ::drogon::orm::UnexpectedRows&) {
-            co_return nullptr;
-        } catch (const ::drogon::orm::DrogonDbException& e) {
-            LOG_ERROR << name() << ": DB error - " << e.base().what();
+            auto result = co_await DbProvider::queryArgs(
+                Mapping::SQL::select_by_pk, id);
+            if (result.empty()) co_return nullptr;
+            auto entity = Entity::fromRow(result[0]);
+            co_return entity ? std::make_shared<const Entity>(std::move(*entity)) : nullptr;
+        } catch (const pqcoro::PgError& e) {
+            RELAIS_LOG_ERROR << name() << ": DB error - " << e.what();
             co_return nullptr;
         }
     }
@@ -150,24 +127,22 @@ public:
 
     /// Create entity in database.
     /// Returns shared_ptr to immutable entity (nullptr on error).
-    /// Compile-time error if Cfg.read_only is true.
-    static ::drogon::Task<WrapperPtrType> create(WrapperPtrType wrapper)
-        requires MutableEntity<Entity, Model> && (!Cfg.read_only)
+    /// Uses INSERT ... RETURNING to get the full entity back (with DB-managed fields).
+    static pqcoro::Task<WrapperPtrType> create(WrapperPtrType wrapper)
+        requires MutableEntity<Entity> && (!Cfg.read_only)
     {
         if (!wrapper) co_return nullptr;
 
         try {
-            auto db = ::drogon::app().getDbClient();
-            ::drogon::orm::CoroMapper<Model> mapper(db);
-
-            Model model = Entity::toModel(*wrapper);
-            Model inserted = co_await mapper.insert(model);
-
-            auto entity = Entity::fromModel(inserted);
+            auto params = Entity::toInsertParams(*wrapper);
+            auto result = co_await DbProvider::queryParams(
+                Mapping::SQL::insert, params);
+            if (result.empty()) co_return nullptr;
+            auto entity = Entity::fromRow(result[0]);
             co_return entity ? std::make_shared<const Entity>(std::move(*entity)) : nullptr;
 
-        } catch (const ::drogon::orm::DrogonDbException& e) {
-            LOG_ERROR << name() << ": create error - " << e.base().what();
+        } catch (const pqcoro::PgError& e) {
+            RELAIS_LOG_ERROR << name() << ": create error - " << e.what();
             co_return nullptr;
         }
     }
@@ -176,31 +151,33 @@ public:
     // Update
     // =====================================================================
 
-    /// Update entity in database.
+    /// Full update of entity in database.
+    /// Builds params as: PK ($1), then insert fields ($2...$N).
     /// Returns true on success, false on error.
-    /// Compile-time error if Cfg.read_only is true.
-    static ::drogon::Task<bool> update(const Key& id, WrapperPtrType wrapper)
-        requires MutableEntity<Entity, Model> && (!Cfg.read_only)
+    static pqcoro::Task<bool> update(const Key& id, WrapperPtrType wrapper)
+        requires MutableEntity<Entity> && (!Cfg.read_only)
     {
         if (!wrapper) co_return false;
 
         try {
-            auto db = ::drogon::app().getDbClient();
-            ::drogon::orm::CoroMapper<Model> mapper(db);
+            // toInsertParams returns fields without PK (db_managed).
+            // SQL::update expects PK as $1, then fields as $2...$N.
+            auto insertParams = Entity::toInsertParams(*wrapper);
+            pqcoro::PgParams params;
+            params.params.reserve(insertParams.params.size() + 1);
+            // $1 = primary key
+            params.params.push_back(
+                pqcoro::PgParams::make(id).params[0]);
+            // $2...$N = fields (same order as toInsertParams)
+            for (auto& p : insertParams.params)
+                params.params.push_back(std::move(p));
 
-            Model model = Entity::toModel(*wrapper);
-            // Ensure PK is set on the model -- toModel() skips DbManaged
-            // fields (like auto-increment PK), but update() needs the PK
-            // for the WHERE clause.
-            if constexpr (requires { Entity::TraitsType::setPrimaryKeyOnModel(model, id); }) {
-                Entity::TraitsType::setPrimaryKeyOnModel(model, id);
-            }
-            co_await mapper.update(model);
+            auto affected = co_await DbProvider::execute(
+                Mapping::SQL::update, params);
+            co_return affected > 0;
 
-            co_return true;
-
-        } catch (const ::drogon::orm::DrogonDbException& e) {
-            LOG_ERROR << name() << ": update error - " << e.base().what();
+        } catch (const pqcoro::PgError& e) {
+            RELAIS_LOG_ERROR << name() << ": update error - " << e.what();
             co_return false;
         }
     }
@@ -210,56 +187,26 @@ public:
     // =====================================================================
 
     /// Remove entity by ID.
-    /// Returns: rows deleted (0 if not found), or nullopt on DB error (FK constraint, etc.)
-    /// Compile-time error if Cfg.read_only is true.
-    static ::drogon::Task<std::optional<size_t>> remove(const Key& id)
+    /// Returns: rows deleted (0 if not found), or nullopt on DB error.
+    static pqcoro::Task<std::optional<size_t>> remove(const Key& id)
         requires (!Cfg.read_only)
     {
         co_return co_await removeImpl(id, nullptr);
     }
 
 protected:
-    /// Internal remove with optional entity hint for PartialKey optimization.
-    /// When hint is provided (e.g. from L1/L2 cache), uses full composite PK
-    /// for partition pruning. Otherwise falls back to criteria-based delete.
-    static ::drogon::Task<std::optional<size_t>> removeImpl(
-        const Key& id, WrapperPtrType cachedHint = nullptr)
+    /// Internal remove with optional entity hint (used by cache layers for
+    /// partition pruning optimization — ignored at L3 level).
+    static pqcoro::Task<std::optional<size_t>> removeImpl(
+        const Key& id, WrapperPtrType /*cachedHint*/ = nullptr)
         requires (!Cfg.read_only)
     {
         try {
-            auto db = ::drogon::app().getDbClient();
-            ::drogon::orm::CoroMapper<Model> mapper(db);
-
-            std::optional<size_t> result;
-            if constexpr (std::is_same_v<Key, typename Model::PrimaryKeyType>) {
-                // Standard path - Key matches Model's PK type
-                result = co_await mapper.deleteByPrimaryKey(id);
-            } else {
-                // Partial key path - for partitioned tables
-                static_assert(HasPartialKey<Entity, Model, Key>,
-                    "Entity must provide makeKeyCriteria when Key differs from "
-                    "Model::PrimaryKeyType. Add '@relais primary_key db_managed' "
-                    "to the PK field.");
-
-                if (cachedHint) {
-                    // Entity available (from L1/L2 cache) -- full PK for partition pruning.
-                    // toModel() may skip db_managed fields (like auto-increment id),
-                    // so we also set the partial key to get a complete PK.
-                    auto model = Entity::toModel(*cachedHint);
-                    Entity::TraitsType::setPrimaryKeyOnModel(model, id);
-                    result = co_await mapper.deleteByPrimaryKey(
-                        model.getPrimaryKey());
-                } else {
-                    // No entity -- criteria-based (1 query, scans all partitions)
-                    result = co_await mapper.deleteBy(
-                        Entity::template makeKeyCriteria<Model>(id));
-                }
-            }
-
-            co_return result;
-
-        } catch (const ::drogon::orm::DrogonDbException& e) {
-            LOG_ERROR << name() << ": remove error - " << e.base().what();
+            auto affected = co_await DbProvider::executeArgs(
+                Mapping::SQL::delete_by_pk, id);
+            co_return static_cast<size_t>(affected);
+        } catch (const pqcoro::PgError& e) {
+            RELAIS_LOG_ERROR << name() << ": remove error - " << e.what();
             co_return std::nullopt;
         }
     }
@@ -271,84 +218,66 @@ public:
     // =====================================================================
 
     /// Partial update: modifies only the specified fields in the database.
-    /// Uses Drogon's dirty-flag tracking to generate SET only for given fields.
+    /// Builds UPDATE ... SET col=$1, ... WHERE pk=$N RETURNING * (single query).
     /// Returns the re-fetched entity from DB (nullptr on error or not found).
-    /// Compile-time error if Cfg.read_only is true or Entity lacks TraitsType.
     template<typename... Updates>
-    static ::drogon::Task<WrapperPtrType> updateBy(const Key& id, Updates&&... updates)
+    static pqcoro::Task<WrapperPtrType> updateBy(const Key& id, Updates&&... updates)
         requires HasFieldUpdate<Entity> && (!Cfg.read_only)
     {
         static_assert(sizeof...(Updates) > 0, "updateBy requires at least one field update");
 
         try {
-            auto db = ::drogon::app().getDbClient();
+            // Build SQL at first call (thread-safe static init).
+            // Field values are $1..$N, PK is $N+1.
+            static const auto sql = detail::buildUpdateReturning(
+                Mapping::table_name,
+                Mapping::primary_key_column,
+                {wrapper::fieldColumnName<typename Entity::TraitsType>(updates)...});
 
-            if constexpr (std::is_same_v<Key, typename Model::PrimaryKeyType>) {
-                // Standard path: UPDATE ... RETURNING * (single DB query)
-                static const auto sql = detail::buildUpdateReturning(
-                    Model::tableName,
-                    Model::primaryKeyName,
-                    {wrapper::fieldColumnName<typename Entity::TraitsType>(updates)...});
+            // Build params: field values first, then PK at the end
+            auto params = pqcoro::PgParams::make(
+                wrapper::fieldValue<typename Entity::TraitsType>(
+                    std::forward<Updates>(updates))...,
+                id);
 
-                auto result = co_await db->execSqlCoro(
-                    sql,
-                    wrapper::fieldValue<typename Entity::TraitsType>(
-                        std::forward<Updates>(updates))...,
-                    id);
+            auto result = co_await DbProvider::queryParams(sql.c_str(), params);
+            if (result.empty()) co_return nullptr;
 
-                if (result.empty()) co_return nullptr;
-                Model model(result[0], static_cast<ssize_t>(-1));
-                auto entity = Entity::fromModel(model);
-                co_return entity ? std::make_shared<const Entity>(std::move(*entity)) : nullptr;
+            auto entity = Entity::fromRow(result[0]);
+            co_return entity ? std::make_shared<const Entity>(std::move(*entity)) : nullptr;
 
-            } else {
-                // PartialKey: criteria-based update + re-fetch (2 queries)
-                ::drogon::orm::CoroMapper<Model> mapper(db);
-                auto criteria = Entity::template makeKeyCriteria<Model>(id);
-                std::vector<std::string> columns = {
-                    wrapper::fieldColumnName<typename Entity::TraitsType>(updates)...
-                };
-                co_await mapper.updateBy(columns, criteria,
-                    wrapper::fieldValue<typename Entity::TraitsType>(updates)...);
-                co_return co_await findById(id);
-            }
-
-        } catch (const ::drogon::orm::DrogonDbException& e) {
-            LOG_ERROR << name() << ": updateBy error - " << e.base().what();
+        } catch (const pqcoro::PgError& e) {
+            RELAIS_LOG_ERROR << name() << ": updateBy error - " << e.what();
             co_return nullptr;
         }
     }
 
     // =====================================================================
-    // List invalidation pass-through (public interface)
+    // Invalidation pass-through (public interface)
     // =====================================================================
 
-    /// Invalidate cache for a key. No-op at BaseRepository level (no cache to invalidate).
-    /// Exists so that any repository can be a cross-invalidation target.
-    static ::drogon::Task<void> invalidate([[maybe_unused]] const Key& id) {
+    /// Invalidate cache for a key. No-op at BaseRepository level.
+    static pqcoro::Task<void> invalidate([[maybe_unused]] const Key& id) {
         co_return;
     }
 
     /// Build a group key from key parts.
-    /// Public wrapper for use by InvalidateListVia resolvers.
     template<typename... GroupArgs>
     static std::string makeGroupKey(GroupArgs&&... groupParts) {
         return makeListGroupKey(std::forward<GroupArgs>(groupParts)...);
     }
 
     /// Selectively invalidate list pages for a pre-built group key.
-    /// No-op at BaseRepository level (no cache to invalidate).
-    static ::drogon::Task<size_t> invalidateListGroupByKey(
+    /// No-op at BaseRepository level.
+    static pqcoro::Task<size_t> invalidateListGroupByKey(
         [[maybe_unused]] const std::string& groupKey,
         [[maybe_unused]] int64_t entity_sort_val)
     {
         co_return 0;
     }
 
-    /// Invalidate all list cache groups for this repository.
-    /// No-op at BaseRepository level (no cache to invalidate).
-    /// Used by InvalidateListVia when resolver returns nullopt (full pattern).
-    static ::drogon::Task<size_t> invalidateAllListGroups()
+    /// Invalidate all list cache groups. No-op at BaseRepository level.
+    static pqcoro::Task<size_t> invalidateAllListGroups()
     {
         co_return 0;
     }
@@ -365,7 +294,6 @@ protected:
         return key;
     }
 
-    /// Build a group key for list tracking (without pagination params).
     template<typename... GroupArgs>
     static std::string makeListGroupKey(GroupArgs&&... groupParts) {
         std::string key = std::string(name()) + ":list";
@@ -375,7 +303,7 @@ protected:
 
     /// Execute a list query directly (no caching).
     template<typename QueryFn, typename... KeyArgs>
-    static ::drogon::Task<std::vector<Entity>> cachedList(
+    static pqcoro::Task<std::vector<Entity>> cachedList(
         QueryFn&& query,
         [[maybe_unused]] KeyArgs&&... keyParts)
     {
@@ -384,7 +312,7 @@ protected:
 
     /// Execute a tracked list query directly (no caching, no tracking).
     template<typename QueryFn, typename... GroupArgs>
-    static ::drogon::Task<std::vector<Entity>> cachedListTracked(
+    static pqcoro::Task<std::vector<Entity>> cachedListTracked(
         QueryFn&& query,
         [[maybe_unused]] int limit,
         [[maybe_unused]] int offset,
@@ -395,7 +323,7 @@ protected:
 
     /// Execute a tracked list query with header directly (no caching, no header).
     template<typename QueryFn, typename HeaderBuilder, typename... GroupArgs>
-    static ::drogon::Task<std::vector<Entity>> cachedListTrackedWithHeader(
+    static pqcoro::Task<std::vector<Entity>> cachedListTrackedWithHeader(
         QueryFn&& query,
         [[maybe_unused]] int limit,
         [[maybe_unused]] int offset,
@@ -405,29 +333,26 @@ protected:
         co_return co_await query();
     }
 
-    /// Invalidate all cached list pages for a group.
-    /// No-op at BaseRepository level (no cache to invalidate).
+    /// Invalidate all cached list pages for a group. No-op at base level.
     template<typename... GroupArgs>
-    static ::drogon::Task<size_t> invalidateListGroup(
+    static pqcoro::Task<size_t> invalidateListGroup(
         [[maybe_unused]] GroupArgs&&... groupParts)
     {
         co_return 0;
     }
 
-    /// Selectively invalidate list pages based on a sort value.
-    /// No-op at BaseRepository level.
+    /// Selectively invalidate list pages based on a sort value. No-op at base level.
     template<typename... GroupArgs>
-    static ::drogon::Task<size_t> invalidateListGroupSelective(
+    static pqcoro::Task<size_t> invalidateListGroupSelective(
         [[maybe_unused]] int64_t entity_sort_val,
         [[maybe_unused]] GroupArgs&&... groupParts)
     {
         co_return 0;
     }
 
-    /// Selectively invalidate list pages based on old and new sort values.
-    /// No-op at BaseRepository level.
+    /// Selectively invalidate list pages based on old and new sort values. No-op.
     template<typename... GroupArgs>
-    static ::drogon::Task<size_t> invalidateListGroupSelectiveUpdate(
+    static pqcoro::Task<size_t> invalidateListGroupSelectiveUpdate(
         [[maybe_unused]] int64_t old_sort_val,
         [[maybe_unused]] int64_t new_sort_val,
         [[maybe_unused]] GroupArgs&&... groupParts)
@@ -437,37 +362,34 @@ protected:
 
     /// Execute a list query and return as a custom list entity (no caching).
     template<typename ListEntity, typename QueryFn, typename... KeyArgs>
-    static ::drogon::Task<ListEntity> cachedListAs(
+    static pqcoro::Task<ListEntity> cachedListAs(
         QueryFn&& query,
         [[maybe_unused]] KeyArgs&&... keyParts)
     {
-        auto models = co_await query();
-        co_return ListEntity::fromModels(models);
+        co_return co_await query();
     }
 
     /// Execute a tracked list query and return as a custom list entity (no caching).
     template<typename ListEntity, typename QueryFn, typename... GroupArgs>
-    static ::drogon::Task<ListEntity> cachedListAsTracked(
+    static pqcoro::Task<ListEntity> cachedListAsTracked(
         QueryFn&& query,
         [[maybe_unused]] int limit,
         [[maybe_unused]] int offset,
         [[maybe_unused]] GroupArgs&&... groupParts)
     {
-        auto models = co_await query();
-        co_return ListEntity::fromModels(models);
+        co_return co_await query();
     }
 
-    /// Execute a tracked list query with header and return as a custom list entity (no caching).
+    /// Execute a tracked list query with header as custom list entity (no caching).
     template<typename ListEntity, typename QueryFn, typename HeaderBuilder, typename... GroupArgs>
-    static ::drogon::Task<ListEntity> cachedListAsTrackedWithHeader(
+    static pqcoro::Task<ListEntity> cachedListAsTrackedWithHeader(
         QueryFn&& query,
         [[maybe_unused]] int limit,
         [[maybe_unused]] int offset,
         [[maybe_unused]] HeaderBuilder&& headerBuilder,
         [[maybe_unused]] GroupArgs&&... groupParts)
     {
-        auto models = co_await query();
-        co_return ListEntity::fromModels(models);
+        co_return co_await query();
     }
 
     template<typename T>
@@ -482,4 +404,4 @@ protected:
 
 }  // namespace jcailloux::relais
 
-#endif //JCX_DROGON_BASEREPOSITORY_H
+#endif //JCX_RELAIS_BASEREPOSITORY_H

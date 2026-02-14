@@ -1,5 +1,5 @@
-#ifndef JCX_DROGON_REPOSITORY_CONFIG_H
-#define JCX_DROGON_REPOSITORY_CONFIG_H
+#ifndef JCX_RELAIS_REPOSITORY_CONFIG_H
+#define JCX_RELAIS_REPOSITORY_CONFIG_H
 
 #include <chrono>
 #include "jcailloux/relais/config/Duration.h"
@@ -103,4 +103,4 @@ namespace jcailloux::relais::config {
 
 }  // namespace jcailloux::relais::config
 
-#endif //JCX_DROGON_REPOSITORY_CONFIG_H
+#endif //JCX_RELAIS_REPOSITORY_CONFIG_H

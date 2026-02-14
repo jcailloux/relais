@@ -1,11 +1,11 @@
-#ifndef JCX_DROGON_PARTIALKEYVALIDATOR_H
-#define JCX_DROGON_PARTIALKEYVALIDATOR_H
+#ifndef JCX_RELAIS_PARTIALKEYVALIDATOR_H
+#define JCX_RELAIS_PARTIALKEYVALIDATOR_H
 
 #include <string>
 #include <vector>
-#include <drogon/utils/coroutine.h>
-#include <drogon/HttpAppFramework.h>
-#include <trantor/utils/Logger.h>
+#include "pqcoro/Task.h"
+#include "jcailloux/relais/DbProvider.h"
+#include "jcailloux/relais/Log.h"
 
 namespace jcailloux::relais {
 
@@ -34,15 +34,13 @@ public:
      * @param keyColumn The column name used as partial key
      * @return ValidationResult with valid=true if column uses sequence or is UUID type
      */
-    static ::drogon::Task<ValidationResult> validateKeyUsesSequenceOrUuid(
+    static pqcoro::Task<ValidationResult> validateKeyUsesSequenceOrUuid(
         const std::string& tableName,
         const std::string& keyColumn
     ) {
-        auto db = ::drogon::app().getDbClient();
-
         // Check for sequence default (SERIAL/BIGSERIAL)
         try {
-            auto seqResult = co_await db->execSqlCoro(R"(
+            auto seqResult = co_await DbProvider::queryArgs(R"(
                 SELECT pg_get_expr(d.adbin, d.adrelid) as default_expr
                 FROM pg_attribute a
                 JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
@@ -50,20 +48,20 @@ public:
                 WHERE c.relname = $1 AND a.attname = $2
             )", tableName, keyColumn);
 
-            if (!seqResult.empty() && !seqResult[0]["default_expr"].isNull()) {
-                auto defaultExpr = seqResult[0]["default_expr"].as<std::string>();
+            if (seqResult.rows() > 0 && !seqResult[0].isNull(0)) {
+                auto defaultExpr = seqResult[0].get<std::string>(0);
                 if (defaultExpr.find("nextval(") != std::string::npos) {
                     co_return ValidationResult{true, "Column uses SEQUENCE (globally unique)"};
                 }
             }
         } catch (const std::exception& e) {
-            LOG_WARN << "PartialKeyValidator: Failed to check sequence for "
+            RELAIS_LOG_WARN << "PartialKeyValidator: Failed to check sequence for "
                      << tableName << "." << keyColumn << ": " << e.what();
         }
 
         // Check for UUID type
         try {
-            auto typeResult = co_await db->execSqlCoro(R"(
+            auto typeResult = co_await DbProvider::queryArgs(R"(
                 SELECT t.typname
                 FROM pg_attribute a
                 JOIN pg_type t ON t.oid = a.atttypid
@@ -71,14 +69,14 @@ public:
                 WHERE c.relname = $1 AND a.attname = $2
             )", tableName, keyColumn);
 
-            if (!typeResult.empty()) {
-                auto typeName = typeResult[0]["typname"].as<std::string>();
+            if (typeResult.rows() > 0) {
+                auto typeName = typeResult[0].get<std::string>(0);
                 if (typeName == "uuid") {
                     co_return ValidationResult{true, "Column is UUID type (practically unique)"};
                 }
             }
         } catch (const std::exception& e) {
-            LOG_WARN << "PartialKeyValidator: Failed to check type for "
+            RELAIS_LOG_WARN << "PartialKeyValidator: Failed to check type for "
                      << tableName << "." << keyColumn << ": " << e.what();
         }
 
@@ -99,16 +97,14 @@ public:
      * @param templateKeyColumns Columns used in the repository Key template
      * @return ValidationResult indicating if the configuration is valid
      */
-    static ::drogon::Task<ValidationResult> validatePartitionColumns(
+    static pqcoro::Task<ValidationResult> validatePartitionColumns(
         const std::string& tableName,
         const std::vector<std::string>& templateKeyColumns
     ) {
-        auto db = ::drogon::app().getDbClient();
-
         // Get partition columns
         std::vector<std::string> partitionCols;
         try {
-            auto partResult = co_await db->execSqlCoro(R"(
+            auto partResult = co_await DbProvider::queryArgs(R"(
                 SELECT a.attname
                 FROM pg_partitioned_table pt
                 JOIN pg_class c ON c.oid = pt.partrelid
@@ -116,8 +112,8 @@ public:
                 WHERE c.relname = $1
             )", tableName);
 
-            for (const auto& row : partResult) {
-                partitionCols.push_back(row["attname"].as<std::string>());
+            for (int i = 0; i < partResult.rows(); ++i) {
+                partitionCols.push_back(partResult[i].get<std::string>(0));
             }
         } catch (const std::exception& e) {
             // Table might not be partitioned - that's OK
@@ -131,7 +127,7 @@ public:
         // Get PK columns
         std::vector<std::string> pkCols;
         try {
-            auto pkResult = co_await db->execSqlCoro(R"(
+            auto pkResult = co_await DbProvider::queryArgs(R"(
                 SELECT a.attname
                 FROM pg_index i
                 JOIN pg_class c ON c.oid = i.indrelid
@@ -139,8 +135,8 @@ public:
                 WHERE c.relname = $1 AND i.indisprimary
             )", tableName);
 
-            for (const auto& row : pkResult) {
-                pkCols.push_back(row["attname"].as<std::string>());
+            for (int i = 0; i < pkResult.rows(); ++i) {
+                pkCols.push_back(pkResult[i].get<std::string>(0));
             }
         } catch (const std::exception& e) {
             co_return ValidationResult{false, "Failed to get PK columns: " + std::string(e.what())};
@@ -191,23 +187,23 @@ public:
      * @param keyColumn The column used as partial key
      * @return true if all validations pass
      */
-    static ::drogon::Task<bool> validateAll(
+    static pqcoro::Task<bool> validateAll(
         const std::string& tableName,
         const std::string& keyColumn
     ) {
         auto seqResult = co_await validateKeyUsesSequenceOrUuid(tableName, keyColumn);
         if (!seqResult.valid) {
-            LOG_ERROR << "PartialKeyValidator [" << tableName << "]: " << seqResult.reason;
+            RELAIS_LOG_ERROR << "PartialKeyValidator [" << tableName << "]: " << seqResult.reason;
             co_return false;
         }
-        LOG_INFO << "PartialKeyValidator [" << tableName << "]: " << seqResult.reason;
+        RELAIS_LOG_DEBUG << "PartialKeyValidator [" << tableName << "]: " << seqResult.reason;
 
         auto partResult = co_await validatePartitionColumns(tableName, {keyColumn});
         if (!partResult.valid) {
-            LOG_ERROR << "PartialKeyValidator [" << tableName << "]: " << partResult.reason;
+            RELAIS_LOG_ERROR << "PartialKeyValidator [" << tableName << "]: " << partResult.reason;
             co_return false;
         }
-        LOG_INFO << "PartialKeyValidator [" << tableName << "]: " << partResult.reason;
+        RELAIS_LOG_DEBUG << "PartialKeyValidator [" << tableName << "]: " << partResult.reason;
 
         co_return true;
     }
@@ -215,4 +211,4 @@ public:
 
 }  // namespace jcailloux::relais
 
-#endif  // JCX_DROGON_PARTIALKEYVALIDATOR_H
+#endif  // JCX_RELAIS_PARTIALKEYVALIDATOR_H

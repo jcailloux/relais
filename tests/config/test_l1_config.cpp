@@ -390,7 +390,7 @@ TEST_CASE("L1 Config - update_strategy",
         sync(LazyReloadRepo::findById(id));
 
         // Update
-        auto updated = makeTestItem("lazy_updated", 20, std::nullopt, true, id);
+        auto updated = makeTestItem("lazy_updated", 20, "", true, id);
         sync(LazyReloadRepo::update(id, updated));
 
         // Next read fetches from DB (cache was invalidated)
@@ -406,7 +406,7 @@ TEST_CASE("L1 Config - update_strategy",
         sync(PopImmediateRepo::findById(id));
 
         // Update
-        auto updated = makeTestItem("pop_updated", 20, std::nullopt, true, id);
+        auto updated = makeTestItem("pop_updated", 20, "", true, id);
         sync(PopImmediateRepo::update(id, updated));
 
         // Modify DB directly

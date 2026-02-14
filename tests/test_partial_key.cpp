@@ -33,13 +33,12 @@ using L1EventAsTargetRepository = Repository<TestEventWrapper, "test:event:l1:ta
 
 // Async resolver: given a user_id, find event IDs for that user
 struct PurchaseToEventResolver {
-    static ::drogon::Task<std::vector<int64_t>> resolve(int64_t user_id) {
-        auto db = ::drogon::app().getDbClient();
-        auto result = co_await db->execSqlCoro(
+    static pqcoro::Task<std::vector<int64_t>> resolve(int64_t user_id) {
+        auto result = co_await jcailloux::relais::DbProvider::queryArgs(
             "SELECT id FROM relais_test_events WHERE user_id = $1", user_id);
         std::vector<int64_t> ids;
-        for (const auto& row : result) {
-            ids.push_back(row["id"].as<int64_t>());
+        for (size_t i = 0; i < result.rows(); ++i) {
+            ids.push_back(result[i].get<int64_t>(0));
         }
         co_return ids;
     }
@@ -548,7 +547,7 @@ TEST_CASE("PartialKey - serialization",
 //
 // #############################################################################
 
-using jcailloux::drogon::wrapper::set;
+using jcailloux::relais::wrapper::set;
 using EF = TestEventWrapper::Field;
 
 TEST_CASE("PartialKey<TestEvent> - updateBy (Uncached)",
@@ -594,10 +593,10 @@ TEST_CASE("PartialKey<TestEvent> - updateBy (Uncached)",
         CHECK(result->region == "eu");
 
         // Independent verification via raw SQL
-        auto dbResult = getDb()->execSqlSync(
+        auto dbResult = execQueryArgs(
             "SELECT region FROM relais_test_events WHERE id = $1", eventId);
-        REQUIRE(dbResult.size() == 1);
-        CHECK(dbResult[0]["region"].as<std::string>() == "eu");
+        REQUIRE(dbResult.rows() == 1);
+        CHECK(dbResult[0].get<std::string>(0) == "eu");
     }
 
     SECTION("[updateBy] returns re-fetched entity with all fields") {

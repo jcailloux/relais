@@ -1,14 +1,14 @@
 #ifndef CODIBOT_LISTCACHEREPOSITORY_H
 #define CODIBOT_LISTCACHEREPOSITORY_H
 
-#include <drogon/utils/coroutine.h>
 #include <memory>
-#include <trantor/utils/Logger.h>
 
+#include "pqcoro/Task.h"
+#include "jcailloux/relais/Log.h"
 #include "ListCache.h"
 #include "ListCacheTraits.h"
 
-namespace jcailloux::drogon::cache::list {
+namespace jcailloux::relais::cache::list {
 
 // =============================================================================
 // ListCacheRepository - Mixin that adds ListCache support to repositories
@@ -21,7 +21,7 @@ namespace jcailloux::drogon::cache::list {
 //   {
 //       using ListMixin = cache::list::ListCacheRepository<...>;
 //   public:
-//       static drogon::Task<ListResult> findItems(ListQuery query) {
+//       static pqcoro::Task<ListResult> findItems(ListQuery query) {
 //           co_return co_await cachedListQuery(std::move(query), [&]() {
 //               return queryFromDb(query);
 //           });
@@ -42,7 +42,7 @@ public:
     /// Prime the ListCache with dummy operations to force internal allocations.
     /// Called by CachedRepository::warmup() automatically.
     static void warmupListCache() {
-        LOG_DEBUG << Derived::name() << ": warmupListCache() called";
+        RELAIS_LOG_DEBUG << Derived::name() << ": warmupListCache() called";
 
         auto& lc = listCache();
 
@@ -56,7 +56,7 @@ public:
         lc.onEntityCreated(nullptr);
         lc.fullCleanup();
 
-        LOG_DEBUG << Derived::name() << ": warmupListCache() complete";
+        RELAIS_LOG_DEBUG << Derived::name() << ": warmupListCache() complete";
     }
 
 protected:
@@ -78,7 +78,7 @@ protected:
     /// Execute a list query with caching
     /// Returns shared_ptr to cached result (nullptr if not found and DB query fails)
     template<typename QueryFn>
-    static ::drogon::Task<ListResultPtr> cachedListQuery(ListQuery query, QueryFn&& dbQuery) {
+    static pqcoro::Task<ListResultPtr> cachedListQuery(ListQuery query, QueryFn&& dbQuery) {
 #ifndef NDEBUG
         using Clock = std::chrono::steady_clock;
         auto t0 = Clock::now();
@@ -125,7 +125,7 @@ protected:
 #ifndef NDEBUG
         auto t4 = Clock::now();
         auto us = [](auto d) { return std::chrono::duration_cast<std::chrono::microseconds>(d).count(); };
-        LOG_DEBUG << Derived::name() << " ListCache timing: "
+        RELAIS_LOG_DEBUG << Derived::name() << " ListCache timing: "
                   << "cache_get=" << us(t1 - t0) << "µs, "
                   << "db_query=" << us(t2 - t1) << "µs, "
                   << "build_result=" << us(t3 - t2) << "µs, "
@@ -196,6 +196,6 @@ protected:
 #define LISTCACHE_NOTIFY_DELETED(entity_ptr) \
     ListMixin::notifyDeleted((entity_ptr))
 
-}  // namespace jcailloux::drogon::cache::list
+}  // namespace jcailloux::relais::cache::list
 
 #endif  // CODIBOT_LISTCACHEREPOSITORY_H

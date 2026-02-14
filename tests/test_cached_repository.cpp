@@ -83,13 +83,12 @@ using L1InvTestPurchaseRepository = Repository<TestPurchaseWrapper, "test:purcha
  * Async resolver: given a user_id, finds all article IDs by that author.
  */
 struct L1UserArticleResolver {
-    static ::drogon::Task<std::vector<int64_t>> resolve(int64_t user_id) {
-        auto db = ::drogon::app().getDbClient();
-        auto result = co_await db->execSqlCoro(
+    static pqcoro::Task<std::vector<int64_t>> resolve(int64_t user_id) {
+        auto result = co_await jcailloux::relais::DbProvider::queryArgs(
             "SELECT id FROM relais_test_articles WHERE author_id = $1", user_id);
         std::vector<int64_t> ids;
-        for (const auto& row : result) {
-            ids.push_back(row["id"].as<int64_t>());
+        for (size_t i = 0; i < result.rows(); ++i) {
+            ids.push_back(result[i].get<int64_t>(0));
         }
         co_return ids;
     }
@@ -111,7 +110,7 @@ using L1CustomTestPurchaseRepository = Repository<TestPurchaseWrapper, "test:pur
  */
 class L1PurchaseListInvalidator {
 public:
-    static ::drogon::Task<void> onEntityModified(
+    static pqcoro::Task<void> onEntityModified(
         std::shared_ptr<const TestPurchaseWrapper>)
     {
         TestInternals::resetListCacheState<TestPurchaseListRepository>();
@@ -151,14 +150,14 @@ public:
         all_groups_invalidated = false;
     }
 
-    static ::drogon::Task<size_t> invalidateByTarget(
+    static pqcoro::Task<size_t> invalidateByTarget(
         const GroupKey& gk, std::optional<int64_t> sort_value)
     {
         invocations.push_back({gk.category, sort_value});
         co_return 1;
     }
 
-    static ::drogon::Task<size_t> invalidateAllListGroups() {
+    static pqcoro::Task<size_t> invalidateAllListGroups() {
         all_groups_invalidated = true;
         co_return 1;
     }
@@ -169,22 +168,21 @@ public:
 // =============================================================================
 
 using L1MockGroupKey = L1MockArticleListRepo::GroupKey;
-using L1MockTarget = jcailloux::drogon::cache::ListInvalidationTarget<L1MockGroupKey>;
+using L1MockTarget = jcailloux::relais::cache::ListInvalidationTarget<L1MockGroupKey>;
 
 /**
  * Per-page resolver: returns targets WITH sort_value → per-page invalidation.
  */
 struct L1PerPageResolver {
-    static ::drogon::Task<std::vector<L1MockTarget>> resolve(int64_t user_id) {
-        auto db = ::drogon::app().getDbClient();
-        auto rows = co_await db->execSqlCoro(
+    static pqcoro::Task<std::vector<L1MockTarget>> resolve(int64_t user_id) {
+        auto result = co_await jcailloux::relais::DbProvider::queryArgs(
             "SELECT category, view_count FROM relais_test_articles WHERE author_id = $1",
             user_id);
         std::vector<L1MockTarget> targets;
-        for (const auto& row : rows) {
+        for (size_t i = 0; i < result.rows(); ++i) {
             L1MockTarget t;
-            t.filters.category = row["category"].as<std::string>();
-            t.sort_value = row["view_count"].as<int64_t>();
+            t.filters.category = result[i].get<std::string>(0);
+            t.sort_value = result[i].get<int64_t>(1);
             targets.push_back(std::move(t));
         }
         co_return targets;
@@ -195,15 +193,14 @@ struct L1PerPageResolver {
  * Per-group resolver: returns targets WITHOUT sort_value → per-group invalidation.
  */
 struct L1PerGroupResolver {
-    static ::drogon::Task<std::vector<L1MockTarget>> resolve(int64_t user_id) {
-        auto db = ::drogon::app().getDbClient();
-        auto rows = co_await db->execSqlCoro(
+    static pqcoro::Task<std::vector<L1MockTarget>> resolve(int64_t user_id) {
+        auto result = co_await jcailloux::relais::DbProvider::queryArgs(
             "SELECT DISTINCT category FROM relais_test_articles WHERE author_id = $1",
             user_id);
         std::vector<L1MockTarget> targets;
-        for (const auto& row : rows) {
+        for (size_t i = 0; i < result.rows(); ++i) {
             L1MockTarget t;
-            t.filters.category = row["category"].as<std::string>();
+            t.filters.category = result[i].get<std::string>(0);
             // No sort_value → per-group invalidation
             targets.push_back(std::move(t));
         }
@@ -215,7 +212,7 @@ struct L1PerGroupResolver {
  * Full pattern resolver: returns nullopt → all groups invalidated.
  */
 struct L1FullPatternResolver {
-    static ::drogon::Task<std::optional<std::vector<L1MockTarget>>> resolve(
+    static pqcoro::Task<std::optional<std::vector<L1MockTarget>>> resolve(
         [[maybe_unused]] int64_t user_id)
     {
         co_return std::nullopt;
@@ -226,22 +223,21 @@ struct L1FullPatternResolver {
  * Mixed resolver: per-page for "tech", per-group for other categories.
  */
 struct L1MixedResolver {
-    static ::drogon::Task<std::vector<L1MockTarget>> resolve(int64_t user_id) {
-        auto db = ::drogon::app().getDbClient();
-        auto rows = co_await db->execSqlCoro(
+    static pqcoro::Task<std::vector<L1MockTarget>> resolve(int64_t user_id) {
+        auto result = co_await jcailloux::relais::DbProvider::queryArgs(
             "SELECT category, view_count FROM relais_test_articles WHERE author_id = $1",
             user_id);
         std::vector<L1MockTarget> targets;
         std::set<std::string> seen;
 
-        for (const auto& row : rows) {
-            auto category = row["category"].as<std::string>();
+        for (size_t i = 0; i < result.rows(); ++i) {
+            auto category = result[i].get<std::string>(0);
 
             if (category == "tech") {
                 // Per-page: include sort_value
                 L1MockTarget t;
                 t.filters.category = category;
-                t.sort_value = row["view_count"].as<int64_t>();
+                t.sort_value = result[i].get<int64_t>(1);
                 targets.push_back(std::move(t));
             } else if (seen.insert(category).second) {
                 // Per-group: no sort_value, deduplicated
@@ -300,7 +296,7 @@ using L1ReadOnlyInvPurchaseRepository = Repository<TestPurchaseWrapper, "test:pu
 
 } // namespace relais_test
 
-using jcailloux::drogon::wrapper::set;
+using jcailloux::relais::wrapper::set;
 using F = TestUserWrapper::Field;
 
 
@@ -387,7 +383,7 @@ TEST_CASE("CachedRepository<TestItem> - update",
         sync(L1TestItemRepository::findById(id));
 
         // Update through repo (invalidates L1, writes to DB)
-        auto success = sync(L1TestItemRepository::update(id, makeTestItem("Updated", 2, std::nullopt, true, id)));
+        auto success = sync(L1TestItemRepository::update(id, makeTestItem("Updated", 2, "", true, id)));
         REQUIRE(success);
 
         // Modify again directly in DB
@@ -575,7 +571,7 @@ TEST_CASE("CachedRepository - WriteThrough config",
         sync(WriteThroughTestItemRepository::findById(id));
 
         // Update through repo (PopulateImmediately strategy)
-        sync(WriteThroughTestItemRepository::update(id, makeTestItem("Updated WT", 2, std::nullopt, true, id)));
+        sync(WriteThroughTestItemRepository::update(id, makeTestItem("Updated WT", 2, "", true, id)));
 
         // Modify in DB directly (bypass cache)
         updateTestItem(id, "DB Direct", 99);

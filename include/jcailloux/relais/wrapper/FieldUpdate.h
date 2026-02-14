@@ -1,12 +1,10 @@
-#ifndef JCX_DROGON_WRAPPER_FIELD_UPDATE_H
-#define JCX_DROGON_WRAPPER_FIELD_UPDATE_H
+#ifndef JCX_RELAIS_WRAPPER_FIELD_UPDATE_H
+#define JCX_RELAIS_WRAPPER_FIELD_UPDATE_H
 
 #include <string>
 #include <type_traits>
 
-#include <trantor/utils/Date.h>
-
-namespace jcailloux::drogon::wrapper {
+namespace jcailloux::relais::wrapper {
 
 // =============================================================================
 // FieldUpdate / FieldSetNull — typed field update descriptors for updateBy
@@ -36,40 +34,7 @@ auto setNull() {
 }
 
 // =============================================================================
-// applyFieldUpdate — applies a single FieldUpdate to a Drogon model
-// =============================================================================
-
-/// Apply a value update: dispatches via Traits::FieldInfo<F> to the model setter.
-template<typename Traits, auto F, typename V>
-void applyFieldUpdate(typename Traits::Model& model, const FieldUpdate<F, V>& update) {
-    using Info = typename Traits::template FieldInfo<F>;
-
-    if constexpr (Info::is_timestamp) {
-        if constexpr (std::is_convertible_v<V, std::string>) {
-            (model.*Info::setter)(
-                ::trantor::Date::fromDbStringLocal(update.value));
-        } else if constexpr (std::is_same_v<std::decay_t<V>, ::trantor::Date>) {
-            (model.*Info::setter)(update.value);
-        } else {
-            static_assert(std::is_convertible_v<V, std::string>,
-                "Timestamp fields require a string or trantor::Date value");
-        }
-    } else {
-        (model.*Info::setter)(
-            static_cast<typename Info::value_type>(update.value));
-    }
-}
-
-/// Apply a setNull: calls the setToNull method on the model.
-template<typename Traits, auto F>
-void applyFieldUpdate(typename Traits::Model& model, const FieldSetNull<F>&) {
-    using Info = typename Traits::template FieldInfo<F>;
-    static_assert(Info::is_nullable, "setNull<F>() can only be used on nullable fields");
-    (model.*Info::setToNull)();
-}
-
-// =============================================================================
-// fieldColumnName / fieldValue — extractors for criteria-based updateBy
+// fieldColumnName / fieldValue — extractors for SQL binding in updateBy
 // =============================================================================
 
 /// Extract quoted column name from a FieldUpdate.
@@ -85,25 +50,25 @@ std::string fieldColumnName(const FieldSetNull<F>&) {
 }
 
 /// Extract properly-typed value for SQL binding from a FieldUpdate.
+/// Timestamps are stored as strings — no conversion needed.
 template<typename Traits, auto F, typename V>
 auto fieldValue(const FieldUpdate<F, V>& update) {
     using Info = typename Traits::template FieldInfo<F>;
     if constexpr (Info::is_timestamp) {
-        if constexpr (std::is_same_v<std::decay_t<V>, ::trantor::Date>) {
-            return update.value;
-        } else {
-            return ::trantor::Date::fromDbStringLocal(std::string(update.value));
-        }
+        return std::string(update.value);
     } else {
         return static_cast<typename Info::value_type>(update.value);
     }
 }
 
+/// Extract NULL value for SQL binding from a FieldSetNull.
 template<typename Traits, auto F>
 std::nullptr_t fieldValue(const FieldSetNull<F>&) {
+    static_assert(Traits::template FieldInfo<F>::is_nullable,
+        "setNull<F>() can only be used on nullable fields");
     return nullptr;
 }
 
-}  // namespace jcailloux::drogon::wrapper
+}  // namespace jcailloux::relais::wrapper
 
-#endif  // JCX_DROGON_WRAPPER_FIELD_UPDATE_H
+#endif  // JCX_RELAIS_WRAPPER_FIELD_UPDATE_H

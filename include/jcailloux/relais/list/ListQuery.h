@@ -10,7 +10,7 @@
 #include <vector>
 #include <glaze/glaze.hpp>
 
-namespace jcailloux::drogon::cache::list {
+namespace jcailloux::relais::cache::list {
 
 // =============================================================================
 // SortDirection - Ascending or Descending
@@ -190,20 +190,20 @@ struct CachedListResult {
     [[nodiscard]] size_t size() const noexcept { return items.size(); }
 };
 
-}  // namespace jcailloux::drogon::cache::list
+}  // namespace jcailloux::relais::cache::list
 
 // =============================================================================
 // Glaze metadata for serialization
 // =============================================================================
 
 template<>
-struct glz::meta<jcailloux::drogon::cache::list::SortDirection> {
-    using enum jcailloux::drogon::cache::list::SortDirection;
+struct glz::meta<jcailloux::relais::cache::list::SortDirection> {
+    using enum jcailloux::relais::cache::list::SortDirection;
     static constexpr auto value = enumerate(Asc, Desc);
 };
 
 template<>
-struct glz::meta<jcailloux::drogon::cache::list::Cursor> {
+struct glz::meta<jcailloux::relais::cache::list::Cursor> {
     static constexpr auto value = object(
         "data", [](auto& self) -> auto& {
             // Serialize as base64 string

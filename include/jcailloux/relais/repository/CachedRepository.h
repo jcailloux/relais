@@ -1,11 +1,13 @@
-#ifndef JCX_DROGON_CACHEDREPOSITORY_H
-#define JCX_DROGON_CACHEDREPOSITORY_H
+#ifndef JCX_RELAIS_CACHEDREPOSITORY_H
+#define JCX_RELAIS_CACHEDREPOSITORY_H
 
 #include <atomic>
 #include <chrono>
 #include <memory>
 #include <type_traits>
+#include "pqcoro/Task.h"
 #include "jcailloux/relais/repository/RedisRepository.h"
+#include "jcailloux/relais/Log.h"
 #include <jcailloux/shardmap/ShardMap.h>
 #include "jcailloux/relais/config/repository_config.h"
 
@@ -79,7 +81,7 @@ struct EntityCacheMetadata {
  * eager evaluation issues with std::conditional_t.
  */
 template<typename Entity, config::FixedString Name, config::CacheConfig Cfg, typename Key>
-requires CacheableEntity<Entity, typename Entity::Model>
+requires CacheableEntity<Entity>
 class CachedRepository : public std::conditional_t<
     Cfg.cache_level == config::CacheLevel::L1,
     BaseRepository<Entity, Name, Cfg, Key>,
@@ -93,13 +95,12 @@ class CachedRepository : public std::conditional_t<
         BaseRepository<Entity, Name, Cfg, Key>
     >;
 
-    using Model = typename Entity::Model;
+    using Mapping = typename Entity::MappingType;
     using Clock = std::chrono::steady_clock;
     using Metadata = EntityCacheMetadata<Cfg.l1_refresh_on_get>;
 
 public:
     using typename Base::EntityType;
-    using typename Base::ModelType;
     using typename Base::KeyType;
     using typename Base::WrapperType;
     using typename Base::WrapperPtrType;
@@ -116,7 +117,7 @@ public:
 
     /// Find by ID with L1 -> (L2) -> DB fallback.
     /// Returns shared_ptr to immutable entity (nullptr if not found).
-    static ::drogon::Task<WrapperPtrType> findById(const Key& id) {
+    static pqcoro::Task<WrapperPtrType> findById(const Key& id) {
         if (auto cached = getFromCache(id)) {
             co_return cached;
         }
@@ -130,7 +131,7 @@ public:
 
     /// Find by ID and return raw JSON string.
     /// Returns shared_ptr to JSON string (nullptr if not found).
-    static ::drogon::Task<std::shared_ptr<const std::string>> findByIdAsJson(const Key& id) {
+    static pqcoro::Task<std::shared_ptr<const std::string>> findByIdAsJson(const Key& id) {
         if (auto cached = getFromCache(id)) {
             co_return cached->toJson();
         }
@@ -155,8 +156,8 @@ public:
 
     /// Create entity and cache it. Returns shared_ptr to immutable entity.
     /// Compile-time error if Cfg.read_only is true.
-    static ::drogon::Task<WrapperPtrType> create(WrapperPtrType wrapper)
-        requires CreatableEntity<Entity, Model, Key> && (!Cfg.read_only)
+    static pqcoro::Task<WrapperPtrType> create(WrapperPtrType wrapper)
+        requires CreatableEntity<Entity, Key> && (!Cfg.read_only)
     {
         auto inserted = co_await Base::create(wrapper);
         if (inserted) {
@@ -170,8 +171,8 @@ public:
     /// Update entity in database with L1 cache handling.
     /// Returns true on success, false on error.
     /// Compile-time error if Cfg.read_only is true.
-    static ::drogon::Task<bool> update(const Key& id, WrapperPtrType wrapper)
-        requires MutableEntity<Entity, Model> && (!Cfg.read_only)
+    static pqcoro::Task<bool> update(const Key& id, WrapperPtrType wrapper)
+        requires MutableEntity<Entity> && (!Cfg.read_only)
     {
         using enum config::UpdateStrategy;
 
@@ -190,7 +191,7 @@ public:
     /// Partial update: invalidates L1 then delegates to Base::updateBy.
     /// Returns the re-fetched entity (nullptr on error or not found).
     template<typename... Updates>
-    static ::drogon::Task<WrapperPtrType> updateBy(const Key& id, Updates&&... updates)
+    static pqcoro::Task<WrapperPtrType> updateBy(const Key& id, Updates&&... updates)
         requires HasFieldUpdate<Entity> && (!Cfg.read_only)
     {
         invalidateL1Internal(id);
@@ -202,14 +203,10 @@ public:
     /// Invalidates L1 cache unless DB error occurred (self-healing).
     /// For PartialKey repos, provides L1 cache hint for partition pruning.
     /// Compile-time error if Cfg.read_only is true.
-    static ::drogon::Task<std::optional<size_t>> remove(const Key& id)
+    static pqcoro::Task<std::optional<size_t>> remove(const Key& id)
         requires (!Cfg.read_only)
     {
-        WrapperPtrType hint;
-        if constexpr (!std::is_same_v<Key, typename Model::PrimaryKeyType>) {
-            hint = getFromCache(id);  // Free L1 check, no DB
-        }
-        auto result = co_await Base::removeImpl(id, std::move(hint));
+        auto result = co_await Base::removeImpl(id, nullptr);
         if (result.has_value()) {
             invalidateL1Internal(id);
         }
@@ -217,7 +214,7 @@ public:
     }
 
     /// Invalidate L1 and L2 caches for a key.
-    static ::drogon::Task<void> invalidate(const Key& id) {
+    static pqcoro::Task<void> invalidate(const Key& id) {
         invalidateL1Internal(id);
         if constexpr (HasRedis) {
             co_await Base::invalidateRedis(id);
@@ -270,10 +267,10 @@ public:
     /// Prime L1 cache at startup.
     /// ListMixin overrides this via method hiding to also warm up the list cache.
     static void warmup() {
-        LOG_DEBUG << name() << ": warming up L1 cache...";
+        RELAIS_LOG_DEBUG << name() << ": warming up L1 cache...";
         // Ensure the static ShardMap instance is constructed.
         (void)cache();
-        LOG_DEBUG << name() << ": L1 cache primed";
+        RELAIS_LOG_DEBUG << name() << ": L1 cache primed";
     }
 
 protected:
@@ -350,4 +347,4 @@ protected:
 
 }  // namespace jcailloux::relais
 
-#endif //JCX_DROGON_CACHEDREPOSITORY_H
+#endif //JCX_RELAIS_CACHEDREPOSITORY_H
