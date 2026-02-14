@@ -15,7 +15,7 @@ A header-only C++23 repository pattern library for [Drogon](https://github.com/d
 - **Auto-detected list caching**: ListMixin activates when the entity's Mapping has an embedded `ListDescriptor`
 - **Smart invalidation**: Cross-cache dependency propagation via variadic `Invalidations...` pack
 - **Partial updates**: Type-safe `updateBy()` with compile-time field enum — updates only specified columns
-- **PartialKey auto-detection**: `makeKeyCriteria` generated into Mapping when PK is `db_managed`
+- **Partition key optimization**: `@relais partition_key` enables single-partition DELETE via cache hints (`HasPartitionKey` concept)
 - **Type-safe**: Hierarchical concepts (`ReadableEntity`, `CacheableEntity`, `MutableEntity`, `CreatableEntity`)
 - **Read-only enforcement**: Compile-time `requires` clause prevents create/update/delete on read-only repositories
 - **Annotation-based generator**: Auto-generate ORM mappings from `@relais` annotations in struct headers
@@ -87,18 +87,19 @@ template<> struct glz::meta<User> {
 };
 
 // 2. Generated Mapping (by generate_entities.py) provides:
-//    - fromModel<Entity>, toModel<Entity>, getPrimaryKey<Entity>
-//    - makeKeyCriteria<M>(key) (auto-generated when PK is db_managed)
+//    - fromRow<Entity>, toInsertParams<Entity>, getPrimaryKey<Entity>
+//    - SQL struct (select_by_pk, insert, update, delete_by_pk)
+//    - makeFullKeyParams (if partition_key annotation present)
 //    - TraitsType with Field enum + FieldInfo (for updateBy)
 //    - glaze_value (fallback Glaze metadata)
 //    - ListDescriptor (if filterable/sortable annotations present)
 
 // 3. EntityWrapper alias (generated):
-using UserWrapper = jcailloux::drogon::wrapper::EntityWrapper<User, generated::UserMapping>;
+using UserWrapper = jcailloux::relais::wrapper::EntityWrapper<User, generated::UserMapping>;
 // UserWrapper inherits from User and adds:
-// - fromModel/toModel (delegated to Mapping)
+// - fromRow/toInsertParams (delegated to Mapping)
 // - toBinary/toJson (thread-safe lazy BEVE/JSON via Glaze)
-// - getPrimaryKey, makeKeyCriteria (if db_managed PK)
+// - getPrimaryKey
 ```
 
 ### 2. Create your repository
@@ -151,30 +152,46 @@ If the entity has an embedded `ListDescriptor` (from `filterable`/`sortable` ann
 
 Key is auto-deduced from `Entity::getPrimaryKey()` return type.
 
-### PartialKey Repositories
+### Partition Key Repositories
 
-For tables with composite primary keys (e.g., PostgreSQL partitioned tables), the repository key can be a subset of the model's full PK. When `primary_key` is annotated with `db_managed`, the generator automatically emits `makeKeyCriteria` in the Mapping:
+For PostgreSQL partitioned tables with composite primary keys (e.g., `PRIMARY KEY (id, region) PARTITION BY LIST (region)`), the repository key can be a subset of the full PK. Annotate the partition column with `@relais partition_key`:
 
 ```cpp
-// Entity struct
-// @relais model=drogon_model::Event
+// @relais table=events
 // @relais output=entities/generated/EventWrapper.h
 struct Event {
     int64_t id = 0;         // @relais primary_key db_managed
-    std::string region;
+    std::string region;     // @relais partition_key
     std::string title;
 };
+```
 
-// Generated Mapping includes:
-//   template<typename M>
-//   static auto makeKeyCriteria(const auto& key) {
-//       return ::drogon::orm::Criteria(M::Cols::_id, key);
-//   }
+The generator produces:
+- `SQL::delete_by_pk`: `DELETE ... WHERE id = $1` (scans all partitions)
+- `SQL::delete_by_full_pk`: `DELETE ... WHERE id = $1 AND region = $2` (single partition)
+- `makeFullKeyParams(entity)`: extracts `(id, region)` as `PgParams`
 
+The `HasPartitionKey` concept auto-detects these capabilities. At runtime, `remove(id)` uses an **opportunistic hint** pattern:
+
+```
+CachedRepository::remove(id)
+  |-- hint = L1 cache lookup (~0ns, free)
+  v
+RedisRepository::removeImpl(id, hint)
+  |-- if no hint: try L2 Redis (~0.1ms)
+  v
+BaseRepository::removeImpl(id, hint)
+  |-- if hint: DELETE ... WHERE id=$1 AND region=$2  → 1 partition
+  |-- else:    DELETE ... WHERE id=$1                → N partitions
+```
+
+**Performance rule**: never add a DB round-trip just for partition pruning. Only use the full key when the entity is free (L1) or near-free (L2).
+
+```cpp
 // Repository — no special configuration needed
 using EventRepository = relais::Repository<EventWrapper, "Event", config::Both>;
-// Key = int64_t (from getPrimaryKey), Model PK = tuple<int64_t, string>
-// PartialKey path auto-detected (Key != Model::PrimaryKeyType)
+// Key = int64_t (from getPrimaryKey)
+// HasPartitionKey auto-detected from Mapping
 ```
 
 ### 3. Use the repository
@@ -361,18 +378,16 @@ Cache handling:
 - **RedisRepository**: L2 is invalidated before the update
 - The re-fetched entity repopulates caches on subsequent `findById` calls
 
-### PartialKey `updateBy`
+### Partition Key `updateBy`
 
-For PartialKey repositories (where `Key != Model::PrimaryKeyType`), the standard model dirty-flag approach is broken because `setPrimaryKeyOnModel` only sets the partial key, resulting in an incomplete composite PK. Instead, `updateBy` uses a **criteria-based** path via `CoroMapper::updateBy(columns, criteria, values)`:
+For partition key repositories, `updateBy` builds a dynamic `UPDATE ... WHERE pk=$N RETURNING *` using only the partial key. This is acceptable since the `id` column is indexed across all partitions. The `FieldInfo::column_name` is used to build the SET clause:
 
 ```cpp
-// Automatic: criteria-based for PartialKey, model dirty-flag for standard repos
 auto updated = co_await EventRepository::updateBy(eventId,
     set<EF::title>(std::string("Updated")),
     set<EF::priority>(99));
+// UPDATE events SET "title"=$1, "priority"=$2 WHERE "id"=$3 RETURNING *
 ```
-
-This requires `FieldInfo` to include `column_name` (generated or hand-written).
 
 ## Cross-Invalidation System
 
@@ -594,6 +609,7 @@ struct AuditLog {
 | `enum=val1:Enum1,val2:Enum2` | Explicit string DB <-> enum C++ mapping (overrides `glz::meta`) |
 | `filterable` | Declares field as a list filter (see below) |
 | `sortable` | Declares field as a list sort (see below) |
+| `partition_key` | Marks field as partition column for full-key DELETE optimization |
 
 #### Declarative list annotations
 
@@ -641,11 +657,11 @@ Column pointers (`&Cols::_field`) are derived automatically from the field name.
 
 ### Generated Output
 
-The generator produces standalone Mapping structs with template `fromModel<Entity>` / `toModel<Entity>` / `getPrimaryKey<Entity>` methods. These are used by `EntityWrapper<Struct, Mapping>`.
+The generator produces standalone Mapping structs with template `fromRow<Entity>` / `toInsertParams<Entity>` / `getPrimaryKey<Entity>` methods. These are used by `EntityWrapper<Struct, Mapping>`.
 
 For each entity:
-- **Mapping struct**: `TraitsType`, `FieldInfo` specializations, `glaze_value`
-- **Partial-key entities** (PK is `db_managed`): `makeKeyCriteria<M>(key)` template method inside the Mapping
+- **Mapping struct**: SQL strings, `TraitsType`, `FieldInfo` specializations, `glaze_value`
+- **Partition key entities** (`partition_key` annotation): `SQL::delete_by_full_pk` + `makeFullKeyParams()` for single-partition DELETE
 - **List entities**: Embedded `ListDescriptor` struct (filters, sorts, limits) inside the Mapping
 - **EntityWrapper alias**: `using XxxWrapper = EntityWrapper<Struct, Mapping>;`
 - **ListWrapper alias** (if list): `using XxxListWrapper = ListWrapper<XxxWrapper>;`
