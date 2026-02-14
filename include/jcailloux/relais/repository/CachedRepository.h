@@ -208,7 +208,7 @@ public:
     {
         // Provide L1 hint for partition pruning (free: ~0ns RAM lookup)
         WrapperPtrType hint = nullptr;
-        if constexpr (HasCompositeKey<Entity>) {
+        if constexpr (HasPartitionKey<Entity>) {
             hint = getFromCache(id);
         }
 

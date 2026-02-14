@@ -86,11 +86,14 @@ concept HasListDescriptor = requires {
     typename Entity::MappingType::ListDescriptor;
 };
 
-/// Entity's Mapping has composite key support (partition-pruned DELETE).
+/// Entity's Mapping has partition key support (partition-pruned DELETE).
 /// Auto-detected from Mapping providing delete_by_full_pk SQL and
-/// makeFullKeyParams method (generated when partition_key annotation is used).
+/// makeFullKeyParams method (generated when @relais partition_key is used).
+/// Distinct from a future HasCompositeKey where ALL key parts are required
+/// for identification — here, the cache key alone suffices but the partition
+/// column enables single-partition pruning when available from cache.
 template<typename Entity>
-concept HasCompositeKey = requires(const Entity& e) {
+concept HasPartitionKey = requires(const Entity& e) {
     { Entity::MappingType::SQL::delete_by_full_pk } -> std::convertible_to<const char*>;
     { Entity::MappingType::makeFullKeyParams(e) } -> std::convertible_to<pqcoro::PgParams>;
 };

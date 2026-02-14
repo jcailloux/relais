@@ -134,7 +134,7 @@ class RedisRepository : public BaseRepository<Entity, Name, Cfg, Key> {
             requires (!Cfg.read_only)
         {
             // L2 hint fallback for partition pruning
-            if constexpr (HasCompositeKey<Entity>) {
+            if constexpr (HasPartitionKey<Entity>) {
                 if (!cachedHint) {
                     auto cached = co_await getFromCache(makeRedisKey(id));
                     if (cached) {

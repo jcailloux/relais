@@ -206,7 +206,7 @@ protected:
     {
         try {
             int affected;
-            if constexpr (HasCompositeKey<Entity>) {
+            if constexpr (HasPartitionKey<Entity>) {
                 if (cachedHint) {
                     // Full composite key: prunes to 1 partition
                     auto params = Mapping::makeFullKeyParams(*cachedHint);
