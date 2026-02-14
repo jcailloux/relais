@@ -1,5 +1,5 @@
-#ifndef JCX_DROGON_QUERY_CACHE_KEY_H
-#define JCX_DROGON_QUERY_CACHE_KEY_H
+#ifndef JCX_RELAIS_QUERY_CACHE_KEY_H
+#define JCX_RELAIS_QUERY_CACHE_KEY_H
 
 #include <array>
 #include <cstdint>
@@ -10,7 +10,7 @@
 #include <tuple>
 #include <xxhash.h>
 
-namespace jcailloux::drogon::cache {
+namespace jcailloux::relais::cache {
 
 // =============================================================================
 // HashBuffer - Stack buffer for canonical hash building
@@ -302,14 +302,14 @@ struct GenericFilters {
 // Type alias for backwards compatibility
 using DefaultQueryCacheKey = QueryCacheKey<GenericFilters>;
 
-}  // namespace jcailloux::drogon::cache
+}  // namespace jcailloux::relais::cache
 
 // std::hash specialization
-template<jcailloux::drogon::cache::HashableFilters Filters>
-struct std::hash<jcailloux::drogon::cache::QueryCacheKey<Filters>> {
-    size_t operator()(const jcailloux::drogon::cache::QueryCacheKey<Filters>& key) const noexcept {
+template<jcailloux::relais::cache::HashableFilters Filters>
+struct std::hash<jcailloux::relais::cache::QueryCacheKey<Filters>> {
+    size_t operator()(const jcailloux::relais::cache::QueryCacheKey<Filters>& key) const noexcept {
         return key.hash();
     }
 };
 
-#endif  // JCX_DROGON_QUERY_CACHE_KEY_H
+#endif  // JCX_RELAIS_QUERY_CACHE_KEY_H

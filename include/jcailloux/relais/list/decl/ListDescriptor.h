@@ -8,17 +8,16 @@
 #include "jcailloux/relais/config/repository_config.h"
 #include "jcailloux/relais/wrapper/EntityConcepts.h"
 
-namespace jcailloux::drogon::cache::list::decl {
+namespace jcailloux::relais::cache::list::decl {
 
 // =============================================================================
 // Concepts for validating list descriptors
 // =============================================================================
 
-/// Check if Descriptor has required type aliases
+/// Check if Descriptor has required Entity type alias
 template<typename Descriptor>
-concept HasEntityAndModel = requires {
+concept HasEntity = requires {
     typename Descriptor::Entity;
-    typename Descriptor::Model;
 };
 
 /// Check if Descriptor has a filters tuple
@@ -38,10 +37,10 @@ concept HasSorts = requires {
 /// Combined concept for a valid list descriptor
 template<typename Descriptor>
 concept ValidListDescriptor =
-    HasEntityAndModel<Descriptor> &&
+    HasEntity<Descriptor> &&
     HasFilters<Descriptor> &&
     HasSorts<Descriptor> &&
-    relais::Readable<typename Descriptor::Entity, typename Descriptor::Model>;
+    relais::Readable<typename Descriptor::Entity>;
 
 // =============================================================================
 // Helper to count filters and sorts
@@ -65,6 +64,6 @@ using filter_at = std::tuple_element_t<I, std::remove_cvref_t<decltype(Descripto
 template<typename Descriptor, size_t I>
 using sort_at = std::tuple_element_t<I, std::remove_cvref_t<decltype(Descriptor::sorts)>>;
 
-}  // namespace jcailloux::drogon::cache::list::decl
+}  // namespace jcailloux::relais::cache::list::decl
 
 #endif  // CODIBOT_CACHE_LIST_DECL_LISTDESCRIPTOR_H

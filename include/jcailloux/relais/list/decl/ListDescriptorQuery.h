@@ -1,5 +1,5 @@
-#ifndef JCX_DROGON_LIST_DECL_LISTDESCRIPTORQUERY_H
-#define JCX_DROGON_LIST_DECL_LISTDESCRIPTORQUERY_H
+#ifndef JCX_RELAIS_LIST_DECL_LISTDESCRIPTORQUERY_H
+#define JCX_RELAIS_LIST_DECL_LISTDESCRIPTORQUERY_H
 
 #include <cstdint>
 #include <optional>
@@ -7,7 +7,7 @@
 #include "GeneratedFilters.h"
 #include "jcailloux/relais/list/ListQuery.h"
 
-namespace jcailloux::drogon::cache::list::decl {
+namespace jcailloux::relais::cache::list::decl {
 
 // =============================================================================
 // ListDescriptorQuery - Query type for the declarative list system
@@ -29,6 +29,6 @@ struct ListDescriptorQuery {
     bool operator==(const ListDescriptorQuery&) const = default;
 };
 
-}  // namespace jcailloux::drogon::cache::list::decl
+}  // namespace jcailloux::relais::cache::list::decl
 
-#endif  // JCX_DROGON_LIST_DECL_LISTDESCRIPTORQUERY_H
+#endif  // JCX_RELAIS_LIST_DECL_LISTDESCRIPTORQUERY_H

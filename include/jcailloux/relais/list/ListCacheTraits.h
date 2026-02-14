@@ -5,7 +5,7 @@
 
 #include "ListQuery.h"
 
-namespace jcailloux::drogon::cache::list {
+namespace jcailloux::relais::cache::list {
 
 // =============================================================================
 // Concepts for ListCacheTraits requirements
@@ -217,6 +217,6 @@ struct ListCacheTraits<entity::MyEntity> {
 };
 */
 
-}  // namespace jcailloux::drogon::cache::list
+}  // namespace jcailloux::relais::cache::list
 
 #endif  // CODIBOT_LISTCACHETRAITS_H

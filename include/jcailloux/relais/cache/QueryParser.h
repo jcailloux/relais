@@ -1,5 +1,5 @@
-#ifndef JCX_DROGON_QUERY_PARSER_H
-#define JCX_DROGON_QUERY_PARSER_H
+#ifndef JCX_RELAIS_QUERY_PARSER_H
+#define JCX_RELAIS_QUERY_PARSER_H
 
 #include "jcailloux/relais/cache/QueryCacheKey.h"
 #include <algorithm>
@@ -7,7 +7,7 @@
 #include <charconv>
 #include <string_view>
 
-namespace jcailloux::drogon::cache {
+namespace jcailloux::relais::cache {
 
 // =============================================================================
 // Parsing utilities
@@ -80,7 +80,7 @@ public:
      *
      * @tparam Parser  Custom parser with VALID_SORTS and parseFilters()
      * @tparam Filters Custom filter struct implementing HashableFilters
-     * @param params   Query parameters map (from Drogon)
+     * @param params   Query parameters map
      * @return Populated QueryCacheKey<Filters>
      */
     template<typename Parser, HashableFilters Filters, typename Map>
@@ -160,6 +160,6 @@ private:
     };
 };
 
-}  // namespace jcailloux::drogon::cache
+}  // namespace jcailloux::relais::cache
 
-#endif  // JCX_DROGON_QUERY_PARSER_H
+#endif  // JCX_RELAIS_QUERY_PARSER_H

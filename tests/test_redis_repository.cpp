@@ -87,13 +87,12 @@ using L2TestPurchaseRepository = Repository<TestPurchaseWrapper, "test:purchase:
  * Async resolver: given a user_id, finds all article IDs by that author.
  */
 struct UserArticleResolver {
-    static ::drogon::Task<std::vector<int64_t>> resolve(int64_t user_id) {
-        auto db = ::drogon::app().getDbClient();
-        auto result = co_await db->execSqlCoro(
+    static pqcoro::Task<std::vector<int64_t>> resolve(int64_t user_id) {
+        auto result = co_await jcailloux::relais::DbProvider::queryArgs(
             "SELECT id FROM relais_test_articles WHERE author_id = $1", user_id);
         std::vector<int64_t> ids;
-        for (const auto& row : result) {
-            ids.push_back(row["id"].as<int64_t>());
+        for (size_t i = 0; i < result.rows(); ++i) {
+            ids.push_back(result[i].get<int64_t>(0));
         }
         co_return ids;
     }
@@ -130,21 +129,19 @@ using L2ReadOnlyInvPurchaseRepository = Repository<TestPurchaseWrapper, "test:pu
  */
 class L2TestArticleListRepo : public Repository<TestArticleWrapper, "test:article:list:l2", cfg::Redis> {
 public:
-    static ::drogon::Task<std::vector<TestArticleWrapper>> getByCategory(
+    static pqcoro::Task<std::vector<TestArticleWrapper>> getByCategory(
         const std::string& category, int limit = 10)
     {
         co_return co_await cachedList(
-            [category, limit]() -> ::drogon::Task<std::vector<TestArticleWrapper>> {
-                auto db = ::drogon::app().getDbClient();
-                ::drogon::orm::CoroMapper<TestArticleModel> mapper(db);
-                auto models = co_await mapper.limit(limit)
-                    .orderBy(TestArticleModel::Cols::_created_at, ::drogon::orm::SortOrder::DESC)
-                    .findBy(::drogon::orm::Criteria(TestArticleModel::Cols::_category, category));
+            [category, limit]() -> pqcoro::Task<std::vector<TestArticleWrapper>> {
+                auto result = co_await jcailloux::relais::DbProvider::queryArgs(
+                    "SELECT id, category, author_id, title, view_count, is_published, published_at, created_at "
+                    "FROM relais_test_articles WHERE category = $1 ORDER BY created_at DESC LIMIT $2",
+                    category, limit);
                 std::vector<TestArticleWrapper> entities;
-                for (auto& m : models) {
-                    if (auto e = TestArticleWrapper::fromModel(m)) {
+                for (size_t i = 0; i < result.rows(); ++i) {
+                    if (auto e = entity::generated::TestArticleMapping::fromRow<TestArticleWrapper>(result[i]))
                         entities.push_back(std::move(*e));
-                    }
                 }
                 co_return entities;
             },
@@ -152,9 +149,9 @@ public:
         );
     }
 
-    static ::drogon::Task<bool> invalidateCategoryList(const std::string& category) {
+    static pqcoro::Task<bool> invalidateCategoryList(const std::string& category) {
         auto key = makeListCacheKey("category", category);
-        co_return co_await jcailloux::drogon::cache::RedisCache::invalidate(key);
+        co_return co_await jcailloux::relais::cache::RedisCache::invalidate(key);
     }
 };
 
@@ -163,24 +160,24 @@ public:
  */
 class L2TestArticleListAsRepo : public Repository<TestArticleWrapper, "test:article:listas:l2", cfg::Redis> {
 public:
-    static ::drogon::Task<TestArticleList> getByCategory(
+    static pqcoro::Task<TestArticleList> getByCategory(
         const std::string& category, int limit = 10)
     {
         co_return co_await cachedListAs<TestArticleList>(
-            [category, limit]() -> ::drogon::Task<std::vector<TestArticleModel>> {
-                auto db = ::drogon::app().getDbClient();
-                ::drogon::orm::CoroMapper<TestArticleModel> mapper(db);
-                co_return co_await mapper.limit(limit)
-                    .orderBy(TestArticleModel::Cols::_created_at, ::drogon::orm::SortOrder::DESC)
-                    .findBy(::drogon::orm::Criteria(TestArticleModel::Cols::_category, category));
+            [category, limit]() -> pqcoro::Task<TestArticleList> {
+                auto result = co_await jcailloux::relais::DbProvider::queryArgs(
+                    "SELECT id, category, author_id, title, view_count, is_published, published_at, created_at "
+                    "FROM relais_test_articles WHERE category = $1 ORDER BY created_at DESC LIMIT $2",
+                    category, limit);
+                co_return TestArticleList::fromRows(result);
             },
             "category", category
         );
     }
 
-    static ::drogon::Task<bool> invalidateCategoryList(const std::string& category) {
+    static pqcoro::Task<bool> invalidateCategoryList(const std::string& category) {
         auto key = makeListCacheKey("category", category);
-        co_return co_await jcailloux::drogon::cache::RedisCache::invalidate(key);
+        co_return co_await jcailloux::relais::cache::RedisCache::invalidate(key);
     }
 };
 
@@ -189,21 +186,19 @@ public:
  */
 class L2TestPurchaseListRepo : public Repository<TestPurchaseWrapper, "test:purchase:list:l2", cfg::Redis> {
 public:
-    static ::drogon::Task<std::vector<TestPurchaseWrapper>> getByUserId(
+    static pqcoro::Task<std::vector<TestPurchaseWrapper>> getByUserId(
         int64_t user_id, int limit = 10)
     {
         co_return co_await cachedList(
-            [user_id, limit]() -> ::drogon::Task<std::vector<TestPurchaseWrapper>> {
-                auto db = ::drogon::app().getDbClient();
-                ::drogon::orm::CoroMapper<TestPurchaseModel> mapper(db);
-                auto models = co_await mapper.limit(limit)
-                    .orderBy(TestPurchaseModel::Cols::_created_at, ::drogon::orm::SortOrder::DESC)
-                    .findBy(::drogon::orm::Criteria(TestPurchaseModel::Cols::_user_id, user_id));
+            [user_id, limit]() -> pqcoro::Task<std::vector<TestPurchaseWrapper>> {
+                auto result = co_await jcailloux::relais::DbProvider::queryArgs(
+                    "SELECT id, user_id, product_name, amount, status, created_at "
+                    "FROM relais_test_purchases WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2",
+                    user_id, limit);
                 std::vector<TestPurchaseWrapper> entities;
-                for (auto& m : models) {
-                    if (auto e = TestPurchaseWrapper::fromModel(m)) {
+                for (size_t i = 0; i < result.rows(); ++i) {
+                    if (auto e = entity::generated::TestPurchaseMapping::fromRow<TestPurchaseWrapper>(result[i]))
                         entities.push_back(std::move(*e));
-                    }
                 }
                 co_return entities;
             },
@@ -211,9 +206,9 @@ public:
         );
     }
 
-    static ::drogon::Task<bool> invalidateUserList(int64_t user_id) {
+    static pqcoro::Task<bool> invalidateUserList(int64_t user_id) {
         auto key = makeListCacheKey("user", user_id);
-        co_return co_await jcailloux::drogon::cache::RedisCache::invalidate(key);
+        co_return co_await jcailloux::relais::cache::RedisCache::invalidate(key);
     }
 };
 
@@ -227,7 +222,7 @@ public:
  */
 class L2PurchaseListInvalidator {
 public:
-    static ::drogon::Task<void> onEntityModified(
+    static pqcoro::Task<void> onEntityModified(
         std::shared_ptr<const TestPurchaseWrapper> entity)
     {
         if (entity) {
@@ -256,14 +251,13 @@ using L2ListInvPurchaseRepo = Repository<TestPurchaseWrapper, "test:purchase:l2:
  * authored by that user. Used for indirect list invalidation.
  */
 struct PurchaseToArticleCategoryResolver {
-    static ::drogon::Task<std::vector<std::string>> resolve(int64_t user_id) {
-        auto db = ::drogon::app().getDbClient();
-        auto result = co_await db->execSqlCoro(
+    static pqcoro::Task<std::vector<std::string>> resolve(int64_t user_id) {
+        auto result = co_await jcailloux::relais::DbProvider::queryArgs(
             "SELECT DISTINCT category FROM relais_test_articles WHERE author_id = $1",
             user_id);
         std::vector<std::string> categories;
-        for (const auto& row : result) {
-            categories.push_back(row["category"].as<std::string>());
+        for (size_t i = 0; i < result.rows(); ++i) {
+            categories.push_back(result[i].get<std::string>(0));
         }
         co_return categories;
     }
@@ -274,7 +268,7 @@ struct PurchaseToArticleCategoryResolver {
  */
 class L2ArticleCategoryListInvalidator {
 public:
-    static ::drogon::Task<void> invalidate(const std::string& category) {
+    static pqcoro::Task<void> invalidate(const std::string& category) {
         co_await L2TestArticleListRepo::invalidateCategoryList(category);
     }
 };
@@ -300,21 +294,19 @@ using L2CustomListPurchaseRepo = Repository<TestPurchaseWrapper, "test:purchase:
  */
 class L2TrackedArticleListRepo : public Repository<TestArticleWrapper, "test:article:tracked:list:l2", cfg::Redis> {
 public:
-    static ::drogon::Task<std::vector<TestArticleWrapper>> getByCategory(
+    static pqcoro::Task<std::vector<TestArticleWrapper>> getByCategory(
         const std::string& category, int limit = 10, int offset = 0)
     {
         co_return co_await cachedListTracked(
-            [category, limit, offset]() -> ::drogon::Task<std::vector<TestArticleWrapper>> {
-                auto db = ::drogon::app().getDbClient();
-                ::drogon::orm::CoroMapper<TestArticleModel> mapper(db);
-                auto models = co_await mapper.limit(limit).offset(offset)
-                    .orderBy(TestArticleModel::Cols::_view_count, ::drogon::orm::SortOrder::DESC)
-                    .findBy(::drogon::orm::Criteria(TestArticleModel::Cols::_category, category));
+            [category, limit, offset]() -> pqcoro::Task<std::vector<TestArticleWrapper>> {
+                auto result = co_await jcailloux::relais::DbProvider::queryArgs(
+                    "SELECT id, category, author_id, title, view_count, is_published, published_at, created_at "
+                    "FROM relais_test_articles WHERE category = $1 ORDER BY view_count DESC LIMIT $2 OFFSET $3",
+                    category, limit, offset);
                 std::vector<TestArticleWrapper> entities;
-                for (auto& m : models) {
-                    if (auto e = TestArticleWrapper::fromModel(m)) {
+                for (size_t i = 0; i < result.rows(); ++i) {
+                    if (auto e = entity::generated::TestArticleMapping::fromRow<TestArticleWrapper>(result[i]))
                         entities.push_back(std::move(*e));
-                    }
                 }
                 co_return entities;
             },
@@ -323,7 +315,7 @@ public:
         );
     }
 
-    static ::drogon::Task<size_t> invalidateCategoryList(const std::string& category) {
+    static pqcoro::Task<size_t> invalidateCategoryList(const std::string& category) {
         co_return co_await invalidateListGroup("category", category);
     }
 };
@@ -333,21 +325,19 @@ public:
  */
 class L2TrackedArticleShortTTLRepo : public Repository<TestArticleWrapper, "test:article:tracked:list:l2:short", test_l2::RedisShortTTL> {
 public:
-    static ::drogon::Task<std::vector<TestArticleWrapper>> getByCategory(
+    static pqcoro::Task<std::vector<TestArticleWrapper>> getByCategory(
         const std::string& category, int limit = 10, int offset = 0)
     {
         co_return co_await cachedListTracked(
-            [category, limit, offset]() -> ::drogon::Task<std::vector<TestArticleWrapper>> {
-                auto db = ::drogon::app().getDbClient();
-                ::drogon::orm::CoroMapper<TestArticleModel> mapper(db);
-                auto models = co_await mapper.limit(limit).offset(offset)
-                    .orderBy(TestArticleModel::Cols::_view_count, ::drogon::orm::SortOrder::DESC)
-                    .findBy(::drogon::orm::Criteria(TestArticleModel::Cols::_category, category));
+            [category, limit, offset]() -> pqcoro::Task<std::vector<TestArticleWrapper>> {
+                auto result = co_await jcailloux::relais::DbProvider::queryArgs(
+                    "SELECT id, category, author_id, title, view_count, is_published, published_at, created_at "
+                    "FROM relais_test_articles WHERE category = $1 ORDER BY view_count DESC LIMIT $2 OFFSET $3",
+                    category, limit, offset);
                 std::vector<TestArticleWrapper> entities;
-                for (auto& m : models) {
-                    if (auto e = TestArticleWrapper::fromModel(m)) {
+                for (size_t i = 0; i < result.rows(); ++i) {
+                    if (auto e = entity::generated::TestArticleMapping::fromRow<TestArticleWrapper>(result[i]))
                         entities.push_back(std::move(*e));
-                    }
                 }
                 co_return entities;
             },
@@ -356,7 +346,7 @@ public:
         );
     }
 
-    static ::drogon::Task<size_t> invalidateCategoryList(const std::string& category) {
+    static pqcoro::Task<size_t> invalidateCategoryList(const std::string& category) {
         co_return co_await invalidateListGroup("category", category);
     }
 };
@@ -366,7 +356,7 @@ public:
  */
 class L2TrackedArticleCategoryInvalidator {
 public:
-    static ::drogon::Task<void> invalidate(const std::string& category) {
+    static pqcoro::Task<void> invalidate(const std::string& category) {
         co_await L2TrackedArticleListRepo::invalidateCategoryList(category);
     }
 };
@@ -459,7 +449,7 @@ TEST_CASE("RedisRepository<TestItem> - update", "[integration][db][redis][item]"
         sync(L2TestItemRepository::findById(id));
 
         // Update through repository
-        auto success = sync(L2TestItemRepository::update(id, makeTestItem("Updated", 20, std::nullopt, true, id)));
+        auto success = sync(L2TestItemRepository::update(id, makeTestItem("Updated", 20, "", true, id)));
         REQUIRE(success == true);
 
         // Next read should fetch fresh data (cache was invalidated)
@@ -502,7 +492,7 @@ TEST_CASE("RedisRepository<TestItem> - remove", "[integration][db][redis][item]"
 //
 // #############################################################################
 
-using jcailloux::drogon::wrapper::set;
+using jcailloux::relais::wrapper::set;
 using F = TestUserWrapper::Field;
 
 TEST_CASE("RedisRepository<TestUser> - binary caching", "[integration][db][redis][binary]") {
@@ -1184,28 +1174,23 @@ namespace {
 
 // Redis inspection coroutines for tracking data verification
 
-::drogon::Task<int64_t> redisTTL(const std::string& key) {
-    auto redis = ::drogon::app().getRedisClient();
-    auto result = co_await redis->execCommandCoro("TTL %s", key.c_str());
+pqcoro::Task<int64_t> redisTTL(const std::string& key) {
+    auto result = co_await jcailloux::relais::DbProvider::redis("TTL", key);
     co_return result.asInteger();
 }
 
-::drogon::Task<int64_t> redisExists(const std::string& key) {
-    auto redis = ::drogon::app().getRedisClient();
-    auto result = co_await redis->execCommandCoro("EXISTS %s", key.c_str());
+pqcoro::Task<int64_t> redisExists(const std::string& key) {
+    auto result = co_await jcailloux::relais::DbProvider::redis("EXISTS", key);
     co_return result.asInteger();
 }
 
-::drogon::Task<int64_t> redisSCard(const std::string& key) {
-    auto redis = ::drogon::app().getRedisClient();
-    auto result = co_await redis->execCommandCoro("SCARD %s", key.c_str());
+pqcoro::Task<int64_t> redisSCard(const std::string& key) {
+    auto result = co_await jcailloux::relais::DbProvider::redis("SCARD", key);
     co_return result.asInteger();
 }
 
-::drogon::Task<bool> redisSetContains(const std::string& setKey, const std::string& member) {
-    auto redis = ::drogon::app().getRedisClient();
-    auto result = co_await redis->execCommandCoro("SISMEMBER %s %s",
-        setKey.c_str(), member.c_str());
+pqcoro::Task<bool> redisSetContains(const std::string& setKey, const std::string& member) {
+    auto result = co_await jcailloux::relais::DbProvider::redis("SISMEMBER", setKey, member);
     co_return result.asInteger() == 1;
 }
 
@@ -1480,7 +1465,7 @@ TEST_CASE("RedisRepository - tracked list Redis tracking data",
 
 namespace relais_test {
 
-namespace list = jcailloux::drogon::cache::list;
+namespace list = jcailloux::relais::cache::list;
 
 /**
  * L2 article repo with tracked list caching + sort bounds header.
@@ -1491,21 +1476,19 @@ namespace list = jcailloux::drogon::cache::list;
  */
 class L2SelectiveArticleListRepo : public Repository<TestArticleWrapper, "test:article:selective:list:l2", cfg::Redis> {
 public:
-    static ::drogon::Task<std::vector<TestArticleWrapper>> getByCategory(
+    static pqcoro::Task<std::vector<TestArticleWrapper>> getByCategory(
         const std::string& category, int limit = 5, int offset = 0)
     {
         co_return co_await cachedListTrackedWithHeader(
-            [category, limit, offset]() -> ::drogon::Task<std::vector<TestArticleWrapper>> {
-                auto db = ::drogon::app().getDbClient();
-                ::drogon::orm::CoroMapper<TestArticleModel> mapper(db);
-                auto models = co_await mapper.limit(limit).offset(offset)
-                    .orderBy(TestArticleModel::Cols::_view_count, ::drogon::orm::SortOrder::DESC)
-                    .findBy(::drogon::orm::Criteria(TestArticleModel::Cols::_category, category));
+            [category, limit, offset]() -> pqcoro::Task<std::vector<TestArticleWrapper>> {
+                auto result = co_await jcailloux::relais::DbProvider::queryArgs(
+                    "SELECT id, category, author_id, title, view_count, is_published, published_at, created_at "
+                    "FROM relais_test_articles WHERE category = $1 ORDER BY view_count DESC LIMIT $2 OFFSET $3",
+                    category, limit, offset);
                 std::vector<TestArticleWrapper> entities;
-                for (auto& m : models) {
-                    if (auto e = TestArticleWrapper::fromModel(m)) {
+                for (size_t i = 0; i < result.rows(); ++i) {
+                    if (auto e = entity::generated::TestArticleMapping::fromRow<TestArticleWrapper>(result[i]))
                         entities.push_back(std::move(*e));
-                    }
                 }
                 co_return entities;
             },
@@ -1536,7 +1519,7 @@ public:
     };
 
     // Translate typed filters → cache invalidation operations
-    static ::drogon::Task<size_t> invalidateByTarget(
+    static pqcoro::Task<size_t> invalidateByTarget(
         const GroupKey& gk,
         std::optional<int64_t> sort_value)
     {
@@ -1548,19 +1531,19 @@ public:
     }
 
     // Full group invalidation (fallback)
-    static ::drogon::Task<size_t> invalidateCategoryList(const std::string& category) {
+    static pqcoro::Task<size_t> invalidateCategoryList(const std::string& category) {
         co_return co_await invalidateListGroup("category", category);
     }
 
     // Selective invalidation for create/delete
-    static ::drogon::Task<size_t> invalidateCategoryListSelective(
+    static pqcoro::Task<size_t> invalidateCategoryListSelective(
         const std::string& category, int64_t entity_sort_val)
     {
         co_return co_await invalidateListGroupSelective(entity_sort_val, "category", category);
     }
 
     // Selective invalidation for update
-    static ::drogon::Task<size_t> invalidateCategoryListSelectiveUpdate(
+    static pqcoro::Task<size_t> invalidateCategoryListSelectiveUpdate(
         const std::string& category, int64_t old_sort_val, int64_t new_sort_val)
     {
         co_return co_await invalidateListGroupSelectiveUpdate(
@@ -1717,7 +1700,7 @@ TEST_CASE("RedisRepository - selective list invalidation with SortBounds",
 
         // Selective invalidation on the old repo's group (pages have no header)
         // No magic bytes → conservative → always deleted
-        auto deleted = sync(jcailloux::drogon::cache::RedisCache::invalidateListGroupSelective(
+        auto deleted = sync(jcailloux::relais::cache::RedisCache::invalidateListGroupSelective(
             trackedGroupKey(kTrackedRepoName, "tech"), 999));
         CHECK(deleted == 1);
     }
@@ -1770,7 +1753,7 @@ TEST_CASE("RedisRepository - selective list invalidation with SortBounds",
 namespace relais_test {
 
 using ArticleGroupKey = L2SelectiveArticleListRepo::GroupKey;
-using ArticleListTarget = jcailloux::drogon::cache::ListInvalidationTarget<ArticleGroupKey>;
+using ArticleListTarget = jcailloux::relais::cache::ListInvalidationTarget<ArticleGroupKey>;
 
 /**
  * Enriched resolver: given a user_id, finds all articles by that author
@@ -1780,17 +1763,16 @@ using ArticleListTarget = jcailloux::drogon::cache::ListInvalidationTarget<Artic
  * whose sort range contains the affected article's view_count.
  */
 struct PurchaseToArticleSelectiveResolver {
-    static ::drogon::Task<std::vector<ArticleListTarget>> resolve(int64_t user_id) {
-        auto db = ::drogon::app().getDbClient();
-        auto rows = co_await db->execSqlCoro(
+    static pqcoro::Task<std::vector<ArticleListTarget>> resolve(int64_t user_id) {
+        auto result = co_await jcailloux::relais::DbProvider::queryArgs(
             "SELECT category, view_count FROM relais_test_articles WHERE author_id = $1",
             user_id);
 
         std::vector<ArticleListTarget> targets;
-        for (const auto& row : rows) {
+        for (size_t i = 0; i < result.rows(); ++i) {
             ArticleListTarget t;
-            t.filters.category = row["category"].as<std::string>();
-            t.sort_value = row["view_count"].as<int64_t>();
+            t.filters.category = result[i].get<std::string>(0);
+            t.sort_value = result[i].get<int64_t>(1);
             targets.push_back(std::move(t));
         }
         co_return targets;
@@ -1965,16 +1947,15 @@ namespace relais_test {
  * All pages in the targeted group are invalidated.
  */
 struct PerGroupResolver {
-    static ::drogon::Task<std::vector<ArticleListTarget>> resolve(int64_t user_id) {
-        auto db = ::drogon::app().getDbClient();
-        auto rows = co_await db->execSqlCoro(
+    static pqcoro::Task<std::vector<ArticleListTarget>> resolve(int64_t user_id) {
+        auto result = co_await jcailloux::relais::DbProvider::queryArgs(
             "SELECT DISTINCT category FROM relais_test_articles WHERE author_id = $1",
             user_id);
 
         std::vector<ArticleListTarget> targets;
-        for (const auto& row : rows) {
+        for (size_t i = 0; i < result.rows(); ++i) {
             ArticleListTarget t;
-            t.filters.category = row["category"].as<std::string>();
+            t.filters.category = result[i].get<std::string>(0);
             // No sort_value → per-group invalidation
             targets.push_back(std::move(t));
         }
@@ -1986,7 +1967,7 @@ struct PerGroupResolver {
  * Full pattern resolver: returns nullopt (all list groups invalidated).
  */
 struct FullPatternResolver {
-    static ::drogon::Task<std::optional<std::vector<ArticleListTarget>>> resolve(
+    static pqcoro::Task<std::optional<std::vector<ArticleListTarget>>> resolve(
         [[maybe_unused]] int64_t user_id)
     {
         co_return std::nullopt;
@@ -1999,9 +1980,8 @@ struct FullPatternResolver {
  * - Other categories: per-group (without sort_value)
  */
 struct MixedResolver {
-    static ::drogon::Task<std::vector<ArticleListTarget>> resolve(int64_t user_id) {
-        auto db = ::drogon::app().getDbClient();
-        auto rows = co_await db->execSqlCoro(
+    static pqcoro::Task<std::vector<ArticleListTarget>> resolve(int64_t user_id) {
+        auto result = co_await jcailloux::relais::DbProvider::queryArgs(
             "SELECT category, view_count FROM relais_test_articles WHERE author_id = $1",
             user_id);
 
@@ -2009,14 +1989,14 @@ struct MixedResolver {
         // Track which non-tech categories we've already seen (for dedup)
         std::set<std::string> seen_categories;
 
-        for (const auto& row : rows) {
-            auto category = row["category"].as<std::string>();
+        for (size_t i = 0; i < result.rows(); ++i) {
+            auto category = result[i].get<std::string>(0);
 
             if (category == "tech") {
                 // Per-page: include sort_value
                 ArticleListTarget t;
                 t.filters.category = category;
-                t.sort_value = row["view_count"].as<int64_t>();
+                t.sort_value = result[i].get<int64_t>(1);
                 targets.push_back(std::move(t));
             } else if (seen_categories.insert(category).second) {
                 // Per-group: no sort_value, one target per category

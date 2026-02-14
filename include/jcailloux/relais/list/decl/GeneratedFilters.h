@@ -9,7 +9,7 @@
 #include "FilterDescriptor.h"
 #include "ListDescriptor.h"
 
-namespace jcailloux::drogon::cache::list::decl {
+namespace jcailloux::relais::cache::list::decl {
 
 // =============================================================================
 // Generated Filters struct from declaration
@@ -181,6 +181,6 @@ template<typename Descriptor>
     return tags;
 }
 
-}  // namespace jcailloux::drogon::cache::list::decl
+}  // namespace jcailloux::relais::cache::list::decl
 
 #endif  // CODIBOT_CACHE_LIST_DECL_GENERATEDFILTERS_H

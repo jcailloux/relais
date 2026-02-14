@@ -1,5 +1,5 @@
-#ifndef JCX_DROGON_WRAPPER_FORMAT_H
-#define JCX_DROGON_WRAPPER_FORMAT_H
+#ifndef JCX_RELAIS_WRAPPER_FORMAT_H
+#define JCX_RELAIS_WRAPPER_FORMAT_H
 
 namespace jcailloux::relais {
 
@@ -14,4 +14,4 @@ struct StructFormat {};
 
 }  // namespace jcailloux::relais
 
-#endif  // JCX_DROGON_WRAPPER_FORMAT_H
+#endif  // JCX_RELAIS_WRAPPER_FORMAT_H

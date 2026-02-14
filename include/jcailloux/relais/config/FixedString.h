@@ -1,5 +1,5 @@
-#ifndef JCX_DROGON_FIXEDSTRING_H
-#define JCX_DROGON_FIXEDSTRING_H
+#ifndef JCX_RELAIS_FIXEDSTRING_H
+#define JCX_RELAIS_FIXEDSTRING_H
 
 #include <algorithm>
 #include <cstddef>
@@ -25,4 +25,4 @@ struct FixedString {
 
 }  // namespace jcailloux::relais::config
 
-#endif //JCX_DROGON_FIXEDSTRING_H
+#endif //JCX_RELAIS_FIXEDSTRING_H

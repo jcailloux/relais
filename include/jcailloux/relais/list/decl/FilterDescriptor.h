@@ -4,11 +4,12 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <type_traits>
 
 #include "FixedString.h"
 
-namespace jcailloux::drogon::cache::list::decl {
+namespace jcailloux::relais::cache::list::decl {
 
 // =============================================================================
 // Comparison operators for filters
@@ -187,22 +188,22 @@ template<typename Entity>
 
 /// Declares a filter field for list queries
 ///
-/// @tparam Name        Field name (for HTTP query param and debugging)
-/// @tparam EntityMemberPtr  Pointer to entity member (&Entity::field)
-/// @tparam ColumnPtr   Pointer to Drogon model column (&Model::Cols::_field)
-/// @tparam Operator    Comparison operator (default: EQ)
-/// @tparam Converter   Value conversion type (default: NoConvert)
-/// @tparam Invalidation  How to handle cache invalidation (default: based on Op)
+/// @tparam Name            Field name (for HTTP query param and debugging)
+/// @tparam EntityMemberPtr Pointer to entity member (&Entity::field)
+/// @tparam ColumnName      SQL column name as FixedString ("column_name")
+/// @tparam Operator        Comparison operator (default: EQ)
+/// @tparam Converter       Value conversion type (default: NoConvert)
+/// @tparam Invalidation    How to handle cache invalidation (default: based on Op)
 ///
 /// Example:
-///   Filter<"guild_id", &Entity::guild_id, &Cols::_guild_id>{}
-///   Filter<"severity", &Entity::severity, &Cols::_severity, Op::EQ, AsString>{}
-///   Filter<"date_from", &Entity::created_at, &Cols::_created_at, Op::GE>{}  // Lazy by default
+///   Filter<"guild_id", &Entity::guild_id, "guild_id">{}
+///   Filter<"severity", &Entity::severity, "severity", Op::EQ, AsString>{}
+///   Filter<"date_from", &Entity::created_at, "created_at", Op::GE>{}
 ///
 template<
     FixedString Name,
     auto EntityMemberPtr,
-    const std::string* ColumnPtr,
+    FixedString ColumnName,
     Op Operator = Op::EQ,
     typename Converter = NoConvert,
     InvalidationStrategy Invalidation = defaultInvalidationStrategy(Operator)
@@ -214,8 +215,8 @@ struct Filter {
     /// Pointer to entity member
     static constexpr auto entity_ptr = EntityMemberPtr;
 
-    /// Pointer to Drogon column string
-    static constexpr auto column_ptr = ColumnPtr;
+    /// SQL column name
+    static constexpr auto column_name = ColumnName;
 
     /// Comparison operator
     static constexpr Op op = Operator;
@@ -226,9 +227,9 @@ struct Filter {
     /// Converter type
     using converter = Converter;
 
-    /// Get the Drogon column name (at runtime)
-    [[nodiscard]] static const std::string& column() noexcept {
-        return *column_ptr;
+    /// Get the SQL column name
+    [[nodiscard]] static constexpr std::string_view column() noexcept {
+        return column_name.view();
     }
 
     /// The raw member type from the entity
@@ -250,6 +251,6 @@ struct Filter {
     static constexpr bool is_lazy = (invalidation == InvalidationStrategy::Lazy);
 };
 
-}  // namespace jcailloux::drogon::cache::list::decl
+}  // namespace jcailloux::relais::cache::list::decl
 
 #endif  // CODIBOT_CACHE_LIST_DECL_FILTERDESCRIPTOR_H

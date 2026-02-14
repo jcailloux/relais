@@ -1,12 +1,12 @@
-#ifndef JCX_DROGON_LIST_MIXIN_H
-#define JCX_DROGON_LIST_MIXIN_H
+#ifndef JCX_RELAIS_LIST_MIXIN_H
+#define JCX_RELAIS_LIST_MIXIN_H
 
-#include <drogon/HttpAppFramework.h>
-#include <drogon/orm/CoroMapper.h>
-#include <drogon/orm/Criteria.h>
-#include <drogon/utils/coroutine.h>
-#include <trantor/utils/Logger.h>
+#include "pqcoro/Task.h"
+#include "pqcoro/pg/PgError.h"
+#include "pqcoro/pg/PgParams.h"
 
+#include "jcailloux/relais/DbProvider.h"
+#include "jcailloux/relais/Log.h"
 #include "jcailloux/relais/list/ListCache.h"
 #include "jcailloux/relais/list/ListQuery.h"
 #include "jcailloux/relais/list/decl/ListDescriptor.h"
@@ -38,21 +38,19 @@ namespace jcailloux::relais {
  *
  * Uses the existing ListCache (shardmap-based) for storage and ModificationTracker
  * for lazy invalidation.
- * into a single shardmap-based mode.
  */
 template<typename Base>
 class ListMixin : public Base {
     using Entity = typename Base::EntityType;
     using Key = typename Base::KeyType;
-    using Model = typename Base::ModelType;
+    using Mapping = typename Entity::MappingType;
 
     // =========================================================================
-    // Augmented Descriptor — adds Entity/Model aliases to embedded ListDescriptor
+    // Augmented Descriptor — adds Entity alias to embedded ListDescriptor
     // =========================================================================
 
     struct Descriptor : Entity::MappingType::ListDescriptor {
         using Entity = ListMixin::Entity;
-        using Model = ListMixin::Model;
     };
 
     // =========================================================================
@@ -184,7 +182,7 @@ class ListMixin : public Base {
         cq.cursor = q.cursor;
         cq.query_hash = q.query_hash;
         if (q.sort) {
-            cq.sort = *q.sort;  // Same SortSpec<size_t> type
+            cq.sort = *q.sort;
         }
         return cq;
     }
@@ -200,7 +198,6 @@ class ListMixin : public Base {
 
 public:
     using typename Base::EntityType;
-    using typename Base::ModelType;
     using typename Base::KeyType;
     using typename Base::WrapperType;
     using typename Base::WrapperPtrType;
@@ -224,7 +221,7 @@ public:
     // =========================================================================
 
     /// Execute a paginated list query with L1 caching and lazy invalidation.
-    static ::drogon::Task<ListResult> query(const ListQuery& q) {
+    static pqcoro::Task<ListResult> query(const ListQuery& q) {
         co_return co_await cachedListQuery(q);
     }
 
@@ -238,8 +235,8 @@ public:
     // =========================================================================
 
     /// Create entity and notify list cache.
-    static ::drogon::Task<WrapperPtrType> create(WrapperPtrType wrapper)
-        requires MutableEntity<Entity, Model> && (!Base::config.read_only)
+    static pqcoro::Task<WrapperPtrType> create(WrapperPtrType wrapper)
+        requires MutableEntity<Entity> && (!Base::config.read_only)
     {
         auto result = co_await Base::create(std::move(wrapper));
         if (result) {
@@ -249,15 +246,15 @@ public:
     }
 
     /// Update entity and notify list cache with old/new data.
-    static ::drogon::Task<bool> update(const Key& id, WrapperPtrType wrapper)
-        requires MutableEntity<Entity, Model> && (!Base::config.read_only)
+    static pqcoro::Task<bool> update(const Key& id, WrapperPtrType wrapper)
+        requires MutableEntity<Entity> && (!Base::config.read_only)
     {
         auto old = co_await Base::findById(id);
         co_return co_await updateWithContext(id, std::move(wrapper), std::move(old));
     }
 
     /// Remove entity and notify list cache.
-    static ::drogon::Task<std::optional<size_t>> remove(const Key& id)
+    static pqcoro::Task<std::optional<size_t>> remove(const Key& id)
         requires (!Base::config.read_only)
     {
         auto entity = co_await Base::findById(id);
@@ -266,7 +263,7 @@ public:
 
     /// Partial update and notify list cache.
     template<typename... Updates>
-    static ::drogon::Task<WrapperPtrType> updateBy(const Key& id, Updates&&... updates)
+    static pqcoro::Task<WrapperPtrType> updateBy(const Key& id, Updates&&... updates)
         requires HasFieldUpdate<Entity> && (!Base::config.read_only)
     {
         auto old = co_await Base::findById(id);
@@ -280,9 +277,9 @@ public:
 
     static void warmup() {
         Base::warmup();
-        LOG_DEBUG << name() << ": warming up list cache...";
+        RELAIS_LOG_DEBUG << name() << ": warming up list cache...";
         (void)listCache();
-        LOG_DEBUG << name() << ": list cache primed";
+        RELAIS_LOG_DEBUG << name() << ": list cache primed";
     }
 
     // =========================================================================
@@ -304,7 +301,7 @@ public:
     }
 
     /// Invalidate entity cache (list cache invalidation is lazy via ModificationTracker).
-    static ::drogon::Task<void> invalidate(const Key& id) {
+    static pqcoro::Task<void> invalidate(const Key& id) {
         co_await Base::invalidate(id);
     }
 
@@ -333,9 +330,9 @@ protected:
     // WithContext variants — accept pre-fetched old entity from upper mixin
     // =========================================================================
 
-    static ::drogon::Task<bool> updateWithContext(
+    static pqcoro::Task<bool> updateWithContext(
         const Key& id, WrapperPtrType wrapper, WrapperPtrType old_entity)
-        requires MutableEntity<Entity, Model> && (!Base::config.read_only)
+        requires MutableEntity<Entity> && (!Base::config.read_only)
     {
         auto new_entity = wrapper;
         bool ok = co_await Base::update(id, std::move(wrapper));
@@ -345,7 +342,7 @@ protected:
         co_return ok;
     }
 
-    static ::drogon::Task<std::optional<size_t>> removeWithContext(
+    static pqcoro::Task<std::optional<size_t>> removeWithContext(
         const Key& id, WrapperPtrType old_entity)
         requires (!Base::config.read_only)
     {
@@ -357,7 +354,7 @@ protected:
     }
 
     template<typename... Updates>
-    static ::drogon::Task<WrapperPtrType> updateByWithContext(
+    static pqcoro::Task<WrapperPtrType> updateByWithContext(
         const Key& id, WrapperPtrType old_entity, Updates&&... updates)
         requires HasFieldUpdate<Entity> && (!Base::config.read_only)
     {
@@ -372,7 +369,7 @@ protected:
     // Cached list query implementation
     // =========================================================================
 
-    static ::drogon::Task<ListResult> cachedListQuery(const ListQuery& query) {
+    static pqcoro::Task<ListResult> cachedListQuery(const ListQuery& query) {
         auto& cache = listCache();
         auto cache_query = toCacheQuery(query);
 
@@ -382,12 +379,12 @@ protected:
         }
 
         // Cache miss — query database
-        auto models = co_await queryFromDb(query);
+        auto entities = co_await queryFromDb(query);
         auto sort = query.sort.value_or(defaultSortAsListSpec());
 
-        // Build ListWrapper directly from Models (no per-item shared_ptr allocation)
-        auto wrapper = std::make_shared<ListWrapperType>(
-            ListWrapperType::fromModels(models));
+        // Build ListWrapper directly from entities
+        auto wrapper = std::make_shared<ListWrapperType>();
+        wrapper->items = std::move(entities);
 
         // Set cursor for pagination (base64 string in ListWrapper)
         if (wrapper->items.size() >= query.limit && !wrapper->items.empty()) {
@@ -397,13 +394,13 @@ protected:
             wrapper->next_cursor = cursor.encode();
         }
 
-        // Extract sort bounds from Models (avoids Entity conversion overhead)
+        // Extract sort bounds from entities
         cache::list::SortBounds bounds;
-        if (!models.empty()) {
-            bounds.first_value = cache::list::decl::extractSortValueFromModel<Descriptor>(
-                models.front(), sort.field);
-            bounds.last_value = cache::list::decl::extractSortValueFromModel<Descriptor>(
-                models.back(), sort.field);
+        if (!wrapper->items.empty()) {
+            bounds.first_value = cache::list::decl::extractSortValue<Descriptor>(
+                wrapper->items.front(), sort.field);
+            bounds.last_value = cache::list::decl::extractSortValue<Descriptor>(
+                wrapper->items.back(), sort.field);
             bounds.is_valid = true;
         }
 
@@ -413,43 +410,52 @@ protected:
     }
 
     // =========================================================================
-    // Database query
+    // Database query — direct SQL via PgClient
     // =========================================================================
 
-    static ::drogon::Task<std::vector<Model>> queryFromDb(const ListQuery& query) {
-        using namespace ::drogon::orm;
-
+    static pqcoro::Task<std::vector<Entity>> queryFromDb(const ListQuery& query) {
         try {
-            auto db = ::drogon::app().getDbClient();
-            CoroMapper<Model> mapper(db);
-
-            // Build criteria from filters
-            auto [criteria, hasCriteria] = cache::list::decl::buildCriteria<Descriptor>(
-                query.filters);
+            // Build WHERE clause from filters
+            auto where = cache::list::decl::buildWhereClause<Descriptor>(query.filters);
 
             // Parse sort
             auto sort = query.sort.value_or(defaultSortAsListSpec());
-            const auto& order_col = cache::list::decl::sortColumnName<Descriptor>(
-                sort.field);
-            SortOrder order_dir = (sort.direction == cache::list::SortDirection::Asc)
-                                ? SortOrder::ASC : SortOrder::DESC;
+            auto sort_col = cache::list::decl::sortColumnName<Descriptor>(sort.field);
+            const char* sort_dir = (sort.direction == cache::list::SortDirection::Asc)
+                                  ? "ASC" : "DESC";
 
-            // Execute query
-            std::vector<Model> models;
-            if (hasCriteria) {
-                models = co_await mapper.orderBy(order_col, order_dir)
-                                        .limit(query.limit)
-                                        .findBy(criteria);
-            } else {
-                models = co_await mapper.orderBy(order_col, order_dir)
-                                        .limit(query.limit)
-                                        .findAll();
+            // Build SQL: SELECT * FROM "table" [WHERE ...] ORDER BY "col" DIR LIMIT N
+            std::string sql;
+            sql.reserve(256);
+            sql += "SELECT * FROM ";
+            sql += Mapping::table_name;
+            if (!where.sql.empty()) {
+                sql += " WHERE ";
+                sql += where.sql;
+            }
+            sql += " ORDER BY \"";
+            sql += sort_col;
+            sql += "\" ";
+            sql += sort_dir;
+            sql += " LIMIT ";
+            sql += std::to_string(query.limit);
+
+            // Execute
+            auto result = co_await DbProvider::queryParams(sql.c_str(), where.params);
+
+            // Build entity vector from rows
+            std::vector<Entity> entities;
+            entities.reserve(static_cast<size_t>(result.rows()));
+            for (int i = 0; i < result.rows(); ++i) {
+                if (auto e = Entity::fromRow(result[i])) {
+                    entities.push_back(std::move(*e));
+                }
             }
 
-            co_return models;
+            co_return entities;
 
-        } catch (const ::drogon::orm::DrogonDbException& e) {
-            LOG_ERROR << name() << ": queryFromDb error - " << e.base().what();
+        } catch (const pqcoro::PgError& e) {
+            RELAIS_LOG_ERROR << name() << ": queryFromDb error - " << e.what();
             co_return {};
         }
     }
@@ -457,4 +463,4 @@ protected:
 
 }  // namespace jcailloux::relais
 
-#endif  // JCX_DROGON_LIST_MIXIN_H
+#endif  // JCX_RELAIS_LIST_MIXIN_H

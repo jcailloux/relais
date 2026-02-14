@@ -154,7 +154,7 @@ static BenchResult computeStats(const std::string& name, std::vector<double>& ti
 /// Async benchmark: runs fn() inside a single coroutine using co_await.
 /// This measures real production performance — no sync_wait() overhead per iteration.
 template<typename Fn>
-static drogon::Task<BenchResult> benchAsync(const std::string& name, Fn&& fn) {
+static pqcoro::Task<BenchResult> benchAsync(const std::string& name, Fn&& fn) {
     for (int i = 0; i < WARMUP; ++i) co_await fn();
 
     const int samples = benchSamples();
@@ -170,7 +170,7 @@ static drogon::Task<BenchResult> benchAsync(const std::string& name, Fn&& fn) {
 
 /// Async benchmark with per-iteration setup. setup() is NOT measured.
 template<typename SetupFn, typename Fn>
-static drogon::Task<BenchResult> benchWithSetupAsync(
+static pqcoro::Task<BenchResult> benchWithSetupAsync(
         const std::string& name, SetupFn&& setup, Fn&& fn) {
     for (int i = 0; i < WARMUP; ++i) { co_await setup(); co_await fn(); }
 
@@ -307,6 +307,83 @@ static std::string formatThroughput(
     return out.str();
 }
 
+struct DurationResult {
+    Clock::duration elapsed;
+    int64_t total_ops;
+};
+
+/// Duration-based benchmark duration (configurable via BENCH_DURATION_S env var).
+static int benchDurationSeconds() {
+    static int n = [] {
+        if (auto* env = std::getenv("BENCH_DURATION_S"))
+            if (int v = std::atoi(env); v > 0) return v;
+        return 10;
+    }();
+    return n;
+}
+
+/// Run N threads for a fixed duration. Each thread loops until `running` is set to false.
+/// fn(int tid, std::atomic<bool>& running) must return the number of ops performed.
+template<typename Fn>
+static DurationResult measureDuration(int num_threads, Fn&& fn) {
+    std::latch ready{num_threads};
+    std::latch go{1};
+    std::atomic<bool> running{true};
+    std::vector<std::atomic<int64_t>> ops_counts(num_threads);
+    std::vector<std::jthread> threads;
+    threads.reserve(num_threads);
+
+    for (int i = 0; i < num_threads; ++i) {
+        ops_counts[i].store(0);
+        threads.emplace_back([&, i]() {
+            cpu_set_t mask;
+            CPU_ZERO(&mask);
+            CPU_SET(i % std::thread::hardware_concurrency(), &mask);
+            sched_setaffinity(0, sizeof(mask), &mask);
+
+            ready.count_down();
+            go.wait();
+            ops_counts[i].store(fn(i, running), std::memory_order_relaxed);
+        });
+    }
+
+    ready.wait();
+    auto t0 = Clock::now();
+    go.count_down();
+    std::this_thread::sleep_for(std::chrono::seconds(benchDurationSeconds()));
+    running.store(false, std::memory_order_relaxed);
+    for (auto& t : threads) t.join();
+    auto elapsed = Clock::now() - t0;
+
+    int64_t total = 0;
+    for (auto& c : ops_counts) total += c.load(std::memory_order_relaxed);
+    return {elapsed, total};
+}
+
+/// Format a duration-based throughput measurement.
+static std::string formatDurationThroughput(
+        const std::string& label, int threads,
+        const DurationResult& result) {
+    auto us = std::chrono::duration_cast<std::chrono::microseconds>(result.elapsed).count();
+    auto ops_per_sec = (us > 0) ? result.total_ops * 1'000'000.0 / us : 0.0;
+    auto avg_us = (result.total_ops > 0) ? static_cast<double>(us) / result.total_ops : 0.0;
+
+    auto bar = std::string(50, '-');
+    std::ostringstream out;
+    out << "\n"
+        << "  " << bar << "\n"
+        << "  " << label << "\n"
+        << "  " << bar << "\n"
+        << "  threads:      " << threads << "\n"
+        << "  duration:     " << std::fixed << std::setprecision(2)
+                              << static_cast<double>(us) / 1'000'000 << " s\n"
+        << "  total ops:    " << result.total_ops << "\n"
+        << "  throughput:   " << fmtOps(ops_per_sec) << "\n"
+        << "  avg latency:  " << fmtDuration(avg_us) << "\n"
+        << "  " << bar;
+    return out.str();
+}
+
 
 // #############################################################################
 //
@@ -322,11 +399,11 @@ TEST_CASE("Benchmark - L1 cache hit", "[benchmark][l1]")
 
     std::vector<BenchResult> results;
 
-    results.push_back(sync(benchAsync("findById", [&]() -> drogon::Task<void> {
+    results.push_back(sync(benchAsync("findById", [&]() -> pqcoro::Task<void> {
         co_await L1TestItemRepository::findById(id);
     })));
 
-    results.push_back(sync(benchAsync("findByIdAsJson", [&]() -> drogon::Task<void> {
+    results.push_back(sync(benchAsync("findByIdAsJson", [&]() -> pqcoro::Task<void> {
         co_await L1TestItemRepository::findByIdAsJson(id);
     })));
 
@@ -348,11 +425,11 @@ TEST_CASE("Benchmark - L2 cache hit", "[benchmark][l2]")
 
     std::vector<BenchResult> results;
 
-    results.push_back(sync(benchAsync("findById", [&]() -> drogon::Task<void> {
+    results.push_back(sync(benchAsync("findById", [&]() -> pqcoro::Task<void> {
         co_await L2TestItemRepository::findById(id);
     })));
 
-    results.push_back(sync(benchAsync("findByIdAsJson", [&]() -> drogon::Task<void> {
+    results.push_back(sync(benchAsync("findByIdAsJson", [&]() -> pqcoro::Task<void> {
         co_await L2TestItemRepository::findByIdAsJson(id);
     })));
 
@@ -374,13 +451,13 @@ TEST_CASE("Benchmark - L1+L2 cache hit", "[benchmark][full-cache]")
 
     std::vector<BenchResult> results;
 
-    results.push_back(sync(benchAsync("findById (L1 serves)", [&]() -> drogon::Task<void> {
+    results.push_back(sync(benchAsync("findById (L1 serves)", [&]() -> pqcoro::Task<void> {
         co_await FullCacheTestItemRepository::findById(id);
     })));
 
     results.push_back(sync(benchWithSetupAsync("findById (L2 fallback)",
-        [&]() -> drogon::Task<void> { FullCacheTestItemRepository::invalidateL1(id); co_return; },
-        [&]() -> drogon::Task<void> { co_await FullCacheTestItemRepository::findById(id); }
+        [&]() -> pqcoro::Task<void> { FullCacheTestItemRepository::invalidateL1(id); co_return; },
+        [&]() -> pqcoro::Task<void> { co_await FullCacheTestItemRepository::findById(id); }
     )));
 
     WARN(formatTable("L1+L2 cache hit", results));
@@ -401,13 +478,13 @@ TEST_CASE("Benchmark - cache miss (DB fetch)", "[benchmark][db]")
     std::vector<BenchResult> results;
 
     results.push_back(sync(benchWithSetupAsync("findById (L1 miss -> DB)",
-        [&]() -> drogon::Task<void> { L1TestItemRepository::invalidateL1(id); co_return; },
-        [&]() -> drogon::Task<void> { co_await L1TestItemRepository::findById(id); }
+        [&]() -> pqcoro::Task<void> { L1TestItemRepository::invalidateL1(id); co_return; },
+        [&]() -> pqcoro::Task<void> { co_await L1TestItemRepository::findById(id); }
     )));
 
     results.push_back(sync(benchWithSetupAsync("findById (L1+L2 miss -> DB)",
-        [&]() -> drogon::Task<void> { co_await FullCacheTestItemRepository::invalidate(id); },
-        [&]() -> drogon::Task<void> { co_await FullCacheTestItemRepository::findById(id); }
+        [&]() -> pqcoro::Task<void> { co_await FullCacheTestItemRepository::invalidate(id); },
+        [&]() -> pqcoro::Task<void> { co_await FullCacheTestItemRepository::findById(id); }
     )));
 
     WARN(formatTable("Cache miss (DB fetch)", results));
@@ -434,25 +511,25 @@ TEST_CASE("Benchmark - write operations", "[benchmark][write]")
 
     std::vector<BenchResult> results;
 
-    results.push_back(sync(benchAsync("create + remove (L1)", [&]() -> drogon::Task<void> {
+    results.push_back(sync(benchAsync("create + remove (L1)", [&]() -> pqcoro::Task<void> {
         auto entity = makeTestItem("bench_cr", 42);
         auto created = co_await L1TestItemRepository::create(entity);
         if (created) co_await L1TestItemRepository::remove(created->id);
     })));
 
-    results.push_back(sync(benchAsync("update (L1)", [&]() -> drogon::Task<void> {
+    results.push_back(sync(benchAsync("update (L1)", [&]() -> pqcoro::Task<void> {
         ++c1;
         auto entity = makeTestItem(
             "bench_u_" + std::to_string(c1), c1,
-            std::nullopt, true, upd_id);
+            "bench_u_description", true, upd_id);
         co_await L1TestItemRepository::update(upd_id, entity);
     })));
 
-    results.push_back(sync(benchAsync("update (L1+L2)", [&]() -> drogon::Task<void> {
+    results.push_back(sync(benchAsync("update (L1+L2)", [&]() -> pqcoro::Task<void> {
         ++c2;
         auto entity = makeTestItem(
             "bench_ub_" + std::to_string(c2), c2,
-            std::nullopt, true, upd_both_id);
+            "bench_ub_description", true, upd_both_id);
         co_await FullCacheTestItemRepository::update(upd_both_id, entity);
     })));
 
@@ -481,7 +558,7 @@ TEST_CASE("Benchmark - list query", "[benchmark][list]")
 
     std::vector<BenchResult> results;
 
-    results.push_back(sync(benchAsync("query (10 articles, L1 hit)", [&]() -> drogon::Task<void> {
+    results.push_back(sync(benchAsync("query (10 articles, L1 hit)", [&]() -> pqcoro::Task<void> {
         co_await TestArticleListRepository::query(query);
     })));
 
@@ -498,7 +575,7 @@ TEST_CASE("Benchmark - list query", "[benchmark][list]")
 // #############################################################################
 //
 //  7a. Raw L1 cache throughput (no coroutine, no sync_wait)
-//      Pure ShardMap performance — 8 threads truly parallel on 8 cores.
+//      Pure ShardMap performance — 6 threads truly parallel on 6 cores.
 //
 // #############################################################################
 
@@ -506,7 +583,7 @@ TEST_CASE("Benchmark - L1 raw throughput", "[benchmark][throughput][raw]")
 {
     TransactionGuard tx;
 
-    static constexpr int THREADS = 8;
+    static constexpr int THREADS = 6;
     static constexpr int OPS = 2'000'000;
     static constexpr int RUNS = 3;
     static constexpr int NUM_KEYS = 64;
@@ -605,7 +682,7 @@ TEST_CASE("Benchmark - multi-threaded throughput", "[benchmark][throughput]")
 {
     TransactionGuard tx;
 
-    static constexpr int THREADS = 8;
+    static constexpr int THREADS = 6;
     static constexpr int OPS = 500'000;
     static constexpr int RUNS = 3;  // best-of-N for stability
 
@@ -618,7 +695,7 @@ TEST_CASE("Benchmark - multi-threaded throughput", "[benchmark][throughput]")
         Clock::duration best = Clock::duration::max();
         for (int r = 0; r < RUNS; ++r) {
             auto elapsed = measureParallel(THREADS, OPS, [&](int, int n) {
-                sync([&, n]() -> drogon::Task<void> {
+                sync([&, n]() -> pqcoro::Task<void> {
                     for (int j = 0; j < n; ++j) {
                         co_await L1TestItemRepository::findById(id);
                     }
@@ -643,7 +720,7 @@ TEST_CASE("Benchmark - multi-threaded throughput", "[benchmark][throughput]")
         Clock::duration best = Clock::duration::max();
         for (int r = 0; r < RUNS; ++r) {
             auto elapsed = measureParallel(THREADS, OPS, [&](int tid, int n) {
-                sync([&, tid, n]() -> drogon::Task<void> {
+                sync([&, tid, n]() -> pqcoro::Task<void> {
                     for (int j = 0; j < n; ++j) {
                         co_await L1TestItemRepository::findById(
                             ids[(tid * n + j) % NUM_KEYS]);
@@ -659,7 +736,7 @@ TEST_CASE("Benchmark - multi-threaded throughput", "[benchmark][throughput]")
         Clock::duration best = Clock::duration::max();
         for (int r = 0; r < RUNS; ++r) {
             auto elapsed = measureParallel(THREADS, OPS, [&](int tid, int n) {
-                sync([&, tid, n]() -> drogon::Task<void> {
+                sync([&, tid, n]() -> pqcoro::Task<void> {
                     for (int j = 0; j < n; ++j) {
                         co_await L1TestItemRepository::findByIdAsJson(
                             ids[(tid * n + j) % NUM_KEYS]);
@@ -671,4 +748,163 @@ TEST_CASE("Benchmark - multi-threaded throughput", "[benchmark][throughput]")
         WARN(formatThroughput("L1 findByIdAsJson (distributed)", THREADS, OPS, best));
     }
 
+}
+
+
+// #############################################################################
+//
+//  7c. Raw L1 cache throughput — duration-based (sustained measurement)
+//
+// #############################################################################
+
+TEST_CASE("Benchmark - L1 raw throughput (duration)", "[benchmark][throughput][raw][duration]")
+{
+    TransactionGuard tx;
+
+    static constexpr int THREADS = 6;
+    static constexpr int NUM_KEYS = 64;
+
+    // Insert and warm cache
+    std::vector<int64_t> ids;
+    ids.reserve(NUM_KEYS);
+    for (int i = 0; i < NUM_KEYS; ++i) {
+        auto kid = insertTestItem("bench_raw_dur_" + std::to_string(i), i);
+        sync(L1TestItemRepository::findById(kid));
+        ids.push_back(kid);
+    }
+
+    SECTION("L1 raw — single key (contention)") {
+        auto id = ids[0];
+        auto result = measureDuration(THREADS, [&](int, std::atomic<bool>& running) -> int64_t {
+            int64_t ops = 0;
+            while (running.load(std::memory_order_relaxed)) {
+                auto ptr = TestInternals::getFromCache<L1TestItemRepository>(id);
+                doNotOptimize(ptr);
+                ++ops;
+            }
+            return ops;
+        });
+        WARN(formatDurationThroughput("L1 raw (single key) [duration]", THREADS, result));
+    }
+
+    SECTION("L1 raw — distributed keys (parallel)") {
+        auto result = measureDuration(THREADS, [&](int tid, std::atomic<bool>& running) -> int64_t {
+            int64_t ops = 0;
+            while (running.load(std::memory_order_relaxed)) {
+                auto ptr = TestInternals::getFromCache<L1TestItemRepository>(
+                    ids[(tid * 1000000 + ops) % NUM_KEYS]);
+                doNotOptimize(ptr);
+                ++ops;
+            }
+            return ops;
+        });
+        WARN(formatDurationThroughput("L1 raw (distributed) [duration]", THREADS, result));
+    }
+
+    SECTION("L1 raw — findByIdAsJson distributed") {
+        auto result = measureDuration(THREADS, [&](int tid, std::atomic<bool>& running) -> int64_t {
+            int64_t ops = 0;
+            while (running.load(std::memory_order_relaxed)) {
+                auto ptr = TestInternals::getFromCache<L1TestItemRepository>(
+                    ids[(tid * 1000000 + ops) % NUM_KEYS]);
+                if (ptr) doNotOptimize(ptr->toJson());
+                ++ops;
+            }
+            return ops;
+        });
+        WARN(formatDurationThroughput("L1 raw findByIdAsJson (distributed) [duration]", THREADS, result));
+    }
+
+    SECTION("L1 raw — mixed read/write distributed (75R/25W)") {
+        auto template_ptr = TestInternals::getFromCache<L1TestItemRepository>(ids[0]);
+        REQUIRE(template_ptr != nullptr);
+
+        auto result = measureDuration(THREADS, [&](int tid, std::atomic<bool>& running) -> int64_t {
+            std::mt19937 rng(tid * 42 + 7);
+            int64_t ops = 0;
+            while (running.load(std::memory_order_relaxed)) {
+                auto kid = ids[(tid * 1000000 + ops) % NUM_KEYS];
+                if (rng() % 4 != 0) {
+                    auto ptr = TestInternals::getFromCache<L1TestItemRepository>(kid);
+                    doNotOptimize(ptr);
+                } else {
+                    TestInternals::invalidateL1<L1TestItemRepository>(kid);
+                    TestInternals::putInCache<L1TestItemRepository>(kid, template_ptr);
+                }
+                ++ops;
+            }
+            return ops;
+        });
+        WARN(formatDurationThroughput("L1 raw mixed (distributed, 75R/25W) [duration]", THREADS, result));
+    }
+}
+
+
+// #############################################################################
+//
+//  7d. Full-path throughput — duration-based (sustained measurement)
+//
+// #############################################################################
+
+TEST_CASE("Benchmark - multi-threaded throughput (duration)", "[benchmark][throughput][duration]")
+{
+    TransactionGuard tx;
+
+    static constexpr int THREADS = 6;
+    static constexpr int NUM_KEYS = 64;
+
+    auto id = insertTestItem("bench_mt_dur", 42);
+    sync(L1TestItemRepository::findById(id));
+
+    std::vector<int64_t> ids;
+    ids.reserve(NUM_KEYS);
+    for (int i = 0; i < NUM_KEYS; ++i) {
+        auto kid = insertTestItem("bench_dur_dist_" + std::to_string(i), i);
+        sync(L1TestItemRepository::findById(kid));
+        ids.push_back(kid);
+    }
+
+    SECTION("L1 findById — single key (contention)") {
+        auto result = measureDuration(THREADS, [&](int, std::atomic<bool>& running) -> int64_t {
+            int64_t ops = 0;
+            sync([&]() -> pqcoro::Task<void> {
+                while (running.load(std::memory_order_relaxed)) {
+                    co_await L1TestItemRepository::findById(id);
+                    ++ops;
+                }
+            }());
+            return ops;
+        });
+        WARN(formatDurationThroughput("L1 findById (single key) [duration]", THREADS, result));
+    }
+
+    SECTION("L1 findById — distributed keys (parallel)") {
+        auto result = measureDuration(THREADS, [&](int tid, std::atomic<bool>& running) -> int64_t {
+            int64_t ops = 0;
+            sync([&]() -> pqcoro::Task<void> {
+                while (running.load(std::memory_order_relaxed)) {
+                    co_await L1TestItemRepository::findById(
+                        ids[(tid * 1000000 + ops) % NUM_KEYS]);
+                    ++ops;
+                }
+            }());
+            return ops;
+        });
+        WARN(formatDurationThroughput("L1 findById (distributed) [duration]", THREADS, result));
+    }
+
+    SECTION("L1 findByIdAsJson — distributed keys (parallel)") {
+        auto result = measureDuration(THREADS, [&](int tid, std::atomic<bool>& running) -> int64_t {
+            int64_t ops = 0;
+            sync([&]() -> pqcoro::Task<void> {
+                while (running.load(std::memory_order_relaxed)) {
+                    co_await L1TestItemRepository::findByIdAsJson(
+                        ids[(tid * 1000000 + ops) % NUM_KEYS]);
+                    ++ops;
+                }
+            }());
+            return ops;
+        });
+        WARN(formatDurationThroughput("L1 findByIdAsJson (distributed) [duration]", THREADS, result));
+    }
 }

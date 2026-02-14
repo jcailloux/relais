@@ -2,13 +2,13 @@
 #define CODIBOT_CACHE_LIST_DECL_SORTDESCRIPTOR_H
 
 #include <cstdint>
-#include <string>
+#include <string_view>
 #include <type_traits>
 
 #include "FixedString.h"
 #include "FilterDescriptor.h"  // For detail::member_pointer_type_t
 
-namespace jcailloux::drogon::cache::list::decl {
+namespace jcailloux::relais::cache::list::decl {
 
 // =============================================================================
 // Sort direction
@@ -29,17 +29,14 @@ enum class SortDirection : uint8_t {
 /// Supported types:
 ///   - Integral types (int64_t, uint32_t, etc.)
 ///   - Enum types (cast to underlying)
-///   - Date types with microSecondsSinceEpoch() (trantor::Date)
+///   - std::optional<T> where T is integral or enum
 ///
 /// String types are NOT supported. Declaring a Sort on a string field
-/// will produce a compile error.
+/// will produce a compile error. Use an integer timestamp field instead.
 template<typename T>
 concept CursorEncodable =
-    std::is_integral_v<std::remove_cvref_t<T>> ||
-    std::is_enum_v<std::remove_cvref_t<T>> ||
-    requires(const std::remove_cvref_t<T>& v) {
-        { v.microSecondsSinceEpoch() } -> std::convertible_to<int64_t>;
-    };
+    std::is_integral_v<detail::unwrap_optional_t<std::remove_cvref_t<T>>> ||
+    std::is_enum_v<detail::unwrap_optional_t<std::remove_cvref_t<T>>>;
 
 // =============================================================================
 // Sort declaration template
@@ -49,32 +46,27 @@ concept CursorEncodable =
 ///
 /// @tparam Name            Field name (for HTTP query param: ?sort=name)
 /// @tparam EntityMemberPtr Pointer to entity member (&Entity::field)
-/// @tparam ColumnPtr       Pointer to Drogon model column (&Model::Cols::_field)
-/// @tparam ModelMemberPtr  Pointer to Drogon model getter (&Model::getValueOfField)
+/// @tparam ColumnName      SQL column name as FixedString ("column_name")
 /// @tparam DefaultDir      Default sort direction (default: Asc)
 ///
 /// Example:
-///   Sort<"created_at", &Entity::created_at, &Cols::_created_at, &Model::getValueOfCreatedAt, SortDirection::Desc>{}
-///   Sort<"id", &Entity::id, &Cols::_id, &Model::getValueOfId>{}
+///   Sort<"created_at", &Entity::created_at_us, "created_at">{}
+///   Sort<"id", &Entity::id, "id">{}
 ///
 template<
     FixedString Name,
     auto EntityMemberPtr,
-    const std::string* ColumnPtr,
-    auto ModelMemberPtr,
+    FixedString ColumnName,
     SortDirection DefaultDir = SortDirection::Asc
 >
 struct Sort {
-    /// The value type for cursor encoding, deduced from the Model getter.
-    /// We use ModelMemberPtr rather than EntityMemberPtr because FlatBuffer
-    /// entities may store dates as strings, while the Model always returns
-    /// the correct semantic type (e.g. trantor::Date for timestamps).
-    using value_type = detail::member_pointer_type_t<decltype(ModelMemberPtr)>;
+    /// The value type for cursor encoding, deduced from the Entity member.
+    using value_type = detail::member_pointer_type_t<decltype(EntityMemberPtr)>;
 
     static_assert(CursorEncodable<value_type>,
-        "Sort field type must be integral, enum, or a date type with "
-        "microSecondsSinceEpoch(). String types cannot be encoded as "
-        "int64_t for cursor pagination.");
+        "Sort field type must be integral or enum. String types cannot be "
+        "encoded as int64_t for cursor pagination. Use an integer timestamp "
+        "field (e.g. microseconds since epoch) instead of a string date.");
 
     /// Field name (from HTTP query param)
     static constexpr auto name = Name;
@@ -82,18 +74,15 @@ struct Sort {
     /// Pointer to entity member
     static constexpr auto entity_ptr = EntityMemberPtr;
 
-    /// Pointer to Drogon column string
-    static constexpr auto column_ptr = ColumnPtr;
-
-    /// Pointer to Drogon model getter
-    static constexpr auto model_ptr = ModelMemberPtr;
+    /// SQL column name
+    static constexpr auto column_name = ColumnName;
 
     /// Default sort direction
     static constexpr SortDirection default_direction = DefaultDir;
 
-    /// Get the Drogon column name (at runtime)
-    [[nodiscard]] static const std::string& column() noexcept {
-        return *column_ptr;
+    /// Get the SQL column name
+    [[nodiscard]] static constexpr std::string_view column() noexcept {
+        return column_name.view();
     }
 };
 
@@ -110,6 +99,6 @@ struct SortSpec {
     bool operator==(const SortSpec&) const = default;
 };
 
-}  // namespace jcailloux::drogon::cache::list::decl
+}  // namespace jcailloux::relais::cache::list::decl
 
 #endif  // CODIBOT_CACHE_LIST_DECL_SORTDESCRIPTOR_H

@@ -1,5 +1,5 @@
-#ifndef JCX_DROGON_REDISCACHE_H
-#define JCX_DROGON_REDISCACHE_H
+#ifndef JCX_RELAIS_REDISCACHE_H
+#define JCX_RELAIS_REDISCACHE_H
 
 #include <string>
 #include <optional>
@@ -7,42 +7,47 @@
 #include <chrono>
 #include <cstring>
 #include <span>
-#include <drogon/HttpAppFramework.h>
-#include <drogon/nosql/RedisClient.h>
-#include <drogon/utils/coroutine.h>
-#include <trantor/utils/Logger.h>
+
+#include "pqcoro/Task.h"
+#include "pqcoro/redis/RedisResult.h"
+#include "jcailloux/relais/DbProvider.h"
+#include "jcailloux/relais/Log.h"
+
 #include <glaze/glaze.hpp>
 #include <jcailloux/relais/list/ListCache.h>
 
-namespace jcailloux::drogon::cache {
+namespace jcailloux::relais::cache {
+
     /**
      * Async Redis cache wrapper for L2 caching.
      * Entity must implement toJson() and fromJson().
+     *
+     * All Redis operations go through DbProvider::redis() which wraps
+     * pqcoro::RedisClient via type-erased std::function.
      */
     class RedisCache {
         public:
 
             template<typename Entity>
-            static ::drogon::Task<std::optional<Entity>> get(const std::string& key) {
-                const auto redis = ::drogon::app().getRedisClient();
-                if (!redis) {
+            static pqcoro::Task<std::optional<Entity>> get(const std::string& key) {
+                if (!DbProvider::hasRedis()) {
                     co_return std::nullopt;
                 }
 
                 try {
-                    auto result = co_await redis->execCommandCoro("GET %s", key.c_str());
+                    auto result = co_await DbProvider::redis("GET", key);
                     if (result.isNil()) {
                         co_return std::nullopt;
                     }
-                    co_return Entity::fromJson(result.asString());
+                    co_return Entity::fromJson(result.asStringView());
                 } catch (const std::exception& e) {
-                    LOG_WARN << "RedisCache GET error: " << e.what();
+                    RELAIS_LOG_WARN << "RedisCache GET error: " << e.what();
                     co_return std::nullopt;
                 }
             }
 
             template<typename Entity, typename Rep, typename Period>
-            static ::drogon::Task<std::optional<Entity>> getEx(const std::string& key,
+            static pqcoro::Task<std::optional<Entity>> getEx(const std::string& key,
                                                               std::chrono::duration<Rep, Period> ttl) {
                 if (auto json = co_await getRawEx(key, ttl)) {
                     co_return Entity::fromJson(*json);
@@ -51,48 +56,44 @@ namespace jcailloux::drogon::cache {
             }
 
             template<typename Entity, typename Rep, typename Period>
-            static ::drogon::Task<bool> set(const std::string& key, const Entity& entity, std::chrono::duration<Rep, Period> ttl) {
-                auto redis = ::drogon::app().getRedisClient();
-                if (!redis) {
+            static pqcoro::Task<bool> set(const std::string& key, const Entity& entity, std::chrono::duration<Rep, Period> ttl) {
+                if (!DbProvider::hasRedis()) {
                     co_return false;
                 }
 
                 try {
                     auto ttl_seconds = std::chrono::duration_cast<std::chrono::seconds>(ttl).count();
                     auto json = entity.toJson();
-                    co_await redis->execCommandCoro("SETEX %s %lld %s",
-                                                    key.c_str(),
-                                                    static_cast<long long>(ttl_seconds),
-                                                    json->c_str());
+                    co_await DbProvider::redis("SETEX", key,
+                        ttl_seconds, *json);
                     co_return true;
                 } catch (const std::exception& e) {
-                    LOG_WARN << "RedisCache SET error: " << e.what();
+                    RELAIS_LOG_WARN << "RedisCache SET error: " << e.what();
                     co_return false;
                 }
             }
 
             template<typename Entity>
-            static ::drogon::Task<std::optional<std::vector<Entity>>> getList(const std::string& key) {
-                const auto redis = ::drogon::app().getRedisClient();
-                if (!redis) {
+            static pqcoro::Task<std::optional<std::vector<Entity>>> getList(const std::string& key) {
+                if (!DbProvider::hasRedis()) {
                     co_return std::nullopt;
                 }
 
                 try {
-                    auto result = co_await redis->execCommandCoro("GET %s", key.c_str());
+                    auto result = co_await DbProvider::redis("GET", key);
                     if (result.isNil()) {
                         co_return std::nullopt;
                     }
-                    auto raw = result.asString();
+                    auto raw = result.asStringView();
                     co_return parseListWithHeader<Entity>(raw);
                 } catch (const std::exception& e) {
-                    LOG_WARN << "RedisCache GET list error: " << e.what();
+                    RELAIS_LOG_WARN << "RedisCache GET list error: " << e.what();
                     co_return std::nullopt;
                 }
             }
 
             template<typename Entity, typename Rep, typename Period>
-            static ::drogon::Task<std::optional<std::vector<Entity>>> getListEx(const std::string& key,
+            static pqcoro::Task<std::optional<std::vector<Entity>>> getListEx(const std::string& key,
                                                                                std::chrono::duration<Rep, Period> ttl) {
                 if (auto raw = co_await getRawEx(key, ttl)) {
                     co_return parseListWithHeader<Entity>(*raw);
@@ -101,12 +102,11 @@ namespace jcailloux::drogon::cache {
             }
 
             template<typename Entity, typename Rep, typename Period>
-            static ::drogon::Task<bool> setList(const std::string& key,
+            static pqcoro::Task<bool> setList(const std::string& key,
                                                const std::vector<Entity>& entities,
                                                std::chrono::duration<Rep, Period> ttl,
                                                std::optional<list::ListBoundsHeader> header = std::nullopt) {
-                auto redis = ::drogon::app().getRedisClient();
-                if (!redis) {
+                if (!DbProvider::hasRedis()) {
                     co_return false;
                 }
 
@@ -120,167 +120,155 @@ namespace jcailloux::drogon::cache {
                         header->writeTo(reinterpret_cast<uint8_t*>(prefixed.data()));
                         std::memcpy(prefixed.data() + list::kListBoundsHeaderSize,
                                     json.data(), json.size());
-                        co_await redis->execCommandCoro("SETEX %s %lld %b",
-                                                        key.c_str(),
-                                                        static_cast<long long>(ttl_seconds),
-                                                        prefixed.data(),
-                                                        prefixed.size());
+                        co_await DbProvider::redis("SETEX", key,
+                            ttl_seconds,
+                            std::string_view(prefixed.data(), prefixed.size()));
                     } else {
-                        co_await redis->execCommandCoro("SETEX %s %lld %s",
-                                                        key.c_str(),
-                                                        static_cast<long long>(ttl_seconds),
-                                                        json.c_str());
+                        co_await DbProvider::redis("SETEX", key,
+                            ttl_seconds, json);
                     }
                     co_return true;
                 } catch (const std::exception& e) {
-                    LOG_WARN << "RedisCache SET list error: " << e.what();
+                    RELAIS_LOG_WARN << "RedisCache SET list error: " << e.what();
                     co_return false;
                 }
             }
 
             /// Get raw JSON string without deserialization.
-            static ::drogon::Task<std::optional<std::string>> getRaw(const std::string& key) {
-                const auto redis = ::drogon::app().getRedisClient();
-                if (!redis) {
+            static pqcoro::Task<std::optional<std::string>> getRaw(const std::string& key) {
+                if (!DbProvider::hasRedis()) {
                     co_return std::nullopt;
                 }
 
                 try {
-                    const auto result = co_await redis->execCommandCoro("GET %s", key.c_str());
+                    auto result = co_await DbProvider::redis("GET", key);
                     if (result.isNil()) {
                         co_return std::nullopt;
                     }
                     co_return result.asString();
                 } catch (const std::exception& e) {
-                    LOG_WARN << "RedisCache getRaw error: " << e.what();
+                    RELAIS_LOG_WARN << "RedisCache getRaw error: " << e.what();
                     co_return std::nullopt;
                 }
             }
 
             template<typename Rep, typename Period>
-            static ::drogon::Task<std::optional<std::string>> getRawEx(const std::string& key,
+            static pqcoro::Task<std::optional<std::string>> getRawEx(const std::string& key,
                                                                       std::chrono::duration<Rep, Period> ttl) {
-                const auto redis = ::drogon::app().getRedisClient();
-                if (!redis) {
+                if (!DbProvider::hasRedis()) {
                     co_return std::nullopt;
                 }
 
                 try {
                     auto ttl_seconds = std::chrono::duration_cast<std::chrono::seconds>(ttl).count();
-                    const auto result = co_await redis->execCommandCoro("GETEX %s EX %lld",
-                                                                         key.c_str(),
-                                                                         static_cast<long long>(ttl_seconds));
+                    auto result = co_await DbProvider::redis("GETEX", key,
+                        "EX", ttl_seconds);
                     if (result.isNil()) {
                         co_return std::nullopt;
                     }
                     co_return result.asString();
                 } catch (const std::exception& e) {
-                    LOG_WARN << "RedisCache getRawEx error: " << e.what();
+                    RELAIS_LOG_WARN << "RedisCache getRawEx error: " << e.what();
                     co_return std::nullopt;
                 }
             }
 
             /// Store raw JSON string without serialization.
             template<typename Rep, typename Period>
-            static ::drogon::Task<bool> setRaw(const std::string& key,
+            static pqcoro::Task<bool> setRaw(const std::string& key,
                                               const std::string_view json,
                                               std::chrono::duration<Rep, Period> ttl) {
-                const auto redis = ::drogon::app().getRedisClient();
-                if (!redis) {
+                if (!DbProvider::hasRedis()) {
                     co_return false;
                 }
 
                 try {
                     auto ttl_seconds = std::chrono::duration_cast<std::chrono::seconds>(ttl).count();
-                    co_await redis->execCommandCoro("SETEX %s %lld %b",
-                                                    key.c_str(),
-                                                    static_cast<long long>(ttl_seconds),
-                                                    json.data(),
-                                                    json.size());
+                    co_await DbProvider::redis("SETEX", key,
+                        ttl_seconds,
+                        std::string_view(json.data(), json.size()));
                     co_return true;
                 } catch (const std::exception& e) {
-                    LOG_WARN << "RedisCache setRaw error: " << e.what();
+                    RELAIS_LOG_WARN << "RedisCache setRaw error: " << e.what();
                     co_return false;
                 }
             }
 
-            static ::drogon::Task<std::optional<std::string>> getListRaw(const std::string& key) {
+            static pqcoro::Task<std::optional<std::string>> getListRaw(const std::string& key) {
                 co_return co_await getRaw(key);
             }
 
             template<typename Rep, typename Period>
-            static ::drogon::Task<bool> setListRaw(const std::string& key,
+            static pqcoro::Task<bool> setListRaw(const std::string& key,
                                                   std::string_view json,
                                                   std::chrono::duration<Rep, Period> ttl) {
                 co_return co_await setRaw(key, json, ttl);
             }
 
             /// Get raw binary data (for BEVE or other binary formats).
-            static ::drogon::Task<std::optional<std::vector<uint8_t>>> getRawBinary(const std::string& key) {
-                const auto redis = ::drogon::app().getRedisClient();
-                if (!redis) {
+            static pqcoro::Task<std::optional<std::vector<uint8_t>>> getRawBinary(const std::string& key) {
+                if (!DbProvider::hasRedis()) {
                     co_return std::nullopt;
                 }
 
                 try {
-                    const auto result = co_await redis->execCommandCoro("GET %s", key.c_str());
+                    auto result = co_await DbProvider::redis("GET", key);
                     if (result.isNil()) {
                         co_return std::nullopt;
                     }
-                    const auto& str = result.asString();
-                    co_return std::vector<uint8_t>(str.begin(), str.end());
+                    auto sv = result.asStringView();
+                    co_return std::vector<uint8_t>(
+                        reinterpret_cast<const uint8_t*>(sv.data()),
+                        reinterpret_cast<const uint8_t*>(sv.data()) + sv.size());
                 } catch (const std::exception& e) {
-                    LOG_WARN << "RedisCache getRawBinary error: " << e.what();
+                    RELAIS_LOG_WARN << "RedisCache getRawBinary error: " << e.what();
                     co_return std::nullopt;
                 }
             }
 
             /// Get raw binary data with TTL refresh (GETEX).
             template<typename Rep, typename Period>
-            static ::drogon::Task<std::optional<std::vector<uint8_t>>> getRawBinaryEx(
+            static pqcoro::Task<std::optional<std::vector<uint8_t>>> getRawBinaryEx(
                 const std::string& key,
                 std::chrono::duration<Rep, Period> ttl) {
-                const auto redis = ::drogon::app().getRedisClient();
-                if (!redis) {
+                if (!DbProvider::hasRedis()) {
                     co_return std::nullopt;
                 }
 
                 try {
                     auto ttl_seconds = std::chrono::duration_cast<std::chrono::seconds>(ttl).count();
-                    const auto result = co_await redis->execCommandCoro("GETEX %s EX %lld",
-                                                                         key.c_str(),
-                                                                         static_cast<long long>(ttl_seconds));
+                    auto result = co_await DbProvider::redis("GETEX", key,
+                        "EX", ttl_seconds);
                     if (result.isNil()) {
                         co_return std::nullopt;
                     }
-                    const auto& str = result.asString();
-                    co_return std::vector<uint8_t>(str.begin(), str.end());
+                    auto sv = result.asStringView();
+                    co_return std::vector<uint8_t>(
+                        reinterpret_cast<const uint8_t*>(sv.data()),
+                        reinterpret_cast<const uint8_t*>(sv.data()) + sv.size());
                 } catch (const std::exception& e) {
-                    LOG_WARN << "RedisCache getRawBinaryEx error: " << e.what();
+                    RELAIS_LOG_WARN << "RedisCache getRawBinaryEx error: " << e.what();
                     co_return std::nullopt;
                 }
             }
 
             /// Store raw binary data.
             template<typename Rep, typename Period>
-            static ::drogon::Task<bool> setRawBinary(const std::string& key,
+            static pqcoro::Task<bool> setRawBinary(const std::string& key,
                                                     const std::vector<uint8_t>& data,
                                                     std::chrono::duration<Rep, Period> ttl) {
-                const auto redis = ::drogon::app().getRedisClient();
-                if (!redis) {
+                if (!DbProvider::hasRedis()) {
                     co_return false;
                 }
 
                 try {
                     auto ttl_seconds = std::chrono::duration_cast<std::chrono::seconds>(ttl).count();
-                    co_await redis->execCommandCoro("SETEX %s %lld %b",
-                                                    key.c_str(),
-                                                    static_cast<long long>(ttl_seconds),
-                                                    data.data(),
-                                                    data.size());
+                    co_await DbProvider::redis("SETEX", key,
+                        ttl_seconds,
+                        std::string_view(reinterpret_cast<const char*>(data.data()), data.size()));
                     co_return true;
                 } catch (const std::exception& e) {
-                    LOG_WARN << "RedisCache setRawBinary error: " << e.what();
+                    RELAIS_LOG_WARN << "RedisCache setRawBinary error: " << e.what();
                     co_return false;
                 }
             }
@@ -288,15 +276,11 @@ namespace jcailloux::drogon::cache {
             // =================================================================
             // FlatBuffer List Entity Binary Methods
             // =================================================================
-            // These methods work with list wrapper entities that support:
-            // - static std::optional<ListEntity> fromBinary(std::span<const uint8_t>)
-            // - std::vector<uint8_t> toBinary() const
 
             /// Get a FlatBuffer list entity from binary cache.
-            /// Automatically skips the ListBoundsHeader if present (magic bytes 0x52 0x4C).
-            /// @tparam ListEntity Must have static fromBinary(span<const uint8_t>) method
+            /// Automatically skips the ListBoundsHeader if present (magic bytes 0x53 0x52).
             template<typename ListEntity>
-            static ::drogon::Task<std::optional<ListEntity>> getListBinary(const std::string& key)
+            static pqcoro::Task<std::optional<ListEntity>> getListBinary(const std::string& key)
                 requires requires(const std::vector<uint8_t>& data) {
                     { ListEntity::fromBinary(std::span<const uint8_t>(data)) } -> std::convertible_to<std::optional<ListEntity>>;
                 }
@@ -316,10 +300,8 @@ namespace jcailloux::drogon::cache {
             }
 
             /// Get a FlatBuffer list entity with TTL refresh.
-            /// Automatically skips the ListBoundsHeader if present.
-            /// @tparam ListEntity Must have static fromBinary(span<const uint8_t>) method
             template<typename ListEntity, typename Rep, typename Period>
-            static ::drogon::Task<std::optional<ListEntity>> getListBinaryEx(
+            static pqcoro::Task<std::optional<ListEntity>> getListBinaryEx(
                 const std::string& key,
                 std::chrono::duration<Rep, Period> ttl)
                 requires requires(const std::vector<uint8_t>& data) {
@@ -340,10 +322,8 @@ namespace jcailloux::drogon::cache {
             }
 
             /// Store a list entity as binary.
-            /// Optionally prepends a ListBoundsHeader for fine-grained invalidation.
-            /// @tparam ListEntity Must have toBinary() returning shared_ptr<const vector<uint8_t>>
             template<typename ListEntity, typename Rep, typename Period>
-            static ::drogon::Task<bool> setListBinary(
+            static pqcoro::Task<bool> setListBinary(
                 const std::string& key,
                 const ListEntity& listEntity,
                 std::chrono::duration<Rep, Period> ttl,
@@ -365,48 +345,42 @@ namespace jcailloux::drogon::cache {
 
             /// Refresh TTL without modifying the value.
             template<typename Rep, typename Period>
-            static ::drogon::Task<bool> expire(const std::string& key,
+            static pqcoro::Task<bool> expire(const std::string& key,
                                               std::chrono::duration<Rep, Period> ttl) {
-                const auto redis = ::drogon::app().getRedisClient();
-                if (!redis) {
+                if (!DbProvider::hasRedis()) {
                     co_return false;
                 }
 
                 try {
                     auto ttl_seconds = std::chrono::duration_cast<std::chrono::seconds>(ttl).count();
-                    auto result = co_await redis->execCommandCoro("EXPIRE %s %lld",
-                                                                   key.c_str(),
-                                                                   static_cast<long long>(ttl_seconds));
+                    auto result = co_await DbProvider::redis("EXPIRE", key,
+                        ttl_seconds);
                     co_return result.asInteger() == 1;
                 } catch (const std::exception& e) {
-                    LOG_WARN << "RedisCache EXPIRE error: " << e.what();
+                    RELAIS_LOG_WARN << "RedisCache EXPIRE error: " << e.what();
                     co_return false;
                 }
             }
 
-            static ::drogon::Task<bool> invalidate(const std::string& key) {
-                const auto redis = ::drogon::app().getRedisClient();
-                if (!redis) {
+            static pqcoro::Task<bool> invalidate(const std::string& key) {
+                if (!DbProvider::hasRedis()) {
                     co_return false;
                 }
 
                 try {
-                    co_await redis->execCommandCoro("DEL %s", key.c_str());
+                    co_await DbProvider::redis("DEL", key);
                     co_return true;
                 } catch (const std::exception& e) {
-                    LOG_WARN << "RedisCache DEL error: " << e.what();
+                    RELAIS_LOG_WARN << "RedisCache DEL error: " << e.what();
                     co_return false;
                 }
             }
 
             /// Invalidate keys matching a pattern using SCAN (non-blocking).
-            /// Safer than invalidatePattern() for production use.
-            /// @param pattern Redis glob pattern (e.g., "MyCache:list:user:123:*")
-            /// @param batch_size Number of keys to scan per iteration (default 100)
-            static ::drogon::Task<size_t> invalidatePatternSafe(const std::string& pattern,
+            /// Safer than KEYS for production use.
+            static pqcoro::Task<size_t> invalidatePatternSafe(const std::string& pattern,
                                                                size_t batch_size = 100) {
-                const auto redis = ::drogon::app().getRedisClient();
-                if (!redis) {
+                if (!DbProvider::hasRedis()) {
                     co_return 0;
                 }
 
@@ -415,40 +389,34 @@ namespace jcailloux::drogon::cache {
                     std::string cursor = "0";
 
                     do {
-                        // Collect keys from SCAN result before issuing DEL commands,
-                        // because co_await DEL may invalidate references to the SCAN result.
                         std::vector<std::string> batch_keys;
 
-                        auto result = co_await redis->execCommandCoro(
-                            "SCAN %s MATCH %s COUNT %lld",
-                            cursor.c_str(), pattern.c_str(), static_cast<long long>(batch_size));
+                        auto result = co_await DbProvider::redis(
+                            "SCAN", cursor, "MATCH", pattern, "COUNT", batch_size);
 
-                        if (result.isNil() || result.type() != ::drogon::nosql::RedisResultType::kArray) {
+                        if (result.isNil() || !result.isArray()) {
                             break;
                         }
 
-                        const auto& arr = result.asArray();
-                        if (arr.size() < 2) break;
+                        if (result.arraySize() < 2) break;
 
-                        cursor = arr[0].asString();
-                        const auto& keys = arr[1].asArray();
+                        cursor = result.at(0).asString();
+                        auto keysResult = result.at(1);
 
-                        for (const auto& keyResult : keys) {
-                            if (keyResult.type() == ::drogon::nosql::RedisResultType::kNil ||
-                                keyResult.type() == ::drogon::nosql::RedisResultType::kArray) {
+                        for (size_t i = 0; i < keysResult.arraySize(); ++i) {
+                            auto elem = keysResult.at(i);
+                            if (elem.isNil() || elem.isArray()) {
                                 continue;
                             }
-                            try {
-                                auto key = keyResult.asString();
-                                if (!key.empty()) {
-                                    batch_keys.push_back(std::move(key));
-                                }
-                            } catch (...) {}
+                            auto keyStr = elem.asString();
+                            if (!keyStr.empty()) {
+                                batch_keys.push_back(std::move(keyStr));
+                            }
                         }
 
-                        for (const auto& key : batch_keys) {
+                        for (const auto& k : batch_keys) {
                             try {
-                                co_await redis->execCommandCoro("DEL %s", key.c_str());
+                                co_await DbProvider::redis("DEL", k);
                                 ++count;
                             } catch (...) {}
                         }
@@ -456,7 +424,7 @@ namespace jcailloux::drogon::cache {
 
                     co_return count;
                 } catch (const std::exception& e) {
-                    LOG_WARN << "RedisCache invalidatePatternSafe error: " << e.what();
+                    RELAIS_LOG_WARN << "RedisCache invalidatePatternSafe error: " << e.what();
                     co_return 0;
                 }
             }
@@ -466,15 +434,11 @@ namespace jcailloux::drogon::cache {
             // =================================================================
 
             /// Track a list cache key in its group's tracking set.
-            /// Call this when caching a list to enable efficient group invalidation.
-            /// @param groupKey The logical group (e.g., "MyRepo:list:user:123")
-            /// @param listKey The actual cache key (e.g., "MyRepo:list:user:123:limit:20:offset:0")
             template<typename Rep, typename Period>
-            static ::drogon::Task<bool> trackListKey(const std::string& groupKey,
+            static pqcoro::Task<bool> trackListKey(const std::string& groupKey,
                                                     const std::string& listKey,
                                                     std::chrono::duration<Rep, Period> ttl) {
-                const auto redis = ::drogon::app().getRedisClient();
-                if (!redis) {
+                if (!DbProvider::hasRedis()) {
                     co_return false;
                 }
 
@@ -482,28 +446,24 @@ namespace jcailloux::drogon::cache {
                     const std::string trackingKey = groupKey + ":_keys";
                     auto ttl_seconds = std::chrono::duration_cast<std::chrono::seconds>(ttl).count();
 
-                    // Add to tracking set (binary-safe value)
-                    co_await redis->execCommandCoro("SADD %s %b",
-                        trackingKey.c_str(), listKey.c_str(), listKey.size());
+                    // Add to tracking set (binary-safe via argvlen)
+                    co_await DbProvider::redis("SADD", trackingKey, listKey);
 
                     // Set TTL on tracking set only if none exists (NX = don't renew)
-                    co_await redis->execCommandCoro("EXPIRE %s %lld NX",
-                        trackingKey.c_str(), static_cast<long long>(ttl_seconds));
+                    co_await DbProvider::redis("EXPIRE", trackingKey,
+                        ttl_seconds, "NX");
 
                     co_return true;
                 } catch (const std::exception& e) {
-                    LOG_WARN << "RedisCache trackListKey error: " << e.what();
+                    RELAIS_LOG_WARN << "RedisCache trackListKey error: " << e.what();
                     co_return false;
                 }
             }
 
             /// Invalidate all list cache keys in a group.
             /// O(M) where M is the number of cached pages (typically small).
-            /// @param groupKey The logical group (e.g., "MyRepo:list:user:123")
-            /// @return Number of keys invalidated
-            static ::drogon::Task<size_t> invalidateListGroup(const std::string& groupKey) {
-                const auto redis = ::drogon::app().getRedisClient();
-                if (!redis) {
+            static pqcoro::Task<size_t> invalidateListGroup(const std::string& groupKey) {
+                if (!DbProvider::hasRedis()) {
                     co_return 0;
                 }
 
@@ -511,7 +471,6 @@ namespace jcailloux::drogon::cache {
                     const std::string trackingKey = groupKey + ":_keys";
 
                     // Atomic Lua script: get all tracked keys, delete them, delete the set.
-                    // This avoids element type parsing issues with SMEMBERS in some drogon/Redis versions.
                     static constexpr std::string_view lua = R"(
                         local keys = redis.call('SMEMBERS', KEYS[1])
                         local count = 0
@@ -523,14 +482,12 @@ namespace jcailloux::drogon::cache {
                         return count
                     )";
 
-                    auto result = co_await redis->execCommandCoro(
-                        "EVAL %s 1 %s",
-                        std::string(lua).c_str(),
-                        trackingKey.c_str());
+                    auto result = co_await DbProvider::redis(
+                        "EVAL", lua, "1", trackingKey);
 
                     co_return result.isNil() ? 0 : static_cast<size_t>(result.asInteger());
                 } catch (const std::exception& e) {
-                    LOG_WARN << "RedisCache invalidateListGroup error: " << e.what();
+                    RELAIS_LOG_WARN << "RedisCache invalidateListGroup error: " << e.what();
                     co_return 0;
                 }
             }
@@ -540,33 +497,17 @@ namespace jcailloux::drogon::cache {
             // =================================================================
 
             /// Selectively invalidate list pages in a group based on a single sort value.
-            /// Used for create/delete operations.
-            ///
-            /// For each page in the tracking set, the Lua script reads the 19-byte header
-            /// via GETRANGE and applies the appropriate invalidation logic:
-            /// - Offset mode (cascade): invalidates pages whose range includes entity_val and all after
-            /// - Cursor mode (localized): only invalidates pages whose range contains entity_val
-            /// - No header (backward compat): always invalidates (conservative)
-            ///
-            /// @param groupKey The logical group (e.g., "MyRepo:list:category:tech")
-            /// @param entity_sort_val The sort value of the created/deleted entity
-            /// @return Number of pages invalidated
-            static ::drogon::Task<size_t> invalidateListGroupSelective(
+            static pqcoro::Task<size_t> invalidateListGroupSelective(
                 const std::string& groupKey,
                 int64_t entity_sort_val)
             {
-                const auto redis = ::drogon::app().getRedisClient();
-                if (!redis) {
+                if (!DbProvider::hasRedis()) {
                     co_return 0;
                 }
 
                 try {
                     const std::string trackingKey = groupKey + ":_keys";
 
-                    // Lua script: iterate pages, read header, decide whether to delete.
-                    // KEYS[1] = trackingKey
-                    // ARGV[1] = entity_sort_val (as string, converted via tonumber)
-                    // ARGV[2] = header_size (19)
                     static constexpr std::string_view lua = R"(
 local keys = redis.call('SMEMBERS', KEYS[1])
 local entity_val = tonumber(ARGV[1])
@@ -637,46 +578,32 @@ if count == #keys then redis.call('DEL', KEYS[1]) end
 return count
 )";
 
-                    auto result = co_await redis->execCommandCoro(
-                        "EVAL %s 1 %s %lld %d",
-                        std::string(lua).c_str(),
-                        trackingKey.c_str(),
-                        static_cast<long long>(entity_sort_val),
+                    auto result = co_await DbProvider::redis(
+                        "EVAL", lua, "1", trackingKey,
+                        entity_sort_val,
                         static_cast<int>(list::kListBoundsHeaderSize));
 
                     co_return result.isNil() ? 0 : static_cast<size_t>(result.asInteger());
                 } catch (const std::exception& e) {
-                    LOG_WARN << "RedisCache invalidateListGroupSelective error: " << e.what();
+                    RELAIS_LOG_WARN << "RedisCache invalidateListGroupSelective error: " << e.what();
                     co_return 0;
                 }
             }
 
             /// Selectively invalidate list pages in a group based on old and new sort values.
             /// Used for update operations where the entity's sort value changed.
-            ///
-            /// - Offset mode: uses interval overlap [page_min, page_max] ∩ [min(old,new), max(old,new)]
-            /// - Cursor mode: checks if old OR new value falls in the page range
-            /// - No header: always invalidates (conservative)
-            ///
-            /// @param groupKey The logical group
-            /// @param old_sort_val Sort value before the update
-            /// @param new_sort_val Sort value after the update
-            /// @return Number of pages invalidated
-            static ::drogon::Task<size_t> invalidateListGroupSelectiveUpdate(
+            static pqcoro::Task<size_t> invalidateListGroupSelectiveUpdate(
                 const std::string& groupKey,
                 int64_t old_sort_val,
                 int64_t new_sort_val)
             {
-                const auto redis = ::drogon::app().getRedisClient();
-                if (!redis) {
+                if (!DbProvider::hasRedis()) {
                     co_return 0;
                 }
 
                 try {
                     const std::string trackingKey = groupKey + ":_keys";
 
-                    // KEYS[1] = trackingKey
-                    // ARGV[1] = old_sort_val, ARGV[2] = new_sort_val, ARGV[3] = header_size
                     static constexpr std::string_view lua = R"(
 local keys = redis.call('SMEMBERS', KEYS[1])
 local old_val = tonumber(ARGV[1])
@@ -744,17 +671,14 @@ if count == #keys then redis.call('DEL', KEYS[1]) end
 return count
 )";
 
-                    auto result = co_await redis->execCommandCoro(
-                        "EVAL %s 1 %s %lld %lld %d",
-                        std::string(lua).c_str(),
-                        trackingKey.c_str(),
-                        static_cast<long long>(old_sort_val),
-                        static_cast<long long>(new_sort_val),
+                    auto result = co_await DbProvider::redis(
+                        "EVAL", lua, "1", trackingKey,
+                        old_sort_val, new_sort_val,
                         static_cast<int>(list::kListBoundsHeaderSize));
 
                     co_return result.isNil() ? 0 : static_cast<size_t>(result.asInteger());
                 } catch (const std::exception& e) {
-                    LOG_WARN << "RedisCache invalidateListGroupSelectiveUpdate error: " << e.what();
+                    RELAIS_LOG_WARN << "RedisCache invalidateListGroupSelectiveUpdate error: " << e.what();
                     co_return 0;
                 }
             }
@@ -773,14 +697,13 @@ return count
             static std::optional<std::vector<Entity>> parseList(const std::string_view json) {
                 std::vector<Entity> result;
                 if (auto ec = glz::read_json(result, json)) {
-                    LOG_WARN << "RedisCache parseList error: " << glz::format_error(ec, json);
+                    RELAIS_LOG_WARN << "RedisCache parseList error: " << glz::format_error(ec, json);
                     return std::nullopt;
                 }
                 return result;
             }
 
             /// Parse a list value that may be prefixed with a ListBoundsHeader.
-            /// Detects magic bytes and skips the header if present.
             template<typename Entity>
             static std::optional<std::vector<Entity>> parseListWithHeader(const std::string_view raw) {
                 std::string_view data = raw;
@@ -793,6 +716,6 @@ return count
             }
     };
 
-} // namespace jcailloux::drogon::cache
+} // namespace jcailloux::relais::cache
 
-#endif //JCX_DROGON_REDISCACHE_H
+#endif //JCX_RELAIS_REDISCACHE_H

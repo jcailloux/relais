@@ -181,7 +181,7 @@ TEST_CASE("Concurrency - concurrent read + write",
                     // Writer
                     auto entity = makeTestItem(
                         "rw_" + std::to_string(i) + "_" + std::to_string(j),
-                        i * 1000 + j, std::nullopt, true, id);
+                        i * 1000 + j, "", true, id);
                     sync(L1TestItemRepository::update(id, entity));
                 }
             }
@@ -203,7 +203,7 @@ TEST_CASE("Concurrency - concurrent read + write",
                 } else {
                     auto entity = makeTestItem(
                         "rw_both_" + std::to_string(i) + "_" + std::to_string(j),
-                        i * 1000 + j, std::nullopt, true, id);
+                        i * 1000 + j, "", true, id);
                     sync(FullCacheTestItemRepository::update(id, entity));
                 }
             }
@@ -432,7 +432,7 @@ TEST_CASE("Concurrency - mixed operations storm",
                         auto entity = makeTestItem(
                             "storm_upd_" + std::to_string(i) + "_" + std::to_string(j),
                             static_cast<int32_t>(rng() % 1000),
-                            std::nullopt, true, id);
+                            "", true, id);
                         sync(FullCacheTestItemRepository::update(id, entity));
                         break;
                     }
@@ -476,7 +476,7 @@ TEST_CASE("Concurrency - mixed operations storm",
                 // Update
                 auto updated = makeTestItem(
                     "crud_upd_" + std::to_string(i) + "_" + std::to_string(j),
-                    i * 100 + j + 1, std::nullopt, true, id);
+                    i * 100 + j + 1, "", true, id);
                 sync(L1TestItemRepository::update(id, updated));
 
                 // Read again
@@ -510,7 +510,7 @@ TEST_CASE("Concurrency - concurrent updateBy",
 {
     TransactionGuard tx;
 
-    using jcailloux::drogon::wrapper::set;
+    using jcailloux::relais::wrapper::set;
     using F = TestUserWrapper::Field;
 
     SECTION("[L1] concurrent updateBy on same user") {
@@ -574,7 +574,7 @@ TEST_CASE("Concurrency - cleanup during operations",
                         auto entity = makeTestItem(
                             "cl_" + std::to_string(i) + "_" + std::to_string(j),
                             static_cast<int32_t>(rng() % 1000),
-                            std::nullopt, true, id);
+                            "", true, id);
                         sync(L1TestItemRepository::update(id, entity));
                     } else {
                         sync(L1TestItemRepository::findById(id));

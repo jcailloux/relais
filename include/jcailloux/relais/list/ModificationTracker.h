@@ -1,5 +1,5 @@
-#ifndef JCAILLOUX_DROGON_LIST_MODIFICATIONTRACKER_H
-#define JCAILLOUX_DROGON_LIST_MODIFICATIONTRACKER_H
+#ifndef JCAILLOUX_RELAIS_LIST_MODIFICATIONTRACKER_H
+#define JCAILLOUX_RELAIS_LIST_MODIFICATIONTRACKER_H
 
 #include <atomic>
 #include <chrono>
@@ -13,7 +13,7 @@
 namespace relais_test { struct TestInternals; }
 #endif
 
-namespace jcailloux::drogon::cache::list {
+namespace jcailloux::relais::cache::list {
 
 // =============================================================================
 // EntityModification - Represents a modification to an entity
@@ -282,6 +282,6 @@ public:
 #endif
 };
 
-}  // namespace jcailloux::drogon::cache::list
+}  // namespace jcailloux::relais::cache::list
 
-#endif  // JCAILLOUX_DROGON_LIST_MODIFICATIONTRACKER_H
+#endif  // JCAILLOUX_RELAIS_LIST_MODIFICATIONTRACKER_H

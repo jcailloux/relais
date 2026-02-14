@@ -1,5 +1,5 @@
-#ifndef JCX_DROGON_DURATION_H
-#define JCX_DROGON_DURATION_H
+#ifndef JCX_RELAIS_DURATION_H
+#define JCX_RELAIS_DURATION_H
 
 #include <chrono>
 #include <cstdint>
@@ -39,4 +39,4 @@ struct Duration {
 
 }  // namespace jcailloux::relais::config
 
-#endif //JCX_DROGON_DURATION_H
+#endif //JCX_RELAIS_DURATION_H

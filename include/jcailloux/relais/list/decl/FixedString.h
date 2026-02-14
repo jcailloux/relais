@@ -5,7 +5,7 @@
 #include <cstddef>
 #include <string_view>
 
-namespace jcailloux::drogon::cache::list::decl {
+namespace jcailloux::relais::cache::list::decl {
 
 /// Compile-time string for use as Non-Type Template Parameter (NTTP)
 template<size_t N>
@@ -42,6 +42,6 @@ struct FixedString {
 template<size_t N>
 FixedString(const char (&)[N]) -> FixedString<N>;
 
-}  // namespace jcailloux::drogon::cache::list::decl
+}  // namespace jcailloux::relais::cache::list::decl
 
 #endif  // CODIBOT_CACHE_LIST_DECL_FIXEDSTRING_H

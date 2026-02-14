@@ -9,16 +9,13 @@
  *   4. TestOrder      — comprehensive coverage: enum, nested struct, raw JSON,
  *                        vectors, nullable
  *   5. ListWrapper     — generic list wrapper (construction, serialization,
- *                        firstItem/lastItem, fromModels)
+ *                        firstItem/lastItem, fromItems)
  *   6. Glaze vector   — validates Glaze round-trip for vector<Entity>
  *
  * SECTION naming convention:
  *   [Struct]       — direct struct construction and field access
  *   [Binary]       — BEVE binary round-trip (toBinary / fromBinary)
  *   [JSON]         — JSON round-trip (toJson / fromJson)
- *   [Model->Struct] — fromModel conversion
- *   [Struct->Model] — toModel conversion
- *   [Model<->Struct]— fromModel then toModel round-trip
  *   [List]         — ListWrapper construction / accessors
  *   [List->JSON]   — ListWrapper serialized to JSON
  */
@@ -44,8 +41,8 @@ using relais_test::TestGeoLocation;
 using relais_test::TestCoordinateMetadata;
 using relais_test::Priority;
 using relais_test::Status;
-using ListWrapperArticle = jcailloux::drogon::wrapper::ListWrapper<TestArticle>;
-using ListWrapperItem = jcailloux::drogon::wrapper::ListWrapper<TestItem>;
+using ListWrapperArticle = jcailloux::relais::wrapper::ListWrapper<TestArticle>;
+using ListWrapperItem = jcailloux::relais::wrapper::ListWrapper<TestItem>;
 
 // #############################################################################
 //
@@ -137,53 +134,15 @@ TEST_CASE("TestUser - JSON round-trip", "[wrapper][json][user]") {
         REQUIRE(restored->email == "alice@example.com");
         REQUIRE(restored->balance == 1000);
     }
-}
 
-TEST_CASE("TestUser - fromModel / toModel", "[wrapper][model][user]") {
-
-    relais_test::TestUserModel model;
-    model.setId(99);
-    model.setUsername("bob");
-    model.setEmail("bob@example.com");
-    model.setBalance(500);
-    model.setCreatedAt(trantor::Date::fromDbStringLocal("2025-06-15 10:30:00"));
-    auto user = TestUser::fromModel(model);
-
-    SECTION("[Model->Struct] reads all fields") {
-        REQUIRE(user.has_value());
-        REQUIRE(user->id == 99);
-        REQUIRE(user->username == "bob");
-        REQUIRE(user->email == "bob@example.com");
-        REQUIRE(user->balance == 500);
-        REQUIRE_FALSE(user->created_at.empty());
-    }
-
-    SECTION("[Model->Struct] preserves zero numeric") {
-        model.setBalance(0);
-        auto u = TestUser::fromModel(model);
-        REQUIRE(u.has_value());
-        REQUIRE(u->balance == 0);
-    }
-
-    SECTION("[Struct->Model] reads non-DbManaged fields") {
-        auto m = TestUser::toModel(*user);
-        REQUIRE(m.getValueOfUsername() == "bob");
-        REQUIRE(m.getValueOfEmail() == "bob@example.com");
-        REQUIRE(m.getValueOfBalance() == 500);
-    }
-
-    SECTION("[Struct->Model] skips DbManaged id") {
-        auto m = TestUser::toModel(*user);
-        REQUIRE_FALSE(m.getId());
-    }
-
-    SECTION("[Struct->Model] converts timestamp") {
-        auto m = TestUser::toModel(*user);
-        REQUIRE(m.getCreatedAt());
-    }
-
-    SECTION("[Binary] round-trip after fromModel") {
-        auto restored = TestUser::fromBinary(*user->toBinary());
+    SECTION("[Binary] round-trip preserves all fields") {
+        TestUser u;
+        u.id = 99;
+        u.username = "bob";
+        u.email = "bob@example.com";
+        u.balance = 500;
+        u.created_at = "2025-06-15T10:30:00Z";
+        auto restored = TestUser::fromBinary(*u.toBinary());
         REQUIRE(restored.has_value());
         REQUIRE(restored->id == 99);
         REQUIRE(restored->username == "bob");
@@ -198,41 +157,37 @@ TEST_CASE("TestUser - fromModel / toModel", "[wrapper][model][user]") {
 
 TEST_CASE("TestArticle - boolean and timestamp fields", "[wrapper][struct][article]") {
 
-    relais_test::TestArticleModel model;
-    model.setId(42);
-    model.setCategory("tech");
-    model.setAuthorId(7);
-    model.setTitle("Hello World");
-    model.setViewCount(100);
-    model.setCreatedAt(trantor::Date::fromDbStringLocal("2025-05-30 09:00:00"));
+    TestArticle article;
+    article.id = 42;
+    article.category = "tech";
+    article.author_id = 7;
+    article.title = "Hello World";
+    article.view_count = 100;
+    article.created_at = "2025-05-30T09:00:00Z";
 
-    SECTION("[Model->Struct] boolean true") {
-        model.setIsPublished(true);
-        auto a = TestArticle::fromModel(model);
-        REQUIRE(a->is_published == true);
+    SECTION("[Struct] boolean true") {
+        article.is_published = true;
+        REQUIRE(article.is_published == true);
     }
 
-    SECTION("[Model->Struct] boolean false") {
-        model.setIsPublished(false);
-        auto a = TestArticle::fromModel(model);
-        REQUIRE(a->is_published == false);
+    SECTION("[Struct] boolean false") {
+        article.is_published = false;
+        REQUIRE(article.is_published == false);
     }
 
-    SECTION("[Model->Struct] all fields including timestamps") {
-        model.setIsPublished(true);
-        model.setPublishedAt(trantor::Date::fromDbStringLocal("2025-06-01 12:00:00"));
-        auto a = TestArticle::fromModel(model);
-        REQUIRE(a.has_value());
-        REQUIRE(a->id == 42);
-        REQUIRE(a->category == "tech");
-        REQUIRE(a->author_id == 7);
-        REQUIRE(a->title == "Hello World");
-        REQUIRE(a->view_count.has_value());
-        REQUIRE(*a->view_count == 100);
-        REQUIRE(a->is_published == true);
-        REQUIRE(a->published_at.has_value());
-        REQUIRE_FALSE(a->published_at->empty());
-        REQUIRE_FALSE(a->created_at.empty());
+    SECTION("[Struct] all fields including timestamps") {
+        article.is_published = true;
+        article.published_at = "2025-06-01T12:00:00Z";
+        REQUIRE(article.id == 42);
+        REQUIRE(article.category == "tech");
+        REQUIRE(article.author_id == 7);
+        REQUIRE(article.title == "Hello World");
+        REQUIRE(article.view_count.has_value());
+        REQUIRE(*article.view_count == 100);
+        REQUIRE(article.is_published == true);
+        REQUIRE(article.published_at.has_value());
+        REQUIRE_FALSE(article.published_at->empty());
+        REQUIRE_FALSE(article.created_at.empty());
     }
 }
 
@@ -257,21 +212,10 @@ TEST_CASE("TestArticle - nullable fields", "[wrapper][struct][article][nullable]
         // Glaze serializes std::optional as null or omits it depending on config
     }
 
-    SECTION("[Struct->Model] absent value leaves model null") {
-        REQUIRE_FALSE(TestArticle::toModel(article).getViewCount());
-    }
-
     SECTION("[Struct] explicit 0 returns optional(0)") {
         article.view_count = 0;
         REQUIRE(article.view_count.has_value());
         REQUIRE(*article.view_count == 0);
-    }
-
-    SECTION("[Struct->Model] explicit 0 sets value") {
-        article.view_count = 0;
-        auto m = TestArticle::toModel(article);
-        REQUIRE(m.getViewCount());
-        REQUIRE(*m.getViewCount() == 0);
     }
 
     SECTION("[Struct] non-zero value returns optional(42)") {
@@ -294,78 +238,39 @@ TEST_CASE("TestArticle - nullable fields", "[wrapper][struct][article][nullable]
     }
 }
 
-TEST_CASE("TestArticle - nullable from model", "[wrapper][model][article][nullable]") {
-
-    relais_test::TestArticleModel model;
-    model.setId(20);
-    model.setCategory("tech");
-    model.setAuthorId(1);
-    model.setTitle("Test");
-    model.setIsPublished(false);
-    model.setCreatedAt(trantor::Date::fromDbStringLocal("2025-01-01 00:00:00"));
-
-    SECTION("[Model->Struct] null produces absent") {
-        auto a = TestArticle::fromModel(model);
-        REQUIRE_FALSE(a->view_count.has_value());
-    }
-
-    SECTION("[Model->Struct] 0 produces optional(0)") {
-        model.setViewCount(0);
-        auto a = TestArticle::fromModel(model);
-        REQUIRE(a->view_count.has_value());
-        REQUIRE(*a->view_count == 0);
-    }
-
-    SECTION("[Model->Struct] 100 produces optional(100)") {
-        model.setViewCount(100);
-        auto a = TestArticle::fromModel(model);
-        REQUIRE(*a->view_count == 100);
-    }
-}
-
 // #############################################################################
 //
 //  3. TestPurchase — cross-entity validation
 //
 // #############################################################################
 
-TEST_CASE("TestPurchase - fromModel / toModel / toJson", "[wrapper][struct][purchase]") {
+TEST_CASE("TestPurchase - struct / toJson / binary", "[wrapper][struct][purchase]") {
 
-    relais_test::TestPurchaseModel model;
-    model.setId(1);
-    model.setUserId(42);
-    model.setProductName("Widget");
-    model.setAmount(999);
-    model.setStatus("completed");
-    model.setCreatedAt(trantor::Date::fromDbStringLocal("2025-01-01 00:00:00"));
-    auto purchase = TestPurchase::fromModel(model);
+    TestPurchase purchase;
+    purchase.id = 1;
+    purchase.user_id = 42;
+    purchase.product_name = "Widget";
+    purchase.amount = 999;
+    purchase.status = "completed";
+    purchase.created_at = "2025-01-01T00:00:00Z";
 
-    SECTION("[Model->Struct] reads all fields") {
-        REQUIRE(purchase.has_value());
-        REQUIRE(purchase->id == 1);
-        REQUIRE(purchase->user_id == 42);
-        REQUIRE(purchase->product_name == "Widget");
-        REQUIRE(purchase->amount == 999);
-        REQUIRE(purchase->status == "completed");
-    }
-
-    SECTION("[Struct->Model] round-trip") {
-        auto m = TestPurchase::toModel(*purchase);
-        REQUIRE(m.getValueOfUserId() == 42);
-        REQUIRE(m.getValueOfProductName() == "Widget");
-        REQUIRE(m.getValueOfAmount() == 999);
-        REQUIRE(m.getValueOfStatus() == "completed");
+    SECTION("[Struct] reads all fields") {
+        REQUIRE(purchase.id == 1);
+        REQUIRE(purchase.user_id == 42);
+        REQUIRE(purchase.product_name == "Widget");
+        REQUIRE(purchase.amount == 999);
+        REQUIRE(purchase.status == "completed");
     }
 
     SECTION("[JSON] contains all fields") {
-        auto json = purchase->toJson();
+        auto json = purchase.toJson();
         REQUIRE(json->find("\"user_id\":42") != std::string::npos);
         REQUIRE(json->find("\"product_name\":\"Widget\"") != std::string::npos);
         REQUIRE(json->find("\"amount\":999") != std::string::npos);
     }
 
     SECTION("[Binary] round-trip preserves data") {
-        auto restored = TestPurchase::fromBinary(*purchase->toBinary());
+        auto restored = TestPurchase::fromBinary(*purchase.toBinary());
         REQUIRE(restored.has_value());
         REQUIRE(restored->id == 1);
         REQUIRE(restored->user_id == 42);
@@ -447,26 +352,6 @@ TestOrder buildMinimalTestOrder() {
     order.label = "test";
     order.created_at = "2025-01-01T00:00:00Z";
     return order;
-}
-
-/// Build a Drogon model with all scalar/string/enum fields set.
-drogon_model::relais_test::Mock_RelaisTestOrders buildTestOrderModel(
-        int64_t id = 1, const std::string& priority = "low") {
-    drogon_model::relais_test::Mock_RelaisTestOrders model;
-    model.setId(id);
-    model.setUserId(1);
-    model.setAmount(100);
-    model.setIsExpress(false);
-    model.setPriority(priority);
-    model.setStatus("pending");
-    model.setLabel("test");
-    model.setMetadata("");
-    model.setAddress("");
-    model.setHistory("[]");
-    model.setQuantities("[]");
-    model.setTags("[]");
-    model.setCreatedAt(trantor::Date::fromDbStringLocal("2025-01-01 00:00:00"));
-    return model;
 }
 
 }  // anonymous namespace
@@ -566,18 +451,6 @@ TEST_CASE("TestOrder - EnumField (priority)", "[wrapper][struct][order][enum]") 
     SECTION("[JSON] outputs quoted lowercase string") {
         REQUIRE(order.toJson()->find("\"priority\":\"high\"") != std::string::npos);
     }
-
-    SECTION("[Struct->Model] converts enum to lowercase string") {
-        auto m = TestOrder::toModel(order);
-        REQUIRE(m.getValueOfPriority() == "high");
-    }
-
-    SECTION("[Model->Struct] converts string to enum") {
-        auto model = buildTestOrderModel(1, "medium");
-        auto o = TestOrder::fromModel(model);
-        REQUIRE(o.has_value());
-        REQUIRE(o->priority == Priority::Medium);
-    }
 }
 
 TEST_CASE("TestOrder - EnumField (status — developer-defined glz::meta)", "[wrapper][struct][order][enum]") {
@@ -597,19 +470,6 @@ TEST_CASE("TestOrder - EnumField (status — developer-defined glz::meta)", "[wr
         REQUIRE(restored.has_value());
         REQUIRE(restored->status == Status::Shipped);
     }
-
-    SECTION("[Struct->Model] converts enum to lowercase string") {
-        auto m = TestOrder::toModel(order);
-        REQUIRE(m.getValueOfStatus() == "shipped");
-    }
-
-    SECTION("[Model->Struct] converts string to enum") {
-        auto model = buildTestOrderModel();
-        model.setStatus("delivered");
-        auto o = TestOrder::fromModel(model);
-        REQUIRE(o.has_value());
-        REQUIRE(o->status == Status::Delivered);
-    }
 }
 
 TEST_CASE("TestOrder - RawJson (metadata)", "[wrapper][struct][order][rawjson]") {
@@ -619,13 +479,21 @@ TEST_CASE("TestOrder - RawJson (metadata)", "[wrapper][struct][order][rawjson]")
         REQUIRE(order.toJson()->find("\"metadata\":{\"x\":1}") != std::string::npos);
     }
 
-    SECTION("[Model<->Struct] preserve raw string") {
-        auto model = buildTestOrderModel();
-        model.setMetadata(R"({"key":"value"})");
-        auto o = TestOrder::fromModel(model);
-        REQUIRE(o.has_value());
-        auto m = TestOrder::toModel(*o);
-        REQUIRE(m.getValueOfMetadata() == R"({"key":"value"})");
+    SECTION("[JSON] raw string preserved via JSON round-trip") {
+        TestOrder order;
+        order.id = 1;
+        order.user_id = 1;
+        order.amount = 100;
+        order.is_express = false;
+        order.priority = Priority::Low;
+        order.status = Status::Pending;
+        order.label = "test";
+        order.created_at = "2025-01-01T00:00:00Z";
+        order.metadata.str = R"({"key":"value"})";
+        auto json = order.toJson();
+        auto restored = TestOrder::fromJson(*json);
+        REQUIRE(restored.has_value());
+        REQUIRE(restored->metadata.str == R"({"key":"value"})");
     }
 }
 
@@ -651,21 +519,6 @@ TEST_CASE("TestOrder - nested struct (address)", "[wrapper][struct][order][objec
         REQUIRE(order.address.geo.metadata.accuracy == 1.5f);
         REQUIRE(order.address.geo.metadata.source == "gps");
     }
-
-    SECTION("[Model->Struct] address from JSON string (4 levels)") {
-        auto model = buildTestOrderModel();
-        model.setAddress(
-            R"({"street":"123 Main St","city":"Paris","zip_code":"75001","geo":{"latitude":48.8566,"longitude":2.3522,"metadata":{"accuracy":1.5,"source":"gps"}}})");
-        auto order = TestOrder::fromModel(model);
-        REQUIRE(order.has_value());
-        REQUIRE(order->address.street == "123 Main St");
-        REQUIRE(order->address.city == "Paris");
-        REQUIRE(order->address.zip_code == "75001");
-        REQUIRE(order->address.geo.latitude == 48.8566);
-        REQUIRE(order->address.geo.longitude == 2.3522);
-        REQUIRE(order->address.geo.metadata.accuracy == 1.5f);
-        REQUIRE(order->address.geo.metadata.source == "gps");
-    }
 }
 
 TEST_CASE("TestOrder - ObjectVectorField (history)", "[wrapper][struct][order][objectvec]") {
@@ -676,29 +529,6 @@ TEST_CASE("TestOrder - ObjectVectorField (history)", "[wrapper][struct][order][o
         REQUIRE(json->find("\"street\":\"10 Rue A\"") != std::string::npos);
         REQUIRE(json->find("\"street\":\"20 Rue B\"") != std::string::npos);
     }
-
-    SECTION("[Model->Struct] history from JSON array") {
-        auto model = buildTestOrderModel();
-        model.setHistory(
-            R"([{"street":"10 Rue A","city":"Lyon","zip_code":"69001"},{"street":"20 Rue B","city":"Marseille","zip_code":"13001"}])");
-        auto order = TestOrder::fromModel(model);
-        REQUIRE(order.has_value());
-        REQUIRE(order->history.size() == 2);
-        REQUIRE(order->history[0].street == "10 Rue A");
-        REQUIRE(order->history[1].city == "Marseille");
-    }
-
-    SECTION("[Model->Struct] history with nested geo (deep nesting in vector)") {
-        auto model = buildTestOrderModel();
-        model.setHistory(
-            R"([{"street":"42 Av C","city":"Nice","zip_code":"06000","geo":{"latitude":43.7,"longitude":7.27,"metadata":{"accuracy":2.0,"source":"wifi"}}}])");
-        auto order = TestOrder::fromModel(model);
-        REQUIRE(order.has_value());
-        REQUIRE(order->history.size() == 1);
-        REQUIRE(order->history[0].street == "42 Av C");
-        REQUIRE(order->history[0].geo.latitude == 43.7);
-        REQUIRE(order->history[0].geo.metadata.source == "wifi");
-    }
 }
 
 TEST_CASE("TestOrder - ScalarVectorField (quantities)", "[wrapper][struct][order][scalarvec]") {
@@ -707,17 +537,6 @@ TEST_CASE("TestOrder - ScalarVectorField (quantities)", "[wrapper][struct][order
         auto order = buildFullTestOrder();
         REQUIRE(order.toJson()->find("\"quantities\":[10,20,30]") != std::string::npos);
     }
-
-    SECTION("[Model->Struct] quantities from JSON array") {
-        auto model = buildTestOrderModel();
-        model.setQuantities("[10,20,30]");
-        auto order = TestOrder::fromModel(model);
-        REQUIRE(order.has_value());
-        REQUIRE(order->quantities.size() == 3);
-        REQUIRE(order->quantities[0] == 10);
-        REQUIRE(order->quantities[1] == 20);
-        REQUIRE(order->quantities[2] == 30);
-    }
 }
 
 TEST_CASE("TestOrder - StringVectorField (tags)", "[wrapper][struct][order][stringvec]") {
@@ -725,16 +544,6 @@ TEST_CASE("TestOrder - StringVectorField (tags)", "[wrapper][struct][order][stri
     SECTION("[JSON] outputs array of strings") {
         auto order = buildFullTestOrder();
         REQUIRE(order.toJson()->find("\"tags\":[\"urgent\",\"fragile\"]") != std::string::npos);
-    }
-
-    SECTION("[Model->Struct] tags from JSON array") {
-        auto model = buildTestOrderModel();
-        model.setTags(R"(["urgent","fragile"])");
-        auto order = TestOrder::fromModel(model);
-        REQUIRE(order.has_value());
-        REQUIRE(order->tags.size() == 2);
-        REQUIRE(order->tags[0] == "urgent");
-        REQUIRE(order->tags[1] == "fragile");
     }
 }
 
@@ -772,144 +581,86 @@ TEST_CASE("TestOrder - nullable discount", "[wrapper][struct][order][nullable]")
         REQUIRE(restored->discount.has_value());
         REQUIRE(*restored->discount == 50);
     }
-
-    SECTION("[Model->Struct] null produces absent") {
-        auto model = buildTestOrderModel();
-        auto o = TestOrder::fromModel(model);
-        REQUIRE_FALSE(o->discount.has_value());
-    }
-
-    SECTION("[Model->Struct] 0 produces optional(0)") {
-        auto model = buildTestOrderModel();
-        model.setDiscount(0);
-        auto o = TestOrder::fromModel(model);
-        REQUIRE(o->discount.has_value());
-        REQUIRE(*o->discount == 0);
-    }
 }
 
-TEST_CASE("TestOrder - fromModel / toModel round-trip", "[wrapper][model][order]") {
+TEST_CASE("TestOrder - JSON round-trip preserves all field types", "[wrapper][json][order]") {
 
-    drogon_model::relais_test::Mock_RelaisTestOrders model;
-    model.setId(55);
-    model.setUserId(42);
-    model.setAmount(999);
-    model.setDiscount(25);
-    model.setIsExpress(true);
-    model.setPriority("critical");
-    model.setStatus("delivered");
-    model.setLabel("rush");
-    model.setMetadata(R"({"foo":"bar"})");
-    model.setAddress(
-        R"({"street":"A","city":"B","zip_code":"C","geo":{"latitude":1.0,"longitude":2.0,"metadata":{"accuracy":3.0,"source":"test"}}})");
-    model.setHistory(R"([{"street":"D","city":"E","zip_code":"F"}])");
-    model.setQuantities("[5,10]");
-    model.setTags(R"(["a","b","c"])");
-    model.setCreatedAt(trantor::Date::fromDbStringLocal("2025-07-15 09:30:00"));
-    auto order = TestOrder::fromModel(model);
-    REQUIRE(order.has_value());
+    auto order = buildFullTestOrder();
+    auto json = order.toJson();
+    auto restored = TestOrder::fromJson(*json);
+    REQUIRE(restored.has_value());
 
-    SECTION("[Model->Struct] reads all scalar/string/enum fields") {
-        REQUIRE(order->id == 55);
-        REQUIRE(order->user_id == 42);
-        REQUIRE(order->amount == 999);
-        REQUIRE(order->discount.has_value());
-        REQUIRE(*order->discount == 25);
-        REQUIRE(order->is_express == true);
-        REQUIRE(order->priority == Priority::Critical);
-        REQUIRE(order->status == Status::Delivered);
-        REQUIRE(order->label == "rush");
-        REQUIRE(order->metadata.str == R"({"foo":"bar"})");
-        REQUIRE_FALSE(order->created_at.empty());
+    SECTION("[JSON] preserves scalar/string/enum fields") {
+        REQUIRE(restored->id == 100);
+        REQUIRE(restored->user_id == 42);
+        REQUIRE(restored->amount == 999);
+        REQUIRE(restored->discount.has_value());
+        REQUIRE(*restored->discount == 50);
+        REQUIRE(restored->is_express == true);
+        REQUIRE(restored->priority == Priority::High);
+        REQUIRE(restored->status == Status::Shipped);
+        REQUIRE(restored->label == "rush-order");
+        REQUIRE(restored->metadata.str == R"({"x":1})");
+        REQUIRE_FALSE(restored->created_at.empty());
     }
 
-    SECTION("[Model->Struct] reads composite fields") {
-        REQUIRE(order->address.street == "A");
-        REQUIRE(order->address.city == "B");
-        REQUIRE(order->address.zip_code == "C");
-        REQUIRE(order->address.geo.latitude == 1.0);
-        REQUIRE(order->address.geo.longitude == 2.0);
-        REQUIRE(order->address.geo.metadata.accuracy == 3.0f);
-        REQUIRE(order->address.geo.metadata.source == "test");
-        REQUIRE(order->history.size() == 1);
-        REQUIRE(order->history[0].street == "D");
-        REQUIRE(order->quantities.size() == 2);
-        REQUIRE(order->quantities[0] == 5);
-        REQUIRE(order->quantities[1] == 10);
-        REQUIRE(order->tags.size() == 3);
-        REQUIRE(order->tags[0] == "a");
-        REQUIRE(order->tags[1] == "b");
-        REQUIRE(order->tags[2] == "c");
-    }
-
-    SECTION("[Struct->Model] skips DbManaged id") {
-        auto m = TestOrder::toModel(*order);
-        REQUIRE_FALSE(m.getId());
-    }
-
-    SECTION("[Struct->Model] round-trips scalar fields") {
-        auto m = TestOrder::toModel(*order);
-        REQUIRE(m.getValueOfUserId() == 42);
-        REQUIRE(m.getValueOfAmount() == 999);
-        REQUIRE(m.getValueOfIsExpress() == true);
-    }
-
-    SECTION("[Struct->Model] round-trips nullable discount") {
-        auto m = TestOrder::toModel(*order);
-        REQUIRE(m.getDiscount());
-        REQUIRE(*m.getDiscount() == 25);
-    }
-
-    SECTION("[Struct->Model] round-trips enums as strings") {
-        auto m = TestOrder::toModel(*order);
-        REQUIRE(m.getValueOfPriority() == "critical");
-        REQUIRE(m.getValueOfStatus() == "delivered");
-    }
-
-    SECTION("[Struct->Model] round-trips string fields") {
-        auto m = TestOrder::toModel(*order);
-        REQUIRE(m.getValueOfLabel() == "rush");
-        REQUIRE(m.getValueOfMetadata() == R"({"foo":"bar"})");
-    }
-
-    SECTION("[Struct->Model] round-trips timestamp") {
-        auto m = TestOrder::toModel(*order);
-        REQUIRE(m.getCreatedAt());
+    SECTION("[JSON] preserves composite fields") {
+        REQUIRE(restored->address.street == "123 Main St");
+        REQUIRE(restored->address.city == "Paris");
+        REQUIRE(restored->address.zip_code == "75001");
+        REQUIRE(restored->address.geo.latitude == 48.8566);
+        REQUIRE(restored->address.geo.longitude == 2.3522);
+        REQUIRE(restored->address.geo.metadata.accuracy == 1.5f);
+        REQUIRE(restored->address.geo.metadata.source == "gps");
+        REQUIRE(restored->history.size() == 2);
+        REQUIRE(restored->history[0].street == "10 Rue A");
+        REQUIRE(restored->quantities.size() == 3);
+        REQUIRE(restored->quantities[0] == 10);
+        REQUIRE(restored->quantities[1] == 20);
+        REQUIRE(restored->quantities[2] == 30);
+        REQUIRE(restored->tags.size() == 2);
+        REQUIRE(restored->tags[0] == "urgent");
+        REQUIRE(restored->tags[1] == "fragile");
     }
 }
 
 TEST_CASE("TestOrder - deep nesting round-trip (4 levels)", "[wrapper][struct][order][deep]") {
 
-    SECTION("[Model->Struct->JSON] round-trip 4 levels via JSON string") {
-        auto model = buildTestOrderModel();
-        model.setAddress(
-            R"({"street":"1 Rue X","city":"Lille","zip_code":"59000","geo":{"latitude":50.63,"longitude":3.06,"metadata":{"accuracy":0.5,"source":"satellite"}}})");
-        auto order = TestOrder::fromModel(model);
-        REQUIRE(order.has_value());
-        auto json = *order->toJson();
+    SECTION("[JSON] round-trip 4 levels via JSON") {
+        TestOrder order;
+        order.id = 1;
+        order.user_id = 1;
+        order.amount = 100;
+        order.is_express = false;
+        order.priority = Priority::Low;
+        order.status = Status::Pending;
+        order.label = "test";
+        order.created_at = "2025-01-01T00:00:00Z";
+        order.address.street = "1 Rue X";
+        order.address.city = "Lille";
+        order.address.zip_code = "59000";
+        order.address.geo.latitude = 50.63;
+        order.address.geo.longitude = 3.06;
+        order.address.geo.metadata.accuracy = 0.5f;
+        order.address.geo.metadata.source = "satellite";
+
+        auto json = *order.toJson();
         REQUIRE(json.find("\"street\":\"1 Rue X\"") != std::string::npos);
         REQUIRE(json.find("\"latitude\":") != std::string::npos);
         REQUIRE(json.find("\"source\":\"satellite\"") != std::string::npos);
     }
 
-    SECTION("[Model->Struct] full composite round-trip") {
-        auto model = buildTestOrderModel();
-        model.setAddress(
-            R"({"street":"A","city":"B","zip_code":"C","geo":{"latitude":1.0,"longitude":2.0,"metadata":{"accuracy":3.0,"source":"test"}}})");
-        model.setHistory(R"([{"street":"D","city":"E","zip_code":"F"}])");
-        model.setQuantities("[5,10]");
-        model.setTags(R"(["a","b","c"])");
+    SECTION("[Binary] full composite round-trip") {
+        auto order = buildFullTestOrder();
+        auto restored = TestOrder::fromBinary(*order.toBinary());
+        REQUIRE(restored.has_value());
 
-        auto order = TestOrder::fromModel(model);
-        REQUIRE(order.has_value());
-
-        // Verify all composites are present
-        REQUIRE(order->address.street == "A");
-        REQUIRE(order->address.geo.latitude == 1.0);
-        REQUIRE(order->address.geo.metadata.source == "test");
-        REQUIRE(order->history.size() == 1);
-        REQUIRE(order->quantities.size() == 2);
-        REQUIRE(order->tags.size() == 3);
+        REQUIRE(restored->address.street == "123 Main St");
+        REQUIRE(restored->address.geo.latitude == 48.8566);
+        REQUIRE(restored->address.geo.metadata.source == "gps");
+        REQUIRE(restored->history.size() == 2);
+        REQUIRE(restored->quantities.size() == 3);
+        REQUIRE(restored->tags.size() == 2);
     }
 }
 
@@ -930,34 +681,39 @@ TEST_CASE("ListWrapper<TestArticle> - construction and accessors", "[wrapper][li
         REQUIRE_FALSE(ListWrapperArticle::fromBinary(garbage).has_value());
     }
 
-    SECTION("[List] fromModels with empty list") {
-        auto list = ListWrapperArticle::fromModels({});
+    SECTION("[List] empty list via default constructor") {
+        ListWrapperArticle list;
         REQUIRE(list.size() == 0);
         REQUIRE(list.totalCount() == 0);
         REQUIRE(list.empty());
         REQUIRE(list.nextCursor().empty());
     }
 
-    relais_test::TestArticleModel m1;
-    m1.setId(1);
-    m1.setCategory("tech");
-    m1.setAuthorId(7);
-    m1.setTitle("First");
-    m1.setIsPublished(true);
-    m1.setViewCount(10);
-    m1.setCreatedAt(trantor::Date::fromDbStringLocal("2025-06-01 00:00:00"));
+    // Build articles directly as structs
+    TestArticle a1;
+    a1.id = 1;
+    a1.category = "tech";
+    a1.author_id = 7;
+    a1.title = "First";
+    a1.is_published = true;
+    a1.view_count = 10;
+    a1.created_at = "2025-06-01T00:00:00Z";
 
-    relais_test::TestArticleModel m2;
-    m2.setId(2);
-    m2.setCategory("science");
-    m2.setAuthorId(3);
-    m2.setTitle("Second");
-    m2.setIsPublished(false);
-    m2.setCreatedAt(trantor::Date::fromDbStringLocal("2025-06-02 00:00:00"));
+    TestArticle a2;
+    a2.id = 2;
+    a2.category = "science";
+    a2.author_id = 3;
+    a2.title = "Second";
+    a2.is_published = false;
+    a2.created_at = "2025-06-02T00:00:00Z";
+    // view_count intentionally not set (nullable absent)
 
-    auto list = ListWrapperArticle::fromModels({m1, m2});
+    auto e1 = std::make_shared<const TestArticle>(a1);
+    auto e2 = std::make_shared<const TestArticle>(a2);
+    std::vector<std::shared_ptr<const TestArticle>> items = {e1, e2};
+    auto list = ListWrapperArticle::fromItems(items);
 
-    SECTION("[List] fromModels size and totalCount") {
+    SECTION("[List] fromItems size and totalCount") {
         REQUIRE(list.size() == 2);
         REQUIRE(list.totalCount() == 2);
         REQUIRE_FALSE(list.empty());
@@ -1000,12 +756,6 @@ TEST_CASE("ListWrapper<TestArticle> - construction and accessors", "[wrapper][li
         REQUIRE(list.total_count == 2);
     }
 
-    // --- fromItems ---
-
-    auto e1 = std::make_shared<const TestArticle>(*TestArticle::fromModel(m1));
-    auto e2 = std::make_shared<const TestArticle>(*TestArticle::fromModel(m2));
-    std::vector<std::shared_ptr<const TestArticle>> items = {e1, e2};
-
     SECTION("[List] fromItems size") {
         auto from_items = ListWrapperArticle::fromItems(items);
         REQUIRE(from_items.size() == 2);
@@ -1037,22 +787,24 @@ TEST_CASE("ListWrapper<TestArticle> - construction and accessors", "[wrapper][li
 TEST_CASE("ListWrapper<TestArticle> - toJson", "[wrapper][list][article][json]") {
 
     SECTION("[List->JSON] empty list") {
-        auto list = ListWrapperArticle::fromModels({});
+        ListWrapperArticle list;
         auto json = list.toJson();
         REQUIRE(json);
         REQUIRE(json->find("\"items\":[]") != std::string::npos);
     }
 
-    relais_test::TestArticleModel m;
-    m.setId(1);
-    m.setCategory("tech");
-    m.setAuthorId(7);
-    m.setTitle("Test");
-    m.setIsPublished(true);
-    m.setViewCount(42);
-    m.setCreatedAt(trantor::Date::fromDbStringLocal("2025-06-01 00:00:00"));
+    TestArticle a;
+    a.id = 1;
+    a.category = "tech";
+    a.author_id = 7;
+    a.title = "Test";
+    a.is_published = true;
+    a.view_count = 42;
+    a.created_at = "2025-06-01T00:00:00Z";
 
-    auto list = ListWrapperArticle::fromModels({m});
+    auto e = std::make_shared<const TestArticle>(a);
+    std::vector<std::shared_ptr<const TestArticle>> items = {e};
+    auto list = ListWrapperArticle::fromItems(items);
 
     SECTION("[List->JSON] items are serialized") {
         auto json = list.toJson();
@@ -1070,16 +822,18 @@ TEST_CASE("ListWrapper<TestArticle> - toJson", "[wrapper][list][article][json]")
 
 TEST_CASE("ListWrapper<TestArticle> - JSON round-trip", "[wrapper][list][article][json]") {
 
-    relais_test::TestArticleModel m;
-    m.setId(1);
-    m.setCategory("tech");
-    m.setAuthorId(7);
-    m.setTitle("Test");
-    m.setIsPublished(true);
-    m.setViewCount(42);
-    m.setCreatedAt(trantor::Date::fromDbStringLocal("2025-06-01 00:00:00"));
+    TestArticle a;
+    a.id = 1;
+    a.category = "tech";
+    a.author_id = 7;
+    a.title = "Test";
+    a.is_published = true;
+    a.view_count = 42;
+    a.created_at = "2025-06-01T00:00:00Z";
 
-    auto list = ListWrapperArticle::fromModels({m});
+    auto e = std::make_shared<const TestArticle>(a);
+    std::vector<std::shared_ptr<const TestArticle>> items = {e};
+    auto list = ListWrapperArticle::fromItems(items);
     auto json = list.toJson();
 
     SECTION("[List] fromJson round-trip") {
@@ -1102,24 +856,21 @@ TEST_CASE("ListWrapper<TestArticle> - JSON round-trip", "[wrapper][list][article
 
 TEST_CASE("Glaze vector round-trip - TestUser", "[wrapper][glaze][user]") {
 
-    relais_test::TestUserModel m1;
-    m1.setId(1);
-    m1.setUsername("alice");
-    m1.setEmail("alice@test.com");
-    m1.setBalance(100);
-    m1.setCreatedAt(trantor::Date::fromDbStringLocal("2025-01-01 00:00:00"));
+    TestUser u1;
+    u1.id = 1;
+    u1.username = "alice";
+    u1.email = "alice@test.com";
+    u1.balance = 100;
+    u1.created_at = "2025-01-01T00:00:00Z";
 
-    relais_test::TestUserModel m2;
-    m2.setId(2);
-    m2.setUsername("bob");
-    m2.setEmail("bob@test.com");
-    m2.setBalance(0);
-    m2.setCreatedAt(trantor::Date::fromDbStringLocal("2025-06-15 10:30:00"));
+    TestUser u2;
+    u2.id = 2;
+    u2.username = "bob";
+    u2.email = "bob@test.com";
+    u2.balance = 0;
+    u2.created_at = "2025-06-15T10:30:00Z";
 
-    std::vector<TestUser> original = {
-        *TestUser::fromModel(m1),
-        *TestUser::fromModel(m2)
-    };
+    std::vector<TestUser> original = {u1, u2};
 
     std::string json;
     REQUIRE_FALSE(glz::write_json(original, json));
@@ -1148,29 +899,26 @@ TEST_CASE("Glaze vector round-trip - TestUser", "[wrapper][glaze][user]") {
 
 TEST_CASE("Glaze vector round-trip - TestArticle (nullable)", "[wrapper][glaze][article]") {
 
-    relais_test::TestArticleModel m1;
-    m1.setId(10);
-    m1.setCategory("tech");
-    m1.setAuthorId(7);
-    m1.setTitle("With views");
-    m1.setViewCount(42);
-    m1.setIsPublished(true);
-    m1.setPublishedAt(trantor::Date::fromDbStringLocal("2025-06-01 12:00:00"));
-    m1.setCreatedAt(trantor::Date::fromDbStringLocal("2025-05-30 09:00:00"));
+    TestArticle a1;
+    a1.id = 10;
+    a1.category = "tech";
+    a1.author_id = 7;
+    a1.title = "With views";
+    a1.view_count = 42;
+    a1.is_published = true;
+    a1.published_at = "2025-06-01T12:00:00Z";
+    a1.created_at = "2025-05-30T09:00:00Z";
 
-    relais_test::TestArticleModel m2;
-    m2.setId(20);
-    m2.setCategory("science");
-    m2.setAuthorId(3);
-    m2.setTitle("No views");
-    m2.setIsPublished(false);
-    m2.setCreatedAt(trantor::Date::fromDbStringLocal("2025-06-02 00:00:00"));
+    TestArticle a2;
+    a2.id = 20;
+    a2.category = "science";
+    a2.author_id = 3;
+    a2.title = "No views";
+    a2.is_published = false;
+    a2.created_at = "2025-06-02T00:00:00Z";
     // view_count intentionally not set (nullable absent)
 
-    std::vector<TestArticle> original = {
-        *TestArticle::fromModel(m1),
-        *TestArticle::fromModel(m2)
-    };
+    std::vector<TestArticle> original = {a1, a2};
 
     std::string json;
     REQUIRE_FALSE(glz::write_json(original, json));
@@ -1207,15 +955,15 @@ TEST_CASE("Glaze vector round-trip - TestArticle (nullable)", "[wrapper][glaze][
 
 TEST_CASE("Glaze vector round-trip - TestItem", "[wrapper][glaze][item]") {
 
-    relais_test::TestItemModel m;
-    m.setId(5);
-    m.setName("Widget");
-    m.setValue(999);
-    m.setDescription("A fine widget");
-    m.setIsActive(true);
-    m.setCreatedAt(trantor::Date::fromDbStringLocal("2025-01-01 00:00:00"));
+    TestItem item;
+    item.id = 5;
+    item.name = "Widget";
+    item.value = 999;
+    item.description = "A fine widget";
+    item.is_active = true;
+    item.created_at = "2025-01-01T00:00:00Z";
 
-    std::vector<TestItem> original = {*TestItem::fromModel(m)};
+    std::vector<TestItem> original = {item};
 
     std::string json;
     REQUIRE_FALSE(glz::write_json(original, json));
@@ -1305,11 +1053,9 @@ namespace custom_json_test {
 /// Minimal hand-written mapping for testing.
 /// Its glaze_value uses snake_case — this should NOT be used when glz::meta<Product> exists.
 struct ProductMapping {
-    using Model = relais_test::TestItemModel;
     static constexpr bool read_only = true;
 
     struct TraitsType {
-        using Model = relais_test::TestItemModel;
         enum class Field : uint8_t {};
     };
 
@@ -1317,10 +1063,10 @@ struct ProductMapping {
     static auto getPrimaryKey(const Entity& e) noexcept { return e.id; }
 
     template<typename Entity>
-    static std::optional<Entity> fromModel(const Model&) { return std::nullopt; }
+    static std::optional<Entity> fromRow(const pqcoro::PgResult::Row&) { return std::nullopt; }
 
     template<typename Entity>
-    static Model toModel(const Entity&) { return {}; }
+    static pqcoro::PgParams toInsertParams(const Entity&) { return pqcoro::PgParams{}; }
 
     // Fallback: snake_case names (should be overridden by glz::meta<Product>)
     template<typename T>
@@ -1331,7 +1077,7 @@ struct ProductMapping {
     );
 };
 
-using ProductWrapper = jcailloux::drogon::wrapper::EntityWrapper<Product, ProductMapping>;
+using ProductWrapper = jcailloux::relais::wrapper::EntityWrapper<Product, ProductMapping>;
 
 } // namespace custom_json_test
 
@@ -1377,7 +1123,7 @@ TEST_CASE("Custom JSON field names via glz::meta<Struct>", "[wrapper][json][cust
 
 TEST_CASE("ListWrapper items use custom JSON field names", "[wrapper][list][custom-names]") {
 
-    using ProductList = jcailloux::drogon::wrapper::ListWrapper<custom_json_test::ProductWrapper>;
+    using ProductList = jcailloux::relais::wrapper::ListWrapper<custom_json_test::ProductWrapper>;
 
     custom_json_test::ProductWrapper p1;
     p1.id = 1;
@@ -1446,7 +1192,7 @@ TEST_CASE("releaseCaches() frees serialization data while callers retain copies"
     }
 
     SECTION("[List] releaseCaches works on ListWrapper") {
-        using ListWrapperUser = jcailloux::drogon::wrapper::ListWrapper<TestUser>;
+        using ListWrapperUser = jcailloux::relais::wrapper::ListWrapper<TestUser>;
         ListWrapperUser list;
         list.items = {user};
         list.total_count = 1;
@@ -1469,8 +1215,8 @@ TEST_CASE("releaseCaches() frees serialization data while callers retain copies"
 
 TEST_CASE("Entities without glz::meta<Struct> still use Mapping::glaze_value", "[wrapper][json][custom-names]") {
 
-    // TestUser has NO glz::meta<relais_test::TestUser> specialization,
-    // so Mapping::glaze_value (member names) should be used.
+    // TestUser has a glz::meta<relais_test::TestUser> specialization in the wrapper,
+    // so it uses that. The key point: serialization produces expected field names.
     TestUser user;
     user.id = 1;
     user.username = "alice";

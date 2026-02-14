@@ -1,8 +1,10 @@
-#ifndef JCX_DROGON_REPOSITORY_H
-#define JCX_DROGON_REPOSITORY_H
+#ifndef JCX_RELAIS_REPOSITORY_H
+#define JCX_RELAIS_REPOSITORY_H
 
 #include <span>
 #include <type_traits>
+#include "pqcoro/Task.h"
+#include "jcailloux/relais/Log.h"
 #include "jcailloux/relais/repository/CachedRepository.h"
 #include "jcailloux/relais/repository/InvalidationMixin.h"
 #include "jcailloux/relais/repository/ListMixin.h"
@@ -87,16 +89,15 @@ class Repository
       >::type
 {
     using Key = decltype(std::declval<const Entity>().getPrimaryKey());
-    using Model = typename Entity::Model;
     using Base = typename detail::MixinStack<Entity, Name, Cfg, Key, Invalidations...>::type;
 
     // Compile-time validation
-    static_assert(ReadableEntity<Entity, Model>,
-        "Entity must satisfy ReadableEntity (provide fromModel)");
+    static_assert(ReadableEntity<Entity>,
+        "Entity must satisfy ReadableEntity (provide fromRow)");
 
     static_assert(
         Cfg.cache_level == config::CacheLevel::None ||
-        CacheableEntity<Entity, Model>,
+        CacheableEntity<Entity>,
         "Cached entities must satisfy CacheableEntity (provide JSON or binary serialization)");
 
     static_assert(
@@ -113,7 +114,6 @@ class Repository
 
 public:
     using typename Base::EntityType;
-    using typename Base::ModelType;
     using typename Base::KeyType;
     using typename Base::WrapperType;
     using typename Base::WrapperPtrType;
@@ -129,12 +129,12 @@ public:
 
     /// Update entity from JSON string.
     /// Parses JSON to create wrapper, then updates via the full mixin chain.
-    static ::drogon::Task<bool> updateFromJson(const Key& id, std::string_view json)
-        requires MutableEntity<Entity, Model> && (!Cfg.read_only)
+    static pqcoro::Task<bool> updateFromJson(const Key& id, std::string_view json)
+        requires MutableEntity<Entity> && (!Cfg.read_only)
     {
         auto wrapper_opt = Entity::fromJson(json);
         if (!wrapper_opt) {
-            LOG_ERROR << name() << ": updateFromJson failed to parse JSON";
+            RELAIS_LOG_ERROR << name() << ": updateFromJson failed to parse JSON";
             co_return false;
         }
         auto wrapper = std::make_shared<const Entity>(std::move(*wrapper_opt));
@@ -143,12 +143,12 @@ public:
 
     /// Update entity from binary data.
     /// Creates wrapper from binary, then updates via the full mixin chain.
-    static ::drogon::Task<bool> updateFromBinary(const Key& id, std::span<const uint8_t> buffer)
-        requires MutableEntity<Entity, Model> && HasBinarySerialization<Entity> && (!Cfg.read_only)
+    static pqcoro::Task<bool> updateFromBinary(const Key& id, std::span<const uint8_t> buffer)
+        requires MutableEntity<Entity> && HasBinarySerialization<Entity> && (!Cfg.read_only)
     {
         auto wrapper_opt = Entity::fromBinary(buffer);
         if (!wrapper_opt) {
-            LOG_ERROR << name() << ": updateFromBinary failed to parse binary data";
+            RELAIS_LOG_ERROR << name() << ": updateFromBinary failed to parse binary data";
             co_return false;
         }
         auto wrapper = std::make_shared<const Entity>(std::move(*wrapper_opt));
@@ -158,4 +158,4 @@ public:
 
 }  // namespace jcailloux::relais
 
-#endif  // JCX_DROGON_REPOSITORY_H
+#endif  // JCX_RELAIS_REPOSITORY_H

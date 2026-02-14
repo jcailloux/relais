@@ -86,7 +86,7 @@ TEST_CASE("BaseRepository<TestItem> - create", "[integration][db][base][item]") 
 
     SECTION("[create] entity is retrievable after insert") {
         auto created = sync(UncachedTestItemRepository::create(
-            makeTestItem("Persistent", 50, std::nullopt, true)));
+            makeTestItem("Persistent", 50, "", true)));
         REQUIRE(created != nullptr);
 
         auto fetched = sync(UncachedTestItemRepository::findById(created->id));
@@ -98,7 +98,7 @@ TEST_CASE("BaseRepository<TestItem> - create", "[integration][db][base][item]") 
 
     SECTION("[create] with null optional field") {
         auto result = sync(UncachedTestItemRepository::create(
-            makeTestItem("No Description", 0, std::nullopt, true)));
+            makeTestItem("No Description", 0, "", true)));
         REQUIRE(result != nullptr);
 
         auto fetched = sync(UncachedTestItemRepository::findById(result->id));
@@ -118,7 +118,7 @@ TEST_CASE("BaseRepository<TestItem> - update", "[integration][db][base][item]") 
         REQUIRE(fetched->name == "Original");
 
         auto success = sync(UncachedTestItemRepository::update(id,
-            makeTestItem("Updated", 20, std::nullopt, true, id)));
+            makeTestItem("Updated", 20, "", true, id)));
         REQUIRE(success == true);
 
         fetched = sync(UncachedTestItemRepository::findById(id));
@@ -133,12 +133,8 @@ TEST_CASE("BaseRepository<TestItem> - update", "[integration][db][base][item]") 
         auto original = sync(UncachedTestItemRepository::findById(id));
         REQUIRE(original != nullptr);
 
-        auto desc = original->description.empty()
-            ? std::nullopt
-            : std::optional<std::string>(original->description);
-
         sync(UncachedTestItemRepository::update(id,
-            makeTestItem(original->name, 999, desc, original->is_active, id)));
+            makeTestItem(original->name, 999, original->description, original->is_active, id)));
 
         auto fetched = sync(UncachedTestItemRepository::findById(id));
         REQUIRE(fetched != nullptr);
@@ -191,7 +187,7 @@ TEST_CASE("BaseRepository<TestItem> - edge cases", "[integration][db][base][item
     SECTION("[edge] special characters in string fields") {
         std::string specialName = "Test 'quotes\" and <special> chars & more";
         auto result = sync(UncachedTestItemRepository::create(
-            makeTestItem(specialName, 0, std::nullopt, true)));
+            makeTestItem(specialName, 0, "", true)));
         REQUIRE(result != nullptr);
 
         auto fetched = sync(UncachedTestItemRepository::findById(result->id));
@@ -202,7 +198,7 @@ TEST_CASE("BaseRepository<TestItem> - edge cases", "[integration][db][base][item
     SECTION("[edge] maximum length name (100 chars)") {
         std::string longName(100, 'X');
         auto result = sync(UncachedTestItemRepository::create(
-            makeTestItem(longName, 0, std::nullopt, true)));
+            makeTestItem(longName, 0, "", true)));
         REQUIRE(result != nullptr);
 
         auto fetched = sync(UncachedTestItemRepository::findById(result->id));
@@ -212,7 +208,7 @@ TEST_CASE("BaseRepository<TestItem> - edge cases", "[integration][db][base][item
 
     SECTION("[edge] negative numeric value") {
         auto result = sync(UncachedTestItemRepository::create(
-            makeTestItem("Negative", -12345, std::nullopt, true)));
+            makeTestItem("Negative", -12345, "", true)));
         REQUIRE(result != nullptr);
 
         auto fetched = sync(UncachedTestItemRepository::findById(result->id));
@@ -222,7 +218,7 @@ TEST_CASE("BaseRepository<TestItem> - edge cases", "[integration][db][base][item
 
     SECTION("[edge] zero numeric value") {
         auto result = sync(UncachedTestItemRepository::create(
-            makeTestItem("Zero", 0, std::nullopt, true)));
+            makeTestItem("Zero", 0, "", true)));
         REQUIRE(result != nullptr);
 
         auto fetched = sync(UncachedTestItemRepository::findById(result->id));
@@ -232,7 +228,7 @@ TEST_CASE("BaseRepository<TestItem> - edge cases", "[integration][db][base][item
 
     SECTION("[edge] boolean false is preserved") {
         auto result = sync(UncachedTestItemRepository::create(
-            makeTestItem("Inactive", 0, std::nullopt, false)));
+            makeTestItem("Inactive", 0, "", false)));
         REQUIRE(result != nullptr);
 
         auto fetched = sync(UncachedTestItemRepository::findById(result->id));
@@ -504,8 +500,8 @@ TEST_CASE("BaseRepository<TestPurchase> - multiple purchases per user", "[integr
 //
 // #############################################################################
 
-using jcailloux::drogon::wrapper::set;
-using jcailloux::drogon::wrapper::setNull;
+using jcailloux::relais::wrapper::set;
+using jcailloux::relais::wrapper::setNull;
 using F = TestUserWrapper::Field;
 
 TEST_CASE("BaseRepository - updateBy single field", "[integration][db][base][updateBy]") {
@@ -874,21 +870,19 @@ namespace uncached_list {
  */
 class UncachedArticleListRepo : public Repository<TestArticleWrapper, "test:article:list:uncached", cfg::Uncached> {
 public:
-    static ::drogon::Task<std::vector<TestArticleWrapper>> getByCategory(
+    static pqcoro::Task<std::vector<TestArticleWrapper>> getByCategory(
         const std::string& category, int limit = 10)
     {
         co_return co_await cachedList(
-            [category, limit]() -> ::drogon::Task<std::vector<TestArticleWrapper>> {
-                auto db = ::drogon::app().getDbClient();
-                ::drogon::orm::CoroMapper<TestArticleModel> mapper(db);
-                auto models = co_await mapper.limit(limit)
-                    .orderBy(TestArticleModel::Cols::_created_at, ::drogon::orm::SortOrder::DESC)
-                    .findBy(::drogon::orm::Criteria(TestArticleModel::Cols::_category, category));
+            [category, limit]() -> pqcoro::Task<std::vector<TestArticleWrapper>> {
+                auto result = co_await jcailloux::relais::DbProvider::queryArgs(
+                    "SELECT id, category, author_id, title, view_count, is_published, published_at, created_at "
+                    "FROM relais_test_articles WHERE category = $1 ORDER BY created_at DESC LIMIT $2",
+                    category, limit);
                 std::vector<TestArticleWrapper> entities;
-                for (auto& m : models) {
-                    if (auto e = TestArticleWrapper::fromModel(m)) {
+                for (size_t i = 0; i < result.rows(); ++i) {
+                    if (auto e = entity::generated::TestArticleMapping::fromRow<TestArticleWrapper>(result[i]))
                         entities.push_back(std::move(*e));
-                    }
                 }
                 co_return entities;
             },
@@ -896,21 +890,19 @@ public:
         );
     }
 
-    static ::drogon::Task<std::vector<TestArticleWrapper>> getByCategoryTracked(
+    static pqcoro::Task<std::vector<TestArticleWrapper>> getByCategoryTracked(
         const std::string& category, int limit = 5, int offset = 0)
     {
         co_return co_await cachedListTracked(
-            [category, limit, offset]() -> ::drogon::Task<std::vector<TestArticleWrapper>> {
-                auto db = ::drogon::app().getDbClient();
-                ::drogon::orm::CoroMapper<TestArticleModel> mapper(db);
-                auto models = co_await mapper.limit(limit).offset(offset)
-                    .orderBy(TestArticleModel::Cols::_view_count, ::drogon::orm::SortOrder::DESC)
-                    .findBy(::drogon::orm::Criteria(TestArticleModel::Cols::_category, category));
+            [category, limit, offset]() -> pqcoro::Task<std::vector<TestArticleWrapper>> {
+                auto result = co_await jcailloux::relais::DbProvider::queryArgs(
+                    "SELECT id, category, author_id, title, view_count, is_published, published_at, created_at "
+                    "FROM relais_test_articles WHERE category = $1 ORDER BY view_count DESC LIMIT $2 OFFSET $3",
+                    category, limit, offset);
                 std::vector<TestArticleWrapper> entities;
-                for (auto& m : models) {
-                    if (auto e = TestArticleWrapper::fromModel(m)) {
+                for (size_t i = 0; i < result.rows(); ++i) {
+                    if (auto e = entity::generated::TestArticleMapping::fromRow<TestArticleWrapper>(result[i]))
                         entities.push_back(std::move(*e));
-                    }
                 }
                 co_return entities;
             },
@@ -920,17 +912,17 @@ public:
     }
 
     // Expose invalidation methods for testing (no-ops at Base level)
-    static ::drogon::Task<size_t> invalidateCategoryGroup(const std::string& category) {
+    static pqcoro::Task<size_t> invalidateCategoryGroup(const std::string& category) {
         co_return co_await invalidateListGroup("category", category);
     }
 
-    static ::drogon::Task<size_t> invalidateCategorySelective(
+    static pqcoro::Task<size_t> invalidateCategorySelective(
         const std::string& category, int64_t sort_val)
     {
         co_return co_await invalidateListGroupSelective(sort_val, "category", category);
     }
 
-    static ::drogon::Task<size_t> invalidateCategorySelectiveUpdate(
+    static pqcoro::Task<size_t> invalidateCategorySelectiveUpdate(
         const std::string& category, int64_t old_val, int64_t new_val)
     {
         co_return co_await invalidateListGroupSelectiveUpdate(old_val, new_val, "category", category);
@@ -942,16 +934,16 @@ public:
  */
 class UncachedArticleListAsRepo : public Repository<TestArticleWrapper, "test:article:as:list:uncached", cfg::Uncached> {
 public:
-    static ::drogon::Task<TestArticleList> getByCategory(
+    static pqcoro::Task<TestArticleList> getByCategory(
         const std::string& category, int limit = 10)
     {
         co_return co_await cachedListAs<TestArticleList>(
-            [category, limit]() -> ::drogon::Task<std::vector<TestArticleModel>> {
-                auto db = ::drogon::app().getDbClient();
-                ::drogon::orm::CoroMapper<TestArticleModel> mapper(db);
-                co_return co_await mapper.limit(limit)
-                    .orderBy(TestArticleModel::Cols::_created_at, ::drogon::orm::SortOrder::DESC)
-                    .findBy(::drogon::orm::Criteria(TestArticleModel::Cols::_category, category));
+            [category, limit]() -> pqcoro::Task<TestArticleList> {
+                auto result = co_await jcailloux::relais::DbProvider::queryArgs(
+                    "SELECT id, category, author_id, title, view_count, is_published, published_at, created_at "
+                    "FROM relais_test_articles WHERE category = $1 ORDER BY created_at DESC LIMIT $2",
+                    category, limit);
+                co_return TestArticleList::fromRows(result);
             },
             "category", category
         );

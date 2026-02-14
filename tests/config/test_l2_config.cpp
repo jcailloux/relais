@@ -199,7 +199,7 @@ TEST_CASE("L2 Config - update_strategy at L2",
         sync(L2LazyReloadRepo::findById(id));
 
         // Update via repo
-        auto updated = makeTestItem("l2_lazy_updated", 20, std::nullopt, true, id);
+        auto updated = makeTestItem("l2_lazy_updated", 20, "", true, id);
         sync(L2LazyReloadRepo::update(id, updated));
 
         // Next read should get updated value from DB
@@ -215,7 +215,7 @@ TEST_CASE("L2 Config - update_strategy at L2",
         sync(L2PopImmediateRepo::findById(id));
 
         // Update via repo (write-through)
-        auto updated = makeTestItem("l2_pop_updated", 20, std::nullopt, true, id);
+        auto updated = makeTestItem("l2_pop_updated", 20, "", true, id);
         sync(L2PopImmediateRepo::update(id, updated));
 
         // Modify DB directly

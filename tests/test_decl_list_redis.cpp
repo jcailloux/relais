@@ -20,7 +20,7 @@
 #include "fixtures/RelaisTestAccessors.h"
 using namespace relais_test;
 
-namespace decl = jcailloux::drogon::cache::list::decl;
+namespace decl = jcailloux::relais::cache::list::decl;
 
 // #############################################################################
 //
@@ -54,19 +54,7 @@ static std::shared_ptr<const TestArticleWrapper> makeArticle(
     const std::string& title,
     int32_t view_count
 ) {
-    TestArticleModel model;
-    model.setId(id);
-    model.setCategory(category);
-    model.setAuthorId(author_id);
-    model.setTitle(title);
-    model.setViewCount(view_count);
-    model.setIsPublished(false);
-    model.setPublishedAt(trantor::Date::now());
-    model.setCreatedAt(trantor::Date::now());
-
-    auto opt = TestArticleWrapper::fromModel(model);
-    REQUIRE(opt.has_value());
-    return std::make_shared<const TestArticleWrapper>(std::move(*opt));
+    return makeTestArticle(category, author_id, title, view_count, false, id);
 }
 
 // =============================================================================
@@ -112,7 +100,7 @@ static L2ArticleDescQuery makeL2ViewCountQuery(std::string_view category, uint16
     L2ArticleDescQuery q;
     q.limit = limit;
     q.filters.get<0>() = category;
-    q.sort = jcailloux::drogon::cache::list::SortSpec<size_t>{1, jcailloux::drogon::cache::list::SortDirection::Desc};
+    q.sort = jcailloux::relais::cache::list::SortSpec<size_t>{1, jcailloux::relais::cache::list::SortDirection::Desc};
     q.query_hash = std::hash<std::string_view>{}(category)
                  ^ (static_cast<size_t>(limit) * 0x9e3779b9)
                  ^ 0xFEED;
@@ -305,11 +293,11 @@ TEST_CASE("[DeclList L2] SortBounds invalidation",
         auto r1 = sync(L2DeclArticleListRepo::query(q1));
         REQUIRE(r1->size() == 10);
 
-        auto result_70 = getDb()->execSqlSync(
+        auto result_70 = execQueryArgs(
             "SELECT id FROM relais_test_articles WHERE view_count = 70 AND author_id = $1 LIMIT 1",
             alice_id);
-        REQUIRE(result_70.size() > 0);
-        auto article_70_id = result_70[0]["id"].as<int64_t>();
+        REQUIRE(result_70.rows() > 0);
+        auto article_70_id = result_70[0].get<int64_t>(0);
 
         auto old_entity = makeArticle(article_70_id, "tech", alice_id, "tech_70", 70);
         updateTestArticle(article_70_id, "tech_70_updated", 25);
@@ -326,11 +314,11 @@ TEST_CASE("[DeclList L2] SortBounds invalidation",
         auto r1 = sync(L2DeclArticleListRepo::query(q1));
         REQUIRE(r1->size() == 8);
 
-        auto result_40 = getDb()->execSqlSync(
+        auto result_40 = execQueryArgs(
             "SELECT id FROM relais_test_articles WHERE view_count = 40 AND author_id = $1 LIMIT 1",
             alice_id);
-        REQUIRE(result_40.size() > 0);
-        auto article_40_id = result_40[0]["id"].as<int64_t>();
+        REQUIRE(result_40.rows() > 0);
+        auto article_40_id = result_40[0].get<int64_t>(0);
 
         auto deleted_entity = makeArticle(article_40_id, "tech", alice_id, "tech_40", 40);
         deleteTestArticle(article_40_id);

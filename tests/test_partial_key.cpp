@@ -10,6 +10,7 @@
 #include <catch2/catch_section_info.hpp>
 #include "fixtures/test_helper.h"
 #include "fixtures/TestRepositories.h"
+#include "fixtures/RelaisTestAccessors.h"
 #include <jcailloux/relais/repository/PartialKeyValidator.h>
 
 using namespace relais_test;
@@ -33,13 +34,12 @@ using L1EventAsTargetRepository = Repository<TestEventWrapper, "test:event:l1:ta
 
 // Async resolver: given a user_id, find event IDs for that user
 struct PurchaseToEventResolver {
-    static ::drogon::Task<std::vector<int64_t>> resolve(int64_t user_id) {
-        auto db = ::drogon::app().getDbClient();
-        auto result = co_await db->execSqlCoro(
+    static pqcoro::Task<std::vector<int64_t>> resolve(int64_t user_id) {
+        auto result = co_await jcailloux::relais::DbProvider::queryArgs(
             "SELECT id FROM relais_test_events WHERE user_id = $1", user_id);
         std::vector<int64_t> ids;
-        for (const auto& row : result) {
-            ids.push_back(row["id"].as<int64_t>());
+        for (size_t i = 0; i < result.rows(); ++i) {
+            ids.push_back(result[i].get<int64_t>(0));
         }
         co_return ids;
     }
@@ -548,7 +548,7 @@ TEST_CASE("PartialKey - serialization",
 //
 // #############################################################################
 
-using jcailloux::drogon::wrapper::set;
+using jcailloux::relais::wrapper::set;
 using EF = TestEventWrapper::Field;
 
 TEST_CASE("PartialKey<TestEvent> - updateBy (Uncached)",
@@ -594,10 +594,10 @@ TEST_CASE("PartialKey<TestEvent> - updateBy (Uncached)",
         CHECK(result->region == "eu");
 
         // Independent verification via raw SQL
-        auto dbResult = getDb()->execSqlSync(
+        auto dbResult = execQueryArgs(
             "SELECT region FROM relais_test_events WHERE id = $1", eventId);
-        REQUIRE(dbResult.size() == 1);
-        CHECK(dbResult[0]["region"].as<std::string>() == "eu");
+        REQUIRE(dbResult.rows() == 1);
+        CHECK(dbResult[0].get<std::string>(0) == "eu");
     }
 
     SECTION("[updateBy] returns re-fetched entity with all fields") {
@@ -756,7 +756,13 @@ TEST_CASE("PartialKey<TestEvent> - remove with L1 hint",
         // Populate L1 cache
         sync(L1TestEventRepository::findById(eventId));
 
-        // Remove (L1 hit → provides hint → full PK delete)
+        // Verify precondition: L1 cache has the entity (hint will be provided)
+        auto cached = TestInternals::getFromCache<L1TestEventRepository>(eventId);
+        REQUIRE(cached != nullptr);
+        CHECK(cached->region == "eu");
+
+        // Remove (L1 hit → provides hint → delete_by_full_pk)
+        // If hint had wrong region, DELETE ... WHERE id=$1 AND region=$2 would return 0
         auto result = sync(L1TestEventRepository::remove(eventId));
         REQUIRE(result.has_value());
         CHECK(*result == 1);
@@ -769,7 +775,11 @@ TEST_CASE("PartialKey<TestEvent> - remove with L1 hint",
     SECTION("[remove] succeeds when entity is NOT in L1 cache (criteria path)") {
         auto eventId = insertTestEvent("us", userId, "Not Cached", 3);
 
-        // Remove without prior findById (no L1 hint → criteria-based)
+        // Verify precondition: L1 cache does NOT have the entity (no hint)
+        auto cached = TestInternals::getFromCache<L1TestEventRepository>(eventId);
+        REQUIRE(cached == nullptr);
+
+        // Remove without hint → delete_by_pk (criteria-based, scans all partitions)
         auto result = sync(L1TestEventRepository::remove(eventId));
         REQUIRE(result.has_value());
         CHECK(*result == 1);
@@ -827,7 +837,12 @@ TEST_CASE("PartialKey<TestEvent> - remove with L1+L2 hint chain",
         // Populate L1 + L2
         sync(L1L2TestEventRepository::findById(eventId));
 
-        // Remove (L1 hit → hint → full PK)
+        // Verify precondition: L1 has entity with correct partition key
+        auto cached = TestInternals::getFromCache<L1L2TestEventRepository>(eventId);
+        REQUIRE(cached != nullptr);
+        CHECK(cached->region == "eu");
+
+        // Remove (L1 hit → hint with region="eu" → delete_by_full_pk)
         auto result = sync(L1L2TestEventRepository::remove(eventId));
         REQUIRE(result.has_value());
         CHECK(*result == 1);
@@ -845,7 +860,11 @@ TEST_CASE("PartialKey<TestEvent> - remove with L1+L2 hint chain",
         // Invalidate L1 only (L2 still has the entity)
         L1L2TestEventRepository::invalidateL1(eventId);
 
-        // Remove (L1 miss → L2 hit → hint → full PK)
+        // Verify precondition: L1 is empty (hint must come from L2)
+        auto cachedL1 = TestInternals::getFromCache<L1L2TestEventRepository>(eventId);
+        REQUIRE(cachedL1 == nullptr);
+
+        // Remove (L1 miss → L2 hit → hint with region="us" → delete_by_full_pk)
         auto result = sync(L1L2TestEventRepository::remove(eventId));
         REQUIRE(result.has_value());
         CHECK(*result == 1);
@@ -857,10 +876,14 @@ TEST_CASE("PartialKey<TestEvent> - remove with L1+L2 hint chain",
     SECTION("[remove] both L1 and L2 miss - criteria fallback") {
         auto eventId = insertTestEvent("eu", userId, "No Cache", 1);
 
-        // Ensure no L2
+        // Ensure no L1 and no L2
         flushRedis();
 
-        // Remove (no L1, no L2 → criteria-based)
+        // Verify precondition: L1 is empty
+        auto cachedL1 = TestInternals::getFromCache<L1L2TestEventRepository>(eventId);
+        REQUIRE(cachedL1 == nullptr);
+
+        // Remove (no L1, no L2 → no hint → delete_by_pk, scans all partitions)
         auto result = sync(L1L2TestEventRepository::remove(eventId));
         REQUIRE(result.has_value());
         CHECK(*result == 1);

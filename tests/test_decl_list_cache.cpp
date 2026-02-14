@@ -21,14 +21,12 @@
 #include "fixtures/RelaisTestAccessors.h"
 using namespace relais_test;
 
-namespace decl = jcailloux::drogon::cache::list::decl;
+namespace decl = jcailloux::relais::cache::list::decl;
 
 // =============================================================================
 // Helper: build a TestArticleWrapper from raw values (no DB round-trip)
 // =============================================================================
 
-/// Construct a TestArticleWrapper shared_ptr from field values using fromModel.
-/// All model fields must be set (including timestamps) to avoid null values.
 std::shared_ptr<const TestArticleWrapper> makeArticle(
     int64_t id,
     const std::string& category,
@@ -36,19 +34,7 @@ std::shared_ptr<const TestArticleWrapper> makeArticle(
     const std::string& title,
     int32_t view_count
 ) {
-    TestArticleModel model;
-    model.setId(id);
-    model.setCategory(category);
-    model.setAuthorId(author_id);
-    model.setTitle(title);
-    model.setViewCount(view_count);
-    model.setIsPublished(false);
-    model.setPublishedAt(trantor::Date::now());
-    model.setCreatedAt(trantor::Date::now());
-
-    auto opt = TestArticleWrapper::fromModel(model);
-    REQUIRE(opt.has_value());
-    return std::make_shared<const TestArticleWrapper>(std::move(*opt));
+    return makeTestArticle(category, author_id, title, view_count, false, id);
 }
 
 // =============================================================================
@@ -67,7 +53,7 @@ TestListQuery makeViewCountQuery(std::string_view category, uint16_t limit) {
     q.filters.get<0>() = category;
 
     // Sort index 1 = view_count, DESC
-    q.sort = jcailloux::drogon::cache::list::SortSpec<size_t>{1, jcailloux::drogon::cache::list::SortDirection::Desc};
+    q.sort = jcailloux::relais::cache::list::SortSpec<size_t>{1, jcailloux::relais::cache::list::SortDirection::Desc};
 
     // Unique hash per (category, limit, sort)
     q.query_hash = std::hash<std::string_view>{}(category)
@@ -416,12 +402,11 @@ TEST_CASE("[DeclListRepository] SortBounds invalidation precision",
         REQUIRE(r1->size() == 10);
 
         // Find article with view_count=70 to update
-        auto result_70 = getDb()->execSqlSync(
+        auto result_70 = execQueryArgs(
             "SELECT id FROM relais_test_articles WHERE view_count = 70 AND author_id = $1 LIMIT 1",
-            alice_id
-        );
-        REQUIRE(result_70.size() > 0);
-        auto article_70_id = result_70[0]["id"].as<int64_t>();
+            alice_id);
+        REQUIRE(result_70.rows() > 0);
+        auto article_70_id = result_70[0].get<int64_t>(0);
 
         // Build old entity (view_count=70) and new entity (view_count=25) manually
         auto old_entity = makeArticle(article_70_id, "tech", alice_id, "tech_70", 70);
@@ -449,12 +434,11 @@ TEST_CASE("[DeclListRepository] SortBounds invalidation precision",
         REQUIRE(r1->size() == 8);
 
         // Find article with view_count=40 to delete
-        auto result_40 = getDb()->execSqlSync(
+        auto result_40 = execQueryArgs(
             "SELECT id FROM relais_test_articles WHERE view_count = 40 AND author_id = $1 LIMIT 1",
-            alice_id
-        );
-        REQUIRE(result_40.size() > 0);
-        auto article_40_id = result_40[0]["id"].as<int64_t>();
+            alice_id);
+        REQUIRE(result_40.rows() > 0);
+        auto article_40_id = result_40[0].get<int64_t>(0);
 
         // Build entity for notification, then delete from DB
         auto deleted_entity = makeArticle(article_40_id, "tech", alice_id, "tech_40", 40);
