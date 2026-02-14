@@ -12,7 +12,6 @@ target_include_directories(jcailloux-relais INTERFACE
 target_compile_features(jcailloux-relais INTERFACE cxx_std_23)
 
 # Workaround for GCC 15 bug with AVX2 intrinsics in avx2intrin.h
-# Remove this when GCC fixes the issue (likely GCC 15.1 or 15.2)
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL "15")
     target_compile_options(jcailloux-relais INTERFACE -mno-avx2)
 endif()
@@ -20,45 +19,30 @@ endif()
 # =============================================================================
 # Dependencies
 # =============================================================================
-
 include(FetchContent)
 
-# shardmap (required)
 FetchContent_Declare(
     shardmap
     GIT_REPOSITORY https://github.com/jcailloux/shardmap
-    GIT_TAG        eaadd56574ee339d4f03a2134e6dec83e0981769
+    GIT_TAG        ad69bd2909c9425260a8b36cb16053d72d837cb8
 )
-FetchContent_MakeAvailable(shardmap)
-
-# pqcoro (async libpq + hiredis wrapper)
-if(NOT TARGET pqcoro::pqcoro AND NOT TARGET pqcoro)
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../pqcoro/CMakeLists.txt")
-        set(PQCORO_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-        add_subdirectory(
-            ${CMAKE_CURRENT_SOURCE_DIR}/../pqcoro
-            ${CMAKE_CURRENT_BINARY_DIR}/pqcoro
-        )
-    else()
-        message(FATAL_ERROR "jcailloux-relais: pqcoro is required. Add it before this library or place it in ../pqcoro/")
-    endif()
-endif()
-
-# glaze - JSON serialization (header-only)
-# FIND_PACKAGE_ARGS: prefer system/parent-provided version if available
-# Disable AVX2 to avoid GCC 15 bug with avx2intrin.h
-#set(glaze_ENABLE_AVX2 OFF CACHE BOOL "" FORCE)
-FetchContent_Declare(glaze
+FetchContent_Declare(
+    pqcoro
+    GIT_REPOSITORY https://github.com/jcailloux/pqcoro.git
+    GIT_TAG        75d5a0b573bb77b7851fa0440d23d5927bf80eca
+)
+FetchContent_Declare(
+    glaze
     GIT_REPOSITORY https://github.com/stephenberry/glaze.git
-    GIT_TAG        v4.2.3
+    GIT_TAG        v7.0.2
     FIND_PACKAGE_ARGS
 )
-FetchContent_MakeAvailable(glaze)
+FetchContent_MakeAvailable(shardmap pqcoro glaze)
 
 # Link all dependencies
 target_link_libraries(jcailloux-relais INTERFACE
-    $<IF:$<TARGET_EXISTS:jcailloux::shardmap>,jcailloux::shardmap,shardmap>
-    $<IF:$<TARGET_EXISTS:pqcoro::pqcoro>,pqcoro::pqcoro,pqcoro>
+    shardmap
+    pqcoro
     glaze::glaze
 )
 
