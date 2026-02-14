@@ -120,6 +120,13 @@ TEST_CASE("BaseRepository concepts", "[base_repo]") {
         STATIC_REQUIRE(HasFieldUpdate<entity::generated::TestOrderWrapper>);
         STATIC_REQUIRE(HasFieldUpdate<entity::generated::TestEventWrapper>);
     }
+
+    SECTION("HasPartitionKey") {
+        STATIC_REQUIRE(HasPartitionKey<entity::generated::TestEventWrapper>);
+        STATIC_REQUIRE_FALSE(HasPartitionKey<entity::generated::TestItemWrapper>);
+        STATIC_REQUIRE_FALSE(HasPartitionKey<entity::generated::TestOrderWrapper>);
+        STATIC_REQUIRE_FALSE(HasPartitionKey<entity::generated::TestUserWrapper>);
+    }
 }
 
 // =========================================================================
@@ -186,6 +193,40 @@ TEST_CASE("SQL strings for complex entity", "[base_repo][sql]") {
         std::string sql = OrderMapping::SQL::insert;
         // The VALUES clause starts with $1 (user_id), not with id
         REQUIRE(sql.find("VALUES ($1,") != std::string::npos);
+    }
+}
+
+TEST_CASE("SQL strings for partition key entity", "[base_repo][sql][partial_key]") {
+    using EventMapping = entity::generated::TestEventMapping;
+
+    SECTION("delete_by_pk uses partial key only") {
+        std::string sql = EventMapping::SQL::delete_by_pk;
+        REQUIRE(sql.starts_with("DELETE"));
+        REQUIRE(sql.find("WHERE id = $1") != std::string::npos);
+        // Must NOT include region in partial key delete
+        REQUIRE(sql.find("region") == std::string::npos);
+    }
+
+    SECTION("delete_by_full_pk includes partition key") {
+        std::string sql = EventMapping::SQL::delete_by_full_pk;
+        REQUIRE(sql.starts_with("DELETE"));
+        REQUIRE(sql.find("WHERE id = $1 AND region = $2") != std::string::npos);
+    }
+
+    SECTION("makeFullKeyParams produces correct params") {
+        entity::generated::TestEventWrapper event;
+        event.id = 42;
+        event.region = "eu";
+        auto params = EventMapping::makeFullKeyParams(event);
+        // PgParams::make(42, "eu") produces 2 parameters
+        REQUIRE(params.params.size() == 2);
+    }
+
+    SECTION("non-partitioned entity has no delete_by_full_pk") {
+        // Structural check: TestItemMapping::SQL does not have delete_by_full_pk
+        STATIC_REQUIRE_FALSE(requires {
+            entity::generated::TestItemMapping::SQL::delete_by_full_pk;
+        });
     }
 }
 
