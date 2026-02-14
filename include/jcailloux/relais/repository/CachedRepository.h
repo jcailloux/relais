@@ -201,12 +201,18 @@ public:
     /// Remove entity by ID.
     /// Returns: rows deleted (0 if not found), or nullopt on DB error.
     /// Invalidates L1 cache unless DB error occurred (self-healing).
-    /// For PartialKey repos, provides L1 cache hint for partition pruning.
+    /// For CompositeKey entities, provides L1 cache hint for partition pruning.
     /// Compile-time error if Cfg.read_only is true.
     static pqcoro::Task<std::optional<size_t>> remove(const Key& id)
         requires (!Cfg.read_only)
     {
-        auto result = co_await Base::removeImpl(id, nullptr);
+        // Provide L1 hint for partition pruning (free: ~0ns RAM lookup)
+        WrapperPtrType hint = nullptr;
+        if constexpr (HasCompositeKey<Entity>) {
+            hint = getFromCache(id);
+        }
+
+        auto result = co_await Base::removeImpl(id, std::move(hint));
         if (result.has_value()) {
             invalidateL1Internal(id);
         }

@@ -127,10 +127,22 @@ class RedisRepository : public BaseRepository<Entity, Name, Cfg, Key> {
 
     protected:
         /// Internal remove with optional entity hint.
+        /// For CompositeKey entities: if L1 didn't provide a hint,
+        /// try L2 (Redis) as a near-free fallback (~0.1-1ms).
         static pqcoro::Task<std::optional<size_t>> removeImpl(
             const Key& id, typename Base::WrapperPtrType cachedHint = nullptr)
             requires (!Cfg.read_only)
         {
+            // L2 hint fallback for partition pruning
+            if constexpr (HasCompositeKey<Entity>) {
+                if (!cachedHint) {
+                    auto cached = co_await getFromCache(makeRedisKey(id));
+                    if (cached) {
+                        cachedHint = std::make_shared<const Entity>(std::move(*cached));
+                    }
+                }
+            }
+
             auto result = co_await Base::removeImpl(id, std::move(cachedHint));
             if (result.has_value()) {
                 co_await invalidateRedis(id);

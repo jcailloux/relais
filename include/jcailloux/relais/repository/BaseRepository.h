@@ -196,14 +196,31 @@ public:
 
 protected:
     /// Internal remove with optional entity hint (used by cache layers for
-    /// partition pruning optimization — ignored at L3 level).
+    /// partition pruning optimization on composite-key entities).
+    /// When a hint is available AND the entity has a composite key, uses the
+    /// full PK SQL for single-partition deletion. Otherwise falls back to
+    /// partial key SQL (scans all partitions — acceptable).
     static pqcoro::Task<std::optional<size_t>> removeImpl(
-        const Key& id, WrapperPtrType /*cachedHint*/ = nullptr)
+        const Key& id, WrapperPtrType cachedHint = nullptr)
         requires (!Cfg.read_only)
     {
         try {
-            auto affected = co_await DbProvider::executeArgs(
-                Mapping::SQL::delete_by_pk, id);
+            int affected;
+            if constexpr (HasCompositeKey<Entity>) {
+                if (cachedHint) {
+                    // Full composite key: prunes to 1 partition
+                    auto params = Mapping::makeFullKeyParams(*cachedHint);
+                    affected = co_await DbProvider::execute(
+                        Mapping::SQL::delete_by_full_pk, params);
+                } else {
+                    // Partial key: scans all partitions
+                    affected = co_await DbProvider::executeArgs(
+                        Mapping::SQL::delete_by_pk, id);
+                }
+            } else {
+                affected = co_await DbProvider::executeArgs(
+                    Mapping::SQL::delete_by_pk, id);
+            }
             co_return static_cast<size_t>(affected);
         } catch (const pqcoro::PgError& e) {
             RELAIS_LOG_ERROR << name() << ": remove error - " << e.what();

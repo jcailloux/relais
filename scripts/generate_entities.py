@@ -86,6 +86,7 @@ class EntityAnnotation:
     table: str = ""       # PostgreSQL table name (new: replaces model=)
     model: str = ""       # Drogon model class (legacy, ignored)
     primary_key: str = "id"
+    partition_keys: list[str] = field(default_factory=list)
     db_managed: list[str] = field(default_factory=list)
     timestamps: list[str] = field(default_factory=list)
     raw_json: list[str] = field(default_factory=list)
@@ -265,6 +266,8 @@ class StructParser:
         for m in members:
             if 'primary_key' in m.tags:
                 annot.primary_key = m.name
+            if 'partition_key' in m.tags:
+                annot.partition_keys.append(m.name)
             if 'db_managed' in m.tags:
                 annot.db_managed.append(m.name)
             if 'timestamp' in m.tags:
@@ -591,6 +594,18 @@ class MappingGenerator:
         lines.append("    }")
         lines.append("")
 
+        # makeFullKeyParams (for composite key partition pruning)
+        if a.partition_keys:
+            args = [f"e.{a.primary_key}"] + [f"e.{pk}" for pk in a.partition_keys]
+            args_str = ",\n            ".join(args)
+            lines.append("    template<typename Entity>")
+            lines.append("    static pqcoro::PgParams makeFullKeyParams(const Entity& e) {")
+            lines.append(f"        return pqcoro::PgParams::make(")
+            lines.append(f"            {args_str}")
+            lines.append(f"        );")
+            lines.append("    }")
+            lines.append("")
+
         # fromRow
         lines.extend(self._generate_from_row(entity))
 
@@ -649,6 +664,17 @@ class MappingGenerator:
         lines.append(f"        static constexpr const char* delete_by_pk =")
         lines.append(
             f'            "DELETE FROM {table_name} WHERE {a.primary_key} = $1";')
+
+        # Full composite key DELETE for partition pruning (when partition_keys present)
+        if a.partition_keys:
+            where_parts = [f"{a.primary_key} = $1"]
+            for i, pk in enumerate(a.partition_keys):
+                where_parts.append(f"{pk} = ${i + 2}")
+            where_clause = " AND ".join(where_parts)
+            lines.append(f"        static constexpr const char* delete_by_full_pk =")
+            lines.append(
+                f'            "DELETE FROM {table_name} WHERE {where_clause}";')
+
         lines.append("    };")
 
         return lines

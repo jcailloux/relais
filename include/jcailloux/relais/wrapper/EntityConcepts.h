@@ -86,6 +86,15 @@ concept HasListDescriptor = requires {
     typename Entity::MappingType::ListDescriptor;
 };
 
+/// Entity's Mapping has composite key support (partition-pruned DELETE).
+/// Auto-detected from Mapping providing delete_by_full_pk SQL and
+/// makeFullKeyParams method (generated when partition_key annotation is used).
+template<typename Entity>
+concept HasCompositeKey = requires(const Entity& e) {
+    { Entity::MappingType::SQL::delete_by_full_pk } -> std::convertible_to<const char*>;
+    { Entity::MappingType::makeFullKeyParams(e) } -> std::convertible_to<pqcoro::PgParams>;
+};
+
 }  // namespace jcailloux::relais
 
 #endif  // JCX_RELAIS_WRAPPER_ENTITY_CONCEPTS_H
