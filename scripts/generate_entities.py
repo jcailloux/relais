@@ -8,7 +8,7 @@ and generates:
   - EntityWrapper<Struct, Mapping> type aliases (public API)
   - ListWrapper and ListDescriptor for list entities
 
-No Drogon dependency — uses pqcoro (libpq async wrapper) directly.
+No Drogon dependency — uses jcailloux::relais::io directly.
 
 Usage:
     python generate_entities.py --scan dir/ --output-dir base/
@@ -423,7 +423,7 @@ class StructParser:
 class MappingGenerator:
     """Generate Mapping structs + EntityWrapper aliases from parsed entities.
 
-    Generates SQL-direct code using pqcoro (libpq async wrapper).
+    Generates SQL-direct code using jcailloux::relais::io.
     No Drogon ORM dependency.
     """
 
@@ -599,8 +599,8 @@ class MappingGenerator:
             args = [f"e.{a.primary_key}"] + [f"e.{pk}" for pk in a.partition_keys]
             args_str = ",\n            ".join(args)
             lines.append("    template<typename Entity>")
-            lines.append("    static pqcoro::PgParams makeFullKeyParams(const Entity& e) {")
-            lines.append(f"        return pqcoro::PgParams::make(")
+            lines.append("    static jcailloux::relais::io::PgParams makeFullKeyParams(const Entity& e) {")
+            lines.append(f"        return jcailloux::relais::io::PgParams::make(")
             lines.append(f"            {args_str}")
             lines.append(f"        );")
             lines.append("    }")
@@ -710,7 +710,7 @@ class MappingGenerator:
         a = entity.annotation
         lines = [
             "    template<typename Entity>",
-            "    static std::optional<Entity> fromRow(const pqcoro::PgResult::Row& row) {",
+            "    static std::optional<Entity> fromRow(const jcailloux::relais::io::PgResult::Row& row) {",
             "        Entity e;",
         ]
 
@@ -778,7 +778,7 @@ class MappingGenerator:
 
         lines = [
             "    template<typename Entity>",
-            "    static pqcoro::PgParams toInsertParams(const Entity& e) {",
+            "    static jcailloux::relais::io::PgParams toInsertParams(const Entity& e) {",
         ]
 
         # Skip comment for db_managed fields
@@ -792,12 +792,12 @@ class MappingGenerator:
             args = []
             for m in insert_members:
                 args.append(f"            e.{m.name}")
-            lines.append("        return pqcoro::PgParams::make(")
+            lines.append("        return jcailloux::relais::io::PgParams::make(")
             lines.append(",\n".join(args))
             lines.append("        );")
         else:
             # Complex case: build params manually for enum/json conversion
-            lines.append("        pqcoro::PgParams p;")
+            lines.append("        jcailloux::relais::io::PgParams p;")
             for m in insert_members:
                 enum_mapping = self._find_enum_mapping(a, m.name)
                 if m.name in a.json_fields:

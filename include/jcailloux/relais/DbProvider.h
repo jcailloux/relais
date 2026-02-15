@@ -10,19 +10,19 @@
 #include <string_view>
 #include <vector>
 
-#include "pqcoro/Task.h"
-#include "pqcoro/pg/PgPool.h"
-#include "pqcoro/pg/PgResult.h"
-#include "pqcoro/pg/PgParams.h"
-#include "pqcoro/redis/RedisClient.h"
-#include "pqcoro/redis/RedisResult.h"
+#include "jcailloux/relais/io/Task.h"
+#include "jcailloux/relais/io/pg/PgPool.h"
+#include "jcailloux/relais/io/pg/PgResult.h"
+#include "jcailloux/relais/io/pg/PgParams.h"
+#include "jcailloux/relais/io/redis/RedisClient.h"
+#include "jcailloux/relais/io/redis/RedisResult.h"
 
 namespace jcailloux::relais {
 
 // =============================================================================
 // DbProvider — Type-erased service locator for PostgreSQL and Redis
 //
-// Wraps pqcoro::PgClient<Io> and pqcoro::RedisClient<Io> behind std::function
+// Wraps io::PgClient<Io> and io::RedisClient<Io> behind std::function
 // to decouple relais from the concrete IoContext type. The application
 // initializes once at startup with the appropriate IoContext.
 //
@@ -51,15 +51,15 @@ public:
 
     /// Execute a simple SQL query (no parameters).
     /// @note sql must remain valid until the co_await completes.
-    static pqcoro::Task<pqcoro::PgResult> query(const char* sql) {
+    static io::Task<io::PgResult> query(const char* sql) {
         assert(pg_query_ && "DbProvider::query() called before init()");
         return pg_query_(sql);
     }
 
     /// Execute a parameterized SQL query.
     /// @note sql and params must remain valid until the co_await completes.
-    static pqcoro::Task<pqcoro::PgResult> queryParams(
-        const char* sql, const pqcoro::PgParams& params)
+    static io::Task<io::PgResult> queryParams(
+        const char* sql, const io::PgParams& params)
     {
         assert(pg_query_params_ && "DbProvider::queryParams() called before init()");
         return pg_query_params_(sql, params);
@@ -67,8 +67,8 @@ public:
 
     /// Execute a command (INSERT/UPDATE/DELETE), returning affected row count.
     /// @note sql and params must remain valid until the co_await completes.
-    static pqcoro::Task<int> execute(
-        const char* sql, const pqcoro::PgParams& params)
+    static io::Task<int> execute(
+        const char* sql, const io::PgParams& params)
     {
         assert(pg_execute_ && "DbProvider::execute() called before init()");
         return pg_execute_(sql, params);
@@ -77,16 +77,16 @@ public:
     /// Execute a parameterized SQL query with inline args.
     /// The PgParams object is kept alive in the coroutine frame.
     template<typename... Args>
-    static pqcoro::Task<pqcoro::PgResult> queryArgs(const char* sql, Args&&... args) {
-        auto params = pqcoro::PgParams::make(std::forward<Args>(args)...);
+    static io::Task<io::PgResult> queryArgs(const char* sql, Args&&... args) {
+        auto params = io::PgParams::make(std::forward<Args>(args)...);
         co_return co_await queryParams(sql, params);
     }
 
     /// Execute a command with inline args, returning affected row count.
     /// The PgParams object is kept alive in the coroutine frame.
     template<typename... Args>
-    static pqcoro::Task<int> executeArgs(const char* sql, Args&&... args) {
-        auto params = pqcoro::PgParams::make(std::forward<Args>(args)...);
+    static io::Task<int> executeArgs(const char* sql, Args&&... args) {
+        auto params = io::PgParams::make(std::forward<Args>(args)...);
         co_return co_await execute(sql, params);
     }
 
@@ -97,7 +97,7 @@ public:
     /// Execute a Redis command with variadic arguments.
     /// Arguments are converted to strings. Binary data can be passed as
     /// std::string_view (including embedded NUL bytes — all args are
-    /// binary-safe since hiredis uses argvlen).
+    /// binary-safe since RESP2 uses length-prefixed strings).
     ///
     /// Usage:
     ///   co_await DbProvider::redis("SET", "key", "value");
@@ -106,7 +106,7 @@ public:
     ///   co_await DbProvider::redis("SETEX", key, ttl_str,
     ///       std::string_view(reinterpret_cast<const char*>(bin.data()), bin.size()));
     template<typename... Args>
-    static pqcoro::Task<pqcoro::RedisResult> redis(Args&&... args) {
+    static io::Task<io::RedisResult> redis(Args&&... args) {
         assert(redis_exec_ && "DbProvider::redis() called before init() or Redis not configured");
 
         // Build argv in the coroutine frame — lifetime extends until co_await completes.
@@ -145,18 +145,18 @@ public:
     /// The IoContext type is erased — callers don't need to know it.
     template<typename Io>
     static void init(
-        std::shared_ptr<pqcoro::PgPool<Io>> pool,
-        std::shared_ptr<pqcoro::RedisClient<Io>> redisClient = nullptr)
+        std::shared_ptr<io::PgPool<Io>> pool,
+        std::shared_ptr<io::RedisClient<Io>> redisClient = nullptr)
     {
-        auto pg = std::make_shared<pqcoro::PgClient<Io>>(std::move(pool));
+        auto pg = std::make_shared<io::PgClient<Io>>(std::move(pool));
 
         pg_query_ = [pg](const char* sql) {
             return pg->query(sql);
         };
-        pg_query_params_ = [pg](const char* sql, const pqcoro::PgParams& params) {
+        pg_query_params_ = [pg](const char* sql, const io::PgParams& params) {
             return pg->queryParams(sql, params);
         };
-        pg_execute_ = [pg](const char* sql, const pqcoro::PgParams& params) {
+        pg_execute_ = [pg](const char* sql, const io::PgParams& params) {
             return pg->execute(sql, params);
         };
 
@@ -184,12 +184,12 @@ private:
     // Type-erased function storage
     // =========================================================================
 
-    using PgQueryFn = std::function<pqcoro::Task<pqcoro::PgResult>(const char*)>;
-    using PgQueryParamsFn = std::function<pqcoro::Task<pqcoro::PgResult>(
-        const char*, const pqcoro::PgParams&)>;
-    using PgExecuteFn = std::function<pqcoro::Task<int>(
-        const char*, const pqcoro::PgParams&)>;
-    using RedisExecFn = std::function<pqcoro::Task<pqcoro::RedisResult>(
+    using PgQueryFn = std::function<io::Task<io::PgResult>(const char*)>;
+    using PgQueryParamsFn = std::function<io::Task<io::PgResult>(
+        const char*, const io::PgParams&)>;
+    using PgExecuteFn = std::function<io::Task<int>(
+        const char*, const io::PgParams&)>;
+    using RedisExecFn = std::function<io::Task<io::RedisResult>(
         int, const char**, const size_t*)>;
 
     static inline PgQueryFn pg_query_;

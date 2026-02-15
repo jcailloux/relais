@@ -4,7 +4,7 @@
 #include <memory>
 #include <optional>
 #include <utility>
-#include "pqcoro/Task.h"
+#include "jcailloux/relais/io/Task.h"
 
 namespace jcailloux::relais::cache {
 
@@ -55,7 +55,7 @@ struct Invalidate {
     using CacheType = Cache;
 
     template<typename Entity>
-    static pqcoro::Task<void> invalidate(const Entity& entity) {
+    static io::Task<void> invalidate(const Entity& entity) {
         if constexpr (requires { KeyExtractor(entity); }) {
             co_await Cache::invalidate(KeyExtractor(entity));
         } else if constexpr (requires { (entity.*KeyExtractor); }) {
@@ -64,7 +64,7 @@ struct Invalidate {
     }
 
     template<typename Entity>
-    static pqcoro::Task<void> invalidateWithData(const InvalidationData<Entity>& data) {
+    static io::Task<void> invalidateWithData(const InvalidationData<Entity>& data) {
         std::optional<decltype(extractKey(std::declval<Entity>()))> old_key;
         std::optional<decltype(extractKey(std::declval<Entity>()))> new_key;
 
@@ -104,7 +104,7 @@ struct InvalidateList {
     using CacheType = ListCache;
 
     template<typename Entity>
-    static pqcoro::Task<void> invalidate(const Entity& entity) {
+    static io::Task<void> invalidate(const Entity& entity) {
         auto entity_ptr = std::make_shared<const Entity>(entity);
         if constexpr (requires { ListCache::onEntityModified(entity_ptr); }) {
             co_await ListCache::onEntityModified(std::move(entity_ptr));
@@ -114,7 +114,7 @@ struct InvalidateList {
     }
 
     template<typename Entity>
-    static pqcoro::Task<void> invalidateWithData(const InvalidationData<Entity>& data) {
+    static io::Task<void> invalidateWithData(const InvalidationData<Entity>& data) {
         if constexpr (requires { ListCache::onEntityModified(data); }) {
             co_await ListCache::onEntityModified(data);
         }
@@ -163,14 +163,14 @@ struct InvalidateVia {
     using CacheType = TargetCache;
 
     template<typename Entity>
-    static pqcoro::Task<void> invalidate(const Entity& entity) {
+    static io::Task<void> invalidate(const Entity& entity) {
         auto target_keys = co_await Resolver(extractKey(entity));
         for (const auto& tk : target_keys)
             co_await TargetCache::invalidate(tk);
     }
 
     template<typename Entity>
-    static pqcoro::Task<void> invalidateWithData(const InvalidationData<Entity>& data) {
+    static io::Task<void> invalidateWithData(const InvalidationData<Entity>& data) {
         using KeyT = decltype(extractKey(std::declval<Entity>()));
         std::optional<KeyT> old_key, new_key;
 
@@ -224,12 +224,12 @@ struct InvalidateListVia {
     using Target = ListInvalidationTarget<GroupKey>;
 
     template<typename Entity>
-    static pqcoro::Task<void> invalidate(const Entity& entity) {
+    static io::Task<void> invalidate(const Entity& entity) {
         co_await resolveAndInvalidate(extractKey(entity));
     }
 
     template<typename Entity>
-    static pqcoro::Task<void> invalidateWithData(const InvalidationData<Entity>& data) {
+    static io::Task<void> invalidateWithData(const InvalidationData<Entity>& data) {
         using KeyT = decltype(extractKey(std::declval<Entity>()));
         std::optional<KeyT> old_key, new_key;
 
@@ -247,7 +247,7 @@ struct InvalidateListVia {
 
 private:
     template<typename KeyT>
-    static pqcoro::Task<void> resolveAndInvalidate(const KeyT& key) {
+    static io::Task<void> resolveAndInvalidate(const KeyT& key) {
         auto resolved = co_await Resolver(key);
         using ResolvedType = std::decay_t<decltype(resolved)>;
 
@@ -280,12 +280,12 @@ private:
 template<typename... Dependencies>
 struct InvalidateOn {
     template<typename Entity>
-    static pqcoro::Task<void> propagate(const Entity& entity) {
+    static io::Task<void> propagate(const Entity& entity) {
         (co_await Dependencies::template invalidate(entity), ...);
     }
 
     template<typename Entity>
-    static pqcoro::Task<void> propagateWithData(const InvalidationData<Entity>& data) {
+    static io::Task<void> propagateWithData(const InvalidationData<Entity>& data) {
         (co_await Dependencies::template invalidateWithData(data), ...);
     }
 };
@@ -293,12 +293,12 @@ struct InvalidateOn {
 template<>
 struct InvalidateOn<> {
     template<typename Entity>
-    static pqcoro::Task<void> propagate(const Entity&) {
+    static io::Task<void> propagate(const Entity&) {
         co_return;
     }
 
     template<typename Entity>
-    static pqcoro::Task<void> propagateWithData(const InvalidationData<Entity>&) {
+    static io::Task<void> propagateWithData(const InvalidationData<Entity>&) {
         co_return;
     }
 };
@@ -308,24 +308,24 @@ struct InvalidateOn<> {
 // =============================================================================
 
 template<typename Entity, typename InvalidatesType>
-pqcoro::Task<void> propagateInvalidationsWithData(const InvalidationData<Entity>& data) {
+io::Task<void> propagateInvalidationsWithData(const InvalidationData<Entity>& data) {
     co_await InvalidatesType::template propagateWithData(data);
 }
 
 template<typename Entity, typename InvalidatesType>
-pqcoro::Task<void> propagateCreate(WrapperPtr<Entity> entity) {
+io::Task<void> propagateCreate(WrapperPtr<Entity> entity) {
     auto data = InvalidationData<Entity>::forCreate(std::move(entity));
     co_await propagateInvalidationsWithData<Entity, InvalidatesType>(data);
 }
 
 template<typename Entity, typename InvalidatesType>
-pqcoro::Task<void> propagateUpdate(WrapperPtr<Entity> old_entity, WrapperPtr<Entity> new_entity) {
+io::Task<void> propagateUpdate(WrapperPtr<Entity> old_entity, WrapperPtr<Entity> new_entity) {
     auto data = InvalidationData<Entity>::forUpdate(std::move(old_entity), std::move(new_entity));
     co_await propagateInvalidationsWithData<Entity, InvalidatesType>(data);
 }
 
 template<typename Entity, typename InvalidatesType>
-pqcoro::Task<void> propagateDelete(WrapperPtr<Entity> entity) {
+io::Task<void> propagateDelete(WrapperPtr<Entity> entity) {
     auto data = InvalidationData<Entity>::forDelete(std::move(entity));
     co_await propagateInvalidationsWithData<Entity, InvalidatesType>(data);
 }

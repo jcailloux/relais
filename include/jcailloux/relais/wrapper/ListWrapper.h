@@ -12,7 +12,7 @@
 
 #include <glaze/glaze.hpp>
 
-#include "pqcoro/pg/PgResult.h"
+#include "jcailloux/relais/io/pg/PgResult.h"
 #include "jcailloux/relais/wrapper/Format.h"
 
 namespace jcailloux::relais::wrapper {
@@ -142,7 +142,7 @@ public:
     // Factory methods
     // =========================================================================
 
-    static ListWrapper fromRows(const pqcoro::PgResult& result) {
+    static ListWrapper fromRows(const io::PgResult& result) {
         ListWrapper list;
         list.items.reserve(result.rows());
         for (int i = 0; i < result.rows(); ++i) {

@@ -870,11 +870,11 @@ namespace uncached_list {
  */
 class UncachedArticleListRepo : public Repository<TestArticleWrapper, "test:article:list:uncached", cfg::Uncached> {
 public:
-    static pqcoro::Task<std::vector<TestArticleWrapper>> getByCategory(
+    static io::Task<std::vector<TestArticleWrapper>> getByCategory(
         const std::string& category, int limit = 10)
     {
         co_return co_await cachedList(
-            [category, limit]() -> pqcoro::Task<std::vector<TestArticleWrapper>> {
+            [category, limit]() -> io::Task<std::vector<TestArticleWrapper>> {
                 auto result = co_await jcailloux::relais::DbProvider::queryArgs(
                     "SELECT id, category, author_id, title, view_count, is_published, published_at, created_at "
                     "FROM relais_test_articles WHERE category = $1 ORDER BY created_at DESC LIMIT $2",
@@ -890,11 +890,11 @@ public:
         );
     }
 
-    static pqcoro::Task<std::vector<TestArticleWrapper>> getByCategoryTracked(
+    static io::Task<std::vector<TestArticleWrapper>> getByCategoryTracked(
         const std::string& category, int limit = 5, int offset = 0)
     {
         co_return co_await cachedListTracked(
-            [category, limit, offset]() -> pqcoro::Task<std::vector<TestArticleWrapper>> {
+            [category, limit, offset]() -> io::Task<std::vector<TestArticleWrapper>> {
                 auto result = co_await jcailloux::relais::DbProvider::queryArgs(
                     "SELECT id, category, author_id, title, view_count, is_published, published_at, created_at "
                     "FROM relais_test_articles WHERE category = $1 ORDER BY view_count DESC LIMIT $2 OFFSET $3",
@@ -912,17 +912,17 @@ public:
     }
 
     // Expose invalidation methods for testing (no-ops at Base level)
-    static pqcoro::Task<size_t> invalidateCategoryGroup(const std::string& category) {
+    static io::Task<size_t> invalidateCategoryGroup(const std::string& category) {
         co_return co_await invalidateListGroup("category", category);
     }
 
-    static pqcoro::Task<size_t> invalidateCategorySelective(
+    static io::Task<size_t> invalidateCategorySelective(
         const std::string& category, int64_t sort_val)
     {
         co_return co_await invalidateListGroupSelective(sort_val, "category", category);
     }
 
-    static pqcoro::Task<size_t> invalidateCategorySelectiveUpdate(
+    static io::Task<size_t> invalidateCategorySelectiveUpdate(
         const std::string& category, int64_t old_val, int64_t new_val)
     {
         co_return co_await invalidateListGroupSelectiveUpdate(old_val, new_val, "category", category);
@@ -934,11 +934,11 @@ public:
  */
 class UncachedArticleListAsRepo : public Repository<TestArticleWrapper, "test:article:as:list:uncached", cfg::Uncached> {
 public:
-    static pqcoro::Task<TestArticleList> getByCategory(
+    static io::Task<TestArticleList> getByCategory(
         const std::string& category, int limit = 10)
     {
         co_return co_await cachedListAs<TestArticleList>(
-            [category, limit]() -> pqcoro::Task<TestArticleList> {
+            [category, limit]() -> io::Task<TestArticleList> {
                 auto result = co_await jcailloux::relais::DbProvider::queryArgs(
                     "SELECT id, category, author_id, title, view_count, is_published, published_at, created_at "
                     "FROM relais_test_articles WHERE category = $1 ORDER BY created_at DESC LIMIT $2",
