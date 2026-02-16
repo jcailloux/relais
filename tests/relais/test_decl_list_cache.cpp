@@ -4,7 +4,7 @@
  *
  * Covers:
  * - Query: filters, combined filters, limits, empty results
- * - Item access: firstItem / lastItem accessors
+ * - Item access: front / back accessors
  * - SortBounds-based invalidation: only pages whose sort range includes
  *   the modified entity's value are invalidated
  * - Filter matching: only pages matching the entity's filter values are affected
@@ -171,7 +171,7 @@ TEST_CASE("[DeclListRepo] Article Item accessors",
     TransactionGuard tx;
     TestInternals::resetListCacheState<TestArticleListRepo>();
 
-    SECTION("[itemview] firstItem and lastItem are accessible") {
+    SECTION("[itemview] front and back are accessible") {
         auto userId = insertTestUser("author", "author@example.com", 0);
         insertTestArticle("tech", userId, "First Article", 10, true);
         insertTestArticle("news", userId, "Last Article", 20, true);

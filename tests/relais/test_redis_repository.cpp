@@ -1048,7 +1048,7 @@ TEST_CASE("RedisRepo - binary list caching", "[integration][db][redis][fb-list]"
         auto result = sync(L2TestArticleListAsRepo::getByCategory("fb_view"));
         REQUIRE(result.size() >= 1);
 
-        auto* first = result.firstItem();
+        auto* first = result.front();
         REQUIRE(first != nullptr);
         REQUIRE(first->category == "fb_view");
         REQUIRE(first->author_id == userId);

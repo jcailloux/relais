@@ -72,11 +72,11 @@ public:
     [[nodiscard]] int64_t count() const noexcept { return total_count; }
     [[nodiscard]] std::string_view cursor() const noexcept { return next_cursor; }
 
-    [[nodiscard]] const Item* firstItem() const noexcept {
+    [[nodiscard]] const Item* front() const noexcept {
         return items.empty() ? nullptr : &items.front();
     }
 
-    [[nodiscard]] const Item* lastItem() const noexcept {
+    [[nodiscard]] const Item* back() const noexcept {
         return items.empty() ? nullptr : &items.back();
     }
 

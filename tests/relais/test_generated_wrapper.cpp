@@ -9,7 +9,7 @@
  *   4. TestOrder      — comprehensive coverage: enum, nested struct, raw JSON,
  *                        vectors, nullable
  *   5. ListWrapper     — generic list wrapper (construction, serialization,
- *                        firstItem/lastItem, fromItems)
+ *                        front/back, fromItems)
  *   6. Glaze vector   — validates Glaze round-trip for vector<Entity>
  *
  * SECTION naming convention:
@@ -719,8 +719,8 @@ TEST_CASE("ListWrapper<TestArticle> - construction and accessors", "[wrapper][li
         REQUIRE_FALSE(list.empty());
     }
 
-    SECTION("[List] firstItem returns pointer to first item") {
-        auto* first = list.firstItem();
+    SECTION("[List] front returns pointer to first item") {
+        auto* first = list.front();
         REQUIRE(first != nullptr);
         REQUIRE(first->category == "tech");
         REQUIRE(first->author_id == 7);
@@ -728,15 +728,15 @@ TEST_CASE("ListWrapper<TestArticle> - construction and accessors", "[wrapper][li
         REQUIRE(*first->view_count == 10);
     }
 
-    SECTION("[List] lastItem returns pointer to last item") {
-        auto* last = list.lastItem();
+    SECTION("[List] back returns pointer to last item") {
+        auto* last = list.back();
         REQUIRE(last != nullptr);
         REQUIRE(last->category == "science");
         REQUIRE(last->author_id == 3);
     }
 
     SECTION("[List] nullable absent in list item") {
-        auto* last = list.lastItem();
+        auto* last = list.back();
         REQUIRE_FALSE(last->view_count.has_value());
     }
 
@@ -769,7 +769,7 @@ TEST_CASE("ListWrapper<TestArticle> - construction and accessors", "[wrapper][li
     SECTION("[List] fromItems preserves nullable present") {
         std::vector<std::shared_ptr<const TestArticle>> one = {e1};
         auto from_items = ListWrapperArticle::fromItems(one);
-        auto* first = from_items.firstItem();
+        auto* first = from_items.front();
         REQUIRE(first != nullptr);
         REQUIRE(first->view_count.has_value());
         REQUIRE(*first->view_count == 10);
@@ -778,7 +778,7 @@ TEST_CASE("ListWrapper<TestArticle> - construction and accessors", "[wrapper][li
     SECTION("[List] fromItems preserves nullable absent") {
         std::vector<std::shared_ptr<const TestArticle>> one = {e2};
         auto from_items = ListWrapperArticle::fromItems(one);
-        auto* first = from_items.firstItem();
+        auto* first = from_items.front();
         REQUIRE(first != nullptr);
         REQUIRE_FALSE(first->view_count.has_value());
     }
@@ -840,7 +840,7 @@ TEST_CASE("ListWrapper<TestArticle> - JSON round-trip", "[wrapper][list][article
         auto restored = ListWrapperArticle::fromJson(*json);
         REQUIRE(restored.has_value());
         REQUIRE(restored->size() == 1);
-        auto* first = restored->firstItem();
+        auto* first = restored->front();
         REQUIRE(first != nullptr);
         REQUIRE(first->category == "tech");
         REQUIRE(first->view_count.has_value());
