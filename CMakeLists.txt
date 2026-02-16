@@ -11,11 +11,6 @@ target_include_directories(jcailloux-relais INTERFACE
 
 target_compile_features(jcailloux-relais INTERFACE cxx_std_23)
 
-# Workaround for GCC 15 bug with AVX2 intrinsics in avx2intrin.h
-if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL "15")
-    target_compile_options(jcailloux-relais INTERFACE -mno-avx2)
-endif()
-
 # =============================================================================
 # Dependencies
 # =============================================================================
