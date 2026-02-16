@@ -61,8 +61,8 @@ public:
     // Primary key — delegated to Mapping
     // =========================================================================
 
-    [[nodiscard]] auto getPrimaryKey() const noexcept {
-        return Mapping::getPrimaryKey(*this);
+    [[nodiscard]] auto key() const noexcept {
+        return Mapping::key(*this);
     }
 
     // =========================================================================

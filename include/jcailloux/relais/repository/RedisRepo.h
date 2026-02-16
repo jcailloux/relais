@@ -83,7 +83,7 @@ class RedisRepo : public BaseRepo<Entity, Name, Cfg, Key> {
         {
             auto inserted = co_await Base::insert(wrapper);
             if (inserted) {
-                co_await setInCache(makeRedisKey(inserted->getPrimaryKey()), *inserted);
+                co_await setInCache(makeRedisKey(inserted->key()), *inserted);
             }
             co_return inserted;
         }

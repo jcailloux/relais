@@ -84,11 +84,11 @@ template<typename Entity, config::FixedString Name, config::CacheConfig Cfg = co
 class Repo
     : public detail::MixinStack<
           Entity, Name, Cfg,
-          decltype(std::declval<const Entity>().getPrimaryKey()),
+          decltype(std::declval<const Entity>().key()),
           Invalidations...
       >::type
 {
-    using Key = decltype(std::declval<const Entity>().getPrimaryKey());
+    using Key = decltype(std::declval<const Entity>().key());
     using Base = typename detail::MixinStack<Entity, Name, Cfg, Key, Invalidations...>::type;
 
     // Compile-time validation

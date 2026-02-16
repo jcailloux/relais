@@ -19,7 +19,7 @@ namespace jcailloux::relais {
 //   Readable          — can be constructed from a PgResult::Row (fromRow)
 //   Serializable      — can be cached (json/fromJson or binary/fromBinary)
 //   Writable          — can produce insert params (toInsertParams)
-//   Keyed             — has a primary key (getPrimaryKey)
+//   Keyed             — has a primary key (key)
 //
 // Composed concepts for repository constraints:
 //
@@ -53,7 +53,7 @@ concept Writable = requires(const W& w) {
 /// Has a primary key for cache key generation
 template<typename W, typename Key = int64_t>
 concept Keyed = requires(const W& w) {
-    { w.getPrimaryKey() } -> std::convertible_to<Key>;
+    { w.key() } -> std::convertible_to<Key>;
 };
 
 // -----------------------------------------------------------------------------

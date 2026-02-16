@@ -1914,7 +1914,7 @@ TEST_CASE("RedisRepo - InvalidateListVia enriched resolver",
         // insert a purchase for Alice, then delete it
         auto created = sync(L2SelectiveListPurchaseRepo::insert(makeTestPurchase(aliceId, "Temp", 50, "pending")));
         REQUIRE(created != nullptr);
-        auto purchaseId = created->getPrimaryKey();
+        auto purchaseId = created->key();
 
         // Pages were partially invalidated by insert — re-cache
         sync(L2SelectiveArticleListRepo::getByCategory("tech", 5, 0));

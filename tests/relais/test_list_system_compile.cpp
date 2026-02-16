@@ -66,7 +66,7 @@ struct TestListArticle {
         };
 
         template<typename Entity>
-        static auto getPrimaryKey(const Entity& e) noexcept { return e.id; }
+        static auto key(const Entity& e) noexcept { return e.id; }
 
         template<typename T>
         static constexpr auto glaze_value = glz::object(
@@ -92,7 +92,7 @@ struct TestListArticle {
 
     using Mapping = MappingType;
 
-    auto getPrimaryKey() const noexcept { return id; }
+    auto key() const noexcept { return id; }
     static std::optional<TestListArticle> fromJson(std::string_view) { return std::nullopt; }
     std::shared_ptr<const std::string> json() const { return nullptr; }
 };

@@ -31,7 +31,7 @@ Technical details about the relais test infrastructure.
 │    TestItem.h (pure struct)     TestUser.h     TestArticle.h        │
 │    TestPurchase.h     TestEvent.h (composite PK: id+region)         │
 │    generated/*Wrapper.h  (Mapping + EntityWrapper aliases)          │
-│    - fromRow / toInsertParams / getPrimaryKey                       │
+│    - fromRow / toInsertParams / key                       │
 └─────────────────────────────────────────────────────────────────────┘
                               │
                               ▼
@@ -111,7 +111,7 @@ using TestItemEntity = EntityWrapper<TestItem, generated::TestItemMapping>;
 `EntityWrapper` inherits from the struct and adds:
 - `fromRow(PgResult::Row)` / `toInsertParams(Entity)` — delegated to Mapping
 - `binary()` / `json()` — thread-safe lazy serialization via Glaze
-- `getPrimaryKey()` — delegated to Mapping
+- `key()` — delegated to Mapping
 - `Field` enum, `TraitsType` — from Mapping
 
 Entities are **immutable** (stored as `shared_ptr<const Entity>`). To update:

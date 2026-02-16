@@ -88,7 +88,7 @@ template<> struct glz::meta<User> {
 };
 
 // 2. Generated Mapping (by generate_entities.py) provides:
-//    - fromRow<Entity>, toInsertParams<Entity>, getPrimaryKey<Entity>
+//    - fromRow<Entity>, toInsertParams<Entity>, key<Entity>
 //    - SQL struct (select_by_pk, insert, update, delete_by_pk)
 //    - makeFullKeyParams (if partition_key annotation present)
 //    - TraitsType with Field enum + FieldInfo (for patch)
@@ -100,7 +100,7 @@ using UserWrapper = jcailloux::relais::wrapper::EntityWrapper<User, generated::U
 // UserWrapper inherits from User and adds:
 // - fromRow/toInsertParams (delegated to Mapping)
 // - binary/json (thread-safe lazy BEVE/JSON via Glaze)
-// - getPrimaryKey
+// - key
 ```
 
 ### 2. Create your repository
@@ -151,7 +151,7 @@ If the entity has an embedded `ListDescriptor` (from `filterable`/`sortable` ann
 | `Cfg` | `CacheConfig` | `config::Local` | NTTP aggregate configuring cache behavior |
 | `Invalidations...` | types | — | Variadic cross-invalidation descriptors |
 
-Key is auto-deduced from `Entity::getPrimaryKey()` return type.
+Key is auto-deduced from `Entity::key()` return type.
 
 ### Partition Key Repositories
 
@@ -191,7 +191,7 @@ BaseRepo::eraseImpl(id, hint)
 ```cpp
 // Repo — no special configuration needed
 using EventRepo = relais::Repo<EventWrapper, "Event", config::Both>;
-// Key = int64_t (from getPrimaryKey)
+// Key = int64_t (from key)
 // HasPartitionKey auto-detected from Mapping
 ```
 
@@ -659,7 +659,7 @@ Column names are derived automatically from the field name.
 
 ### Generated Output
 
-The generator produces standalone Mapping structs with template `fromRow<Entity>` / `toInsertParams<Entity>` / `getPrimaryKey<Entity>` methods. These are used by `EntityWrapper<Struct, Mapping>`.
+The generator produces standalone Mapping structs with template `fromRow<Entity>` / `toInsertParams<Entity>` / `key<Entity>` methods. These are used by `EntityWrapper<Struct, Mapping>`.
 
 For each entity:
 - **Mapping struct**: SQL strings, `TraitsType`, `FieldInfo` specializations, `glaze_value`

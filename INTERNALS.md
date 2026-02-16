@@ -40,7 +40,7 @@ template<typename Entity, config::FixedString Name, config::CacheConfig Cfg, typ
 - **Entity**: `EntityWrapper<Struct, Mapping>` type
 - **Name**: `FixedString` NTTP — compile-time string literal for the repository name and Redis key prefix
 - **Cfg**: `CacheConfig` NTTP — structural aggregate (all fields are public structural types)
-- **Key**: Auto-deduced from `decltype(std::declval<const Entity>().getPrimaryKey())`
+- **Key**: Auto-deduced from `decltype(std::declval<const Entity>().key())`
 
 No `Config` struct, no `typename Derived`, no separate ORM model type.
 
@@ -846,7 +846,7 @@ concept MutableEntity = ReadableEntity<W> && requires {
 
 template<typename W, typename Key = int64_t>
 concept Keyed = requires(const W& w) {
-    { w.getPrimaryKey() } -> std::convertible_to<Key>;
+    { w.key() } -> std::convertible_to<Key>;
 };
 ```
 
@@ -895,7 +895,7 @@ if constexpr (HasBinarySerialization<Entity>) {
 ```cpp
 template<typename Struct, typename Mapping>
 class EntityWrapper : public Struct {
-    // Delegates fromRow/toInsertParams/getPrimaryKey to Mapping
+    // Delegates fromRow/toInsertParams/key to Mapping
     // Conditionally exposes makeFullKeyParams (if Mapping has it)
     // Conditionally exposes ListDescriptor (if Mapping has it)
     // Thread-safe lazy BEVE/JSON serialization via std::call_once
@@ -903,7 +903,7 @@ class EntityWrapper : public Struct {
 ```
 
 - **Struct**: Pure C++ data type, framework-agnostic, shareable across projects
-- **Mapping**: Generated standalone struct with template `fromRow<Entity>`, `toInsertParams<Entity>`, `getPrimaryKey<Entity>`
+- **Mapping**: Generated standalone struct with template `fromRow<Entity>`, `toInsertParams<Entity>`, `key<Entity>`
 - **Serialization caches**: `std::once_flag` + mutable `shared_ptr` cache fields; both `binary()` and `json()` return `shared_ptr` for safe lifetime management
 - **`releaseCaches()`**: Resets both BEVE and JSON shared_ptrs to nullptr. After release, `binary()`/`json()` return nullptr (once_flag already triggered)
 
@@ -1080,7 +1080,7 @@ The `scripts/generate_entities.py` script generates standalone ORM Mapping struc
 1. Scans `.h` files for `// @relais` annotations on struct declarations and data members
 2. Parses data members via regex (type, name, default value, inline annotations)
 3. Derives SQL column names from field names
-4. Generates a standalone Mapping struct with template methods (`fromRow`, `toInsertParams`, `getPrimaryKey`)
+4. Generates a standalone Mapping struct with template methods (`fromRow`, `toInsertParams`, `key`)
 
 ### Generated Components
 
@@ -1088,7 +1088,7 @@ The `scripts/generate_entities.py` script generates standalone ORM Mapping struc
 - `Mapping` struct with `TraitsType`, `FieldInfo` specializations, `glaze_value`
 - `template<typename Entity> fromRow(const PgResult::Row&) -> optional<Entity>`
 - `template<typename Entity> toInsertParams(const Entity&) -> PgParams`
-- `template<typename Entity> getPrimaryKey(const Entity&) -> auto`
+- `template<typename Entity> key(const Entity&) -> auto`
 - `using XxxWrapper = EntityWrapper<Struct, Mapping>;`
 
 **For partial-key entities (PK is `db_managed`):**

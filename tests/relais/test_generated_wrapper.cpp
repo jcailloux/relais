@@ -67,8 +67,8 @@ TEST_CASE("TestUser - direct construction and field access", "[wrapper][struct][
         REQUIRE(user.created_at == "2025-01-01T00:00:00Z");
     }
 
-    SECTION("[Struct] getPrimaryKey returns id") {
-        REQUIRE(user.getPrimaryKey() == 42);
+    SECTION("[Struct] key returns id") {
+        REQUIRE(user.key() == 42);
     }
 }
 
@@ -1060,7 +1060,7 @@ struct ProductMapping {
     };
 
     template<typename Entity>
-    static auto getPrimaryKey(const Entity& e) noexcept { return e.id; }
+    static auto key(const Entity& e) noexcept { return e.id; }
 
     template<typename Entity>
     static std::optional<Entity> fromRow(const jcailloux::relais::io::PgResult::Row&) { return std::nullopt; }
@@ -1116,8 +1116,8 @@ TEST_CASE("Custom JSON field names via glz::meta<Struct>", "[wrapper][json][cust
         REQUIRE(restored->unit_price == 999);
     }
 
-    SECTION("[Struct] getPrimaryKey works") {
-        REQUIRE(product.getPrimaryKey() == 42);
+    SECTION("[Struct] key works") {
+        REQUIRE(product.key() == 42);
     }
 }
 

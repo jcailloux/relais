@@ -161,7 +161,7 @@ public:
         auto inserted = co_await Base::insert(wrapper);
         if (inserted) {
             // Populate L1 cache with the new entity
-            putInCache(inserted->getPrimaryKey(), inserted);
+            putInCache(inserted->key(), inserted);
             co_return inserted;
         }
         co_return nullptr;
