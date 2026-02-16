@@ -15,6 +15,8 @@ Usage:
     python generate_entities.py --files file1.h file2.h --output-dir base/
 """
 
+from __future__ import annotations
+
 import argparse
 import re
 import sys
