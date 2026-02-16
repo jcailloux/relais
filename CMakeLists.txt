@@ -44,7 +44,7 @@ target_link_libraries(jcailloux-relais INTERFACE
 # Tests
 # =============================================================================
 
-option(RELAIS_BUILD_TESTS "Build relais tests" ON)
+option(RELAIS_BUILD_TESTS "Build relais tests" ${PROJECT_IS_TOP_LEVEL})
 
 if(RELAIS_BUILD_TESTS)
     enable_testing()
