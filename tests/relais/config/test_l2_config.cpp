@@ -61,19 +61,19 @@ namespace relais_test {
 namespace l2ct = l2_config_test;
 
 // TTL repos
-using L2ShortTTLRepo = Repository<TestItemWrapper, "cfg:l2:ttl3s",  l2ct::ShortTTL>;
-using L2LongTTLRepo  = Repository<TestItemWrapper, "cfg:l2:ttl30s", l2ct::LongTTL>;
+using L2ShortTTLRepo = Repo<TestItemWrapper, "cfg:l2:ttl3s",  l2ct::ShortTTL>;
+using L2LongTTLRepo  = Repo<TestItemWrapper, "cfg:l2:ttl30s", l2ct::LongTTL>;
 
 // Refresh repos
-using L2RefreshTrueRepo  = Repository<TestItemWrapper, "cfg:l2:refresh:t",  l2ct::RefreshTrue>;
-using L2RefreshFalseRepo = Repository<TestItemWrapper, "cfg:l2:refresh:f",  l2ct::RefreshFalse>;
+using L2RefreshTrueRepo  = Repo<TestItemWrapper, "cfg:l2:refresh:t",  l2ct::RefreshTrue>;
+using L2RefreshFalseRepo = Repo<TestItemWrapper, "cfg:l2:refresh:f",  l2ct::RefreshFalse>;
 
 // Strategy repos
-using L2LazyReloadRepo  = Repository<TestItemWrapper, "cfg:l2:lazy",  l2ct::LazyReload>;
-using L2PopImmediateRepo = Repository<TestItemWrapper, "cfg:l2:pop",   l2ct::PopImmediate>;
+using L2LazyReloadRepo  = Repo<TestItemWrapper, "cfg:l2:lazy",  l2ct::LazyReload>;
+using L2PopImmediateRepo = Repo<TestItemWrapper, "cfg:l2:pop",   l2ct::PopImmediate>;
 
 // Read-only repo
-using L2ReadOnlyCfgRepo = Repository<TestItemWrapper, "cfg:l2:ro", l2ct::ReadOnlyL2>;
+using L2ReadOnlyCfgRepo = Repo<TestItemWrapper, "cfg:l2:ro", l2ct::ReadOnlyL2>;
 
 } // namespace relais_test
 
@@ -91,7 +91,7 @@ TEST_CASE("L2 Config - l2_ttl",
     SECTION("[ttl] short TTL (1s): entry expires and re-fetched from DB") {
         auto id = insertTestItem("l2_ttl_short", 10);
 
-        sync(L2ShortTTLRepo::findById(id));
+        sync(L2ShortTTLRepo::find(id));
 
         // Update DB
         updateTestItem(id, "l2_ttl_updated", 99);
@@ -100,7 +100,7 @@ TEST_CASE("L2 Config - l2_ttl",
         waitForExpiration(std::chrono::milliseconds{1500});
 
         // Should fetch from DB now
-        auto item = sync(L2ShortTTLRepo::findById(id));
+        auto item = sync(L2ShortTTLRepo::find(id));
         REQUIRE(item->name == "l2_ttl_updated");
         REQUIRE(item->value == 99);
     }
@@ -108,7 +108,7 @@ TEST_CASE("L2 Config - l2_ttl",
     SECTION("[ttl] long TTL: entry survives moderate wait") {
         auto id = insertTestItem("l2_ttl_long", 20);
 
-        sync(L2LongTTLRepo::findById(id));
+        sync(L2LongTTLRepo::find(id));
 
         // Modify DB
         updateTestItem(id, "invisible", 99);
@@ -116,7 +116,7 @@ TEST_CASE("L2 Config - l2_ttl",
         // Wait a bit — should still be cached (30s TTL)
         waitForExpiration(std::chrono::milliseconds{500});
 
-        auto item = sync(L2LongTTLRepo::findById(id));
+        auto item = sync(L2LongTTLRepo::find(id));
         REQUIRE(item->name == "l2_ttl_long");
         REQUIRE(item->value == 20);
     }
@@ -138,11 +138,11 @@ TEST_CASE("L2 Config - l2_refresh_on_get",
         auto id = insertTestItem("l2_refresh_item", 10);
 
         // Populate cache (TTL = 1s)
-        sync(L2RefreshTrueRepo::findById(id));
+        sync(L2RefreshTrueRepo::find(id));
 
         // Wait 700ms, then read (GETEX extends TTL by 1s from now)
         waitForExpiration(std::chrono::milliseconds{700});
-        sync(L2RefreshTrueRepo::findById(id));
+        sync(L2RefreshTrueRepo::find(id));
 
         // Wait 700ms more (1.4s total > 1s original TTL)
         waitForExpiration(std::chrono::milliseconds{700});
@@ -151,7 +151,7 @@ TEST_CASE("L2 Config - l2_refresh_on_get",
         updateTestItem(id, "l2_ref_modified", 99);
 
         // TTL was extended — should still serve old value
-        auto item = sync(L2RefreshTrueRepo::findById(id));
+        auto item = sync(L2RefreshTrueRepo::find(id));
         REQUIRE(item->name == "l2_refresh_item");
         REQUIRE(item->value == 10);
     }
@@ -160,11 +160,11 @@ TEST_CASE("L2 Config - l2_refresh_on_get",
         auto id = insertTestItem("l2_noref_item", 10);
 
         // Populate cache (TTL = 1s)
-        sync(L2RefreshFalseRepo::findById(id));
+        sync(L2RefreshFalseRepo::find(id));
 
         // Wait 700ms, read (plain GET, no TTL extension)
         waitForExpiration(std::chrono::milliseconds{700});
-        sync(L2RefreshFalseRepo::findById(id));
+        sync(L2RefreshFalseRepo::find(id));
 
         // Wait 500ms more (1.2s total > 1s original TTL)
         waitForExpiration(std::chrono::milliseconds{500});
@@ -173,7 +173,7 @@ TEST_CASE("L2 Config - l2_refresh_on_get",
         updateTestItem(id, "l2_noref_updated", 99);
 
         // TTL expired — should fetch from DB
-        auto item = sync(L2RefreshFalseRepo::findById(id));
+        auto item = sync(L2RefreshFalseRepo::find(id));
         REQUIRE(item->name == "l2_noref_updated");
         REQUIRE(item->value == 99);
     }
@@ -195,14 +195,14 @@ TEST_CASE("L2 Config - update_strategy at L2",
         auto id = insertTestItem("l2_lazy_item", 10);
 
         // Populate cache
-        sync(L2LazyReloadRepo::findById(id));
+        sync(L2LazyReloadRepo::find(id));
 
         // Update via repo
         auto updated = makeTestItem("l2_lazy_updated", 20, "", true, id);
         sync(L2LazyReloadRepo::update(id, updated));
 
         // Next read should get updated value from DB
-        auto item = sync(L2LazyReloadRepo::findById(id));
+        auto item = sync(L2LazyReloadRepo::find(id));
         REQUIRE(item->name == "l2_lazy_updated");
         REQUIRE(item->value == 20);
     }
@@ -211,7 +211,7 @@ TEST_CASE("L2 Config - update_strategy at L2",
         auto id = insertTestItem("l2_pop_item", 10);
 
         // Populate cache
-        sync(L2PopImmediateRepo::findById(id));
+        sync(L2PopImmediateRepo::find(id));
 
         // Update via repo (write-through)
         auto updated = makeTestItem("l2_pop_updated", 20, "", true, id);
@@ -221,7 +221,7 @@ TEST_CASE("L2 Config - update_strategy at L2",
         updateTestItem(id, "sneaky", 99);
 
         // L2 should serve the write-through value
-        auto item = sync(L2PopImmediateRepo::findById(id));
+        auto item = sync(L2PopImmediateRepo::find(id));
         REQUIRE(item->name == "l2_pop_updated");
         REQUIRE(item->value == 20);
     }
@@ -239,23 +239,23 @@ TEST_CASE("L2 Config - read_only",
 {
     TransactionGuard tx;
 
-    SECTION("[readonly] findById works and caches in Redis") {
+    SECTION("[readonly] find works and caches in Redis") {
         auto id = insertTestItem("l2_ro_item", 42);
 
-        auto item = sync(L2ReadOnlyCfgRepo::findById(id));
+        auto item = sync(L2ReadOnlyCfgRepo::find(id));
         REQUIRE(item != nullptr);
         REQUIRE(item->name == "l2_ro_item");
 
         // Verify caching: DB change not visible
         updateTestItem(id, "modified", 99);
-        auto cached = sync(L2ReadOnlyCfgRepo::findById(id));
+        auto cached = sync(L2ReadOnlyCfgRepo::find(id));
         REQUIRE(cached->name == "l2_ro_item");
     }
 
-    SECTION("[readonly] findByIdAsJson works") {
+    SECTION("[readonly] findJson works") {
         auto id = insertTestItem("l2_ro_json", 10);
 
-        auto json = sync(L2ReadOnlyCfgRepo::findByIdAsJson(id));
+        auto json = sync(L2ReadOnlyCfgRepo::findJson(id));
         REQUIRE(json != nullptr);
         REQUIRE(json->find("\"l2_ro_json\"") != std::string::npos);
     }

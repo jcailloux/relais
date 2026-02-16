@@ -7,7 +7,7 @@
 namespace jcailloux::relais::wrapper {
 
 // =============================================================================
-// FieldUpdate / FieldSetNull — typed field update descriptors for updateBy
+// FieldUpdate / FieldSetNull — typed field update descriptors for patch
 // =============================================================================
 
 /// Carries a value to set on a specific field (F is a Traits::Field enum value).
@@ -34,7 +34,7 @@ auto setNull() {
 }
 
 // =============================================================================
-// fieldColumnName / fieldValue — extractors for SQL binding in updateBy
+// fieldColumnName / fieldValue — extractors for SQL binding in patch
 // =============================================================================
 
 /// Extract quoted column name from a FieldUpdate.

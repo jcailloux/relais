@@ -583,9 +583,9 @@ class MappingGenerator:
         lines.extend(self._generate_traits_type(entity, updateable))
         lines.append("")
 
-        # getPrimaryKey
+        # key
         lines.append("    template<typename Entity>")
-        lines.append("    static auto getPrimaryKey(const Entity& e) noexcept {")
+        lines.append("    static auto key(const Entity& e) noexcept {")
         lines.append(f"        return e.{a.primary_key};")
         lines.append("    }")
         lines.append("")

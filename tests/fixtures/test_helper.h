@@ -562,19 +562,19 @@ inline void updateTestEvent(int64_t id, const std::string& title, int32_t priori
 // Cache Testing Utilities
 // =============================================================================
 
-template<typename Repository>
+template<typename Repo>
 size_t getCacheSize() {
-    return Repository::cacheSize();
+    return Repo::size();
 }
 
-template<typename Repository>
-void forceFullCleanup() {
-    Repository::fullCleanup();
+template<typename Repo>
+void forcePurge() {
+    Repo::purge();
 }
 
-template<typename Repository>
-void triggerCleanup() {
-    Repository::triggerCleanup();
+template<typename Repo>
+void trySweep() {
+    Repo::trySweep();
 }
 
 } // namespace relais_test

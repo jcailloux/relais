@@ -1,5 +1,5 @@
-#ifndef JCX_RELAIS_REPOSITORY_CONFIG_H
-#define JCX_RELAIS_REPOSITORY_CONFIG_H
+#ifndef JCX_RELAIS_REPO_CONFIG_H
+#define JCX_RELAIS_REPO_CONFIG_H
 
 #include <chrono>
 #include "jcailloux/relais/config/Duration.h"
@@ -11,10 +11,10 @@ namespace jcailloux::relais::config {
     // Cache levels - determines which caching layers are active
     // =========================================================================
     enum class CacheLevel {
-        None,   // DB only (BaseRepository)
-        L1,     // RAM -> DB (CachedRepository without Redis)
-        L2,     // Redis -> DB (RedisRepository)
-        L1_L2   // RAM -> Redis -> DB (CachedRepository with Redis)
+        None,   // DB only (BaseRepo)
+        L1,     // RAM -> DB (CachedRepo without Redis)
+        L2,     // Redis -> DB (RedisRepo)
+        L1_L2   // RAM -> Redis -> DB (CachedRepo with Redis)
     };
 
     // =========================================================================
@@ -32,9 +32,9 @@ namespace jcailloux::relais::config {
     // All fields are public structural types → usable as template parameter.
     //
     // Usage:
-    //   using MyRepo = Repository<MyWrapper, "MyEntity">;                // defaults to Local
-    //   using MyRepo = Repository<MyWrapper, "MyEntity", config::Both>;  // preset
-    //   using MyRepo = Repository<MyWrapper, "MyEntity",
+    //   using MyRepo = Repo<MyWrapper, "MyEntity">;                // defaults to Local
+    //   using MyRepo = Repo<MyWrapper, "MyEntity", config::Both>;  // preset
+    //   using MyRepo = Repo<MyWrapper, "MyEntity",
     //       config::Local.with_l1_ttl(30min).with_read_only()>;          // customized
     //
 
@@ -103,4 +103,4 @@ namespace jcailloux::relais::config {
 
 }  // namespace jcailloux::relais::config
 
-#endif //JCX_RELAIS_REPOSITORY_CONFIG_H
+#endif //JCX_RELAIS_REPO_CONFIG_H

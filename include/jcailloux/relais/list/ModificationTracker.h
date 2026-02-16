@@ -82,7 +82,7 @@ namespace detail {
 //
 // Each modification tracks a bitmap of pending shard identities.
 // When a shard is cleaned, its bit is cleared. When all bits are 0,
-// all shards have seen this modification and it can be removed.
+// all shards have seen this modification and it can be erased.
 //
 // TotalSegments = number of shards, known at compile time (from ShardMap config).
 //
@@ -171,7 +171,7 @@ public:
 
     /// Called after each successful try_cleanup() of the cache.
     /// Clears the bit for shard_id in each modification's bitmap.
-    /// Removes modifications whose bitmap becomes 0 (all shards processed).
+    /// Erases modifications whose bitmap becomes 0 (all shards processed).
     ///
     /// Only modifications with modified_at <= cutoff are processed. The cutoff
     /// must be captured BEFORE the shard cleanup, so that modifications added
@@ -181,10 +181,10 @@ public:
     /// - Phase 1 (shared_lock): clear bits via atomic_ref, collect fully-drained indices.
     ///   Concurrent with forEachModificationWithBitmap — no conflict because
     ///   forEachModificationWithBitmap reads via atomic_ref too.
-    /// - Phase 2 (unique_lock): remove expired entries via swap-with-last.
+    /// - Phase 2 (unique_lock): erase expired entries via swap-with-last.
     ///   Only taken when there are actual removals.
-    void cleanup(TimePoint cutoff, uint8_t shard_id) {
-        std::vector<size_t> to_remove;
+    void drainShard(TimePoint cutoff, uint8_t shard_id) {
+        std::vector<size_t> to_erase;
         const BitmapType shard_bit = BitmapType{1} << shard_id;
 
         {
@@ -198,14 +198,14 @@ public:
                     & static_cast<BitmapType>(~shard_bit);
 
                 if (remaining == 0) {
-                    to_remove.push_back(i);
+                    to_erase.push_back(i);
                 }
             }
         }
 
-        if (!to_remove.empty()) {
+        if (!to_erase.empty()) {
             std::unique_lock lock(mutex_);
-            for (auto it = to_remove.rbegin(); it != to_remove.rend(); ++it) {
+            for (auto it = to_erase.rbegin(); it != to_erase.rend(); ++it) {
                 size_t idx = *it;
                 if (idx < modifications_.size()) {
                     if (idx != modifications_.size() - 1) {
@@ -217,8 +217,8 @@ public:
         }
     }
 
-    /// Remove all modifications with modified_at <= cutoff in one pass.
-    /// Used by fullCleanup() after processing all segments at once.
+    /// Erase all modifications with modified_at <= cutoff in one pass.
+    /// Used by purge() after processing all segments at once.
     void drain(TimePoint cutoff) {
         std::unique_lock lock(mutex_);
         std::erase_if(modifications_, [cutoff](const TrackedModification& t) {

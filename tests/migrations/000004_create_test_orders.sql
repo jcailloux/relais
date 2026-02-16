@@ -1,6 +1,6 @@
 -- Test table for relais comprehensive field type testing
 -- Contains scalar, nullable, enum, string, timestamp, and raw JSON fields
--- Composite fields (address, history, quantities, tags) are FlatBuffer-only
+-- Composite fields (address, history, quantities, tags) are binary-only (BEVE)
 
 CREATE TABLE IF NOT EXISTS relais_test_orders (
     id BIGSERIAL PRIMARY KEY,

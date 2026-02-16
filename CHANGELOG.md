@@ -1,5 +1,59 @@
 # Changelog
 
+## [0.3.0] - 2026-02-17
+
+### Added
+
+- `sweep()` on CachedRepo and ListCache — single-shard cleanup that waits for the lock
+- Symmetric sweep API on ListMixin:
+    - Unified: `trySweep()`, `sweep()`, `purge()`
+    - Entity only: `trySweepEntities()`, `sweepEntities()`, `purgeEntities()`
+    - List only: `trySweepLists()`, `sweepLists()`, `purgeLists()`
+- Compile-time test suites: `test_relais_base_compile`, `test_relais_repo_compile`
+- `findBinary(id)` on RedisRepo and CachedRepo — returns raw BEVE bytes directly from Redis without deserialization
+
+### Changed (Breaking)
+
+All public API names have been shortened and aligned with SQL/STL/cache conventions.
+
+**Class & file renames:**
+- `Repository` → `Repo`, `BaseRepository` → `BaseRepo`, `RedisRepository` → `RedisRepo`
+- `CachedRepository` → `CachedRepo`, `ListCacheRepository` → `ListCacheRepo`
+- `repository_config.h` → `repo_config.h`
+
+**CRUD methods:**
+- `findById` → `find`
+- `create` → `insert`
+- `updateBy` → `patch` (partial update)
+- `remove` → `erase`
+- `updateFromJson` → `updateJson`, `updateFromBinary` → `updateBinary`
+- `findByIdAsJson` → `findJson`
+
+**Serialization accessors (EntityWrapper, ListWrapper, ListQuery):**
+- `toJson()` → `json()`, `toBinary()` → `binary()`
+- `getPrimaryKey()` → `key()`
+
+**ListWrapper accessors:**
+- `firstItem` → `front`, `lastItem` → `back`
+- `totalCount` → `count`, `nextCursor` → `cursor`
+
+**Cache management:**
+- `invalidateL1` → `evict`, `invalidateRedis` → `evictRedis`
+- `triggerCleanup` → `trySweep`, `fullCleanup` → `purge`
+- `cacheSize` → `size`, `listCacheSize` → `listSize`
+
+**Context variants (ListMixin, InvalidationMixin):**
+- `removeWithContext` → `eraseWithContext`
+- `updateByWithContext` → `patchWithContext`
+
+### Removed
+
+- `PartialKeyValidator` class (obsolete)
+
+### Fixed
+
+- `findJson` on RedisRepo was reading binary data as a JSON string when Redis stores BEVE
+
 ## [0.2.0] - 2026-02-16
 
 ### Added

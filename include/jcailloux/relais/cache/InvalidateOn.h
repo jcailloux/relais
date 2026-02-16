@@ -19,7 +19,7 @@ using WrapperPtr = std::shared_ptr<const Entity>;
 /// Invalidation data for cross-repository notifications
 template<typename Entity>
 struct InvalidationData {
-    std::optional<WrapperPtr<Entity>> old_entity;  // Before mutation (null for create)
+    std::optional<WrapperPtr<Entity>> old_entity;  // Before mutation (null for insert)
     std::optional<WrapperPtr<Entity>> new_entity;  // After mutation (null for delete)
 
     static InvalidationData forCreate(WrapperPtr<Entity> entity) {
