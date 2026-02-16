@@ -59,7 +59,7 @@ tests/
 │   │   ├── TestArticleMapping.h     # + ListDescriptor
 │   │   ├── TestPurchaseMapping.h    # + ListDescriptor
 │   │   ├── TestOrderMapping.h
-│   │   └── TestEventWrapper.h       # Hand-written PartialKey wrapper (Key≠PK)
+│   │   └── TestEventWrapper.h       # Partition key wrapper (Key + partition hint)
 │   ├── test_helper.h        # DbProvider init, TransactionGuard, sync helpers
 │   ├── TestItem.h            # Pure data struct with @relais annotations
 │   ├── TestUser.h            # ...
@@ -68,7 +68,7 @@ tests/
 │   ├── TestOrder.h           # Complex struct (nested, enum, vectors, raw JSON)
 │   ├── TestEvent.h           # Pure data struct for partitioned table
 │   ├── TestEntities.h       # EntityWrapper<Struct, Mapping> type aliases
-│   └── TestRepositories.h   # Repository classes with 4+ cache configs
+│   └── TestRepositories.h   # Repo classes with 4+ cache configs
 ├── migrations/
 │   ├── 000001_create_test_items.sql
 │   ├── 000004_create_test_orders.sql
@@ -77,14 +77,14 @@ tests/
 │   ├── test_l1_config.cpp          # Exhaustive L1 config parameter tests (TTL, refresh, cleanup)
 │   └── test_l2_config.cpp          # Exhaustive L2 config parameter tests (TTL, refresh, strategy)
 ├── test_generated_wrapper.cpp      # Unit tests for struct + EntityWrapper + ListWrapper
-├── test_base_repository.cpp        # Tests for BaseRepository (no cache) + updateBy
-├── test_redis_repository.cpp       # Tests for RedisRepository (L2 cache)
-├── test_cached_repository.cpp      # Tests for CachedRepository (L1 cache)
+├── test_base_repository.cpp        # Tests for BaseRepo (no cache) + patch
+├── test_redis_repository.cpp       # Tests for RedisRepo (L2 cache)
+├── test_cached_repository.cpp      # Tests for CachedRepo (L1 cache)
 ├── test_full_cache.cpp             # Tests for L1+L2 (Both) cache hierarchy interaction
 ├── test_decl_list_cache.cpp        # Tests for ListMixin (L1 list cache)
 ├── test_decl_list_redis.cpp        # Tests for declarative list caching at L2 (Redis)
 ├── test_decl_list_full.cpp         # Tests for declarative list caching at L1+L2 (Both)
-├── test_partial_key.cpp            # Tests for PartialKey repos (composite PK, partitioned tables)
+├── test_partition_key.cpp          # Tests for partition key repos (composite PK, partitioned tables)
 ├── test_warmup.cpp                 # Tests for warmup() priming cache infrastructure
 ├── test_concurrency.cpp            # Concurrency stress tests across all cache levels
 ├── test_benchmark.cpp              # Performance benchmarks (latency, throughput)
@@ -110,7 +110,7 @@ ctest -L integration --output-on-failure
 
 ### Specific Test Case
 ```bash
-./test_relais_base "[BaseRepository] CRUD Operations"
+./test_relais_base "[BaseRepo] CRUD Operations"
 ```
 
 ### With Verbose Output
@@ -139,44 +139,44 @@ Each test section uses `TransactionGuard` which:
 
 This ensures complete isolation between tests without leaving data behind.
 
-## updateBy Tests
+## patch Tests
 
-`test_base_repository.cpp` includes tests for partial field updates via `updateBy`:
+`test_base_repository.cpp` includes tests for partial field updates via `patch`:
 
 - **Single field update**: Modifies only one column, verifies other columns are unchanged
 - **Multiple field update**: Modifies several columns in a single call
-- **Re-fetch verification**: Confirms `updateBy` returns the complete re-fetched entity from the database
+- **Re-fetch verification**: Confirms `patch` returns the complete re-fetched entity from the database
 
-These tests use `UncachedTestUserRepository` (a generated entity repository) since `updateBy` requires a generated entity with `TraitsType` containing `Field` enum and `FieldInfo` specializations. Hand-written entities (e.g., `TestItemEntity`) do not support `updateBy`.
+These tests use `UncachedTestUserRepo` (a generated entity repository) since `patch` requires a generated entity with `TraitsType` containing `Field` enum and `FieldInfo` specializations. Hand-written entities (e.g., `TestItemEntity`) do not support `patch`.
 
-### PartialKey updateBy
+### Partition key patch
 
-For PartialKey repos, `updateBy` uses a **criteria-based** approach building a dynamic `UPDATE ... SET col=$N WHERE pk=$M RETURNING *` instead of the standard full-entity update path.
+For partition key repos, `patch` uses a **criteria-based** approach building a dynamic `UPDATE ... SET col=$N WHERE pk=$M RETURNING *` instead of the standard full-entity update path.
 
-See `test_partial_key.cpp` sections 8a-8d for coverage at all cache levels + cross-invalidation.
+See `test_partition_key.cpp` sections 7a-7d for coverage at all cache levels + cross-invalidation.
 
 ## Test Tags
 
-### `test_relais_redis` (RedisRepository — L2 cache)
+### `test_relais_redis` (RedisRepo — L2 cache)
 
-| Tag | Description |
-|-----|-------------|
-| `[item]` | Entity CRUD with Redis caching |
-| `[flatbuffer]` | Binary (BEVE) serialization in Redis |
-| `[updateBy]` | Partial field updates with Redis invalidation |
-| `[json]` | `findByIdAsJson` raw JSON retrieval |
-| `[invalidate]` | Explicit `invalidateRedis` operations |
-| `[readonly]` | Read-only repository caching |
-| `[cross-inv]` | `Invalidate<>` entity→entity cross-invalidation |
-| `[custom-inv]` | `InvalidateVia<>` with custom resolver |
-| `[readonly-inv]` | Cross-invalidation targeting read-only caches |
-| `[list]` | List caching (JSON) |
-| `[fb-list]` | List caching (binary) |
-| `[list-inv]` | `InvalidateList<>` entity→list cross-invalidation |
-| `[list-custom]` | List cross-invalidation with custom resolver |
-| `[list-tracked]` | Tracked pagination with group invalidation |
-| `[list-selective]` | SortBounds selective page invalidation (Lua) |
-| `[list-resolver]` | `InvalidateListVia<>` with typed `GroupKey` resolver |
+| Tag                  | Description |
+|----------------------|-------------|
+| `[item]`             | Entity CRUD with Redis caching |
+| `[binary]`           | Binary (BEVE) serialization in Redis |
+| `[patch]`         | Partial field updates with Redis invalidation |
+| `[json]`             | `findJson` raw JSON retrieval |
+| `[invalidate]`       | Explicit `evictRedis` operations |
+| `[readonly]`         | Read-only repository caching |
+| `[cross-inv]`        | `Invalidate<>` entity→entity cross-invalidation |
+| `[custom-inv]`       | `InvalidateVia<>` with custom resolver |
+| `[readonly-inv]`     | Cross-invalidation targeting read-only caches |
+| `[list]`             | List caching (JSON) |
+| `[fb-list]`          | List caching (binary) |
+| `[list-inv]`         | `InvalidateList<>` entity→list cross-invalidation |
+| `[list-custom]`      | List cross-invalidation with custom resolver |
+| `[list-tracked]`     | Tracked pagination with group invalidation |
+| `[list-selective]`   | SortBounds selective page invalidation (Lua) |
+| `[list-resolver]`    | `InvalidateListVia<>` with typed `GroupKey` resolver |
 | `[list-granularity]` | Three granularities: per-page, per-group, full pattern |
 
 ### `test_relais_decl_list_cache` (ListMixin — L1 list cache)
@@ -188,16 +188,15 @@ See `test_partial_key.cpp` sections 8a-8d for coverage at all cache levels + cro
 | `[sortbounds]` | SortBounds-based selective invalidation at L1 |
 | `[tracker-cleanup]` | `ModificationTracker` cleanup cycles |
 
-### `test_relais_partial_key` (PartialKey — composite PK, partitioned tables)
+### `test_relais_partition_key` (Partition key — composite PK, partitioned tables)
 
 | Tag | Description |
 |-----|-------------|
-| `[partial-key]` | All PartialKey tests |
-| `[cached]` | L1 cache behavior with PartialKey |
-| `[redis]` | L2 cache behavior with PartialKey |
+| `[partition-key]` | All partition key tests |
+| `[cached]` | L1 cache behavior with partition key |
+| `[redis]` | L2 cache behavior with partition key |
 | `[cross-inv]` | Cross-invalidation (Event as source/target) |
-| `[validator]` | PartialKeyValidator runtime checks |
-| `[updateBy]` | Criteria-based partial updates at all cache levels |
+| `[patch]` | Criteria-based partial updates at all cache levels |
 
 ### `test_relais_full_cache` (L1+L2 cache hierarchy)
 
@@ -219,18 +218,18 @@ Tests for `warmup()` priming cache infrastructure including L1 entity cache and 
 
 | Tag | Description |
 |-----|-------------|
-| `[read]` | Concurrent `findById` (L1, L2, L1+L2) |
+| `[read]` | Concurrent `find` (L1, L2, L1+L2) |
 | `[read-write]` | Concurrent read + write on same entity |
-| `[create-remove]` | Concurrent create + remove |
+| `[insert-erase]` | Concurrent insert + erase |
 | `[cross-inv]` | Concurrent cross-invalidation |
 | `[list]` | Concurrent list queries + entity creates |
 | `[warmup]` | Concurrent warmup + operations |
 | `[storm]` | Mixed operations storm (all operations interleaved) |
-| `[updateBy]` | Concurrent `updateBy` on same entity |
+| `[patch]` | Concurrent `patch` on same entity |
 | `[cleanup]` | Concurrent entity cache cleanup + reads/writes |
-| `[list-cleanup]` | Concurrent list CRUD + unified `triggerCleanup`/`fullCleanup` |
-| `[tracker-drain]` | `fullCleanup()` drains tracker to zero after concurrent storm |
-| `[tracker-progressive]` | Progressive tracker reduction via `triggerCleanup()` |
+| `[list-cleanup]` | Concurrent list CRUD + unified `trySweep`/`purge` |
+| `[tracker-drain]` | `purge()` drains tracker to zero after concurrent storm |
+| `[tracker-progressive]` | Progressive tracker reduction via `trySweep()` |
 
 ### `config/test_l1_config` and `config/test_l2_config` (Configuration)
 

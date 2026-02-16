@@ -7,11 +7,11 @@ Technical details about the relais test infrastructure.
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │                         Test Files (.cpp)                           │
-│  test_base_repository.cpp      BaseRepository (no cache) + updateBy │
-│  test_redis_repository.cpp     RedisRepository (L2 cache)           │
+│  test_base_repository.cpp      BaseRepo (no cache) + patch │
+│  test_redis_repository.cpp     RedisRepo (L2 cache)           │
 │  test_decl_list_cache.cpp      ListMixin (L1 lists)                  │
-│  test_cached_repository.cpp    CachedRepository (L1 cache)          │
-│  test_partial_key.cpp          PartialKey (composite PK, partitions) │
+│  test_cached_repository.cpp    CachedRepo (L1 cache)          │
+│  test_partition_key.cpp         PartitionKey (composite PK, partitions) │
 │  test_generated_wrapper.cpp    Struct + EntityWrapper + ListWrapper  │
 └─────────────────────────────────────────────────────────────────────┘
                               │
@@ -20,8 +20,8 @@ Technical details about the relais test infrastructure.
 │                       TestRepositories.h                            │
 │  Configs: Uncached, L1Only, L2Only, Both, ShortTTL, WriteThrough…  │
 │  Entity repos: L2TestItemRepo, L1TestUserRepo, L2TestPurchaseRepo… │
-│  List repos: TestArticleListRepository, TestPurchaseListRepository  │
-│  (inherit from relais::Repository<...> + ListCacheRepository)    │
+│  List repos: TestArticleListRepo, TestPurchaseListRepo  │
+│  (inherit from relais::Repo<...> + ListCacheRepo)    │
 └─────────────────────────────────────────────────────────────────────┘
                               │
                               │
@@ -31,7 +31,7 @@ Technical details about the relais test infrastructure.
 │    TestItem.h (pure struct)     TestUser.h     TestArticle.h        │
 │    TestPurchase.h     TestEvent.h (composite PK: id+region)         │
 │    generated/*Wrapper.h  (Mapping + EntityWrapper aliases)          │
-│    - fromRow / toInsertParams / getPrimaryKey                       │
+│    - fromRow / toInsertParams / key                       │
 └─────────────────────────────────────────────────────────────────────┘
                               │
                               ▼
@@ -80,7 +80,7 @@ All database modifications within a test are automatically rolled back.
 
 Runs a coroutine synchronously:
 ```cpp
-auto result = sync(Repository::findById(123));
+auto result = sync(Repo::find(123));
 // Blocks until the coroutine completes
 ```
 
@@ -110,16 +110,16 @@ using TestItemEntity = EntityWrapper<TestItem, generated::TestItemMapping>;
 
 `EntityWrapper` inherits from the struct and adds:
 - `fromRow(PgResult::Row)` / `toInsertParams(Entity)` — delegated to Mapping
-- `toBinary()` / `toJson()` — thread-safe lazy serialization via Glaze
-- `getPrimaryKey()` — delegated to Mapping
+- `binary()` / `json()` — thread-safe lazy serialization via Glaze
+- `key()` — delegated to Mapping
 - `Field` enum, `TraitsType` — from Mapping
 
 Entities are **immutable** (stored as `shared_ptr<const Entity>`). To update:
 ```cpp
-auto original = sync(Repository::findById(id));
+auto original = sync(Repo::find(id));
 TestItemEntity updated = *original;  // Copy
 updated.name = "New Name";
-sync(Repository::update(id, makeEntity(updated)));
+sync(Repo::update(id, makeEntity(updated)));
 ```
 
 ### TestRepositories.h
@@ -127,17 +127,17 @@ sync(Repository::update(id, makeEntity(updated)));
 Four repository classes with different cache configurations:
 
 ```cpp
-// No caching - tests BaseRepository
-class UncachedTestItemRepository : public Repository<..., config::Uncached> {};
+// No caching - tests BaseRepo
+class UncachedTestItemRepo : public Repo<..., config::Uncached> {};
 
-// L1 only - tests CachedRepository without Redis
-class L1TestItemRepository : public Repository<..., config::L1Only> {};
+// L1 only - tests CachedRepo without Redis
+class L1TestItemRepo : public Repo<..., config::L1Only> {};
 
-// L2 only - tests RedisRepository
-class L2TestItemRepository : public Repository<..., config::L2Only> {};
+// L2 only - tests RedisRepo
+class L2TestItemRepo : public Repo<..., config::L2Only> {};
 
-// Full hierarchy - tests CachedRepository with Redis
-class FullCacheTestItemRepository : public Repository<..., config::Both> {};
+// Full hierarchy - tests CachedRepo with Redis
+class FullCacheTestItemRepo : public Repo<..., config::Both> {};
 ```
 
 All entity types are `EntityWrapper<Struct, Mapping>` aliases defined in `TestEntities.h`. List types use `ListWrapper<EntityType>`.
@@ -159,14 +159,14 @@ CREATE TABLE relais_test_items (
 
 ### Basic CRUD Test
 ```cpp
-TEST_CASE("[Repository] CRUD", "[integration][db]") {
+TEST_CASE("[Repo] CRUD", "[integration][db]") {
     initTest();
 
-    SECTION("findById returns entity") {
+    SECTION("find returns entity") {
         TransactionGuard tx;
 
         auto id = insertTestItem("Test", 42);
-        auto result = sync(Repository::findById(id));
+        auto result = sync(Repo::find(id));
 
         REQUIRE(result != nullptr);
         REQUIRE(result->name == "Test");
@@ -182,13 +182,13 @@ SECTION("L1 cache returns stale data") {
     auto id = insertTestItem("Original", 1);
 
     // Populate cache
-    sync(L1Repository::findById(id));
+    sync(L1Repo::find(id));
 
     // Modify directly in DB (bypass cache)
     updateTestItem(id, "Modified", 2);
 
     // Should still return cached value
-    auto cached = sync(L1Repository::findById(id));
+    auto cached = sync(L1Repo::find(id));
     REQUIRE(cached->name == "Original");  // Stale!
 }
 ```
@@ -199,12 +199,12 @@ SECTION("invalidate clears cache") {
     TransactionGuard tx;
 
     auto id = insertTestItem("Test", 1);
-    sync(Repository::findById(id));  // Populate cache
+    sync(Repo::find(id));  // Populate cache
 
     updateTestItem(id, "Updated", 2);
-    sync(Repository::invalidate(id));  // Clear cache
+    sync(Repo::invalidate(id));  // Clear cache
 
-    auto fresh = sync(Repository::findById(id));
+    auto fresh = sync(Repo::find(id));
     REQUIRE(fresh->name == "Updated");  // Fresh from DB
 }
 ```
@@ -223,40 +223,40 @@ initTest();
 ### Check Cache State
 ```cpp
 // L1 cache size
-REQUIRE(L1Repository::cacheSize() >= 1);
+REQUIRE(L1Repo::size() >= 1);
 
 // Clear L1 cache
-L1Repository::clearCache();
+L1Repo::clearCache();
 ```
 
 ### Test Single Case
 ```bash
-./test_relais_base "[BaseRepository] CRUD Operations" -s
+./test_relais_base "[BaseRepo] CRUD Operations" -s
 ```
 
-## Redis Repository Tests (`test_redis_repository.cpp`)
+## Redis Repo Tests (`test_redis_repository.cpp`)
 
 Comprehensive integration tests for the L2 (Redis) cache layer, organized in 17 logical sections:
 
-| Section | Tag | Content |
-|---------|-----|---------|
-| 1 | `[item]` | `findById` — cache hit, miss, multi-entity |
-| 2 | `[item]` | `create` — insert + populate Redis |
-| 3 | `[item]` | `update` — invalidate Redis (lazy reload) |
-| 4 | `[item]` | `remove` — invalidate Redis |
-| 5 | `[flatbuffer]` | Binary (BEVE) serialization in Redis |
-| 6 | `[updateBy]` | Partial field updates with Redis invalidation |
-| 7 | `[json]` | `findByIdAsJson` raw JSON retrieval |
-| 8 | `[invalidate]` | Explicit `invalidateRedis` + isolation |
-| 9 | `[readonly]` | Read-only repository caching |
-| 10 | `[cross-inv]` | `Invalidate<>` entity→entity (create, update, delete, FK change) |
-| 11 | `[custom-inv]` | `InvalidateVia<>` with custom resolver |
-| 12 | `[readonly-inv]` | Cross-invalidation targeting read-only caches |
-| 13 | `[list]` + `[fb-list]` | List caching — JSON and BEVE binary |
-| 14 | `[list-inv]` + `[list-custom]` | `InvalidateList<>` and list custom resolver |
-| 15 | `[list-tracked]` | Tracked pagination + group invalidation + tracking data |
+| Section | Tag                                    | Content |
+|---------|----------------------------------------|---------|
+| 1 | `[item]`                               | `find` — cache hit, miss, multi-entity |
+| 2 | `[item]`                               | `insert` — insert + populate Redis |
+| 3 | `[item]`                               | `update` — invalidate Redis (lazy reload) |
+| 4 | `[item]`                               | `erase` — invalidate Redis |
+| 5 | `[binary]`                             | Binary (BEVE) serialization in Redis |
+| 6 | `[patch]`                           | Partial field updates with Redis invalidation |
+| 7 | `[json]`                               | `findJson` raw JSON retrieval |
+| 8 | `[invalidate]`                         | Explicit `evictRedis` + isolation |
+| 9 | `[readonly]`                           | Read-only repository caching |
+| 10 | `[cross-inv]`                          | `Invalidate<>` entity→entity (insert, update, delete, FK change) |
+| 11 | `[custom-inv]`                         | `InvalidateVia<>` with custom resolver |
+| 12 | `[readonly-inv]`                       | Cross-invalidation targeting read-only caches |
+| 13 | `[list]` + `[fb-list]`                 | List caching — JSON and BEVE binary |
+| 14 | `[list-inv]` + `[list-custom]`         | `InvalidateList<>` and list custom resolver |
+| 15 | `[list-tracked]`                       | Tracked pagination + group invalidation + tracking data |
 | 16 | `[list-selective]` + `[list-resolver]` | SortBounds Lua selective invalidation + `InvalidateListVia` with GroupKey |
-| 17 | `[list-granularity]` | Three granularities: per-page, per-group, full pattern |
+| 17 | `[list-granularity]`                   | Three granularities: per-page, per-group, full pattern |
 
 ## ListDescriptor Tests (`test_decl_list_cache.cpp`)
 
@@ -268,7 +268,7 @@ Integration tests for the declarative L1 list cache system:
 | 2 | `[itemview]` | Article `ItemView` accessors on cached results |
 | 3 | `[query]` | Purchase list — user_id/status filters |
 | 4 | `[itemview]` | Purchase `ItemView` accessors |
-| 5 | `[sortbounds]` | SortBounds invalidation precision (create, update, delete, filter mismatch) |
+| 5 | `[sortbounds]` | SortBounds invalidation precision (insert, update, delete, filter mismatch) |
 | 6 | `[tracker-cleanup]` | `ModificationTracker` cleanup cycles |
 
 ## Cross-Invalidation Patterns
@@ -350,8 +350,8 @@ Defined in the concrete list repository. Translates the typed `GroupKey` + optio
 ### `invalidateAllListGroups()`
 
 Defined in the CRTP hierarchy:
-- **BaseRepository**: no-op (no cache to invalidate)
-- **RedisRepository**: `SCAN` with pattern `name() + ":list:*"` and `DEL` each match
+- **BaseRepo**: no-op (no cache to invalidate)
+- **RedisRepo**: `SCAN` with pattern `name() + ":list:*"` and `DEL` each match
 
 Called when the resolver returns `std::nullopt` (full pattern invalidation).
 
@@ -359,68 +359,66 @@ Called when the resolver returns `std::nullopt` (full pattern invalidation).
 
 The `ListInvalidationTarget<GroupKey>` API is identical regardless of cache level. The resolver always works with typed values — the cache-level-specific logic lives in `invalidateByTarget` and `invalidateAllListGroups` implementations, not in the resolver.
 
-## PartialKey Repositories (`test_partial_key.cpp`)
+## Partition Key Repositories (`test_partition_key.cpp`)
 
-Tests for repositories where `Key` differs from `Model::PrimaryKeyType` — typically partitioned PostgreSQL tables with a composite PK (e.g., `(id, region)`) but queried by a single unique key (`id`).
+Tests for repositories with partitioned PostgreSQL tables where the composite PK includes a partition column (e.g., `(id, region)`) but the repository key is only the logical identifier (`id`).
 
 ### Test Entity: `TestEvent`
 
 - **Table**: `relais_test_events` — range-partitioned by `region` (eu, us, ap)
 - **Composite PK**: `(id BIGINT, region VARCHAR)` — `id` from shared sequence, `region` as partition key
-- **Repository Key**: `int64_t` (partial — only `id`)
-- **Config requires**: `key_is_unique = true` + `makeKeyCriteria<Model>(id)`
+- **Repo Key**: `int64_t` (only `id` — partition key is a separate hint)
 
 ### Tested Configurations
 
 | Repository | Config | Cache Level |
 |-----------|--------|-------------|
-| `UncachedTestEventRepository` | `EventPartialKeyUncached` | None |
-| `L1TestEventRepository` | `EventPartialKeyL1` | L1 |
-| `L2TestEventRepository` | `EventPartialKeyL2` | L2 |
-| `L1L2TestEventRepository` | `EventPartialKeyBoth` | L1+L2 |
+| `UncachedTestEventRepo` | `Uncached` | None |
+| `L1TestEventRepo` | `Local` | L1 |
+| `L2TestEventRepo` | `Redis` | L2 |
+| `L1L2TestEventRepo` | `Both` | L1+L2 |
 
-### `updateBy` — Criteria-Based for PartialKey
+### `patch` — Criteria-Based
 
-For PartialKey entities, `updateBy` builds a dynamic SQL query:
+`patch` builds a dynamic SQL query:
 ```sql
 UPDATE table SET "col1"=$1, "col2"=$2 WHERE "id"=$3 RETURNING *
 ```
 
 Helpers in `FieldUpdate.h`: `fieldColumnName<Traits>(update)` extracts the quoted column name, `fieldValue<Traits>(update)` extracts the properly-typed value.
 
-### `remove` — Opportunistic Full PK via Cache Hint
+### `erase` — Opportunistic Full PK via Cache Hint
 
 For partition pruning, `DELETE WHERE id=$1 AND region=$2` scans 1 partition vs `DELETE WHERE id=$1` scans N. The optimization uses cached entities as hints:
 
 ```
-CachedRepository::remove(id)
+CachedRepo::erase(id)
   → hint = getFromCache(id)        // Free L1 check
-  → RedisRepository::removeImpl(id, hint)
-    → if (!hint && PartialKey) {
+  → RedisRepo::eraseImpl(id, hint)
+    → if (!hint && HasPartitionKey) {
         hint = getFromRedis(id)    // ~0.1ms L2 check
       }
-    → BaseRepository::removeImpl(id, hint)
+    → BaseRepo::eraseImpl(id, hint)
       → if (hint) deleteByPrimaryKey(fullPK)  // Pruned: 1 partition
-      → else      deleteBy(criteria)           // Scan: N partitions
+      → else      deleteByKey(id)              // Scan: N partitions
 ```
 
 **Performance rule**: Never add a DB round-trip just for partition pruning. Only use full PK when the entity is already available from cache (free or near-free).
 
 ### Test Coverage
 
-| Section | Content |
-|---------|---------|
-| 1 | CRUD: findById, create, update, remove (Uncached) |
-| 2 | L1 caching: cache hit, staleness, invalidation |
-| 3 | L2 caching: Redis hit, staleness, invalidation |
-| 4 | Cross-invalidation: Event as source (→ User L1) |
-| 5 | Cross-invalidation: Event as target (Purchase → Event via resolver) |
-| 6 | PartialKeyValidator runtime checks |
-| 7 | Serialization: JSON + BEVE round-trip |
-| 8a | updateBy Uncached: single/multi field, partition preservation, re-fetch |
-| 8b | updateBy L1: cache invalidation + re-fetch |
-| 8c | updateBy L2: Redis invalidation + re-fetch |
-| 8d | updateBy cross-invalidation: Event updateBy → User L1 |
-| 9a | remove L1 hint: cache hit vs miss paths |
-| 9b | remove L2 hint: Redis hit vs miss paths |
-| 9c | remove L1+L2 chain: L1 hit, L1 miss/L2 hit, both miss |
+| Section | Content                                                                 |
+|---------|-------------------------------------------------------------------------|
+| 1 | CRUD: find, insert, update, erase (Uncached)                           |
+| 2 | L1 caching: cache hit, staleness, invalidation                          |
+| 3 | L2 caching: Redis hit, staleness, invalidation                          |
+| 4 | Cross-invalidation: Event as source (→ User L1)                         |
+| 5 | Cross-invalidation: Event as target (Purchase → Event via resolver)     |
+| 6 | Serialization: JSON + BEVE round-trip                                   |
+| 7a | patch Uncached: single/multi field, partition preservation, re-fetch |
+| 7b | patch L1: cache invalidation + re-fetch                              |
+| 7c | patch L2: Redis invalidation + re-fetch                              |
+| 7d | patch cross-invalidation: Event patch → User L1                   |
+| 8a | erase L1 hint: cache hit vs miss paths                                 |
+| 8b | erase L2 hint: Redis hit vs miss paths                                 |
+| 8c | erase L1+L2 chain: L1 hit, L1 miss/L2 hit, both miss                   |

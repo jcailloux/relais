@@ -15,8 +15,8 @@ concept HasListMixin = requires { typename T::ListDescriptorType; };
 /**
  * Optional mixin layer for cross-repository cache invalidation.
  *
- * Activated when the Repository has variadic Invalidations... (non-empty).
- * Sits at the top of the mixin chain and intercepts create/update/remove
+ * Activated when the Repo has variadic Invalidations... (non-empty).
+ * Sits at the top of the mixin chain and intercepts insert/update/erase
  * to propagate invalidations to dependent caches.
  *
  * Chain: InvalidationMixin -> [ListMixin] -> CachedRepo -> [RedisRepo] -> BaseRepo
@@ -36,16 +36,16 @@ public:
     using typename Base::WrapperType;
     using typename Base::WrapperPtrType;
     using Base::name;
-    using Base::findById;
+    using Base::find;
 
     // Expose Invalidates type for external detection
     using Invalidates = InvList;
 
-    /// Create entity and propagate cross-invalidation to dependent caches.
-    static io::Task<WrapperPtrType> create(WrapperPtrType wrapper)
+    /// insert entity and propagate cross-invalidation to dependent caches.
+    static io::Task<WrapperPtrType> insert(WrapperPtrType wrapper)
         requires MutableEntity<Entity> && (!Base::config.read_only)
     {
-        auto result = co_await Base::create(std::move(wrapper));
+        auto result = co_await Base::insert(std::move(wrapper));
         if (result) {
             co_await cache::propagateCreate<Entity, InvList>(result);
         }
@@ -58,7 +58,7 @@ public:
     static io::Task<bool> update(const Key& id, WrapperPtrType wrapper)
         requires MutableEntity<Entity> && (!Base::config.read_only)
     {
-        auto old = co_await Base::findById(id);
+        auto old = co_await Base::find(id);
         auto new_entity = wrapper;
 
         bool ok;
@@ -75,18 +75,18 @@ public:
         co_return ok;
     }
 
-    /// Remove entity and propagate cross-invalidation with deleted data.
+    /// Erase entity and propagate cross-invalidation with deleted data.
     /// When Base is ListMixin, reuses the pre-fetched entity via WithContext.
-    static io::Task<std::optional<size_t>> remove(const Key& id)
+    static io::Task<std::optional<size_t>> erase(const Key& id)
         requires (!Base::config.read_only)
     {
-        auto entity = co_await Base::findById(id);
+        auto entity = co_await Base::find(id);
 
         std::optional<size_t> result;
         if constexpr (detail::HasListMixin<Base>) {
-            result = co_await Base::removeWithContext(id, entity);
+            result = co_await Base::eraseWithContext(id, entity);
         } else {
-            result = co_await Base::remove(id);
+            result = co_await Base::erase(id);
         }
 
         if (result.has_value() && entity) {
@@ -98,17 +98,17 @@ public:
     /// Partial update with cross-invalidation.
     /// When Base is ListMixin, reuses the pre-fetched old entity via WithContext.
     template<typename... Updates>
-    static io::Task<WrapperPtrType> updateBy(const Key& id, Updates&&... updates)
+    static io::Task<WrapperPtrType> patch(const Key& id, Updates&&... updates)
         requires HasFieldUpdate<Entity> && (!Base::config.read_only)
     {
-        auto old = co_await Base::findById(id);
+        auto old = co_await Base::find(id);
 
         WrapperPtrType result;
         if constexpr (detail::HasListMixin<Base>) {
-            result = co_await Base::updateByWithContext(
+            result = co_await Base::patchWithContext(
                 id, old, std::forward<Updates>(updates)...);
         } else {
-            result = co_await Base::updateBy(id, std::forward<Updates>(updates)...);
+            result = co_await Base::patch(id, std::forward<Updates>(updates)...);
         }
 
         if (result) {
@@ -120,7 +120,7 @@ public:
 
     /// Invalidate all caches (L1 + L2) and propagate cross-invalidation.
     static io::Task<void> invalidate(const Key& id) {
-        auto entity = co_await Base::findById(id);
+        auto entity = co_await Base::find(id);
         if (entity) {
             co_await cache::propagateDelete<Entity, InvList>(std::move(entity));
         }

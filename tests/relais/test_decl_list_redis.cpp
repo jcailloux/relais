@@ -30,8 +30,8 @@ namespace decl = jcailloux::relais::cache::list::decl;
 
 namespace relais_test {
 
-using L2DeclArticleListRepo = Repository<TestArticleWrapper, "test:article:list:l2:decl", cfg::Redis>;
-using L2DeclPurchaseListRepo = Repository<TestPurchaseWrapper, "test:purchase:list:l2:decl", cfg::Redis>;
+using L2DeclArticleListRepo = Repo<TestArticleWrapper, "test:article:list:l2:decl", cfg::Redis>;
+using L2DeclPurchaseListRepo = Repo<TestPurchaseWrapper, "test:purchase:list:l2:decl", cfg::Redis>;
 
 // Type aliases for L2 list queries
 using L2ArticleListQuery = L2DeclArticleListRepo::ListQuery;

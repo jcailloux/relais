@@ -1,9 +1,9 @@
 /**
  * test_base_repository_compile.cpp
  *
- * Compile-time and structural tests for BaseRepository.
+ * Compile-time and structural tests for BaseRepo.
  * Verifies that:
- *   - BaseRepository instantiates with all entity types
+ *   - BaseRepo instantiates with all entity types
  *   - Concepts (ReadableEntity, MutableEntity, HasFieldUpdate) are satisfied
  *   - SQL strings are correct
  *   - FieldUpdate utilities (set, fieldColumnName, fieldValue) work
@@ -15,7 +15,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
-#include "jcailloux/relais/repository/BaseRepository.h"
+#include "jcailloux/relais/repository/BaseRepo.h"
 #include "fixtures/generated/TestItemWrapper.h"
 #include "fixtures/generated/TestUserWrapper.h"
 #include "fixtures/generated/TestOrderWrapper.h"
@@ -24,23 +24,23 @@
 using namespace jcailloux::relais;
 
 // =========================================================================
-// Instantiate BaseRepository with each entity type to verify compilation.
-// These are direct BaseRepository instantiations (not Repository<>) to avoid
+// Instantiate BaseRepo with each entity type to verify compilation.
+// These are direct BaseRepo instantiations (not Repo<>) to avoid
 // depending on the full mixin chain (RedisRepo, CachedRepo, etc.) which
 // is not yet refactored.
 // =========================================================================
 
-using ItemRepo = BaseRepository<
+using ItemRepo = BaseRepo<
     entity::generated::TestItemWrapper, "test:item", config::Uncached, int64_t>;
-using UserRepo = BaseRepository<
+using UserRepo = BaseRepo<
     entity::generated::TestUserWrapper, "test:user", config::Uncached, int64_t>;
-using OrderRepo = BaseRepository<
+using OrderRepo = BaseRepo<
     entity::generated::TestOrderWrapper, "test:order", config::Uncached, int64_t>;
-using EventRepo = BaseRepository<
+using EventRepo = BaseRepo<
     entity::generated::TestEventWrapper, "test:event", config::Uncached, int64_t>;
 
 // Read-only repo
-using ReadOnlyItemRepo = BaseRepository<
+using ReadOnlyItemRepo = BaseRepo<
     entity::generated::TestItemWrapper, "test:item:ro",
     config::Uncached.with_read_only(), int64_t>;
 
@@ -48,7 +48,7 @@ using ReadOnlyItemRepo = BaseRepository<
 // Type trait tests
 // =========================================================================
 
-TEST_CASE("BaseRepository type traits", "[base_repo]") {
+TEST_CASE("BaseRepo type traits", "[base_repo]") {
     SECTION("EntityType is correct") {
         STATIC_REQUIRE(std::is_same_v<
             ItemRepo::EntityType, entity::generated::TestItemWrapper>);
@@ -90,7 +90,7 @@ TEST_CASE("BaseRepository type traits", "[base_repo]") {
 // Concept tests
 // =========================================================================
 
-TEST_CASE("BaseRepository concepts", "[base_repo]") {
+TEST_CASE("BaseRepo concepts", "[base_repo]") {
     SECTION("ReadableEntity") {
         STATIC_REQUIRE(ReadableEntity<entity::generated::TestItemWrapper>);
         STATIC_REQUIRE(ReadableEntity<entity::generated::TestUserWrapper>);
@@ -196,7 +196,7 @@ TEST_CASE("SQL strings for complex entity", "[base_repo][sql]") {
     }
 }
 
-TEST_CASE("SQL strings for partition key entity", "[base_repo][sql][partial_key]") {
+TEST_CASE("SQL strings for partition key entity", "[base_repo][sql][partition_key]") {
     using EventMapping = entity::generated::TestEventMapping;
 
     SECTION("delete_by_pk uses partial key only") {
@@ -222,10 +222,9 @@ TEST_CASE("SQL strings for partition key entity", "[base_repo][sql][partial_key]
         REQUIRE(params.params.size() == 2);
     }
 
-    SECTION("non-partitioned entity has no delete_by_full_pk") {
-        // Structural check: TestItemMapping::SQL does not have delete_by_full_pk
-        STATIC_REQUIRE_FALSE(requires {
-            entity::generated::TestItemMapping::SQL::delete_by_full_pk;
+    SECTION("non-partitioned entity has delete_by_pk") {
+        STATIC_REQUIRE(requires {
+            entity::generated::TestItemMapping::SQL::delete_by_pk;
         });
     }
 }
@@ -273,12 +272,12 @@ TEST_CASE("FieldUpdate utilities", "[base_repo][field_update]") {
         REQUIRE(val == "hello");
     }
 
-    SECTION("fieldValue for timestamp field returns string") {
-        auto update = wrapper::set<Field::created_at>(
-            std::string("2024-01-01 00:00:00"));
+    SECTION("fieldValue for string field returns string") {
+        auto update = wrapper::set<Field::description>(
+            std::string("some description"));
         auto val = wrapper::fieldValue<Traits>(update);
         STATIC_REQUIRE(std::is_same_v<decltype(val), std::string>);
-        REQUIRE(val == "2024-01-01 00:00:00");
+        REQUIRE(val == "some description");
     }
 
     SECTION("fieldValue for boolean field") {
@@ -363,16 +362,19 @@ TEST_CASE("PgParams construction for CRUD operations", "[base_repo][params]") {
         REQUIRE(params.params[1].isNull());
     }
 
-    SECTION("toInsertParams produces correct count") {
+    SECTION("toInsertParams excludes db_managed fields") {
         entity::generated::TestItemWrapper item;
+        item.id = 999;
         item.name = "test";
         item.value = 42;
         item.description = "desc";
         item.is_active = true;
-        item.created_at = "2024-01-01";
+        item.created_at = "2024-01-01 00:00:00";
         auto params = entity::generated::TestItemWrapper::toInsertParams(item);
-        // 5 fields: name, value, description, is_active, created_at (no id)
-        REQUIRE(params.count() == 5);
+        // db_managed fields (id, created_at) are set on the struct but must
+        // NOT appear in insert params — the DB manages them.
+        // Only user-supplied fields: name, value, description, is_active
+        REQUIRE(params.count() == 4);
     }
 
     SECTION("update params construction: PK + insert params") {
@@ -382,7 +384,6 @@ TEST_CASE("PgParams construction for CRUD operations", "[base_repo][params]") {
         item.value = 42;
         item.description = "desc";
         item.is_active = true;
-        item.created_at = "2024-01-01";
 
         auto insertParams = entity::generated::TestItemWrapper::toInsertParams(item);
         jcailloux::relais::io::PgParams updateParams;
@@ -394,8 +395,8 @@ TEST_CASE("PgParams construction for CRUD operations", "[base_repo][params]") {
         for (auto& p : insertParams.params)
             updateParams.params.push_back(std::move(p));
 
-        // 6 params: id + 5 fields
-        REQUIRE(updateParams.count() == 6);
+        // 5 params: id + 4 fields
+        REQUIRE(updateParams.count() == 5);
         REQUIRE(!updateParams.params[0].isNull());
     }
 }

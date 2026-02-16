@@ -1,8 +1,8 @@
 /**
  * test_cached_repository.cpp
  *
- * Tests for CachedRepository (L1 - RAM caching on top of database).
- * Uses L1 configurations that resolve to CachedRepository via Repository<>.
+ * Tests for CachedRepo (L1 - RAM caching on top of database).
+ * Uses L1 configurations that resolve to CachedRepo via Repo<>.
  *
  * Progressive complexity:
  *   1. TestItem    — basic CRUD with L1 cache (staleness, populate, invalidate)
@@ -12,16 +12,16 @@
  *   5. List-inv    — InvalidateList<> entity → ListDescriptor bridge at L1
  *   6. ListVia     — InvalidateListVia<> with GroupKey (3 granularities)
  *   7. Binary      — binary entity CRUD with L1 caching
- *   8. updateBy    — partial field updates with L1 invalidation
- *   9. JSON        — findByIdAsJson with L1 caching
+ *   8. patch    — partial field updates with L1 invalidation
+ *   9. JSON        — findJson with L1 caching
  *  10. ReadOnly    — read-only repository at L1
  *  11. RO+Inv      — read-only as cross-invalidation target at L1
  *
  * SECTION naming convention:
- *   [findById]      — read by primary key with caching
- *   [create]        — insert with L1 cache population
+ *   [find]      — read by primary key with caching
+ *   [insert]        — insert with L1 cache population
  *   [update]        — modify with L1 invalidation/population
- *   [remove]        — delete with L1 invalidation
+ *   [erase]        — delete with L1 invalidation
  *   [invalidate]    — explicit cache invalidation
  *   [ttl]           — TTL expiration behavior
  *   [refresh]       — TTL refresh on get
@@ -33,9 +33,9 @@
  *   [list-inv]      — entity → ListDescriptor cross-invalidation
  *   [list-resolver] — InvalidateListVia with typed GroupKey
  *   [list-granularity] — per-page, per-group, full pattern dispatch
- *   [flatbuffer]    — binary entity caching
- *   [updateBy]      — partial field updates
- *   [json]          — findByIdAsJson raw JSON retrieval
+ *   [binary]    — binary entity caching
+ *   [patch]      — partial field updates
+ *   [json]          — findJson raw JSON retrieval
  *   [readonly]      — read-only repository
  *   [readonly-inv]  — read-only as cross-invalidation target
  */
@@ -62,18 +62,18 @@ namespace relais_test {
 // =============================================================================
 
 /// L1 user repo as cross-invalidation target.
-using L1InvTestUserRepository = Repository<TestUserWrapper, "test:user:l1:inv">;
+using L1InvTestUserRepo = Repo<TestUserWrapper, "test:user:l1:inv">;
 
 /// L1 article repo as cross-invalidation target (for InvalidateVia).
-using L1InvTestArticleRepository = Repository<TestArticleWrapper, "test:article:l1:inv">;
+using L1InvTestArticleRepo = Repo<TestArticleWrapper, "test:article:l1:inv">;
 
 // =============================================================================
 // Standard cross-invalidation: Purchase → User (L1)
 // =============================================================================
 
-using L1InvTestPurchaseRepository = Repository<TestPurchaseWrapper, "test:purchase:l1:inv",
+using L1InvTestPurchaseRepo = Repo<TestPurchaseWrapper, "test:purchase:l1:inv",
     cfg::Local,
-    cache::Invalidate<L1InvTestUserRepository, purchaseUserId>>;
+    cache::Invalidate<L1InvTestUserRepo, purchaseUserId>>;
 
 // =============================================================================
 // Custom cross-invalidation: Purchase → User + Articles (via resolver, L1)
@@ -94,10 +94,10 @@ struct L1UserArticleResolver {
     }
 };
 
-using L1CustomTestPurchaseRepository = Repository<TestPurchaseWrapper, "test:purchase:l1:custom",
+using L1CustomTestPurchaseRepo = Repo<TestPurchaseWrapper, "test:purchase:l1:custom",
     cfg::Local,
-    cache::Invalidate<L1InvTestUserRepository, purchaseUserId>,
-    cache::InvalidateVia<L1InvTestArticleRepository, purchaseUserId, &L1UserArticleResolver::resolve>>;
+    cache::Invalidate<L1InvTestUserRepo, purchaseUserId>,
+    cache::InvalidateVia<L1InvTestArticleRepo, purchaseUserId, &L1UserArticleResolver::resolve>>;
 
 // =============================================================================
 // Entity → ListDescriptor cross-invalidation bridge
@@ -113,14 +113,14 @@ public:
     static io::Task<void> onEntityModified(
         std::shared_ptr<const TestPurchaseWrapper>)
     {
-        TestInternals::resetListCacheState<TestPurchaseListRepository>();
+        TestInternals::resetListCacheState<TestPurchaseListRepo>();
         co_return;
     }
 };
 
-using L1ListInvPurchaseRepository = Repository<TestPurchaseWrapper, "test:purchase:l1:listinv",
+using L1ListInvPurchaseRepo = Repo<TestPurchaseWrapper, "test:purchase:l1:listinv",
     cfg::Local,
-    cache::Invalidate<L1InvTestUserRepository, purchaseUserId>,
+    cache::Invalidate<L1InvTestUserRepo, purchaseUserId>,
     cache::InvalidateList<L1PurchaseListInvalidator>>;
 
 // =============================================================================
@@ -254,19 +254,19 @@ struct L1MixedResolver {
 // Purchase repos for InvalidateListVia granularity tests
 // =============================================================================
 
-using L1PerPagePurchaseRepo = Repository<TestPurchaseWrapper, "test:purchase:l1:perpage",
+using L1PerPagePurchaseRepo = Repo<TestPurchaseWrapper, "test:purchase:l1:perpage",
     cfg::Local,
     cache::InvalidateListVia<L1MockArticleListRepo, purchaseUserId, &L1PerPageResolver::resolve>>;
 
-using L1PerGroupPurchaseRepo = Repository<TestPurchaseWrapper, "test:purchase:l1:pergroup",
+using L1PerGroupPurchaseRepo = Repo<TestPurchaseWrapper, "test:purchase:l1:pergroup",
     cfg::Local,
     cache::InvalidateListVia<L1MockArticleListRepo, purchaseUserId, &L1PerGroupResolver::resolve>>;
 
-using L1FullPatternPurchaseRepo = Repository<TestPurchaseWrapper, "test:purchase:l1:fullpattern",
+using L1FullPatternPurchaseRepo = Repo<TestPurchaseWrapper, "test:purchase:l1:fullpattern",
     cfg::Local,
     cache::InvalidateListVia<L1MockArticleListRepo, purchaseUserId, &L1FullPatternResolver::resolve>>;
 
-using L1MixedPurchaseRepo = Repository<TestPurchaseWrapper, "test:purchase:l1:mixed",
+using L1MixedPurchaseRepo = Repo<TestPurchaseWrapper, "test:purchase:l1:mixed",
     cfg::Local,
     cache::InvalidateListVia<L1MockArticleListRepo, purchaseUserId, &L1MixedResolver::resolve>>;
 
@@ -282,17 +282,17 @@ inline constexpr auto ReadOnlyUserL1 = Local.with_read_only();
 } // namespace test_local
 
 /// L1 read-only item repository — no writes allowed.
-using ReadOnlyL1TestItemRepository = Repository<TestItemWrapper, "test:readonly:l1",
+using ReadOnlyL1TestItemRepo = Repo<TestItemWrapper, "test:readonly:l1",
     test_local::ReadOnlyL1>;
 
-/// L1 read-only user repository — CachedRepository provides invalidate().
-using ReadOnlyL1TestUserRepository = Repository<TestUserWrapper, "test:readonly:user:l1",
+/// L1 read-only user repository — CachedRepo provides invalidate().
+using ReadOnlyL1TestUserRepo = Repo<TestUserWrapper, "test:readonly:user:l1",
     test_local::ReadOnlyUserL1>;
 
 /// L1 purchase repo whose writes invalidate a read-only user repo.
-using L1ReadOnlyInvPurchaseRepository = Repository<TestPurchaseWrapper, "test:purchase:l1:readonly:inv",
+using L1ReadOnlyInvPurchaseRepo = Repo<TestPurchaseWrapper, "test:purchase:l1:readonly:inv",
     cfg::Local,
-    cache::Invalidate<ReadOnlyL1TestUserRepository, purchaseUserId>>;
+    cache::Invalidate<ReadOnlyL1TestUserRepo, purchaseUserId>>;
 
 } // namespace relais_test
 
@@ -306,16 +306,16 @@ using F = TestUserWrapper::Field;
 //
 // #############################################################################
 
-TEST_CASE("CachedRepository<TestItem> - findById",
+TEST_CASE("CachedRepo<TestItem> - find",
           "[integration][db][cached][item]")
 {
     TransactionGuard tx;
 
-    SECTION("[findById] caches result in L1 and returns stale data") {
+    SECTION("[find] caches result in L1 and returns stale data") {
         auto id = insertTestItem("Cached", 42);
 
         // First call: cache miss → fetches from DB → populates L1
-        auto result1 = sync(L1TestItemRepository::findById(id));
+        auto result1 = sync(L1TestItemRepo::find(id));
         REQUIRE(result1 != nullptr);
         REQUIRE(result1->name == "Cached");
         REQUIRE(result1->value == 42);
@@ -324,23 +324,23 @@ TEST_CASE("CachedRepository<TestItem> - findById",
         updateTestItem(id, "Modified", 99);
 
         // Second call: cache hit → returns stale data
-        auto result2 = sync(L1TestItemRepository::findById(id));
+        auto result2 = sync(L1TestItemRepo::find(id));
         REQUIRE(result2 != nullptr);
         CHECK(result2->name == "Cached");   // Still old value
         CHECK(result2->value == 42);
     }
 
-    SECTION("[findById] returns nullptr for non-existent id") {
-        auto result = sync(L1TestItemRepository::findById(999999));
+    SECTION("[find] returns nullptr for non-existent id") {
+        auto result = sync(L1TestItemRepo::find(999999));
         CHECK(result == nullptr);
     }
 
-    SECTION("[findById] returns correct entity among multiple") {
+    SECTION("[find] returns correct entity among multiple") {
         auto id1 = insertTestItem("First", 1);
         auto id2 = insertTestItem("Second", 2);
 
-        auto r1 = sync(L1TestItemRepository::findById(id1));
-        auto r2 = sync(L1TestItemRepository::findById(id2));
+        auto r1 = sync(L1TestItemRepo::find(id1));
+        auto r2 = sync(L1TestItemRepo::find(id2));
 
         REQUIRE(r1 != nullptr);
         REQUIRE(r2 != nullptr);
@@ -349,13 +349,13 @@ TEST_CASE("CachedRepository<TestItem> - findById",
     }
 }
 
-TEST_CASE("CachedRepository<TestItem> - create",
+TEST_CASE("CachedRepo<TestItem> - insert",
           "[integration][db][cached][item]")
 {
     TransactionGuard tx;
 
-    SECTION("[create] inserts entity and populates L1 cache") {
-        auto created = sync(L1TestItemRepository::create(makeTestItem("New Item", 100, "Created via repo")));
+    SECTION("[insert] inserts entity and populates L1 cache") {
+        auto created = sync(L1TestItemRepo::insert(makeTestItem("New Item", 100, "Created via repo")));
         REQUIRE(created != nullptr);
         REQUIRE(created->id > 0);
         CHECK(created->name == "New Item");
@@ -364,14 +364,14 @@ TEST_CASE("CachedRepository<TestItem> - create",
         // Modify in DB directly
         updateTestItem(created->id, "DB Modified", 999);
 
-        // L1 cache populated by create → returns stale value
-        auto cached = sync(L1TestItemRepository::findById(created->id));
+        // L1 cache populated by insert → returns stale value
+        auto cached = sync(L1TestItemRepo::find(created->id));
         REQUIRE(cached != nullptr);
         CHECK(cached->name == "New Item");  // From L1 cache
     }
 }
 
-TEST_CASE("CachedRepository<TestItem> - update",
+TEST_CASE("CachedRepo<TestItem> - update",
           "[integration][db][cached][item]")
 {
     TransactionGuard tx;
@@ -380,52 +380,52 @@ TEST_CASE("CachedRepository<TestItem> - update",
         auto id = insertTestItem("Original", 1);
 
         // Populate L1 cache
-        sync(L1TestItemRepository::findById(id));
+        sync(L1TestItemRepo::find(id));
 
         // Update through repo (invalidates L1, writes to DB)
-        auto success = sync(L1TestItemRepository::update(id, makeTestItem("Updated", 2, "", true, id)));
+        auto success = sync(L1TestItemRepo::update(id, makeTestItem("Updated", 2, "", true, id)));
         REQUIRE(success);
 
         // Modify again directly in DB
         updateTestItem(id, "DB Override", 99);
 
         // InvalidateAndLazyReload: L1 was invalidated, next read fetches from DB
-        auto result = sync(L1TestItemRepository::findById(id));
+        auto result = sync(L1TestItemRepo::find(id));
         REQUIRE(result != nullptr);
         CHECK(result->name == "DB Override");
         CHECK(result->value == 99);
     }
 }
 
-TEST_CASE("CachedRepository<TestItem> - remove",
+TEST_CASE("CachedRepo<TestItem> - erase",
           "[integration][db][cached][item]")
 {
     TransactionGuard tx;
 
-    SECTION("[remove] invalidates L1 cache") {
+    SECTION("[erase] invalidates L1 cache") {
         auto id = insertTestItem("ToDelete", 1);
 
         // Populate L1 cache
-        sync(L1TestItemRepository::findById(id));
+        sync(L1TestItemRepo::find(id));
 
-        // Remove through repo
-        auto result = sync(L1TestItemRepository::remove(id));
+        // erase through repo
+        auto result = sync(L1TestItemRepo::erase(id));
         REQUIRE(result.has_value());
         CHECK(*result == 1);
 
         // Entity gone from DB and cache
-        auto gone = sync(L1TestItemRepository::findById(id));
+        auto gone = sync(L1TestItemRepo::find(id));
         CHECK(gone == nullptr);
     }
 
-    SECTION("[remove] returns 0 for non-existent id") {
-        auto result = sync(L1TestItemRepository::remove(999999));
+    SECTION("[erase] returns 0 for non-existent id") {
+        auto result = sync(L1TestItemRepo::erase(999999));
         REQUIRE(result.has_value());
         CHECK(*result == 0);
     }
 }
 
-TEST_CASE("CachedRepository<TestItem> - explicit invalidation",
+TEST_CASE("CachedRepo<TestItem> - explicit invalidation",
           "[integration][db][cached][invalidate]")
 {
     TransactionGuard tx;
@@ -434,17 +434,17 @@ TEST_CASE("CachedRepository<TestItem> - explicit invalidation",
         auto id = insertTestItem("Invalidate Me", 42);
 
         // Populate L1
-        sync(L1TestItemRepository::findById(id));
+        sync(L1TestItemRepo::find(id));
         updateTestItem(id, "Fresh Value", 99);
 
         // Still cached
-        CHECK(sync(L1TestItemRepository::findById(id))->name == "Invalidate Me");
+        CHECK(sync(L1TestItemRepo::find(id))->name == "Invalidate Me");
 
         // Invalidate
-        sync(L1TestItemRepository::invalidate(id));
+        sync(L1TestItemRepo::invalidate(id));
 
         // Next read gets fresh data
-        auto fresh = sync(L1TestItemRepository::findById(id));
+        auto fresh = sync(L1TestItemRepo::find(id));
         REQUIRE(fresh != nullptr);
         CHECK(fresh->name == "Fresh Value");
         CHECK(fresh->value == 99);
@@ -455,19 +455,19 @@ TEST_CASE("CachedRepository<TestItem> - explicit invalidation",
         auto id2 = insertTestItem("Invalidate", 2);
 
         // Populate both
-        sync(L1TestItemRepository::findById(id1));
-        sync(L1TestItemRepository::findById(id2));
+        sync(L1TestItemRepo::find(id1));
+        sync(L1TestItemRepo::find(id2));
 
         updateTestItem(id1, "Keep Modified", 10);
         updateTestItem(id2, "Inv Modified", 20);
 
         // Invalidate only id2
-        sync(L1TestItemRepository::invalidate(id2));
+        sync(L1TestItemRepo::invalidate(id2));
 
         // id1 still cached (stale)
-        CHECK(sync(L1TestItemRepository::findById(id1))->name == "Keep");
+        CHECK(sync(L1TestItemRepo::find(id1))->name == "Keep");
         // id2 refreshed from DB
-        CHECK(sync(L1TestItemRepository::findById(id2))->name == "Inv Modified");
+        CHECK(sync(L1TestItemRepo::find(id2))->name == "Inv Modified");
     }
 }
 
@@ -478,7 +478,7 @@ TEST_CASE("CachedRepository<TestItem> - explicit invalidation",
 //
 // #############################################################################
 
-TEST_CASE("CachedRepository - ShortTTL config",
+TEST_CASE("CachedRepo - ShortTTL config",
           "[integration][db][cached][config][ttl]")
 {
     TransactionGuard tx;
@@ -487,7 +487,7 @@ TEST_CASE("CachedRepository - ShortTTL config",
         auto id = insertTestItem("Short TTL", 42);
 
         // Populate cache (TTL = 100ms)
-        auto r1 = sync(ShortTTLTestItemRepository::findById(id));
+        auto r1 = sync(ShortTTLTestItemRepo::find(id));
         REQUIRE(r1 != nullptr);
 
         updateTestItem(id, "After Expiry", 99);
@@ -496,13 +496,13 @@ TEST_CASE("CachedRepository - ShortTTL config",
         waitForExpiration(std::chrono::milliseconds{150});
 
         // Expired entry rejected → fetches fresh from DB
-        auto r2 = sync(ShortTTLTestItemRepository::findById(id));
+        auto r2 = sync(ShortTTLTestItemRepo::find(id));
         REQUIRE(r2 != nullptr);
         CHECK(r2->name == "After Expiry");
     }
 }
 
-TEST_CASE("CachedRepository - AcceptExpired config",
+TEST_CASE("CachedRepo - AcceptExpired config",
           "[integration][db][cached][config][expired]")
 {
     TransactionGuard tx;
@@ -511,26 +511,26 @@ TEST_CASE("CachedRepository - AcceptExpired config",
         auto id = insertTestItem("Accept Expired", 42);
 
         // Populate cache (TTL = 100ms)
-        sync(AcceptExpiredTestItemRepository::findById(id));
+        sync(AcceptExpiredTestItemRepo::find(id));
         updateTestItem(id, "Fresh", 99);
 
         waitForExpiration(std::chrono::milliseconds{150});
 
         // Expired but accepted (l1_accept_expired_on_get = true)
-        auto stale = sync(AcceptExpiredTestItemRepository::findById(id));
+        auto stale = sync(AcceptExpiredTestItemRepo::find(id));
         REQUIRE(stale != nullptr);
         CHECK(stale->name == "Accept Expired");  // Stale, but accepted
 
         // Cleanup evicts expired entries
-        forceFullCleanup<AcceptExpiredTestItemRepository>();
+        forcePurge<AcceptExpiredTestItemRepo>();
 
-        auto fresh = sync(AcceptExpiredTestItemRepository::findById(id));
+        auto fresh = sync(AcceptExpiredTestItemRepo::find(id));
         REQUIRE(fresh != nullptr);
         CHECK(fresh->name == "Fresh");
     }
 }
 
-TEST_CASE("CachedRepository - NoRefresh config",
+TEST_CASE("CachedRepo - NoRefresh config",
           "[integration][db][cached][config][refresh]")
 {
     TransactionGuard tx;
@@ -539,11 +539,11 @@ TEST_CASE("CachedRepository - NoRefresh config",
         auto id = insertTestItem("No Refresh", 42);
 
         // Populate cache (TTL = 200ms, no refresh, accept expired)
-        sync(NoRefreshTestItemRepository::findById(id));
+        sync(NoRefreshTestItemRepo::find(id));
 
         // Read at 120ms (within TTL)
         waitForExpiration(std::chrono::milliseconds{120});
-        sync(NoRefreshTestItemRepository::findById(id));
+        sync(NoRefreshTestItemRepo::find(id));
 
         // Wait until past original 200ms TTL (total ~220ms)
         waitForExpiration(std::chrono::milliseconds{100});
@@ -551,15 +551,15 @@ TEST_CASE("CachedRepository - NoRefresh config",
         updateTestItem(id, "Refreshed", 99);
 
         // Entry expired; cleanup evicts it
-        forceFullCleanup<NoRefreshTestItemRepository>();
+        forcePurge<NoRefreshTestItemRepo>();
 
-        auto fresh = sync(NoRefreshTestItemRepository::findById(id));
+        auto fresh = sync(NoRefreshTestItemRepo::find(id));
         REQUIRE(fresh != nullptr);
         CHECK(fresh->name == "Refreshed");
     }
 }
 
-TEST_CASE("CachedRepository - WriteThrough config",
+TEST_CASE("CachedRepo - WriteThrough config",
           "[integration][db][cached][config][write-through]")
 {
     TransactionGuard tx;
@@ -568,55 +568,55 @@ TEST_CASE("CachedRepository - WriteThrough config",
         auto id = insertTestItem("Original", 1);
 
         // Populate cache
-        sync(WriteThroughTestItemRepository::findById(id));
+        sync(WriteThroughTestItemRepo::find(id));
 
         // Update through repo (PopulateImmediately strategy)
-        sync(WriteThroughTestItemRepository::update(id, makeTestItem("Updated WT", 2, "", true, id)));
+        sync(WriteThroughTestItemRepo::update(id, makeTestItem("Updated WT", 2, "", true, id)));
 
         // Modify in DB directly (bypass cache)
         updateTestItem(id, "DB Direct", 99);
 
         // Cache still has the write-through value
-        auto cached = sync(WriteThroughTestItemRepository::findById(id));
+        auto cached = sync(WriteThroughTestItemRepo::find(id));
         REQUIRE(cached != nullptr);
         CHECK(cached->name == "Updated WT");
         CHECK(cached->value == 2);
     }
 }
 
-TEST_CASE("CachedRepository - FewShards config",
+TEST_CASE("CachedRepo - FewShards config",
           "[integration][db][cached][config][cleanup]")
 {
     TransactionGuard tx;
 
-    SECTION("[cleanup] full cleanup only removes expired entries") {
+    SECTION("[cleanup] full cleanup only erases expired entries") {
         auto id1 = insertTestItem("Seg1", 1);
         auto id2 = insertTestItem("Seg2", 2);
         auto id3 = insertTestItem("Seg3", 3);
 
-        sync(FewShardsTestItemRepository::findById(id1));
-        sync(FewShardsTestItemRepository::findById(id2));
-        sync(FewShardsTestItemRepository::findById(id3));
+        sync(FewShardsTestItemRepo::find(id1));
+        sync(FewShardsTestItemRepo::find(id2));
+        sync(FewShardsTestItemRepo::find(id3));
 
-        auto sizeBefore = getCacheSize<FewShardsTestItemRepository>();
+        auto sizeBefore = getCacheSize<FewShardsTestItemRepo>();
         CHECK(sizeBefore >= 3);
 
-        // Full cleanup: non-expired entries are NOT removed
-        auto removed = FewShardsTestItemRepository::fullCleanup();
-        CHECK(removed == 0);
-        CHECK(getCacheSize<FewShardsTestItemRepository>() == sizeBefore);
+        // Full cleanup: non-expired entries are NOT erased
+        auto erased = FewShardsTestItemRepo::purge();
+        CHECK(erased == 0);
+        CHECK(getCacheSize<FewShardsTestItemRepo>() == sizeBefore);
     }
 
-    SECTION("[cleanup] triggerCleanup processes one shard at a time") {
+    SECTION("[cleanup] trySweep processes one shard at a time") {
         auto id = insertTestItem("Trigger", 1);
-        sync(FewShardsTestItemRepository::findById(id));
+        sync(FewShardsTestItemRepo::find(id));
 
-        // triggerCleanup should return true (cleanup performed)
-        auto cleaned = FewShardsTestItemRepository::triggerCleanup();
+        // trySweep should return true (cleanup performed)
+        auto cleaned = FewShardsTestItemRepo::trySweep();
         CHECK(cleaned);
 
         // Non-expired entry survives
-        auto result = sync(FewShardsTestItemRepository::findById(id));
+        auto result = sync(FewShardsTestItemRepo::find(id));
         REQUIRE(result != nullptr);
         CHECK(result->name == "Trigger");
     }
@@ -629,16 +629,16 @@ TEST_CASE("CachedRepository - FewShards config",
 //
 // #############################################################################
 
-TEST_CASE("CachedRepository - cross-invalidation Purchase → User",
+TEST_CASE("CachedRepo - cross-invalidation Purchase → User",
           "[integration][db][cached][cross-inv]")
 {
     TransactionGuard tx;
 
-    SECTION("[cross-inv] create purchase invalidates user L1 cache") {
+    SECTION("[cross-inv] insert purchase invalidates user L1 cache") {
         auto userId = insertTestUser("inv_user", "inv@test.com", 1000);
 
         // Cache user in L1
-        auto user1 = sync(L1InvTestUserRepository::findById(userId));
+        auto user1 = sync(L1InvTestUserRepo::find(userId));
         REQUIRE(user1 != nullptr);
         REQUIRE(user1->balance == 1000);
 
@@ -646,14 +646,14 @@ TEST_CASE("CachedRepository - cross-invalidation Purchase → User",
         updateTestUserBalance(userId, 500);
 
         // User still cached (stale)
-        CHECK(sync(L1InvTestUserRepository::findById(userId))->balance == 1000);
+        CHECK(sync(L1InvTestUserRepo::find(userId))->balance == 1000);
 
-        // Create purchase → triggers Invalidate<User, &Purchase::user_id>
-        auto created = sync(L1InvTestPurchaseRepository::create(makeTestPurchase(userId, "Widget", 100, "pending")));
+        // insert purchase → triggers Invalidate<User, &Purchase::user_id>
+        auto created = sync(L1InvTestPurchaseRepo::insert(makeTestPurchase(userId, "Widget", 100, "pending")));
         REQUIRE(created != nullptr);
 
         // User L1 cache invalidated → next read gets fresh data from DB
-        auto user2 = sync(L1InvTestUserRepository::findById(userId));
+        auto user2 = sync(L1InvTestUserRepo::find(userId));
         REQUIRE(user2 != nullptr);
         CHECK(user2->balance == 500);
     }
@@ -663,14 +663,14 @@ TEST_CASE("CachedRepository - cross-invalidation Purchase → User",
         auto purchaseId = insertTestPurchase(userId, "Product", 50);
 
         // Cache user
-        sync(L1InvTestUserRepository::findById(userId));
+        sync(L1InvTestUserRepo::find(userId));
         updateTestUserBalance(userId, 750);
 
         // Update purchase through repo
-        sync(L1InvTestPurchaseRepository::update(purchaseId, makeTestPurchase(userId, "Updated Product", 100, "completed", purchaseId)));
+        sync(L1InvTestPurchaseRepo::update(purchaseId, makeTestPurchase(userId, "Updated Product", 100, "completed", purchaseId)));
 
         // User cache invalidated
-        auto user = sync(L1InvTestUserRepository::findById(userId));
+        auto user = sync(L1InvTestUserRepo::find(userId));
         REQUIRE(user != nullptr);
         CHECK(user->balance == 750);
     }
@@ -679,12 +679,12 @@ TEST_CASE("CachedRepository - cross-invalidation Purchase → User",
         auto userId = insertTestUser("del_user", "del@test.com", 1000);
         auto purchaseId = insertTestPurchase(userId, "To Delete", 50);
 
-        sync(L1InvTestUserRepository::findById(userId));
+        sync(L1InvTestUserRepo::find(userId));
         updateTestUserBalance(userId, 200);
 
-        sync(L1InvTestPurchaseRepository::remove(purchaseId));
+        sync(L1InvTestPurchaseRepo::erase(purchaseId));
 
-        auto user = sync(L1InvTestUserRepository::findById(userId));
+        auto user = sync(L1InvTestUserRepo::find(userId));
         REQUIRE(user != nullptr);
         CHECK(user->balance == 200);
     }
@@ -695,23 +695,23 @@ TEST_CASE("CachedRepository - cross-invalidation Purchase → User",
         auto purchaseId = insertTestPurchase(user1Id, "Product", 100);
 
         // Cache both users
-        sync(L1InvTestUserRepository::findById(user1Id));
-        sync(L1InvTestUserRepository::findById(user2Id));
+        sync(L1InvTestUserRepo::find(user1Id));
+        sync(L1InvTestUserRepo::find(user2Id));
 
         // Modify both in DB
         updateTestUserBalance(user1Id, 111);
         updateTestUserBalance(user2Id, 222);
 
         // Both still cached
-        CHECK(sync(L1InvTestUserRepository::findById(user1Id))->balance == 1000);
-        CHECK(sync(L1InvTestUserRepository::findById(user2Id))->balance == 2000);
+        CHECK(sync(L1InvTestUserRepo::find(user1Id))->balance == 1000);
+        CHECK(sync(L1InvTestUserRepo::find(user2Id))->balance == 2000);
 
         // Update purchase: change user_id from user1 to user2
-        sync(L1InvTestPurchaseRepository::update(purchaseId, makeTestPurchase(user2Id, "Product", 100, "pending", purchaseId)));
+        sync(L1InvTestPurchaseRepo::update(purchaseId, makeTestPurchase(user2Id, "Product", 100, "pending", purchaseId)));
 
         // Both users invalidated (old FK + new FK)
-        CHECK(sync(L1InvTestUserRepository::findById(user1Id))->balance == 111);
-        CHECK(sync(L1InvTestUserRepository::findById(user2Id))->balance == 222);
+        CHECK(sync(L1InvTestUserRepo::find(user1Id))->balance == 111);
+        CHECK(sync(L1InvTestUserRepo::find(user2Id))->balance == 222);
     }
 }
 
@@ -722,7 +722,7 @@ TEST_CASE("CachedRepository - cross-invalidation Purchase → User",
 //
 // #############################################################################
 
-TEST_CASE("CachedRepository - custom cross-invalidation via resolver",
+TEST_CASE("CachedRepo - custom cross-invalidation via resolver",
           "[integration][db][cached][custom-inv]")
 {
     TransactionGuard tx;
@@ -732,8 +732,8 @@ TEST_CASE("CachedRepository - custom cross-invalidation via resolver",
         auto articleId = insertTestArticle("tech", userId, "My Article", 42, true);
 
         // Cache user and article in L1
-        auto user1 = sync(L1InvTestUserRepository::findById(userId));
-        auto article1 = sync(L1InvTestArticleRepository::findById(articleId));
+        auto user1 = sync(L1InvTestUserRepo::find(userId));
+        auto article1 = sync(L1InvTestArticleRepo::find(articleId));
         REQUIRE(user1 != nullptr);
         REQUIRE(article1 != nullptr);
 
@@ -742,17 +742,17 @@ TEST_CASE("CachedRepository - custom cross-invalidation via resolver",
         updateTestArticle(articleId, "Updated Title", 999);
 
         // Both still cached
-        CHECK(sync(L1InvTestUserRepository::findById(userId))->balance == 1000);
-        CHECK(sync(L1InvTestArticleRepository::findById(articleId))->title == "My Article");
+        CHECK(sync(L1InvTestUserRepo::find(userId))->balance == 1000);
+        CHECK(sync(L1InvTestArticleRepo::find(articleId))->title == "My Article");
 
-        // Create purchase → triggers Invalidate<User> + InvalidateVia<Article>
-        sync(L1CustomTestPurchaseRepository::create(makeTestPurchase(userId, "Trigger", 50, "pending")));
+        // insert purchase → triggers Invalidate<User> + InvalidateVia<Article>
+        sync(L1CustomTestPurchaseRepo::insert(makeTestPurchase(userId, "Trigger", 50, "pending")));
 
         // User invalidated (standard Invalidate<>)
-        CHECK(sync(L1InvTestUserRepository::findById(userId))->balance == 500);
+        CHECK(sync(L1InvTestUserRepo::find(userId))->balance == 500);
 
         // Article invalidated (InvalidateVia resolver)
-        auto article2 = sync(L1InvTestArticleRepository::findById(articleId));
+        auto article2 = sync(L1InvTestArticleRepo::find(articleId));
         CHECK(article2->title == "Updated Title");
         CHECK(article2->view_count == 999);
     }
@@ -760,10 +760,10 @@ TEST_CASE("CachedRepository - custom cross-invalidation via resolver",
     SECTION("[custom-inv] resolver with no related articles does not crash") {
         auto userId = insertTestUser("no_articles", "noart@test.com", 100);
 
-        sync(L1InvTestUserRepository::findById(userId));
+        sync(L1InvTestUserRepo::find(userId));
 
         // Resolver returns empty vector — no crash
-        auto created = sync(L1CustomTestPurchaseRepository::create(makeTestPurchase(userId, "Safe Trigger", 10, "pending")));
+        auto created = sync(L1CustomTestPurchaseRepo::insert(makeTestPurchase(userId, "Safe Trigger", 10, "pending")));
         REQUIRE(created != nullptr);
     }
 
@@ -774,22 +774,22 @@ TEST_CASE("CachedRepository - custom cross-invalidation via resolver",
         auto a3 = insertTestArticle("tech", userId, "Tech 2", 30, true);
 
         // Cache all articles
-        sync(L1InvTestArticleRepository::findById(a1));
-        sync(L1InvTestArticleRepository::findById(a2));
-        sync(L1InvTestArticleRepository::findById(a3));
+        sync(L1InvTestArticleRepo::find(a1));
+        sync(L1InvTestArticleRepo::find(a2));
+        sync(L1InvTestArticleRepo::find(a3));
 
         // Modify all in DB
         updateTestArticle(a1, "New Tech 1", 100);
         updateTestArticle(a2, "New News 1", 200);
         updateTestArticle(a3, "New Tech 2", 300);
 
-        // Create purchase → resolver finds all 3 articles
-        sync(L1CustomTestPurchaseRepository::create(makeTestPurchase(userId, "Big Trigger", 999, "pending")));
+        // insert purchase → resolver finds all 3 articles
+        sync(L1CustomTestPurchaseRepo::insert(makeTestPurchase(userId, "Big Trigger", 999, "pending")));
 
         // All articles refreshed from DB
-        CHECK(sync(L1InvTestArticleRepository::findById(a1))->title == "New Tech 1");
-        CHECK(sync(L1InvTestArticleRepository::findById(a2))->title == "New News 1");
-        CHECK(sync(L1InvTestArticleRepository::findById(a3))->title == "New Tech 2");
+        CHECK(sync(L1InvTestArticleRepo::find(a1))->title == "New Tech 1");
+        CHECK(sync(L1InvTestArticleRepo::find(a2))->title == "New News 1");
+        CHECK(sync(L1InvTestArticleRepo::find(a3))->title == "New Tech 2");
     }
 }
 
@@ -800,11 +800,11 @@ TEST_CASE("CachedRepository - custom cross-invalidation via resolver",
 //
 // #############################################################################
 
-TEST_CASE("CachedRepository - entity to ListDescriptor cross-invalidation",
+TEST_CASE("CachedRepo - entity to ListDescriptor cross-invalidation",
           "[integration][db][cached][list-inv]")
 {
     TransactionGuard tx;
-    TestInternals::resetListCacheState<TestPurchaseListRepository>();
+    TestInternals::resetListCacheState<TestPurchaseListRepo>();
 
     SECTION("[list-inv] purchase creation invalidates purchase ListDescriptor cache") {
         auto userId = insertTestUser("list_user", "list@test.com", 1000);
@@ -812,7 +812,7 @@ TEST_CASE("CachedRepository - entity to ListDescriptor cross-invalidation",
 
         // Query ListDescriptor to populate cache
         auto query = makePurchaseQuery(userId);
-        auto result1 = sync(TestPurchaseListRepository::query(query));
+        auto result1 = sync(TestPurchaseListRepo::query(query));
         auto count1 = result1->size();
         CHECK(count1 == 1);
 
@@ -820,16 +820,16 @@ TEST_CASE("CachedRepository - entity to ListDescriptor cross-invalidation",
         insertTestPurchase(userId, "Direct Insert", 75);
 
         // ListDescriptor still cached → same count
-        auto result2 = sync(TestPurchaseListRepository::query(query));
+        auto result2 = sync(TestPurchaseListRepo::query(query));
         CHECK(result2->size() == count1);  // Stale
 
-        // Create purchase through cross-invalidating repo
+        // insert purchase through cross-invalidating repo
         // → triggers InvalidateList<L1PurchaseListInvalidator>
         // → resets ListDescriptor cache
-        sync(L1ListInvPurchaseRepository::create(makeTestPurchase(userId, "Via Repo", 100, "pending")));
+        sync(L1ListInvPurchaseRepo::insert(makeTestPurchase(userId, "Via Repo", 100, "pending")));
 
         // ListDescriptor cache invalidated → fresh from DB
-        auto result3 = sync(TestPurchaseListRepository::query(query));
+        auto result3 = sync(TestPurchaseListRepo::query(query));
         // Includes: "Existing Product" + "Direct Insert" + "Via Repo" = 3
         CHECK(result3->size() == count1 + 2);
     }
@@ -839,28 +839,28 @@ TEST_CASE("CachedRepository - entity to ListDescriptor cross-invalidation",
         insertTestPurchase(userId, "Product A", 50);
         insertTestPurchase(userId, "Product B", 75);
 
-        TestInternals::resetListCacheState<TestPurchaseListRepository>();
+        TestInternals::resetListCacheState<TestPurchaseListRepo>();
 
         // Query ListDescriptor
         auto query = makePurchaseQuery(userId);
-        auto result1 = sync(TestPurchaseListRepository::query(query));
+        auto result1 = sync(TestPurchaseListRepo::query(query));
         auto count1 = result1->size();
         CHECK(count1 == 2);
 
-        // Create one through repo first (so we have an ID to delete)
-        auto created = sync(L1ListInvPurchaseRepository::create(makeTestPurchase(userId, "To Delete", 25, "pending")));
+        // insert one through repo first (so we have an ID to delete)
+        auto created = sync(L1ListInvPurchaseRepo::insert(makeTestPurchase(userId, "To Delete", 25, "pending")));
         REQUIRE(created != nullptr);
 
-        // Cache was reset by create; re-populate
-        TestInternals::resetListCacheState<TestPurchaseListRepository>();
-        auto result2 = sync(TestPurchaseListRepository::query(query));
+        // Cache was reset by insert; re-populate
+        TestInternals::resetListCacheState<TestPurchaseListRepo>();
+        auto result2 = sync(TestPurchaseListRepo::query(query));
         auto count2 = result2->size();
         CHECK(count2 == 3);  // A + B + "To Delete"
 
         // Delete through repo → triggers ListDescriptor invalidation
-        sync(L1ListInvPurchaseRepository::remove(created->id));
+        sync(L1ListInvPurchaseRepo::erase(created->id));
 
-        auto result3 = sync(TestPurchaseListRepository::query(query));
+        auto result3 = sync(TestPurchaseListRepo::query(query));
         CHECK(result3->size() == 2);  // A + B
     }
 }
@@ -872,7 +872,7 @@ TEST_CASE("CachedRepository - entity to ListDescriptor cross-invalidation",
 //
 // #############################################################################
 
-TEST_CASE("CachedRepository - InvalidateListVia per-page resolver",
+TEST_CASE("CachedRepo - InvalidateListVia per-page resolver",
           "[integration][db][cached][list-resolver]")
 {
     TransactionGuard tx;
@@ -884,7 +884,7 @@ TEST_CASE("CachedRepository - InvalidateListVia per-page resolver",
     insertTestArticle("news", aliceId, "alice_news_100", 100, true);
 
     SECTION("[list-resolver] per-page resolver sends sort_value for each article") {
-        sync(L1PerPagePurchaseRepo::create(makeTestPurchase(aliceId, "PerPageTest", 100, "completed")));
+        sync(L1PerPagePurchaseRepo::insert(makeTestPurchase(aliceId, "PerPageTest", 100, "completed")));
 
         // Resolver found 3 articles → 3 invalidateByTarget calls
         REQUIRE(L1MockArticleListRepo::invocations.size() == 3);
@@ -908,7 +908,7 @@ TEST_CASE("CachedRepository - InvalidateListVia per-page resolver",
     }
 }
 
-TEST_CASE("CachedRepository - InvalidateListVia per-group resolver",
+TEST_CASE("CachedRepo - InvalidateListVia per-group resolver",
           "[integration][db][cached][list-resolver][list-granularity]")
 {
     TransactionGuard tx;
@@ -920,7 +920,7 @@ TEST_CASE("CachedRepository - InvalidateListVia per-group resolver",
     insertTestArticle("news", aliceId, "alice_news_a", 100, true);
 
     SECTION("[list-granularity] per-group resolver sends nullopt sort_value") {
-        sync(L1PerGroupPurchaseRepo::create(makeTestPurchase(aliceId, "PerGroupTest", 100, "completed")));
+        sync(L1PerGroupPurchaseRepo::insert(makeTestPurchase(aliceId, "PerGroupTest", 100, "completed")));
 
         // DISTINCT categories: "tech" and "news" → 2 invalidateByTarget calls
         REQUIRE(L1MockArticleListRepo::invocations.size() == 2);
@@ -941,7 +941,7 @@ TEST_CASE("CachedRepository - InvalidateListVia per-group resolver",
     }
 }
 
-TEST_CASE("CachedRepository - InvalidateListVia full pattern resolver",
+TEST_CASE("CachedRepo - InvalidateListVia full pattern resolver",
           "[integration][db][cached][list-resolver][list-granularity]")
 {
     TransactionGuard tx;
@@ -951,7 +951,7 @@ TEST_CASE("CachedRepository - InvalidateListVia full pattern resolver",
     insertTestArticle("tech", aliceId, "alice_tech", 10, true);
 
     SECTION("[list-granularity] full pattern resolver calls invalidateAllListGroups") {
-        sync(L1FullPatternPurchaseRepo::create(makeTestPurchase(aliceId, "FullPatternTest", 100, "completed")));
+        sync(L1FullPatternPurchaseRepo::insert(makeTestPurchase(aliceId, "FullPatternTest", 100, "completed")));
 
         // Resolver returned nullopt → invalidateAllListGroups called
         CHECK(L1MockArticleListRepo::all_groups_invalidated);
@@ -960,7 +960,7 @@ TEST_CASE("CachedRepository - InvalidateListVia full pattern resolver",
     }
 }
 
-TEST_CASE("CachedRepository - InvalidateListVia mixed granularity",
+TEST_CASE("CachedRepo - InvalidateListVia mixed granularity",
           "[integration][db][cached][list-resolver][list-granularity]")
 {
     TransactionGuard tx;
@@ -973,7 +973,7 @@ TEST_CASE("CachedRepository - InvalidateListVia mixed granularity",
     insertTestArticle("news", aliceId, "alice_news_200", 200, true);
 
     SECTION("[list-granularity] mixed: per-page tech + per-group news") {
-        sync(L1MixedPurchaseRepo::create(makeTestPurchase(aliceId, "MixedTest", 100, "completed")));
+        sync(L1MixedPurchaseRepo::insert(makeTestPurchase(aliceId, "MixedTest", 100, "completed")));
 
         CHECK_FALSE(L1MockArticleListRepo::all_groups_invalidated);
 
@@ -1003,16 +1003,16 @@ TEST_CASE("CachedRepository - InvalidateListVia mixed granularity",
 //
 // #############################################################################
 
-TEST_CASE("CachedRepository<TestUser> - binary caching",
-          "[integration][db][cached][flatbuffer]")
+TEST_CASE("CachedRepo<TestUser> - binary caching",
+          "[integration][db][cached][binary]")
 {
     TransactionGuard tx;
 
-    SECTION("[flatbuffer] caches binary entity in L1") {
+    SECTION("[binary] caches binary entity in L1") {
         auto id = insertTestUser("alice", "alice@example.com", 1000);
 
         // First fetch — DB, cached in L1
-        auto result1 = sync(L1TestUserRepository::findById(id));
+        auto result1 = sync(L1TestUserRepo::find(id));
         REQUIRE(result1 != nullptr);
         REQUIRE(result1->username == "alice");
         REQUIRE(result1->balance == 1000);
@@ -1021,25 +1021,25 @@ TEST_CASE("CachedRepository<TestUser> - binary caching",
         updateTestUserBalance(id, 999);
 
         // Second fetch — L1 cached (stale)
-        auto result2 = sync(L1TestUserRepository::findById(id));
+        auto result2 = sync(L1TestUserRepo::find(id));
         REQUIRE(result2 != nullptr);
         REQUIRE(result2->username == "alice");
         REQUIRE(result2->balance == 1000);  // Still cached
     }
 
-    SECTION("[flatbuffer] updateBy invalidates L1 binary cache") {
+    SECTION("[binary] patch invalidates L1 binary cache") {
         auto id = insertTestUser("fb_update", "fb_up@example.com", 100);
 
         // Populate cache
-        sync(L1TestUserRepository::findById(id));
+        sync(L1TestUserRepo::find(id));
 
         // Partial update through repo → invalidates L1
-        auto result = sync(L1TestUserRepository::updateBy(id, set<F::balance>(200)));
+        auto result = sync(L1TestUserRepo::patch(id, set<F::balance>(200)));
         REQUIRE(result != nullptr);
         REQUIRE(result->balance == 200);
 
         // Fetch again — should reflect update (re-fetched from DB)
-        auto fetched = sync(L1TestUserRepository::findById(id));
+        auto fetched = sync(L1TestUserRepo::find(id));
         REQUIRE(fetched != nullptr);
         REQUIRE(fetched->balance == 200);
     }
@@ -1048,23 +1048,23 @@ TEST_CASE("CachedRepository<TestUser> - binary caching",
 
 // #############################################################################
 //
-//  8. updateBy — partial field updates with L1 invalidation
+//  8. patch — partial field updates with L1 invalidation
 //
 // #############################################################################
 
-TEST_CASE("CachedRepository<TestUser> - updateBy",
-          "[integration][db][cached][updateBy]")
+TEST_CASE("CachedRepo<TestUser> - patch",
+          "[integration][db][cached][patch]")
 {
     TransactionGuard tx;
 
-    SECTION("[updateBy] invalidates L1 then re-fetches") {
+    SECTION("[patch] invalidates L1 then re-fetches") {
         auto id = insertTestUser("bob", "bob@example.com", 500);
 
         // Populate cache
-        sync(L1TestUserRepository::findById(id));
+        sync(L1TestUserRepo::find(id));
 
         // Partial update: only change balance
-        auto result = sync(L1TestUserRepository::updateBy(id, set<F::balance>(777)));
+        auto result = sync(L1TestUserRepo::patch(id, set<F::balance>(777)));
 
         REQUIRE(result != nullptr);
         REQUIRE(result->balance == 777);
@@ -1072,15 +1072,15 @@ TEST_CASE("CachedRepository<TestUser> - updateBy",
         REQUIRE(result->email == "bob@example.com");
 
         // Independent fetch confirms DB state
-        auto fetched = sync(L1TestUserRepository::findById(id));
+        auto fetched = sync(L1TestUserRepo::find(id));
         REQUIRE(fetched != nullptr);
         REQUIRE(fetched->balance == 777);
     }
 
-    SECTION("[updateBy] updates multiple fields") {
+    SECTION("[patch] updates multiple fields") {
         auto id = insertTestUser("carol", "carol@example.com", 200);
 
-        auto result = sync(L1TestUserRepository::updateBy(id,
+        auto result = sync(L1TestUserRepo::patch(id,
             set<F::balance>(0),
             set<F::username>(std::string("caroline"))));
 
@@ -1094,28 +1094,28 @@ TEST_CASE("CachedRepository<TestUser> - updateBy",
 
 // #############################################################################
 //
-//  9. findByIdAsJson — raw JSON retrieval with L1 caching
+//  9. findJson — raw JSON retrieval with L1 caching
 //
 // #############################################################################
 
-TEST_CASE("CachedRepository - findByIdAsJson",
+TEST_CASE("CachedRepo - findJson",
           "[integration][db][cached][json]")
 {
     TransactionGuard tx;
 
-    // Uses L1TestUserRepository (generated entity with shared_ptr<const string> toJson)
+    // Uses L1TestUserRepo (generated entity with shared_ptr<const string> json)
 
     SECTION("[json] returns JSON string from L1 cache") {
         auto id = insertTestUser("json_user", "json@example.com", 42);
 
-        auto result = sync(L1TestUserRepository::findByIdAsJson(id));
+        auto result = sync(L1TestUserRepo::findJson(id));
 
         REQUIRE(result != nullptr);
         REQUIRE(result->find("json_user") != std::string::npos);
     }
 
     SECTION("[json] returns nullptr for non-existent id") {
-        auto result = sync(L1TestUserRepository::findByIdAsJson(999999999));
+        auto result = sync(L1TestUserRepo::findJson(999999999));
 
         REQUIRE(result == nullptr);
     }
@@ -1124,14 +1124,14 @@ TEST_CASE("CachedRepository - findByIdAsJson",
         auto id = insertTestUser("cache_json", "cj@example.com", 10);
 
         // First call — DB fetch, cache entity in L1
-        auto result1 = sync(L1TestUserRepository::findByIdAsJson(id));
+        auto result1 = sync(L1TestUserRepo::findJson(id));
         REQUIRE(result1 != nullptr);
 
         // Modify DB directly
         updateTestUserBalance(id, 999);
 
         // Second call — L1 cached entity converted to JSON
-        auto result2 = sync(L1TestUserRepository::findByIdAsJson(id));
+        auto result2 = sync(L1TestUserRepo::findJson(id));
         REQUIRE(result2 != nullptr);
         REQUIRE(result2->find("cache_json") != std::string::npos);
         // Balance should still be 10 (stale from L1 cache)
@@ -1146,7 +1146,7 @@ TEST_CASE("CachedRepository - findByIdAsJson",
 //
 // #############################################################################
 
-TEST_CASE("CachedRepository - read-only",
+TEST_CASE("CachedRepo - read-only",
           "[integration][db][cached][readonly]")
 {
     TransactionGuard tx;
@@ -1156,10 +1156,10 @@ TEST_CASE("CachedRepository - read-only",
     static_assert(test_local::ReadOnlyL1.cache_level
                   == jcailloux::relais::config::CacheLevel::L1);
 
-    SECTION("[readonly] findById works and caches in L1") {
+    SECTION("[readonly] find works and caches in L1") {
         auto id = insertTestItem("ReadOnly L1", 42);
 
-        auto result1 = sync(ReadOnlyL1TestItemRepository::findById(id));
+        auto result1 = sync(ReadOnlyL1TestItemRepo::find(id));
         REQUIRE(result1 != nullptr);
         REQUIRE(result1->name == "ReadOnly L1");
 
@@ -1167,17 +1167,17 @@ TEST_CASE("CachedRepository - read-only",
         updateTestItem(id, "Modified", 999);
 
         // Should return cached value (stale)
-        auto result2 = sync(ReadOnlyL1TestItemRepository::findById(id));
+        auto result2 = sync(ReadOnlyL1TestItemRepo::find(id));
         REQUIRE(result2 != nullptr);
         REQUIRE(result2->name == "ReadOnly L1");  // Still cached
     }
 
     SECTION("[readonly] returns nullptr for non-existent id") {
-        auto result = sync(ReadOnlyL1TestItemRepository::findById(999999999));
+        auto result = sync(ReadOnlyL1TestItemRepo::find(999999999));
         REQUIRE(result == nullptr);
     }
 
-    // Note: create(), update(), remove() are compile-time errors on read-only repos.
+    // Note: insert(), update(), erase() are compile-time errors on read-only repos.
     // They use `requires (!Cfg.read_only)` and will not compile if called.
 }
 
@@ -1188,7 +1188,7 @@ TEST_CASE("CachedRepository - read-only",
 //
 // #############################################################################
 
-TEST_CASE("CachedRepository - read-only as cross-invalidation target",
+TEST_CASE("CachedRepo - read-only as cross-invalidation target",
           "[integration][db][cached][readonly-inv]")
 {
     TransactionGuard tx;
@@ -1197,7 +1197,7 @@ TEST_CASE("CachedRepository - read-only as cross-invalidation target",
         auto userId = insertTestUser("ro_user", "ro@test.com", 1000);
 
         // Cache user via read-only repo
-        auto user1 = sync(ReadOnlyL1TestUserRepository::findById(userId));
+        auto user1 = sync(ReadOnlyL1TestUserRepo::find(userId));
         REQUIRE(user1 != nullptr);
         REQUIRE(user1->balance == 1000);
 
@@ -1205,13 +1205,13 @@ TEST_CASE("CachedRepository - read-only as cross-invalidation target",
         updateTestUserBalance(userId, 500);
 
         // Still cached (read-only, no writes to trigger invalidation)
-        REQUIRE(sync(ReadOnlyL1TestUserRepository::findById(userId))->balance == 1000);
+        REQUIRE(sync(ReadOnlyL1TestUserRepo::find(userId))->balance == 1000);
 
-        // Create purchase via repo that targets the read-only user cache
-        sync(L1ReadOnlyInvPurchaseRepository::create(makeTestPurchase(userId, "RO Trigger", 50, "pending")));
+        // insert purchase via repo that targets the read-only user cache
+        sync(L1ReadOnlyInvPurchaseRepo::insert(makeTestPurchase(userId, "RO Trigger", 50, "pending")));
 
         // Read-only user cache should be invalidated — fresh data from DB
-        auto user2 = sync(ReadOnlyL1TestUserRepository::findById(userId));
+        auto user2 = sync(ReadOnlyL1TestUserRepo::find(userId));
         REQUIRE(user2 != nullptr);
         REQUIRE(user2->balance == 500);
     }
@@ -1219,23 +1219,23 @@ TEST_CASE("CachedRepository - read-only as cross-invalidation target",
     SECTION("[readonly-inv] purchase deletion invalidates read-only user L1 cache") {
         auto userId = insertTestUser("ro_del", "rodel@test.com", 2000);
 
-        // Create purchase through repo (need an ID to delete later)
-        auto created = sync(L1ReadOnlyInvPurchaseRepository::create(makeTestPurchase(userId, "To Delete", 100, "pending")));
+        // insert purchase through repo (need an ID to delete later)
+        auto created = sync(L1ReadOnlyInvPurchaseRepo::insert(makeTestPurchase(userId, "To Delete", 100, "pending")));
         REQUIRE(created != nullptr);
 
         // Cache user
-        sync(ReadOnlyL1TestUserRepository::findById(userId));
+        sync(ReadOnlyL1TestUserRepo::find(userId));
 
         // Modify user in DB directly
         updateTestUserBalance(userId, 1);
 
         // Still cached
-        REQUIRE(sync(ReadOnlyL1TestUserRepository::findById(userId))->balance == 2000);
+        REQUIRE(sync(ReadOnlyL1TestUserRepo::find(userId))->balance == 2000);
 
         // Delete purchase → triggers read-only user invalidation
-        sync(L1ReadOnlyInvPurchaseRepository::remove(created->id));
+        sync(L1ReadOnlyInvPurchaseRepo::erase(created->id));
 
-        auto user = sync(ReadOnlyL1TestUserRepository::findById(userId));
+        auto user = sync(ReadOnlyL1TestUserRepo::find(userId));
         REQUIRE(user->balance == 1);
     }
 }

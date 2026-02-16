@@ -1,4 +1,4 @@
--- Test table for relais PartialKey integration tests
+-- Test table for relais partition key integration tests
 -- Partitioned by region with composite PK (id, region)
 -- Uses a shared sequence so 'id' is globally unique across partitions
 

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(jcailloux-relais VERSION 0.2.0 LANGUAGES CXX)
+project(jcailloux-relais VERSION 0.3.0 LANGUAGES CXX)
 
 add_library(jcailloux-relais INTERFACE)
 add_library(jcailloux::relais ALIAS jcailloux-relais)
@@ -153,7 +153,9 @@ if(RELAIS_BUILD_TESTS)
     # -------------------------------------------------------------------------
     # Unit tests
     # -------------------------------------------------------------------------
-    relais_add_test(relais_tests          tests/relais/test_generated_wrapper.cpp  DEFINITIONS RELAIS_BUILDING_TESTS)
+    relais_add_test(relais_tests                tests/relais/test_generated_wrapper.cpp          DEFINITIONS RELAIS_BUILDING_TESTS)
+    relais_add_test(test_relais_base_compile    tests/relais/test_base_repository_compile.cpp    DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;compile")
+    relais_add_test(test_relais_repo_compile    tests/relais/test_repository_compile.cpp         DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;compile")
     relais_add_test(test_io_task          tests/io/test_io_task.cpp               LABELS "io")
     relais_add_test(test_io_context       tests/io/test_io_context.cpp            LABELS "io")
     relais_add_test(test_io_pg_types      tests/io/test_io_pg_types.cpp           LABELS "io")
@@ -171,7 +173,7 @@ if(RELAIS_BUILD_TESTS)
     relais_add_test(test_relais_redis           tests/relais/test_redis_repository.cpp     DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;redis"            RESOURCE_LOCK)
     relais_add_test(test_relais_decl_list_cache tests/relais/test_decl_list_cache.cpp      DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;list"             RESOURCE_LOCK)
     relais_add_test(test_relais_cached          tests/relais/test_cached_repository.cpp    DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;cache"            RESOURCE_LOCK)
-    relais_add_test(test_relais_partial_key     tests/relais/test_partial_key.cpp          DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;partial-key"      RESOURCE_LOCK)
+    relais_add_test(test_relais_partition_key     tests/relais/test_partition_key.cpp          DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;partition-key"      RESOURCE_LOCK)
     relais_add_test(test_relais_full_cache      tests/relais/test_full_cache.cpp           DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;full-cache"       RESOURCE_LOCK)
     relais_add_test(test_relais_decl_list_redis tests/relais/test_decl_list_redis.cpp      DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;redis;list"       RESOURCE_LOCK)
     relais_add_test(test_relais_decl_list_full  tests/relais/test_decl_list_full.cpp       DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;full-cache;list"  RESOURCE_LOCK)
@@ -199,7 +201,7 @@ if(RELAIS_BUILD_TESTS)
             test_relais_redis
             test_relais_cached
             test_relais_decl_list_cache
-            test_relais_partial_key
+            test_relais_partition_key
             test_relais_full_cache
             test_relais_decl_list_redis
             test_relais_decl_list_full
@@ -218,7 +220,7 @@ if(RELAIS_BUILD_TESTS)
         tests/relais/test_redis_repository.cpp
         tests/relais/test_cached_repository.cpp
         tests/relais/test_decl_list_cache.cpp
-        tests/relais/test_partial_key.cpp
+        tests/relais/test_partition_key.cpp
         tests/relais/test_full_cache.cpp
         tests/relais/test_decl_list_redis.cpp
         tests/relais/test_decl_list_full.cpp

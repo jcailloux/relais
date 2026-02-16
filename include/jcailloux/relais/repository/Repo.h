@@ -1,11 +1,11 @@
-#ifndef JCX_RELAIS_REPOSITORY_H
-#define JCX_RELAIS_REPOSITORY_H
+#ifndef JCX_RELAIS_REPO_H
+#define JCX_RELAIS_REPO_H
 
 #include <span>
 #include <type_traits>
 #include "jcailloux/relais/io/Task.h"
 #include "jcailloux/relais/Log.h"
-#include "jcailloux/relais/repository/CachedRepository.h"
+#include "jcailloux/relais/repository/CachedRepo.h"
 #include "jcailloux/relais/repository/InvalidationMixin.h"
 #include "jcailloux/relais/repository/ListMixin.h"
 #include "jcailloux/relais/config/FixedString.h"
@@ -14,21 +14,21 @@
 namespace jcailloux::relais {
 
 // =============================================================================
-// RepositoryBuilder — assembles the mixin chain from template parameters
+// RepoBuilder — assembles the mixin chain from template parameters
 // =============================================================================
 //
 // Chain (bottom to top):
-//   BaseRepository
+//   BaseRepos
 //     ↑ (if L2 or L1_L2)
-//   RedisRepository
+//   RedisRepo
 //     ↑ (if L1 or L1_L2)
-//   CachedRepository
+//   CachedRepo
 //     ↑ (if Entity has ListDescriptor)
 //   ListMixin
 //     ↑ (if Invalidations... non-empty)
 //   InvalidationMixin
 //
-// The final Repository class sits on top and adds convenience methods.
+// The final Repo class sits on top and adds convenience methods.
 //
 
 namespace detail {
@@ -38,11 +38,11 @@ template<typename Entity, config::FixedString Name, config::CacheConfig Cfg, typ
 struct CacheLayerSelector {
     using type = std::conditional_t<
         Cfg.cache_level == config::CacheLevel::L1 || Cfg.cache_level == config::CacheLevel::L1_L2,
-        CachedRepository<Entity, Name, Cfg, Key>,
+        CachedRepo<Entity, Name, Cfg, Key>,
         std::conditional_t<
             Cfg.cache_level == config::CacheLevel::L2,
-            RedisRepository<Entity, Name, Cfg, Key>,
-            BaseRepository<Entity, Name, Cfg, Key>
+            RedisRepo<Entity, Name, Cfg, Key>,
+            BaseRepo<Entity, Name, Cfg, Key>
         >
     >;
 };
@@ -69,26 +69,26 @@ struct MixinStack {
 }  // namespace detail
 
 // =============================================================================
-// Repository — final class with convenience methods
+// Repo — final class with convenience methods
 // =============================================================================
 //
 // Usage:
-//   using MyRepo = Repository<MyWrapper, "MyEntity">;                     // L1 (default)
-//   using MyRepo = Repository<MyWrapper, "MyEntity", config::Both>;       // L1+L2
-//   using MyRepo = Repository<MyWrapper, "MyEntity", config::Local,
+//   using MyRepo = Repo<MyWrapper, "MyEntity">;                     // L1 (default)
+//   using MyRepo = Repo<MyWrapper, "MyEntity", config::Both>;       // L1+L2
+//   using MyRepo = Repo<MyWrapper, "MyEntity", config::Local,
 //       Invalidate<OtherRepo, &MyStruct::other_id>>;                      // with cross-inv
 //
 
 template<typename Entity, config::FixedString Name, config::CacheConfig Cfg = config::Local,
          typename... Invalidations>
-class Repository
+class Repo
     : public detail::MixinStack<
           Entity, Name, Cfg,
-          decltype(std::declval<const Entity>().getPrimaryKey()),
+          decltype(std::declval<const Entity>().key()),
           Invalidations...
       >::type
 {
-    using Key = decltype(std::declval<const Entity>().getPrimaryKey());
+    using Key = decltype(std::declval<const Entity>().key());
     using Base = typename detail::MixinStack<Entity, Name, Cfg, Key, Invalidations...>::type;
 
     // Compile-time validation
@@ -120,7 +120,7 @@ public:
 
     // Re-export all Base methods via using declarations
     using Base::name;
-    using Base::findById;
+    using Base::find;
     using Base::config;
 
     // =======================================================================
@@ -129,12 +129,12 @@ public:
 
     /// Update entity from JSON string.
     /// Parses JSON to create wrapper, then updates via the full mixin chain.
-    static io::Task<bool> updateFromJson(const Key& id, std::string_view json)
+    static io::Task<bool> updateJson(const Key& id, std::string_view json)
         requires MutableEntity<Entity> && (!Cfg.read_only)
     {
         auto wrapper_opt = Entity::fromJson(json);
         if (!wrapper_opt) {
-            RELAIS_LOG_ERROR << name() << ": updateFromJson failed to parse JSON";
+            RELAIS_LOG_ERROR << name() << ": updateJson failed to parse JSON";
             co_return false;
         }
         auto wrapper = std::make_shared<const Entity>(std::move(*wrapper_opt));
@@ -143,12 +143,12 @@ public:
 
     /// Update entity from binary data.
     /// Creates wrapper from binary, then updates via the full mixin chain.
-    static io::Task<bool> updateFromBinary(const Key& id, std::span<const uint8_t> buffer)
+    static io::Task<bool> updateBinary(const Key& id, std::span<const uint8_t> buffer)
         requires MutableEntity<Entity> && HasBinarySerialization<Entity> && (!Cfg.read_only)
     {
         auto wrapper_opt = Entity::fromBinary(buffer);
         if (!wrapper_opt) {
-            RELAIS_LOG_ERROR << name() << ": updateFromBinary failed to parse binary data";
+            RELAIS_LOG_ERROR << name() << ": updateBinary failed to parse binary data";
             co_return false;
         }
         auto wrapper = std::make_shared<const Entity>(std::move(*wrapper_opt));
@@ -158,4 +158,4 @@ public:
 
 }  // namespace jcailloux::relais
 
-#endif  // JCX_RELAIS_REPOSITORY_H
+#endif  // JCX_RELAIS_REPO_H

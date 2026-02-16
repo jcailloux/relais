@@ -155,7 +155,7 @@ struct ListQuery {
     /// Returns the pre-computed hash (from HTTP query string)
     [[nodiscard]] size_t hash() const noexcept { return query_hash; }
 
-    [[nodiscard]] std::shared_ptr<const std::string> toJson() const {
+    [[nodiscard]] std::shared_ptr<const std::string> json() const {
         auto buffer = std::make_shared<std::string>();
         glz::write_json(*this, *buffer);
         return buffer;

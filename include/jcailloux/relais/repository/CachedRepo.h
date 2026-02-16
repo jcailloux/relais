@@ -1,15 +1,15 @@
-#ifndef JCX_RELAIS_CACHEDREPOSITORY_H
-#define JCX_RELAIS_CACHEDREPOSITORY_H
+#ifndef JCX_RELAIS_CACHEDREPO_H
+#define JCX_RELAIS_CACHEDREPO_H
 
 #include <atomic>
 #include <chrono>
 #include <memory>
 #include <type_traits>
 #include "jcailloux/relais/io/Task.h"
-#include "jcailloux/relais/repository/RedisRepository.h"
+#include "jcailloux/relais/repository/RedisRepo.h"
 #include "jcailloux/relais/Log.h"
 #include <jcailloux/shardmap/ShardMap.h>
-#include "jcailloux/relais/config/repository_config.h"
+#include "jcailloux/relais/config/repo_config.h"
 
 #ifdef RELAIS_BUILDING_TESTS
 namespace relais_test { struct TestInternals; }
@@ -71,28 +71,28 @@ struct EntityCacheMetadata {
 };
 
 /**
- * Repository with L1 RAM cache.
+ * Repo with L1 RAM cache.
  *
  * Supports two modes based on Cfg.cache_level:
  * - CacheLevel::L1:    RAM -> Database (Redis bypassed)
  * - CacheLevel::L1_L2: RAM -> Redis -> Database (full hierarchy)
  *
- * Note: L1RepoConfig constraint is verified in Repository.h to avoid
+ * Note: L1RepoConfig constraint is verified in Repo.h to avoid
  * eager evaluation issues with std::conditional_t.
  */
 template<typename Entity, config::FixedString Name, config::CacheConfig Cfg, typename Key>
 requires CacheableEntity<Entity>
-class CachedRepository : public std::conditional_t<
+class CachedRepo : public std::conditional_t<
     Cfg.cache_level == config::CacheLevel::L1,
-    BaseRepository<Entity, Name, Cfg, Key>,
-    RedisRepository<Entity, Name, Cfg, Key>
+    BaseRepo<Entity, Name, Cfg, Key>,
+    RedisRepo<Entity, Name, Cfg, Key>
 > {
     static constexpr bool HasRedis = (Cfg.cache_level == config::CacheLevel::L1_L2);
 
     using Base = std::conditional_t<
         HasRedis,
-        RedisRepository<Entity, Name, Cfg, Key>,
-        BaseRepository<Entity, Name, Cfg, Key>
+        RedisRepo<Entity, Name, Cfg, Key>,
+        BaseRepo<Entity, Name, Cfg, Key>
     >;
 
     using Mapping = typename Entity::MappingType;
@@ -116,12 +116,12 @@ public:
 
     /// Find by ID with L1 -> (L2) -> DB fallback.
     /// Returns shared_ptr to immutable entity (nullptr if not found).
-    static io::Task<WrapperPtrType> findById(const Key& id) {
+    static io::Task<WrapperPtrType> find(const Key& id) {
         if (auto cached = getFromCache(id)) {
             co_return cached;
         }
 
-        auto ptr = co_await Base::findById(id);
+        auto ptr = co_await Base::find(id);
         if (ptr) {
             putInCache(id, ptr);
         }
@@ -130,38 +130,51 @@ public:
 
     /// Find by ID and return raw JSON string.
     /// Returns shared_ptr to JSON string (nullptr if not found).
-    static io::Task<std::shared_ptr<const std::string>> findByIdAsJson(const Key& id) {
+    static io::Task<std::shared_ptr<const std::string>> findJson(const Key& id) {
         if (auto cached = getFromCache(id)) {
-            co_return cached->toJson();
+            co_return cached->json();
+        }
+
+        auto ptr = co_await find(id);
+        co_return ptr ? ptr->json() : nullptr;
+    }
+
+    /// Find by ID and return raw binary (BEVE).
+    /// Returns shared_ptr to binary data (nullptr if not found).
+    static io::Task<std::shared_ptr<const std::vector<uint8_t>>> findBinary(const Key& id)
+        requires HasBinarySerialization<Entity>
+    {
+        if (auto cached = getFromCache(id)) {
+            co_return cached->binary();
         }
 
         if constexpr (HasRedis) {
-            auto json = co_await Base::findByIdAsJson(id);
-            if (json) {
-                if (auto entity = Entity::fromJson(*json)) {
+            auto bin = co_await Base::findBinary(id);
+            if (bin) {
+                if (auto entity = Entity::fromBinary(*bin)) {
                     putInCache(id, std::make_shared<const Entity>(std::move(*entity)));
                 }
             }
-            co_return json;
+            co_return bin;
         } else {
-            auto ptr = co_await Base::findById(id);
+            auto ptr = co_await Base::find(id);
             if (ptr) {
                 putInCache(id, ptr);
-                co_return ptr->toJson();
+                co_return ptr->binary();
             }
             co_return nullptr;
         }
     }
 
-    /// Create entity and cache it. Returns shared_ptr to immutable entity.
+    /// insert entity and cache it. Returns shared_ptr to immutable entity.
     /// Compile-time error if Cfg.read_only is true.
-    static io::Task<WrapperPtrType> create(WrapperPtrType wrapper)
+    static io::Task<WrapperPtrType> insert(WrapperPtrType wrapper)
         requires CreatableEntity<Entity, Key> && (!Cfg.read_only)
     {
-        auto inserted = co_await Base::create(wrapper);
+        auto inserted = co_await Base::insert(wrapper);
         if (inserted) {
             // Populate L1 cache with the new entity
-            putInCache(inserted->getPrimaryKey(), inserted);
+            putInCache(inserted->key(), inserted);
             co_return inserted;
         }
         co_return nullptr;
@@ -179,7 +192,7 @@ public:
         if (success) {
             // Update L1 cache based on configured strategy
             if constexpr (Cfg.update_strategy == InvalidateAndLazyReload) {
-                invalidateL1Internal(id);
+                evict(id);
             } else {
                 putInCache(id, wrapper);
             }
@@ -187,22 +200,22 @@ public:
         co_return success;
     }
 
-    /// Partial update: invalidates L1 then delegates to Base::updateBy.
+    /// Partial update: invalidates L1 then delegates to Base::patch.
     /// Returns the re-fetched entity (nullptr on error or not found).
     template<typename... Updates>
-    static io::Task<WrapperPtrType> updateBy(const Key& id, Updates&&... updates)
+    static io::Task<WrapperPtrType> patch(const Key& id, Updates&&... updates)
         requires HasFieldUpdate<Entity> && (!Cfg.read_only)
     {
-        invalidateL1Internal(id);
-        co_return co_await Base::updateBy(id, std::forward<Updates>(updates)...);
+        evict(id);
+        co_return co_await Base::patch(id, std::forward<Updates>(updates)...);
     }
 
-    /// Remove entity by ID.
+    /// Erase entity by ID.
     /// Returns: rows deleted (0 if not found), or nullopt on DB error.
     /// Invalidates L1 cache unless DB error occurred (self-healing).
     /// For CompositeKey entities, provides L1 cache hint for partition pruning.
     /// Compile-time error if Cfg.read_only is true.
-    static io::Task<std::optional<size_t>> remove(const Key& id)
+    static io::Task<std::optional<size_t>> erase(const Key& id)
         requires (!Cfg.read_only)
     {
         // Provide L1 hint for partition pruning (free: ~0ns RAM lookup)
@@ -211,35 +224,27 @@ public:
             hint = getFromCache(id);
         }
 
-        auto result = co_await Base::removeImpl(id, std::move(hint));
+        auto result = co_await Base::eraseImpl(id, std::move(hint));
         if (result.has_value()) {
-            invalidateL1Internal(id);
+            evict(id);
         }
         co_return result;
     }
 
     /// Invalidate L1 and L2 caches for a key.
     static io::Task<void> invalidate(const Key& id) {
-        invalidateL1Internal(id);
+        evict(id);
         if constexpr (HasRedis) {
-            co_await Base::invalidateRedis(id);
+            co_await Base::evictRedis(id);
         }
     }
 
     /// Invalidate L1 cache only. Non-coroutine since there is no async work.
-    static void invalidateL1(const Key& id) {
-        invalidateL1Internal(id);
-    }
-
-private:
-    /// Internal L1 invalidation.
-    static void invalidateL1Internal(const Key& id) {
+    static void evict(const Key& id) {
         cache().invalidate(id);
     }
 
-public:
-
-    [[nodiscard]] static size_t cacheSize() {
+    [[nodiscard]] static size_t size() {
         return cache().size();
     }
 
@@ -248,9 +253,9 @@ public:
         Clock::time_point now;
     };
 
-    /// Try to trigger a cleanup (non-blocking).
-    /// Returns true if cleanup was performed, false if another cleanup is in progress.
-    static bool triggerCleanup() {
+    /// Try to sweep one shard.
+    /// Returns immediately if a sweep is already in progress.
+    static bool trySweep() {
         CleanupContext ctx{Clock::now()};
         return cache().try_cleanup(ctx, [](const Key&,
                                             const Metadata& meta,
@@ -259,8 +264,18 @@ public:
         }).has_value();
     }
 
-    /// Full cleanup (blocking) - processes all shards.
-    static size_t fullCleanup() {
+    /// Sweep one shard.
+    static bool sweep() {
+        CleanupContext ctx{Clock::now()};
+        return cache().cleanup(ctx, [](const Key&,
+                                            const Metadata& meta,
+                                            const CleanupContext& ctx) {
+            return meta.expiration() < ctx.now;
+        }).removed > 0;
+    }
+
+    /// Sweep all shards.
+    static size_t purge() {
         CleanupContext ctx{Clock::now()};
         return cache().full_cleanup(ctx, [](const Key&,
                                              const Metadata& meta,
@@ -330,7 +345,7 @@ protected:
         if (!last_cleanup_time.compare_exchange_strong(last, now, std::memory_order_relaxed))
             return;
 
-        triggerCleanup();
+        trySweep();
     }
 
     /// Put entity in cache (wraps in shared_ptr).
@@ -352,4 +367,4 @@ protected:
 
 }  // namespace jcailloux::relais
 
-#endif //JCX_RELAIS_CACHEDREPOSITORY_H
+#endif //JCX_RELAIS_CACHEDREPO_H

@@ -7,7 +7,7 @@
 #
 # This script:
 #   1. Initializes the test database (PostgreSQL)
-#   2. Generates test fixtures (FlatBuffers, ORM models, entities)
+#   2. Generates test fixtures (binary, ORM models, entities)
 #
 # =============================================================================
 

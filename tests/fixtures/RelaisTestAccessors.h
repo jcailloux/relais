@@ -6,7 +6,7 @@
  * Test-only accessor for relais internal state.
  * Compiled only when RELAIS_BUILDING_TESTS is defined.
  * Provides cache reset, modification count inspection, and forced cleanup
- * via friend access to CachedRepository, ListMixin, ListCache, and ModificationTracker.
+ * via friend access to CachedRepo, ListMixin, ListCache, and ModificationTracker.
  */
 
 #include <shared_mutex>
@@ -47,14 +47,14 @@ struct TestInternals {
     /// Force a modification tracker cleanup cycle (partial, one shard).
     template<typename Repo>
     static void forceModificationTrackerCleanup() {
-        Repo::listCache().triggerCleanup();
+        Repo::listCache().trySweep();
     }
 
     /// Full cleanup of list cache only (entity cache untouched).
     /// Processes all shards + drains modification tracker.
     template<typename Repo>
     static size_t forceFullListCleanup() {
-        return Repo::listCache().fullCleanup();
+        return Repo::listCache().purge();
     }
 
     /// Call ModificationTracker::cleanup() directly with a controlled cutoff and shard identity.
@@ -62,7 +62,7 @@ struct TestInternals {
     template<typename Repo>
     static void cleanupModificationsWithCutoff(
             std::chrono::steady_clock::time_point cutoff, uint8_t shard_id) {
-        Repo::listCache().modifications_.cleanup(cutoff, shard_id);
+        Repo::listCache().modifications_.drainShard(cutoff, shard_id);
     }
 
     /// Call ModificationTracker::drain() directly with a controlled cutoff.
@@ -74,7 +74,7 @@ struct TestInternals {
     }
 
     /// Direct L1 cache get — bypasses coroutine overhead.
-    /// Same path as findById L1 hit, but synchronous (no sync_wait thread).
+    /// Same path as find L1 hit, but synchronous (no sync_wait thread).
     template<typename Repo, typename Key>
     static auto getFromCache(const Key& key) {
         return Repo::getFromCache(key);
@@ -88,8 +88,8 @@ struct TestInternals {
 
     /// Direct L1 cache invalidate.
     template<typename Repo, typename Key>
-    static void invalidateL1(const Key& key) {
-        Repo::invalidateL1Internal(key);
+    static void evict(const Key& key) {
+        Repo::evict(key);
     }
 
     /// Read the shard_id for a cached list entry (for bitmap skip testing).

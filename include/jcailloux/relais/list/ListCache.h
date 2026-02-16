@@ -24,7 +24,7 @@ namespace jcailloux::relais::cache::list {
 // =============================================================================
 
 enum class PaginationMode : uint8_t {
-    Offset = 0,  // Traditional offset+limit (cascade invalidation for create/delete)
+    Offset = 0,  // Traditional offset+limit (cascade invalidation for insert/delete)
     Cursor = 1   // Keyset/cursor-based (localized invalidation)
 };
 
@@ -153,7 +153,7 @@ struct ListBoundsHeader {
         return h;
     }
 
-    /// Check if a create or delete of an entity with this sort value affects this page.
+    /// Check if a insert or delete of an entity with this sort value affects this page.
     ///
     /// - Offset mode (cascade): the segment is affected if entity_val is within or above
     ///   its range, because inserting/deleting shifts all subsequent segments.
@@ -308,7 +308,7 @@ public:
     ResultPtr get(const Query& query) {
         // Trigger cleanup every N gets
         if (++get_counter_ % config_.cleanup_every_n_gets == 0) {
-            triggerCleanup();
+            trySweep();
         }
 
         auto key = query.hash();
@@ -400,9 +400,9 @@ public:
         const ListCache& cache;
     };
 
-    /// Try to trigger a cleanup (non-blocking)
-    /// Returns true if cleanup was performed, false if another cleanup is in progress
-    bool triggerCleanup() {
+    /// Try to sweep one shard.
+    /// Returns immediately if a sweep is already in progress.
+    bool trySweep() {
         // Snapshot time BEFORE shard cleanup so that modifications added
         // during cleanup are not counted (they weren't fully considered).
         const auto now = Clock::now();
@@ -418,7 +418,7 @@ public:
                const CleanupContext& ctx, uint8_t shard_id) {
                 // 1. TTL check
                 if (meta->cachedAt() < ctx.expiration_limit) {
-                    return true;  // Expired, remove
+                    return true;  // Expired, erase
                 }
 
                 // 2. Check if affected by modifications (with bitmap skip)
@@ -442,14 +442,15 @@ public:
             });
 
         if (shard) {
-            modifications_.cleanup(now, *shard);
+            modifications_.drainShard(now, *shard);
         }
 
         return shard.has_value();
     }
 
-    /// Full cleanup (blocking) - processes all shards
-    size_t fullCleanup() {
+    /// Sweep one shard.
+    /// Returns true if entries were removed.
+    bool sweep() {
         const auto now = Clock::now();
 
         CleanupContext ctx{
@@ -458,7 +459,50 @@ public:
             .cache = *this
         };
 
-        size_t removed = cache_.full_cleanup(ctx,
+        auto result = cache_.cleanup(ctx,
+            [](const CacheKey&, const ResultPtr& result, const MetadataPtr& meta,
+               const CleanupContext& ctx, uint8_t shard_id) {
+                // 1. TTL check
+                if (meta->cachedAt() < ctx.expiration_limit) {
+                    return true;  // Expired, erase
+                }
+
+                // 2. Check if affected by modifications (with bitmap skip)
+                bool affected = false;
+                ctx.modifications.forEachModificationWithBitmap(
+                    [&](const Modification& mod, BitmapType pending_segments) {
+                        if (affected) return;
+
+                        // Skip: shard already cleaned for this modification
+                        if ((pending_segments & (BitmapType{1} << shard_id)) == 0) return;
+
+                        // Skip: data created after modification
+                        if (mod.modified_at <= meta->cachedAt()) return;
+
+                        if (ctx.cache.isModificationAffecting(mod, meta, *result)) {
+                            affected = true;
+                        }
+                    });
+
+                return affected;
+            });
+
+        modifications_.drainShard(now, result.shard_id);
+
+        return result.removed > 0;
+    }
+
+    /// Sweep all shards.
+    size_t purge() {
+        const auto now = Clock::now();
+
+        CleanupContext ctx{
+            .expiration_limit = now - config_.default_ttl,
+            .modifications = modifications_,
+            .cache = *this
+        };
+
+        size_t erased = cache_.full_cleanup(ctx,
             [](const CacheKey&, const ResultPtr& result, const MetadataPtr& meta,
                const CleanupContext& ctx) {
                 if (meta->cachedAt() < ctx.expiration_limit) {
@@ -481,7 +525,7 @@ public:
         // All shards processed — drain modifications that existed before cleanup
         modifications_.drain(now);
 
-        return removed;
+        return erased;
     }
 
     // =========================================================================
@@ -558,7 +602,7 @@ private:
             }
         }
 
-        // Check new_entity if present (for create/update)
+        // Check new_entity if present (for insert/update)
         if (mod.new_entity && Traits::matchesFilters(*mod.new_entity, filters)) {
             if (isEntityInPageRange(*mod.new_entity, query, result, bounds, sort)) {
                 return true;

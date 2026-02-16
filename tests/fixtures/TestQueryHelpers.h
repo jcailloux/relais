@@ -11,8 +11,8 @@
 
 namespace relais_test {
 
-using ArticleListQuery = TestArticleListRepository::ListQuery;
-using PurchaseListQuery = TestPurchaseListRepository::ListQuery;
+using ArticleListQuery = TestArticleListRepo::ListQuery;
+using PurchaseListQuery = TestPurchaseListRepo::ListQuery;
 
 inline ArticleListQuery makeArticleQuery(
     std::optional<std::string> category = std::nullopt,

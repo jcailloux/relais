@@ -1,9 +1,9 @@
 /**
  * test_redis_repository_compile.cpp
  *
- * Compile-time and structural tests for RedisRepository and RedisCache.
+ * Compile-time and structural tests for RedisRepo and RedisCache.
  * Verifies that:
- *   - RedisRepository instantiates with all entity types
+ *   - RedisRepo instantiates with all entity types
  *   - Type aliases, config, and l2Ttl are correct
  *   - RedisCache namespace is jcailloux::relais::cache
  *   - InvalidateOn types compile in the new namespace
@@ -15,7 +15,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
-#include "jcailloux/relais/repository/RedisRepository.h"
+#include "jcailloux/relais/repository/RedisRepo.h"
 #include "jcailloux/relais/cache/InvalidateOn.h"
 #include "fixtures/generated/TestItemWrapper.h"
 #include "fixtures/generated/TestUserWrapper.h"
@@ -24,7 +24,7 @@
 using namespace jcailloux::relais;
 
 // =========================================================================
-// Instantiate RedisRepository with each entity type to verify compilation.
+// Instantiate RedisRepo with each entity type to verify compilation.
 // L2 TTL = 5min in nanoseconds.
 // =========================================================================
 
@@ -33,11 +33,11 @@ static constexpr auto kRedisConfig = config::CacheConfig{
     .l2_ttl = std::chrono::minutes(5),
 };
 
-using ItemRedisRepo = RedisRepository<
+using ItemRedisRepo = RedisRepo<
     entity::generated::TestItemWrapper, "test:item:redis", kRedisConfig, int64_t>;
-using UserRedisRepo = RedisRepository<
+using UserRedisRepo = RedisRepo<
     entity::generated::TestUserWrapper, "test:user:redis", kRedisConfig, int64_t>;
-using OrderRedisRepo = RedisRepository<
+using OrderRedisRepo = RedisRepo<
     entity::generated::TestOrderWrapper, "test:order:redis", kRedisConfig, int64_t>;
 
 // With l2_refresh_on_get
@@ -47,20 +47,20 @@ static constexpr auto kRedisRefreshConfig = config::CacheConfig{
     .l2_refresh_on_get = true,
 };
 
-using ItemRedisRefreshRepo = RedisRepository<
+using ItemRedisRefreshRepo = RedisRepo<
     entity::generated::TestItemWrapper, "test:item:redis:refresh", kRedisRefreshConfig, int64_t>;
 
 // Read-only variant
 static constexpr auto kReadOnlyRedisConfig = kRedisConfig.with_read_only();
 
-using ReadOnlyItemRedisRepo = RedisRepository<
+using ReadOnlyItemRedisRepo = RedisRepo<
     entity::generated::TestItemWrapper, "test:item:redis:ro", kReadOnlyRedisConfig, int64_t>;
 
 // =========================================================================
 // Type trait tests
 // =========================================================================
 
-TEST_CASE("RedisRepository type traits", "[redis_repo]") {
+TEST_CASE("RedisRepo type traits", "[redis_repo]") {
     SECTION("EntityType is correct") {
         STATIC_REQUIRE(std::is_same_v<
             ItemRedisRepo::EntityType, entity::generated::TestItemWrapper>);
@@ -98,7 +98,7 @@ TEST_CASE("RedisRepository type traits", "[redis_repo]") {
 // L2 TTL tests
 // =========================================================================
 
-TEST_CASE("RedisRepository l2Ttl", "[redis_repo]") {
+TEST_CASE("RedisRepo l2Ttl", "[redis_repo]") {
     SECTION("l2Ttl returns configured duration") {
         auto ttl = ItemRedisRepo::l2Ttl();
         auto seconds = std::chrono::duration_cast<std::chrono::seconds>(ttl).count();
@@ -116,7 +116,7 @@ TEST_CASE("RedisRepository l2Ttl", "[redis_repo]") {
 // Redis key generation tests
 // =========================================================================
 
-TEST_CASE("RedisRepository makeRedisKey", "[redis_repo]") {
+TEST_CASE("RedisRepo makeRedisKey", "[redis_repo]") {
     SECTION("integer key") {
         auto key = ItemRedisRepo::makeRedisKey(42);
         REQUIRE(key == "test:item:redis:42");
@@ -140,7 +140,7 @@ TEST_CASE("RedisRepository makeRedisKey", "[redis_repo]") {
 // Concept verification tests
 // =========================================================================
 
-TEST_CASE("RedisRepository concepts", "[redis_repo]") {
+TEST_CASE("RedisRepo concepts", "[redis_repo]") {
     SECTION("CacheableEntity is satisfied") {
         STATIC_REQUIRE(CacheableEntity<entity::generated::TestItemWrapper>);
         STATIC_REQUIRE(CacheableEntity<entity::generated::TestUserWrapper>);
@@ -163,10 +163,10 @@ TEST_CASE("RedisRepository concepts", "[redis_repo]") {
 }
 
 // =========================================================================
-// Group key tests (same logic as BaseRepository but via RedisRepository)
+// Group key tests (same logic as BaseRepo but via RedisRepo)
 // =========================================================================
 
-TEST_CASE("RedisRepository group keys", "[redis_repo]") {
+TEST_CASE("RedisRepo group keys", "[redis_repo]") {
     SECTION("makeGroupKey with string parts") {
         auto key = ItemRedisRepo::makeGroupKey("category", "tech");
         REQUIRE(key == "test:item:redis:list:category:tech");

@@ -1,5 +1,5 @@
-#ifndef JCX_RELAIS_BASEREPOSITORY_H
-#define JCX_RELAIS_BASEREPOSITORY_H
+#ifndef JCX_RELAIS_BASEREPO_H
+#define JCX_RELAIS_BASEREPO_H
 
 #include <optional>
 #include <string>
@@ -11,7 +11,7 @@
 #include "jcailloux/relais/io/pg/PgResult.h"
 #include "jcailloux/relais/DbProvider.h"
 #include "jcailloux/relais/Log.h"
-#include "jcailloux/relais/config/repository_config.h"
+#include "jcailloux/relais/config/repo_config.h"
 #include "jcailloux/relais/config/FixedString.h"
 #include "jcailloux/relais/wrapper/EntityConcepts.h"
 #include "jcailloux/relais/wrapper/FieldUpdate.h"
@@ -75,10 +75,10 @@ inline std::string buildUpdateReturning(
 }  // namespace detail
 
 // =========================================================================
-// BaseRepository - CRUD operations with L3 (database) access only
+// BaseRepo - CRUD operations with L3 (database) access only
 // =========================================================================
 //
-// Hierarchy: BaseRepository -> RedisRepository -> CachedRepository
+// Hierarchy: BaseRepo -> RedisRepo -> CachedRepo
 //
 // No CRTP. Config is a CacheConfig NTTP. Cross-invalidation is handled
 // by InvalidationMixin at a higher layer.
@@ -89,7 +89,7 @@ inline std::string buildUpdateReturning(
 
 template<typename Entity, config::FixedString Name, config::CacheConfig Cfg, typename Key>
 requires ReadableEntity<Entity>
-class BaseRepository {
+class BaseRepo {
     using Mapping = typename Entity::MappingType;
 
 public:
@@ -107,7 +107,7 @@ public:
 
     /// Find by ID with L3 (database) access only.
     /// Returns shared_ptr to immutable entity (nullptr if not found).
-    static io::Task<WrapperPtrType> findById(const Key& id) {
+    static io::Task<WrapperPtrType> find(const Key& id) {
         try {
             auto result = co_await DbProvider::queryArgs(
                 Mapping::SQL::select_by_pk, id);
@@ -121,13 +121,13 @@ public:
     }
 
     // =====================================================================
-    // Create
+    // insert
     // =====================================================================
 
-    /// Create entity in database.
+    /// insert entity in database.
     /// Returns shared_ptr to immutable entity (nullptr on error).
     /// Uses INSERT ... RETURNING to get the full entity back (with DB-managed fields).
-    static io::Task<WrapperPtrType> create(WrapperPtrType wrapper)
+    static io::Task<WrapperPtrType> insert(WrapperPtrType wrapper)
         requires MutableEntity<Entity> && (!Cfg.read_only)
     {
         if (!wrapper) co_return nullptr;
@@ -141,7 +141,7 @@ public:
             co_return entity ? std::make_shared<const Entity>(std::move(*entity)) : nullptr;
 
         } catch (const io::PgError& e) {
-            RELAIS_LOG_ERROR << name() << ": create error - " << e.what();
+            RELAIS_LOG_ERROR << name() << ": insert error - " << e.what();
             co_return nullptr;
         }
     }
@@ -182,24 +182,24 @@ public:
     }
 
     // =====================================================================
-    // Remove
+    // Erase
     // =====================================================================
 
-    /// Remove entity by ID.
+    /// Erase entity by ID.
     /// Returns: rows deleted (0 if not found), or nullopt on DB error.
-    static io::Task<std::optional<size_t>> remove(const Key& id)
+    static io::Task<std::optional<size_t>> erase(const Key& id)
         requires (!Cfg.read_only)
     {
-        co_return co_await removeImpl(id, nullptr);
+        co_return co_await eraseImpl(id, nullptr);
     }
 
 protected:
-    /// Internal remove with optional entity hint (used by cache layers for
+    /// Internal erase with optional entity hint (used by cache layers for
     /// partition pruning optimization on composite-key entities).
     /// When a hint is available AND the entity has a composite key, uses the
     /// full PK SQL for single-partition deletion. Otherwise falls back to
     /// partial key SQL (scans all partitions — acceptable).
-    static io::Task<std::optional<size_t>> removeImpl(
+    static io::Task<std::optional<size_t>> eraseImpl(
         const Key& id, WrapperPtrType cachedHint = nullptr)
         requires (!Cfg.read_only)
     {
@@ -222,7 +222,7 @@ protected:
             }
             co_return static_cast<size_t>(affected);
         } catch (const io::PgError& e) {
-            RELAIS_LOG_ERROR << name() << ": remove error - " << e.what();
+            RELAIS_LOG_ERROR << name() << ": erase error - " << e.what();
             co_return std::nullopt;
         }
     }
@@ -230,17 +230,17 @@ protected:
 public:
 
     // =====================================================================
-    // Partial update (updateBy)
+    // Partial update (patch)
     // =====================================================================
 
     /// Partial update: modifies only the specified fields in the database.
     /// Builds UPDATE ... SET col=$1, ... WHERE pk=$N RETURNING * (single query).
     /// Returns the re-fetched entity from DB (nullptr on error or not found).
     template<typename... Updates>
-    static io::Task<WrapperPtrType> updateBy(const Key& id, Updates&&... updates)
+    static io::Task<WrapperPtrType> patch(const Key& id, Updates&&... updates)
         requires HasFieldUpdate<Entity> && (!Cfg.read_only)
     {
-        static_assert(sizeof...(Updates) > 0, "updateBy requires at least one field update");
+        static_assert(sizeof...(Updates) > 0, "patch requires at least one field update");
 
         try {
             // Build SQL at first call (thread-safe static init).
@@ -263,7 +263,7 @@ public:
             co_return entity ? std::make_shared<const Entity>(std::move(*entity)) : nullptr;
 
         } catch (const io::PgError& e) {
-            RELAIS_LOG_ERROR << name() << ": updateBy error - " << e.what();
+            RELAIS_LOG_ERROR << name() << ": patch error - " << e.what();
             co_return nullptr;
         }
     }
@@ -272,7 +272,7 @@ public:
     // Invalidation pass-through (public interface)
     // =====================================================================
 
-    /// Invalidate cache for a key. No-op at BaseRepository level.
+    /// Invalidate cache for a key. No-op at BaseRepo level.
     static io::Task<void> invalidate([[maybe_unused]] const Key& id) {
         co_return;
     }
@@ -284,7 +284,7 @@ public:
     }
 
     /// Selectively invalidate list pages for a pre-built group key.
-    /// No-op at BaseRepository level.
+    /// No-op at BaseRepo level.
     static io::Task<size_t> invalidateListGroupByKey(
         [[maybe_unused]] const std::string& groupKey,
         [[maybe_unused]] int64_t entity_sort_val)
@@ -292,7 +292,7 @@ public:
         co_return 0;
     }
 
-    /// Invalidate all list cache groups. No-op at BaseRepository level.
+    /// Invalidate all list cache groups. No-op at BaseRepo level.
     static io::Task<size_t> invalidateAllListGroups()
     {
         co_return 0;
@@ -420,4 +420,4 @@ protected:
 
 }  // namespace jcailloux::relais
 
-#endif //JCX_RELAIS_BASEREPOSITORY_H
+#endif //JCX_RELAIS_BASEREPO_H
