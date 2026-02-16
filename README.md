@@ -1,6 +1,6 @@
 # relais
 
-A header-only C++23 repository pattern library for [Drogon](https://github.com/drogonframework/drogon) with integrated multi-tier caching.
+A header-only C++23 repository pattern library with integrated multi-tier caching (L1 RAM, L2 Redis, L3 PostgreSQL).
 
 ## Features
 
@@ -23,8 +23,9 @@ A header-only C++23 repository pattern library for [Drogon](https://github.com/d
 ## Requirements
 
 - C++23 compiler (GCC 13+, Clang 17+)
-- Drogon framework with PostgreSQL ORM
-- [shardmap](../jcailloux-shardmap) (in-memory TTL cache with callback-based validation)
+- PostgreSQL (libpq)
+- [shardmap](https://github.com/jcailloux/shardmap) (in-memory TTL cache with callback-based validation)
+- [glaze](https://github.com/stephenberry/glaze) (JSON/BEVE serialization)
 - Redis (optional, for L2 caching)
 
 ## Installation
@@ -67,7 +68,7 @@ Entities are pure C++ structs with `@relais` inline annotations. The Python gene
 
 ```cpp
 // 1. Pure data struct (framework-agnostic, shareable)
-// @relais model=drogon_model::User
+// @relais table=users
 // @relais output=entities/generated/UserWrapper.h
 struct User {
     int64_t id = 0;    // @relais primary_key db_managed
@@ -197,24 +198,29 @@ using EventRepository = relais::Repository<EventWrapper, "Event", config::Both>;
 ### 3. Use the repository
 
 ```cpp
-drogon::Task<void> example() {
+io::Task<void> example() {
     // Find by ID (automatically uses cache)
     auto user = co_await UserRepository::findById(123);
     if (user) {
-        LOG_INFO << "Found: " << user->username;  // Direct data member access
+        std::cout << "Found: " << user->username << "\n";
     }
 
     // Create (automatically caches result) - only if !read_only
-    auto newUser = UserWrapper::fromModel(createUserModel("alice", "alice@example.com"));
-    auto created = co_await UserRepository::create(newUser);
+    UserWrapper newUser;
+    newUser.username = "alice";
+    newUser.email = "alice@example.com";
+    auto created = co_await UserRepository::create(
+        std::make_shared<const UserWrapper>(std::move(newUser)));
 
     // Update - only if !read_only
-    auto updatedUser = createUpdatedUser(created);
-    co_await UserRepository::update(created->id, updatedUser);
+    UserWrapper modified = *created;
+    modified.balance = 100;
+    co_await UserRepository::update(created->id,
+        std::make_shared<const UserWrapper>(std::move(modified)));
 
     // Partial update - only modifies specified fields (requires generated entity with Field enum)
     using F = UserWrapper::Field;
-    using jcailloux::drogon::wrapper::set;
+    using jcailloux::relais::wrapper::set;
     auto updated = co_await UserRepository::updateBy(created->id,
         set<F::balance>(999),
         set<F::username>("bob"));
@@ -234,7 +240,7 @@ Entities use Glaze for both binary (BEVE) and JSON serialization. Both formats a
 
 - **L1 (RAM)**: Stores `shared_ptr<const Entity>` directly
 - **L2 (Redis)**: Stores BEVE binary data; deserialized on retrieval
-- **L3 (PostgreSQL)**: Source of truth; entities are constructed via `fromModel()`
+- **L3 (PostgreSQL)**: Source of truth; entities are constructed via `fromRow()`
 
 The struct's `glz::meta` specialization drives both BEVE and JSON serialization — no manual serialization code is needed.
 
@@ -344,17 +350,17 @@ using AuditLogRepo = Repository<AuditLogWrapper, "AuditLog",
 This is enforced via `requires` clauses:
 ```cpp
 static Task<bool> update(const Key& id, WrapperPtr wrapper)
-    requires MutableEntity<Entity, Model> && (!Cfg.read_only);
+    requires MutableEntity<Entity> && (!Cfg.read_only);
 ```
 
 ## Partial Updates with `updateBy`
 
-Generated entities expose a `Field` enum for type-safe partial updates. Only the specified columns are written to the database (via Drogon's dirty-flag tracking), and the full entity is re-fetched after the update.
+Generated entities expose a `Field` enum for type-safe partial updates. Only the specified columns are written to the database (via dynamic `UPDATE ... SET` built from `FieldInfo::column_name`), and the full entity is re-fetched after the update.
 
 ```cpp
 using F = UserWrapper::Field;
-using jcailloux::drogon::wrapper::set;
-using jcailloux::drogon::wrapper::setNull;
+using jcailloux::relais::wrapper::set;
+using jcailloux::relais::wrapper::setNull;
 
 // Update a single field
 auto updated = co_await UserRepository::updateBy(id, set<F::balance>(999));
@@ -418,14 +424,12 @@ When the source entity doesn't contain the target cache's key directly (e.g., th
 ```cpp
 // Resolver: query junction table to find target keys
 struct UserToGuildsResolver {
-    static drogon::Task<std::vector<int64_t>> resolve(int64_t user_id) {
-        auto db = drogon::app().getDbClient();
-        drogon::orm::CoroMapper<GuildMembers> mapper(db);
-        auto rows = co_await mapper.findBy(
-            drogon::orm::Criteria(GuildMembers::Cols::_user_id, user_id));
+    static io::Task<std::vector<int64_t>> resolve(int64_t user_id) {
+        auto result = co_await DbProvider::queryArgs(
+            "SELECT guild_id FROM guild_members WHERE user_id = $1", user_id);
         std::vector<int64_t> guild_ids;
-        for (const auto& row : rows)
-            guild_ids.push_back(row.getValueOfGuildId());
+        for (size_t i = 0; i < result.size(); ++i)
+            guild_ids.push_back(result[i].get<int64_t>(0));
         co_return guild_ids;
     }
 };
@@ -447,16 +451,15 @@ The target list repository defines a `GroupKey` type (typed filter values) and a
 using Target = cache::ListInvalidationTarget<ArticleListRepo::GroupKey>;
 
 struct PurchaseToArticleResolver {
-    static drogon::Task<std::vector<Target>> resolve(int64_t user_id) {
-        auto db = drogon::app().getDbClient();
-        auto rows = co_await db->execSqlCoro(
+    static io::Task<std::vector<Target>> resolve(int64_t user_id) {
+        auto result = co_await DbProvider::queryArgs(
             "SELECT category, view_count FROM articles WHERE author_id = $1", user_id);
 
         std::vector<Target> targets;
-        for (const auto& row : rows) {
+        for (size_t i = 0; i < result.size(); ++i) {
             Target t;
-            t.filters.category = row["category"].as<std::string>();
-            t.sort_value = row["view_count"].as<int64_t>();
+            t.filters.category = result[i].get<std::string>(0);
+            t.sort_value = result[i].get<int64_t>(1);
             targets.push_back(std::move(t));
         }
         co_return targets;
@@ -500,7 +503,7 @@ The list cache provides paginated query results with lazy validation via modific
 Annotate fields with `filterable` and `sortable` in the struct header. The generator embeds the `ListDescriptor` inside the Mapping:
 
 ```cpp
-// @relais model=drogon_model::codibot::AuditLogs
+// @relais table=audit_logs
 // @relais output=entities/generated/AuditLogWrapper.h
 // @relais_list limits=10,25,50,100
 struct AuditLog {
@@ -514,12 +517,10 @@ struct AuditLog {
 
 // Generated in the Mapping:
 //   struct ListDescriptor {
-//       using Cols = Model::Cols;
-//       static constexpr auto filters = std::make_tuple(
-//           Filter<"guild_id", &AuditLog::guild_id, &Cols::_guild_id>{}, ...);
-//       static constexpr auto sorts = std::make_tuple(
-//           Sort<"id", &AuditLog::id, &Cols::_id, &Model::getValueOfId, SortDirection::Asc>{}, ...);
-//       static constexpr std::array<uint16_t, 4> allowedLimits = {10, 25, 50, 100};
+//       static constexpr auto filters = std::tuple{
+//           Filter<"guild_id", &AuditLog::guild_id, "guild_id">{}, ...};
+//       static constexpr auto sorts = std::tuple{
+//           Sort<"id", &AuditLog::id, "id", SortDirection::Asc>{}, ...};
 //       static constexpr uint16_t defaultLimit = 10;
 //       static constexpr uint16_t maxLimit = 100;
 //   };
@@ -534,20 +535,21 @@ using AuditLogRepository = Repository<AuditLogWrapper, "AuditLog">;
 // In controller:
 #include <jcailloux/relais/list/decl/HttpQueryParser.h>
 
-Task<HttpResponsePtr> AuditLogsCtrl::list(const HttpRequestPtr req) {
+// parseListQueryStrict takes a generic Map (default: unordered_map<string, string>)
+io::Task<std::string> handleAuditLogList(
+    const std::unordered_map<std::string, std::string>& params)
+{
     // Parse and validate query parameters against the ListDescriptor
-    auto query_result = parseListQueryStrict<AuditLogRepository::ListDescriptorType>(req);
+    auto query_result = parseListQueryStrict<AuditLogRepository::ListDescriptorType>(params);
     if (!query_result) {
-        // Handle validation error...
+        // Handle validation error (query_result.error())...
     }
 
     // Execute paginated query (L1 cached with lazy invalidation)
     auto result = co_await AuditLogRepository::query(std::move(*query_result));
 
-    auto resp = HttpResponse::newHttpResponse();
-    resp->setContentTypeCode(CT_APPLICATION_JSON);
-    resp->setBody(*result.toJson());
-    co_return resp;
+    // result.toJson() returns shared_ptr<const std::string>
+    co_return *result.toJson();
 }
 ```
 
@@ -579,7 +581,7 @@ Generates standalone ORM Mapping structs from `@relais` annotations in C++ struc
 Annotations are inline comments on struct declarations and data members:
 
 ```cpp
-// @relais model=drogon_model::codibot::AuditLogs
+// @relais table=audit_logs
 // @relais output=entities/generated/AuditLogWrapper.h
 // @relais_list limits=10,25,50,100
 struct AuditLog {
@@ -593,16 +595,16 @@ struct AuditLog {
 
 | Annotation (struct-level) | Description |
 |--------------------------|-------------|
-| `model=Qualified::Name` | Drogon ORM model class |
+| `table=table_name` | PostgreSQL table name |
 | `output=path/to/Wrapper.h` | Generated file path (relative to `--output-dir`) |
 | `read_only` | Mark entity as read-only |
 
 | Annotation (field-level) | Description |
 |--------------------------|-------------|
 | `primary_key` | Marks the primary key field |
-| `db_managed` | Excluded from `toModel` (auto-generated by DB) |
-| `timestamp` | `trantor::Date` conversion in `fromModel`/`toModel` |
-| `nullable` | `std::optional<T>` handling with `setToNull` |
+| `db_managed` | Excluded from `toInsertParams` (auto-generated by DB) |
+| `timestamp` | Timestamp field — stored as `std::string` (ISO 8601 format) |
+| `nullable` | `std::optional<T>` handling with `setNull` |
 | `raw_json` | `glz::raw_json_t` — stored as raw string in DB (optional: auto-detected from type) |
 | `json_field` | Struct/vector stored as JSON in DB |
 | `enum` | Auto-resolve DB <-> enum mapping from `glz::meta<EnumType>` in source header |
@@ -616,7 +618,7 @@ struct AuditLog {
 Filter and sort capabilities are declared per-field. Pagination limits stay at class level via `@relais_list`:
 
 ```cpp
-// @relais model=drogon_model::Article
+// @relais table=articles
 // @relais output=entities/generated/ArticleWrapper.h
 // @relais_list limits=10,25,50
 struct Article {
@@ -653,7 +655,7 @@ std::string created_at;  // @relais timestamp filterable:date_from:gte filterabl
 | `sortable:desc` | field name | DESC |
 | `sortable:custom_name:asc` | `custom_name` | ASC |
 
-Column pointers (`&Cols::_field`) are derived automatically from the field name.
+Column names are derived automatically from the field name.
 
 ### Generated Output
 
@@ -721,8 +723,7 @@ When `Invalidations...` is non-empty, the mixin intercepts `create()`, `update()
 Build and run tests:
 
 ```bash
-cd lib/jcailloux-relais
-cmake -B build -DCMAKE_PREFIX_PATH=/path/to/drogon -DRELAIS_BUILD_TESTS=ON
+cmake -B build -DRELAIS_BUILD_TESTS=ON
 cmake --build build
 ctest --test-dir build --output-on-failure
 ```

@@ -106,7 +106,6 @@ public:
     using typename Base::WrapperPtrType;
     using Base::name;
 
-    // Alias for backward compatibility and internal use
     using EntityPtr = WrapperPtrType;
 
     static constexpr auto l1Ttl() { return std::chrono::nanoseconds(Cfg.l1_ttl); }

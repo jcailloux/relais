@@ -1,9 +1,9 @@
 /**
  * test_repository_compile.cpp
  *
- * Compile-time tests for the full Repository mixin chain after Drogon removal.
+ * Compile-time tests for the full Repository mixin chain.
  * Verifies that Repository.h, CachedRepository.h, InvalidationMixin.h,
- * ListMixin.h, and PartialKeyValidator.h compile without Drogon.
+ * ListMixin.h, and PartialKeyValidator.h compile correctly.
  *
  * Exercises all mixin combinations:
  *   - Uncached (BaseRepository only)
