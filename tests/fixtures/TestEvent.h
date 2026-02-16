@@ -12,7 +12,6 @@
 namespace relais_test {
 
     // @relais table=relais_test_events
-    // @relais output=fixtures/generated/TestEventWrapper.h
     struct TestEvent {
         int64_t id = 0;          // @relais primary_key db_managed
         std::string region;      // @relais partition_key

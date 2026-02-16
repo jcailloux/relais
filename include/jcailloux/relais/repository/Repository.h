@@ -3,7 +3,7 @@
 
 #include <span>
 #include <type_traits>
-#include "pqcoro/Task.h"
+#include "jcailloux/relais/io/Task.h"
 #include "jcailloux/relais/Log.h"
 #include "jcailloux/relais/repository/CachedRepository.h"
 #include "jcailloux/relais/repository/InvalidationMixin.h"
@@ -129,7 +129,7 @@ public:
 
     /// Update entity from JSON string.
     /// Parses JSON to create wrapper, then updates via the full mixin chain.
-    static pqcoro::Task<bool> updateFromJson(const Key& id, std::string_view json)
+    static io::Task<bool> updateFromJson(const Key& id, std::string_view json)
         requires MutableEntity<Entity> && (!Cfg.read_only)
     {
         auto wrapper_opt = Entity::fromJson(json);
@@ -143,7 +143,7 @@ public:
 
     /// Update entity from binary data.
     /// Creates wrapper from binary, then updates via the full mixin chain.
-    static pqcoro::Task<bool> updateFromBinary(const Key& id, std::span<const uint8_t> buffer)
+    static io::Task<bool> updateFromBinary(const Key& id, std::span<const uint8_t> buffer)
         requires MutableEntity<Entity> && HasBinarySerialization<Entity> && (!Cfg.read_only)
     {
         auto wrapper_opt = Entity::fromBinary(buffer);

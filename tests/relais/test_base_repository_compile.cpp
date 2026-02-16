@@ -2,7 +2,7 @@
  * test_base_repository_compile.cpp
  *
  * Compile-time and structural tests for BaseRepository after the
- * Drogon -> pqcoro refactoring. Verifies that:
+ * Drogon -> direct I/O refactoring. Verifies that:
  *   - BaseRepository instantiates with all entity types (no Drogon needed)
  *   - Concepts (ReadableEntity, MutableEntity, HasFieldUpdate) are satisfied
  *   - SQL strings are correct
@@ -342,13 +342,13 @@ TEST_CASE("buildUpdateReturning", "[base_repo][sql]") {
 
 TEST_CASE("PgParams construction for CRUD operations", "[base_repo][params]") {
     SECTION("make with mixed types") {
-        auto params = pqcoro::PgParams::make(
+        auto params = jcailloux::relais::io::PgParams::make(
             int64_t(42), std::string("hello"), true, int32_t(100));
         REQUIRE(params.count() == 4);
     }
 
     SECTION("make with nullable") {
-        auto params = pqcoro::PgParams::make(
+        auto params = jcailloux::relais::io::PgParams::make(
             int64_t(1), nullptr, std::string("test"));
         REQUIRE(params.count() == 3);
         REQUIRE(params.params[1].isNull());
@@ -357,7 +357,7 @@ TEST_CASE("PgParams construction for CRUD operations", "[base_repo][params]") {
     SECTION("make with optional") {
         std::optional<int32_t> some_val = 42;
         std::optional<int32_t> no_val = std::nullopt;
-        auto params = pqcoro::PgParams::make(some_val, no_val);
+        auto params = jcailloux::relais::io::PgParams::make(some_val, no_val);
         REQUIRE(params.count() == 2);
         REQUIRE(!params.params[0].isNull());
         REQUIRE(params.params[1].isNull());
@@ -385,11 +385,11 @@ TEST_CASE("PgParams construction for CRUD operations", "[base_repo][params]") {
         item.created_at = "2024-01-01";
 
         auto insertParams = entity::generated::TestItemWrapper::toInsertParams(item);
-        pqcoro::PgParams updateParams;
+        jcailloux::relais::io::PgParams updateParams;
         updateParams.params.reserve(insertParams.params.size() + 1);
         // $1 = PK
         updateParams.params.push_back(
-            pqcoro::PgParams::make(item.id).params[0]);
+            jcailloux::relais::io::PgParams::make(item.id).params[0]);
         // $2...$N = fields
         for (auto& p : insertParams.params)
             updateParams.params.push_back(std::move(p));

@@ -1063,10 +1063,10 @@ struct ProductMapping {
     static auto getPrimaryKey(const Entity& e) noexcept { return e.id; }
 
     template<typename Entity>
-    static std::optional<Entity> fromRow(const pqcoro::PgResult::Row&) { return std::nullopt; }
+    static std::optional<Entity> fromRow(const jcailloux::relais::io::PgResult::Row&) { return std::nullopt; }
 
     template<typename Entity>
-    static pqcoro::PgParams toInsertParams(const Entity&) { return pqcoro::PgParams{}; }
+    static jcailloux::relais::io::PgParams toInsertParams(const Entity&) { return jcailloux::relais::io::PgParams{}; }
 
     // Fallback: snake_case names (should be overridden by glz::meta<Product>)
     template<typename T>

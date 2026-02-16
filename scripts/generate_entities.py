@@ -8,14 +8,17 @@ and generates:
   - EntityWrapper<Struct, Mapping> type aliases (public API)
   - ListWrapper and ListDescriptor for list entities
 
-No Drogon dependency — uses pqcoro (libpq async wrapper) directly.
+No Drogon dependency — uses jcailloux::relais::io directly.
 
 Usage:
-    python generate_entities.py --scan dir/ --output-dir base/
-    python generate_entities.py --files file1.h file2.h --output-dir base/
+    python generate_entities.py --sources dir/ --output-dir generated/
+    python generate_entities.py --sources file1.h file2.h --output-dir generated/
 """
 
+from __future__ import annotations
+
 import argparse
+import os
 import re
 import sys
 from dataclasses import dataclass, field
@@ -92,7 +95,6 @@ class EntityAnnotation:
     raw_json: list[str] = field(default_factory=list)
     json_fields: list[str] = field(default_factory=list)
     enums: list[EnumMapping] = field(default_factory=list)
-    output: str = ""
     read_only: bool = False
     # List annotations
     filters: list[FilterConfig] = field(default_factory=list)
@@ -223,8 +225,6 @@ class StructParser:
                         annot.table = token[6:]
                     elif token.startswith("model="):
                         annot.model = token[6:]
-                    elif token.startswith("output="):
-                        annot.output = token[7:]
                     elif token == "read_only" or token == "read_only=true":
                         annot.read_only = True
 
@@ -423,13 +423,12 @@ class StructParser:
 class MappingGenerator:
     """Generate Mapping structs + EntityWrapper aliases from parsed entities.
 
-    Generates SQL-direct code using pqcoro (libpq async wrapper).
+    Generates SQL-direct code using jcailloux::relais::io.
     No Drogon ORM dependency.
     """
 
-    def __init__(self, output_dir: Path, scan_dirs: list[Path]):
-        self.output_dir = output_dir
-        self.scan_dirs = scan_dirs
+    def __init__(self):
+        pass
 
     def _resolve_table_name(self, entity: ParsedEntity) -> str:
         """Resolve PostgreSQL table name from annotations."""
@@ -444,7 +443,7 @@ class MappingGenerator:
               f"using derived name '{s}'", file=sys.stderr)
         return s
 
-    def generate(self, entity: ParsedEntity) -> str:
+    def generate(self, entity: ParsedEntity, output_file: Path) -> str:
         """Generate the complete wrapper header."""
         a = entity.annotation
         mapping_name = f"{entity.class_name}Mapping"
@@ -466,7 +465,7 @@ class MappingGenerator:
         ]
 
         # Includes
-        lines.extend(self._generate_includes(entity))
+        lines.extend(self._generate_includes(entity, output_file))
         lines.append("")
         lines.append("namespace entity::generated {")
         lines.append("")
@@ -514,7 +513,7 @@ class MappingGenerator:
     # Includes
     # =========================================================================
 
-    def _generate_includes(self, entity: ParsedEntity) -> list[str]:
+    def _generate_includes(self, entity: ParsedEntity, output_file: Path) -> list[str]:
         a = entity.annotation
         lines = [
             "#include <cstdint>",
@@ -537,8 +536,8 @@ class MappingGenerator:
         # EntityWrapper (always needed)
         lines.append("#include <jcailloux/relais/wrapper/EntityWrapper.h>")
 
-        # Struct header
-        struct_include = self._find_struct_include(entity)
+        # Struct header (relative path from generated file to source)
+        struct_include = self._find_struct_include(entity, output_file)
         lines.append(f'#include "{struct_include}"')
 
         # List includes
@@ -549,12 +548,10 @@ class MappingGenerator:
 
         return lines
 
-    def _find_struct_include(self, entity: ParsedEntity) -> str:
-        """Return include path for the struct header, relative to output_dir."""
-        try:
-            return str(entity.source_file.relative_to(self.output_dir))
-        except ValueError:
-            return str(entity.source_file)
+    @staticmethod
+    def _find_struct_include(entity: ParsedEntity, output_file: Path) -> str:
+        """Return include path for the struct header, relative to the generated file."""
+        return os.path.relpath(entity.source_file, output_file.parent)
 
     # =========================================================================
     # Mapping struct
@@ -599,8 +596,8 @@ class MappingGenerator:
             args = [f"e.{a.primary_key}"] + [f"e.{pk}" for pk in a.partition_keys]
             args_str = ",\n            ".join(args)
             lines.append("    template<typename Entity>")
-            lines.append("    static pqcoro::PgParams makeFullKeyParams(const Entity& e) {")
-            lines.append(f"        return pqcoro::PgParams::make(")
+            lines.append("    static jcailloux::relais::io::PgParams makeFullKeyParams(const Entity& e) {")
+            lines.append(f"        return jcailloux::relais::io::PgParams::make(")
             lines.append(f"            {args_str}")
             lines.append(f"        );")
             lines.append("    }")
@@ -710,7 +707,7 @@ class MappingGenerator:
         a = entity.annotation
         lines = [
             "    template<typename Entity>",
-            "    static std::optional<Entity> fromRow(const pqcoro::PgResult::Row& row) {",
+            "    static std::optional<Entity> fromRow(const jcailloux::relais::io::PgResult::Row& row) {",
             "        Entity e;",
         ]
 
@@ -778,7 +775,7 @@ class MappingGenerator:
 
         lines = [
             "    template<typename Entity>",
-            "    static pqcoro::PgParams toInsertParams(const Entity& e) {",
+            "    static jcailloux::relais::io::PgParams toInsertParams(const Entity& e) {",
         ]
 
         # Skip comment for db_managed fields
@@ -792,12 +789,12 @@ class MappingGenerator:
             args = []
             for m in insert_members:
                 args.append(f"            e.{m.name}")
-            lines.append("        return pqcoro::PgParams::make(")
+            lines.append("        return jcailloux::relais::io::PgParams::make(")
             lines.append(",\n".join(args))
             lines.append("        );")
         else:
             # Complex case: build params manually for enum/json conversion
-            lines.append("        pqcoro::PgParams p;")
+            lines.append("        jcailloux::relais::io::PgParams p;")
             for m in insert_members:
                 enum_mapping = self._find_enum_mapping(a, m.name)
                 if m.name in a.json_fields:
@@ -1092,49 +1089,42 @@ class MappingGenerator:
 def main():
     parser = argparse.ArgumentParser(
         description="Generate standalone Mapping structs from annotated C++ structs")
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--scan", nargs="+",
-                       help="Directories to scan for @relais annotated headers")
-    group.add_argument("--files", nargs="+",
-                       help="Specific header files to process")
+    parser.add_argument("--sources", nargs="+", required=True,
+                        help="Files and/or directories to scan for @relais annotated headers")
     parser.add_argument("--output-dir", required=True,
-                        help="Base directory for output files")
+                        help="Destination directory for generated wrapper files")
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
     struct_parser = StructParser()
 
-    # Collect files to process
+    # Collect files to process (sources can be a mix of files and directories)
     files: list[Path] = []
-    scan_dirs: list[Path] = []
-    if args.scan:
-        for d in args.scan:
-            scan_dir = Path(d)
-            scan_dirs.append(scan_dir)
-            for f in scan_dir.rglob("*.h"):
+    for src in args.sources:
+        p = Path(src)
+        if p.is_dir():
+            for f in p.rglob("*.h"):
                 if "generated" in str(f) or "Wrapper" in f.name:
                     continue
                 files.append(f)
-    elif args.files:
-        for f in args.files:
-            files.append(Path(f))
-        scan_dirs = list(set(f.parent for f in files))
+        elif p.is_file():
+            files.append(p)
+        else:
+            print(f"Error: {src} is not a file or directory", file=sys.stderr)
+            sys.exit(1)
 
-    generator = MappingGenerator(output_dir, scan_dirs)
+    generator = MappingGenerator()
     generated_count = 0
 
     for filepath in files:
         entities = struct_parser.parse_file(filepath)
         for entity in entities:
-            if not entity.annotation.output:
-                print(f"  Warning: {entity.class_name} has no output annotation, skipping",
-                      file=sys.stderr)
-                continue
+            filename = f"{entity.class_name}Wrapper.h"
+            output_path = output_dir / filename
 
             print(f"  -> {entity.class_name}")
-            code = generator.generate(entity)
+            code = generator.generate(entity, output_path)
 
-            output_path = output_dir / entity.annotation.output
             output_path.parent.mkdir(parents=True, exist_ok=True)
             output_path.write_text(code)
             generated_count += 1

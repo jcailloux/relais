@@ -3,7 +3,7 @@
 
 #include <memory>
 
-#include "pqcoro/Task.h"
+#include "jcailloux/relais/io/Task.h"
 #include "jcailloux/relais/Log.h"
 #include "ListCache.h"
 #include "ListCacheTraits.h"
@@ -21,7 +21,7 @@ namespace jcailloux::relais::cache::list {
 //   {
 //       using ListMixin = cache::list::ListCacheRepository<...>;
 //   public:
-//       static pqcoro::Task<ListResult> findItems(ListQuery query) {
+//       static io::Task<ListResult> findItems(ListQuery query) {
 //           co_return co_await cachedListQuery(std::move(query), [&]() {
 //               return queryFromDb(query);
 //           });
@@ -78,7 +78,7 @@ protected:
     /// Execute a list query with caching
     /// Returns shared_ptr to cached result (nullptr if not found and DB query fails)
     template<typename QueryFn>
-    static pqcoro::Task<ListResultPtr> cachedListQuery(ListQuery query, QueryFn&& dbQuery) {
+    static io::Task<ListResultPtr> cachedListQuery(ListQuery query, QueryFn&& dbQuery) {
 #ifndef NDEBUG
         using Clock = std::chrono::steady_clock;
         auto t0 = Clock::now();

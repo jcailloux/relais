@@ -80,12 +80,12 @@ struct TestListArticle {
         );
 
         template<typename Entity>
-        static std::optional<Entity> fromRow(const pqcoro::PgResult::Row&) {
+        static std::optional<Entity> fromRow(const jcailloux::relais::io::PgResult::Row&) {
             return std::nullopt; // stub
         }
 
         template<typename Entity>
-        static pqcoro::PgParams toInsertParams(const Entity&) {
+        static jcailloux::relais::io::PgParams toInsertParams(const Entity&) {
             return {}; // stub
         }
     };

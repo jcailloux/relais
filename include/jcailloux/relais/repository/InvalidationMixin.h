@@ -1,7 +1,7 @@
 #ifndef JCX_RELAIS_INVALIDATION_MIXIN_H
 #define JCX_RELAIS_INVALIDATION_MIXIN_H
 
-#include "pqcoro/Task.h"
+#include "jcailloux/relais/io/Task.h"
 #include "jcailloux/relais/cache/InvalidateOn.h"
 
 namespace jcailloux::relais {
@@ -42,7 +42,7 @@ public:
     using Invalidates = InvList;
 
     /// Create entity and propagate cross-invalidation to dependent caches.
-    static pqcoro::Task<WrapperPtrType> create(WrapperPtrType wrapper)
+    static io::Task<WrapperPtrType> create(WrapperPtrType wrapper)
         requires MutableEntity<Entity> && (!Base::config.read_only)
     {
         auto result = co_await Base::create(std::move(wrapper));
@@ -55,7 +55,7 @@ public:
     /// Update entity and propagate cross-invalidation with old/new data.
     /// When Base is ListMixin, reuses the pre-fetched old entity via WithContext
     /// to avoid a redundant L1 lookup.
-    static pqcoro::Task<bool> update(const Key& id, WrapperPtrType wrapper)
+    static io::Task<bool> update(const Key& id, WrapperPtrType wrapper)
         requires MutableEntity<Entity> && (!Base::config.read_only)
     {
         auto old = co_await Base::findById(id);
@@ -77,7 +77,7 @@ public:
 
     /// Remove entity and propagate cross-invalidation with deleted data.
     /// When Base is ListMixin, reuses the pre-fetched entity via WithContext.
-    static pqcoro::Task<std::optional<size_t>> remove(const Key& id)
+    static io::Task<std::optional<size_t>> remove(const Key& id)
         requires (!Base::config.read_only)
     {
         auto entity = co_await Base::findById(id);
@@ -98,7 +98,7 @@ public:
     /// Partial update with cross-invalidation.
     /// When Base is ListMixin, reuses the pre-fetched old entity via WithContext.
     template<typename... Updates>
-    static pqcoro::Task<WrapperPtrType> updateBy(const Key& id, Updates&&... updates)
+    static io::Task<WrapperPtrType> updateBy(const Key& id, Updates&&... updates)
         requires HasFieldUpdate<Entity> && (!Base::config.read_only)
     {
         auto old = co_await Base::findById(id);
@@ -119,7 +119,7 @@ public:
     }
 
     /// Invalidate all caches (L1 + L2) and propagate cross-invalidation.
-    static pqcoro::Task<void> invalidate(const Key& id) {
+    static io::Task<void> invalidate(const Key& id) {
         auto entity = co_await Base::findById(id);
         if (entity) {
             co_await cache::propagateDelete<Entity, InvList>(std::move(entity));

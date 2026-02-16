@@ -35,7 +35,7 @@ class RedisRepository : public BaseRepository<Entity, Name, Cfg, Key> {
 
         /// Find by ID with L2 (Redis) -> L3 (DB) fallback.
         /// Returns shared_ptr to immutable entity (nullptr if not found).
-        static pqcoro::Task<WrapperPtrType> findById(const Key& id) {
+        static io::Task<WrapperPtrType> findById(const Key& id) {
             auto redisKey = makeRedisKey(id);
 
             std::optional<Entity> cached = co_await getFromCache(redisKey);
@@ -52,7 +52,7 @@ class RedisRepository : public BaseRepository<Entity, Name, Cfg, Key> {
 
         /// Find by ID and return raw JSON string.
         /// Returns shared_ptr to JSON string (nullptr if not found).
-        static pqcoro::Task<std::shared_ptr<const std::string>> findByIdAsJson(const Key& id) {
+        static io::Task<std::shared_ptr<const std::string>> findByIdAsJson(const Key& id) {
             auto redisKey = makeRedisKey(id);
 
             std::optional<std::string> cached;
@@ -78,7 +78,7 @@ class RedisRepository : public BaseRepository<Entity, Name, Cfg, Key> {
 
         /// Create entity in database with L2 cache population.
         /// Returns shared_ptr to immutable entity (nullptr on error).
-        static pqcoro::Task<WrapperPtrType> create(WrapperPtrType wrapper)
+        static io::Task<WrapperPtrType> create(WrapperPtrType wrapper)
             requires CreatableEntity<Entity, Key> && (!Cfg.read_only)
         {
             auto inserted = co_await Base::create(wrapper);
@@ -90,7 +90,7 @@ class RedisRepository : public BaseRepository<Entity, Name, Cfg, Key> {
 
         /// Update entity in database with L2 cache handling.
         /// Returns true on success, false on error.
-        static pqcoro::Task<bool> update(const Key& id, WrapperPtrType wrapper)
+        static io::Task<bool> update(const Key& id, WrapperPtrType wrapper)
             requires MutableEntity<Entity> && (!Cfg.read_only)
         {
             using enum config::UpdateStrategy;
@@ -109,7 +109,7 @@ class RedisRepository : public BaseRepository<Entity, Name, Cfg, Key> {
         /// Partial update: invalidates Redis then delegates to Base::updateBy.
         /// Returns the re-fetched entity (nullptr on error or not found).
         template<typename... Updates>
-        static pqcoro::Task<WrapperPtrType> updateBy(const Key& id, Updates&&... updates)
+        static io::Task<WrapperPtrType> updateBy(const Key& id, Updates&&... updates)
             requires HasFieldUpdate<Entity> && (!Cfg.read_only)
         {
             co_await invalidateRedis(id);
@@ -119,7 +119,7 @@ class RedisRepository : public BaseRepository<Entity, Name, Cfg, Key> {
         /// Remove entity by ID.
         /// Returns: rows deleted (0 if not found), or nullopt on DB error.
         /// Invalidates Redis cache unless DB error occurred.
-        static pqcoro::Task<std::optional<size_t>> remove(const Key& id)
+        static io::Task<std::optional<size_t>> remove(const Key& id)
             requires (!Cfg.read_only)
         {
             co_return co_await removeImpl(id, nullptr);
@@ -129,7 +129,7 @@ class RedisRepository : public BaseRepository<Entity, Name, Cfg, Key> {
         /// Internal remove with optional entity hint.
         /// For CompositeKey entities: if L1 didn't provide a hint,
         /// try L2 (Redis) as a near-free fallback (~0.1-1ms).
-        static pqcoro::Task<std::optional<size_t>> removeImpl(
+        static io::Task<std::optional<size_t>> removeImpl(
             const Key& id, typename Base::WrapperPtrType cachedHint = nullptr)
             requires (!Cfg.read_only)
         {
@@ -154,12 +154,12 @@ class RedisRepository : public BaseRepository<Entity, Name, Cfg, Key> {
 
         /// Invalidate Redis cache for a key and return void.
         /// Used as cross-invalidation target interface.
-        static pqcoro::Task<void> invalidate(const Key& id) {
+        static io::Task<void> invalidate(const Key& id) {
             co_await invalidateRedis(id);
         }
 
         /// Invalidate Redis cache for a key.
-        static pqcoro::Task<bool> invalidateRedis(const Key& id) {
+        static io::Task<bool> invalidateRedis(const Key& id) {
             co_return co_await cache::RedisCache::invalidate(makeRedisKey(id));
         }
 
@@ -178,7 +178,7 @@ class RedisRepository : public BaseRepository<Entity, Name, Cfg, Key> {
         }
 
         /// Selectively invalidate list pages for a pre-built group key.
-        static pqcoro::Task<size_t> invalidateListGroupByKey(
+        static io::Task<size_t> invalidateListGroupByKey(
             const std::string& groupKey, int64_t entity_sort_val)
         {
             co_return co_await cache::RedisCache::invalidateListGroupSelective(
@@ -186,7 +186,7 @@ class RedisRepository : public BaseRepository<Entity, Name, Cfg, Key> {
         }
 
         /// Invalidate all list cache groups for this repository.
-        static pqcoro::Task<size_t> invalidateAllListGroups()
+        static io::Task<size_t> invalidateAllListGroups()
         {
             std::string pattern = std::string(name()) + ":list:*";
             co_return co_await cache::RedisCache::invalidatePatternSafe(pattern);
@@ -198,7 +198,7 @@ class RedisRepository : public BaseRepository<Entity, Name, Cfg, Key> {
         // =====================================================================
 
         /// Get entity from cache using its native serialization format.
-        static pqcoro::Task<std::optional<Entity>> getFromCache(const std::string& key) {
+        static io::Task<std::optional<Entity>> getFromCache(const std::string& key) {
             if constexpr (HasBinarySerialization<Entity>) {
                 std::optional<std::vector<uint8_t>> data;
                 if constexpr (Cfg.l2_refresh_on_get) {
@@ -221,7 +221,7 @@ class RedisRepository : public BaseRepository<Entity, Name, Cfg, Key> {
         }
 
         /// Set entity in cache using its native serialization format.
-        static pqcoro::Task<bool> setInCache(const std::string& key, const Entity& entity) {
+        static io::Task<bool> setInCache(const std::string& key, const Entity& entity) {
             if constexpr (HasBinarySerialization<Entity>) {
                 co_return co_await cache::RedisCache::setRawBinary(key, *entity.toBinary(), l2Ttl());
             } else {
@@ -230,14 +230,14 @@ class RedisRepository : public BaseRepository<Entity, Name, Cfg, Key> {
         }
 
         template<typename E = Entity>
-        static pqcoro::Task<std::optional<std::vector<E>>> getListFromRedis(const std::string& key)
+        static io::Task<std::optional<std::vector<E>>> getListFromRedis(const std::string& key)
             requires HasJsonSerialization<E>
         {
             co_return co_await cache::RedisCache::getList<E>(key);
         }
 
         template<typename E = Entity, typename Rep, typename Period>
-        static pqcoro::Task<bool> setListInRedis(const std::string& key,
+        static io::Task<bool> setListInRedis(const std::string& key,
                                                   const std::vector<E>& entities,
                                                   std::chrono::duration<Rep, Period> ttl)
             requires HasJsonSerialization<E>
@@ -254,7 +254,7 @@ class RedisRepository : public BaseRepository<Entity, Name, Cfg, Key> {
 
         /// Execute a list query with Redis caching.
         template<typename QueryFn, typename... KeyArgs>
-        static pqcoro::Task<std::vector<Entity>> cachedList(QueryFn&& query, KeyArgs&&... keyParts) {
+        static io::Task<std::vector<Entity>> cachedList(QueryFn&& query, KeyArgs&&... keyParts) {
             auto cacheKey = makeListCacheKey(std::forward<KeyArgs>(keyParts)...);
 
             std::optional<std::vector<Entity>> cached;
@@ -288,7 +288,7 @@ class RedisRepository : public BaseRepository<Entity, Name, Cfg, Key> {
 
         /// Execute a list query with Redis caching and group tracking.
         template<typename QueryFn, typename... GroupArgs>
-        static pqcoro::Task<std::vector<Entity>> cachedListTracked(
+        static io::Task<std::vector<Entity>> cachedListTracked(
             QueryFn&& query,
             int limit,
             int offset,
@@ -301,7 +301,7 @@ class RedisRepository : public BaseRepository<Entity, Name, Cfg, Key> {
 
         /// Execute a list query with Redis caching, group tracking, and sort bounds header.
         template<typename QueryFn, typename HeaderBuilder, typename... GroupArgs>
-        static pqcoro::Task<std::vector<Entity>> cachedListTrackedWithHeader(
+        static io::Task<std::vector<Entity>> cachedListTrackedWithHeader(
             QueryFn&& query,
             int limit,
             int offset,
@@ -338,14 +338,14 @@ class RedisRepository : public BaseRepository<Entity, Name, Cfg, Key> {
 
         /// Invalidate all cached list pages for a group.
         template<typename... GroupArgs>
-        static pqcoro::Task<size_t> invalidateListGroup(GroupArgs&&... groupParts) {
+        static io::Task<size_t> invalidateListGroup(GroupArgs&&... groupParts) {
             std::string groupKey = makeListGroupKey(std::forward<GroupArgs>(groupParts)...);
             co_return co_await cache::RedisCache::invalidateListGroup(groupKey);
         }
 
         /// Selectively invalidate list pages for a group based on a sort value.
         template<typename... GroupArgs>
-        static pqcoro::Task<size_t> invalidateListGroupSelective(
+        static io::Task<size_t> invalidateListGroupSelective(
             int64_t entity_sort_val,
             GroupArgs&&... groupParts)
         {
@@ -356,7 +356,7 @@ class RedisRepository : public BaseRepository<Entity, Name, Cfg, Key> {
 
         /// Selectively invalidate list pages for a group based on old and new sort values.
         template<typename... GroupArgs>
-        static pqcoro::Task<size_t> invalidateListGroupSelectiveUpdate(
+        static io::Task<size_t> invalidateListGroupSelectiveUpdate(
             int64_t old_sort_val,
             int64_t new_sort_val,
             GroupArgs&&... groupParts)
@@ -372,7 +372,7 @@ class RedisRepository : public BaseRepository<Entity, Name, Cfg, Key> {
 
         /// Execute a list query and cache the result as a binary list entity.
         template<typename ListEntity, typename QueryFn, typename... KeyArgs>
-        static pqcoro::Task<ListEntity> cachedListAs(
+        static io::Task<ListEntity> cachedListAs(
             QueryFn&& query,
             KeyArgs&&... keyParts)
         {
@@ -400,7 +400,7 @@ class RedisRepository : public BaseRepository<Entity, Name, Cfg, Key> {
 
         /// Execute a list query with group tracking, returning a binary list entity.
         template<typename ListEntity, typename QueryFn, typename... GroupArgs>
-        static pqcoro::Task<ListEntity> cachedListAsTracked(
+        static io::Task<ListEntity> cachedListAsTracked(
             QueryFn&& query,
             int limit,
             int offset,
@@ -413,7 +413,7 @@ class RedisRepository : public BaseRepository<Entity, Name, Cfg, Key> {
 
         /// Execute a list query with group tracking + sort bounds header.
         template<typename ListEntity, typename QueryFn, typename HeaderBuilder, typename... GroupArgs>
-        static pqcoro::Task<ListEntity> cachedListAsTrackedWithHeader(
+        static io::Task<ListEntity> cachedListAsTrackedWithHeader(
             QueryFn&& query,
             int limit,
             int offset,

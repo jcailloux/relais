@@ -3,8 +3,8 @@
 #include <jcailloux/relais/Log.h>
 #include <jcailloux/relais/DbProvider.h>
 
-#include "EpollIoContext.h"
-#include "TestRunner.h"
+#include <fixtures/EpollIoContext.h>
+#include <fixtures/TestRunner.h>
 
 #include <string>
 #include <vector>
@@ -96,16 +96,16 @@ TEST_CASE("DbProvider: not initialized", "[dbprovider]") {
 }
 
 TEST_CASE("DbProvider: init with PgPool", "[dbprovider][integration]") {
-    using pqcoro::test::EpollIoContext;
-    using pqcoro::test::runTask;
+    using jcailloux::relais::io::test::EpollIoContext;
+    using jcailloux::relais::io::test::runTask;
 
     EpollIoContext io;
 
-    auto conninfo = std::string("host=localhost port=5432 dbname=pqcoro_test "
-                                "user=pqcoro_test password=pqcoro_test");
+    auto conninfo = std::string("host=localhost port=5432 dbname=relais_test "
+                                "user=relais_test password=relais_test");
 
-    runTask(io, [](EpollIoContext& io, const std::string& conninfo) -> pqcoro::Task<void> {
-        auto pool = co_await pqcoro::PgPool<EpollIoContext>::create(
+    runTask(io, [](EpollIoContext& io, const std::string& conninfo) -> jcailloux::relais::io::Task<void> {
+        auto pool = co_await jcailloux::relais::io::PgPool<EpollIoContext>::create(
             io, conninfo, 1, 4);
         DbProvider::init(pool);
 
@@ -125,7 +125,7 @@ TEST_CASE("DbProvider: init with PgPool", "[dbprovider][integration]") {
         REQUIRE(result2[0].get<int32_t>(0) == 42);
 
         // Test queryParams
-        auto params = pqcoro::PgParams::make("hello");
+        auto params = jcailloux::relais::io::PgParams::make("hello");
         auto result3 = co_await DbProvider::queryParams(
             "SELECT $1::text AS msg", params);
         REQUIRE(result3.ok());
@@ -136,18 +136,18 @@ TEST_CASE("DbProvider: init with PgPool", "[dbprovider][integration]") {
 }
 
 TEST_CASE("DbProvider: init with Redis", "[dbprovider][integration]") {
-    using pqcoro::test::EpollIoContext;
-    using pqcoro::test::runTask;
+    using jcailloux::relais::io::test::EpollIoContext;
+    using jcailloux::relais::io::test::runTask;
 
     EpollIoContext io;
 
-    auto conninfo = std::string("host=localhost port=5432 dbname=pqcoro_test "
-                                "user=pqcoro_test password=pqcoro_test");
+    auto conninfo = std::string("host=localhost port=5432 dbname=relais_test "
+                                "user=relais_test password=relais_test");
 
-    runTask(io, [](EpollIoContext& io, const std::string& conninfo) -> pqcoro::Task<void> {
-        auto pool = co_await pqcoro::PgPool<EpollIoContext>::create(
+    runTask(io, [](EpollIoContext& io, const std::string& conninfo) -> jcailloux::relais::io::Task<void> {
+        auto pool = co_await jcailloux::relais::io::PgPool<EpollIoContext>::create(
             io, conninfo, 1, 4);
-        auto redis = co_await pqcoro::RedisClient<EpollIoContext>::connect(io);
+        auto redis = co_await jcailloux::relais::io::RedisClient<EpollIoContext>::connect(io);
 
         DbProvider::init(pool, redis);
         REQUIRE(DbProvider::initialized());

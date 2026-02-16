@@ -5,10 +5,10 @@
 #include <string>
 #include <vector>
 
-#include "pqcoro/Task.h"
-#include "pqcoro/pg/PgError.h"
-#include "pqcoro/pg/PgParams.h"
-#include "pqcoro/pg/PgResult.h"
+#include "jcailloux/relais/io/Task.h"
+#include "jcailloux/relais/io/pg/PgError.h"
+#include "jcailloux/relais/io/pg/PgParams.h"
+#include "jcailloux/relais/io/pg/PgResult.h"
 #include "jcailloux/relais/DbProvider.h"
 #include "jcailloux/relais/Log.h"
 #include "jcailloux/relais/config/repository_config.h"
@@ -108,14 +108,14 @@ public:
 
     /// Find by ID with L3 (database) access only.
     /// Returns shared_ptr to immutable entity (nullptr if not found).
-    static pqcoro::Task<WrapperPtrType> findById(const Key& id) {
+    static io::Task<WrapperPtrType> findById(const Key& id) {
         try {
             auto result = co_await DbProvider::queryArgs(
                 Mapping::SQL::select_by_pk, id);
             if (result.empty()) co_return nullptr;
             auto entity = Entity::fromRow(result[0]);
             co_return entity ? std::make_shared<const Entity>(std::move(*entity)) : nullptr;
-        } catch (const pqcoro::PgError& e) {
+        } catch (const io::PgError& e) {
             RELAIS_LOG_ERROR << name() << ": DB error - " << e.what();
             co_return nullptr;
         }
@@ -128,7 +128,7 @@ public:
     /// Create entity in database.
     /// Returns shared_ptr to immutable entity (nullptr on error).
     /// Uses INSERT ... RETURNING to get the full entity back (with DB-managed fields).
-    static pqcoro::Task<WrapperPtrType> create(WrapperPtrType wrapper)
+    static io::Task<WrapperPtrType> create(WrapperPtrType wrapper)
         requires MutableEntity<Entity> && (!Cfg.read_only)
     {
         if (!wrapper) co_return nullptr;
@@ -141,7 +141,7 @@ public:
             auto entity = Entity::fromRow(result[0]);
             co_return entity ? std::make_shared<const Entity>(std::move(*entity)) : nullptr;
 
-        } catch (const pqcoro::PgError& e) {
+        } catch (const io::PgError& e) {
             RELAIS_LOG_ERROR << name() << ": create error - " << e.what();
             co_return nullptr;
         }
@@ -154,7 +154,7 @@ public:
     /// Full update of entity in database.
     /// Builds params as: PK ($1), then insert fields ($2...$N).
     /// Returns true on success, false on error.
-    static pqcoro::Task<bool> update(const Key& id, WrapperPtrType wrapper)
+    static io::Task<bool> update(const Key& id, WrapperPtrType wrapper)
         requires MutableEntity<Entity> && (!Cfg.read_only)
     {
         if (!wrapper) co_return false;
@@ -163,11 +163,11 @@ public:
             // toInsertParams returns fields without PK (db_managed).
             // SQL::update expects PK as $1, then fields as $2...$N.
             auto insertParams = Entity::toInsertParams(*wrapper);
-            pqcoro::PgParams params;
+            io::PgParams params;
             params.params.reserve(insertParams.params.size() + 1);
             // $1 = primary key
             params.params.push_back(
-                pqcoro::PgParams::make(id).params[0]);
+                io::PgParams::make(id).params[0]);
             // $2...$N = fields (same order as toInsertParams)
             for (auto& p : insertParams.params)
                 params.params.push_back(std::move(p));
@@ -176,7 +176,7 @@ public:
                 Mapping::SQL::update, params);
             co_return affected > 0;
 
-        } catch (const pqcoro::PgError& e) {
+        } catch (const io::PgError& e) {
             RELAIS_LOG_ERROR << name() << ": update error - " << e.what();
             co_return false;
         }
@@ -188,7 +188,7 @@ public:
 
     /// Remove entity by ID.
     /// Returns: rows deleted (0 if not found), or nullopt on DB error.
-    static pqcoro::Task<std::optional<size_t>> remove(const Key& id)
+    static io::Task<std::optional<size_t>> remove(const Key& id)
         requires (!Cfg.read_only)
     {
         co_return co_await removeImpl(id, nullptr);
@@ -200,7 +200,7 @@ protected:
     /// When a hint is available AND the entity has a composite key, uses the
     /// full PK SQL for single-partition deletion. Otherwise falls back to
     /// partial key SQL (scans all partitions — acceptable).
-    static pqcoro::Task<std::optional<size_t>> removeImpl(
+    static io::Task<std::optional<size_t>> removeImpl(
         const Key& id, WrapperPtrType cachedHint = nullptr)
         requires (!Cfg.read_only)
     {
@@ -222,7 +222,7 @@ protected:
                     Mapping::SQL::delete_by_pk, id);
             }
             co_return static_cast<size_t>(affected);
-        } catch (const pqcoro::PgError& e) {
+        } catch (const io::PgError& e) {
             RELAIS_LOG_ERROR << name() << ": remove error - " << e.what();
             co_return std::nullopt;
         }
@@ -238,7 +238,7 @@ public:
     /// Builds UPDATE ... SET col=$1, ... WHERE pk=$N RETURNING * (single query).
     /// Returns the re-fetched entity from DB (nullptr on error or not found).
     template<typename... Updates>
-    static pqcoro::Task<WrapperPtrType> updateBy(const Key& id, Updates&&... updates)
+    static io::Task<WrapperPtrType> updateBy(const Key& id, Updates&&... updates)
         requires HasFieldUpdate<Entity> && (!Cfg.read_only)
     {
         static_assert(sizeof...(Updates) > 0, "updateBy requires at least one field update");
@@ -252,7 +252,7 @@ public:
                 {wrapper::fieldColumnName<typename Entity::TraitsType>(updates)...});
 
             // Build params: field values first, then PK at the end
-            auto params = pqcoro::PgParams::make(
+            auto params = io::PgParams::make(
                 wrapper::fieldValue<typename Entity::TraitsType>(
                     std::forward<Updates>(updates))...,
                 id);
@@ -263,7 +263,7 @@ public:
             auto entity = Entity::fromRow(result[0]);
             co_return entity ? std::make_shared<const Entity>(std::move(*entity)) : nullptr;
 
-        } catch (const pqcoro::PgError& e) {
+        } catch (const io::PgError& e) {
             RELAIS_LOG_ERROR << name() << ": updateBy error - " << e.what();
             co_return nullptr;
         }
@@ -274,7 +274,7 @@ public:
     // =====================================================================
 
     /// Invalidate cache for a key. No-op at BaseRepository level.
-    static pqcoro::Task<void> invalidate([[maybe_unused]] const Key& id) {
+    static io::Task<void> invalidate([[maybe_unused]] const Key& id) {
         co_return;
     }
 
@@ -286,7 +286,7 @@ public:
 
     /// Selectively invalidate list pages for a pre-built group key.
     /// No-op at BaseRepository level.
-    static pqcoro::Task<size_t> invalidateListGroupByKey(
+    static io::Task<size_t> invalidateListGroupByKey(
         [[maybe_unused]] const std::string& groupKey,
         [[maybe_unused]] int64_t entity_sort_val)
     {
@@ -294,7 +294,7 @@ public:
     }
 
     /// Invalidate all list cache groups. No-op at BaseRepository level.
-    static pqcoro::Task<size_t> invalidateAllListGroups()
+    static io::Task<size_t> invalidateAllListGroups()
     {
         co_return 0;
     }
@@ -320,7 +320,7 @@ protected:
 
     /// Execute a list query directly (no caching).
     template<typename QueryFn, typename... KeyArgs>
-    static pqcoro::Task<std::vector<Entity>> cachedList(
+    static io::Task<std::vector<Entity>> cachedList(
         QueryFn&& query,
         [[maybe_unused]] KeyArgs&&... keyParts)
     {
@@ -329,7 +329,7 @@ protected:
 
     /// Execute a tracked list query directly (no caching, no tracking).
     template<typename QueryFn, typename... GroupArgs>
-    static pqcoro::Task<std::vector<Entity>> cachedListTracked(
+    static io::Task<std::vector<Entity>> cachedListTracked(
         QueryFn&& query,
         [[maybe_unused]] int limit,
         [[maybe_unused]] int offset,
@@ -340,7 +340,7 @@ protected:
 
     /// Execute a tracked list query with header directly (no caching, no header).
     template<typename QueryFn, typename HeaderBuilder, typename... GroupArgs>
-    static pqcoro::Task<std::vector<Entity>> cachedListTrackedWithHeader(
+    static io::Task<std::vector<Entity>> cachedListTrackedWithHeader(
         QueryFn&& query,
         [[maybe_unused]] int limit,
         [[maybe_unused]] int offset,
@@ -352,7 +352,7 @@ protected:
 
     /// Invalidate all cached list pages for a group. No-op at base level.
     template<typename... GroupArgs>
-    static pqcoro::Task<size_t> invalidateListGroup(
+    static io::Task<size_t> invalidateListGroup(
         [[maybe_unused]] GroupArgs&&... groupParts)
     {
         co_return 0;
@@ -360,7 +360,7 @@ protected:
 
     /// Selectively invalidate list pages based on a sort value. No-op at base level.
     template<typename... GroupArgs>
-    static pqcoro::Task<size_t> invalidateListGroupSelective(
+    static io::Task<size_t> invalidateListGroupSelective(
         [[maybe_unused]] int64_t entity_sort_val,
         [[maybe_unused]] GroupArgs&&... groupParts)
     {
@@ -369,7 +369,7 @@ protected:
 
     /// Selectively invalidate list pages based on old and new sort values. No-op.
     template<typename... GroupArgs>
-    static pqcoro::Task<size_t> invalidateListGroupSelectiveUpdate(
+    static io::Task<size_t> invalidateListGroupSelectiveUpdate(
         [[maybe_unused]] int64_t old_sort_val,
         [[maybe_unused]] int64_t new_sort_val,
         [[maybe_unused]] GroupArgs&&... groupParts)
@@ -379,7 +379,7 @@ protected:
 
     /// Execute a list query and return as a custom list entity (no caching).
     template<typename ListEntity, typename QueryFn, typename... KeyArgs>
-    static pqcoro::Task<ListEntity> cachedListAs(
+    static io::Task<ListEntity> cachedListAs(
         QueryFn&& query,
         [[maybe_unused]] KeyArgs&&... keyParts)
     {
@@ -388,7 +388,7 @@ protected:
 
     /// Execute a tracked list query and return as a custom list entity (no caching).
     template<typename ListEntity, typename QueryFn, typename... GroupArgs>
-    static pqcoro::Task<ListEntity> cachedListAsTracked(
+    static io::Task<ListEntity> cachedListAsTracked(
         QueryFn&& query,
         [[maybe_unused]] int limit,
         [[maybe_unused]] int offset,
@@ -399,7 +399,7 @@ protected:
 
     /// Execute a tracked list query with header as custom list entity (no caching).
     template<typename ListEntity, typename QueryFn, typename HeaderBuilder, typename... GroupArgs>
-    static pqcoro::Task<ListEntity> cachedListAsTrackedWithHeader(
+    static io::Task<ListEntity> cachedListAsTrackedWithHeader(
         QueryFn&& query,
         [[maybe_unused]] int limit,
         [[maybe_unused]] int offset,
