@@ -139,7 +139,7 @@ using PurchaseRepo = relais::Repo<
 
 If the entity has an embedded `ListDescriptor` (from `filterable`/`sortable` annotations), the repository also provides:
 - `query(ListQuery)` — `Task<ListResult>` (paginated, cached)
-- `listCacheSize()` — current L1 list cache entry count
+- `listSize()` — current L1 list cache entry count
 - `warmup()` — primes both entity and list caches
 
 ### Template Parameters
@@ -700,7 +700,7 @@ python scripts/generate_entities.py --files src/entities/User.h --output-dir src
 |--------|-------------|
 | `trySweep()` | Try to cleanup expired entries (non-blocking) |
 | `purge()` | Force cleanup of all expired entries |
-| `cacheSize()` | Current L1 cache entry count |
+| `size()` | Current L1 cache entry count |
 | `warmup()` | Prime cache structures at startup |
 
 ### ListMixin Methods (auto-detected)
@@ -708,7 +708,7 @@ python scripts/generate_entities.py --files src/entities/User.h --output-dir src
 | Method | Description |
 |--------|-------------|
 | `query(ListQuery)` | Execute paginated list query (L1 cached) |
-| `listCacheSize()` | Current list cache entry count |
+| `listSize()` | Current list cache entry count |
 | `trySweep()` | Cleanup entity + list L1 caches (non-blocking) |
 | `purge()` | Full cleanup entity + list L1 caches (blocking) |
 | `warmup()` | Primes both entity and list caches |

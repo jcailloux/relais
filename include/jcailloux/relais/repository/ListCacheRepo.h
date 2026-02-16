@@ -85,7 +85,7 @@ public:
     }
 
     /// Get cache size
-    static size_t listCacheSize() {
+    static size_t listSize() {
         return listCache().size();
     }
 

@@ -223,7 +223,7 @@ initTest();
 ### Check Cache State
 ```cpp
 // L1 cache size
-REQUIRE(L1Repo::cacheSize() >= 1);
+REQUIRE(L1Repo::size() >= 1);
 
 // Clear L1 cache
 L1Repo::clearCache();

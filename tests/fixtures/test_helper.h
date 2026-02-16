@@ -564,7 +564,7 @@ inline void updateTestEvent(int64_t id, const std::string& title, int32_t priori
 
 template<typename Repo>
 size_t getCacheSize() {
-    return Repo::cacheSize();
+    return Repo::size();
 }
 
 template<typename Repo>

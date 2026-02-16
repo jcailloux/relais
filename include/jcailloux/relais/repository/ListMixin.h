@@ -226,7 +226,7 @@ public:
     }
 
     /// Get L1 list cache size.
-    [[nodiscard]] static size_t listCacheSize() noexcept {
+    [[nodiscard]] static size_t listSize() noexcept {
         return listCache().size();
     }
 

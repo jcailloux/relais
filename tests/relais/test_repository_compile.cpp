@@ -100,8 +100,8 @@ TEST_CASE("CachedRepo features", "[repository][compile][cached]") {
         REQUIRE(ttl.count() > 0);
     }
 
-    SECTION("cacheSize") {
-        auto size = L1TestItemRepo::cacheSize();
+    SECTION("size") {
+        auto size = L1TestItemRepo::size();
         REQUIRE(size == 0);  // empty at start
     }
 

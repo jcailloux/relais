@@ -359,7 +359,7 @@ TEST_CASE("[DeclListRepo] SortBounds invalidation precision",
         REQUIRE(r2->size() == 15);  // tech all 15
         REQUIRE(r3->size() == 3);   // news all 3
 
-        CHECK(TestArticleListRepo::listCacheSize() == 3);
+        CHECK(TestArticleListRepo::listSize() == 3);
 
         // Insert a new tech article with view_count=45 directly in DB
         // (two inserts: one for the DB data, one as entity for notification)
@@ -571,7 +571,7 @@ TEST_CASE("[DeclListRepo] ModificationTracker cleanup",
         CHECK(r_again->size() == 6);  // Cache HIT (stale modification ignored)
 
         // Cache should still have exactly 1 entry (not evicted)
-        CHECK(TestArticleListRepo::listCacheSize() == 1);
+        CHECK(TestArticleListRepo::listSize() == 1);
     }
 }
 
@@ -648,7 +648,7 @@ TEST_CASE("[DeclListRepo] Modification cutoff safety",
         auto q = makeViewCountQuery("tech", 10);
         auto r1 = sync(TestArticleListRepo::query(q));
         REQUIRE(r1->size() == 5);
-        CHECK(TestArticleListRepo::listCacheSize() == 1);
+        CHECK(TestArticleListRepo::listSize() == 1);
 
         // 2. M1 (before cutoff) — invalidates the cached page
         auto entity1 = makeArticle(9001, "tech", alice_id, "cutoff_old", 25);
@@ -706,7 +706,7 @@ TEST_CASE("[DeclListRepo] Bitmap skip optimization",
         auto q = makeViewCountQuery("tech", 10);
         auto r1 = sync(TestArticleListRepo::query(q));
         REQUIRE(r1->size() == 5);
-        CHECK(TestArticleListRepo::listCacheSize() == 1);
+        CHECK(TestArticleListRepo::listSize() == 1);
 
         // 2. Read the shard_id assigned to this cache entry
         auto shard_id_opt = TestInternals::getListEntryShardId<TestArticleListRepo>(

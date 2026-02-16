@@ -49,7 +49,7 @@ TEST_CASE("CachedRepo::warmup - L1 entity cache",
         REQUIRE(item->name == "warmup_item");
     }
 
-    SECTION("[warmup] cacheSize is 0 after warmup (probe cleaned up)") {
+    SECTION("[warmup] size is 0 after warmup (probe cleaned up)") {
         TestInternals::resetEntityCacheState<L1TestItemRepo>();
         L1TestItemRepo::warmup();
         // warmup() inserts a probe then invalidates it — cache should be empty
@@ -85,12 +85,12 @@ TEST_CASE("ListMixin::warmup - entity + list cache",
         REQUIRE(result->size() == 1);
     }
 
-    SECTION("[warmup] listCacheSize is 0 after warmup (probe cleaned up)") {
+    SECTION("[warmup] listSize is 0 after warmup (probe cleaned up)") {
         TestInternals::resetEntityCacheState<TestArticleListRepo>();
         TestInternals::resetListCacheState<TestArticleListRepo>();
         TestArticleListRepo::warmup();
         // warmup() inserts probes then invalidates them — caches should be empty
         REQUIRE(getCacheSize<TestArticleListRepo>() == 0);
-        REQUIRE(TestArticleListRepo::listCacheSize() == 0);
+        REQUIRE(TestArticleListRepo::listSize() == 0);
     }
 }

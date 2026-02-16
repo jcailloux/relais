@@ -231,7 +231,7 @@ public:
         cache().invalidate(id);
     }
 
-    [[nodiscard]] static size_t cacheSize() {
+    [[nodiscard]] static size_t size() {
         return cache().size();
     }
 
