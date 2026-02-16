@@ -329,10 +329,10 @@ namespace jcailloux::relais::cache {
                 std::chrono::duration<Rep, Period> ttl,
                 std::optional<list::ListBoundsHeader> header = std::nullopt)
                 requires requires(const ListEntity& l) {
-                    { l.toBinary() } -> std::convertible_to<std::shared_ptr<const std::vector<uint8_t>>>;
+                    { l.binary() } -> std::convertible_to<std::shared_ptr<const std::vector<uint8_t>>>;
                 }
             {
-                auto binary = listEntity.toBinary();
+                auto binary = listEntity.binary();
                 if (header) {
                     std::vector<uint8_t> prefixed(list::kListBoundsHeaderSize + binary->size());
                     header->writeTo(prefixed.data());

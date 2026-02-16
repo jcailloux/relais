@@ -223,7 +223,7 @@ class RedisRepo : public BaseRepo<Entity, Name, Cfg, Key> {
         /// Set entity in cache using its native serialization format.
         static io::Task<bool> setInCache(const std::string& key, const Entity& entity) {
             if constexpr (HasBinarySerialization<Entity>) {
-                co_return co_await cache::RedisCache::setRawBinary(key, *entity.toBinary(), l2Ttl());
+                co_return co_await cache::RedisCache::setRawBinary(key, *entity.binary(), l2Ttl());
             } else {
                 co_return co_await cache::RedisCache::set(key, entity, l2Ttl());
             }

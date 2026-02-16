@@ -17,7 +17,7 @@ namespace jcailloux::relais {
 // Each level adds requirements on top of the previous one.
 //
 //   Readable          — can be constructed from a PgResult::Row (fromRow)
-//   Serializable      — can be cached (toJson/fromJson or toBinary/fromBinary)
+//   Serializable      — can be cached (toJson/fromJson or binary/fromBinary)
 //   Writable          — can produce insert params (toInsertParams)
 //   Keyed             — has a primary key (getPrimaryKey)
 //

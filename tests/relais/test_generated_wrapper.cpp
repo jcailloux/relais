@@ -14,7 +14,7 @@
  *
  * SECTION naming convention:
  *   [Struct]       — direct struct construction and field access
- *   [Binary]       — BEVE binary round-trip (toBinary / fromBinary)
+ *   [Binary]       — BEVE binary round-trip (binary / fromBinary)
  *   [JSON]         — JSON round-trip (toJson / fromJson)
  *   [List]         — ListWrapper construction / accessors
  *   [List->JSON]   — ListWrapper serialized to JSON
@@ -91,7 +91,7 @@ TEST_CASE("TestUser - binary (BEVE) round-trip", "[wrapper][binary][user]") {
     user.created_at = "2025-01-01T00:00:00Z";
 
     SECTION("[Binary] round-trip preserves all fields") {
-        auto restored = TestUser::fromBinary(*user.toBinary());
+        auto restored = TestUser::fromBinary(*user.binary());
         REQUIRE(restored.has_value());
         REQUIRE(restored->id == 42);
         REQUIRE(restored->username == "alice");
@@ -142,7 +142,7 @@ TEST_CASE("TestUser - JSON round-trip", "[wrapper][json][user]") {
         u.email = "bob@example.com";
         u.balance = 500;
         u.created_at = "2025-06-15T10:30:00Z";
-        auto restored = TestUser::fromBinary(*u.toBinary());
+        auto restored = TestUser::fromBinary(*u.binary());
         REQUIRE(restored.has_value());
         REQUIRE(restored->id == 99);
         REQUIRE(restored->username == "bob");
@@ -224,14 +224,14 @@ TEST_CASE("TestArticle - nullable fields", "[wrapper][struct][article][nullable]
     }
 
     SECTION("[Binary] round-trip preserves absent optional") {
-        auto restored = TestArticle::fromBinary(*article.toBinary());
+        auto restored = TestArticle::fromBinary(*article.binary());
         REQUIRE(restored.has_value());
         REQUIRE_FALSE(restored->view_count.has_value());
     }
 
     SECTION("[Binary] round-trip preserves present optional") {
         article.view_count = 42;
-        auto restored = TestArticle::fromBinary(*article.toBinary());
+        auto restored = TestArticle::fromBinary(*article.binary());
         REQUIRE(restored.has_value());
         REQUIRE(restored->view_count.has_value());
         REQUIRE(*restored->view_count == 42);
@@ -270,7 +270,7 @@ TEST_CASE("TestPurchase - struct / toJson / binary", "[wrapper][struct][purchase
     }
 
     SECTION("[Binary] round-trip preserves data") {
-        auto restored = TestPurchase::fromBinary(*purchase.toBinary());
+        auto restored = TestPurchase::fromBinary(*purchase.binary());
         REQUIRE(restored.has_value());
         REQUIRE(restored->id == 1);
         REQUIRE(restored->user_id == 42);
@@ -390,7 +390,7 @@ TEST_CASE("TestOrder - direct construction reads all fields", "[wrapper][struct]
 TEST_CASE("TestOrder - binary (BEVE) round-trip", "[wrapper][binary][order]") {
 
     auto order = buildFullTestOrder();
-    auto restored = TestOrder::fromBinary(*order.toBinary());
+    auto restored = TestOrder::fromBinary(*order.binary());
     REQUIRE(restored.has_value());
 
     SECTION("[Binary] preserves scalar fields") {
@@ -466,7 +466,7 @@ TEST_CASE("TestOrder - EnumField (status — developer-defined glz::meta)", "[wr
     }
 
     SECTION("[Binary] round-trips through BEVE") {
-        auto restored = TestOrder::fromBinary(*order.toBinary());
+        auto restored = TestOrder::fromBinary(*order.binary());
         REQUIRE(restored.has_value());
         REQUIRE(restored->status == Status::Shipped);
     }
@@ -569,14 +569,14 @@ TEST_CASE("TestOrder - nullable discount", "[wrapper][struct][order][nullable]")
 
     SECTION("[Binary] round-trip preserves absent") {
         auto order = buildMinimalTestOrder();
-        auto restored = TestOrder::fromBinary(*order.toBinary());
+        auto restored = TestOrder::fromBinary(*order.binary());
         REQUIRE(restored.has_value());
         REQUIRE_FALSE(restored->discount.has_value());
     }
 
     SECTION("[Binary] round-trip preserves present value") {
         auto order = buildFullTestOrder();
-        auto restored = TestOrder::fromBinary(*order.toBinary());
+        auto restored = TestOrder::fromBinary(*order.binary());
         REQUIRE(restored.has_value());
         REQUIRE(restored->discount.has_value());
         REQUIRE(*restored->discount == 50);
@@ -652,7 +652,7 @@ TEST_CASE("TestOrder - deep nesting round-trip (4 levels)", "[wrapper][struct][o
 
     SECTION("[Binary] full composite round-trip") {
         auto order = buildFullTestOrder();
-        auto restored = TestOrder::fromBinary(*order.toBinary());
+        auto restored = TestOrder::fromBinary(*order.binary());
         REQUIRE(restored.has_value());
 
         REQUIRE(restored->address.street == "123 Main St");
@@ -740,8 +740,8 @@ TEST_CASE("ListWrapper<TestArticle> - construction and accessors", "[wrapper][li
         REQUIRE_FALSE(last->view_count.has_value());
     }
 
-    SECTION("[List] toBinary round-trip preserves list") {
-        auto restored = ListWrapperArticle::fromBinary(*list.toBinary());
+    SECTION("[List] binary round-trip preserves list") {
+        auto restored = ListWrapperArticle::fromBinary(*list.binary());
         REQUIRE(restored.has_value());
         REQUIRE(restored->size() == 2);
     }
@@ -1109,7 +1109,7 @@ TEST_CASE("Custom JSON field names via glz::meta<Struct>", "[wrapper][json][cust
     }
 
     SECTION("[Binary] BEVE round-trip preserves all fields") {
-        auto restored = custom_json_test::ProductWrapper::fromBinary(*product.toBinary());
+        auto restored = custom_json_test::ProductWrapper::fromBinary(*product.binary());
         REQUIRE(restored.has_value());
         REQUIRE(restored->id == 42);
         REQUIRE(restored->product_name == "Widget");
@@ -1149,7 +1149,7 @@ TEST_CASE("ListWrapper items use custom JSON field names", "[wrapper][list][cust
     }
 
     SECTION("[List] BEVE round-trip preserves items") {
-        auto restored = ProductList::fromBinary(*list.toBinary());
+        auto restored = ProductList::fromBinary(*list.binary());
         REQUIRE(restored.has_value());
         REQUIRE(restored->size() == 2);
         REQUIRE(restored->items[0].product_name == "Widget");
@@ -1167,7 +1167,7 @@ TEST_CASE("releaseCaches() frees serialization data while callers retain copies"
     user.created_at = "2025-01-01T00:00:00Z";
 
     SECTION("[Entity] callers retain binary data after releaseCaches") {
-        auto binary = user.toBinary();
+        auto binary = user.binary();
         REQUIRE(binary);
         REQUIRE_FALSE(binary->empty());
         auto size_before = binary->size();
@@ -1177,7 +1177,7 @@ TEST_CASE("releaseCaches() frees serialization data while callers retain copies"
         // Caller's shared_ptr still valid
         REQUIRE(binary->size() == size_before);
         // Entity's BEVE cache is gone (once_flag already triggered)
-        REQUIRE_FALSE(user.toBinary());
+        REQUIRE_FALSE(user.binary());
     }
 
     SECTION("[Entity] callers retain JSON data after releaseCaches") {
@@ -1197,7 +1197,7 @@ TEST_CASE("releaseCaches() frees serialization data while callers retain copies"
         list.items = {user};
         list.total_count = 1;
 
-        auto binary = list.toBinary();
+        auto binary = list.binary();
         auto json = list.toJson();
         REQUIRE(binary);
         REQUIRE(json);
@@ -1208,7 +1208,7 @@ TEST_CASE("releaseCaches() frees serialization data while callers retain copies"
         REQUIRE_FALSE(binary->empty());
         REQUIRE(json->find("\"username\":\"alice\"") != std::string::npos);
         // List's caches are gone
-        REQUIRE_FALSE(list.toBinary());
+        REQUIRE_FALSE(list.binary());
         REQUIRE_FALSE(list.toJson());
     }
 }

@@ -99,7 +99,7 @@ template<> struct glz::meta<User> {
 using UserWrapper = jcailloux::relais::wrapper::EntityWrapper<User, generated::UserMapping>;
 // UserWrapper inherits from User and adds:
 // - fromRow/toInsertParams (delegated to Mapping)
-// - toBinary/toJson (thread-safe lazy BEVE/JSON via Glaze)
+// - binary/toJson (thread-safe lazy BEVE/JSON via Glaze)
 // - getPrimaryKey
 ```
 

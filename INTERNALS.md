@@ -872,7 +872,7 @@ concept HasJsonSerialization = requires(const Entity& e, std::string_view json) 
 
 template<typename Entity>
 concept HasBinarySerialization = requires(const Entity& e, std::span<const uint8_t> data) {
-    { e.toBinary() } -> std::convertible_to<std::shared_ptr<const std::vector<uint8_t>>>;
+    { e.binary() } -> std::convertible_to<std::shared_ptr<const std::vector<uint8_t>>>;
     { Entity::fromBinary(data) } -> std::convertible_to<std::optional<Entity>>;
 };
 ```
@@ -904,8 +904,8 @@ class EntityWrapper : public Struct {
 
 - **Struct**: Pure C++ data type, framework-agnostic, shareable across projects
 - **Mapping**: Generated standalone struct with template `fromRow<Entity>`, `toInsertParams<Entity>`, `getPrimaryKey<Entity>`
-- **Serialization caches**: `std::once_flag` + mutable `shared_ptr` cache fields; both `toBinary()` and `toJson()` return `shared_ptr` for safe lifetime management
-- **`releaseCaches()`**: Resets both BEVE and JSON shared_ptrs to nullptr. After release, `toBinary()`/`toJson()` return nullptr (once_flag already triggered)
+- **Serialization caches**: `std::once_flag` + mutable `shared_ptr` cache fields; both `binary()` and `toJson()` return `shared_ptr` for safe lifetime management
+- **`releaseCaches()`**: Resets both BEVE and JSON shared_ptrs to nullptr. After release, `binary()`/`toJson()` return nullptr (once_flag already triggered)
 
 #### Glaze Metadata Resolution
 

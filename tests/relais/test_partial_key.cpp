@@ -530,7 +530,7 @@ TEST_CASE("PartialKey - serialization",
         auto original = sync(UncachedTestEventRepo::find(eventId));
         REQUIRE(original != nullptr);
 
-        auto binary = original->toBinary();
+        auto binary = original->binary();
         REQUIRE(binary != nullptr);
         REQUIRE(!binary->empty());
 

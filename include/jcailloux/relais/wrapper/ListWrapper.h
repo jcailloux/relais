@@ -84,7 +84,7 @@ public:
     // Binary serialization (Glaze BEVE)
     // =========================================================================
 
-    [[nodiscard]] std::shared_ptr<const std::vector<uint8_t>> toBinary() const {
+    [[nodiscard]] std::shared_ptr<const std::vector<uint8_t>> binary() const {
         std::call_once(beve_flag_, [this] {
             auto buf = std::make_shared<std::vector<uint8_t>>();
             if (glz::write_beve(*this, *buf))
@@ -130,9 +130,9 @@ public:
     // Cache management
     // =========================================================================
 
-    /// Release serialization caches. After this call, toBinary()/toJson()
+    /// Release serialization caches. After this call, binary()/toJson()
     /// return nullptr. Callers who previously obtained shared_ptrs from
-    /// toBinary()/toJson() retain valid data through reference counting.
+    /// binary()/toJson() retain valid data through reference counting.
     void releaseCaches() const noexcept {
         beve_cache_.reset();
         json_cache_.reset();
