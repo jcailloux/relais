@@ -8,8 +8,8 @@
 #include <cstring>
 #include <span>
 
-#include "pqcoro/Task.h"
-#include "pqcoro/redis/RedisResult.h"
+#include "jcailloux/relais/io/Task.h"
+#include "jcailloux/relais/io/redis/RedisResult.h"
 #include "jcailloux/relais/DbProvider.h"
 #include "jcailloux/relais/Log.h"
 
@@ -23,13 +23,13 @@ namespace jcailloux::relais::cache {
      * Entity must implement toJson() and fromJson().
      *
      * All Redis operations go through DbProvider::redis() which wraps
-     * pqcoro::RedisClient via type-erased std::function.
+     * io::RedisClient via type-erased std::function.
      */
     class RedisCache {
         public:
 
             template<typename Entity>
-            static pqcoro::Task<std::optional<Entity>> get(const std::string& key) {
+            static io::Task<std::optional<Entity>> get(const std::string& key) {
                 if (!DbProvider::hasRedis()) {
                     co_return std::nullopt;
                 }
@@ -47,7 +47,7 @@ namespace jcailloux::relais::cache {
             }
 
             template<typename Entity, typename Rep, typename Period>
-            static pqcoro::Task<std::optional<Entity>> getEx(const std::string& key,
+            static io::Task<std::optional<Entity>> getEx(const std::string& key,
                                                               std::chrono::duration<Rep, Period> ttl) {
                 if (auto json = co_await getRawEx(key, ttl)) {
                     co_return Entity::fromJson(*json);
@@ -56,7 +56,7 @@ namespace jcailloux::relais::cache {
             }
 
             template<typename Entity, typename Rep, typename Period>
-            static pqcoro::Task<bool> set(const std::string& key, const Entity& entity, std::chrono::duration<Rep, Period> ttl) {
+            static io::Task<bool> set(const std::string& key, const Entity& entity, std::chrono::duration<Rep, Period> ttl) {
                 if (!DbProvider::hasRedis()) {
                     co_return false;
                 }
@@ -74,7 +74,7 @@ namespace jcailloux::relais::cache {
             }
 
             template<typename Entity>
-            static pqcoro::Task<std::optional<std::vector<Entity>>> getList(const std::string& key) {
+            static io::Task<std::optional<std::vector<Entity>>> getList(const std::string& key) {
                 if (!DbProvider::hasRedis()) {
                     co_return std::nullopt;
                 }
@@ -93,7 +93,7 @@ namespace jcailloux::relais::cache {
             }
 
             template<typename Entity, typename Rep, typename Period>
-            static pqcoro::Task<std::optional<std::vector<Entity>>> getListEx(const std::string& key,
+            static io::Task<std::optional<std::vector<Entity>>> getListEx(const std::string& key,
                                                                                std::chrono::duration<Rep, Period> ttl) {
                 if (auto raw = co_await getRawEx(key, ttl)) {
                     co_return parseListWithHeader<Entity>(*raw);
@@ -102,7 +102,7 @@ namespace jcailloux::relais::cache {
             }
 
             template<typename Entity, typename Rep, typename Period>
-            static pqcoro::Task<bool> setList(const std::string& key,
+            static io::Task<bool> setList(const std::string& key,
                                                const std::vector<Entity>& entities,
                                                std::chrono::duration<Rep, Period> ttl,
                                                std::optional<list::ListBoundsHeader> header = std::nullopt) {
@@ -135,7 +135,7 @@ namespace jcailloux::relais::cache {
             }
 
             /// Get raw JSON string without deserialization.
-            static pqcoro::Task<std::optional<std::string>> getRaw(const std::string& key) {
+            static io::Task<std::optional<std::string>> getRaw(const std::string& key) {
                 if (!DbProvider::hasRedis()) {
                     co_return std::nullopt;
                 }
@@ -153,7 +153,7 @@ namespace jcailloux::relais::cache {
             }
 
             template<typename Rep, typename Period>
-            static pqcoro::Task<std::optional<std::string>> getRawEx(const std::string& key,
+            static io::Task<std::optional<std::string>> getRawEx(const std::string& key,
                                                                       std::chrono::duration<Rep, Period> ttl) {
                 if (!DbProvider::hasRedis()) {
                     co_return std::nullopt;
@@ -175,7 +175,7 @@ namespace jcailloux::relais::cache {
 
             /// Store raw JSON string without serialization.
             template<typename Rep, typename Period>
-            static pqcoro::Task<bool> setRaw(const std::string& key,
+            static io::Task<bool> setRaw(const std::string& key,
                                               const std::string_view json,
                                               std::chrono::duration<Rep, Period> ttl) {
                 if (!DbProvider::hasRedis()) {
@@ -194,19 +194,19 @@ namespace jcailloux::relais::cache {
                 }
             }
 
-            static pqcoro::Task<std::optional<std::string>> getListRaw(const std::string& key) {
+            static io::Task<std::optional<std::string>> getListRaw(const std::string& key) {
                 co_return co_await getRaw(key);
             }
 
             template<typename Rep, typename Period>
-            static pqcoro::Task<bool> setListRaw(const std::string& key,
+            static io::Task<bool> setListRaw(const std::string& key,
                                                   std::string_view json,
                                                   std::chrono::duration<Rep, Period> ttl) {
                 co_return co_await setRaw(key, json, ttl);
             }
 
             /// Get raw binary data (for BEVE or other binary formats).
-            static pqcoro::Task<std::optional<std::vector<uint8_t>>> getRawBinary(const std::string& key) {
+            static io::Task<std::optional<std::vector<uint8_t>>> getRawBinary(const std::string& key) {
                 if (!DbProvider::hasRedis()) {
                     co_return std::nullopt;
                 }
@@ -228,7 +228,7 @@ namespace jcailloux::relais::cache {
 
             /// Get raw binary data with TTL refresh (GETEX).
             template<typename Rep, typename Period>
-            static pqcoro::Task<std::optional<std::vector<uint8_t>>> getRawBinaryEx(
+            static io::Task<std::optional<std::vector<uint8_t>>> getRawBinaryEx(
                 const std::string& key,
                 std::chrono::duration<Rep, Period> ttl) {
                 if (!DbProvider::hasRedis()) {
@@ -254,7 +254,7 @@ namespace jcailloux::relais::cache {
 
             /// Store raw binary data.
             template<typename Rep, typename Period>
-            static pqcoro::Task<bool> setRawBinary(const std::string& key,
+            static io::Task<bool> setRawBinary(const std::string& key,
                                                     const std::vector<uint8_t>& data,
                                                     std::chrono::duration<Rep, Period> ttl) {
                 if (!DbProvider::hasRedis()) {
@@ -280,7 +280,7 @@ namespace jcailloux::relais::cache {
             /// Get a FlatBuffer list entity from binary cache.
             /// Automatically skips the ListBoundsHeader if present (magic bytes 0x53 0x52).
             template<typename ListEntity>
-            static pqcoro::Task<std::optional<ListEntity>> getListBinary(const std::string& key)
+            static io::Task<std::optional<ListEntity>> getListBinary(const std::string& key)
                 requires requires(const std::vector<uint8_t>& data) {
                     { ListEntity::fromBinary(std::span<const uint8_t>(data)) } -> std::convertible_to<std::optional<ListEntity>>;
                 }
@@ -301,7 +301,7 @@ namespace jcailloux::relais::cache {
 
             /// Get a FlatBuffer list entity with TTL refresh.
             template<typename ListEntity, typename Rep, typename Period>
-            static pqcoro::Task<std::optional<ListEntity>> getListBinaryEx(
+            static io::Task<std::optional<ListEntity>> getListBinaryEx(
                 const std::string& key,
                 std::chrono::duration<Rep, Period> ttl)
                 requires requires(const std::vector<uint8_t>& data) {
@@ -323,7 +323,7 @@ namespace jcailloux::relais::cache {
 
             /// Store a list entity as binary.
             template<typename ListEntity, typename Rep, typename Period>
-            static pqcoro::Task<bool> setListBinary(
+            static io::Task<bool> setListBinary(
                 const std::string& key,
                 const ListEntity& listEntity,
                 std::chrono::duration<Rep, Period> ttl,
@@ -345,7 +345,7 @@ namespace jcailloux::relais::cache {
 
             /// Refresh TTL without modifying the value.
             template<typename Rep, typename Period>
-            static pqcoro::Task<bool> expire(const std::string& key,
+            static io::Task<bool> expire(const std::string& key,
                                               std::chrono::duration<Rep, Period> ttl) {
                 if (!DbProvider::hasRedis()) {
                     co_return false;
@@ -362,7 +362,7 @@ namespace jcailloux::relais::cache {
                 }
             }
 
-            static pqcoro::Task<bool> invalidate(const std::string& key) {
+            static io::Task<bool> invalidate(const std::string& key) {
                 if (!DbProvider::hasRedis()) {
                     co_return false;
                 }
@@ -378,7 +378,7 @@ namespace jcailloux::relais::cache {
 
             /// Invalidate keys matching a pattern using SCAN (non-blocking).
             /// Safer than KEYS for production use.
-            static pqcoro::Task<size_t> invalidatePatternSafe(const std::string& pattern,
+            static io::Task<size_t> invalidatePatternSafe(const std::string& pattern,
                                                                size_t batch_size = 100) {
                 if (!DbProvider::hasRedis()) {
                     co_return 0;
@@ -435,7 +435,7 @@ namespace jcailloux::relais::cache {
 
             /// Track a list cache key in its group's tracking set.
             template<typename Rep, typename Period>
-            static pqcoro::Task<bool> trackListKey(const std::string& groupKey,
+            static io::Task<bool> trackListKey(const std::string& groupKey,
                                                     const std::string& listKey,
                                                     std::chrono::duration<Rep, Period> ttl) {
                 if (!DbProvider::hasRedis()) {
@@ -462,7 +462,7 @@ namespace jcailloux::relais::cache {
 
             /// Invalidate all list cache keys in a group.
             /// O(M) where M is the number of cached pages (typically small).
-            static pqcoro::Task<size_t> invalidateListGroup(const std::string& groupKey) {
+            static io::Task<size_t> invalidateListGroup(const std::string& groupKey) {
                 if (!DbProvider::hasRedis()) {
                     co_return 0;
                 }
@@ -497,7 +497,7 @@ namespace jcailloux::relais::cache {
             // =================================================================
 
             /// Selectively invalidate list pages in a group based on a single sort value.
-            static pqcoro::Task<size_t> invalidateListGroupSelective(
+            static io::Task<size_t> invalidateListGroupSelective(
                 const std::string& groupKey,
                 int64_t entity_sort_val)
             {
@@ -592,7 +592,7 @@ return count
 
             /// Selectively invalidate list pages in a group based on old and new sort values.
             /// Used for update operations where the entity's sort value changed.
-            static pqcoro::Task<size_t> invalidateListGroupSelectiveUpdate(
+            static io::Task<size_t> invalidateListGroupSelectiveUpdate(
                 const std::string& groupKey,
                 int64_t old_sort_val,
                 int64_t new_sort_val)

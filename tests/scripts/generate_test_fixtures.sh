@@ -37,8 +37,8 @@ echo "Generating entity wrappers..."
 if [ -d "$TESTS_DIR/fixtures" ]; then
   if command -v python3 &> /dev/null; then
       python3 "$SCRIPT_PATH" \
-          --scan "$FIXTURES_DIR" \
-          --output-dir "$TESTS_DIR" || {
+          --sources "$FIXTURES_DIR" \
+          --output-dir "$GENERATED_DIR" || {
           echo "  Warning: Entity generation failed"
       }
       echo "  Done."

@@ -4,8 +4,8 @@
 #include <concepts>
 #include <optional>
 
-#include "pqcoro/pg/PgResult.h"
-#include "pqcoro/pg/PgParams.h"
+#include "jcailloux/relais/io/pg/PgResult.h"
+#include "jcailloux/relais/io/pg/PgParams.h"
 #include "jcailloux/relais/wrapper/SerializationTraits.h"
 
 namespace jcailloux::relais {
@@ -35,7 +35,7 @@ namespace jcailloux::relais {
 
 /// Can be constructed from a PostgreSQL result row
 template<typename W>
-concept Readable = requires(const pqcoro::PgResult::Row& row) {
+concept Readable = requires(const io::PgResult::Row& row) {
     { W::fromRow(row) } -> std::convertible_to<std::optional<W>>;
 };
 
@@ -47,7 +47,7 @@ concept Serializable = HasJsonSerialization<W>
 /// Can produce SQL insert parameters for DB writes
 template<typename W>
 concept Writable = requires(const W& w) {
-    { W::toInsertParams(w) } -> std::convertible_to<pqcoro::PgParams>;
+    { W::toInsertParams(w) } -> std::convertible_to<io::PgParams>;
 };
 
 /// Has a primary key for cache key generation
@@ -95,7 +95,7 @@ concept HasListDescriptor = requires {
 template<typename Entity>
 concept HasPartitionKey = requires(const Entity& e) {
     { Entity::MappingType::SQL::delete_by_full_pk } -> std::convertible_to<const char*>;
-    { Entity::MappingType::makeFullKeyParams(e) } -> std::convertible_to<pqcoro::PgParams>;
+    { Entity::MappingType::makeFullKeyParams(e) } -> std::convertible_to<io::PgParams>;
 };
 
 }  // namespace jcailloux::relais

@@ -58,7 +58,7 @@ namespace relais_test {
 // CacheConfig presets for L2 tests with custom TTL
 namespace test_l2 {
 using namespace jcailloux::relais::config;
-inline constexpr auto RedisShortTTL = Redis.with_l2_ttl(std::chrono::seconds{6});
+inline constexpr auto RedisShortTTL = Redis.with_l2_ttl(std::chrono::seconds{2});
 } // namespace test_l2
 
 // =============================================================================
@@ -87,7 +87,7 @@ using L2TestPurchaseRepository = Repository<TestPurchaseWrapper, "test:purchase:
  * Async resolver: given a user_id, finds all article IDs by that author.
  */
 struct UserArticleResolver {
-    static pqcoro::Task<std::vector<int64_t>> resolve(int64_t user_id) {
+    static io::Task<std::vector<int64_t>> resolve(int64_t user_id) {
         auto result = co_await jcailloux::relais::DbProvider::queryArgs(
             "SELECT id FROM relais_test_articles WHERE author_id = $1", user_id);
         std::vector<int64_t> ids;
@@ -129,11 +129,11 @@ using L2ReadOnlyInvPurchaseRepository = Repository<TestPurchaseWrapper, "test:pu
  */
 class L2TestArticleListRepo : public Repository<TestArticleWrapper, "test:article:list:l2", cfg::Redis> {
 public:
-    static pqcoro::Task<std::vector<TestArticleWrapper>> getByCategory(
+    static io::Task<std::vector<TestArticleWrapper>> getByCategory(
         const std::string& category, int limit = 10)
     {
         co_return co_await cachedList(
-            [category, limit]() -> pqcoro::Task<std::vector<TestArticleWrapper>> {
+            [category, limit]() -> io::Task<std::vector<TestArticleWrapper>> {
                 auto result = co_await jcailloux::relais::DbProvider::queryArgs(
                     "SELECT id, category, author_id, title, view_count, is_published, published_at, created_at "
                     "FROM relais_test_articles WHERE category = $1 ORDER BY created_at DESC LIMIT $2",
@@ -149,7 +149,7 @@ public:
         );
     }
 
-    static pqcoro::Task<bool> invalidateCategoryList(const std::string& category) {
+    static io::Task<bool> invalidateCategoryList(const std::string& category) {
         auto key = makeListCacheKey("category", category);
         co_return co_await jcailloux::relais::cache::RedisCache::invalidate(key);
     }
@@ -160,11 +160,11 @@ public:
  */
 class L2TestArticleListAsRepo : public Repository<TestArticleWrapper, "test:article:listas:l2", cfg::Redis> {
 public:
-    static pqcoro::Task<TestArticleList> getByCategory(
+    static io::Task<TestArticleList> getByCategory(
         const std::string& category, int limit = 10)
     {
         co_return co_await cachedListAs<TestArticleList>(
-            [category, limit]() -> pqcoro::Task<TestArticleList> {
+            [category, limit]() -> io::Task<TestArticleList> {
                 auto result = co_await jcailloux::relais::DbProvider::queryArgs(
                     "SELECT id, category, author_id, title, view_count, is_published, published_at, created_at "
                     "FROM relais_test_articles WHERE category = $1 ORDER BY created_at DESC LIMIT $2",
@@ -175,7 +175,7 @@ public:
         );
     }
 
-    static pqcoro::Task<bool> invalidateCategoryList(const std::string& category) {
+    static io::Task<bool> invalidateCategoryList(const std::string& category) {
         auto key = makeListCacheKey("category", category);
         co_return co_await jcailloux::relais::cache::RedisCache::invalidate(key);
     }
@@ -186,11 +186,11 @@ public:
  */
 class L2TestPurchaseListRepo : public Repository<TestPurchaseWrapper, "test:purchase:list:l2", cfg::Redis> {
 public:
-    static pqcoro::Task<std::vector<TestPurchaseWrapper>> getByUserId(
+    static io::Task<std::vector<TestPurchaseWrapper>> getByUserId(
         int64_t user_id, int limit = 10)
     {
         co_return co_await cachedList(
-            [user_id, limit]() -> pqcoro::Task<std::vector<TestPurchaseWrapper>> {
+            [user_id, limit]() -> io::Task<std::vector<TestPurchaseWrapper>> {
                 auto result = co_await jcailloux::relais::DbProvider::queryArgs(
                     "SELECT id, user_id, product_name, amount, status, created_at "
                     "FROM relais_test_purchases WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2",
@@ -206,7 +206,7 @@ public:
         );
     }
 
-    static pqcoro::Task<bool> invalidateUserList(int64_t user_id) {
+    static io::Task<bool> invalidateUserList(int64_t user_id) {
         auto key = makeListCacheKey("user", user_id);
         co_return co_await jcailloux::relais::cache::RedisCache::invalidate(key);
     }
@@ -222,7 +222,7 @@ public:
  */
 class L2PurchaseListInvalidator {
 public:
-    static pqcoro::Task<void> onEntityModified(
+    static io::Task<void> onEntityModified(
         std::shared_ptr<const TestPurchaseWrapper> entity)
     {
         if (entity) {
@@ -251,7 +251,7 @@ using L2ListInvPurchaseRepo = Repository<TestPurchaseWrapper, "test:purchase:l2:
  * authored by that user. Used for indirect list invalidation.
  */
 struct PurchaseToArticleCategoryResolver {
-    static pqcoro::Task<std::vector<std::string>> resolve(int64_t user_id) {
+    static io::Task<std::vector<std::string>> resolve(int64_t user_id) {
         auto result = co_await jcailloux::relais::DbProvider::queryArgs(
             "SELECT DISTINCT category FROM relais_test_articles WHERE author_id = $1",
             user_id);
@@ -268,7 +268,7 @@ struct PurchaseToArticleCategoryResolver {
  */
 class L2ArticleCategoryListInvalidator {
 public:
-    static pqcoro::Task<void> invalidate(const std::string& category) {
+    static io::Task<void> invalidate(const std::string& category) {
         co_await L2TestArticleListRepo::invalidateCategoryList(category);
     }
 };
@@ -294,11 +294,11 @@ using L2CustomListPurchaseRepo = Repository<TestPurchaseWrapper, "test:purchase:
  */
 class L2TrackedArticleListRepo : public Repository<TestArticleWrapper, "test:article:tracked:list:l2", cfg::Redis> {
 public:
-    static pqcoro::Task<std::vector<TestArticleWrapper>> getByCategory(
+    static io::Task<std::vector<TestArticleWrapper>> getByCategory(
         const std::string& category, int limit = 10, int offset = 0)
     {
         co_return co_await cachedListTracked(
-            [category, limit, offset]() -> pqcoro::Task<std::vector<TestArticleWrapper>> {
+            [category, limit, offset]() -> io::Task<std::vector<TestArticleWrapper>> {
                 auto result = co_await jcailloux::relais::DbProvider::queryArgs(
                     "SELECT id, category, author_id, title, view_count, is_published, published_at, created_at "
                     "FROM relais_test_articles WHERE category = $1 ORDER BY view_count DESC LIMIT $2 OFFSET $3",
@@ -315,7 +315,7 @@ public:
         );
     }
 
-    static pqcoro::Task<size_t> invalidateCategoryList(const std::string& category) {
+    static io::Task<size_t> invalidateCategoryList(const std::string& category) {
         co_return co_await invalidateListGroup("category", category);
     }
 };
@@ -325,11 +325,11 @@ public:
  */
 class L2TrackedArticleShortTTLRepo : public Repository<TestArticleWrapper, "test:article:tracked:list:l2:short", test_l2::RedisShortTTL> {
 public:
-    static pqcoro::Task<std::vector<TestArticleWrapper>> getByCategory(
+    static io::Task<std::vector<TestArticleWrapper>> getByCategory(
         const std::string& category, int limit = 10, int offset = 0)
     {
         co_return co_await cachedListTracked(
-            [category, limit, offset]() -> pqcoro::Task<std::vector<TestArticleWrapper>> {
+            [category, limit, offset]() -> io::Task<std::vector<TestArticleWrapper>> {
                 auto result = co_await jcailloux::relais::DbProvider::queryArgs(
                     "SELECT id, category, author_id, title, view_count, is_published, published_at, created_at "
                     "FROM relais_test_articles WHERE category = $1 ORDER BY view_count DESC LIMIT $2 OFFSET $3",
@@ -346,7 +346,7 @@ public:
         );
     }
 
-    static pqcoro::Task<size_t> invalidateCategoryList(const std::string& category) {
+    static io::Task<size_t> invalidateCategoryList(const std::string& category) {
         co_return co_await invalidateListGroup("category", category);
     }
 };
@@ -356,7 +356,7 @@ public:
  */
 class L2TrackedArticleCategoryInvalidator {
 public:
-    static pqcoro::Task<void> invalidate(const std::string& category) {
+    static io::Task<void> invalidate(const std::string& category) {
         co_await L2TrackedArticleListRepo::invalidateCategoryList(category);
     }
 };
@@ -1174,22 +1174,22 @@ namespace {
 
 // Redis inspection coroutines for tracking data verification
 
-pqcoro::Task<int64_t> redisTTL(const std::string& key) {
+io::Task<int64_t> redisTTL(const std::string& key) {
     auto result = co_await jcailloux::relais::DbProvider::redis("TTL", key);
     co_return result.asInteger();
 }
 
-pqcoro::Task<int64_t> redisExists(const std::string& key) {
+io::Task<int64_t> redisExists(const std::string& key) {
     auto result = co_await jcailloux::relais::DbProvider::redis("EXISTS", key);
     co_return result.asInteger();
 }
 
-pqcoro::Task<int64_t> redisSCard(const std::string& key) {
+io::Task<int64_t> redisSCard(const std::string& key) {
     auto result = co_await jcailloux::relais::DbProvider::redis("SCARD", key);
     co_return result.asInteger();
 }
 
-pqcoro::Task<bool> redisSetContains(const std::string& setKey, const std::string& member) {
+io::Task<bool> redisSetContains(const std::string& setKey, const std::string& member) {
     auto result = co_await jcailloux::relais::DbProvider::redis("SISMEMBER", setKey, member);
     co_return result.asInteger() == 1;
 }
@@ -1356,8 +1356,8 @@ TEST_CASE("RedisRepository - tracked list Redis tracking data",
         auto ttl1 = sync(redisTTL(trackKey));
         REQUIRE(ttl1 > 0);
 
-        // Wait 2 seconds
-        std::this_thread::sleep_for(std::chrono::seconds(2));
+        // Wait 1 second
+        std::this_thread::sleep_for(std::chrono::seconds(1));
 
         // Cache page 2 → EXPIRE NX should NOT renew TTL
         sync(L2TrackedArticleListRepo::getByCategory("ttl_test", 5, 5));
@@ -1429,21 +1429,21 @@ TEST_CASE("RedisRepository - tracked list Redis tracking data",
         for (int i = 0; i < 10; ++i)
             insertTestArticle("orphan_test", userId, "Orphan " + std::to_string(i), (i + 1) * 10, true);
 
-        // Cache page 1 at t=0 → tracking set TTL = 6s
+        // Cache page 1 at t=0 → tracking set TTL = 2s
         sync(L2TrackedArticleShortTTLRepo::getByCategory("orphan_test", 5, 0));
 
-        // Wait 3 seconds, then cache page 2
-        // Page 2 TTL = 6s (expires at t≈9), tracking set EXPIRE NX unchanged (expires at t≈6)
-        std::this_thread::sleep_for(std::chrono::seconds(3));
+        // Wait 1 second, then cache page 2
+        // Page 2 TTL = 2s (expires at t≈3), tracking set EXPIRE NX unchanged (expires at t≈2)
+        std::this_thread::sleep_for(std::chrono::seconds(1));
         sync(L2TrackedArticleShortTTLRepo::getByCategory("orphan_test", 5, 5));
 
         auto trackKey = trackedTrackingKey(kTrackedShortTTLRepoName, "orphan_test");
         auto page5Key = trackedPageKey(kTrackedShortTTLRepoName, "orphan_test", 5, 5);
 
         // Wait until tracking set expires but page 2 is still alive
-        // At t≈7, tracking set (TTL 6s from t=0) is expired,
-        // page 2 (TTL 6s from t=3) still alive until t≈9
-        std::this_thread::sleep_for(std::chrono::seconds(4));
+        // At t≈2.5, tracking set (TTL 2s from t=0) is expired,
+        // page 2 (TTL 2s from t=1) still alive until t≈3
+        std::this_thread::sleep_for(std::chrono::milliseconds(1500));
 
         // Tracking set should be expired
         REQUIRE(sync(redisExists(trackKey)) == 0);
@@ -1476,11 +1476,11 @@ namespace list = jcailloux::relais::cache::list;
  */
 class L2SelectiveArticleListRepo : public Repository<TestArticleWrapper, "test:article:selective:list:l2", cfg::Redis> {
 public:
-    static pqcoro::Task<std::vector<TestArticleWrapper>> getByCategory(
+    static io::Task<std::vector<TestArticleWrapper>> getByCategory(
         const std::string& category, int limit = 5, int offset = 0)
     {
         co_return co_await cachedListTrackedWithHeader(
-            [category, limit, offset]() -> pqcoro::Task<std::vector<TestArticleWrapper>> {
+            [category, limit, offset]() -> io::Task<std::vector<TestArticleWrapper>> {
                 auto result = co_await jcailloux::relais::DbProvider::queryArgs(
                     "SELECT id, category, author_id, title, view_count, is_published, published_at, created_at "
                     "FROM relais_test_articles WHERE category = $1 ORDER BY view_count DESC LIMIT $2 OFFSET $3",
@@ -1519,7 +1519,7 @@ public:
     };
 
     // Translate typed filters → cache invalidation operations
-    static pqcoro::Task<size_t> invalidateByTarget(
+    static io::Task<size_t> invalidateByTarget(
         const GroupKey& gk,
         std::optional<int64_t> sort_value)
     {
@@ -1531,19 +1531,19 @@ public:
     }
 
     // Full group invalidation (fallback)
-    static pqcoro::Task<size_t> invalidateCategoryList(const std::string& category) {
+    static io::Task<size_t> invalidateCategoryList(const std::string& category) {
         co_return co_await invalidateListGroup("category", category);
     }
 
     // Selective invalidation for create/delete
-    static pqcoro::Task<size_t> invalidateCategoryListSelective(
+    static io::Task<size_t> invalidateCategoryListSelective(
         const std::string& category, int64_t entity_sort_val)
     {
         co_return co_await invalidateListGroupSelective(entity_sort_val, "category", category);
     }
 
     // Selective invalidation for update
-    static pqcoro::Task<size_t> invalidateCategoryListSelectiveUpdate(
+    static io::Task<size_t> invalidateCategoryListSelectiveUpdate(
         const std::string& category, int64_t old_sort_val, int64_t new_sort_val)
     {
         co_return co_await invalidateListGroupSelectiveUpdate(
@@ -1763,7 +1763,7 @@ using ArticleListTarget = jcailloux::relais::cache::ListInvalidationTarget<Artic
  * whose sort range contains the affected article's view_count.
  */
 struct PurchaseToArticleSelectiveResolver {
-    static pqcoro::Task<std::vector<ArticleListTarget>> resolve(int64_t user_id) {
+    static io::Task<std::vector<ArticleListTarget>> resolve(int64_t user_id) {
         auto result = co_await jcailloux::relais::DbProvider::queryArgs(
             "SELECT category, view_count FROM relais_test_articles WHERE author_id = $1",
             user_id);
@@ -1947,7 +1947,7 @@ namespace relais_test {
  * All pages in the targeted group are invalidated.
  */
 struct PerGroupResolver {
-    static pqcoro::Task<std::vector<ArticleListTarget>> resolve(int64_t user_id) {
+    static io::Task<std::vector<ArticleListTarget>> resolve(int64_t user_id) {
         auto result = co_await jcailloux::relais::DbProvider::queryArgs(
             "SELECT DISTINCT category FROM relais_test_articles WHERE author_id = $1",
             user_id);
@@ -1967,7 +1967,7 @@ struct PerGroupResolver {
  * Full pattern resolver: returns nullopt (all list groups invalidated).
  */
 struct FullPatternResolver {
-    static pqcoro::Task<std::optional<std::vector<ArticleListTarget>>> resolve(
+    static io::Task<std::optional<std::vector<ArticleListTarget>>> resolve(
         [[maybe_unused]] int64_t user_id)
     {
         co_return std::nullopt;
@@ -1980,7 +1980,7 @@ struct FullPatternResolver {
  * - Other categories: per-group (without sort_value)
  */
 struct MixedResolver {
-    static pqcoro::Task<std::vector<ArticleListTarget>> resolve(int64_t user_id) {
+    static io::Task<std::vector<ArticleListTarget>> resolve(int64_t user_id) {
         auto result = co_await jcailloux::relais::DbProvider::queryArgs(
             "SELECT category, view_count FROM relais_test_articles WHERE author_id = $1",
             user_id);

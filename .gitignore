@@ -1,2 +1,21 @@
+# Build
+build/
+cmake-build-*/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Tooling
+.cache/
+compile_commands.json
+
+# Generated (from generate_entities.py)
 tests/fixtures/generated/*
-.idea/*
+
+# OS
+.DS_Store
+Thumbs.db

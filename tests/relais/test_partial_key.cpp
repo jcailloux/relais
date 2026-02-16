@@ -34,7 +34,7 @@ using L1EventAsTargetRepository = Repository<TestEventWrapper, "test:event:l1:ta
 
 // Async resolver: given a user_id, find event IDs for that user
 struct PurchaseToEventResolver {
-    static pqcoro::Task<std::vector<int64_t>> resolve(int64_t user_id) {
+    static io::Task<std::vector<int64_t>> resolve(int64_t user_id) {
         auto result = co_await jcailloux::relais::DbProvider::queryArgs(
             "SELECT id FROM relais_test_events WHERE user_id = $1", user_id);
         std::vector<int64_t> ids;

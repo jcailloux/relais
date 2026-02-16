@@ -3,7 +3,7 @@
 
 #include <string>
 #include <vector>
-#include "pqcoro/Task.h"
+#include "jcailloux/relais/io/Task.h"
 #include "jcailloux/relais/DbProvider.h"
 #include "jcailloux/relais/Log.h"
 
@@ -34,7 +34,7 @@ public:
      * @param keyColumn The column name used as partial key
      * @return ValidationResult with valid=true if column uses sequence or is UUID type
      */
-    static pqcoro::Task<ValidationResult> validateKeyUsesSequenceOrUuid(
+    static io::Task<ValidationResult> validateKeyUsesSequenceOrUuid(
         const std::string& tableName,
         const std::string& keyColumn
     ) {
@@ -97,7 +97,7 @@ public:
      * @param templateKeyColumns Columns used in the repository Key template
      * @return ValidationResult indicating if the configuration is valid
      */
-    static pqcoro::Task<ValidationResult> validatePartitionColumns(
+    static io::Task<ValidationResult> validatePartitionColumns(
         const std::string& tableName,
         const std::vector<std::string>& templateKeyColumns
     ) {
@@ -187,7 +187,7 @@ public:
      * @param keyColumn The column used as partial key
      * @return true if all validations pass
      */
-    static pqcoro::Task<bool> validateAll(
+    static io::Task<bool> validateAll(
         const std::string& tableName,
         const std::string& keyColumn
     ) {

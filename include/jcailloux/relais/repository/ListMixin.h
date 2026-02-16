@@ -1,9 +1,9 @@
 #ifndef JCX_RELAIS_LIST_MIXIN_H
 #define JCX_RELAIS_LIST_MIXIN_H
 
-#include "pqcoro/Task.h"
-#include "pqcoro/pg/PgError.h"
-#include "pqcoro/pg/PgParams.h"
+#include "jcailloux/relais/io/Task.h"
+#include "jcailloux/relais/io/pg/PgError.h"
+#include "jcailloux/relais/io/pg/PgParams.h"
 
 #include "jcailloux/relais/DbProvider.h"
 #include "jcailloux/relais/Log.h"
@@ -221,7 +221,7 @@ public:
     // =========================================================================
 
     /// Execute a paginated list query with L1 caching and lazy invalidation.
-    static pqcoro::Task<ListResult> query(const ListQuery& q) {
+    static io::Task<ListResult> query(const ListQuery& q) {
         co_return co_await cachedListQuery(q);
     }
 
@@ -235,7 +235,7 @@ public:
     // =========================================================================
 
     /// Create entity and notify list cache.
-    static pqcoro::Task<WrapperPtrType> create(WrapperPtrType wrapper)
+    static io::Task<WrapperPtrType> create(WrapperPtrType wrapper)
         requires MutableEntity<Entity> && (!Base::config.read_only)
     {
         auto result = co_await Base::create(std::move(wrapper));
@@ -246,7 +246,7 @@ public:
     }
 
     /// Update entity and notify list cache with old/new data.
-    static pqcoro::Task<bool> update(const Key& id, WrapperPtrType wrapper)
+    static io::Task<bool> update(const Key& id, WrapperPtrType wrapper)
         requires MutableEntity<Entity> && (!Base::config.read_only)
     {
         auto old = co_await Base::findById(id);
@@ -254,7 +254,7 @@ public:
     }
 
     /// Remove entity and notify list cache.
-    static pqcoro::Task<std::optional<size_t>> remove(const Key& id)
+    static io::Task<std::optional<size_t>> remove(const Key& id)
         requires (!Base::config.read_only)
     {
         auto entity = co_await Base::findById(id);
@@ -263,7 +263,7 @@ public:
 
     /// Partial update and notify list cache.
     template<typename... Updates>
-    static pqcoro::Task<WrapperPtrType> updateBy(const Key& id, Updates&&... updates)
+    static io::Task<WrapperPtrType> updateBy(const Key& id, Updates&&... updates)
         requires HasFieldUpdate<Entity> && (!Base::config.read_only)
     {
         auto old = co_await Base::findById(id);
@@ -301,7 +301,7 @@ public:
     }
 
     /// Invalidate entity cache (list cache invalidation is lazy via ModificationTracker).
-    static pqcoro::Task<void> invalidate(const Key& id) {
+    static io::Task<void> invalidate(const Key& id) {
         co_await Base::invalidate(id);
     }
 
@@ -330,7 +330,7 @@ protected:
     // WithContext variants — accept pre-fetched old entity from upper mixin
     // =========================================================================
 
-    static pqcoro::Task<bool> updateWithContext(
+    static io::Task<bool> updateWithContext(
         const Key& id, WrapperPtrType wrapper, WrapperPtrType old_entity)
         requires MutableEntity<Entity> && (!Base::config.read_only)
     {
@@ -342,7 +342,7 @@ protected:
         co_return ok;
     }
 
-    static pqcoro::Task<std::optional<size_t>> removeWithContext(
+    static io::Task<std::optional<size_t>> removeWithContext(
         const Key& id, WrapperPtrType old_entity)
         requires (!Base::config.read_only)
     {
@@ -354,7 +354,7 @@ protected:
     }
 
     template<typename... Updates>
-    static pqcoro::Task<WrapperPtrType> updateByWithContext(
+    static io::Task<WrapperPtrType> updateByWithContext(
         const Key& id, WrapperPtrType old_entity, Updates&&... updates)
         requires HasFieldUpdate<Entity> && (!Base::config.read_only)
     {
@@ -369,7 +369,7 @@ protected:
     // Cached list query implementation
     // =========================================================================
 
-    static pqcoro::Task<ListResult> cachedListQuery(const ListQuery& query) {
+    static io::Task<ListResult> cachedListQuery(const ListQuery& query) {
         auto& cache = listCache();
         auto cache_query = toCacheQuery(query);
 
@@ -413,7 +413,7 @@ protected:
     // Database query — direct SQL via PgClient
     // =========================================================================
 
-    static pqcoro::Task<std::vector<Entity>> queryFromDb(const ListQuery& query) {
+    static io::Task<std::vector<Entity>> queryFromDb(const ListQuery& query) {
         try {
             // Build WHERE clause from filters
             auto where = cache::list::decl::buildWhereClause<Descriptor>(query.filters);
@@ -454,7 +454,7 @@ protected:
 
             co_return entities;
 
-        } catch (const pqcoro::PgError& e) {
+        } catch (const io::PgError& e) {
             RELAIS_LOG_ERROR << name() << ": queryFromDb error - " << e.what();
             co_return {};
         }

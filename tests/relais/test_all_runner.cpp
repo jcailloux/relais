@@ -1,6 +1,6 @@
 /**
  * test_all_runner.cpp
- * Single translation unit that registers the PqcoroTestListener exactly once
+ * Single translation unit that registers the RelaisTestListener exactly once
  * for the combined test executable (test_relais_all).
  *
  * Individual test executables register the listener via test_helper.h directly
@@ -14,5 +14,5 @@
 #include "fixtures/test_helper.h"
 
 namespace relais_test {
-CATCH_REGISTER_LISTENER(PqcoroTestListener)
+CATCH_REGISTER_LISTENER(RelaisTestListener)
 }

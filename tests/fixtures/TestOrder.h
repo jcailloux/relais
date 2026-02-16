@@ -48,7 +48,6 @@ enum class Status {
 };
 
 // @relais table=relais_test_orders
-// @relais output=fixtures/generated/TestOrderWrapper.h
 struct TestOrder {
     int64_t id = 0; // @relais primary_key db_managed
     int64_t user_id = 0;

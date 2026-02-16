@@ -6,7 +6,6 @@
 namespace relais_test {
 
 // @relais table=relais_test_users
-// @relais output=fixtures/generated/TestUserWrapper.h
 struct TestUser {
     int64_t id = 0; // @relais primary_key db_managed
     std::string username;

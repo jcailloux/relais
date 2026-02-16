@@ -83,7 +83,7 @@ using L1InvTestPurchaseRepository = Repository<TestPurchaseWrapper, "test:purcha
  * Async resolver: given a user_id, finds all article IDs by that author.
  */
 struct L1UserArticleResolver {
-    static pqcoro::Task<std::vector<int64_t>> resolve(int64_t user_id) {
+    static io::Task<std::vector<int64_t>> resolve(int64_t user_id) {
         auto result = co_await jcailloux::relais::DbProvider::queryArgs(
             "SELECT id FROM relais_test_articles WHERE author_id = $1", user_id);
         std::vector<int64_t> ids;
@@ -110,7 +110,7 @@ using L1CustomTestPurchaseRepository = Repository<TestPurchaseWrapper, "test:pur
  */
 class L1PurchaseListInvalidator {
 public:
-    static pqcoro::Task<void> onEntityModified(
+    static io::Task<void> onEntityModified(
         std::shared_ptr<const TestPurchaseWrapper>)
     {
         TestInternals::resetListCacheState<TestPurchaseListRepository>();
@@ -150,14 +150,14 @@ public:
         all_groups_invalidated = false;
     }
 
-    static pqcoro::Task<size_t> invalidateByTarget(
+    static io::Task<size_t> invalidateByTarget(
         const GroupKey& gk, std::optional<int64_t> sort_value)
     {
         invocations.push_back({gk.category, sort_value});
         co_return 1;
     }
 
-    static pqcoro::Task<size_t> invalidateAllListGroups() {
+    static io::Task<size_t> invalidateAllListGroups() {
         all_groups_invalidated = true;
         co_return 1;
     }
@@ -174,7 +174,7 @@ using L1MockTarget = jcailloux::relais::cache::ListInvalidationTarget<L1MockGrou
  * Per-page resolver: returns targets WITH sort_value → per-page invalidation.
  */
 struct L1PerPageResolver {
-    static pqcoro::Task<std::vector<L1MockTarget>> resolve(int64_t user_id) {
+    static io::Task<std::vector<L1MockTarget>> resolve(int64_t user_id) {
         auto result = co_await jcailloux::relais::DbProvider::queryArgs(
             "SELECT category, view_count FROM relais_test_articles WHERE author_id = $1",
             user_id);
@@ -193,7 +193,7 @@ struct L1PerPageResolver {
  * Per-group resolver: returns targets WITHOUT sort_value → per-group invalidation.
  */
 struct L1PerGroupResolver {
-    static pqcoro::Task<std::vector<L1MockTarget>> resolve(int64_t user_id) {
+    static io::Task<std::vector<L1MockTarget>> resolve(int64_t user_id) {
         auto result = co_await jcailloux::relais::DbProvider::queryArgs(
             "SELECT DISTINCT category FROM relais_test_articles WHERE author_id = $1",
             user_id);
@@ -212,7 +212,7 @@ struct L1PerGroupResolver {
  * Full pattern resolver: returns nullopt → all groups invalidated.
  */
 struct L1FullPatternResolver {
-    static pqcoro::Task<std::optional<std::vector<L1MockTarget>>> resolve(
+    static io::Task<std::optional<std::vector<L1MockTarget>>> resolve(
         [[maybe_unused]] int64_t user_id)
     {
         co_return std::nullopt;
@@ -223,7 +223,7 @@ struct L1FullPatternResolver {
  * Mixed resolver: per-page for "tech", per-group for other categories.
  */
 struct L1MixedResolver {
-    static pqcoro::Task<std::vector<L1MockTarget>> resolve(int64_t user_id) {
+    static io::Task<std::vector<L1MockTarget>> resolve(int64_t user_id) {
         auto result = co_await jcailloux::relais::DbProvider::queryArgs(
             "SELECT category, view_count FROM relais_test_articles WHERE author_id = $1",
             user_id);

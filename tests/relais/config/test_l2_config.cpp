@@ -30,18 +30,18 @@ using namespace jcailloux::relais::config;
 
 // --- l2_ttl ---
 inline constexpr auto ShortTTL = Redis
-    .with_l2_ttl(std::chrono::seconds{3});
+    .with_l2_ttl(std::chrono::seconds{1});
 
 inline constexpr auto LongTTL = Redis
     .with_l2_ttl(std::chrono::seconds{30});
 
 // --- l2_refresh_on_get ---
 inline constexpr auto RefreshTrue = Redis
-    .with_l2_ttl(std::chrono::seconds{3})
+    .with_l2_ttl(std::chrono::seconds{1})
     .with_l2_refresh_on_get(true);
 
 inline constexpr auto RefreshFalse = Redis
-    .with_l2_ttl(std::chrono::seconds{3})
+    .with_l2_ttl(std::chrono::seconds{1})
     .with_l2_refresh_on_get(false);
 
 // --- update_strategy ---
@@ -88,8 +88,7 @@ TEST_CASE("L2 Config - l2_ttl",
           "[integration][db][config][l2][ttl]")
 {
     TransactionGuard tx;
-
-    SECTION("[ttl] short TTL (3s): entry expires and re-fetched from DB") {
+    SECTION("[ttl] short TTL (1s): entry expires and re-fetched from DB") {
         auto id = insertTestItem("l2_ttl_short", 10);
 
         sync(L2ShortTTLRepo::findById(id));
@@ -97,8 +96,8 @@ TEST_CASE("L2 Config - l2_ttl",
         // Update DB
         updateTestItem(id, "l2_ttl_updated", 99);
 
-        // Wait for Redis TTL to expire (3s + margin)
-        waitForExpiration(std::chrono::milliseconds{3500});
+        // Wait for Redis TTL to expire (1s + margin)
+        waitForExpiration(std::chrono::milliseconds{1500});
 
         // Should fetch from DB now
         auto item = sync(L2ShortTTLRepo::findById(id));
@@ -114,8 +113,8 @@ TEST_CASE("L2 Config - l2_ttl",
         // Modify DB
         updateTestItem(id, "invisible", 99);
 
-        // Wait a few seconds — should still be cached (30s TTL)
-        waitForExpiration(std::chrono::milliseconds{2000});
+        // Wait a bit — should still be cached (30s TTL)
+        waitForExpiration(std::chrono::milliseconds{500});
 
         auto item = sync(L2LongTTLRepo::findById(id));
         REQUIRE(item->name == "l2_ttl_long");
@@ -138,15 +137,15 @@ TEST_CASE("L2 Config - l2_refresh_on_get",
     SECTION("[refresh] true: GETEX extends TTL, entry survives past original expiry") {
         auto id = insertTestItem("l2_refresh_item", 10);
 
-        // Populate cache (TTL = 3s)
+        // Populate cache (TTL = 1s)
         sync(L2RefreshTrueRepo::findById(id));
 
-        // Wait 2s, then read (GETEX extends TTL by 3s from now)
-        waitForExpiration(std::chrono::milliseconds{2000});
+        // Wait 700ms, then read (GETEX extends TTL by 1s from now)
+        waitForExpiration(std::chrono::milliseconds{700});
         sync(L2RefreshTrueRepo::findById(id));
 
-        // Wait 2s more (4s total > 3s original TTL)
-        waitForExpiration(std::chrono::milliseconds{2000});
+        // Wait 700ms more (1.4s total > 1s original TTL)
+        waitForExpiration(std::chrono::milliseconds{700});
 
         // Update DB
         updateTestItem(id, "l2_ref_modified", 99);
@@ -160,15 +159,15 @@ TEST_CASE("L2 Config - l2_refresh_on_get",
     SECTION("[refresh] false: GET does not extend TTL, entry expires on schedule") {
         auto id = insertTestItem("l2_noref_item", 10);
 
-        // Populate cache (TTL = 3s)
+        // Populate cache (TTL = 1s)
         sync(L2RefreshFalseRepo::findById(id));
 
-        // Wait 2s, read (plain GET, no TTL extension)
-        waitForExpiration(std::chrono::milliseconds{2000});
+        // Wait 700ms, read (plain GET, no TTL extension)
+        waitForExpiration(std::chrono::milliseconds{700});
         sync(L2RefreshFalseRepo::findById(id));
 
-        // Wait 1.5s more (3.5s total > 3s original TTL)
-        waitForExpiration(std::chrono::milliseconds{1500});
+        // Wait 500ms more (1.2s total > 1s original TTL)
+        waitForExpiration(std::chrono::milliseconds{500});
 
         // Update DB
         updateTestItem(id, "l2_noref_updated", 99);

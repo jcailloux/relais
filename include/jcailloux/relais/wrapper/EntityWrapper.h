@@ -12,8 +12,8 @@
 
 #include <glaze/glaze.hpp>
 
-#include "pqcoro/pg/PgResult.h"
-#include "pqcoro/pg/PgParams.h"
+#include "jcailloux/relais/io/pg/PgResult.h"
+#include "jcailloux/relais/io/pg/PgParams.h"
 #include "jcailloux/relais/wrapper/Format.h"
 
 namespace jcailloux::relais::wrapper {
@@ -69,11 +69,11 @@ public:
     // SQL row mapping — delegated to Mapping
     // =========================================================================
 
-    static std::optional<EntityWrapper> fromRow(const pqcoro::PgResult::Row& row) {
+    static std::optional<EntityWrapper> fromRow(const io::PgResult::Row& row) {
         return Mapping::template fromRow<EntityWrapper>(row);
     }
 
-    static pqcoro::PgParams toInsertParams(const EntityWrapper& e) {
+    static io::PgParams toInsertParams(const EntityWrapper& e) {
         return Mapping::template toInsertParams<EntityWrapper>(e);
     }
 

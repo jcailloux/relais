@@ -5,7 +5,7 @@
 #include <chrono>
 #include <memory>
 #include <type_traits>
-#include "pqcoro/Task.h"
+#include "jcailloux/relais/io/Task.h"
 #include "jcailloux/relais/repository/RedisRepository.h"
 #include "jcailloux/relais/Log.h"
 #include <jcailloux/shardmap/ShardMap.h>
@@ -117,7 +117,7 @@ public:
 
     /// Find by ID with L1 -> (L2) -> DB fallback.
     /// Returns shared_ptr to immutable entity (nullptr if not found).
-    static pqcoro::Task<WrapperPtrType> findById(const Key& id) {
+    static io::Task<WrapperPtrType> findById(const Key& id) {
         if (auto cached = getFromCache(id)) {
             co_return cached;
         }
@@ -131,7 +131,7 @@ public:
 
     /// Find by ID and return raw JSON string.
     /// Returns shared_ptr to JSON string (nullptr if not found).
-    static pqcoro::Task<std::shared_ptr<const std::string>> findByIdAsJson(const Key& id) {
+    static io::Task<std::shared_ptr<const std::string>> findByIdAsJson(const Key& id) {
         if (auto cached = getFromCache(id)) {
             co_return cached->toJson();
         }
@@ -156,7 +156,7 @@ public:
 
     /// Create entity and cache it. Returns shared_ptr to immutable entity.
     /// Compile-time error if Cfg.read_only is true.
-    static pqcoro::Task<WrapperPtrType> create(WrapperPtrType wrapper)
+    static io::Task<WrapperPtrType> create(WrapperPtrType wrapper)
         requires CreatableEntity<Entity, Key> && (!Cfg.read_only)
     {
         auto inserted = co_await Base::create(wrapper);
@@ -171,7 +171,7 @@ public:
     /// Update entity in database with L1 cache handling.
     /// Returns true on success, false on error.
     /// Compile-time error if Cfg.read_only is true.
-    static pqcoro::Task<bool> update(const Key& id, WrapperPtrType wrapper)
+    static io::Task<bool> update(const Key& id, WrapperPtrType wrapper)
         requires MutableEntity<Entity> && (!Cfg.read_only)
     {
         using enum config::UpdateStrategy;
@@ -191,7 +191,7 @@ public:
     /// Partial update: invalidates L1 then delegates to Base::updateBy.
     /// Returns the re-fetched entity (nullptr on error or not found).
     template<typename... Updates>
-    static pqcoro::Task<WrapperPtrType> updateBy(const Key& id, Updates&&... updates)
+    static io::Task<WrapperPtrType> updateBy(const Key& id, Updates&&... updates)
         requires HasFieldUpdate<Entity> && (!Cfg.read_only)
     {
         invalidateL1Internal(id);
@@ -203,7 +203,7 @@ public:
     /// Invalidates L1 cache unless DB error occurred (self-healing).
     /// For CompositeKey entities, provides L1 cache hint for partition pruning.
     /// Compile-time error if Cfg.read_only is true.
-    static pqcoro::Task<std::optional<size_t>> remove(const Key& id)
+    static io::Task<std::optional<size_t>> remove(const Key& id)
         requires (!Cfg.read_only)
     {
         // Provide L1 hint for partition pruning (free: ~0ns RAM lookup)
@@ -220,7 +220,7 @@ public:
     }
 
     /// Invalidate L1 and L2 caches for a key.
-    static pqcoro::Task<void> invalidate(const Key& id) {
+    static io::Task<void> invalidate(const Key& id) {
         invalidateL1Internal(id);
         if constexpr (HasRedis) {
             co_await Base::invalidateRedis(id);

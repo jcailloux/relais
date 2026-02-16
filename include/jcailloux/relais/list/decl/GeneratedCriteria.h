@@ -5,7 +5,7 @@
 #include <type_traits>
 #include <utility>
 
-#include "pqcoro/pg/PgParams.h"
+#include "jcailloux/relais/io/pg/PgParams.h"
 
 #include "FilterDescriptor.h"
 #include "ListDescriptor.h"
@@ -37,24 +37,24 @@ namespace detail {
 
 /// Convert filter value for DB query and add to params
 template<typename FilterType, typename T>
-void addParamForDb(pqcoro::PgParams& params, const T& value) {
+void addParamForDb(io::PgParams& params, const T& value) {
     if constexpr (std::is_same_v<typename FilterType::converter, AsString>) {
         using std::to_string;
-        params.params.push_back(pqcoro::PgParam::text(toString(value)));
+        params.params.push_back(io::PgParam::text(toString(value)));
     } else if constexpr (std::is_integral_v<std::remove_cvref_t<T>>) {
         if constexpr (sizeof(T) <= 4) {
-            params.params.push_back(pqcoro::PgParam::integer(static_cast<int32_t>(value)));
+            params.params.push_back(io::PgParam::integer(static_cast<int32_t>(value)));
         } else {
-            params.params.push_back(pqcoro::PgParam::bigint(static_cast<int64_t>(value)));
+            params.params.push_back(io::PgParam::bigint(static_cast<int64_t>(value)));
         }
     } else if constexpr (std::is_enum_v<std::remove_cvref_t<T>>) {
         using U = std::underlying_type_t<std::remove_cvref_t<T>>;
-        params.params.push_back(pqcoro::PgParam::bigint(static_cast<int64_t>(static_cast<U>(value))));
+        params.params.push_back(io::PgParam::bigint(static_cast<int64_t>(static_cast<U>(value))));
     } else if constexpr (std::is_same_v<std::remove_cvref_t<T>, bool>) {
-        params.params.push_back(pqcoro::PgParam::boolean(value));
+        params.params.push_back(io::PgParam::boolean(value));
     } else {
         // String-like types
-        params.params.push_back(pqcoro::PgParam::text(std::string(value)));
+        params.params.push_back(io::PgParam::text(std::string(value)));
     }
 }
 
@@ -73,7 +73,7 @@ template<typename Descriptor>
     requires ValidListDescriptor<Descriptor>
 struct WhereClause {
     std::string sql;
-    pqcoro::PgParams params;
+    io::PgParams params;
     size_t next_param{1};
 };
 

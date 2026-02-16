@@ -1,24 +1,23 @@
 /**
  * test_helper.h
  * Test utilities for relais integration tests.
- * Provides pqcoro initialization, transaction guards, and sync helpers.
  *
- * Uses EpollIoContext (from pqcoro tests) as the event loop driver.
+ * Uses EpollIoContext as the event loop driver.
  * A background thread runs the event loop; sync() dispatches coroutines
  * to it via eventfd + promise/future, allowing safe concurrent usage.
  */
 
 #pragma once
 
-#include <pqcoro/Task.h>
-#include <pqcoro/pg/PgPool.h>
-#include <pqcoro/pg/PgResult.h>
-#include <pqcoro/pg/PgParams.h>
-#include <pqcoro/redis/RedisClient.h>
+#include <jcailloux/relais/io/Task.h>
+#include <jcailloux/relais/io/pg/PgPool.h>
+#include <jcailloux/relais/io/pg/PgResult.h>
+#include <jcailloux/relais/io/pg/PgParams.h>
+#include <jcailloux/relais/io/redis/RedisClient.h>
 #include <jcailloux/relais/DbProvider.h>
 
-#include <EpollIoContext.h>
-#include <TestRunner.h>
+#include <fixtures/EpollIoContext.h>
+#include <fixtures/TestRunner.h>
 
 #include <catch2/reporters/catch_reporter_event_listener.hpp>
 #include <catch2/reporters/catch_reporter_registrars.hpp>
@@ -38,7 +37,8 @@
 
 namespace relais_test {
 
-using IoCtx = pqcoro::test::EpollIoContext;
+namespace io = jcailloux::relais::io;
+using IoCtx = io::test::EpollIoContext;
 
 // =============================================================================
 // DetachedHandle — fire-and-forget eager coroutine
@@ -72,8 +72,8 @@ public:
             throw std::runtime_error("eventfd creation failed");
 
         wakeup_handle_ = io_.addWatch(
-            wakeup_fd_, pqcoro::IoEvent::Read,
-            [this](pqcoro::IoEvent) {
+            wakeup_fd_, io::IoEvent::Read,
+            [this](io::IoEvent) {
                 // Drain the eventfd
                 uint64_t val;
                 [[maybe_unused]] auto r = ::read(wakeup_fd_, &val, sizeof(val));
@@ -166,13 +166,13 @@ namespace detail {
         return loop;
     }
 
-    inline std::shared_ptr<pqcoro::PgClient<IoCtx>>& testPg() {
-        static std::shared_ptr<pqcoro::PgClient<IoCtx>> pg;
+    inline std::shared_ptr<io::PgClient<IoCtx>>& testPg() {
+        static std::shared_ptr<io::PgClient<IoCtx>> pg;
         return pg;
     }
 
-    inline std::shared_ptr<pqcoro::RedisClient<IoCtx>>& testRedis() {
-        static std::shared_ptr<pqcoro::RedisClient<IoCtx>> redis;
+    inline std::shared_ptr<io::RedisClient<IoCtx>>& testRedis() {
+        static std::shared_ptr<io::RedisClient<IoCtx>> redis;
         return redis;
     }
 
@@ -190,7 +190,7 @@ namespace detail {
 inline void initTest();
 
 // Catch2 event listener to handle initialization and cleanup
-class PqcoroTestListener : public Catch::EventListenerBase {
+class RelaisTestListener : public Catch::EventListenerBase {
 public:
     using Catch::EventListenerBase::EventListenerBase;
 
@@ -204,21 +204,21 @@ public:
 };
 
 #ifndef RELAIS_COMBINED_TESTS
-CATCH_REGISTER_LISTENER(PqcoroTestListener)
+CATCH_REGISTER_LISTENER(RelaisTestListener)
 #endif
 
 /**
- * Run a pqcoro::Task<T> synchronously.
+ * Run a Task<T> synchronously.
  * Dispatches the coroutine to the background event loop thread and blocks
  * the calling thread until completion. Safe to call from multiple threads.
  */
 template<typename T>
-T sync(pqcoro::Task<T> task) {
+T sync(io::Task<T> task) {
     std::promise<T> promise;
     auto future = promise.get_future();
 
     detail::testLoop().dispatch([t = std::move(task), p = std::move(promise)]() mutable {
-        [](pqcoro::Task<T> t, std::promise<T> p) -> DetachedHandle {
+        [](io::Task<T> t, std::promise<T> p) -> DetachedHandle {
             try {
                 p.set_value(co_await std::move(t));
             } catch (...) {
@@ -230,12 +230,12 @@ T sync(pqcoro::Task<T> task) {
     return future.get();
 }
 
-inline void sync(pqcoro::Task<void> task) {
+inline void sync(io::Task<void> task) {
     std::promise<void> promise;
     auto future = promise.get_future();
 
     detail::testLoop().dispatch([t = std::move(task), p = std::move(promise)]() mutable {
-        [](pqcoro::Task<void> t, std::promise<void> p) -> DetachedHandle {
+        [](io::Task<void> t, std::promise<void> p) -> DetachedHandle {
             try {
                 co_await std::move(t);
                 p.set_value();
@@ -251,7 +251,7 @@ inline void sync(pqcoro::Task<void> task) {
 /**
  * Execute a query and return the PgResult.
  */
-inline pqcoro::PgResult execQuery(const char* sql) {
+inline io::PgResult execQuery(const char* sql) {
     return sync(detail::testPg()->query(sql));
 }
 
@@ -259,7 +259,7 @@ inline pqcoro::PgResult execQuery(const char* sql) {
  * Execute a parameterized query and return the PgResult.
  */
 template<typename... Args>
-pqcoro::PgResult execQueryArgs(const char* sql, Args&&... args) {
+io::PgResult execQueryArgs(const char* sql, Args&&... args) {
     return sync(detail::testPg()->queryArgs(sql, std::forward<Args>(args)...));
 }
 
@@ -278,7 +278,7 @@ inline const char* getConnInfo() {
 }
 
 /**
- * Initialize pqcoro for integration tests.
+ * Initialize I/O for integration tests.
  * Phase 1: synchronous init (PgPool, Redis, DbProvider) via runTask().
  * Phase 2: start background event loop thread for concurrent sync() calls.
  */
@@ -290,20 +290,20 @@ inline void initTest() {
     auto& io = detail::testIo();
 
     // Phase 1: Synchronous initialization (no background thread yet)
-    auto pool = pqcoro::test::runTask(io,
-        pqcoro::PgPool<IoCtx>::create(io, getConnInfo(), 2, 4));
+    auto pool = io::test::runTask(io,
+        io::PgPool<IoCtx>::create(io, getConnInfo(), 2, 4));
 
-    detail::testPg() = std::make_shared<pqcoro::PgClient<IoCtx>>(pool);
+    detail::testPg() = std::make_shared<io::PgClient<IoCtx>>(pool);
 
-    std::shared_ptr<pqcoro::RedisClient<IoCtx>> redis;
+    std::shared_ptr<io::RedisClient<IoCtx>> redis;
     try {
         // Try Unix socket first (lower latency)
-        redis = pqcoro::test::runTask(io,
-            pqcoro::RedisClient<IoCtx>::connectUnix(io, "/run/redis/redis.sock"));
+        redis = io::test::runTask(io,
+            io::RedisClient<IoCtx>::connectUnix(io, "/run/redis/redis.sock"));
     } catch (...) {
         // Fall back to TCP
-        redis = pqcoro::test::runTask(io,
-            pqcoro::RedisClient<IoCtx>::connect(io, "127.0.0.1", 6379));
+        redis = io::test::runTask(io,
+            io::RedisClient<IoCtx>::connect(io, "127.0.0.1", 6379));
     }
     detail::testRedis() = redis;
 
