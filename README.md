@@ -691,8 +691,8 @@ python scripts/generate_entities.py --files src/entities/User.h --output-dir src
 | `patch(id, set<F>()...)` | `Task<WrapperPtr>` | `!read_only`, `HasFieldUpdate` | Partial update, re-fetches entity |
 | `erase(id)` | `Task<optional<size_t>>` | `!read_only` | Delete and invalidate cache |
 | `invalidate(id)` | `Task<void>` | - | Explicit cache invalidation |
-| `updateFromJson(id, json)` | `Task<bool>` | `!read_only` | Parse JSON and update |
-| `updateFromBinary(id, data)` | `Task<bool>` | `!read_only`, `HasBinarySerialization` | Parse binary and update |
+| `updateJson(id, json)` | `Task<bool>` | `!read_only` | Parse JSON and update |
+| `updateBinary(id, data)` | `Task<bool>` | `!read_only`, `HasBinarySerialization` | Parse binary and update |
 
 ### CachedRepo Additional Methods
 

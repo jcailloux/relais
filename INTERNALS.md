@@ -107,7 +107,7 @@ struct MixinStack {
 
 The `Repo<>` class inherits from `MixinStack::type` and adds:
 - Compile-time `static_assert` validation (L1/L2 TTL > 0, segments >= 2, concept checks)
-- Convenience methods (`updateFromJson`, `updateFromBinary`)
+- Convenience methods (`updateJson`, `updateBinary`)
 - Re-export of base type aliases (`EntityType`, `KeyType`, `MappingType`, etc.)
 
 ### Cache Layer Selection

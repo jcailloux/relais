@@ -129,12 +129,12 @@ public:
 
     /// Update entity from JSON string.
     /// Parses JSON to create wrapper, then updates via the full mixin chain.
-    static io::Task<bool> updateFromJson(const Key& id, std::string_view json)
+    static io::Task<bool> updateJson(const Key& id, std::string_view json)
         requires MutableEntity<Entity> && (!Cfg.read_only)
     {
         auto wrapper_opt = Entity::fromJson(json);
         if (!wrapper_opt) {
-            RELAIS_LOG_ERROR << name() << ": updateFromJson failed to parse JSON";
+            RELAIS_LOG_ERROR << name() << ": updateJson failed to parse JSON";
             co_return false;
         }
         auto wrapper = std::make_shared<const Entity>(std::move(*wrapper_opt));
@@ -143,12 +143,12 @@ public:
 
     /// Update entity from binary data.
     /// Creates wrapper from binary, then updates via the full mixin chain.
-    static io::Task<bool> updateFromBinary(const Key& id, std::span<const uint8_t> buffer)
+    static io::Task<bool> updateBinary(const Key& id, std::span<const uint8_t> buffer)
         requires MutableEntity<Entity> && HasBinarySerialization<Entity> && (!Cfg.read_only)
     {
         auto wrapper_opt = Entity::fromBinary(buffer);
         if (!wrapper_opt) {
-            RELAIS_LOG_ERROR << name() << ": updateFromBinary failed to parse binary data";
+            RELAIS_LOG_ERROR << name() << ": updateBinary failed to parse binary data";
             co_return false;
         }
         auto wrapper = std::make_shared<const Entity>(std::move(*wrapper_opt));
