@@ -11,7 +11,7 @@ Technical details about the relais test infrastructure.
 │  test_redis_repository.cpp     RedisRepo (L2 cache)           │
 │  test_decl_list_cache.cpp      ListMixin (L1 lists)                  │
 │  test_cached_repository.cpp    CachedRepo (L1 cache)          │
-│  test_partial_key.cpp          PartialKey (composite PK, partitions) │
+│  test_partition_key.cpp         PartitionKey (composite PK, partitions) │
 │  test_generated_wrapper.cpp    Struct + EntityWrapper + ListWrapper  │
 └─────────────────────────────────────────────────────────────────────┘
                               │
@@ -359,29 +359,28 @@ Called when the resolver returns `std::nullopt` (full pattern invalidation).
 
 The `ListInvalidationTarget<GroupKey>` API is identical regardless of cache level. The resolver always works with typed values — the cache-level-specific logic lives in `invalidateByTarget` and `invalidateAllListGroups` implementations, not in the resolver.
 
-## PartialKey Repositories (`test_partial_key.cpp`)
+## Partition Key Repositories (`test_partition_key.cpp`)
 
-Tests for repositories where `Key` differs from `Model::PrimaryKeyType` — typically partitioned PostgreSQL tables with a composite PK (e.g., `(id, region)`) but queried by a single unique key (`id`).
+Tests for repositories with partitioned PostgreSQL tables where the composite PK includes a partition column (e.g., `(id, region)`) but the repository key is only the logical identifier (`id`).
 
 ### Test Entity: `TestEvent`
 
 - **Table**: `relais_test_events` — range-partitioned by `region` (eu, us, ap)
 - **Composite PK**: `(id BIGINT, region VARCHAR)` — `id` from shared sequence, `region` as partition key
-- **Repo Key**: `int64_t` (partial — only `id`)
-- **Config requires**: `key_is_unique = true` + `makeKeyCriteria<Model>(id)`
+- **Repo Key**: `int64_t` (only `id` — partition key is a separate hint)
 
 ### Tested Configurations
 
 | Repository | Config | Cache Level |
 |-----------|--------|-------------|
-| `UncachedTestEventRepo` | `EventPartialKeyUncached` | None |
-| `L1TestEventRepo` | `EventPartialKeyL1` | L1 |
-| `L2TestEventRepo` | `EventPartialKeyL2` | L2 |
-| `L1L2TestEventRepo` | `EventPartialKeyBoth` | L1+L2 |
+| `UncachedTestEventRepo` | `Uncached` | None |
+| `L1TestEventRepo` | `Local` | L1 |
+| `L2TestEventRepo` | `Redis` | L2 |
+| `L1L2TestEventRepo` | `Both` | L1+L2 |
 
-### `patch` — Criteria-Based for PartialKey
+### `patch` — Criteria-Based
 
-For PartialKey entities, `patch` builds a dynamic SQL query:
+`patch` builds a dynamic SQL query:
 ```sql
 UPDATE table SET "col1"=$1, "col2"=$2 WHERE "id"=$3 RETURNING *
 ```
@@ -396,12 +395,12 @@ For partition pruning, `DELETE WHERE id=$1 AND region=$2` scans 1 partition vs `
 CachedRepo::erase(id)
   → hint = getFromCache(id)        // Free L1 check
   → RedisRepo::eraseImpl(id, hint)
-    → if (!hint && PartialKey) {
+    → if (!hint && HasPartitionKey) {
         hint = getFromRedis(id)    // ~0.1ms L2 check
       }
     → BaseRepo::eraseImpl(id, hint)
       → if (hint) deleteByPrimaryKey(fullPK)  // Pruned: 1 partition
-      → else      deleteBy(criteria)           // Scan: N partitions
+      → else      deleteByKey(id)              // Scan: N partitions
 ```
 
 **Performance rule**: Never add a DB round-trip just for partition pruning. Only use full PK when the entity is already available from cache (free or near-free).
@@ -415,12 +414,11 @@ CachedRepo::erase(id)
 | 3 | L2 caching: Redis hit, staleness, invalidation                          |
 | 4 | Cross-invalidation: Event as source (→ User L1)                         |
 | 5 | Cross-invalidation: Event as target (Purchase → Event via resolver)     |
-| 6 | PartialKeyValidator runtime checks                                      |
-| 7 | Serialization: JSON + BEVE round-trip                                   |
-| 8a | patch Uncached: single/multi field, partition preservation, re-fetch |
-| 8b | patch L1: cache invalidation + re-fetch                              |
-| 8c | patch L2: Redis invalidation + re-fetch                              |
-| 8d | patch cross-invalidation: Event patch → User L1                   |
-| 9a | erase L1 hint: cache hit vs miss paths                                 |
-| 9b | erase L2 hint: Redis hit vs miss paths                                 |
-| 9c | erase L1+L2 chain: L1 hit, L1 miss/L2 hit, both miss                   |
+| 6 | Serialization: JSON + BEVE round-trip                                   |
+| 7a | patch Uncached: single/multi field, partition preservation, re-fetch |
+| 7b | patch L1: cache invalidation + re-fetch                              |
+| 7c | patch L2: Redis invalidation + re-fetch                              |
+| 7d | patch cross-invalidation: Event patch → User L1                   |
+| 8a | erase L1 hint: cache hit vs miss paths                                 |
+| 8b | erase L2 hint: Redis hit vs miss paths                                 |
+| 8c | erase L1+L2 chain: L1 hit, L1 miss/L2 hit, both miss                   |

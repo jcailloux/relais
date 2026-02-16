@@ -1,6 +1,6 @@
 /**
  * TestEvent.h
- * Pure data struct for PartialKey integration testing.
+ * Pure data struct for partition key integration testing.
  * Represents an event in a partitioned table with composite PK (id, region).
  */
 

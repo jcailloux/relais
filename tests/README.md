@@ -59,7 +59,7 @@ tests/
 │   │   ├── TestArticleMapping.h     # + ListDescriptor
 │   │   ├── TestPurchaseMapping.h    # + ListDescriptor
 │   │   ├── TestOrderMapping.h
-│   │   └── TestEventWrapper.h       # Hand-written PartialKey wrapper (Key≠PK)
+│   │   └── TestEventWrapper.h       # Partition key wrapper (Key + partition hint)
 │   ├── test_helper.h        # DbProvider init, TransactionGuard, sync helpers
 │   ├── TestItem.h            # Pure data struct with @relais annotations
 │   ├── TestUser.h            # ...
@@ -84,7 +84,7 @@ tests/
 ├── test_decl_list_cache.cpp        # Tests for ListMixin (L1 list cache)
 ├── test_decl_list_redis.cpp        # Tests for declarative list caching at L2 (Redis)
 ├── test_decl_list_full.cpp         # Tests for declarative list caching at L1+L2 (Both)
-├── test_partial_key.cpp            # Tests for PartialKey repos (composite PK, partitioned tables)
+├── test_partition_key.cpp          # Tests for partition key repos (composite PK, partitioned tables)
 ├── test_warmup.cpp                 # Tests for warmup() priming cache infrastructure
 ├── test_concurrency.cpp            # Concurrency stress tests across all cache levels
 ├── test_benchmark.cpp              # Performance benchmarks (latency, throughput)
@@ -149,11 +149,11 @@ This ensures complete isolation between tests without leaving data behind.
 
 These tests use `UncachedTestUserRepo` (a generated entity repository) since `patch` requires a generated entity with `TraitsType` containing `Field` enum and `FieldInfo` specializations. Hand-written entities (e.g., `TestItemEntity`) do not support `patch`.
 
-### PartialKey patch
+### Partition key patch
 
-For PartialKey repos, `patch` uses a **criteria-based** approach building a dynamic `UPDATE ... SET col=$N WHERE pk=$M RETURNING *` instead of the standard full-entity update path.
+For partition key repos, `patch` uses a **criteria-based** approach building a dynamic `UPDATE ... SET col=$N WHERE pk=$M RETURNING *` instead of the standard full-entity update path.
 
-See `test_partial_key.cpp` sections 8a-8d for coverage at all cache levels + cross-invalidation.
+See `test_partition_key.cpp` sections 7a-7d for coverage at all cache levels + cross-invalidation.
 
 ## Test Tags
 
@@ -188,15 +188,14 @@ See `test_partial_key.cpp` sections 8a-8d for coverage at all cache levels + cro
 | `[sortbounds]` | SortBounds-based selective invalidation at L1 |
 | `[tracker-cleanup]` | `ModificationTracker` cleanup cycles |
 
-### `test_relais_partial_key` (PartialKey — composite PK, partitioned tables)
+### `test_relais_partition_key` (Partition key — composite PK, partitioned tables)
 
 | Tag | Description |
 |-----|-------------|
-| `[partial-key]` | All PartialKey tests |
-| `[cached]` | L1 cache behavior with PartialKey |
-| `[redis]` | L2 cache behavior with PartialKey |
+| `[partition-key]` | All partition key tests |
+| `[cached]` | L1 cache behavior with partition key |
+| `[redis]` | L2 cache behavior with partition key |
 | `[cross-inv]` | Cross-invalidation (Event as source/target) |
-| `[validator]` | PartialKeyValidator runtime checks |
 | `[patch]` | Criteria-based partial updates at all cache levels |
 
 ### `test_relais_full_cache` (L1+L2 cache hierarchy)

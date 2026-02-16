@@ -248,7 +248,7 @@ inline auto makeTestEvent(
 }
 
 // =============================================================================
-// Event Repositories (PartialKey: Key auto-deduced as int64_t from Mapping)
+// Event Repositories (PartitionKey: Key auto-deduced as int64_t from Mapping)
 // =============================================================================
 
 using UncachedTestEventRepo = Repo<TestEventWrapper, "test:event:partial:uncached", cfg::Uncached>;

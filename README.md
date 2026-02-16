@@ -736,7 +736,7 @@ ctest --test-dir build --output-on-failure
 | `test_redis_repository.cpp` | RedisRepo (L2): CRUD caching, cross-invalidation, list caching, selective Lua invalidation, InvalidateListVia |
 | `test_cached_repository.cpp` | CachedRepo (L1+L2): RAM cache, TTL, config variants |
 | `test_decl_list_cache.cpp` | ListMixin: query/ItemView, SortBounds invalidation, ModificationTracker |
-| `test_partial_key.cpp` | PartialKey repositories: composite PK, criteria-based patch, erase with cache hints, cross-invalidation |
+| `test_partition_key.cpp` | Partition key repositories: composite PK, criteria-based patch, erase with cache hints, cross-invalidation |
 
 ### Running specific test tags
 

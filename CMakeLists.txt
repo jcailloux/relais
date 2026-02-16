@@ -171,7 +171,7 @@ if(RELAIS_BUILD_TESTS)
     relais_add_test(test_relais_redis           tests/relais/test_redis_repository.cpp     DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;redis"            RESOURCE_LOCK)
     relais_add_test(test_relais_decl_list_cache tests/relais/test_decl_list_cache.cpp      DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;list"             RESOURCE_LOCK)
     relais_add_test(test_relais_cached          tests/relais/test_cached_repository.cpp    DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;cache"            RESOURCE_LOCK)
-    relais_add_test(test_relais_partial_key     tests/relais/test_partial_key.cpp          DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;partial-key"      RESOURCE_LOCK)
+    relais_add_test(test_relais_partition_key     tests/relais/test_partition_key.cpp          DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;partition-key"      RESOURCE_LOCK)
     relais_add_test(test_relais_full_cache      tests/relais/test_full_cache.cpp           DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;full-cache"       RESOURCE_LOCK)
     relais_add_test(test_relais_decl_list_redis tests/relais/test_decl_list_redis.cpp      DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;redis;list"       RESOURCE_LOCK)
     relais_add_test(test_relais_decl_list_full  tests/relais/test_decl_list_full.cpp       DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;full-cache;list"  RESOURCE_LOCK)
@@ -199,7 +199,7 @@ if(RELAIS_BUILD_TESTS)
             test_relais_redis
             test_relais_cached
             test_relais_decl_list_cache
-            test_relais_partial_key
+            test_relais_partition_key
             test_relais_full_cache
             test_relais_decl_list_redis
             test_relais_decl_list_full
@@ -218,7 +218,7 @@ if(RELAIS_BUILD_TESTS)
         tests/relais/test_redis_repository.cpp
         tests/relais/test_cached_repository.cpp
         tests/relais/test_decl_list_cache.cpp
-        tests/relais/test_partial_key.cpp
+        tests/relais/test_partition_key.cpp
         tests/relais/test_full_cache.cpp
         tests/relais/test_decl_list_redis.cpp
         tests/relais/test_decl_list_full.cpp

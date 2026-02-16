@@ -196,7 +196,7 @@ TEST_CASE("SQL strings for complex entity", "[base_repo][sql]") {
     }
 }
 
-TEST_CASE("SQL strings for partition key entity", "[base_repo][sql][partial_key]") {
+TEST_CASE("SQL strings for partition key entity", "[base_repo][sql][partition_key]") {
     using EventMapping = entity::generated::TestEventMapping;
 
     SECTION("delete_by_pk uses partial key only") {

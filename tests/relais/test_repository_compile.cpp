@@ -3,7 +3,7 @@
  *
  * Compile-time tests for the full Repo mixin chain.
  * Verifies that Repo.h, CachedRepo.h, InvalidationMixin.h,
- * ListMixin.h, and PartialKeyValidator.h compile correctly.
+ * and ListMixin.h compile correctly.
  *
  * Exercises all mixin combinations:
  *   - Uncached (BaseRepo only)
@@ -199,10 +199,10 @@ TEST_CASE("User repository variants", "[repository][compile]") {
 }
 
 // =============================================================================
-// Verify Event (PartialKey) repositories compile
+// Verify Event (PartitionKey) repositories compile
 // =============================================================================
 
-TEST_CASE("PartialKey event repositories", "[repository][compile][partial_key]") {
+TEST_CASE("PartitionKey event repositories", "[repository][compile][partition_key]") {
     SECTION("Uncached event") {
         STATIC_REQUIRE(std::is_same_v<UncachedTestEventRepo::KeyType, int64_t>);
     }

@@ -296,7 +296,7 @@ RedisRepo::erase(id)
     |-- co_await invalidateRedisInternal(id)
 ```
 
-For PartialKey repositories, `erase` uses an **opportunistic hint** pattern — cache layers pass any already-available entity to the base layer to enable full PK deletion (partition pruning):
+For partition key repositories, `erase` uses an **opportunistic hint** pattern — cache layers pass any already-available entity to the base layer to enable full PK deletion (partition pruning):
 
 ```
 CachedRepo::erase(id)
@@ -304,7 +304,7 @@ CachedRepo::erase(id)
     |
     v
 RedisRepo::eraseImpl(id, hint)
-    |-- if (!hint && PartialKey):
+    |-- if (!hint && HasPartitionKey):
     |     hint = co_await getFromCache(redisKey)  // L2 check (~0.1-1ms)
     |
     v
@@ -313,7 +313,7 @@ BaseRepo::eraseImpl(id, hint)
     |     params = Entity::makeFullKeyParams(*hint)
     |     DELETE ... WHERE id=$1 AND region=$2     // Full composite PK -> 1 partition
     |-- else:
-    |     DELETE ... WHERE id=$1                   // Partial key -> N partitions
+    |     DELETE ... WHERE id=$1                   // Key only -> N partitions
 ```
 
 **Performance rule**: Never add a DB round-trip just for partition pruning. Only use full PK when entity is free (L1) or near-free (L2 ~0.1ms).
@@ -1003,18 +1003,18 @@ BaseRepo::patch(id, set<F>(v)...)
 
 Note: When `ListMixin` or `InvalidationMixin` are active, they intercept `patch()` to additionally notify the list cache and/or propagate cross-invalidation.
 
-## PartialKey Repositories
+## Partition Key Repositories
 
-PartialKey repositories handle tables where the repository key is a strict subset of the composite primary key. The canonical use case is PostgreSQL partitioned tables where `PK = (id, region)` but the application queries by `id` alone.
+Partition key repositories handle tables where the PostgreSQL primary key includes partition columns (e.g., `PK = (id, region)`) but the repository key is only the logical identifier (`id`). The partition column is declared with `@relais partition_key` and is **not** part of the repository key.
 
 ### Auto-Detection
 
-PartialKey is auto-detected at compile time via the `HasPartitionKey` concept, which checks whether the generated Mapping provides `SQL::delete_by_full_pk` and `makeFullKeyParams()`.
+Partition key support is auto-detected at compile time via the `HasPartitionKey` concept, which checks whether the generated Mapping provides `SQL::delete_by_full_pk` and `makeFullKeyParams()`.
 
 ### Operation Behavior
 
-| Operation | Standard | PartialKey |
-|-----------|----------|------------|
+| Operation | Standard | HasPartitionKey |
+|-----------|----------|-----------------|
 | `find` | `SELECT ... WHERE id = $1` | Same (id is unique across partitions) |
 | `update` | `UPDATE ... WHERE id = $1` | Same |
 | `patch` | `UPDATE ... SET cols WHERE id = $N RETURNING *` | Same |
@@ -1047,7 +1047,7 @@ wrapper/
 ├── Format.h               # StructFormat tag
 ├── SerializationTraits.h   # HasJsonSerialization, HasBinarySerialization
 ├── EntityConcepts.h        # Readable, Serializable, Writable, Keyed + composed concepts
-│                           # HasListDescriptor, HasPartialKey
+│                           # HasListDescriptor, HasPartitionKey
 ├── FieldUpdate.h          # set<F>(), setNull<F>(), applyFieldUpdate
 ├── EntityWrapper.h        # EntityWrapper<Struct, Mapping>
 └── ListWrapper.h          # ListWrapper<Item>
@@ -1091,7 +1091,7 @@ The `scripts/generate_entities.py` script generates standalone ORM Mapping struc
 - `template<typename Entity> key(const Entity&) -> auto`
 - `using XxxWrapper = EntityWrapper<Struct, Mapping>;`
 
-**For partial-key entities (PK is `db_managed`):**
+**For partition key entities (`@relais partition_key`):**
 - `makeFullKeyParams(const Entity&) -> PgParams` (for single-partition DELETE)
 
 **For list entities (with `filterable`/`sortable` annotations):**

@@ -1,9 +1,9 @@
 /**
- * test_partial_key.cpp
- * Integration tests for PartialKey repositories.
+ * test_partition_key.cpp
+ * Integration tests for partition key repositories.
  *
- * Tests CRUD, L1/L2 caching, cross-invalidation, and PartialKeyValidator
- * with a partitioned table where Key=int64_t but Model::PrimaryKeyType=tuple<int64_t,string>.
+ * Tests CRUD, L1/L2 caching, and cross-invalidation
+ * with a partitioned table where Key=int64_t and region is a partition key hint.
  */
 
 #include <catch2/catch_test_macros.hpp>
@@ -11,7 +11,6 @@
 #include "fixtures/test_helper.h"
 #include "fixtures/TestRepositories.h"
 #include "fixtures/RelaisTestAccessors.h"
-#include <jcailloux/relais/repository/PartialKeyValidator.h>
 
 using namespace relais_test;
 
@@ -54,12 +53,12 @@ using L1PurchaseInvEventRepo = Repo<TestPurchaseWrapper, "test:purchase:l1:event
 
 // #############################################################################
 //
-//  1. PartialKey CRUD (Uncached / BaseRepo)
+//  1. PartitionKey CRUD (Uncached / BaseRepo)
 //
 // #############################################################################
 
-TEST_CASE("PartialKey<TestEvent> - find",
-          "[integration][db][partial-key]")
+TEST_CASE("PartitionKey<TestEvent> - find",
+          "[integration][db][partition-key]")
 {
     TransactionGuard tx;
     auto userId = insertTestUser("event_user", "event@test.com", 100);
@@ -112,8 +111,8 @@ TEST_CASE("PartialKey<TestEvent> - find",
     }
 }
 
-TEST_CASE("PartialKey<TestEvent> - insert",
-          "[integration][db][partial-key]")
+TEST_CASE("PartitionKey<TestEvent> - insert",
+          "[integration][db][partition-key]")
 {
     TransactionGuard tx;
     auto userId = insertTestUser("create_user", "insert@test.com", 100);
@@ -159,8 +158,8 @@ TEST_CASE("PartialKey<TestEvent> - insert",
     }
 }
 
-TEST_CASE("PartialKey<TestEvent> - update",
-          "[integration][db][partial-key]")
+TEST_CASE("PartitionKey<TestEvent> - update",
+          "[integration][db][partition-key]")
 {
     TransactionGuard tx;
     auto userId = insertTestUser("update_user", "update@test.com", 100);
@@ -191,8 +190,8 @@ TEST_CASE("PartialKey<TestEvent> - update",
     }
 }
 
-TEST_CASE("PartialKey<TestEvent> - erase",
-          "[integration][db][partial-key]")
+TEST_CASE("PartitionKey<TestEvent> - erase",
+          "[integration][db][partition-key]")
 {
     TransactionGuard tx;
     auto userId = insertTestUser("erase_user", "erase@test.com", 100);
@@ -217,12 +216,12 @@ TEST_CASE("PartialKey<TestEvent> - erase",
 
 // #############################################################################
 //
-//  2. PartialKey with L1 caching
+//  2. PartitionKey with L1 caching
 //
 // #############################################################################
 
-TEST_CASE("PartialKey<TestEvent> - L1 caching",
-          "[integration][db][partial-key][cached]")
+TEST_CASE("PartitionKey<TestEvent> - L1 caching",
+          "[integration][db][partition-key][cached]")
 {
     TransactionGuard tx;
     auto userId = insertTestUser("cache_user", "cache@test.com", 100);
@@ -294,12 +293,12 @@ TEST_CASE("PartialKey<TestEvent> - L1 caching",
 
 // #############################################################################
 //
-//  3. PartialKey with L2 caching (Redis)
+//  3. PartitionKey with L2 caching (Redis)
 //
 // #############################################################################
 
-TEST_CASE("PartialKey<TestEvent> - L2 caching",
-          "[integration][db][partial-key][redis]")
+TEST_CASE("PartitionKey<TestEvent> - L2 caching",
+          "[integration][db][partition-key][redis]")
 {
     TransactionGuard tx;
     auto userId = insertTestUser("redis_user", "redis@test.com", 100);
@@ -344,12 +343,12 @@ TEST_CASE("PartialKey<TestEvent> - L2 caching",
 
 // #############################################################################
 //
-//  4. Cross-invalidation: Event (PartialKey) as SOURCE
+//  4. Cross-invalidation: Event (PartitionKey) as SOURCE
 //
 // #############################################################################
 
-TEST_CASE("PartialKey cross-invalidation - Event as source",
-          "[integration][db][partial-key][cross-inv]")
+TEST_CASE("PartitionKey cross-invalidation - Event as source",
+          "[integration][db][partition-key][cross-inv]")
 {
     TransactionGuard tx;
 
@@ -413,12 +412,12 @@ TEST_CASE("PartialKey cross-invalidation - Event as source",
 
 // #############################################################################
 //
-//  5. Cross-invalidation: Event (PartialKey) as TARGET
+//  5. Cross-invalidation: Event (PartitionKey) as TARGET
 //
 // #############################################################################
 
-TEST_CASE("PartialKey cross-invalidation - Event as target",
-          "[integration][db][partial-key][cross-inv]")
+TEST_CASE("PartitionKey cross-invalidation - Event as target",
+          "[integration][db][partition-key][cross-inv]")
 {
     TransactionGuard tx;
 
@@ -452,52 +451,12 @@ TEST_CASE("PartialKey cross-invalidation - Event as target",
 
 // #############################################################################
 //
-//  6. PartialKeyValidator
+//  6. Serialization
 //
 // #############################################################################
 
-TEST_CASE("PartialKeyValidator",
-          "[integration][db][partial-key][validator]")
-{
-    TransactionGuard tx;
-
-    using Validator = jcailloux::relais::PartialKeyValidator;
-
-    SECTION("[validator] validateKeyUsesSequenceOrUuid passes for events.id") {
-        auto result = sync(Validator::validateKeyUsesSequenceOrUuid(
-            "relais_test_events", "id"));
-        CHECK(result.valid);
-        CHECK(result.reason.find("SEQUENCE") != std::string::npos);
-    }
-
-    SECTION("[validator] validatePartitionColumns passes for events table") {
-        auto result = sync(Validator::validatePartitionColumns(
-            "relais_test_events", {"id"}));
-        CHECK(result.valid);
-        CHECK(result.reason.find("partition") != std::string::npos);
-    }
-
-    SECTION("[validator] validateAll passes") {
-        auto result = sync(Validator::validateAll(
-            "relais_test_events", "id"));
-        CHECK(result == true);
-    }
-
-    SECTION("[validator] rejects non-sequence column") {
-        auto result = sync(Validator::validateKeyUsesSequenceOrUuid(
-            "relais_test_events", "region"));
-        CHECK_FALSE(result.valid);
-    }
-}
-
-// #############################################################################
-//
-//  7. Serialization
-//
-// #############################################################################
-
-TEST_CASE("PartialKey - serialization",
-          "[integration][db][partial-key]")
+TEST_CASE("PartitionKey - serialization",
+          "[integration][db][partition-key]")
 {
     TransactionGuard tx;
     auto userId = insertTestUser("serial_user", "serial@test.com", 100);
@@ -544,15 +503,15 @@ TEST_CASE("PartialKey - serialization",
 
 // #############################################################################
 //
-//  8. patch — criteria-based partial update for PartialKey
+//  7. patch — criteria-based partial update for PartitionKey
 //
 // #############################################################################
 
 using jcailloux::relais::wrapper::set;
 using EF = TestEventWrapper::Field;
 
-TEST_CASE("PartialKey<TestEvent> - patch (Uncached)",
-          "[integration][db][partial-key][patch]")
+TEST_CASE("PartitionKey<TestEvent> - patch (Uncached)",
+          "[integration][db][partition-key][patch]")
 {
     TransactionGuard tx;
     auto userId = insertTestUser("patch_user", "patch@test.com", 100);
@@ -623,8 +582,8 @@ TEST_CASE("PartialKey<TestEvent> - patch (Uncached)",
     }
 }
 
-TEST_CASE("PartialKey<TestEvent> - patch (L1)",
-          "[integration][db][partial-key][cached][patch]")
+TEST_CASE("PartitionKey<TestEvent> - patch (L1)",
+          "[integration][db][partition-key][cached][patch]")
 {
     TransactionGuard tx;
     auto userId = insertTestUser("l1patch_user", "l1patch@test.com", 100);
@@ -670,8 +629,8 @@ TEST_CASE("PartialKey<TestEvent> - patch (L1)",
     }
 }
 
-TEST_CASE("PartialKey<TestEvent> - patch (L2)",
-          "[integration][db][partial-key][redis][patch]")
+TEST_CASE("PartitionKey<TestEvent> - patch (L2)",
+          "[integration][db][partition-key][redis][patch]")
 {
     TransactionGuard tx;
     auto userId = insertTestUser("l2patch_user", "l2patch@test.com", 100);
@@ -706,8 +665,8 @@ TEST_CASE("PartialKey<TestEvent> - patch (L2)",
     }
 }
 
-TEST_CASE("PartialKey<TestEvent> - patch cross-invalidation",
-          "[integration][db][partial-key][cross-inv][patch]")
+TEST_CASE("PartitionKey<TestEvent> - patch cross-invalidation",
+          "[integration][db][partition-key][cross-inv][patch]")
 {
     TransactionGuard tx;
 
@@ -740,12 +699,12 @@ TEST_CASE("PartialKey<TestEvent> - patch cross-invalidation",
 
 // #############################################################################
 //
-//  9. erase — Opportunistic full PK via L1/L2 hint
+//  8. erase — Opportunistic full PK via L1/L2 hint
 //
 // #############################################################################
 
-TEST_CASE("PartialKey<TestEvent> - erase with L1 hint",
-          "[integration][db][partial-key][cached]")
+TEST_CASE("PartitionKey<TestEvent> - erase with L1 hint",
+          "[integration][db][partition-key][cached]")
 {
     TransactionGuard tx;
     auto userId = insertTestUser("l1erase_user", "l1erase@test.com", 100);
@@ -790,8 +749,8 @@ TEST_CASE("PartialKey<TestEvent> - erase with L1 hint",
     }
 }
 
-TEST_CASE("PartialKey<TestEvent> - erase with L2 hint",
-          "[integration][db][partial-key][redis]")
+TEST_CASE("PartitionKey<TestEvent> - erase with L2 hint",
+          "[integration][db][partition-key][redis]")
 {
     TransactionGuard tx;
     auto userId = insertTestUser("l2erase_user", "l2erase@test.com", 100);
@@ -825,8 +784,8 @@ TEST_CASE("PartialKey<TestEvent> - erase with L2 hint",
     }
 }
 
-TEST_CASE("PartialKey<TestEvent> - erase with L1+L2 hint chain",
-          "[integration][db][partial-key][cached][redis]")
+TEST_CASE("PartitionKey<TestEvent> - erase with L1+L2 hint chain",
+          "[integration][db][partition-key][cached][redis]")
 {
     TransactionGuard tx;
     auto userId = insertTestUser("botherase_user", "botherase@test.com", 100);
