@@ -866,7 +866,7 @@ Low-level capability detection:
 ```cpp
 template<typename Entity>
 concept HasJsonSerialization = requires(const Entity& e, std::string_view json) {
-    { e.toJson() } -> std::convertible_to<std::shared_ptr<const std::string>>;
+    { e.json() } -> std::convertible_to<std::shared_ptr<const std::string>>;
     { Entity::fromJson(json) } -> std::convertible_to<std::optional<Entity>>;
 };
 
@@ -904,8 +904,8 @@ class EntityWrapper : public Struct {
 
 - **Struct**: Pure C++ data type, framework-agnostic, shareable across projects
 - **Mapping**: Generated standalone struct with template `fromRow<Entity>`, `toInsertParams<Entity>`, `getPrimaryKey<Entity>`
-- **Serialization caches**: `std::once_flag` + mutable `shared_ptr` cache fields; both `binary()` and `toJson()` return `shared_ptr` for safe lifetime management
-- **`releaseCaches()`**: Resets both BEVE and JSON shared_ptrs to nullptr. After release, `binary()`/`toJson()` return nullptr (once_flag already triggered)
+- **Serialization caches**: `std::once_flag` + mutable `shared_ptr` cache fields; both `binary()` and `json()` return `shared_ptr` for safe lifetime management
+- **`releaseCaches()`**: Resets both BEVE and JSON shared_ptrs to nullptr. After release, `binary()`/`json()` return nullptr (once_flag already triggered)
 
 #### Glaze Metadata Resolution
 

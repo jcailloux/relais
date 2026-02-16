@@ -99,7 +99,7 @@ template<> struct glz::meta<User> {
 using UserWrapper = jcailloux::relais::wrapper::EntityWrapper<User, generated::UserMapping>;
 // UserWrapper inherits from User and adds:
 // - fromRow/toInsertParams (delegated to Mapping)
-// - binary/toJson (thread-safe lazy BEVE/JSON via Glaze)
+// - binary/json (thread-safe lazy BEVE/JSON via Glaze)
 // - getPrimaryKey
 ```
 
@@ -548,8 +548,8 @@ io::Task<std::string> handleAuditLogList(
     // Execute paginated query (L1 cached with lazy invalidation)
     auto result = co_await AuditLogRepo::query(std::move(*query_result));
 
-    // result.toJson() returns shared_ptr<const std::string>
-    co_return *result.toJson();
+    // result.json() returns shared_ptr<const std::string>
+    co_return *result.json();
 }
 ```
 

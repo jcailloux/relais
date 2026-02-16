@@ -1103,7 +1103,7 @@ TEST_CASE("CachedRepo - findAsJson",
 {
     TransactionGuard tx;
 
-    // Uses L1TestUserRepo (generated entity with shared_ptr<const string> toJson)
+    // Uses L1TestUserRepo (generated entity with shared_ptr<const string> json)
 
     SECTION("[json] returns JSON string from L1 cache") {
         auto id = insertTestUser("json_user", "json@example.com", 42);

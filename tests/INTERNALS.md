@@ -110,7 +110,7 @@ using TestItemEntity = EntityWrapper<TestItem, generated::TestItemMapping>;
 
 `EntityWrapper` inherits from the struct and adds:
 - `fromRow(PgResult::Row)` / `toInsertParams(Entity)` — delegated to Mapping
-- `binary()` / `toJson()` — thread-safe lazy serialization via Glaze
+- `binary()` / `json()` — thread-safe lazy serialization via Glaze
 - `getPrimaryKey()` — delegated to Mapping
 - `Field` enum, `TraitsType` — from Mapping
 

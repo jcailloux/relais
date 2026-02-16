@@ -508,7 +508,7 @@ TEST_CASE("PartialKey - serialization",
         auto original = sync(UncachedTestEventRepo::find(eventId));
         REQUIRE(original != nullptr);
 
-        auto json = original->toJson();
+        auto json = original->json();
         REQUIRE(json != nullptr);
 
         // Verify region is in the JSON

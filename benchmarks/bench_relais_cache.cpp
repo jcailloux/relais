@@ -280,7 +280,7 @@ TEST_CASE("Benchmark - L1 raw throughput", "[benchmark][throughput][raw]")
             while (running.load(std::memory_order_relaxed)) {
                 auto ptr = TestInternals::getFromCache<L1TestItemRepo>(
                     ids[(tid * 1000000 + ops) % NUM_KEYS]);
-                if (ptr) doNotOptimize(ptr->toJson());
+                if (ptr) doNotOptimize(ptr->json());
                 ++ops;
             }
             return ops;

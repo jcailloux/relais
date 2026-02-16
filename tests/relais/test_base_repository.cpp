@@ -240,14 +240,14 @@ TEST_CASE("BaseRepo<TestItem> - edge cases", "[integration][db][base][item][edge
 TEST_CASE("BaseRepo<TestItem> - JSON serialization", "[integration][db][base][item][json]") {
     TransactionGuard tx;
 
-    SECTION("[json] toJson returns valid JSON with all fields") {
+    SECTION("[json] json returns valid JSON with all fields") {
         auto id = insertTestItem("Serialization Test", 42, std::optional<std::string>{"desc"}, true);
 
         auto original = sync(UncachedTestItemRepo::find(id));
 
         REQUIRE(original != nullptr);
 
-        auto json = original->toJson();
+        auto json = original->json();
         REQUIRE(json != nullptr);
         REQUIRE(!json->empty());
         REQUIRE(json->find("Serialization Test") != std::string::npos);
@@ -255,13 +255,13 @@ TEST_CASE("BaseRepo<TestItem> - JSON serialization", "[integration][db][base][it
         REQUIRE(json->find("desc") != std::string::npos);
     }
 
-    SECTION("[json] toJson with null description") {
+    SECTION("[json] json with null description") {
         auto id = insertTestItem("No Desc", 0);
 
         auto entity = sync(UncachedTestItemRepo::find(id));
         REQUIRE(entity != nullptr);
 
-        auto json = entity->toJson();
+        auto json = entity->json();
         REQUIRE(json != nullptr);
         REQUIRE(!json->empty());
         REQUIRE(json->find("No Desc") != std::string::npos);
@@ -789,14 +789,14 @@ TEST_CASE("BaseRepo<TestArticle> - edge cases", "[integration][db][base][article
 TEST_CASE("BaseRepo<TestArticle> - JSON serialization", "[integration][db][base][article][json]") {
     TransactionGuard tx;
 
-    SECTION("[json] toJson returns valid JSON with all fields") {
+    SECTION("[json] json returns valid JSON with all fields") {
         auto userId = insertTestUser("author", "author@example.com", 0);
         auto id = insertTestArticle("tech", userId, "JSON Test", 42, true);
 
         auto original = sync(UncachedTestArticleRepo::find(id));
         REQUIRE(original != nullptr);
 
-        auto json = original->toJson();
+        auto json = original->json();
         REQUIRE(json != nullptr);
         REQUIRE(!json->empty());
         REQUIRE(json->find("tech") != std::string::npos);

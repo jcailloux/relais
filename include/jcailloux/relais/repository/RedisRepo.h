@@ -67,7 +67,7 @@ class RedisRepo : public BaseRepo<Entity, Name, Cfg, Key> {
             }
 
             if (auto ptr = co_await Base::find(id)) {
-                auto json = ptr->toJson();
+                auto json = ptr->json();
                 if (json) {
                     co_await cache::RedisCache::setRaw(redisKey, *json, l2Ttl());
                 }

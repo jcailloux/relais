@@ -20,7 +20,7 @@ namespace jcailloux::relais::cache {
 
     /**
      * Async Redis cache wrapper for L2 caching.
-     * Entity must implement toJson() and fromJson().
+     * Entity must implement json() and fromJson().
      *
      * All Redis operations go through DbProvider::redis() which wraps
      * io::RedisClient via type-erased std::function.
@@ -63,7 +63,7 @@ namespace jcailloux::relais::cache {
 
                 try {
                     auto ttl_seconds = std::chrono::duration_cast<std::chrono::seconds>(ttl).count();
-                    auto json = entity.toJson();
+                    auto json = entity.json();
                     co_await DbProvider::redis("SETEX", key,
                         ttl_seconds, *json);
                     co_return true;

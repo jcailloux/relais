@@ -132,7 +132,7 @@ public:
     /// Returns shared_ptr to JSON string (nullptr if not found).
     static io::Task<std::shared_ptr<const std::string>> findAsJson(const Key& id) {
         if (auto cached = getFromCache(id)) {
-            co_return cached->toJson();
+            co_return cached->json();
         }
 
         if constexpr (HasRedis) {
@@ -147,7 +147,7 @@ public:
             auto ptr = co_await Base::find(id);
             if (ptr) {
                 putInCache(id, ptr);
-                co_return ptr->toJson();
+                co_return ptr->json();
             }
             co_return nullptr;
         }

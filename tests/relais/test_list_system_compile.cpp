@@ -94,7 +94,7 @@ struct TestListArticle {
 
     auto getPrimaryKey() const noexcept { return id; }
     static std::optional<TestListArticle> fromJson(std::string_view) { return std::nullopt; }
-    std::shared_ptr<const std::string> toJson() const { return nullptr; }
+    std::shared_ptr<const std::string> json() const { return nullptr; }
 };
 
 template<>

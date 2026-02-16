@@ -18,12 +18,12 @@ namespace jcailloux::relais {
 // These check what an entity CAN do (capability), not how it's configured.
 // =============================================================================
 
-/// Entity supports JSON serialization (toJson/fromJson).
-/// toJson() returns shared_ptr<const string> — cacheable, nullable, zero-copy.
+/// Entity supports JSON serialization (json/fromJson).
+/// json() returns shared_ptr<const string> — cacheable, nullable, zero-copy.
 /// fromJson(string_view) is the canonical input form.
 template<typename Entity>
 concept HasJsonSerialization = requires(const Entity& e, std::string_view json) {
-    { e.toJson() } -> std::convertible_to<std::shared_ptr<const std::string>>;
+    { e.json() } -> std::convertible_to<std::shared_ptr<const std::string>>;
     { Entity::fromJson(json) } -> std::convertible_to<std::optional<Entity>>;
 };
 
