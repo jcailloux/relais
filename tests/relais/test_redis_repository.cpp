@@ -598,6 +598,74 @@ TEST_CASE("RedisRepo - findJson", "[integration][db][redis][json]") {
 
 // #############################################################################
 //
+//  3b. findBinary — raw binary (BEVE) path
+//
+// #############################################################################
+
+TEST_CASE("RedisRepo - findBinary", "[integration][db][redis][binary]") {
+    TransactionGuard tx;
+
+    SECTION("[binary] returns raw BEVE bytes from Redis") {
+        auto id = insertTestUser("binary_user", "binary@test.com", 100);
+
+        auto result = sync(L2TestUserRepo::findBinary(id));
+
+        REQUIRE(result != nullptr);
+        REQUIRE(!result->empty());
+        // Verify roundtrip: deserialize BEVE back to entity
+        auto entity = entity::generated::TestUserWrapper::fromBinary(*result);
+        REQUIRE(entity.has_value());
+        REQUIRE(entity->username == "binary_user");
+        REQUIRE(entity->balance == 100);
+    }
+
+    SECTION("[binary] returns nullptr for non-existent id") {
+        auto result = sync(L2TestUserRepo::findBinary(999999999));
+
+        REQUIRE(result == nullptr);
+    }
+
+    SECTION("[binary] second call served from Redis cache") {
+        auto id = insertTestUser("cached_binary", "cached@test.com", 200);
+
+        // First call — DB fetch, store binary in Redis
+        auto result1 = sync(L2TestUserRepo::findBinary(id));
+        REQUIRE(result1 != nullptr);
+
+        // Modify DB directly (bypass cache)
+        updateTestUserBalance(id, 999);
+
+        // Second call — cached binary (still has old balance)
+        auto result2 = sync(L2TestUserRepo::findBinary(id));
+        REQUIRE(result2 != nullptr);
+        auto entity = entity::generated::TestUserWrapper::fromBinary(*result2);
+        REQUIRE(entity.has_value());
+        REQUIRE(entity->balance == 200);
+    }
+
+    SECTION("[binary] invalidation clears cached binary") {
+        auto id = insertTestUser("inv_binary", "inv@test.com", 300);
+
+        // Populate cache
+        sync(L2TestUserRepo::findBinary(id));
+
+        // Invalidate
+        sync(L2TestUserRepo::evictRedis(id));
+
+        // Modify DB
+        updateTestUserBalance(id, 0);
+
+        // Should fetch fresh data from DB
+        auto result = sync(L2TestUserRepo::findBinary(id));
+        REQUIRE(result != nullptr);
+        auto entity = entity::generated::TestUserWrapper::fromBinary(*result);
+        REQUIRE(entity.has_value());
+        REQUIRE(entity->balance == 0);
+    }
+}
+
+// #############################################################################
+//
 //  4. Explicit invalidation — evictRedis
 //
 // #############################################################################

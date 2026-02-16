@@ -286,19 +286,47 @@ public:
     // Cache management — unified entity + list cleanup
     // =========================================================================
 
-    /// Trigger cleanup on both entity and list L1 caches (non-blocking).
+    /// Try to sweep one shard on both entity and list caches.
+    /// Returns immediately if a sweep is already in progress.
     static bool trySweep() {
         bool entity_cleaned = Base::trySweep();
         bool list_cleaned = listCache().trySweep();
         return entity_cleaned || list_cleaned;
     }
 
-    /// Full cleanup on both entity and list L1 caches (blocking).
+    /// Sweep one shard on both entity and list caches.
+    static bool sweep() {
+        bool entity_cleaned = Base::sweep();
+        bool list_cleaned = listCache().sweep();
+        return entity_cleaned || list_cleaned;
+    }
+
+    /// Sweep all shards on both entity and list caches.
     static size_t purge() {
         size_t entity_erased = Base::purge();
         size_t list_erased = listCache().purge();
         return entity_erased + list_erased;
     }
+
+    /// Try to sweep one entity cache shard.
+    /// Returns immediately if a sweep is already in progress.
+    static bool trySweepEntities() { return Base::trySweep(); }
+
+    /// Sweep one entity cache shard.
+    static bool sweepEntities() { return Base::sweep(); }
+
+    /// Sweep all entity cache shards.
+    static size_t purgeEntities() { return Base::purge(); }
+
+    /// Try to sweep one list cache shard.
+    /// Returns immediately if a sweep is already in progress.
+    static bool trySweepLists() { return listCache().trySweep(); }
+
+    /// Sweep one list cache shard.
+    static bool sweepLists() { return listCache().sweep(); }
+
+    /// Sweep all list cache shards.
+    static size_t purgeLists() { return listCache().purge(); }
 
     /// Invalidate entity cache (list cache invalidation is lazy via ModificationTracker).
     static io::Task<void> invalidate(const Key& id) {

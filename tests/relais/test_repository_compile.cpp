@@ -111,6 +111,16 @@ TEST_CASE("CachedRepo features", "[repository][compile][cached]") {
         (void)result;
     }
 
+    SECTION("sweep") {
+        auto result = L1TestItemRepo::sweep();
+        (void)result;
+    }
+
+    SECTION("purge") {
+        auto erased = L1TestItemRepo::purge();
+        REQUIRE(erased == 0);  // empty cache
+    }
+
     SECTION("warmup") {
         L1TestItemRepo::warmup();
     }
@@ -155,6 +165,31 @@ TEST_CASE("ListMixin auto-detected from ListDescriptor", "[repository][compile][
         // ListDescriptorType should exist if ListMixin is active
         using Desc = TestArticleListRepo::ListDescriptorType;
         (void)sizeof(Desc);  // verify type exists
+    }
+
+    SECTION("sweep — unified (entity + list)") {
+        (void)TestArticleListRepo::trySweep();
+        (void)TestArticleListRepo::sweep();
+        auto erased = TestArticleListRepo::purge();
+        REQUIRE(erased == 0);
+    }
+
+    SECTION("sweepEntities — entity cache only") {
+        (void)TestArticleListRepo::trySweepEntities();
+        (void)TestArticleListRepo::sweepEntities();
+        auto erased = TestArticleListRepo::purgeEntities();
+        REQUIRE(erased == 0);
+    }
+
+    SECTION("sweepLists — list cache only") {
+        (void)TestArticleListRepo::trySweepLists();
+        (void)TestArticleListRepo::sweepLists();
+        auto erased = TestArticleListRepo::purgeLists();
+        REQUIRE(erased == 0);
+    }
+
+    SECTION("listSize") {
+        REQUIRE(TestArticleListRepo::listSize() == 0);
     }
 }
 

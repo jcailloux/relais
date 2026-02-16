@@ -135,19 +135,32 @@ public:
             co_return cached->json();
         }
 
+        auto ptr = co_await find(id);
+        co_return ptr ? ptr->json() : nullptr;
+    }
+
+    /// Find by ID and return raw binary (BEVE).
+    /// Returns shared_ptr to binary data (nullptr if not found).
+    static io::Task<std::shared_ptr<const std::vector<uint8_t>>> findBinary(const Key& id)
+        requires HasBinarySerialization<Entity>
+    {
+        if (auto cached = getFromCache(id)) {
+            co_return cached->binary();
+        }
+
         if constexpr (HasRedis) {
-            auto json = co_await Base::findJson(id);
-            if (json) {
-                if (auto entity = Entity::fromJson(*json)) {
+            auto bin = co_await Base::findBinary(id);
+            if (bin) {
+                if (auto entity = Entity::fromBinary(*bin)) {
                     putInCache(id, std::make_shared<const Entity>(std::move(*entity)));
                 }
             }
-            co_return json;
+            co_return bin;
         } else {
             auto ptr = co_await Base::find(id);
             if (ptr) {
                 putInCache(id, ptr);
-                co_return ptr->json();
+                co_return ptr->binary();
             }
             co_return nullptr;
         }
@@ -240,8 +253,8 @@ public:
         Clock::time_point now;
     };
 
-    /// Try to sweep one shard (non-blocking).
-    /// Returns true if a shard was swept, false if already in progress.
+    /// Try to sweep one shard.
+    /// Returns immediately if a sweep is already in progress.
     static bool trySweep() {
         CleanupContext ctx{Clock::now()};
         return cache().try_cleanup(ctx, [](const Key&,
@@ -251,17 +264,17 @@ public:
         }).has_value();
     }
 
-    /// Sweep one shard (waits if another sweep is in progress).
+    /// Sweep one shard.
     static bool sweep() {
         CleanupContext ctx{Clock::now()};
         return cache().cleanup(ctx, [](const Key&,
                                             const Metadata& meta,
                                             const CleanupContext& ctx) {
             return meta.expiration() < ctx.now;
-        }).has_value();
+        }).removed > 0;
     }
 
-    /// Sweep all shards sequentially
+    /// Sweep all shards.
     static size_t purge() {
         CleanupContext ctx{Clock::now()};
         return cache().full_cleanup(ctx, [](const Key&,

@@ -68,19 +68,19 @@ public:
         listCache().invalidate(query);
     }
 
-    ///try to sweep one list cache shard (non-blocking).
-    /// Returns true if a shard was swept, false if already in progress.
-    static bool trySweepList() {
+    /// Try to sweep one list cache shard.
+    /// Returns immediately if a sweep is already in progress.
+    static bool trySweepLists() {
         return listCache().trySweep();
     }
 
-    /// Sweep one list cache shard (waits if another sweep is in progress).
-    static bool sweepList() {
-        return listCache().trySweep();
+    /// Sweep one list cache shard.
+    static bool sweepLists() {
+        return listCache().sweep();
     }
 
-    /// Sweep all list cache shards sequentially.
-    static size_t purgeList() {
+    /// Sweep all list cache shards.
+    static size_t purgeLists() {
         return listCache().purge();
     }
 

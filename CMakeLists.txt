@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(jcailloux-relais VERSION 0.2.0 LANGUAGES CXX)
+project(jcailloux-relais VERSION 0.3.0 LANGUAGES CXX)
 
 add_library(jcailloux-relais INTERFACE)
 add_library(jcailloux::relais ALIAS jcailloux-relais)
@@ -153,7 +153,9 @@ if(RELAIS_BUILD_TESTS)
     # -------------------------------------------------------------------------
     # Unit tests
     # -------------------------------------------------------------------------
-    relais_add_test(relais_tests          tests/relais/test_generated_wrapper.cpp  DEFINITIONS RELAIS_BUILDING_TESTS)
+    relais_add_test(relais_tests                tests/relais/test_generated_wrapper.cpp          DEFINITIONS RELAIS_BUILDING_TESTS)
+    relais_add_test(test_relais_base_compile    tests/relais/test_base_repository_compile.cpp    DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;compile")
+    relais_add_test(test_relais_repo_compile    tests/relais/test_repository_compile.cpp         DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;compile")
     relais_add_test(test_io_task          tests/io/test_io_task.cpp               LABELS "io")
     relais_add_test(test_io_context       tests/io/test_io_context.cpp            LABELS "io")
     relais_add_test(test_io_pg_types      tests/io/test_io_pg_types.cpp           LABELS "io")

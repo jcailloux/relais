@@ -53,25 +53,34 @@ class RedisRepo : public BaseRepo<Entity, Name, Cfg, Key> {
         /// Find by ID and return raw JSON string.
         /// Returns shared_ptr to JSON string (nullptr if not found).
         static io::Task<std::shared_ptr<const std::string>> findJson(const Key& id) {
+            auto ptr = co_await find(id);
+            co_return ptr ? ptr->json() : nullptr;
+        }
+
+        /// Find by ID and return raw binary
+        /// Returns shared_ptr to binary data (nullptr if not found).
+        static io::Task<std::shared_ptr<const std::vector<uint8_t>>> findBinary(const Key& id)
+            requires HasBinarySerialization<Entity>
+        {
             auto redisKey = makeRedisKey(id);
 
-            std::optional<std::string> cached;
+            std::optional<std::vector<uint8_t>> cached;
             if constexpr (Cfg.l2_refresh_on_get) {
-                cached = co_await cache::RedisCache::getRawEx(redisKey, l2Ttl());
+                cached = co_await cache::RedisCache::getRawBinaryEx(redisKey, l2Ttl());
             } else {
-                cached = co_await cache::RedisCache::getRaw(redisKey);
+                cached = co_await cache::RedisCache::getRawBinary(redisKey);
             }
 
             if (cached) {
-                co_return std::make_shared<const std::string>(std::move(*cached));
+                co_return std::make_shared<const std::vector<uint8_t>>(std::move(*cached));
             }
 
             if (auto ptr = co_await Base::find(id)) {
-                auto json = ptr->json();
-                if (json) {
-                    co_await cache::RedisCache::setRaw(redisKey, *json, l2Ttl());
+                auto bin = ptr->binary();
+                if (bin) {
+                    co_await cache::RedisCache::setRawBinary(redisKey, *bin, l2Ttl());
                 }
-                co_return json;
+                co_return bin;
             }
             co_return nullptr;
         }

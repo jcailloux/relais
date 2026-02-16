@@ -400,8 +400,8 @@ public:
         const ListCache& cache;
     };
 
-    /// Try to trigger a cleanup (non-blocking)
-    /// Returns true if cleanup was performed, false if another cleanup is in progress
+    /// Try to sweep one shard.
+    /// Returns immediately if a sweep is already in progress.
     bool trySweep() {
         // Snapshot time BEFORE shard cleanup so that modifications added
         // during cleanup are not counted (they weren't fully considered).
@@ -448,7 +448,51 @@ public:
         return shard.has_value();
     }
 
-    /// Full cleanup (blocking) - processes all shards
+    /// Sweep one shard.
+    /// Returns true if entries were removed.
+    bool sweep() {
+        const auto now = Clock::now();
+
+        CleanupContext ctx{
+            .expiration_limit = now - config_.default_ttl,
+            .modifications = modifications_,
+            .cache = *this
+        };
+
+        auto result = cache_.cleanup(ctx,
+            [](const CacheKey&, const ResultPtr& result, const MetadataPtr& meta,
+               const CleanupContext& ctx, uint8_t shard_id) {
+                // 1. TTL check
+                if (meta->cachedAt() < ctx.expiration_limit) {
+                    return true;  // Expired, erase
+                }
+
+                // 2. Check if affected by modifications (with bitmap skip)
+                bool affected = false;
+                ctx.modifications.forEachModificationWithBitmap(
+                    [&](const Modification& mod, BitmapType pending_segments) {
+                        if (affected) return;
+
+                        // Skip: shard already cleaned for this modification
+                        if ((pending_segments & (BitmapType{1} << shard_id)) == 0) return;
+
+                        // Skip: data created after modification
+                        if (mod.modified_at <= meta->cachedAt()) return;
+
+                        if (ctx.cache.isModificationAffecting(mod, meta, *result)) {
+                            affected = true;
+                        }
+                    });
+
+                return affected;
+            });
+
+        modifications_.drainShard(now, result.shard_id);
+
+        return result.removed > 0;
+    }
+
+    /// Sweep all shards.
     size_t purge() {
         const auto now = Clock::now();
 
