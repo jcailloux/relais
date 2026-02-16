@@ -116,20 +116,20 @@ class RedisRepo : public BaseRepo<Entity, Name, Cfg, Key> {
             co_return co_await Base::patch(id, std::forward<Updates>(updates)...);
         }
 
-        /// Remove entity by ID.
+        /// Erase entity by ID.
         /// Returns: rows deleted (0 if not found), or nullopt on DB error.
         /// Invalidates Redis cache unless DB error occurred.
-        static io::Task<std::optional<size_t>> remove(const Key& id)
+        static io::Task<std::optional<size_t>> erase(const Key& id)
             requires (!Cfg.read_only)
         {
-            co_return co_await removeImpl(id, nullptr);
+            co_return co_await eraseImpl(id, nullptr);
         }
 
     protected:
-        /// Internal remove with optional entity hint.
+        /// Internal erase with optional entity hint.
         /// For CompositeKey entities: if L1 didn't provide a hint,
         /// try L2 (Redis) as a near-free fallback (~0.1-1ms).
-        static io::Task<std::optional<size_t>> removeImpl(
+        static io::Task<std::optional<size_t>> eraseImpl(
             const Key& id, typename Base::WrapperPtrType cachedHint = nullptr)
             requires (!Cfg.read_only)
         {
@@ -143,7 +143,7 @@ class RedisRepo : public BaseRepo<Entity, Name, Cfg, Key> {
                 }
             }
 
-            auto result = co_await Base::removeImpl(id, std::move(cachedHint));
+            auto result = co_await Base::eraseImpl(id, std::move(cachedHint));
             if (result.has_value()) {
                 co_await invalidateRedis(id);
             }

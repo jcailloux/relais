@@ -33,7 +33,7 @@ namespace jcailloux::relais {
  *
  * Provides:
  * - query()           : paginated list queries with L1 caching + lazy invalidation
- * - CRUD interception : automatically notifies list cache on insert/update/remove
+ * - CRUD interception : automatically notifies list cache on insert/update/erase
  * - warmup()          : primes both entity and list L1 caches
  *
  * Uses the existing ListCache (shardmap-based) for storage and ModificationTracker
@@ -253,12 +253,12 @@ public:
         co_return co_await updateWithContext(id, std::move(wrapper), std::move(old));
     }
 
-    /// Remove entity and notify list cache.
-    static io::Task<std::optional<size_t>> remove(const Key& id)
+    /// Erase entity and notify list cache.
+    static io::Task<std::optional<size_t>> erase(const Key& id)
         requires (!Base::config.read_only)
     {
         auto entity = co_await Base::find(id);
-        co_return co_await removeWithContext(id, std::move(entity));
+        co_return co_await eraseWithContext(id, std::move(entity));
     }
 
     /// Partial update and notify list cache.
@@ -295,9 +295,9 @@ public:
 
     /// Full cleanup on both entity and list L1 caches (blocking).
     static size_t fullCleanup() {
-        size_t entity_removed = Base::fullCleanup();
-        size_t list_removed = listCache().fullCleanup();
-        return entity_removed + list_removed;
+        size_t entity_erased = Base::fullCleanup();
+        size_t list_erased = listCache().fullCleanup();
+        return entity_erased + list_erased;
     }
 
     /// Invalidate entity cache (list cache invalidation is lazy via ModificationTracker).
@@ -342,11 +342,11 @@ protected:
         co_return ok;
     }
 
-    static io::Task<std::optional<size_t>> removeWithContext(
+    static io::Task<std::optional<size_t>> eraseWithContext(
         const Key& id, WrapperPtrType old_entity)
         requires (!Base::config.read_only)
     {
-        auto result = co_await Base::remove(id);
+        auto result = co_await Base::erase(id);
         if (result.has_value() && old_entity) {
             listCache().onEntityDeleted(std::move(old_entity));
         }

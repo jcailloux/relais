@@ -243,7 +243,7 @@ Comprehensive integration tests for the L2 (Redis) cache layer, organized in 17 
 | 1 | `[item]`                               | `find` — cache hit, miss, multi-entity |
 | 2 | `[item]`                               | `insert` — insert + populate Redis |
 | 3 | `[item]`                               | `update` — invalidate Redis (lazy reload) |
-| 4 | `[item]`                               | `remove` — invalidate Redis |
+| 4 | `[item]`                               | `erase` — invalidate Redis |
 | 5 | `[binary]`                             | Binary (BEVE) serialization in Redis |
 | 6 | `[patch]`                           | Partial field updates with Redis invalidation |
 | 7 | `[json]`                               | `findAsJson` raw JSON retrieval |
@@ -388,18 +388,18 @@ UPDATE table SET "col1"=$1, "col2"=$2 WHERE "id"=$3 RETURNING *
 
 Helpers in `FieldUpdate.h`: `fieldColumnName<Traits>(update)` extracts the quoted column name, `fieldValue<Traits>(update)` extracts the properly-typed value.
 
-### `remove` — Opportunistic Full PK via Cache Hint
+### `erase` — Opportunistic Full PK via Cache Hint
 
 For partition pruning, `DELETE WHERE id=$1 AND region=$2` scans 1 partition vs `DELETE WHERE id=$1` scans N. The optimization uses cached entities as hints:
 
 ```
-CachedRepo::remove(id)
+CachedRepo::erase(id)
   → hint = getFromCache(id)        // Free L1 check
-  → RedisRepo::removeImpl(id, hint)
+  → RedisRepo::eraseImpl(id, hint)
     → if (!hint && PartialKey) {
         hint = getFromRedis(id)    // ~0.1ms L2 check
       }
-    → BaseRepo::removeImpl(id, hint)
+    → BaseRepo::eraseImpl(id, hint)
       → if (hint) deleteByPrimaryKey(fullPK)  // Pruned: 1 partition
       → else      deleteBy(criteria)           // Scan: N partitions
 ```
@@ -410,7 +410,7 @@ CachedRepo::remove(id)
 
 | Section | Content                                                                 |
 |---------|-------------------------------------------------------------------------|
-| 1 | CRUD: find, insert, update, remove (Uncached)                           |
+| 1 | CRUD: find, insert, update, erase (Uncached)                           |
 | 2 | L1 caching: cache hit, staleness, invalidation                          |
 | 3 | L2 caching: Redis hit, staleness, invalidation                          |
 | 4 | Cross-invalidation: Event as source (→ User L1)                         |
@@ -421,6 +421,6 @@ CachedRepo::remove(id)
 | 8b | patch L1: cache invalidation + re-fetch                              |
 | 8c | patch L2: Redis invalidation + re-fetch                              |
 | 8d | patch cross-invalidation: Event patch → User L1                   |
-| 9a | remove L1 hint: cache hit vs miss paths                                 |
-| 9b | remove L2 hint: Redis hit vs miss paths                                 |
-| 9c | remove L1+L2 chain: L1 hit, L1 miss/L2 hit, both miss                   |
+| 9a | erase L1 hint: cache hit vs miss paths                                 |
+| 9b | erase L2 hint: Redis hit vs miss paths                                 |
+| 9c | erase L1+L2 chain: L1 hit, L1 miss/L2 hit, both miss                   |

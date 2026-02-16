@@ -191,16 +191,16 @@ TEST_CASE("PartialKey<TestEvent> - update",
     }
 }
 
-TEST_CASE("PartialKey<TestEvent> - remove",
+TEST_CASE("PartialKey<TestEvent> - erase",
           "[integration][db][partial-key]")
 {
     TransactionGuard tx;
-    auto userId = insertTestUser("remove_user", "remove@test.com", 100);
+    auto userId = insertTestUser("erase_user", "erase@test.com", 100);
 
-    SECTION("[remove] deletes via partial key criteria") {
+    SECTION("[erase] deletes via partial key criteria") {
         auto eventId = insertTestEvent("eu", userId, "To Delete", 1);
 
-        auto result = sync(UncachedTestEventRepo::remove(eventId));
+        auto result = sync(UncachedTestEventRepo::erase(eventId));
         REQUIRE(result.has_value());
         CHECK(*result == 1);
 
@@ -208,8 +208,8 @@ TEST_CASE("PartialKey<TestEvent> - remove",
         CHECK(found == nullptr);
     }
 
-    SECTION("[remove] returns 0 for non-existent id") {
-        auto result = sync(UncachedTestEventRepo::remove(999999));
+    SECTION("[erase] returns 0 for non-existent id") {
+        auto result = sync(UncachedTestEventRepo::erase(999999));
         REQUIRE(result.has_value());
         CHECK(*result == 0);
     }
@@ -277,14 +277,14 @@ TEST_CASE("PartialKey<TestEvent> - L1 caching",
         CHECK(found->title == "Repo Updated");
     }
 
-    SECTION("[remove] invalidates L1 cache") {
-        auto eventId = insertTestEvent("eu", userId, "To Remove", 1);
+    SECTION("[erase] invalidates L1 cache") {
+        auto eventId = insertTestEvent("eu", userId, "To erase", 1);
 
         // Cache in L1
         sync(L1TestEventRepo::find(eventId));
 
-        // Remove via repo
-        sync(L1TestEventRepo::remove(eventId));
+        // erase via repo
+        sync(L1TestEventRepo::erase(eventId));
 
         // Not found
         auto found = sync(L1TestEventRepo::find(eventId));
@@ -403,7 +403,7 @@ TEST_CASE("PartialKey cross-invalidation - Event as source",
         sync(L1EventTargetUserRepo::find(userId));
         updateTestUserBalance(userId, 200);
 
-        sync(L1EventSourceRepo::remove(eventId));
+        sync(L1EventSourceRepo::erase(eventId));
 
         auto user = sync(L1EventTargetUserRepo::find(userId));
         REQUIRE(user != nullptr);
@@ -740,17 +740,17 @@ TEST_CASE("PartialKey<TestEvent> - patch cross-invalidation",
 
 // #############################################################################
 //
-//  9. remove — Opportunistic full PK via L1/L2 hint
+//  9. erase — Opportunistic full PK via L1/L2 hint
 //
 // #############################################################################
 
-TEST_CASE("PartialKey<TestEvent> - remove with L1 hint",
+TEST_CASE("PartialKey<TestEvent> - erase with L1 hint",
           "[integration][db][partial-key][cached]")
 {
     TransactionGuard tx;
-    auto userId = insertTestUser("l1remove_user", "l1remove@test.com", 100);
+    auto userId = insertTestUser("l1erase_user", "l1erase@test.com", 100);
 
-    SECTION("[remove] succeeds when entity is in L1 cache (full PK path)") {
+    SECTION("[erase] succeeds when entity is in L1 cache (full PK path)") {
         auto eventId = insertTestEvent("eu", userId, "L1 Cached", 5);
 
         // Populate L1 cache
@@ -761,9 +761,9 @@ TEST_CASE("PartialKey<TestEvent> - remove with L1 hint",
         REQUIRE(cached != nullptr);
         CHECK(cached->region == "eu");
 
-        // Remove (L1 hit → provides hint → delete_by_full_pk)
+        // erase (L1 hit → provides hint → delete_by_full_pk)
         // If hint had wrong region, DELETE ... WHERE id=$1 AND region=$2 would return 0
-        auto result = sync(L1TestEventRepo::remove(eventId));
+        auto result = sync(L1TestEventRepo::erase(eventId));
         REQUIRE(result.has_value());
         CHECK(*result == 1);
 
@@ -772,15 +772,15 @@ TEST_CASE("PartialKey<TestEvent> - remove with L1 hint",
         CHECK(found == nullptr);
     }
 
-    SECTION("[remove] succeeds when entity is NOT in L1 cache (criteria path)") {
+    SECTION("[erase] succeeds when entity is NOT in L1 cache (criteria path)") {
         auto eventId = insertTestEvent("us", userId, "Not Cached", 3);
 
         // Verify precondition: L1 cache does NOT have the entity (no hint)
         auto cached = TestInternals::getFromCache<L1TestEventRepo>(eventId);
         REQUIRE(cached == nullptr);
 
-        // Remove without hint → delete_by_pk (criteria-based, scans all partitions)
-        auto result = sync(L1TestEventRepo::remove(eventId));
+        // erase without hint → delete_by_pk (criteria-based, scans all partitions)
+        auto result = sync(L1TestEventRepo::erase(eventId));
         REQUIRE(result.has_value());
         CHECK(*result == 1);
 
@@ -790,20 +790,20 @@ TEST_CASE("PartialKey<TestEvent> - remove with L1 hint",
     }
 }
 
-TEST_CASE("PartialKey<TestEvent> - remove with L2 hint",
+TEST_CASE("PartialKey<TestEvent> - erase with L2 hint",
           "[integration][db][partial-key][redis]")
 {
     TransactionGuard tx;
-    auto userId = insertTestUser("l2remove_user", "l2remove@test.com", 100);
+    auto userId = insertTestUser("l2erase_user", "l2erase@test.com", 100);
 
-    SECTION("[remove] succeeds when entity is in Redis (L2 hint path)") {
+    SECTION("[erase] succeeds when entity is in Redis (L2 hint path)") {
         auto eventId = insertTestEvent("eu", userId, "Redis Cached", 5);
 
         // Populate Redis cache
         sync(L2TestEventRepo::find(eventId));
 
-        // Remove (L2 hit → provides hint → full PK delete)
-        auto result = sync(L2TestEventRepo::remove(eventId));
+        // erase (L2 hit → provides hint → full PK delete)
+        auto result = sync(L2TestEventRepo::erase(eventId));
         REQUIRE(result.has_value());
         CHECK(*result == 1);
 
@@ -812,26 +812,26 @@ TEST_CASE("PartialKey<TestEvent> - remove with L2 hint",
         CHECK(found == nullptr);
     }
 
-    SECTION("[remove] succeeds when entity is NOT in Redis (criteria fallback)") {
+    SECTION("[erase] succeeds when entity is NOT in Redis (criteria fallback)") {
         auto eventId = insertTestEvent("us", userId, "Not Cached", 3);
 
         // Ensure no Redis data
         flushRedis();
 
-        // Remove (no L2 hint → criteria-based)
-        auto result = sync(L2TestEventRepo::remove(eventId));
+        // erase (no L2 hint → criteria-based)
+        auto result = sync(L2TestEventRepo::erase(eventId));
         REQUIRE(result.has_value());
         CHECK(*result == 1);
     }
 }
 
-TEST_CASE("PartialKey<TestEvent> - remove with L1+L2 hint chain",
+TEST_CASE("PartialKey<TestEvent> - erase with L1+L2 hint chain",
           "[integration][db][partial-key][cached][redis]")
 {
     TransactionGuard tx;
-    auto userId = insertTestUser("bothremove_user", "bothremove@test.com", 100);
+    auto userId = insertTestUser("botherase_user", "botherase@test.com", 100);
 
-    SECTION("[remove] L1 hit provides hint (skips L2 check)") {
+    SECTION("[erase] L1 hit provides hint (skips L2 check)") {
         auto eventId = insertTestEvent("eu", userId, "Both Cached", 5);
 
         // Populate L1 + L2
@@ -842,8 +842,8 @@ TEST_CASE("PartialKey<TestEvent> - remove with L1+L2 hint chain",
         REQUIRE(cached != nullptr);
         CHECK(cached->region == "eu");
 
-        // Remove (L1 hit → hint with region="eu" → delete_by_full_pk)
-        auto result = sync(L1L2TestEventRepo::remove(eventId));
+        // erase (L1 hit → hint with region="eu" → delete_by_full_pk)
+        auto result = sync(L1L2TestEventRepo::erase(eventId));
         REQUIRE(result.has_value());
         CHECK(*result == 1);
 
@@ -851,7 +851,7 @@ TEST_CASE("PartialKey<TestEvent> - remove with L1+L2 hint chain",
         CHECK(found == nullptr);
     }
 
-    SECTION("[remove] L1 miss, L2 hit provides hint") {
+    SECTION("[erase] L1 miss, L2 hit provides hint") {
         auto eventId = insertTestEvent("us", userId, "L2 Only", 3);
 
         // Populate L1 + L2
@@ -864,8 +864,8 @@ TEST_CASE("PartialKey<TestEvent> - remove with L1+L2 hint chain",
         auto cachedL1 = TestInternals::getFromCache<L1L2TestEventRepo>(eventId);
         REQUIRE(cachedL1 == nullptr);
 
-        // Remove (L1 miss → L2 hit → hint with region="us" → delete_by_full_pk)
-        auto result = sync(L1L2TestEventRepo::remove(eventId));
+        // erase (L1 miss → L2 hit → hint with region="us" → delete_by_full_pk)
+        auto result = sync(L1L2TestEventRepo::erase(eventId));
         REQUIRE(result.has_value());
         CHECK(*result == 1);
 
@@ -873,7 +873,7 @@ TEST_CASE("PartialKey<TestEvent> - remove with L1+L2 hint chain",
         CHECK(found == nullptr);
     }
 
-    SECTION("[remove] both L1 and L2 miss - criteria fallback") {
+    SECTION("[erase] both L1 and L2 miss - criteria fallback") {
         auto eventId = insertTestEvent("eu", userId, "No Cache", 1);
 
         // Ensure no L1 and no L2
@@ -883,8 +883,8 @@ TEST_CASE("PartialKey<TestEvent> - remove with L1+L2 hint chain",
         auto cachedL1 = TestInternals::getFromCache<L1L2TestEventRepo>(eventId);
         REQUIRE(cachedL1 == nullptr);
 
-        // Remove (no L1, no L2 → no hint → delete_by_pk, scans all partitions)
-        auto result = sync(L1L2TestEventRepo::remove(eventId));
+        // erase (no L1, no L2 → no hint → delete_by_pk, scans all partitions)
+        auto result = sync(L1L2TestEventRepo::erase(eventId));
         REQUIRE(result.has_value());
         CHECK(*result == 1);
 

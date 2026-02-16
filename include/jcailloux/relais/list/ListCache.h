@@ -418,7 +418,7 @@ public:
                const CleanupContext& ctx, uint8_t shard_id) {
                 // 1. TTL check
                 if (meta->cachedAt() < ctx.expiration_limit) {
-                    return true;  // Expired, remove
+                    return true;  // Expired, erase
                 }
 
                 // 2. Check if affected by modifications (with bitmap skip)
@@ -458,7 +458,7 @@ public:
             .cache = *this
         };
 
-        size_t removed = cache_.full_cleanup(ctx,
+        size_t erased = cache_.full_cleanup(ctx,
             [](const CacheKey&, const ResultPtr& result, const MetadataPtr& meta,
                const CleanupContext& ctx) {
                 if (meta->cachedAt() < ctx.expiration_limit) {
@@ -481,7 +481,7 @@ public:
         // All shards processed — drain modifications that existed before cleanup
         modifications_.drain(now);
 
-        return removed;
+        return erased;
     }
 
     // =========================================================================

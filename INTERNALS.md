@@ -232,7 +232,7 @@ static EntityPtr getFromCache(const Key& key) {
 
 ### Cleanup with Context
 
-Cleanup uses a context object and callback to determine which entries to remove:
+Cleanup uses a context object and callback to determine which entries to erase:
 
 ```cpp
 struct CleanupContext {
@@ -244,7 +244,7 @@ static bool triggerCleanup() {
     return cache().try_cleanup(ctx, [](const Key&, const EntityPtr&,
                                         const EntityCacheMetadata& meta,
                                         const CleanupContext& ctx) {
-        return meta.expiration_date < ctx.now;  // true = remove
+        return meta.expiration_date < ctx.now;  // true = erase
     });
 }
 ```
@@ -284,31 +284,31 @@ L2 Cache Hit? --yes--> Deserialize --> Store in L1 --> Return
 Database Query --> Store in L2 --> Store in L1 --> Return
 ```
 
-### Delete: `remove(id)`
+### Delete: `erase(id)`
 
 For standard repositories:
 ```
-CachedRepo::remove(id)
+CachedRepo::erase(id)
     |-- invalidateL1Internal(id)
     v
-RedisRepo::remove(id)
-    |-- co_await BaseRepo::remove(id)  -> deleteByPrimaryKey(id)
+RedisRepo::erase(id)
+    |-- co_await BaseRepo::erase(id)  -> deleteByPrimaryKey(id)
     |-- co_await invalidateRedisInternal(id)
 ```
 
-For PartialKey repositories, `remove` uses an **opportunistic hint** pattern — cache layers pass any already-available entity to the base layer to enable full PK deletion (partition pruning):
+For PartialKey repositories, `erase` uses an **opportunistic hint** pattern — cache layers pass any already-available entity to the base layer to enable full PK deletion (partition pruning):
 
 ```
-CachedRepo::remove(id)
+CachedRepo::erase(id)
     |-- hint = getFromCache(id)         // Free L1 check (~0ns)
     |
     v
-RedisRepo::removeImpl(id, hint)
+RedisRepo::eraseImpl(id, hint)
     |-- if (!hint && PartialKey):
     |     hint = co_await getFromCache(redisKey)  // L2 check (~0.1-1ms)
     |
     v
-BaseRepo::removeImpl(id, hint)
+BaseRepo::eraseImpl(id, hint)
     |-- if (hint):
     |     params = Entity::makeFullKeyParams(*hint)
     |     DELETE ... WHERE id=$1 AND region=$2     // Full composite PK -> 1 partition
@@ -423,7 +423,7 @@ struct Traits {
 
 ### CRUD Interception
 
-`ListMixin` intercepts `insert()`, `update()`, `remove()`, and `patch()` to notify the list cache of entity changes:
+`ListMixin` intercepts `insert()`, `update()`, `erase()`, and `patch()` to notify the list cache of entity changes:
 
 ```cpp
 static io::Task<bool> update(const Key& id, WrapperPtrType wrapper) {
@@ -503,7 +503,7 @@ cache::InvalidateListVia<ListRepo, &Entity::key, &Resolver::resolve> // table ->
 
 - `propagateCreate<Entity, InvList>(new_entity)` — called after `insert()`
 - `propagateUpdate<Entity, InvList>(old, new_entity)` — called after `update()`/`patch()`
-- `propagateDelete<Entity, InvList>(old_entity)` — called after `remove()`/`invalidate()`
+- `propagateDelete<Entity, InvList>(old_entity)` — called after `erase()`/`invalidate()`
 
 ### Indirect Invalidation: `InvalidateVia`
 
@@ -764,7 +764,7 @@ Modifications are retained until all cache segments have been processed:
 
 1. **On modification**: Add with `cleanup_count = 0`
 2. **On each cleanup**: Increment `cleanup_count` for all modifications
-3. **Remove when**: `cleanup_count >= num_segments + 1`
+3. **Erase when**: `cleanup_count >= num_segments + 1`
 
 This guarantees every cache segment has had the opportunity to validate against each modification.
 
@@ -1018,7 +1018,7 @@ PartialKey is auto-detected at compile time via the `HasPartitionKey` concept, w
 | `find` | `SELECT ... WHERE id = $1` | Same (id is unique across partitions) |
 | `update` | `UPDATE ... WHERE id = $1` | Same |
 | `patch` | `UPDATE ... SET cols WHERE id = $N RETURNING *` | Same |
-| `remove` | `DELETE ... WHERE id = $1` | Opportunistic: `DELETE ... WHERE id=$1 AND region=$2` if entity in L1/L2, else `DELETE ... WHERE id=$1` |
+| `erase` | `DELETE ... WHERE id = $1` | Opportunistic: `DELETE ... WHERE id=$1 AND region=$2` if entity in L1/L2, else `DELETE ... WHERE id=$1` |
 | `insert` | Standard | Standard |
 
 ## Namespace Organization

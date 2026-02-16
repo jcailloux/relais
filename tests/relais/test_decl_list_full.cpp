@@ -194,7 +194,7 @@ TEST_CASE("[DeclList L1+L2] Cascade invalidation",
         REQUIRE(r1->size() == 2);
 
         // Delete via repo
-        sync(FullCacheArticleListRepo::remove(articleId));
+        sync(FullCacheArticleListRepo::erase(articleId));
 
         // List should show only the remaining article
         auto r2 = sync(FullCacheArticleListRepo::query(

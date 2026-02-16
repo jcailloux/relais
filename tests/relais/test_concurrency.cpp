@@ -15,7 +15,7 @@
  * Covers:
  *   1. Concurrent find (L1, L2, L1+L2)
  *   2. Concurrent read + write on same entity
- *   3. Concurrent insert + remove
+ *   3. Concurrent insert + erase
  *   4. Concurrent cross-invalidation
  *   5. Concurrent list queries + entity modifications
  *   6. Concurrent warmup + operations
@@ -217,16 +217,16 @@ TEST_CASE("Concurrency - concurrent read + write",
 
 // #############################################################################
 //
-//  3. Concurrent insert + remove
+//  3. Concurrent insert + erase
 //
 // #############################################################################
 
-TEST_CASE("Concurrency - concurrent insert + remove",
-          "[integration][db][concurrency][insert-remove]")
+TEST_CASE("Concurrency - concurrent insert + erase",
+          "[integration][db][concurrency][insert-erase]")
 {
     TransactionGuard tx;
 
-    SECTION("[L1] threads insert and remove entities concurrently") {
+    SECTION("[L1] threads insert and erase entities concurrently") {
         std::atomic<int> created_count{0};
 
         parallel(NUM_THREADS, [&](int i) {
@@ -237,7 +237,7 @@ TEST_CASE("Concurrency - concurrent insert + remove",
                 auto item = sync(L1TestItemRepo::insert(entity));
                 if (item) {
                     created_count.fetch_add(1, std::memory_order_relaxed);
-                    sync(L1TestItemRepo::remove(item->id));
+                    sync(L1TestItemRepo::erase(item->id));
                 }
             }
         });
@@ -245,7 +245,7 @@ TEST_CASE("Concurrency - concurrent insert + remove",
         REQUIRE(created_count.load() > 0);
     }
 
-    SECTION("[L1+L2] threads insert and remove entities concurrently") {
+    SECTION("[L1+L2] threads insert and erase entities concurrently") {
         std::atomic<int> created_count{0};
 
         parallel(NUM_THREADS, [&](int i) {
@@ -256,7 +256,7 @@ TEST_CASE("Concurrency - concurrent insert + remove",
                 auto item = sync(FullCacheTestItemRepo::insert(entity));
                 if (item) {
                     created_count.fetch_add(1, std::memory_order_relaxed);
-                    sync(FullCacheTestItemRepo::remove(item->id));
+                    sync(FullCacheTestItemRepo::erase(item->id));
                 }
             }
         });
@@ -292,7 +292,7 @@ TEST_CASE("Concurrency - concurrent cross-invalidation",
                         userId, "Widget_" + std::to_string(i * 100 + j), 10 + j);
                     auto created = sync(L1TestPurchaseRepo::insert(purchase));
                     if (created) {
-                        sync(L1TestPurchaseRepo::remove(created->id));
+                        sync(L1TestPurchaseRepo::erase(created->id));
                     }
                 }
             }
@@ -483,7 +483,7 @@ TEST_CASE("Concurrency - mixed operations storm",
                 sync(L1TestItemRepo::find(id));
 
                 // Delete
-                sync(L1TestItemRepo::remove(id));
+                sync(L1TestItemRepo::erase(id));
 
                 // Read after delete -> should be nullptr
                 auto gone = sync(L1TestItemRepo::find(id));
@@ -604,7 +604,7 @@ TEST_CASE("Concurrency - list CRUD + list cache cleanup",
     TransactionGuard tx;
     TestInternals::resetListCacheState<TestArticleListRepo>();
 
-    SECTION("[L1] concurrent insert/update/remove/query with triggerCleanup") {
+    SECTION("[L1] concurrent insert/update/erase/query with triggerCleanup") {
         auto userId = insertTestUser("conc_lc_author", "conc_lc@test.com", 0);
 
         // Seed articles
@@ -659,13 +659,13 @@ TEST_CASE("Concurrency - list CRUD + list cache cleanup",
                             static_cast<int32_t>(rng() % 1000), false, id);
                         sync(TestArticleListRepo::update(id, article));
                     } else {
-                        // Remove (pick random existing)
+                        // Erase (pick random existing)
                         int64_t id;
                         {
                             std::lock_guard lock(ids_mutex);
                             id = ids[rng() % ids.size()];
                         }
-                        sync(TestArticleListRepo::remove(id));
+                        sync(TestArticleListRepo::erase(id));
                     }
                 }
             }

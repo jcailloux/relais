@@ -21,7 +21,7 @@
  *   [find]      — read by primary key with caching
  *   [insert]        — insert with L1 cache population
  *   [update]        — modify with L1 invalidation/population
- *   [remove]        — delete with L1 invalidation
+ *   [erase]        — delete with L1 invalidation
  *   [invalidate]    — explicit cache invalidation
  *   [ttl]           — TTL expiration behavior
  *   [refresh]       — TTL refresh on get
@@ -397,19 +397,19 @@ TEST_CASE("CachedRepo<TestItem> - update",
     }
 }
 
-TEST_CASE("CachedRepo<TestItem> - remove",
+TEST_CASE("CachedRepo<TestItem> - erase",
           "[integration][db][cached][item]")
 {
     TransactionGuard tx;
 
-    SECTION("[remove] invalidates L1 cache") {
+    SECTION("[erase] invalidates L1 cache") {
         auto id = insertTestItem("ToDelete", 1);
 
         // Populate L1 cache
         sync(L1TestItemRepo::find(id));
 
-        // Remove through repo
-        auto result = sync(L1TestItemRepo::remove(id));
+        // erase through repo
+        auto result = sync(L1TestItemRepo::erase(id));
         REQUIRE(result.has_value());
         CHECK(*result == 1);
 
@@ -418,8 +418,8 @@ TEST_CASE("CachedRepo<TestItem> - remove",
         CHECK(gone == nullptr);
     }
 
-    SECTION("[remove] returns 0 for non-existent id") {
-        auto result = sync(L1TestItemRepo::remove(999999));
+    SECTION("[erase] returns 0 for non-existent id") {
+        auto result = sync(L1TestItemRepo::erase(999999));
         REQUIRE(result.has_value());
         CHECK(*result == 0);
     }
@@ -589,7 +589,7 @@ TEST_CASE("CachedRepo - FewShards config",
 {
     TransactionGuard tx;
 
-    SECTION("[cleanup] full cleanup only removes expired entries") {
+    SECTION("[cleanup] full cleanup only erases expired entries") {
         auto id1 = insertTestItem("Seg1", 1);
         auto id2 = insertTestItem("Seg2", 2);
         auto id3 = insertTestItem("Seg3", 3);
@@ -601,9 +601,9 @@ TEST_CASE("CachedRepo - FewShards config",
         auto sizeBefore = getCacheSize<FewShardsTestItemRepo>();
         CHECK(sizeBefore >= 3);
 
-        // Full cleanup: non-expired entries are NOT removed
-        auto removed = FewShardsTestItemRepo::fullCleanup();
-        CHECK(removed == 0);
+        // Full cleanup: non-expired entries are NOT erased
+        auto erased = FewShardsTestItemRepo::fullCleanup();
+        CHECK(erased == 0);
         CHECK(getCacheSize<FewShardsTestItemRepo>() == sizeBefore);
     }
 
@@ -682,7 +682,7 @@ TEST_CASE("CachedRepo - cross-invalidation Purchase → User",
         sync(L1InvTestUserRepo::find(userId));
         updateTestUserBalance(userId, 200);
 
-        sync(L1InvTestPurchaseRepo::remove(purchaseId));
+        sync(L1InvTestPurchaseRepo::erase(purchaseId));
 
         auto user = sync(L1InvTestUserRepo::find(userId));
         REQUIRE(user != nullptr);
@@ -858,7 +858,7 @@ TEST_CASE("CachedRepo - entity to ListDescriptor cross-invalidation",
         CHECK(count2 == 3);  // A + B + "To Delete"
 
         // Delete through repo → triggers ListDescriptor invalidation
-        sync(L1ListInvPurchaseRepo::remove(created->id));
+        sync(L1ListInvPurchaseRepo::erase(created->id));
 
         auto result3 = sync(TestPurchaseListRepo::query(query));
         CHECK(result3->size() == 2);  // A + B
@@ -1177,7 +1177,7 @@ TEST_CASE("CachedRepo - read-only",
         REQUIRE(result == nullptr);
     }
 
-    // Note: insert(), update(), remove() are compile-time errors on read-only repos.
+    // Note: insert(), update(), erase() are compile-time errors on read-only repos.
     // They use `requires (!Cfg.read_only)` and will not compile if called.
 }
 
@@ -1233,7 +1233,7 @@ TEST_CASE("CachedRepo - read-only as cross-invalidation target",
         REQUIRE(sync(ReadOnlyL1TestUserRepo::find(userId))->balance == 2000);
 
         // Delete purchase → triggers read-only user invalidation
-        sync(L1ReadOnlyInvPurchaseRepo::remove(created->id));
+        sync(L1ReadOnlyInvPurchaseRepo::erase(created->id));
 
         auto user = sync(ReadOnlyL1TestUserRepo::find(userId));
         REQUIRE(user->balance == 1);

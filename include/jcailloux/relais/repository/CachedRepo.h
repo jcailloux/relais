@@ -197,12 +197,12 @@ public:
         co_return co_await Base::patch(id, std::forward<Updates>(updates)...);
     }
 
-    /// Remove entity by ID.
+    /// Erase entity by ID.
     /// Returns: rows deleted (0 if not found), or nullopt on DB error.
     /// Invalidates L1 cache unless DB error occurred (self-healing).
     /// For CompositeKey entities, provides L1 cache hint for partition pruning.
     /// Compile-time error if Cfg.read_only is true.
-    static io::Task<std::optional<size_t>> remove(const Key& id)
+    static io::Task<std::optional<size_t>> erase(const Key& id)
         requires (!Cfg.read_only)
     {
         // Provide L1 hint for partition pruning (free: ~0ns RAM lookup)
@@ -211,7 +211,7 @@ public:
             hint = getFromCache(id);
         }
 
-        auto result = co_await Base::removeImpl(id, std::move(hint));
+        auto result = co_await Base::eraseImpl(id, std::move(hint));
         if (result.has_value()) {
             invalidateL1Internal(id);
         }

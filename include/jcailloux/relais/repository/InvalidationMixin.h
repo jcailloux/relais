@@ -16,7 +16,7 @@ concept HasListMixin = requires { typename T::ListDescriptorType; };
  * Optional mixin layer for cross-repository cache invalidation.
  *
  * Activated when the Repo has variadic Invalidations... (non-empty).
- * Sits at the top of the mixin chain and intercepts insert/update/remove
+ * Sits at the top of the mixin chain and intercepts insert/update/erase
  * to propagate invalidations to dependent caches.
  *
  * Chain: InvalidationMixin -> [ListMixin] -> CachedRepo -> [RedisRepo] -> BaseRepo
@@ -75,18 +75,18 @@ public:
         co_return ok;
     }
 
-    /// Remove entity and propagate cross-invalidation with deleted data.
+    /// Erase entity and propagate cross-invalidation with deleted data.
     /// When Base is ListMixin, reuses the pre-fetched entity via WithContext.
-    static io::Task<std::optional<size_t>> remove(const Key& id)
+    static io::Task<std::optional<size_t>> erase(const Key& id)
         requires (!Base::config.read_only)
     {
         auto entity = co_await Base::find(id);
 
         std::optional<size_t> result;
         if constexpr (detail::HasListMixin<Base>) {
-            result = co_await Base::removeWithContext(id, entity);
+            result = co_await Base::eraseWithContext(id, entity);
         } else {
-            result = co_await Base::remove(id);
+            result = co_await Base::erase(id);
         }
 
         if (result.has_value() && entity) {

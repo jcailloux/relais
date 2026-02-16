@@ -182,24 +182,24 @@ public:
     }
 
     // =====================================================================
-    // Remove
+    // Erase
     // =====================================================================
 
-    /// Remove entity by ID.
+    /// Erase entity by ID.
     /// Returns: rows deleted (0 if not found), or nullopt on DB error.
-    static io::Task<std::optional<size_t>> remove(const Key& id)
+    static io::Task<std::optional<size_t>> erase(const Key& id)
         requires (!Cfg.read_only)
     {
-        co_return co_await removeImpl(id, nullptr);
+        co_return co_await eraseImpl(id, nullptr);
     }
 
 protected:
-    /// Internal remove with optional entity hint (used by cache layers for
+    /// Internal erase with optional entity hint (used by cache layers for
     /// partition pruning optimization on composite-key entities).
     /// When a hint is available AND the entity has a composite key, uses the
     /// full PK SQL for single-partition deletion. Otherwise falls back to
     /// partial key SQL (scans all partitions — acceptable).
-    static io::Task<std::optional<size_t>> removeImpl(
+    static io::Task<std::optional<size_t>> eraseImpl(
         const Key& id, WrapperPtrType cachedHint = nullptr)
         requires (!Cfg.read_only)
     {
@@ -222,7 +222,7 @@ protected:
             }
             co_return static_cast<size_t>(affected);
         } catch (const io::PgError& e) {
-            RELAIS_LOG_ERROR << name() << ": remove error - " << e.what();
+            RELAIS_LOG_ERROR << name() << ": erase error - " << e.what();
             co_return std::nullopt;
         }
     }

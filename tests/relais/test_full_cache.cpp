@@ -209,13 +209,13 @@ TEST_CASE("FullCache<TestItem> - cascade invalidation",
         REQUIRE(item->value == 20);
     }
 
-    SECTION("[remove] invalidates both L1 and L2") {
-        auto id = insertTestItem("to_remove", 10);
+    SECTION("[erase] invalidates both L1 and L2") {
+        auto id = insertTestItem("to_erase", 10);
 
         // Populate caches
         sync(FullCacheTestItemRepo::find(id));
 
-        sync(FullCacheTestItemRepo::remove(id));
+        sync(FullCacheTestItemRepo::erase(id));
 
         auto item = sync(FullCacheTestItemRepo::find(id));
         REQUIRE(item == nullptr);

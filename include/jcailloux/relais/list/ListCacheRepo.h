@@ -192,7 +192,7 @@ protected:
 #define LISTCACHE_NOTIFY_UPDATED(old_ptr, new_ptr) \
     ListMixin::notifyUpdated((old_ptr), (new_ptr))
 
-/// Convenience macro for notifying deletion in a repository remove() method
+/// Convenience macro for notifying deletion in a repository erase() method
 #define LISTCACHE_NOTIFY_DELETED(entity_ptr) \
     ListMixin::notifyDeleted((entity_ptr))
 

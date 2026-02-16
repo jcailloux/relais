@@ -134,7 +134,7 @@ using PurchaseRepo = relais::Repo<
 - `insert(wrapper)` — `Task<WrapperPtr>` (requires `!read_only`)
 - `update(id, wrapper)` — `Task<bool>` (requires `!read_only`)
 - `patch(id, set<F>(v)...)` — `Task<WrapperPtr>` (requires `HasFieldUpdate`)
-- `remove(id)` — `Task<optional<size_t>>` (requires `!read_only`)
+- `erase(id)` — `Task<optional<size_t>>` (requires `!read_only`)
 - `invalidate(id)` — `Task<void>`
 
 If the entity has an embedded `ListDescriptor` (from `filterable`/`sortable` annotations), the repository also provides:
@@ -172,16 +172,16 @@ The generator produces:
 - `SQL::delete_by_full_pk`: `DELETE ... WHERE id = $1 AND region = $2` (single partition)
 - `makeFullKeyParams(entity)`: extracts `(id, region)` as `PgParams`
 
-The `HasPartitionKey` concept auto-detects these capabilities. At runtime, `remove(id)` uses an **opportunistic hint** pattern:
+The `HasPartitionKey` concept auto-detects these capabilities. At runtime, `erase(id)` uses an **opportunistic hint** pattern:
 
 ```
-CachedRepo::remove(id)
+CachedRepo::erase(id)
   |-- hint = L1 cache lookup (~0ns, free)
   v
-RedisRepo::removeImpl(id, hint)
+RedisRepo::eraseImpl(id, hint)
   |-- if no hint: try L2 Redis (~0.1ms)
   v
-BaseRepo::removeImpl(id, hint)
+BaseRepo::eraseImpl(id, hint)
   |-- if hint: DELETE ... WHERE id=$1 AND region=$2  → 1 partition
   |-- else:    DELETE ... WHERE id=$1                → N partitions
 ```
@@ -227,7 +227,7 @@ io::Task<void> example() {
     // updated is a re-fetched WrapperPtr with all fields populated
 
     // Delete - only if !read_only
-    co_await UserRepo::remove(created->id);
+    co_await UserRepo::erase(created->id);
 
     // Explicit invalidation (propagates to dependent caches)
     co_await UserRepo::invalidate(456);
@@ -344,7 +344,7 @@ Mark repositories as read-only to disable modification operations at compile-tim
 using AuditLogRepo = Repo<AuditLogWrapper, "AuditLog",
     config::Local.with_read_only()>;
 // find() — available
-// insert(), update(), remove() — COMPILE ERROR if called
+// insert(), update(), erase() — COMPILE ERROR if called
 ```
 
 This is enforced via `requires` clauses:
@@ -397,7 +397,7 @@ auto updated = co_await EventRepo::patch(eventId,
 
 ## Cross-Invalidation System
 
-Cross-invalidation is declared via the variadic `Invalidations...` pack on `Repo`. The `InvalidationMixin` sits at the top of the mixin chain and intercepts insert/update/remove to propagate invalidations to dependent caches.
+Cross-invalidation is declared via the variadic `Invalidations...` pack on `Repo`. The `InvalidationMixin` sits at the top of the mixin chain and intercepts insert/update/erase to propagate invalidations to dependent caches.
 
 ### Declaring Dependencies
 
@@ -484,7 +484,7 @@ Each cached list page in Redis is prefixed with a 19-byte binary header containi
 
 ### Propagation Behavior
 
-**Modification operations** (`insert`, `update`, `remove`):
+**Modification operations** (`insert`, `update`, `erase`):
 - Fetch old value before operation (for updates/deletes)
 - Perform the database operation
 - Propagate to dependent caches with old/new entity data
@@ -555,7 +555,7 @@ io::Task<std::string> handleAuditLogList(
 
 ### CRUD-to-List Notification
 
-ListMixin intercepts `insert()`, `update()`, `remove()`, and `patch()` to automatically notify the list cache of entity changes. The ModificationTracker records these changes, and list cache entries are validated lazily on the next `query()` call.
+ListMixin intercepts `insert()`, `update()`, `erase()`, and `patch()` to automatically notify the list cache of entity changes. The ModificationTracker records these changes, and list cache entries are validated lazily on the next `query()` call.
 
 No manual `notifyCreated`/`notifyUpdated`/`notifyDeleted` calls are needed for same-repo entities.
 
@@ -689,7 +689,7 @@ python scripts/generate_entities.py --files src/entities/User.h --output-dir src
 | `insert(wrapper)` | `Task<WrapperPtr>` | `!read_only` | Insert and cache |
 | `update(id, wrapper)` | `Task<bool>` | `!read_only` | Full update and handle cache |
 | `patch(id, set<F>()...)` | `Task<WrapperPtr>` | `!read_only`, `HasFieldUpdate` | Partial update, re-fetches entity |
-| `remove(id)` | `Task<optional<size_t>>` | `!read_only` | Delete and invalidate cache |
+| `erase(id)` | `Task<optional<size_t>>` | `!read_only` | Delete and invalidate cache |
 | `invalidate(id)` | `Task<void>` | - | Explicit cache invalidation |
 | `updateFromJson(id, json)` | `Task<bool>` | `!read_only` | Parse JSON and update |
 | `updateFromBinary(id, data)` | `Task<bool>` | `!read_only`, `HasBinarySerialization` | Parse binary and update |
@@ -716,7 +716,7 @@ python scripts/generate_entities.py --files src/entities/User.h --output-dir src
 
 ### InvalidationMixin (auto-activated)
 
-When `Invalidations...` is non-empty, the mixin intercepts `insert()`, `update()`, `remove()`, `patch()`, and `invalidate()` to propagate cross-invalidation. No additional API — it wraps the existing methods transparently.
+When `Invalidations...` is non-empty, the mixin intercepts `insert()`, `update()`, `erase()`, `patch()`, and `invalidate()` to propagate cross-invalidation. No additional API — it wraps the existing methods transparently.
 
 ## Testing
 
@@ -736,7 +736,7 @@ ctest --test-dir build --output-on-failure
 | `test_redis_repository.cpp` | RedisRepo (L2): CRUD caching, cross-invalidation, list caching, selective Lua invalidation, InvalidateListVia |
 | `test_cached_repository.cpp` | CachedRepo (L1+L2): RAM cache, TTL, config variants |
 | `test_decl_list_cache.cpp` | ListMixin: query/ItemView, SortBounds invalidation, ModificationTracker |
-| `test_partial_key.cpp` | PartialKey repositories: composite PK, criteria-based patch, remove with cache hints, cross-invalidation |
+| `test_partial_key.cpp` | PartialKey repositories: composite PK, criteria-based patch, erase with cache hints, cross-invalidation |
 
 ### Running specific test tags
 

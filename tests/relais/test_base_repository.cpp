@@ -13,7 +13,7 @@
  *   [find]     — read by primary key
  *   [insert]       — insert new entity
  *   [update]       — modify existing entity
- *   [remove]       — delete entity
+ *   [erase]       — delete entity
  *   [edge]         — edge cases (nulls, special chars, boundaries)
  *   [multi]        — multiple entities coexistence
  *   [json]         — JSON serialization round-trip
@@ -145,35 +145,35 @@ TEST_CASE("BaseRepo<TestItem> - update", "[integration][db][base][item]") {
     }
 }
 
-TEST_CASE("BaseRepo<TestItem> - remove", "[integration][db][base][item]") {
+TEST_CASE("BaseRepo<TestItem> - erase", "[integration][db][base][item]") {
     TransactionGuard tx;
 
-    SECTION("[remove] deletes existing entity") {
+    SECTION("[erase] deletes existing entity") {
         auto id = insertTestItem("To Delete", 0);
 
         auto before = sync(UncachedTestItemRepo::find(id));
         REQUIRE(before != nullptr);
 
-        auto removed = sync(UncachedTestItemRepo::remove(id));
-        REQUIRE(removed.has_value());
-        REQUIRE(*removed == 1);
+        auto erased = sync(UncachedTestItemRepo::erase(id));
+        REQUIRE(erased.has_value());
+        REQUIRE(*erased == 1);
 
         auto after = sync(UncachedTestItemRepo::find(id));
         REQUIRE(after == nullptr);
     }
 
-    SECTION("[remove] returns 0 rows for non-existent id") {
-        auto removed = sync(UncachedTestItemRepo::remove(999999999));
-        REQUIRE(removed.has_value());
-        REQUIRE(*removed == 0);
+    SECTION("[erase] returns 0 rows for non-existent id") {
+        auto erased = sync(UncachedTestItemRepo::erase(999999999));
+        REQUIRE(erased.has_value());
+        REQUIRE(*erased == 0);
     }
 
-    SECTION("[remove] does not affect other entities") {
+    SECTION("[erase] does not affect other entities") {
         auto id1 = insertTestItem("Keep", 1);
         auto id2 = insertTestItem("Delete", 2);
         auto id3 = insertTestItem("Keep Too", 3);
 
-        sync(UncachedTestItemRepo::remove(id2));
+        sync(UncachedTestItemRepo::erase(id2));
 
         REQUIRE(sync(UncachedTestItemRepo::find(id1)) != nullptr);
         REQUIRE(sync(UncachedTestItemRepo::find(id2)) == nullptr);
@@ -342,15 +342,15 @@ TEST_CASE("BaseRepo<TestUser> - update", "[integration][db][base][user]") {
     }
 }
 
-TEST_CASE("BaseRepo<TestUser> - remove", "[integration][db][base][user]") {
+TEST_CASE("BaseRepo<TestUser> - erase", "[integration][db][base][user]") {
     TransactionGuard tx;
 
-    SECTION("[remove] deletes existing user") {
+    SECTION("[erase] deletes existing user") {
         auto id = insertTestUser("todelete", "del@example.com", 0);
 
-        auto removed = sync(UncachedTestUserRepo::remove(id));
-        REQUIRE(removed.has_value());
-        REQUIRE(*removed == 1);
+        auto erased = sync(UncachedTestUserRepo::erase(id));
+        REQUIRE(erased.has_value());
+        REQUIRE(*erased == 1);
 
         REQUIRE(sync(UncachedTestUserRepo::find(id)) == nullptr);
     }
@@ -437,16 +437,16 @@ TEST_CASE("BaseRepo<TestPurchase> - update", "[integration][db][base][purchase]"
     }
 }
 
-TEST_CASE("BaseRepo<TestPurchase> - remove", "[integration][db][base][purchase]") {
+TEST_CASE("BaseRepo<TestPurchase> - erase", "[integration][db][base][purchase]") {
     TransactionGuard tx;
 
-    SECTION("[remove] deletes purchase without affecting parent user") {
+    SECTION("[erase] deletes purchase without affecting parent user") {
         auto userId = insertTestUser("buyer", "buyer@example.com", 1000);
         auto purchaseId = insertTestPurchase(userId, "Widget", 100);
 
-        auto removed = sync(UncachedTestPurchaseRepo::remove(purchaseId));
-        REQUIRE(removed.has_value());
-        REQUIRE(*removed == 1);
+        auto erased = sync(UncachedTestPurchaseRepo::erase(purchaseId));
+        REQUIRE(erased.has_value());
+        REQUIRE(*erased == 1);
 
         REQUIRE(sync(UncachedTestPurchaseRepo::find(purchaseId)) == nullptr);
         REQUIRE(sync(UncachedTestUserRepo::find(userId)) != nullptr);
@@ -485,7 +485,7 @@ TEST_CASE("BaseRepo<TestPurchase> - multiple purchases per user", "[integration]
         auto p2 = insertTestPurchase(userId, "Delete B", 200);
         auto p3 = insertTestPurchase(userId, "Keep C", 300);
 
-        sync(UncachedTestPurchaseRepo::remove(p2));
+        sync(UncachedTestPurchaseRepo::erase(p2));
 
         REQUIRE(sync(UncachedTestPurchaseRepo::find(p1)) != nullptr);
         REQUIRE(sync(UncachedTestPurchaseRepo::find(p2)) == nullptr);
@@ -709,37 +709,37 @@ TEST_CASE("BaseRepo<TestArticle> - update", "[integration][db][base][article]") 
     }
 }
 
-TEST_CASE("BaseRepo<TestArticle> - remove", "[integration][db][base][article]") {
+TEST_CASE("BaseRepo<TestArticle> - erase", "[integration][db][base][article]") {
     TransactionGuard tx;
 
-    SECTION("[remove] deletes existing article") {
+    SECTION("[erase] deletes existing article") {
         auto userId = insertTestUser("author", "author@example.com", 0);
         auto id = insertTestArticle("tech", userId, "To Delete", 0);
 
-        auto removed = sync(UncachedTestArticleRepo::remove(id));
-        REQUIRE(removed.has_value());
-        REQUIRE(*removed == 1);
+        auto erased = sync(UncachedTestArticleRepo::erase(id));
+        REQUIRE(erased.has_value());
+        REQUIRE(*erased == 1);
 
         REQUIRE(sync(UncachedTestArticleRepo::find(id)) == nullptr);
     }
 
-    SECTION("[remove] does not affect parent user") {
+    SECTION("[erase] does not affect parent user") {
         auto userId = insertTestUser("author", "author@example.com", 100);
         auto articleId = insertTestArticle("tech", userId, "Article", 0);
 
-        sync(UncachedTestArticleRepo::remove(articleId));
+        sync(UncachedTestArticleRepo::erase(articleId));
 
         REQUIRE(sync(UncachedTestArticleRepo::find(articleId)) == nullptr);
         REQUIRE(sync(UncachedTestUserRepo::find(userId)) != nullptr);
     }
 
-    SECTION("[remove] does not affect other articles") {
+    SECTION("[erase] does not affect other articles") {
         auto userId = insertTestUser("author", "author@example.com", 0);
         auto id1 = insertTestArticle("tech", userId, "Keep A", 0);
         auto id2 = insertTestArticle("tech", userId, "Delete B", 0);
         auto id3 = insertTestArticle("news", userId, "Keep C", 0);
 
-        sync(UncachedTestArticleRepo::remove(id2));
+        sync(UncachedTestArticleRepo::erase(id2));
 
         REQUIRE(sync(UncachedTestArticleRepo::find(id1)) != nullptr);
         REQUIRE(sync(UncachedTestArticleRepo::find(id2)) == nullptr);
@@ -849,7 +849,7 @@ TEST_CASE("BaseRepo - read-only configuration", "[integration][db][base][readonl
         REQUIRE(result->value == 2);
     }
 
-    // Note: insert(), update(), remove() are compile-time errors on read-only repos.
+    // Note: insert(), update(), erase() are compile-time errors on read-only repos.
     // They use `requires (!Cfg.read_only)` and will not compile if called.
     // This is verified by the static_assert above.
 }

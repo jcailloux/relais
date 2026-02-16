@@ -24,7 +24,7 @@
  *   [find]      — read by primary key with caching
  *   [insert]        — insert with L2 cache population
  *   [update]        — modify with L2 invalidation/population
- *   [remove]        — delete with L2 invalidation
+ *   [erase]        — delete with L2 invalidation
  *   [patch]      — partial field update
  *   [json]          — JSON string access path
  *   [invalidate]    — explicit cache invalidation
@@ -460,29 +460,29 @@ TEST_CASE("RedisRepo<TestItem> - update", "[integration][db][redis][item]") {
     }
 }
 
-TEST_CASE("RedisRepo<TestItem> - remove", "[integration][db][redis][item]") {
+TEST_CASE("RedisRepo<TestItem> - erase", "[integration][db][redis][item]") {
     TransactionGuard tx;
 
-    SECTION("[remove] invalidates Redis cache") {
-        auto id = insertTestItem("To Remove", 0);
+    SECTION("[erase] invalidates Redis cache") {
+        auto id = insertTestItem("To erase", 0);
 
         // Populate cache
         sync(L2TestItemRepo::find(id));
 
-        // Remove through repository
-        auto removed = sync(L2TestItemRepo::remove(id));
-        REQUIRE(removed.has_value());
-        REQUIRE(*removed == 1);
+        // Erase through repository
+        auto erased = sync(L2TestItemRepo::erase(id));
+        REQUIRE(erased.has_value());
+        REQUIRE(*erased == 1);
 
         // Should return nullptr (not from cache)
         auto result = sync(L2TestItemRepo::find(id));
         REQUIRE(result == nullptr);
     }
 
-    SECTION("[remove] returns 0 for non-existent id") {
-        auto removed = sync(L2TestItemRepo::remove(999999999));
-        REQUIRE(removed.has_value());
-        REQUIRE(*removed == 0);
+    SECTION("[erase] returns 0 for non-existent id") {
+        auto erased = sync(L2TestItemRepo::erase(999999999));
+        REQUIRE(erased.has_value());
+        REQUIRE(*erased == 0);
     }
 }
 
@@ -687,7 +687,7 @@ TEST_CASE("RedisRepo - read-only", "[integration][db][redis][readonly]") {
         REQUIRE(result == nullptr);
     }
 
-    // Note: insert(), update(), remove() are compile-time errors on read-only repos.
+    // Note: insert(), update(), erase() are compile-time errors on read-only repos.
     // They use `requires (!Cfg.read_only)` and will not compile if called.
 }
 
@@ -753,7 +753,7 @@ TEST_CASE("RedisRepo - cross-invalidation Purchase → User", "[integration][db]
         updateTestUserBalance(userId, 200);
 
         // Delete purchase
-        sync(L2TestPurchaseRepo::remove(purchaseId));
+        sync(L2TestPurchaseRepo::erase(purchaseId));
 
         // User cache invalidated
         auto user = sync(L2InvTestUserRepo::find(userId));
@@ -908,7 +908,7 @@ TEST_CASE("RedisRepo - read-only as cross-invalidation target", "[integration][d
         updateTestUserBalance(userId, 1);
 
         // Delete purchase
-        sync(L2ReadOnlyInvPurchaseRepo::remove(purchaseId));
+        sync(L2ReadOnlyInvPurchaseRepo::erase(purchaseId));
 
         auto user = sync(ReadOnlyL2TestUserRepo::find(userId));
         REQUIRE(user->balance == 1);
@@ -1097,7 +1097,7 @@ TEST_CASE("RedisRepo - list cross-invalidation", "[integration][db][redis][list-
         REQUIRE(list1.size() == 2);
 
         // Delete through invalidating repo
-        sync(L2ListInvPurchaseRepo::remove(p2));
+        sync(L2ListInvPurchaseRepo::erase(p2));
 
         // List cache invalidated — only 1 purchase left
         auto list2 = sync(L2TestPurchaseListRepo::getByUserId(userId));
@@ -1922,7 +1922,7 @@ TEST_CASE("RedisRepo - InvalidateListVia enriched resolver",
         sync(L2SelectiveArticleListRepo::getByCategory("tech", 5, 10));
 
         // Delete the purchase — triggers resolver with old entity's user_id
-        auto deleted = sync(L2SelectiveListPurchaseRepo::remove(purchaseId));
+        auto deleted = sync(L2SelectiveListPurchaseRepo::erase(purchaseId));
         REQUIRE(deleted.has_value());
         REQUIRE(*deleted == 1);
 
