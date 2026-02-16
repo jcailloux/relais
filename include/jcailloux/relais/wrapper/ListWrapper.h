@@ -69,8 +69,8 @@ public:
 
     [[nodiscard]] size_t size() const noexcept { return items.size(); }
     [[nodiscard]] bool empty() const noexcept { return items.empty(); }
-    [[nodiscard]] int64_t totalCount() const noexcept { return total_count; }
-    [[nodiscard]] std::string_view nextCursor() const noexcept { return next_cursor; }
+    [[nodiscard]] int64_t count() const noexcept { return total_count; }
+    [[nodiscard]] std::string_view cursor() const noexcept { return next_cursor; }
 
     [[nodiscard]] const Item* firstItem() const noexcept {
         return items.empty() ? nullptr : &items.front();

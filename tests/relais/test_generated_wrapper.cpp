@@ -684,9 +684,9 @@ TEST_CASE("ListWrapper<TestArticle> - construction and accessors", "[wrapper][li
     SECTION("[List] empty list via default constructor") {
         ListWrapperArticle list;
         REQUIRE(list.size() == 0);
-        REQUIRE(list.totalCount() == 0);
+        REQUIRE(list.count() == 0);
         REQUIRE(list.empty());
-        REQUIRE(list.nextCursor().empty());
+        REQUIRE(list.cursor().empty());
     }
 
     // Build articles directly as structs
@@ -713,9 +713,9 @@ TEST_CASE("ListWrapper<TestArticle> - construction and accessors", "[wrapper][li
     std::vector<std::shared_ptr<const TestArticle>> items = {e1, e2};
     auto list = ListWrapperArticle::fromItems(items);
 
-    SECTION("[List] fromItems size and totalCount") {
+    SECTION("[List] fromItems size and count") {
         REQUIRE(list.size() == 2);
-        REQUIRE(list.totalCount() == 2);
+        REQUIRE(list.count() == 2);
         REQUIRE_FALSE(list.empty());
     }
 
@@ -763,7 +763,7 @@ TEST_CASE("ListWrapper<TestArticle> - construction and accessors", "[wrapper][li
 
     SECTION("[List] fromItems with cursor") {
         auto from_items = ListWrapperArticle::fromItems(items, "cursor_abc");
-        REQUIRE(from_items.nextCursor() == "cursor_abc");
+        REQUIRE(from_items.cursor() == "cursor_abc");
     }
 
     SECTION("[List] fromItems preserves nullable present") {
