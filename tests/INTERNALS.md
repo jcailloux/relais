@@ -7,7 +7,7 @@ Technical details about the relais test infrastructure.
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │                         Test Files (.cpp)                           │
-│  test_base_repository.cpp      BaseRepo (no cache) + updateBy │
+│  test_base_repository.cpp      BaseRepo (no cache) + patch │
 │  test_redis_repository.cpp     RedisRepo (L2 cache)           │
 │  test_decl_list_cache.cpp      ListMixin (L1 lists)                  │
 │  test_cached_repository.cpp    CachedRepo (L1 cache)          │
@@ -245,7 +245,7 @@ Comprehensive integration tests for the L2 (Redis) cache layer, organized in 17 
 | 3 | `[item]`                               | `update` — invalidate Redis (lazy reload) |
 | 4 | `[item]`                               | `remove` — invalidate Redis |
 | 5 | `[binary]`                             | Binary (BEVE) serialization in Redis |
-| 6 | `[updateBy]`                           | Partial field updates with Redis invalidation |
+| 6 | `[patch]`                           | Partial field updates with Redis invalidation |
 | 7 | `[json]`                               | `findAsJson` raw JSON retrieval |
 | 8 | `[invalidate]`                         | Explicit `invalidateRedis` + isolation |
 | 9 | `[readonly]`                           | Read-only repository caching |
@@ -379,9 +379,9 @@ Tests for repositories where `Key` differs from `Model::PrimaryKeyType` — typi
 | `L2TestEventRepo` | `EventPartialKeyL2` | L2 |
 | `L1L2TestEventRepo` | `EventPartialKeyBoth` | L1+L2 |
 
-### `updateBy` — Criteria-Based for PartialKey
+### `patch` — Criteria-Based for PartialKey
 
-For PartialKey entities, `updateBy` builds a dynamic SQL query:
+For PartialKey entities, `patch` builds a dynamic SQL query:
 ```sql
 UPDATE table SET "col1"=$1, "col2"=$2 WHERE "id"=$3 RETURNING *
 ```
@@ -417,10 +417,10 @@ CachedRepo::remove(id)
 | 5 | Cross-invalidation: Event as target (Purchase → Event via resolver)     |
 | 6 | PartialKeyValidator runtime checks                                      |
 | 7 | Serialization: JSON + BEVE round-trip                                   |
-| 8a | updateBy Uncached: single/multi field, partition preservation, re-fetch |
-| 8b | updateBy L1: cache invalidation + re-fetch                              |
-| 8c | updateBy L2: Redis invalidation + re-fetch                              |
-| 8d | updateBy cross-invalidation: Event updateBy → User L1                   |
+| 8a | patch Uncached: single/multi field, partition preservation, re-fetch |
+| 8b | patch L1: cache invalidation + re-fetch                              |
+| 8c | patch L2: Redis invalidation + re-fetch                              |
+| 8d | patch cross-invalidation: Event patch → User L1                   |
 | 9a | remove L1 hint: cache hit vs miss paths                                 |
 | 9b | remove L2 hint: Redis hit vs miss paths                                 |
 | 9c | remove L1+L2 chain: L1 hit, L1 miss/L2 hit, both miss                   |

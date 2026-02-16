@@ -230,17 +230,17 @@ protected:
 public:
 
     // =====================================================================
-    // Partial update (updateBy)
+    // Partial update (patch)
     // =====================================================================
 
     /// Partial update: modifies only the specified fields in the database.
     /// Builds UPDATE ... SET col=$1, ... WHERE pk=$N RETURNING * (single query).
     /// Returns the re-fetched entity from DB (nullptr on error or not found).
     template<typename... Updates>
-    static io::Task<WrapperPtrType> updateBy(const Key& id, Updates&&... updates)
+    static io::Task<WrapperPtrType> patch(const Key& id, Updates&&... updates)
         requires HasFieldUpdate<Entity> && (!Cfg.read_only)
     {
-        static_assert(sizeof...(Updates) > 0, "updateBy requires at least one field update");
+        static_assert(sizeof...(Updates) > 0, "patch requires at least one field update");
 
         try {
             // Build SQL at first call (thread-safe static init).
@@ -263,7 +263,7 @@ public:
             co_return entity ? std::make_shared<const Entity>(std::move(*entity)) : nullptr;
 
         } catch (const io::PgError& e) {
-            RELAIS_LOG_ERROR << name() << ": updateBy error - " << e.what();
+            RELAIS_LOG_ERROR << name() << ": patch error - " << e.what();
             co_return nullptr;
         }
     }

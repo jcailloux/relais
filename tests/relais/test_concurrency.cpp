@@ -20,7 +20,7 @@
  *   5. Concurrent list queries + entity modifications
  *   6. Concurrent warmup + operations
  *   7. Mixed operations storm (all operations interleaved)
- *   8. Concurrent updateBy
+ *   8. Concurrent patch
  *   9. Concurrent cleanup + operations (entity cache)
  *  10. Concurrent list CRUD + list cache cleanup
  *  11a. ModificationTracker drains after concurrent storm
@@ -501,26 +501,26 @@ TEST_CASE("Concurrency - mixed operations storm",
 
 // #############################################################################
 //
-//  8. Concurrent updateBy
+//  8. Concurrent patch
 //
 // #############################################################################
 
-TEST_CASE("Concurrency - concurrent updateBy",
-          "[integration][db][concurrency][updateBy]")
+TEST_CASE("Concurrency - concurrent patch",
+          "[integration][db][concurrency][patch]")
 {
     TransactionGuard tx;
 
     using jcailloux::relais::wrapper::set;
     using F = TestUserWrapper::Field;
 
-    SECTION("[L1] concurrent updateBy on same user") {
-        auto userId = insertTestUser("conc_updateby", "conc_ub@test.com", 0);
+    SECTION("[L1] concurrent patch on same user") {
+        auto userId = insertTestUser("conc_patch", "conc_ub@test.com", 0);
         sync(L1TestUserRepo::find(userId));
 
         parallel(NUM_THREADS, [&](int i) {
             for (int j = 0; j < OPS_PER_THREAD / 2; ++j) {
                 auto balance = static_cast<int32_t>(i * 1000 + j);
-                sync(L1TestUserRepo::updateBy(userId,
+                sync(L1TestUserRepo::patch(userId,
                     set<F::balance>(balance)));
             }
         });

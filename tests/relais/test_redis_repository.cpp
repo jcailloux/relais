@@ -6,7 +6,7 @@
  *
  * Progressive complexity:
  *   1. TestItem    — basic CRUD with L2 JSON caching
- *   2. TestUser  — BEVE binary caching, updateBy
+ *   2. TestUser  — BEVE binary caching, patch
  *   3. JSON access — findAsJson raw string path
  *   4. Invalidation— explicit invalidateRedis control
  *   5. Read-only   — compile-time write enforcement at L2
@@ -25,7 +25,7 @@
  *   [insert]        — insert with L2 cache population
  *   [update]        — modify with L2 invalidation/population
  *   [remove]        — delete with L2 invalidation
- *   [updateBy]      — partial field update
+ *   [patch]      — partial field update
  *   [json]          — JSON string access path
  *   [invalidate]    — explicit cache invalidation
  *   [readonly]      — read-only enforcement
@@ -488,7 +488,7 @@ TEST_CASE("RedisRepo<TestItem> - remove", "[integration][db][redis][item]") {
 
 // #############################################################################
 //
-//  2. TestUser — BEVE binary caching, updateBy
+//  2. TestUser — BEVE binary caching, patch
 //
 // #############################################################################
 
@@ -518,17 +518,17 @@ TEST_CASE("RedisRepo<TestUser> - binary caching", "[integration][db][redis][bina
     }
 }
 
-TEST_CASE("RedisRepo<TestUser> - updateBy", "[integration][db][redis][updateBy]") {
+TEST_CASE("RedisRepo<TestUser> - patch", "[integration][db][redis][patch]") {
     TransactionGuard tx;
 
-    SECTION("[updateBy] invalidates Redis then re-fetches") {
+    SECTION("[patch] invalidates Redis then re-fetches") {
         auto id = insertTestUser("bob", "bob@example.com", 500);
 
         // Populate cache
         sync(L2TestUserRepo::find(id));
 
         // Partial update: only change balance
-        auto result = sync(L2TestUserRepo::updateBy(id, set<F::balance>(777)));
+        auto result = sync(L2TestUserRepo::patch(id, set<F::balance>(777)));
 
         REQUIRE(result != nullptr);
         REQUIRE(result->balance == 777);
@@ -541,10 +541,10 @@ TEST_CASE("RedisRepo<TestUser> - updateBy", "[integration][db][redis][updateBy]"
         REQUIRE(fetched->balance == 777);
     }
 
-    SECTION("[updateBy] updates multiple fields") {
+    SECTION("[patch] updates multiple fields") {
         auto id = insertTestUser("carol", "carol@example.com", 200);
 
-        auto result = sync(L2TestUserRepo::updateBy(id,
+        auto result = sync(L2TestUserRepo::patch(id,
             set<F::balance>(0),
             set<F::username>(std::string("caroline"))));
 

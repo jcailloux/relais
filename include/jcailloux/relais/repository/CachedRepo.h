@@ -187,14 +187,14 @@ public:
         co_return success;
     }
 
-    /// Partial update: invalidates L1 then delegates to Base::updateBy.
+    /// Partial update: invalidates L1 then delegates to Base::patch.
     /// Returns the re-fetched entity (nullptr on error or not found).
     template<typename... Updates>
-    static io::Task<WrapperPtrType> updateBy(const Key& id, Updates&&... updates)
+    static io::Task<WrapperPtrType> patch(const Key& id, Updates&&... updates)
         requires HasFieldUpdate<Entity> && (!Cfg.read_only)
     {
         invalidateL1Internal(id);
-        co_return co_await Base::updateBy(id, std::forward<Updates>(updates)...);
+        co_return co_await Base::patch(id, std::forward<Updates>(updates)...);
     }
 
     /// Remove entity by ID.

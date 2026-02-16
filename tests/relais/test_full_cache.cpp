@@ -350,14 +350,14 @@ TEST_CASE("FullCache<TestUser> - binary entity at L1+L2",
         REQUIRE(user->balance == 200);
     }
 
-    SECTION("[binary] updateBy invalidates both layers") {
-        auto id = insertTestUser("updateby_user", "updateby@test.com", 50);
+    SECTION("[binary] patch invalidates both layers") {
+        auto id = insertTestUser("patch_user", "patch@test.com", 50);
 
         // Populate cache
         sync(FullCacheTestUserRepo::find(id));
 
         // Partial update
-        auto updated = sync(FullCacheTestUserRepo::updateBy(id,
+        auto updated = sync(FullCacheTestUserRepo::patch(id,
             set<F::balance>(300)));
         REQUIRE(updated != nullptr);
         REQUIRE(updated->balance == 300);

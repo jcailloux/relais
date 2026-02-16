@@ -12,7 +12,7 @@
  *   5. List-inv    — InvalidateList<> entity → ListDescriptor bridge at L1
  *   6. ListVia     — InvalidateListVia<> with GroupKey (3 granularities)
  *   7. Binary      — binary entity CRUD with L1 caching
- *   8. updateBy    — partial field updates with L1 invalidation
+ *   8. patch    — partial field updates with L1 invalidation
  *   9. JSON        — findAsJson with L1 caching
  *  10. ReadOnly    — read-only repository at L1
  *  11. RO+Inv      — read-only as cross-invalidation target at L1
@@ -34,7 +34,7 @@
  *   [list-resolver] — InvalidateListVia with typed GroupKey
  *   [list-granularity] — per-page, per-group, full pattern dispatch
  *   [binary]    — binary entity caching
- *   [updateBy]      — partial field updates
+ *   [patch]      — partial field updates
  *   [json]          — findAsJson raw JSON retrieval
  *   [readonly]      — read-only repository
  *   [readonly-inv]  — read-only as cross-invalidation target
@@ -1027,14 +1027,14 @@ TEST_CASE("CachedRepo<TestUser> - binary caching",
         REQUIRE(result2->balance == 1000);  // Still cached
     }
 
-    SECTION("[binary] updateBy invalidates L1 binary cache") {
+    SECTION("[binary] patch invalidates L1 binary cache") {
         auto id = insertTestUser("fb_update", "fb_up@example.com", 100);
 
         // Populate cache
         sync(L1TestUserRepo::find(id));
 
         // Partial update through repo → invalidates L1
-        auto result = sync(L1TestUserRepo::updateBy(id, set<F::balance>(200)));
+        auto result = sync(L1TestUserRepo::patch(id, set<F::balance>(200)));
         REQUIRE(result != nullptr);
         REQUIRE(result->balance == 200);
 
@@ -1048,23 +1048,23 @@ TEST_CASE("CachedRepo<TestUser> - binary caching",
 
 // #############################################################################
 //
-//  8. updateBy — partial field updates with L1 invalidation
+//  8. patch — partial field updates with L1 invalidation
 //
 // #############################################################################
 
-TEST_CASE("CachedRepo<TestUser> - updateBy",
-          "[integration][db][cached][updateBy]")
+TEST_CASE("CachedRepo<TestUser> - patch",
+          "[integration][db][cached][patch]")
 {
     TransactionGuard tx;
 
-    SECTION("[updateBy] invalidates L1 then re-fetches") {
+    SECTION("[patch] invalidates L1 then re-fetches") {
         auto id = insertTestUser("bob", "bob@example.com", 500);
 
         // Populate cache
         sync(L1TestUserRepo::find(id));
 
         // Partial update: only change balance
-        auto result = sync(L1TestUserRepo::updateBy(id, set<F::balance>(777)));
+        auto result = sync(L1TestUserRepo::patch(id, set<F::balance>(777)));
 
         REQUIRE(result != nullptr);
         REQUIRE(result->balance == 777);
@@ -1077,10 +1077,10 @@ TEST_CASE("CachedRepo<TestUser> - updateBy",
         REQUIRE(fetched->balance == 777);
     }
 
-    SECTION("[updateBy] updates multiple fields") {
+    SECTION("[patch] updates multiple fields") {
         auto id = insertTestUser("carol", "carol@example.com", 200);
 
-        auto result = sync(L1TestUserRepo::updateBy(id,
+        auto result = sync(L1TestUserRepo::patch(id,
             set<F::balance>(0),
             set<F::username>(std::string("caroline"))));
 

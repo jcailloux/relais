@@ -544,23 +544,23 @@ TEST_CASE("PartialKey - serialization",
 
 // #############################################################################
 //
-//  8. updateBy — criteria-based partial update for PartialKey
+//  8. patch — criteria-based partial update for PartialKey
 //
 // #############################################################################
 
 using jcailloux::relais::wrapper::set;
 using EF = TestEventWrapper::Field;
 
-TEST_CASE("PartialKey<TestEvent> - updateBy (Uncached)",
-          "[integration][db][partial-key][updateBy]")
+TEST_CASE("PartialKey<TestEvent> - patch (Uncached)",
+          "[integration][db][partial-key][patch]")
 {
     TransactionGuard tx;
-    auto userId = insertTestUser("updateby_user", "updateby@test.com", 100);
+    auto userId = insertTestUser("patch_user", "patch@test.com", 100);
 
-    SECTION("[updateBy] updates single field via criteria-based partial update") {
+    SECTION("[patch] updates single field via criteria-based partial update") {
         auto eventId = insertTestEvent("eu", userId, "Original", 1);
 
-        auto result = sync(UncachedTestEventRepo::updateBy(
+        auto result = sync(UncachedTestEventRepo::patch(
             eventId, set<EF::title>(std::string("Updated"))));
 
         REQUIRE(result != nullptr);
@@ -570,10 +570,10 @@ TEST_CASE("PartialKey<TestEvent> - updateBy (Uncached)",
         CHECK(result->user_id == userId);    // Unchanged
     }
 
-    SECTION("[updateBy] updates multiple fields") {
+    SECTION("[patch] updates multiple fields") {
         auto eventId = insertTestEvent("us", userId, "Multi", 3);
 
-        auto result = sync(UncachedTestEventRepo::updateBy(
+        auto result = sync(UncachedTestEventRepo::patch(
             eventId,
             set<EF::title>(std::string("Changed")),
             set<EF::priority>(9)));
@@ -584,10 +584,10 @@ TEST_CASE("PartialKey<TestEvent> - updateBy (Uncached)",
         CHECK(result->region == "us");       // Partition preserved
     }
 
-    SECTION("[updateBy] preserves partition (region) after update") {
+    SECTION("[patch] preserves partition (region) after update") {
         auto eventId = insertTestEvent("eu", userId, "EU Event", 5);
 
-        auto result = sync(UncachedTestEventRepo::updateBy(
+        auto result = sync(UncachedTestEventRepo::patch(
             eventId, set<EF::priority>(99)));
 
         REQUIRE(result != nullptr);
@@ -600,10 +600,10 @@ TEST_CASE("PartialKey<TestEvent> - updateBy (Uncached)",
         CHECK(dbResult[0].get<std::string>(0) == "eu");
     }
 
-    SECTION("[updateBy] returns re-fetched entity with all fields") {
+    SECTION("[patch] returns re-fetched entity with all fields") {
         auto eventId = insertTestEvent("us", userId, "Before", 2);
 
-        auto result = sync(UncachedTestEventRepo::updateBy(
+        auto result = sync(UncachedTestEventRepo::patch(
             eventId, set<EF::title>(std::string("After"))));
 
         REQUIRE(result != nullptr);
@@ -615,21 +615,21 @@ TEST_CASE("PartialKey<TestEvent> - updateBy (Uncached)",
         CHECK(!result->created_at.empty());
     }
 
-    SECTION("[updateBy] returns nullptr for non-existent id") {
-        auto result = sync(UncachedTestEventRepo::updateBy(
+    SECTION("[patch] returns nullptr for non-existent id") {
+        auto result = sync(UncachedTestEventRepo::patch(
             999999, set<EF::title>(std::string("Ghost"))));
 
         CHECK(result == nullptr);
     }
 }
 
-TEST_CASE("PartialKey<TestEvent> - updateBy (L1)",
-          "[integration][db][partial-key][cached][updateBy]")
+TEST_CASE("PartialKey<TestEvent> - patch (L1)",
+          "[integration][db][partial-key][cached][patch]")
 {
     TransactionGuard tx;
-    auto userId = insertTestUser("l1updateby_user", "l1updateby@test.com", 100);
+    auto userId = insertTestUser("l1patch_user", "l1patch@test.com", 100);
 
-    SECTION("[updateBy] invalidates L1 and returns fresh entity") {
+    SECTION("[patch] invalidates L1 and returns fresh entity") {
         auto eventId = insertTestEvent("eu", userId, "Cached", 5);
 
         // Populate L1 cache
@@ -643,8 +643,8 @@ TEST_CASE("PartialKey<TestEvent> - updateBy (L1)",
         // L1 still returns stale
         CHECK(sync(L1TestEventRepo::find(eventId))->title == "Cached");
 
-        // updateBy invalidates L1 and re-fetches
-        auto result = sync(L1TestEventRepo::updateBy(
+        // patch invalidates L1 and re-fetches
+        auto result = sync(L1TestEventRepo::patch(
             eventId, set<EF::priority>(7)));
 
         REQUIRE(result != nullptr);
@@ -652,13 +652,13 @@ TEST_CASE("PartialKey<TestEvent> - updateBy (L1)",
         CHECK(result->title == "DB Changed");  // Re-fetched from DB, not stale L1
     }
 
-    SECTION("[updateBy] updates multiple fields with L1 invalidation") {
+    SECTION("[patch] updates multiple fields with L1 invalidation") {
         auto eventId = insertTestEvent("us", userId, "Multi", 1);
 
         // Populate L1
         sync(L1TestEventRepo::find(eventId));
 
-        auto result = sync(L1TestEventRepo::updateBy(
+        auto result = sync(L1TestEventRepo::patch(
             eventId,
             set<EF::title>(std::string("New")),
             set<EF::priority>(8)));
@@ -670,13 +670,13 @@ TEST_CASE("PartialKey<TestEvent> - updateBy (L1)",
     }
 }
 
-TEST_CASE("PartialKey<TestEvent> - updateBy (L2)",
-          "[integration][db][partial-key][redis][updateBy]")
+TEST_CASE("PartialKey<TestEvent> - patch (L2)",
+          "[integration][db][partial-key][redis][patch]")
 {
     TransactionGuard tx;
-    auto userId = insertTestUser("l2updateby_user", "l2updateby@test.com", 100);
+    auto userId = insertTestUser("l2patch_user", "l2patch@test.com", 100);
 
-    SECTION("[updateBy] invalidates Redis then re-fetches") {
+    SECTION("[patch] invalidates Redis then re-fetches") {
         auto eventId = insertTestEvent("eu", userId, "Redis Cached", 5);
 
         // Populate Redis
@@ -690,8 +690,8 @@ TEST_CASE("PartialKey<TestEvent> - updateBy (L2)",
         REQUIRE(stale != nullptr);
         CHECK(stale->title == "Redis Cached");
 
-        // updateBy invalidates Redis, updates priority, then re-fetches from DB
-        auto result = sync(L2TestEventRepo::updateBy(
+        // patch invalidates Redis, updates priority, then re-fetches from DB
+        auto result = sync(L2TestEventRepo::patch(
             eventId, set<EF::priority>(42)));
 
         REQUIRE(result != nullptr);
@@ -706,12 +706,12 @@ TEST_CASE("PartialKey<TestEvent> - updateBy (L2)",
     }
 }
 
-TEST_CASE("PartialKey<TestEvent> - updateBy cross-invalidation",
-          "[integration][db][partial-key][cross-inv][updateBy]")
+TEST_CASE("PartialKey<TestEvent> - patch cross-invalidation",
+          "[integration][db][partial-key][cross-inv][patch]")
 {
     TransactionGuard tx;
 
-    SECTION("[updateBy] on event invalidates user L1 cache") {
+    SECTION("[patch] on event invalidates user L1 cache") {
         auto userId = insertTestUser("crossinv_user", "crossinv@test.com", 1000);
         auto eventId = insertTestEvent("eu", userId, "Event", 1);
 
@@ -726,8 +726,8 @@ TEST_CASE("PartialKey<TestEvent> - updateBy cross-invalidation",
         // User still cached (stale)
         CHECK(sync(L1EventTargetUserRepo::find(userId))->balance == 1000);
 
-        // updateBy on event → triggers cross-invalidation → invalidates user cache
-        auto result = sync(L1EventSourceRepo::updateBy(
+        // patch on event → triggers cross-invalidation → invalidates user cache
+        auto result = sync(L1EventSourceRepo::patch(
             eventId, set<EF::priority>(99)));
         REQUIRE(result != nullptr);
 

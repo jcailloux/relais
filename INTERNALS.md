@@ -423,7 +423,7 @@ struct Traits {
 
 ### CRUD Interception
 
-`ListMixin` intercepts `insert()`, `update()`, `remove()`, and `updateBy()` to notify the list cache of entity changes:
+`ListMixin` intercepts `insert()`, `update()`, `remove()`, and `patch()` to notify the list cache of entity changes:
 
 ```cpp
 static io::Task<bool> update(const Key& id, WrapperPtrType wrapper) {
@@ -502,7 +502,7 @@ cache::InvalidateListVia<ListRepo, &Entity::key, &Resolver::resolve> // table ->
 `InvalidateOn<Deps...>` uses fold expressions to dispatch to each dependency:
 
 - `propagateCreate<Entity, InvList>(new_entity)` — called after `insert()`
-- `propagateUpdate<Entity, InvList>(old, new_entity)` — called after `update()`/`updateBy()`
+- `propagateUpdate<Entity, InvList>(old, new_entity)` — called after `update()`/`patch()`
 - `propagateDelete<Entity, InvList>(old_entity)` — called after `remove()`/`invalidate()`
 
 ### Indirect Invalidation: `InvalidateVia`
@@ -942,7 +942,7 @@ class ListWrapper {
 };
 ```
 
-## Partial Field Updates (`updateBy`)
+## Partial Field Updates (`patch`)
 
 ### Field Enum and FieldInfo (Generated)
 
@@ -978,18 +978,18 @@ template<auto F> auto setNull();          // Returns FieldSetNull<F>
 }
 ```
 
-### updateBy Flow Across Tiers
+### patch Flow Across Tiers
 
 ```
-CachedRepo::updateBy(id, set<F>(v)...)
+CachedRepo::patch(id, set<F>(v)...)
     |-- invalidateL1Internal(id)
     |
     v
-RedisRepo::updateBy(id, set<F>(v)...)
+RedisRepo::patch(id, set<F>(v)...)
     |-- co_await invalidateRedisInternal(id)
     |
     v
-BaseRepo::updateBy(id, set<F>(v)...)
+BaseRepo::patch(id, set<F>(v)...)
     |-- [optional] Fetch old entity for cross-invalidation
     |
     |-- Build dynamic SQL: UPDATE table SET "col1"=$1, "col2"=$2 WHERE "pk"=$3 RETURNING *
@@ -1001,7 +1001,7 @@ BaseRepo::updateBy(id, set<F>(v)...)
     |-- co_return re-fetched entity
 ```
 
-Note: When `ListMixin` or `InvalidationMixin` are active, they intercept `updateBy()` to additionally notify the list cache and/or propagate cross-invalidation.
+Note: When `ListMixin` or `InvalidationMixin` are active, they intercept `patch()` to additionally notify the list cache and/or propagate cross-invalidation.
 
 ## PartialKey Repositories
 
@@ -1017,7 +1017,7 @@ PartialKey is auto-detected at compile time via the `HasPartitionKey` concept, w
 |-----------|----------|------------|
 | `find` | `SELECT ... WHERE id = $1` | Same (id is unique across partitions) |
 | `update` | `UPDATE ... WHERE id = $1` | Same |
-| `updateBy` | `UPDATE ... SET cols WHERE id = $N RETURNING *` | Same |
+| `patch` | `UPDATE ... SET cols WHERE id = $N RETURNING *` | Same |
 | `remove` | `DELETE ... WHERE id = $1` | Opportunistic: `DELETE ... WHERE id=$1 AND region=$2` if entity in L1/L2, else `DELETE ... WHERE id=$1` |
 | `insert` | Standard | Standard |
 

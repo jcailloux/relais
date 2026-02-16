@@ -263,11 +263,11 @@ public:
 
     /// Partial update and notify list cache.
     template<typename... Updates>
-    static io::Task<WrapperPtrType> updateBy(const Key& id, Updates&&... updates)
+    static io::Task<WrapperPtrType> patch(const Key& id, Updates&&... updates)
         requires HasFieldUpdate<Entity> && (!Base::config.read_only)
     {
         auto old = co_await Base::find(id);
-        co_return co_await updateByWithContext(id, std::move(old),
+        co_return co_await patchWithContext(id, std::move(old),
             std::forward<Updates>(updates)...);
     }
 
@@ -354,11 +354,11 @@ protected:
     }
 
     template<typename... Updates>
-    static io::Task<WrapperPtrType> updateByWithContext(
+    static io::Task<WrapperPtrType> patchWithContext(
         const Key& id, WrapperPtrType old_entity, Updates&&... updates)
         requires HasFieldUpdate<Entity> && (!Base::config.read_only)
     {
-        auto result = co_await Base::updateBy(id, std::forward<Updates>(updates)...);
+        auto result = co_await Base::patch(id, std::forward<Updates>(updates)...);
         if (result) {
             listCache().onEntityUpdated(std::move(old_entity), result);
         }

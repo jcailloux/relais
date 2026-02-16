@@ -495,7 +495,7 @@ TEST_CASE("BaseRepo<TestPurchase> - multiple purchases per user", "[integration]
 
 // #############################################################################
 //
-//  4. updateBy — partial field update via entity with Traits
+//  4. patch — partial field update via entity with Traits
 //     Uses UncachedTestUserRepo (TestUser entity with Field enum)
 //
 // #############################################################################
@@ -504,13 +504,13 @@ using jcailloux::relais::wrapper::set;
 using jcailloux::relais::wrapper::setNull;
 using F = TestUserWrapper::Field;
 
-TEST_CASE("BaseRepo - updateBy single field", "[integration][db][base][updateBy]") {
+TEST_CASE("BaseRepo - patch single field", "[integration][db][base][patch]") {
     TransactionGuard tx;
 
-    SECTION("[updateBy] updates only balance, other fields intact") {
+    SECTION("[patch] updates only balance, other fields intact") {
         auto id = insertTestUser("alice", "alice@example.com", 100);
 
-        auto result = sync(UncachedTestUserRepo::updateBy(id, set<F::balance>(999)));
+        auto result = sync(UncachedTestUserRepo::patch(id, set<F::balance>(999)));
 
         REQUIRE(result != nullptr);
         REQUIRE(result->balance == 999);
@@ -518,10 +518,10 @@ TEST_CASE("BaseRepo - updateBy single field", "[integration][db][base][updateBy]
         REQUIRE(result->email == "alice@example.com");
     }
 
-    SECTION("[updateBy] updates only username, other fields intact") {
+    SECTION("[patch] updates only username, other fields intact") {
         auto id = insertTestUser("bob", "bob@example.com", 500);
 
-        auto result = sync(UncachedTestUserRepo::updateBy(id,
+        auto result = sync(UncachedTestUserRepo::patch(id,
             set<F::username>(std::string("robert"))));
 
         REQUIRE(result != nullptr);
@@ -531,13 +531,13 @@ TEST_CASE("BaseRepo - updateBy single field", "[integration][db][base][updateBy]
     }
 }
 
-TEST_CASE("BaseRepo - updateBy multiple fields", "[integration][db][base][updateBy]") {
+TEST_CASE("BaseRepo - patch multiple fields", "[integration][db][base][patch]") {
     TransactionGuard tx;
 
-    SECTION("[updateBy] updates balance and username together") {
+    SECTION("[patch] updates balance and username together") {
         auto id = insertTestUser("carol", "carol@example.com", 200);
 
-        auto result = sync(UncachedTestUserRepo::updateBy(id,
+        auto result = sync(UncachedTestUserRepo::patch(id,
             set<F::balance>(777),
             set<F::username>(std::string("caroline"))));
 
@@ -547,10 +547,10 @@ TEST_CASE("BaseRepo - updateBy multiple fields", "[integration][db][base][update
         REQUIRE(result->email == "carol@example.com");
     }
 
-    SECTION("[updateBy] updates all non-PK fields") {
+    SECTION("[patch] updates all non-PK fields") {
         auto id = insertTestUser("dave", "dave@example.com", 300);
 
-        auto result = sync(UncachedTestUserRepo::updateBy(id,
+        auto result = sync(UncachedTestUserRepo::patch(id,
             set<F::balance>(0),
             set<F::username>(std::string("david")),
             set<F::email>(std::string("david@newdomain.com"))));
@@ -562,13 +562,13 @@ TEST_CASE("BaseRepo - updateBy multiple fields", "[integration][db][base][update
     }
 }
 
-TEST_CASE("BaseRepo - updateBy returns re-fetched entity", "[integration][db][base][updateBy]") {
+TEST_CASE("BaseRepo - patch returns re-fetched entity", "[integration][db][base][patch]") {
     TransactionGuard tx;
 
-    SECTION("[updateBy] returned entity reflects DB state") {
+    SECTION("[patch] returned entity reflects DB state") {
         auto id = insertTestUser("eve", "eve@example.com", 400);
 
-        auto result = sync(UncachedTestUserRepo::updateBy(id, set<F::balance>(123)));
+        auto result = sync(UncachedTestUserRepo::patch(id, set<F::balance>(123)));
         REQUIRE(result != nullptr);
 
         // Verify by independent fetch
@@ -578,13 +578,13 @@ TEST_CASE("BaseRepo - updateBy returns re-fetched entity", "[integration][db][ba
         REQUIRE(fetched->balance == result->balance);
     }
 
-    SECTION("[updateBy] returns nullptr for non-existent id") {
-        auto result = sync(UncachedTestUserRepo::updateBy(999999999,
+    SECTION("[patch] returns nullptr for non-existent id") {
+        auto result = sync(UncachedTestUserRepo::patch(999999999,
             set<F::balance>(999)));
 
-        // updateBy calls mapper.update which may throw or succeed with 0 rows,
+        // patch calls mapper.update which may throw or succeed with 0 rows,
         // then re-fetches which returns nullptr
-        // updateBy on non-existent ID: either nullptr or exception -> nullptr
+        // patch on non-existent ID: either nullptr or exception -> nullptr
         REQUIRE(result == nullptr);
     }
 }

@@ -77,7 +77,7 @@ tests/
 │   ├── test_l1_config.cpp          # Exhaustive L1 config parameter tests (TTL, refresh, cleanup)
 │   └── test_l2_config.cpp          # Exhaustive L2 config parameter tests (TTL, refresh, strategy)
 ├── test_generated_wrapper.cpp      # Unit tests for struct + EntityWrapper + ListWrapper
-├── test_base_repository.cpp        # Tests for BaseRepo (no cache) + updateBy
+├── test_base_repository.cpp        # Tests for BaseRepo (no cache) + patch
 ├── test_redis_repository.cpp       # Tests for RedisRepo (L2 cache)
 ├── test_cached_repository.cpp      # Tests for CachedRepo (L1 cache)
 ├── test_full_cache.cpp             # Tests for L1+L2 (Both) cache hierarchy interaction
@@ -139,19 +139,19 @@ Each test section uses `TransactionGuard` which:
 
 This ensures complete isolation between tests without leaving data behind.
 
-## updateBy Tests
+## patch Tests
 
-`test_base_repository.cpp` includes tests for partial field updates via `updateBy`:
+`test_base_repository.cpp` includes tests for partial field updates via `patch`:
 
 - **Single field update**: Modifies only one column, verifies other columns are unchanged
 - **Multiple field update**: Modifies several columns in a single call
-- **Re-fetch verification**: Confirms `updateBy` returns the complete re-fetched entity from the database
+- **Re-fetch verification**: Confirms `patch` returns the complete re-fetched entity from the database
 
-These tests use `UncachedTestUserRepo` (a generated entity repository) since `updateBy` requires a generated entity with `TraitsType` containing `Field` enum and `FieldInfo` specializations. Hand-written entities (e.g., `TestItemEntity`) do not support `updateBy`.
+These tests use `UncachedTestUserRepo` (a generated entity repository) since `patch` requires a generated entity with `TraitsType` containing `Field` enum and `FieldInfo` specializations. Hand-written entities (e.g., `TestItemEntity`) do not support `patch`.
 
-### PartialKey updateBy
+### PartialKey patch
 
-For PartialKey repos, `updateBy` uses a **criteria-based** approach building a dynamic `UPDATE ... SET col=$N WHERE pk=$M RETURNING *` instead of the standard full-entity update path.
+For PartialKey repos, `patch` uses a **criteria-based** approach building a dynamic `UPDATE ... SET col=$N WHERE pk=$M RETURNING *` instead of the standard full-entity update path.
 
 See `test_partial_key.cpp` sections 8a-8d for coverage at all cache levels + cross-invalidation.
 
@@ -163,7 +163,7 @@ See `test_partial_key.cpp` sections 8a-8d for coverage at all cache levels + cro
 |----------------------|-------------|
 | `[item]`             | Entity CRUD with Redis caching |
 | `[binary]`           | Binary (BEVE) serialization in Redis |
-| `[updateBy]`         | Partial field updates with Redis invalidation |
+| `[patch]`         | Partial field updates with Redis invalidation |
 | `[json]`             | `findAsJson` raw JSON retrieval |
 | `[invalidate]`       | Explicit `invalidateRedis` operations |
 | `[readonly]`         | Read-only repository caching |
@@ -197,7 +197,7 @@ See `test_partial_key.cpp` sections 8a-8d for coverage at all cache levels + cro
 | `[redis]` | L2 cache behavior with PartialKey |
 | `[cross-inv]` | Cross-invalidation (Event as source/target) |
 | `[validator]` | PartialKeyValidator runtime checks |
-| `[updateBy]` | Criteria-based partial updates at all cache levels |
+| `[patch]` | Criteria-based partial updates at all cache levels |
 
 ### `test_relais_full_cache` (L1+L2 cache hierarchy)
 
@@ -226,7 +226,7 @@ Tests for `warmup()` priming cache infrastructure including L1 entity cache and 
 | `[list]` | Concurrent list queries + entity creates |
 | `[warmup]` | Concurrent warmup + operations |
 | `[storm]` | Mixed operations storm (all operations interleaved) |
-| `[updateBy]` | Concurrent `updateBy` on same entity |
+| `[patch]` | Concurrent `patch` on same entity |
 | `[cleanup]` | Concurrent entity cache cleanup + reads/writes |
 | `[list-cleanup]` | Concurrent list CRUD + unified `triggerCleanup`/`fullCleanup` |
 | `[tracker-drain]` | `fullCleanup()` drains tracker to zero after concurrent storm |

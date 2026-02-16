@@ -98,17 +98,17 @@ public:
     /// Partial update with cross-invalidation.
     /// When Base is ListMixin, reuses the pre-fetched old entity via WithContext.
     template<typename... Updates>
-    static io::Task<WrapperPtrType> updateBy(const Key& id, Updates&&... updates)
+    static io::Task<WrapperPtrType> patch(const Key& id, Updates&&... updates)
         requires HasFieldUpdate<Entity> && (!Base::config.read_only)
     {
         auto old = co_await Base::find(id);
 
         WrapperPtrType result;
         if constexpr (detail::HasListMixin<Base>) {
-            result = co_await Base::updateByWithContext(
+            result = co_await Base::patchWithContext(
                 id, old, std::forward<Updates>(updates)...);
         } else {
-            result = co_await Base::updateBy(id, std::forward<Updates>(updates)...);
+            result = co_await Base::patch(id, std::forward<Updates>(updates)...);
         }
 
         if (result) {

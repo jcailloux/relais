@@ -14,7 +14,7 @@ A header-only C++23 repository pattern library with integrated multi-tier cachin
 - **ORM decoupled**: Entity structs are framework-agnostic and can be shared across projects
 - **Auto-detected list caching**: ListMixin activates when the entity's Mapping has an embedded `ListDescriptor`
 - **Smart invalidation**: Cross-cache dependency propagation via variadic `Invalidations...` pack
-- **Partial updates**: Type-safe `updateBy()` with compile-time field enum — updates only specified columns
+- **Partial updates**: Type-safe `patch()` with compile-time field enum — updates only specified columns
 - **Partition key optimization**: `@relais partition_key` enables single-partition DELETE via cache hints (`HasPartitionKey` concept)
 - **Type-safe**: Hierarchical concepts (`ReadableEntity`, `CacheableEntity`, `MutableEntity`, `CreatableEntity`)
 - **Read-only enforcement**: Compile-time `requires` clause prevents insert/update/delete on read-only repositories
@@ -91,7 +91,7 @@ template<> struct glz::meta<User> {
 //    - fromRow<Entity>, toInsertParams<Entity>, getPrimaryKey<Entity>
 //    - SQL struct (select_by_pk, insert, update, delete_by_pk)
 //    - makeFullKeyParams (if partition_key annotation present)
-//    - TraitsType with Field enum + FieldInfo (for updateBy)
+//    - TraitsType with Field enum + FieldInfo (for patch)
 //    - glaze_value (fallback Glaze metadata)
 //    - ListDescriptor (if filterable/sortable annotations present)
 
@@ -133,7 +133,7 @@ using PurchaseRepo = relais::Repo<
 - `findAsJson(id)` — `Task<shared_ptr<const string>>`
 - `insert(wrapper)` — `Task<WrapperPtr>` (requires `!read_only`)
 - `update(id, wrapper)` — `Task<bool>` (requires `!read_only`)
-- `updateBy(id, set<F>(v)...)` — `Task<WrapperPtr>` (requires `HasFieldUpdate`)
+- `patch(id, set<F>(v)...)` — `Task<WrapperPtr>` (requires `HasFieldUpdate`)
 - `remove(id)` — `Task<optional<size_t>>` (requires `!read_only`)
 - `invalidate(id)` — `Task<void>`
 
@@ -221,7 +221,7 @@ io::Task<void> example() {
     // Partial update - only modifies specified fields (requires generated entity with Field enum)
     using F = UserWrapper::Field;
     using jcailloux::relais::wrapper::set;
-    auto updated = co_await UserRepo::updateBy(created->id,
+    auto updated = co_await UserRepo::patch(created->id,
         set<F::balance>(999),
         set<F::username>("bob"));
     // updated is a re-fetched WrapperPtr with all fields populated
@@ -353,7 +353,7 @@ static Task<bool> update(const Key& id, WrapperPtr wrapper)
     requires MutableEntity<Entity> && (!Cfg.read_only);
 ```
 
-## Partial Updates with `updateBy`
+## Partial Updates with `patch`
 
 Generated entities expose a `Field` enum for type-safe partial updates. Only the specified columns are written to the database (via dynamic `UPDATE ... SET` built from `FieldInfo::column_name`), and the full entity is re-fetched after the update.
 
@@ -363,33 +363,33 @@ using jcailloux::relais::wrapper::set;
 using jcailloux::relais::wrapper::setNull;
 
 // Update a single field
-auto updated = co_await UserRepo::updateBy(id, set<F::balance>(999));
+auto updated = co_await UserRepo::patch(id, set<F::balance>(999));
 
 // Update multiple fields
-auto updated = co_await UserRepo::updateBy(id,
+auto updated = co_await UserRepo::patch(id,
     set<F::balance>(999),
     set<F::username>("alice"));
 
 // Set a nullable field to NULL
-co_await ArticleRepo::updateBy(id, setNull<F::view_count>());
+co_await ArticleRepo::patch(id, setNull<F::view_count>());
 ```
 
 Requirements:
 - The entity must be generated with a `TraitsType` that includes `Field` enum and `FieldInfo` specializations
 - The repository must not be `read_only`
-- Hand-written entities without `TraitsType` do not support `updateBy` (the `HasFieldUpdate` concept gates availability)
+- Hand-written entities without `TraitsType` do not support `patch` (the `HasFieldUpdate` concept gates availability)
 
 Cache handling:
 - **CachedRepo**: L1 is invalidated before the update
 - **RedisRepo**: L2 is invalidated before the update
 - The re-fetched entity repopulates caches on subsequent `find` calls
 
-### Partition Key `updateBy`
+### Partition Key `patch`
 
-For partition key repositories, `updateBy` builds a dynamic `UPDATE ... WHERE pk=$N RETURNING *` using only the partial key. This is acceptable since the `id` column is indexed across all partitions. The `FieldInfo::column_name` is used to build the SET clause:
+For partition key repositories, `patch` builds a dynamic `UPDATE ... WHERE pk=$N RETURNING *` using only the partial key. This is acceptable since the `id` column is indexed across all partitions. The `FieldInfo::column_name` is used to build the SET clause:
 
 ```cpp
-auto updated = co_await EventRepo::updateBy(eventId,
+auto updated = co_await EventRepo::patch(eventId,
     set<EF::title>(std::string("Updated")),
     set<EF::priority>(99));
 // UPDATE events SET "title"=$1, "priority"=$2 WHERE "id"=$3 RETURNING *
@@ -555,7 +555,7 @@ io::Task<std::string> handleAuditLogList(
 
 ### CRUD-to-List Notification
 
-ListMixin intercepts `insert()`, `update()`, `remove()`, and `updateBy()` to automatically notify the list cache of entity changes. The ModificationTracker records these changes, and list cache entries are validated lazily on the next `query()` call.
+ListMixin intercepts `insert()`, `update()`, `remove()`, and `patch()` to automatically notify the list cache of entity changes. The ModificationTracker records these changes, and list cache entries are validated lazily on the next `query()` call.
 
 No manual `notifyCreated`/`notifyUpdated`/`notifyDeleted` calls are needed for same-repo entities.
 
@@ -688,7 +688,7 @@ python scripts/generate_entities.py --files src/entities/User.h --output-dir src
 | `findAsJson(id)` | `Task<shared_ptr<const string>>` | - | Find and return JSON directly |
 | `insert(wrapper)` | `Task<WrapperPtr>` | `!read_only` | Insert and cache |
 | `update(id, wrapper)` | `Task<bool>` | `!read_only` | Full update and handle cache |
-| `updateBy(id, set<F>()...)` | `Task<WrapperPtr>` | `!read_only`, `HasFieldUpdate` | Partial update, re-fetches entity |
+| `patch(id, set<F>()...)` | `Task<WrapperPtr>` | `!read_only`, `HasFieldUpdate` | Partial update, re-fetches entity |
 | `remove(id)` | `Task<optional<size_t>>` | `!read_only` | Delete and invalidate cache |
 | `invalidate(id)` | `Task<void>` | - | Explicit cache invalidation |
 | `updateFromJson(id, json)` | `Task<bool>` | `!read_only` | Parse JSON and update |
@@ -716,7 +716,7 @@ python scripts/generate_entities.py --files src/entities/User.h --output-dir src
 
 ### InvalidationMixin (auto-activated)
 
-When `Invalidations...` is non-empty, the mixin intercepts `insert()`, `update()`, `remove()`, `updateBy()`, and `invalidate()` to propagate cross-invalidation. No additional API — it wraps the existing methods transparently.
+When `Invalidations...` is non-empty, the mixin intercepts `insert()`, `update()`, `remove()`, `patch()`, and `invalidate()` to propagate cross-invalidation. No additional API — it wraps the existing methods transparently.
 
 ## Testing
 
@@ -736,7 +736,7 @@ ctest --test-dir build --output-on-failure
 | `test_redis_repository.cpp` | RedisRepo (L2): CRUD caching, cross-invalidation, list caching, selective Lua invalidation, InvalidateListVia |
 | `test_cached_repository.cpp` | CachedRepo (L1+L2): RAM cache, TTL, config variants |
 | `test_decl_list_cache.cpp` | ListMixin: query/ItemView, SortBounds invalidation, ModificationTracker |
-| `test_partial_key.cpp` | PartialKey repositories: composite PK, criteria-based updateBy, remove with cache hints, cross-invalidation |
+| `test_partial_key.cpp` | PartialKey repositories: composite PK, criteria-based patch, remove with cache hints, cross-invalidation |
 
 ### Running specific test tags
 
