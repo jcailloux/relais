@@ -108,7 +108,7 @@ TEST_CASE("Benchmark - L1+L2 cache hit", "[benchmark][full-cache]")
     })));
 
     results.push_back(sync(benchWithSetupAsync("find (L2 fallback)",
-        [&]() -> io::Task<void> { FullCacheTestItemRepo::invalidateL1(id); co_return; },
+        [&]() -> io::Task<void> { FullCacheTestItemRepo::evict(id); co_return; },
         [&]() -> io::Task<void> { co_await FullCacheTestItemRepo::find(id); }
     )));
 
@@ -130,7 +130,7 @@ TEST_CASE("Benchmark - cache miss (DB fetch)", "[benchmark][db]")
     std::vector<BenchResult> results;
 
     results.push_back(sync(benchWithSetupAsync("find (L1 miss -> DB)",
-        [&]() -> io::Task<void> { L1TestItemRepo::invalidateL1(id); co_return; },
+        [&]() -> io::Task<void> { L1TestItemRepo::evict(id); co_return; },
         [&]() -> io::Task<void> { co_await L1TestItemRepo::find(id); }
     )));
 
@@ -301,7 +301,7 @@ TEST_CASE("Benchmark - L1 raw throughput", "[benchmark][throughput][raw]")
                     auto ptr = TestInternals::getFromCache<L1TestItemRepo>(kid);
                     doNotOptimize(ptr);
                 } else {
-                    TestInternals::invalidateL1<L1TestItemRepo>(kid);
+                    TestInternals::evict<L1TestItemRepo>(kid);
                     TestInternals::putInCache<L1TestItemRepo>(kid, template_ptr);
                 }
                 ++ops;

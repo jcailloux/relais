@@ -289,7 +289,7 @@ Database Query --> Store in L2 --> Store in L1 --> Return
 For standard repositories:
 ```
 CachedRepo::erase(id)
-    |-- invalidateL1Internal(id)
+    |-- evict(id)
     v
 RedisRepo::erase(id)
     |-- co_await BaseRepo::erase(id)  -> deleteByPrimaryKey(id)
@@ -982,7 +982,7 @@ template<auto F> auto setNull();          // Returns FieldSetNull<F>
 
 ```
 CachedRepo::patch(id, set<F>(v)...)
-    |-- invalidateL1Internal(id)
+    |-- evict(id)
     |
     v
 RedisRepo::patch(id, set<F>(v)...)

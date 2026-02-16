@@ -442,7 +442,7 @@ public:
             });
 
         if (shard) {
-            modifications_.cleanup(now, *shard);
+            modifications_.drainShard(now, *shard);
         }
 
         return shard.has_value();

@@ -179,7 +179,7 @@ public:
         if (success) {
             // Update L1 cache based on configured strategy
             if constexpr (Cfg.update_strategy == InvalidateAndLazyReload) {
-                invalidateL1Internal(id);
+                evict(id);
             } else {
                 putInCache(id, wrapper);
             }
@@ -193,7 +193,7 @@ public:
     static io::Task<WrapperPtrType> patch(const Key& id, Updates&&... updates)
         requires HasFieldUpdate<Entity> && (!Cfg.read_only)
     {
-        invalidateL1Internal(id);
+        evict(id);
         co_return co_await Base::patch(id, std::forward<Updates>(updates)...);
     }
 
@@ -213,31 +213,23 @@ public:
 
         auto result = co_await Base::eraseImpl(id, std::move(hint));
         if (result.has_value()) {
-            invalidateL1Internal(id);
+            evict(id);
         }
         co_return result;
     }
 
     /// Invalidate L1 and L2 caches for a key.
     static io::Task<void> invalidate(const Key& id) {
-        invalidateL1Internal(id);
+        evict(id);
         if constexpr (HasRedis) {
             co_await Base::invalidateRedis(id);
         }
     }
 
     /// Invalidate L1 cache only. Non-coroutine since there is no async work.
-    static void invalidateL1(const Key& id) {
-        invalidateL1Internal(id);
-    }
-
-private:
-    /// Internal L1 invalidation.
-    static void invalidateL1Internal(const Key& id) {
+    static void evict(const Key& id) {
         cache().invalidate(id);
     }
-
-public:
 
     [[nodiscard]] static size_t cacheSize() {
         return cache().size();

@@ -62,7 +62,7 @@ struct TestInternals {
     template<typename Repo>
     static void cleanupModificationsWithCutoff(
             std::chrono::steady_clock::time_point cutoff, uint8_t shard_id) {
-        Repo::listCache().modifications_.cleanup(cutoff, shard_id);
+        Repo::listCache().modifications_.drainShard(cutoff, shard_id);
     }
 
     /// Call ModificationTracker::drain() directly with a controlled cutoff.
@@ -88,8 +88,8 @@ struct TestInternals {
 
     /// Direct L1 cache invalidate.
     template<typename Repo, typename Key>
-    static void invalidateL1(const Key& key) {
-        Repo::invalidateL1Internal(key);
+    static void evict(const Key& key) {
+        Repo::evict(key);
     }
 
     /// Read the shard_id for a cached list entry (for bitmap skip testing).

@@ -441,8 +441,8 @@ TEST_CASE("Concurrency - mixed operations storm",
                         sync(FullCacheTestItemRepo::invalidate(id));
                         break;
 
-                    case 5:  // invalidateL1 + read
-                        FullCacheTestItemRepo::invalidateL1(id);
+                    case 5:  // evict + read
+                        FullCacheTestItemRepo::evict(id);
                         sync(FullCacheTestItemRepo::find(id));
                         break;
                 }

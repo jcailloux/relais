@@ -6,7 +6,7 @@
  *
  * Covers:
  *   1. L1 to L2 promotion (cache miss → L2 populate → L1 populate)
- *   2. Cascade invalidation (invalidate both layers, invalidateL1 only)
+ *   2. Cascade invalidation (invalidate both layers, evict only)
  *   3. L1 expiration with L2 fallback
  *   4. Write-through at L1+L2
  *   5. Binary entity at L1+L2
@@ -115,7 +115,7 @@ TEST_CASE("FullCache<TestItem> - L1 to L2 promotion",
         sync(FullCacheTestItemRepo::find(id));
 
         // Clear L1 only
-        FullCacheTestItemRepo::invalidateL1(id);
+        FullCacheTestItemRepo::evict(id);
 
         // Modify DB directly — L2 still has old value
         updateTestItem(id, "db_only_value", 999);
@@ -162,7 +162,7 @@ TEST_CASE("FullCache<TestItem> - cascade invalidation",
         REQUIRE(item->value == 20);
     }
 
-    SECTION("[invalidate] invalidateL1 clears L1 but preserves L2") {
+    SECTION("[invalidate] evict clears L1 but preserves L2") {
         auto id = insertTestItem("inv_l1_only", 10);
 
         // Populate both layers
@@ -172,7 +172,7 @@ TEST_CASE("FullCache<TestItem> - cascade invalidation",
         updateTestItem(id, "inv_l1_updated", 20);
 
         // Clear L1 only
-        FullCacheTestItemRepo::invalidateL1(id);
+        FullCacheTestItemRepo::evict(id);
 
         // Read should come from L2 (stale)
         auto item = sync(FullCacheTestItemRepo::find(id));
@@ -339,7 +339,7 @@ TEST_CASE("FullCache<TestUser> - binary entity at L1+L2",
         sync(FullCacheTestUserRepo::find(id));
 
         // Clear L1
-        FullCacheTestUserRepo::invalidateL1(id);
+        FullCacheTestUserRepo::evict(id);
 
         // Modify DB
         updateTestUserBalance(id, 999);
@@ -468,7 +468,7 @@ TEST_CASE("FullCache - hierarchy verification",
         sync(FullCacheTestItemRepo::find(id));
 
         // Clear L1 only
-        FullCacheTestItemRepo::invalidateL1(id);
+        FullCacheTestItemRepo::evict(id);
 
         // Modify DB — L2 still has old value
         updateTestItem(id, "l2_hit_modified", 99);
@@ -533,7 +533,7 @@ TEST_CASE("FullCache - findJson at L1+L2",
         sync(FullCacheTestItemRepo::findJson(id));
 
         // Clear L1
-        FullCacheTestItemRepo::invalidateL1(id);
+        FullCacheTestItemRepo::evict(id);
 
         // Should fall back to L2
         auto json = sync(FullCacheTestItemRepo::findJson(id));

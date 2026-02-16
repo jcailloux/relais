@@ -817,7 +817,7 @@ TEST_CASE("PartitionKey<TestEvent> - erase with L1+L2 hint chain",
         sync(L1L2TestEventRepo::find(eventId));
 
         // Invalidate L1 only (L2 still has the entity)
-        L1L2TestEventRepo::invalidateL1(eventId);
+        L1L2TestEventRepo::evict(eventId);
 
         // Verify precondition: L1 is empty (hint must come from L2)
         auto cachedL1 = TestInternals::getFromCache<L1L2TestEventRepo>(eventId);
