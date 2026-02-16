@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [master, dev]
+  pull_request:
+    branches: [master]
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: relais_test
+          POSTGRES_PASSWORD: relais_test
+          POSTGRES_DB: relais_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-14 g++-14 cmake libpq-dev postgresql-client python3
+
+      - name: Run database migrations
+        env:
+          PGHOST: localhost
+          PGPORT: "5432"
+          PGUSER: relais_test
+          PGPASSWORD: relais_test
+          PGDATABASE: relais_test
+        run: |
+          for f in tests/migrations/*.sql; do
+            echo "Applying: $f"
+            psql < "$f"
+          done
+
+      - name: Generate test fixtures
+        run: python3 scripts/generate_entities.py --scan tests/fixtures/ --output-dir tests/
+
+      - name: Configure
+        run: >
+          cmake -B build
+          -DCMAKE_CXX_COMPILER=g++-14
+          -DRELAIS_BUILD_TESTS=ON
+          -DRELAIS_BUILD_BENCHMARKS=OFF
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
