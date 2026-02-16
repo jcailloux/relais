@@ -27,8 +27,8 @@ using namespace relais_test;
 
 namespace relais_test {
 
-using FullCacheArticleListRepo = Repository<TestArticleWrapper, "test:article:list:both", cfg::Both>;
-using FullCachePurchaseListRepo = Repository<TestPurchaseWrapper, "test:purchase:list:both", cfg::Both>;
+using FullCacheArticleListRepo = Repo<TestArticleWrapper, "test:article:list:both", cfg::Both>;
+using FullCachePurchaseListRepo = Repo<TestPurchaseWrapper, "test:purchase:list:both", cfg::Both>;
 
 using FullArticleListQuery = FullCacheArticleListRepo::ListQuery;
 using FullPurchaseListQuery = FullCachePurchaseListRepo::ListQuery;

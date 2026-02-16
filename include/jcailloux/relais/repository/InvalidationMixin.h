@@ -15,7 +15,7 @@ concept HasListMixin = requires { typename T::ListDescriptorType; };
 /**
  * Optional mixin layer for cross-repository cache invalidation.
  *
- * Activated when the Repository has variadic Invalidations... (non-empty).
+ * Activated when the Repo has variadic Invalidations... (non-empty).
  * Sits at the top of the mixin chain and intercepts create/update/remove
  * to propagate invalidations to dependent caches.
  *

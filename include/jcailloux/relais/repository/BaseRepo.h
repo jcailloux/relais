@@ -1,5 +1,5 @@
-#ifndef JCX_RELAIS_BASEREPOSITORY_H
-#define JCX_RELAIS_BASEREPOSITORY_H
+#ifndef JCX_RELAIS_BASEREPO_H
+#define JCX_RELAIS_BASEREPO_H
 
 #include <optional>
 #include <string>
@@ -11,7 +11,7 @@
 #include "jcailloux/relais/io/pg/PgResult.h"
 #include "jcailloux/relais/DbProvider.h"
 #include "jcailloux/relais/Log.h"
-#include "jcailloux/relais/config/repository_config.h"
+#include "jcailloux/relais/config/repo_config.h"
 #include "jcailloux/relais/config/FixedString.h"
 #include "jcailloux/relais/wrapper/EntityConcepts.h"
 #include "jcailloux/relais/wrapper/FieldUpdate.h"
@@ -75,10 +75,10 @@ inline std::string buildUpdateReturning(
 }  // namespace detail
 
 // =========================================================================
-// BaseRepository - CRUD operations with L3 (database) access only
+// BaseRepo - CRUD operations with L3 (database) access only
 // =========================================================================
 //
-// Hierarchy: BaseRepository -> RedisRepository -> CachedRepository
+// Hierarchy: BaseRepo -> RedisRepo -> CachedRepo
 //
 // No CRTP. Config is a CacheConfig NTTP. Cross-invalidation is handled
 // by InvalidationMixin at a higher layer.
@@ -89,7 +89,7 @@ inline std::string buildUpdateReturning(
 
 template<typename Entity, config::FixedString Name, config::CacheConfig Cfg, typename Key>
 requires ReadableEntity<Entity>
-class BaseRepository {
+class BaseRepo {
     using Mapping = typename Entity::MappingType;
 
 public:
@@ -272,7 +272,7 @@ public:
     // Invalidation pass-through (public interface)
     // =====================================================================
 
-    /// Invalidate cache for a key. No-op at BaseRepository level.
+    /// Invalidate cache for a key. No-op at BaseRepo level.
     static io::Task<void> invalidate([[maybe_unused]] const Key& id) {
         co_return;
     }
@@ -284,7 +284,7 @@ public:
     }
 
     /// Selectively invalidate list pages for a pre-built group key.
-    /// No-op at BaseRepository level.
+    /// No-op at BaseRepo level.
     static io::Task<size_t> invalidateListGroupByKey(
         [[maybe_unused]] const std::string& groupKey,
         [[maybe_unused]] int64_t entity_sort_val)
@@ -292,7 +292,7 @@ public:
         co_return 0;
     }
 
-    /// Invalidate all list cache groups. No-op at BaseRepository level.
+    /// Invalidate all list cache groups. No-op at BaseRepo level.
     static io::Task<size_t> invalidateAllListGroups()
     {
         co_return 0;
@@ -420,4 +420,4 @@ protected:
 
 }  // namespace jcailloux::relais
 
-#endif //JCX_RELAIS_BASEREPOSITORY_H
+#endif //JCX_RELAIS_BASEREPO_H

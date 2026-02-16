@@ -7,15 +7,15 @@ This document describes the internal architecture of relais for contributors and
 The library uses a **mixin architecture with method hiding** for compile-time composition. No CRTP — no `Derived` template parameter. Each layer calls `Base::method()` downward.
 
 ```
-BaseRepository<Entity, Name, Cfg, Key>
+BaseRepo<Entity, Name, Cfg, Key>
        |
        |  (adds Redis caching — if L2 or L1_L2)
        v
-RedisRepository<Entity, Name, Cfg, Key>
+RedisRepo<Entity, Name, Cfg, Key>
        |
        |  (adds RAM caching — if L1 or L1_L2)
        v
-CachedRepository<Entity, Name, Cfg, Key>
+CachedRepo<Entity, Name, Cfg, Key>
        |
        |  (adds list caching — if Entity has ListDescriptor)
        v
@@ -26,7 +26,7 @@ ListMixin<CacheLayer>
 InvalidationMixin<WithList, Invalidations...>
        |
        v
-Repository<Entity, Name, Cfg, Invalidations...>  (final class)
+Repo<Entity, Name, Cfg, Invalidations...>  (final class)
 ```
 
 ### Template Parameters
@@ -48,7 +48,7 @@ No `Config` struct, no `typename Derived`, no separate ORM model type.
 
 Each mixin layer can override methods from its `Base` by declaring a method with the same name. The upper method calls `Base::method()` explicitly to delegate. This is standard C++ name hiding — no virtuals, no CRTP.
 
-Example: `ListMixin::update()` hides `CachedRepository::update()`:
+Example: `ListMixin::update()` hides `CachedRepo::update()`:
 
 ```cpp
 template<typename Base>
@@ -62,9 +62,9 @@ class ListMixin : public Base {
 };
 ```
 
-### RepositoryBuilder
+### RepoBuilder
 
-`Repository.h` contains the `RepositoryBuilder` that auto-assembles the mixin chain:
+`Repo.h` contains the `RepoBuilder` that auto-assembles the mixin chain:
 
 ```cpp
 namespace detail {
@@ -74,11 +74,11 @@ template<typename Entity, config::FixedString Name, config::CacheConfig Cfg, typ
 struct CacheLayerSelector {
     using type = std::conditional_t<
         Cfg.cache_level == CacheLevel::L1 || Cfg.cache_level == CacheLevel::L1_L2,
-        CachedRepository<Entity, Name, Cfg, Key>,
+        CachedRepo<Entity, Name, Cfg, Key>,
         std::conditional_t<
             Cfg.cache_level == CacheLevel::L2,
-            RedisRepository<Entity, Name, Cfg, Key>,
-            BaseRepository<Entity, Name, Cfg, Key>
+            RedisRepo<Entity, Name, Cfg, Key>,
+            BaseRepo<Entity, Name, Cfg, Key>
         >
     >;
 };
@@ -105,7 +105,7 @@ struct MixinStack {
 }  // namespace detail
 ```
 
-The `Repository<>` class inherits from `MixinStack::type` and adds:
+The `Repo<>` class inherits from `MixinStack::type` and adds:
 - Compile-time `static_assert` validation (L1/L2 TTL > 0, segments >= 2, concept checks)
 - Convenience methods (`updateFromJson`, `updateFromBinary`)
 - Re-export of base type aliases (`EntityType`, `KeyType`, `MappingType`, etc.)
@@ -114,21 +114,21 @@ The `Repository<>` class inherits from `MixinStack::type` and adds:
 
 | `Cfg.cache_level` | Selected Base |
 |--------------------|---------------|
-| `CacheLevel::None` | `BaseRepository` |
-| `CacheLevel::L2` | `RedisRepository` |
-| `CacheLevel::L1` | `CachedRepository` (inherits `BaseRepository`) |
-| `CacheLevel::L1_L2` | `CachedRepository` (inherits `RedisRepository`) |
+| `CacheLevel::None` | `BaseRepo` |
+| `CacheLevel::L2` | `RedisRepo` |
+| `CacheLevel::L1` | `CachedRepo` (inherits `BaseRepo`) |
+| `CacheLevel::L1_L2` | `CachedRepo` (inherits `RedisRepo`) |
 
-### Conditional Inheritance in CachedRepository
+### Conditional Inheritance in CachedRepo
 
-`CachedRepository` uses `std::conditional_t` to choose its base class at compile time:
+`CachedRepo` uses `std::conditional_t` to choose its base class at compile time:
 
 ```cpp
 template<typename Entity, config::FixedString Name, config::CacheConfig Cfg, typename Key>
-class CachedRepository : public std::conditional_t<
+class CachedRepo : public std::conditional_t<
     Cfg.cache_level == CacheLevel::L1,
-    BaseRepository<Entity, Name, Cfg, Key>,      // L1-only: skip Redis
-    RedisRepository<Entity, Name, Cfg, Key>       // L1_L2: include Redis layer
+    BaseRepo<Entity, Name, Cfg, Key>,      // L1-only: skip Redis
+    RedisRepo<Entity, Name, Cfg, Key>       // L1_L2: include Redis layer
 > { ... };
 ```
 
@@ -187,7 +187,7 @@ The L1 (RAM) cache uses [shardmap](../jcailloux-shardmap), a thread-safe concurr
 ### Cache Storage with Metadata
 
 ```cpp
-// CachedRepository.h
+// CachedRepo.h
 struct EntityCacheMetadata {
     std::atomic<int64_t> expiration_rep{0};  // Atomic for shared-lock safety
     // ... constructor from time_point, expiration()/setExpiration() accessors
@@ -288,27 +288,27 @@ Database Query --> Store in L2 --> Store in L1 --> Return
 
 For standard repositories:
 ```
-CachedRepository::remove(id)
+CachedRepo::remove(id)
     |-- invalidateL1Internal(id)
     v
-RedisRepository::remove(id)
-    |-- co_await BaseRepository::remove(id)  -> deleteByPrimaryKey(id)
+RedisRepo::remove(id)
+    |-- co_await BaseRepo::remove(id)  -> deleteByPrimaryKey(id)
     |-- co_await invalidateRedisInternal(id)
 ```
 
 For PartialKey repositories, `remove` uses an **opportunistic hint** pattern — cache layers pass any already-available entity to the base layer to enable full PK deletion (partition pruning):
 
 ```
-CachedRepository::remove(id)
+CachedRepo::remove(id)
     |-- hint = getFromCache(id)         // Free L1 check (~0ns)
     |
     v
-RedisRepository::removeImpl(id, hint)
+RedisRepo::removeImpl(id, hint)
     |-- if (!hint && PartialKey):
     |     hint = co_await getFromCache(redisKey)  // L2 check (~0.1-1ms)
     |
     v
-BaseRepository::removeImpl(id, hint)
+BaseRepo::removeImpl(id, hint)
     |-- if (hint):
     |     params = Entity::makeFullKeyParams(*hint)
     |     DELETE ... WHERE id=$1 AND region=$2     // Full composite PK -> 1 partition
@@ -373,7 +373,7 @@ This augmented descriptor is exposed as `ListDescriptorType` for use with `parse
 
 ListMixin uses **two independent shardmap instances** — one for entities, one for lists:
 
-- **Entity cache** (from CachedRepository): `shardmap::ShardMap<Key, EntityPtr, EntityCacheMetadata>` — keys = PK values
+- **Entity cache** (from CachedRepo): `shardmap::ShardMap<Key, EntityPtr, EntityCacheMetadata>` — keys = PK values
 - **List cache** (from ListMixin): `shardmap::ShardMap<size_t, ResultPtr, ListCacheMetadata>` — keys = XXH3 hash of query
 
 These are different template instantiations, so they are distinct static objects with independent `KeyTracker`, cleanup state, and segments. No collision is possible.
@@ -490,7 +490,7 @@ static io::Task<bool> update(const Key& id, WrapperPtrType wrapper) {
 ### Four Invalidation Mechanisms
 
 ```cpp
-// Declared as Invalidations... variadic pack on Repository:
+// Declared as Invalidations... variadic pack on Repo:
 cache::Invalidate<TargetCache, &Entity::foreign_key>          // table -> table (simple)
 cache::InvalidateList<ListRepo>                                // table -> list (full entity)
 cache::InvalidateVia<Target, &Entity::key, &Resolver::resolve> // table -> table (async resolver)
@@ -547,7 +547,7 @@ Each `invalidateListGroupByKey` executes a Lua script that reads the 19-byte bin
 ```
 list/
 ├── ListCache.h              # Core cache, SortBounds, PaginationMode, ListBoundsHeader
-├── ListCacheRepository.h    # Low-level mixin (used by ListMixin internally)
+├── ListCacheRepo.h    # Low-level mixin (used by ListMixin internally)
 ├── ListCacheTraits.h        # Traits concepts for filter/sort
 ├── ListQuery.h              # Query and result types
 ├── ModificationTracker.h    # Unified modification tracking
@@ -704,7 +704,7 @@ Same as above, but checks interval overlap:
 
 List query methods exist at all repository levels for config-level switching:
 
-| Method | BaseRepository | RedisRepository |
+| Method | BaseRepo | RedisRepo |
 |--------|---------------|-----------------|
 | `cachedList(query, keyParts...)` | Pass-through (executes query) | Redis-cached |
 | `cachedListTracked(query, limit, offset, groupParts...)` | Pass-through | Redis-cached + tracked |
@@ -854,8 +854,8 @@ Composed concepts used in repository `requires` clauses:
 
 | Concept | Definition | Used by |
 |---------|------------|---------|
-| `ReadableEntity<W>` | Has Mapping with SQL queries | `BaseRepository` |
-| `CacheableEntity<W>` | `Readable + Serializable` | `RedisRepository`, `CachedRepository` |
+| `ReadableEntity<W>` | Has Mapping with SQL queries | `BaseRepo` |
+| `CacheableEntity<W>` | `Readable + Serializable` | `RedisRepo`, `CachedRepo` |
 | `MutableEntity<W>` | `Readable + has insert/update SQL` | `create()`, `update()` |
 | `CreatableEntity<W, K>` | `Mutable + Keyed` | `create()` with cache population |
 
@@ -880,7 +880,7 @@ concept HasBinarySerialization = requires(const Entity& e, std::span<const uint8
 The repository automatically selects the serialization format based on entity capabilities:
 
 ```cpp
-// In RedisRepository::getFromCache / setInCache:
+// In RedisRepo::getFromCache / setInCache:
 if constexpr (HasBinarySerialization<Entity>) {
     // Binary path (BEVE via Glaze)
 } else {
@@ -981,15 +981,15 @@ template<auto F> auto setNull();          // Returns FieldSetNull<F>
 ### updateBy Flow Across Tiers
 
 ```
-CachedRepository::updateBy(id, set<F>(v)...)
+CachedRepo::updateBy(id, set<F>(v)...)
     |-- invalidateL1Internal(id)
     |
     v
-RedisRepository::updateBy(id, set<F>(v)...)
+RedisRepo::updateBy(id, set<F>(v)...)
     |-- co_await invalidateRedisInternal(id)
     |
     v
-BaseRepository::updateBy(id, set<F>(v)...)
+BaseRepo::updateBy(id, set<F>(v)...)
     |-- [optional] Fetch old entity for cross-invalidation
     |
     |-- Build dynamic SQL: UPDATE table SET "col1"=$1, "col2"=$2 WHERE "pk"=$3 RETURNING *
@@ -1024,8 +1024,8 @@ PartialKey is auto-detected at compile time via the `HasPartitionKey` concept, w
 ## Namespace Organization
 
 ```
-jcailloux::relais::                     # Repository, BaseRepository, RedisRepository,
-                                        # CachedRepository, ListMixin, InvalidationMixin
+jcailloux::relais::                     # Repo, BaseRepo, RedisRepo,
+                                        # CachedRepo, ListMixin, InvalidationMixin
 jcailloux::relais::config::             # CacheConfig, CacheLevel, UpdateStrategy,
                                         # Duration, FixedString, presets
 jcailloux::relais::wrapper::            # EntityWrapper<Struct, Mapping>, ListWrapper<Item>
@@ -1063,7 +1063,7 @@ wrapper/
 
 ## Performance Considerations
 
-1. **Warmup**: Call `Repository::warmup()` at startup to pre-allocate internal structures (both entity and list caches)
+1. **Warmup**: Call `Repo::warmup()` at startup to pre-allocate internal structures (both entity and list caches)
 2. **Segment count**: More segments = less contention but more memory overhead
 3. **Cleanup frequency**: `l1_cleanup_every_n_gets` balances memory usage and CPU overhead
 4. **Lazy validation**: Modifications are checked on `get()`, not on notification

@@ -116,35 +116,35 @@ namespace relais_test {
 namespace ct = config_test;
 
 // TTL repos
-using TTL50msRepo   = Repository<TestItemWrapper, "cfg:l1:ttl50",   ct::TTL50ms>;
-using TTL500msRepo  = Repository<TestItemWrapper, "cfg:l1:ttl500",  ct::TTL500ms>;
+using TTL50msRepo   = Repo<TestItemWrapper, "cfg:l1:ttl50",   ct::TTL50ms>;
+using TTL500msRepo  = Repo<TestItemWrapper, "cfg:l1:ttl500",  ct::TTL500ms>;
 
 // Refresh repos
-using RefreshTrueRepo  = Repository<TestItemWrapper, "cfg:l1:refresh:t",  ct::RefreshTrue>;
-using RefreshFalseRepo = Repository<TestItemWrapper, "cfg:l1:refresh:f",  ct::RefreshFalse>;
+using RefreshTrueRepo  = Repo<TestItemWrapper, "cfg:l1:refresh:t",  ct::RefreshTrue>;
+using RefreshFalseRepo = Repo<TestItemWrapper, "cfg:l1:refresh:f",  ct::RefreshFalse>;
 
 // Accept expired repos
-using AcceptExpTrueRepo  = Repository<TestItemWrapper, "cfg:l1:exp:t",  ct::AcceptExpTrue>;
-using AcceptExpFalseRepo = Repository<TestItemWrapper, "cfg:l1:exp:f",  ct::AcceptExpFalse>;
+using AcceptExpTrueRepo  = Repo<TestItemWrapper, "cfg:l1:exp:t",  ct::AcceptExpTrue>;
+using AcceptExpFalseRepo = Repo<TestItemWrapper, "cfg:l1:exp:f",  ct::AcceptExpFalse>;
 
 // Segment repos
-using Seg2Repo  = Repository<TestItemWrapper, "cfg:l1:seg2",  ct::Seg2>;
-using Seg16Repo = Repository<TestItemWrapper, "cfg:l1:seg16", ct::Seg16>;
+using Seg2Repo  = Repo<TestItemWrapper, "cfg:l1:seg2",  ct::Seg2>;
+using Seg16Repo = Repo<TestItemWrapper, "cfg:l1:seg16", ct::Seg16>;
 
 // Strategy repos
-using LazyReloadRepo  = Repository<TestItemWrapper, "cfg:l1:lazy",  ct::LazyReload>;
-using PopImmediateRepo = Repository<TestItemWrapper, "cfg:l1:pop",   ct::PopImmediate>;
+using LazyReloadRepo  = Repo<TestItemWrapper, "cfg:l1:lazy",  ct::LazyReload>;
+using PopImmediateRepo = Repo<TestItemWrapper, "cfg:l1:pop",   ct::PopImmediate>;
 
 // Auto-cleanup repos
-using AutoCleanup5Repo = Repository<TestItemWrapper, "cfg:l1:ac5",  ct::AutoCleanup5>;
-using AutoCleanupOffRepo = Repository<TestItemWrapper, "cfg:l1:ac0", ct::AutoCleanupDisabled>;
+using AutoCleanup5Repo = Repo<TestItemWrapper, "cfg:l1:ac5",  ct::AutoCleanup5>;
+using AutoCleanupOffRepo = Repo<TestItemWrapper, "cfg:l1:ac0", ct::AutoCleanupDisabled>;
 
 // Cleanup interval repos
-using CleanupInterval0Repo = Repository<TestItemWrapper, "cfg:l1:ci0",   ct::CleanupInterval0>;
-using CleanupIntervalLongRepo = Repository<TestItemWrapper, "cfg:l1:cilong", ct::CleanupIntervalLong>;
+using CleanupInterval0Repo = Repo<TestItemWrapper, "cfg:l1:ci0",   ct::CleanupInterval0>;
+using CleanupIntervalLongRepo = Repo<TestItemWrapper, "cfg:l1:cilong", ct::CleanupIntervalLong>;
 
 // Read-only repo
-using ReadOnlyCfgRepo = Repository<TestItemWrapper, "cfg:l1:ro", ct::ReadOnlyL1>;
+using ReadOnlyCfgRepo = Repo<TestItemWrapper, "cfg:l1:ro", ct::ReadOnlyL1>;
 
 } // namespace relais_test
 

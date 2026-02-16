@@ -68,7 +68,7 @@ tests/
 │   ├── TestOrder.h           # Complex struct (nested, enum, vectors, raw JSON)
 │   ├── TestEvent.h           # Pure data struct for partitioned table
 │   ├── TestEntities.h       # EntityWrapper<Struct, Mapping> type aliases
-│   └── TestRepositories.h   # Repository classes with 4+ cache configs
+│   └── TestRepositories.h   # Repo classes with 4+ cache configs
 ├── migrations/
 │   ├── 000001_create_test_items.sql
 │   ├── 000004_create_test_orders.sql
@@ -77,9 +77,9 @@ tests/
 │   ├── test_l1_config.cpp          # Exhaustive L1 config parameter tests (TTL, refresh, cleanup)
 │   └── test_l2_config.cpp          # Exhaustive L2 config parameter tests (TTL, refresh, strategy)
 ├── test_generated_wrapper.cpp      # Unit tests for struct + EntityWrapper + ListWrapper
-├── test_base_repository.cpp        # Tests for BaseRepository (no cache) + updateBy
-├── test_redis_repository.cpp       # Tests for RedisRepository (L2 cache)
-├── test_cached_repository.cpp      # Tests for CachedRepository (L1 cache)
+├── test_base_repository.cpp        # Tests for BaseRepo (no cache) + updateBy
+├── test_redis_repository.cpp       # Tests for RedisRepo (L2 cache)
+├── test_cached_repository.cpp      # Tests for CachedRepo (L1 cache)
 ├── test_full_cache.cpp             # Tests for L1+L2 (Both) cache hierarchy interaction
 ├── test_decl_list_cache.cpp        # Tests for ListMixin (L1 list cache)
 ├── test_decl_list_redis.cpp        # Tests for declarative list caching at L2 (Redis)
@@ -110,7 +110,7 @@ ctest -L integration --output-on-failure
 
 ### Specific Test Case
 ```bash
-./test_relais_base "[BaseRepository] CRUD Operations"
+./test_relais_base "[BaseRepo] CRUD Operations"
 ```
 
 ### With Verbose Output
@@ -147,7 +147,7 @@ This ensures complete isolation between tests without leaving data behind.
 - **Multiple field update**: Modifies several columns in a single call
 - **Re-fetch verification**: Confirms `updateBy` returns the complete re-fetched entity from the database
 
-These tests use `UncachedTestUserRepository` (a generated entity repository) since `updateBy` requires a generated entity with `TraitsType` containing `Field` enum and `FieldInfo` specializations. Hand-written entities (e.g., `TestItemEntity`) do not support `updateBy`.
+These tests use `UncachedTestUserRepo` (a generated entity repository) since `updateBy` requires a generated entity with `TraitsType` containing `Field` enum and `FieldInfo` specializations. Hand-written entities (e.g., `TestItemEntity`) do not support `updateBy`.
 
 ### PartialKey updateBy
 
@@ -157,7 +157,7 @@ See `test_partial_key.cpp` sections 8a-8d for coverage at all cache levels + cro
 
 ## Test Tags
 
-### `test_relais_redis` (RedisRepository — L2 cache)
+### `test_relais_redis` (RedisRepo — L2 cache)
 
 | Tag | Description |
 |-----|-------------|

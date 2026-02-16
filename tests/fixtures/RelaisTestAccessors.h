@@ -6,7 +6,7 @@
  * Test-only accessor for relais internal state.
  * Compiled only when RELAIS_BUILDING_TESTS is defined.
  * Provides cache reset, modification count inspection, and forced cleanup
- * via friend access to CachedRepository, ListMixin, ListCache, and ModificationTracker.
+ * via friend access to CachedRepo, ListMixin, ListCache, and ModificationTracker.
  */
 
 #include <shared_mutex>

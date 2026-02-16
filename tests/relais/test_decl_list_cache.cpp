@@ -68,11 +68,11 @@ TestListQuery makeViewCountQuery(std::string_view category, uint16_t limit) {
 //
 // #############################################################################
 
-TEST_CASE("[DeclListRepository] Article list query",
+TEST_CASE("[DeclListRepo] Article list query",
           "[integration][db][list][query][article]")
 {
     TransactionGuard tx;
-    TestInternals::resetListCacheState<TestArticleListRepository>();
+    TestInternals::resetListCacheState<TestArticleListRepo>();
 
     SECTION("[query] returns all articles when no filter") {
         auto userId = insertTestUser("author", "author@example.com", 0);
@@ -80,7 +80,7 @@ TEST_CASE("[DeclListRepository] Article list query",
         insertTestArticle("news", userId, "Article B", 20);
         insertTestArticle("tech", userId, "Article C", 30);
 
-        auto result = sync(TestArticleListRepository::query(makeArticleQuery()));
+        auto result = sync(TestArticleListRepo::query(makeArticleQuery()));
 
         REQUIRE(result->size() == 3);
         REQUIRE(result->size() == 3);
@@ -92,7 +92,7 @@ TEST_CASE("[DeclListRepository] Article list query",
         insertTestArticle("news", userId, "News 1", 20);
         insertTestArticle("tech", userId, "Tech 2", 30);
 
-        auto result = sync(TestArticleListRepository::query(
+        auto result = sync(TestArticleListRepo::query(
             makeArticleQuery("tech")));
 
         REQUIRE(result->size() == 2);
@@ -106,7 +106,7 @@ TEST_CASE("[DeclListRepository] Article list query",
         insertTestArticle("tech", user2, "Bob Article 1", 20);
         insertTestArticle("news", user2, "Bob Article 2", 30);
 
-        auto result = sync(TestArticleListRepository::query(
+        auto result = sync(TestArticleListRepo::query(
             makeArticleQuery(std::nullopt, user2)));
 
         REQUIRE(result->size() == 2);
@@ -121,7 +121,7 @@ TEST_CASE("[DeclListRepository] Article list query",
         insertTestArticle("tech", user2, "Bob Tech", 30);
         insertTestArticle("news", user2, "Bob News", 40);
 
-        auto result = sync(TestArticleListRepository::query(
+        auto result = sync(TestArticleListRepo::query(
             makeArticleQuery("tech", user2)));
 
         REQUIRE(result->size() == 1);
@@ -132,7 +132,7 @@ TEST_CASE("[DeclListRepository] Article list query",
         auto userId = insertTestUser("author", "author@example.com", 0);
         insertTestArticle("tech", userId, "Tech Article", 10);
 
-        auto result = sync(TestArticleListRepository::query(
+        auto result = sync(TestArticleListRepo::query(
             makeArticleQuery("nonexistent")));
 
         REQUIRE(result->size() == 0);
@@ -145,14 +145,14 @@ TEST_CASE("[DeclListRepository] Article list query",
             insertTestArticle("tech", userId, "Article " + std::to_string(i), i * 10);
         }
 
-        auto result = sync(TestArticleListRepository::query(
+        auto result = sync(TestArticleListRepo::query(
             makeArticleQuery(std::nullopt, std::nullopt, 10)));
 
         REQUIRE(result->size() == 5);
     }
 
     SECTION("[query] returns empty when no data") {
-        auto result = sync(TestArticleListRepository::query(makeArticleQuery()));
+        auto result = sync(TestArticleListRepo::query(makeArticleQuery()));
 
         REQUIRE(result->size() == 0);
         REQUIRE(result->empty());
@@ -165,18 +165,18 @@ TEST_CASE("[DeclListRepository] Article list query",
 //
 // #############################################################################
 
-TEST_CASE("[DeclListRepository] Article Item accessors",
+TEST_CASE("[DeclListRepo] Article Item accessors",
           "[integration][db][list][itemview][article]")
 {
     TransactionGuard tx;
-    TestInternals::resetListCacheState<TestArticleListRepository>();
+    TestInternals::resetListCacheState<TestArticleListRepo>();
 
     SECTION("[itemview] firstItem and lastItem are accessible") {
         auto userId = insertTestUser("author", "author@example.com", 0);
         insertTestArticle("tech", userId, "First Article", 10, true);
         insertTestArticle("news", userId, "Last Article", 20, true);
 
-        auto result = sync(TestArticleListRepository::query(makeArticleQuery()));
+        auto result = sync(TestArticleListRepo::query(makeArticleQuery()));
 
         REQUIRE(result->size() == 2);
 
@@ -191,7 +191,7 @@ TEST_CASE("[DeclListRepository] Article Item accessors",
         auto userId = insertTestUser("author", "author@example.com", 0);
         insertTestArticle("science", userId, "Science Article", 42, true);
 
-        auto result = sync(TestArticleListRepository::query(
+        auto result = sync(TestArticleListRepo::query(
             makeArticleQuery("science")));
 
         REQUIRE(result->size() == 1);
@@ -207,11 +207,11 @@ TEST_CASE("[DeclListRepository] Article Item accessors",
 //
 // #############################################################################
 
-TEST_CASE("[DeclListRepository] Purchase list query",
+TEST_CASE("[DeclListRepo] Purchase list query",
           "[integration][db][list][query][purchase]")
 {
     TransactionGuard tx;
-    TestInternals::resetListCacheState<TestPurchaseListRepository>();
+    TestInternals::resetListCacheState<TestPurchaseListRepo>();
 
     SECTION("[query] returns all purchases when no filter") {
         auto userId = insertTestUser("buyer", "buyer@example.com", 1000);
@@ -219,7 +219,7 @@ TEST_CASE("[DeclListRepository] Purchase list query",
         insertTestPurchase(userId, "Item B", 200, "pending");
         insertTestPurchase(userId, "Item C", 300, "completed");
 
-        auto result = sync(TestPurchaseListRepository::query(makePurchaseQuery()));
+        auto result = sync(TestPurchaseListRepo::query(makePurchaseQuery()));
 
         REQUIRE(result->size() == 3);
         REQUIRE(result->size() == 3);
@@ -232,7 +232,7 @@ TEST_CASE("[DeclListRepository] Purchase list query",
         insertTestPurchase(user2, "Gadget", 200);
         insertTestPurchase(user2, "Doohickey", 300);
 
-        auto result = sync(TestPurchaseListRepository::query(
+        auto result = sync(TestPurchaseListRepo::query(
             makePurchaseQuery(user2)));
 
         REQUIRE(result->size() == 2);
@@ -245,7 +245,7 @@ TEST_CASE("[DeclListRepository] Purchase list query",
         insertTestPurchase(userId, "Item B", 200, "pending");
         insertTestPurchase(userId, "Item C", 300, "completed");
 
-        auto result = sync(TestPurchaseListRepository::query(
+        auto result = sync(TestPurchaseListRepo::query(
             makePurchaseQuery(std::nullopt, std::string("completed"))));
 
         REQUIRE(result->size() == 2);
@@ -260,7 +260,7 @@ TEST_CASE("[DeclListRepository] Purchase list query",
         insertTestPurchase(user2, "C", 300, "completed");
         insertTestPurchase(user2, "D", 400, "pending");
 
-        auto result = sync(TestPurchaseListRepository::query(
+        auto result = sync(TestPurchaseListRepo::query(
             makePurchaseQuery(user1, std::string("pending"))));
 
         REQUIRE(result->size() == 1);
@@ -268,7 +268,7 @@ TEST_CASE("[DeclListRepository] Purchase list query",
     }
 
     SECTION("[query] returns empty when no data") {
-        auto result = sync(TestPurchaseListRepository::query(makePurchaseQuery()));
+        auto result = sync(TestPurchaseListRepo::query(makePurchaseQuery()));
 
         REQUIRE(result->size() == 0);
         REQUIRE(result->empty());
@@ -281,17 +281,17 @@ TEST_CASE("[DeclListRepository] Purchase list query",
 //
 // #############################################################################
 
-TEST_CASE("[DeclListRepository] Purchase Item accessors",
+TEST_CASE("[DeclListRepo] Purchase Item accessors",
           "[integration][db][list][itemview][purchase]")
 {
     TransactionGuard tx;
-    TestInternals::resetListCacheState<TestPurchaseListRepository>();
+    TestInternals::resetListCacheState<TestPurchaseListRepo>();
 
     SECTION("[itemview] returns correct fields") {
         auto userId = insertTestUser("buyer", "buyer@example.com", 1000);
         insertTestPurchase(userId, "Widget", 100, "completed");
 
-        auto result = sync(TestPurchaseListRepository::query(makePurchaseQuery()));
+        auto result = sync(TestPurchaseListRepo::query(makePurchaseQuery()));
 
         REQUIRE(result->size() == 1);
         const auto& view = result->items.front();
@@ -306,13 +306,13 @@ TEST_CASE("[DeclListRepository] Purchase Item accessors",
 //
 // #############################################################################
 
-TEST_CASE("[DeclListRepository] SortBounds invalidation precision",
+TEST_CASE("[DeclListRepo] SortBounds invalidation precision",
           "[integration][db][list][invalidation]")
 {
     TransactionGuard guard;
 
     // Reset list cache state for test isolation
-    TestInternals::resetListCacheState<TestArticleListRepository>();
+    TestInternals::resetListCacheState<TestArticleListRepo>();
 
     // =========================================================================
     // Setup: Create test data
@@ -351,15 +351,15 @@ TEST_CASE("[DeclListRepository] SortBounds invalidation precision",
         auto q3 = makeViewCountQuery("news", 10);
 
         // Prime the cache
-        auto r1 = sync(TestArticleListRepository::query(q1));
-        auto r2 = sync(TestArticleListRepository::query(q2));
-        auto r3 = sync(TestArticleListRepository::query(q3));
+        auto r1 = sync(TestArticleListRepo::query(q1));
+        auto r2 = sync(TestArticleListRepo::query(q2));
+        auto r3 = sync(TestArticleListRepo::query(q3));
 
         REQUIRE(r1->size() == 10);  // tech top 10
         REQUIRE(r2->size() == 15);  // tech all 15
         REQUIRE(r3->size() == 3);   // news all 3
 
-        CHECK(TestArticleListRepository::listCacheSize() == 3);
+        CHECK(TestArticleListRepo::listCacheSize() == 3);
 
         // Insert a new tech article with view_count=45 directly in DB
         // (two inserts: one for the DB data, one as entity for notification)
@@ -369,24 +369,24 @@ TEST_CASE("[DeclListRepository] SortBounds invalidation precision",
         auto trigger_entity = makeArticle(999, "tech", alice_id, "tech_trigger_45", 45);
 
         // Manually invoke the cross-invalidation path
-        TestArticleListRepository::notifyCreated(trigger_entity);
+        TestArticleListRepo::notifyCreated(trigger_entity);
 
         // Verify pending modifications
-        CHECK(TestInternals::pendingModificationCount<TestArticleListRepository>() == 1);
+        CHECK(TestInternals::pendingModificationCount<TestArticleListRepo>() == 1);
 
         // Re-query: q1 should be PRESERVED (45 < 60, out of bounds)
-        auto r1_after = sync(TestArticleListRepository::query(q1));
+        auto r1_after = sync(TestArticleListRepo::query(q1));
         // shouldEvictEntry: bounds(150, 60), 45 >= 60? false → NOT evicted
         CHECK(r1_after->size() == 10);  // Cache HIT (preserved)
 
         // Re-query: q2 should be INVALIDATED (45 >= 10)
-        auto r2_after = sync(TestArticleListRepository::query(q2));
+        auto r2_after = sync(TestArticleListRepo::query(q2));
         // shouldEvictEntry: bounds(150, 10), 45 >= 10 = true → evicted → re-fetch
         // Now DB has 16 tech articles (15 original + 1 new), limit=25 → returns 16
         CHECK(r2_after->size() == 16);  // Cache MISS → fresh data
 
         // Re-query: q3 should be PRESERVED (filter mismatch: entity is "tech", query filters "news")
-        auto r3_after = sync(TestArticleListRepository::query(q3));
+        auto r3_after = sync(TestArticleListRepo::query(q3));
         CHECK(r3_after->size() == 3);  // Cache HIT (preserved)
     }
 
@@ -398,7 +398,7 @@ TEST_CASE("[DeclListRepository] SortBounds invalidation precision",
 
         // Cache: tech limit=10 → [150..60], bounds(150, 60)
         auto q1 = makeViewCountQuery("tech", 10);
-        auto r1 = sync(TestArticleListRepository::query(q1));
+        auto r1 = sync(TestArticleListRepo::query(q1));
         REQUIRE(r1->size() == 10);
 
         // Find article with view_count=70 to update
@@ -414,10 +414,10 @@ TEST_CASE("[DeclListRepository] SortBounds invalidation precision",
         auto new_entity = makeArticle(article_70_id, "tech", alice_id, "tech_70_updated", 25);
 
         // Trigger update notification
-        TestArticleListRepository::notifyUpdated(old_entity, new_entity);
+        TestArticleListRepo::notifyUpdated(old_entity, new_entity);
 
         // Re-query: old_entity.view_count=70 is in [150, 60] → 70>=60 = true → INVALIDATED
-        auto r1_after = sync(TestArticleListRepository::query(q1));
+        auto r1_after = sync(TestArticleListRepo::query(q1));
         // After re-fetch: 70 is gone from top range, 50 takes its place
         // New top 10 DESC: [150,140,130,120,110,100,90,80,60,50]
         CHECK(r1_after->size() == 10);
@@ -430,7 +430,7 @@ TEST_CASE("[DeclListRepository] SortBounds invalidation precision",
     SECTION("[sortbounds] delete invalidates affected range") {
         // Cache: tech limit=10 → all 8 items [80..10], bounds(80, 10)
         auto q1 = makeViewCountQuery("tech", 10);
-        auto r1 = sync(TestArticleListRepository::query(q1));
+        auto r1 = sync(TestArticleListRepo::query(q1));
         REQUIRE(r1->size() == 8);
 
         // Find article with view_count=40 to delete
@@ -445,10 +445,10 @@ TEST_CASE("[DeclListRepository] SortBounds invalidation precision",
         deleteTestArticle(article_40_id);
 
         // Trigger delete notification
-        TestArticleListRepository::notifyDeleted(deleted_entity);
+        TestArticleListRepo::notifyDeleted(deleted_entity);
 
         // Re-query: deleted_entity.view_count=40, bounds(80, 10) → 40>=10 = true → INVALIDATED
-        auto r1_after = sync(TestArticleListRepository::query(q1));
+        auto r1_after = sync(TestArticleListRepo::query(q1));
         CHECK(r1_after->size() == 7);  // One fewer article
     }
 
@@ -457,8 +457,8 @@ TEST_CASE("[DeclListRepository] SortBounds invalidation precision",
         auto q_tech = makeViewCountQuery("tech", 10);
         auto q_news = makeViewCountQuery("news", 10);
 
-        auto r_tech = sync(TestArticleListRepository::query(q_tech));
-        auto r_news = sync(TestArticleListRepository::query(q_news));
+        auto r_tech = sync(TestArticleListRepo::query(q_tech));
+        auto r_news = sync(TestArticleListRepo::query(q_news));
         REQUIRE(r_tech->size() == 8);
         REQUIRE(r_news->size() == 3);
 
@@ -466,15 +466,15 @@ TEST_CASE("[DeclListRepository] SortBounds invalidation precision",
         auto new_tech_id = insertTestArticle("tech", alice_id, "tech_new", 55);
         auto tech_entity = makeArticle(new_tech_id, "tech", alice_id, "tech_new", 55);
 
-        TestArticleListRepository::notifyCreated(tech_entity);
+        TestArticleListRepo::notifyCreated(tech_entity);
 
         // tech: entity category="tech" matches filter → check bounds
         // bounds(80, 10), value=55 → 55>=10 = true → INVALIDATED
-        auto r_tech_after = sync(TestArticleListRepository::query(q_tech));
+        auto r_tech_after = sync(TestArticleListRepo::query(q_tech));
         CHECK(r_tech_after->size() == 9);  // Fresh data with new article
 
         // news: entity category="tech" does NOT match filter "news" → PRESERVED
-        auto r_news_after = sync(TestArticleListRepository::query(q_news));
+        auto r_news_after = sync(TestArticleListRepo::query(q_news));
         CHECK(r_news_after->size() == 3);  // Cache HIT
     }
 }
@@ -485,13 +485,13 @@ TEST_CASE("[DeclListRepository] SortBounds invalidation precision",
 //
 // #############################################################################
 
-TEST_CASE("[DeclListRepository] ModificationTracker cleanup",
+TEST_CASE("[DeclListRepo] ModificationTracker cleanup",
           "[integration][db][list][cleanup]")
 {
     TransactionGuard guard;
 
     // Reset list cache state for test isolation
-    TestInternals::resetListCacheState<TestArticleListRepository>();
+    TestInternals::resetListCacheState<TestArticleListRepo>();
 
     auto alice_id = insertTestUser("alice_cleanup", "alice_cleanup@test.com", 0);
 
@@ -503,49 +503,49 @@ TEST_CASE("[DeclListRepository] ModificationTracker cleanup",
     SECTION("[tracker-cleanup] old modifications are removed after enough cleanup cycles") {
         // Build entity manually (no DB round-trip needed for notification)
         auto entity1 = makeArticle(9001, "tech", alice_id, "cleanup_new", 35);
-        TestArticleListRepository::notifyCreated(entity1);
-        CHECK(TestInternals::pendingModificationCount<TestArticleListRepository>() == 1);
+        TestArticleListRepo::notifyCreated(entity1);
+        CHECK(TestInternals::pendingModificationCount<TestArticleListRepo>() == 1);
 
         // ModificationTracker uses a bitmap with ShardCount bits (one per shard).
         // Each cleanup cycle clears one shard's bit. After ShardCount cycles,
         // all bits are cleared → bitmap=0 → modification removed.
-        constexpr auto N = TestInternals::listCacheShardCount<TestArticleListRepository>();
+        constexpr auto N = TestInternals::listCacheShardCount<TestArticleListRepo>();
         for (size_t i = 0; i < N; ++i) {
-            TestInternals::forceModificationTrackerCleanup<TestArticleListRepository>();
+            TestInternals::forceModificationTrackerCleanup<TestArticleListRepo>();
         }
 
-        CHECK(TestInternals::pendingModificationCount<TestArticleListRepository>() == 0);
+        CHECK(TestInternals::pendingModificationCount<TestArticleListRepo>() == 0);
     }
 
     SECTION("[tracker-cleanup] recent modifications survive cleanup") {
-        constexpr auto N = TestInternals::listCacheShardCount<TestArticleListRepository>();
+        constexpr auto N = TestInternals::listCacheShardCount<TestArticleListRepo>();
 
         // Build entities manually
         auto entity1 = makeArticle(9001, "tech", alice_id, "cleanup_a", 15);
-        TestArticleListRepository::notifyCreated(entity1);
-        CHECK(TestInternals::pendingModificationCount<TestArticleListRepository>() == 1);
+        TestArticleListRepo::notifyCreated(entity1);
+        CHECK(TestInternals::pendingModificationCount<TestArticleListRepo>() == 1);
 
         // Run 1 cleanup cycle
-        TestInternals::forceModificationTrackerCleanup<TestArticleListRepository>();
-        CHECK(TestInternals::pendingModificationCount<TestArticleListRepository>() == 1);  // Still there
+        TestInternals::forceModificationTrackerCleanup<TestArticleListRepo>();
+        CHECK(TestInternals::pendingModificationCount<TestArticleListRepo>() == 1);  // Still there
 
         // Notify second creation
         auto entity2 = makeArticle(9002, "tech", alice_id, "cleanup_b", 25);
-        TestArticleListRepository::notifyCreated(entity2);
-        CHECK(TestInternals::pendingModificationCount<TestArticleListRepository>() == 2);
+        TestArticleListRepo::notifyCreated(entity2);
+        CHECK(TestInternals::pendingModificationCount<TestArticleListRepo>() == 2);
 
         // Run N-1 more cycles — entity1 has seen N total shards, entity2 has seen N-1
         for (size_t i = 0; i < N - 1; ++i) {
-            TestInternals::forceModificationTrackerCleanup<TestArticleListRepository>();
+            TestInternals::forceModificationTrackerCleanup<TestArticleListRepo>();
         }
 
         // entity1: 1 + (N-1) = N bits cleared → bitmap=0 → REMOVED
         // entity2: 0 + (N-1) = N-1 bits cleared → 1 bit remaining → KEPT
-        CHECK(TestInternals::pendingModificationCount<TestArticleListRepository>() == 1);
+        CHECK(TestInternals::pendingModificationCount<TestArticleListRepo>() == 1);
 
         // One more cycle removes entity2
-        TestInternals::forceModificationTrackerCleanup<TestArticleListRepository>();
-        CHECK(TestInternals::pendingModificationCount<TestArticleListRepository>() == 0);
+        TestInternals::forceModificationTrackerCleanup<TestArticleListRepo>();
+        CHECK(TestInternals::pendingModificationCount<TestArticleListRepo>() == 0);
     }
 
     SECTION("[tracker-cleanup] stale modification does not invalidate fresh cache entries") {
@@ -554,24 +554,24 @@ TEST_CASE("[DeclListRepository] ModificationTracker cleanup",
         auto id1 = insertTestArticle("tech", alice_id, "cleanup_stale", 35);
         auto entity1 = makeArticle(id1, "tech", alice_id, "cleanup_stale", 35);
 
-        TestArticleListRepository::notifyCreated(entity1);
-        CHECK(TestInternals::pendingModificationCount<TestArticleListRepository>() == 1);
+        TestArticleListRepo::notifyCreated(entity1);
+        CHECK(TestInternals::pendingModificationCount<TestArticleListRepo>() == 1);
 
         // 2. Wait a tiny bit so the cache entry will have a later timestamp
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
 
         // 3. Cache a query — this entry's cached_at will be AFTER the modification
         auto q = makeViewCountQuery("tech", 10);
-        auto r = sync(TestArticleListRepository::query(q));
+        auto r = sync(TestArticleListRepo::query(q));
         // DB now has 5 original + 1 new = 6 tech articles
         REQUIRE(r->size() == 6);
 
         // 4. Re-query: the modification is older than the cache entry → skipped → cache HIT
-        auto r_again = sync(TestArticleListRepository::query(q));
+        auto r_again = sync(TestArticleListRepo::query(q));
         CHECK(r_again->size() == 6);  // Cache HIT (stale modification ignored)
 
         // Cache should still have exactly 1 entry (not evicted)
-        CHECK(TestArticleListRepository::listCacheSize() == 1);
+        CHECK(TestArticleListRepo::listCacheSize() == 1);
     }
 }
 
@@ -585,18 +585,18 @@ TEST_CASE("[DeclListRepository] ModificationTracker cleanup",
 // added after the cutoff. This prevents premature draining when a modification
 // is track()'d between the segment cleanup and the modification cleanup.
 
-TEST_CASE("[DeclListRepository] Modification cutoff safety",
+TEST_CASE("[DeclListRepo] Modification cutoff safety",
           "[integration][db][list][cutoff]")
 {
     TransactionGuard guard;
-    TestInternals::resetListCacheState<TestArticleListRepository>();
+    TestInternals::resetListCacheState<TestArticleListRepo>();
 
     auto alice_id = insertTestUser("alice_cutoff", "alice_cutoff@test.com", 0);
 
     SECTION("[cutoff] cleanup(cutoff) only increments pre-cutoff modifications") {
         // M1: before cutoff
         auto entity1 = makeArticle(9001, "tech", alice_id, "before_cutoff", 10);
-        TestArticleListRepository::notifyCreated(entity1);
+        TestArticleListRepo::notifyCreated(entity1);
 
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
         auto cutoff = std::chrono::steady_clock::now();
@@ -604,39 +604,39 @@ TEST_CASE("[DeclListRepository] Modification cutoff safety",
 
         // M2: after cutoff
         auto entity2 = makeArticle(9002, "tech", alice_id, "after_cutoff", 20);
-        TestArticleListRepository::notifyCreated(entity2);
+        TestArticleListRepo::notifyCreated(entity2);
 
-        CHECK(TestInternals::pendingModificationCount<TestArticleListRepository>() == 2);
+        CHECK(TestInternals::pendingModificationCount<TestArticleListRepo>() == 2);
 
         // Run ShardCount cleanup cycles with the cutoff, one per shard identity.
         // Only M1 (before cutoff) has its bits cleared. M2 (after cutoff) is skipped.
-        constexpr auto N = TestInternals::listCacheShardCount<TestArticleListRepository>();
+        constexpr auto N = TestInternals::listCacheShardCount<TestArticleListRepo>();
         for (uint8_t i = 0; i < static_cast<uint8_t>(N); ++i) {
-            TestInternals::cleanupModificationsWithCutoff<TestArticleListRepository>(cutoff, i);
+            TestInternals::cleanupModificationsWithCutoff<TestArticleListRepo>(cutoff, i);
         }
 
         // M1: all N bits cleared → bitmap=0 → drained.  M2: 0 bits cleared → still present
-        CHECK(TestInternals::pendingModificationCount<TestArticleListRepository>() == 1);
+        CHECK(TestInternals::pendingModificationCount<TestArticleListRepo>() == 1);
     }
 
     SECTION("[cutoff] drain(cutoff) only removes pre-cutoff modifications") {
         auto entity1 = makeArticle(9001, "tech", alice_id, "before_drain", 10);
-        TestArticleListRepository::notifyCreated(entity1);
+        TestArticleListRepo::notifyCreated(entity1);
 
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
         auto cutoff = std::chrono::steady_clock::now();
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
 
         auto entity2 = makeArticle(9002, "tech", alice_id, "after_drain", 20);
-        TestArticleListRepository::notifyCreated(entity2);
+        TestArticleListRepo::notifyCreated(entity2);
 
-        CHECK(TestInternals::pendingModificationCount<TestArticleListRepository>() == 2);
+        CHECK(TestInternals::pendingModificationCount<TestArticleListRepo>() == 2);
 
         // Drain only modifications before cutoff
-        TestInternals::drainModificationsWithCutoff<TestArticleListRepository>(cutoff);
+        TestInternals::drainModificationsWithCutoff<TestArticleListRepo>(cutoff);
 
         // M1: drained.  M2: still present
-        CHECK(TestInternals::pendingModificationCount<TestArticleListRepository>() == 1);
+        CHECK(TestInternals::pendingModificationCount<TestArticleListRepo>() == 1);
     }
 
     SECTION("[cutoff] post-cutoff modification still invalidates cache entries") {
@@ -646,16 +646,16 @@ TEST_CASE("[DeclListRepository] Modification cutoff safety",
                               "cutoff_art_" + std::to_string(vc), vc);
         }
         auto q = makeViewCountQuery("tech", 10);
-        auto r1 = sync(TestArticleListRepository::query(q));
+        auto r1 = sync(TestArticleListRepo::query(q));
         REQUIRE(r1->size() == 5);
-        CHECK(TestArticleListRepository::listCacheSize() == 1);
+        CHECK(TestArticleListRepo::listCacheSize() == 1);
 
         // 2. M1 (before cutoff) — invalidates the cached page
         auto entity1 = makeArticle(9001, "tech", alice_id, "cutoff_old", 25);
-        TestArticleListRepository::notifyCreated(entity1);
+        TestArticleListRepo::notifyCreated(entity1);
 
         // Re-query to absorb M1's invalidation and re-cache with fresh timestamp
-        auto r2 = sync(TestArticleListRepository::query(q));
+        auto r2 = sync(TestArticleListRepo::query(q));
         REQUIRE(r2->size() == 5);  // DB still has 5 (entity1 not in DB)
 
         // 3. Cutoff between M1 and M2
@@ -666,14 +666,14 @@ TEST_CASE("[DeclListRepository] Modification cutoff safety",
         // 4. M2 (after cutoff) — insert into DB + notify
         insertTestArticle("tech", alice_id, "cutoff_new", 35);
         auto entity2 = makeArticle(9002, "tech", alice_id, "cutoff_new", 35);
-        TestArticleListRepository::notifyCreated(entity2);
+        TestArticleListRepo::notifyCreated(entity2);
 
         // 5. Drain only M1
-        TestInternals::drainModificationsWithCutoff<TestArticleListRepository>(cutoff);
-        CHECK(TestInternals::pendingModificationCount<TestArticleListRepository>() == 1);
+        TestInternals::drainModificationsWithCutoff<TestArticleListRepo>(cutoff);
+        CHECK(TestInternals::pendingModificationCount<TestArticleListRepo>() == 1);
 
         // 6. Re-query: M2 is still in tracker → cache invalidated → DB returns 6
-        auto r3 = sync(TestArticleListRepository::query(q));
+        auto r3 = sync(TestArticleListRepo::query(q));
         CHECK(r3->size() == 6);
     }
 }
@@ -689,11 +689,11 @@ TEST_CASE("[DeclListRepository] Modification cutoff safety",
 // the modification is skipped during get() → cache HIT despite the modification
 // still existing in the tracker.
 
-TEST_CASE("[DeclListRepository] Bitmap skip optimization",
+TEST_CASE("[DeclListRepo] Bitmap skip optimization",
           "[integration][db][list][skip]")
 {
     TransactionGuard guard;
-    TestInternals::resetListCacheState<TestArticleListRepository>();
+    TestInternals::resetListCacheState<TestArticleListRepo>();
 
     auto alice_id = insertTestUser("alice_skip", "alice_skip@test.com", 0);
 
@@ -704,12 +704,12 @@ TEST_CASE("[DeclListRepository] Bitmap skip optimization",
     SECTION("[skip] cleared bitmap bit prevents lazy invalidation") {
         // 1. Cache a query: tech articles sorted by view_count DESC, limit=10
         auto q = makeViewCountQuery("tech", 10);
-        auto r1 = sync(TestArticleListRepository::query(q));
+        auto r1 = sync(TestArticleListRepo::query(q));
         REQUIRE(r1->size() == 5);
-        CHECK(TestArticleListRepository::listCacheSize() == 1);
+        CHECK(TestArticleListRepo::listCacheSize() == 1);
 
         // 2. Read the shard_id assigned to this cache entry
-        auto shard_id_opt = TestInternals::getListEntryShardId<TestArticleListRepository>(
+        auto shard_id_opt = TestInternals::getListEntryShardId<TestArticleListRepo>(
             q.query_hash);
         REQUIRE(shard_id_opt.has_value());
         uint8_t shard_id = *shard_id_opt;
@@ -719,21 +719,21 @@ TEST_CASE("[DeclListRepository] Bitmap skip optimization",
         //    category="tech" matches filter, view_count=35 is in bounds [50, 10].
         insertTestArticle("tech", alice_id, "skip_trigger", 35);
         auto entity = makeArticle(9001, "tech", alice_id, "skip_trigger", 35);
-        TestArticleListRepository::notifyCreated(entity);
-        CHECK(TestInternals::pendingModificationCount<TestArticleListRepository>() == 1);
+        TestArticleListRepo::notifyCreated(entity);
+        CHECK(TestInternals::pendingModificationCount<TestArticleListRepo>() == 1);
 
         // 4. Clear ONLY the bit for the entry's shard identity in the ModificationTracker.
         //    The modification still exists (other bits remain set), but bit shard_id = 0.
         auto cutoff = std::chrono::steady_clock::now();
-        TestInternals::cleanupModificationsWithCutoff<TestArticleListRepository>(
+        TestInternals::cleanupModificationsWithCutoff<TestArticleListRepo>(
             cutoff, shard_id);
         // M still in tracker (other bits remain)
-        CHECK(TestInternals::pendingModificationCount<TestArticleListRepository>() == 1);
+        CHECK(TestInternals::pendingModificationCount<TestArticleListRepo>() == 1);
 
         // 5. Re-query: lazy validation in get() checks modification M.
         //    pending_segments & (1 << shard_id) == 0 → SKIP M → entry not affected → cache HIT.
         //    Cache HIT returns 5 (stale). Cache MISS would return 6 (DB has new article).
-        auto r2 = sync(TestArticleListRepository::query(q));
+        auto r2 = sync(TestArticleListRepo::query(q));
         CHECK(r2->size() == 5);  // Cache HIT — bitmap skip prevented invalidation
     }
 }

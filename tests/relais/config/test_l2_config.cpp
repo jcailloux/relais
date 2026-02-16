@@ -61,19 +61,19 @@ namespace relais_test {
 namespace l2ct = l2_config_test;
 
 // TTL repos
-using L2ShortTTLRepo = Repository<TestItemWrapper, "cfg:l2:ttl3s",  l2ct::ShortTTL>;
-using L2LongTTLRepo  = Repository<TestItemWrapper, "cfg:l2:ttl30s", l2ct::LongTTL>;
+using L2ShortTTLRepo = Repo<TestItemWrapper, "cfg:l2:ttl3s",  l2ct::ShortTTL>;
+using L2LongTTLRepo  = Repo<TestItemWrapper, "cfg:l2:ttl30s", l2ct::LongTTL>;
 
 // Refresh repos
-using L2RefreshTrueRepo  = Repository<TestItemWrapper, "cfg:l2:refresh:t",  l2ct::RefreshTrue>;
-using L2RefreshFalseRepo = Repository<TestItemWrapper, "cfg:l2:refresh:f",  l2ct::RefreshFalse>;
+using L2RefreshTrueRepo  = Repo<TestItemWrapper, "cfg:l2:refresh:t",  l2ct::RefreshTrue>;
+using L2RefreshFalseRepo = Repo<TestItemWrapper, "cfg:l2:refresh:f",  l2ct::RefreshFalse>;
 
 // Strategy repos
-using L2LazyReloadRepo  = Repository<TestItemWrapper, "cfg:l2:lazy",  l2ct::LazyReload>;
-using L2PopImmediateRepo = Repository<TestItemWrapper, "cfg:l2:pop",   l2ct::PopImmediate>;
+using L2LazyReloadRepo  = Repo<TestItemWrapper, "cfg:l2:lazy",  l2ct::LazyReload>;
+using L2PopImmediateRepo = Repo<TestItemWrapper, "cfg:l2:pop",   l2ct::PopImmediate>;
 
 // Read-only repo
-using L2ReadOnlyCfgRepo = Repository<TestItemWrapper, "cfg:l2:ro", l2ct::ReadOnlyL2>;
+using L2ReadOnlyCfgRepo = Repo<TestItemWrapper, "cfg:l2:ro", l2ct::ReadOnlyL2>;
 
 } // namespace relais_test
 

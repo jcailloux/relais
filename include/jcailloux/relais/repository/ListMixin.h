@@ -29,7 +29,7 @@ namespace jcailloux::relais {
  * Activated when Entity has a ListDescriptor (detected via HasListDescriptor concept).
  * Sits in the mixin chain between the cache layer and InvalidationMixin.
  *
- * Chain: [InvalidationMixin] -> ListMixin -> CachedRepository -> [RedisRepository] -> BaseRepository
+ * Chain: [InvalidationMixin] -> ListMixin -> CachedRepo -> [RedisRepo] -> BaseRepo
  *
  * Provides:
  * - query()           : paginated list queries with L1 caching + lazy invalidation

@@ -4,7 +4,7 @@
  * Tests for warmup() — priming cache infrastructure at startup.
  *
  * Covers:
- *   1. CachedRepository::warmup() — L1 entity cache priming
+ *   1. CachedRepo::warmup() — L1 entity cache priming
  *   2. ListMixin::warmup() — entity + list cache priming
  */
 
@@ -20,40 +20,40 @@ using namespace relais_test;
 
 // #############################################################################
 //
-//  1. CachedRepository::warmup — L1 entity cache
+//  1. CachedRepo::warmup — L1 entity cache
 //
 // #############################################################################
 
-TEST_CASE("CachedRepository::warmup - L1 entity cache",
+TEST_CASE("CachedRepo::warmup - L1 entity cache",
           "[integration][db][warmup][l1]")
 {
     TransactionGuard tx;
 
     SECTION("[warmup] primes L1 cache infrastructure without error") {
-        L1TestItemRepository::warmup();
+        L1TestItemRepo::warmup();
         // No crash, no exception — success
     }
 
     SECTION("[warmup] is idempotent (can be called twice)") {
-        L1TestItemRepository::warmup();
-        L1TestItemRepository::warmup();
+        L1TestItemRepo::warmup();
+        L1TestItemRepo::warmup();
         // Second call should be a no-op
     }
 
     SECTION("[warmup] findById works after warmup") {
-        L1TestItemRepository::warmup();
+        L1TestItemRepo::warmup();
 
         auto id = insertTestItem("warmup_item", 42);
-        auto item = sync(L1TestItemRepository::findById(id));
+        auto item = sync(L1TestItemRepo::findById(id));
         REQUIRE(item != nullptr);
         REQUIRE(item->name == "warmup_item");
     }
 
     SECTION("[warmup] cacheSize is 0 after warmup (probe cleaned up)") {
-        TestInternals::resetEntityCacheState<L1TestItemRepository>();
-        L1TestItemRepository::warmup();
+        TestInternals::resetEntityCacheState<L1TestItemRepo>();
+        L1TestItemRepo::warmup();
         // warmup() inserts a probe then invalidates it — cache should be empty
-        REQUIRE(getCacheSize<L1TestItemRepository>() == 0);
+        REQUIRE(getCacheSize<L1TestItemRepo>() == 0);
     }
 }
 
@@ -70,27 +70,27 @@ TEST_CASE("ListMixin::warmup - entity + list cache",
     TransactionGuard tx;
 
     SECTION("[warmup] primes both entity and list cache") {
-        TestArticleListRepository::warmup();
+        TestArticleListRepo::warmup();
         // No crash, no exception — success
     }
 
     SECTION("[warmup] list query works after warmup") {
-        TestArticleListRepository::warmup();
+        TestArticleListRepo::warmup();
 
         auto userId = insertTestUser("warmup_author", "warmup@test.com", 0);
         insertTestArticle("tech", userId, "Warmup Article", 10, true);
 
-        auto result = sync(TestArticleListRepository::query(
+        auto result = sync(TestArticleListRepo::query(
             makeArticleQuery("tech")));
         REQUIRE(result->size() == 1);
     }
 
     SECTION("[warmup] listCacheSize is 0 after warmup (probe cleaned up)") {
-        TestInternals::resetEntityCacheState<TestArticleListRepository>();
-        TestInternals::resetListCacheState<TestArticleListRepository>();
-        TestArticleListRepository::warmup();
+        TestInternals::resetEntityCacheState<TestArticleListRepo>();
+        TestInternals::resetListCacheState<TestArticleListRepo>();
+        TestArticleListRepo::warmup();
         // warmup() inserts probes then invalidates them — caches should be empty
-        REQUIRE(getCacheSize<TestArticleListRepository>() == 0);
-        REQUIRE(TestArticleListRepository::listCacheSize() == 0);
+        REQUIRE(getCacheSize<TestArticleListRepo>() == 0);
+        REQUIRE(TestArticleListRepo::listCacheSize() == 0);
     }
 }

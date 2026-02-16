@@ -1,14 +1,14 @@
-#ifndef JCX_RELAIS_REDISREPOSITORY_H
-#define JCX_RELAIS_REDISREPOSITORY_H
+#ifndef JCX_RELAIS_REDISREPO_H
+#define JCX_RELAIS_REDISREPO_H
 
-#include "jcailloux/relais/repository/BaseRepository.h"
+#include "jcailloux/relais/repository/BaseRepo.h"
 #include "jcailloux/relais/cache/RedisCache.h"
-#include "jcailloux/relais/config/repository_config.h"
+#include "jcailloux/relais/config/repo_config.h"
 
 namespace jcailloux::relais {
 
 /**
- * Repository with L2 Redis caching on top of L3 database.
+ * Repo with L2 Redis caching on top of L3 database.
  *
  * Automatically selects binary or JSON serialization based on Entity capabilities:
  * - Binary (BEVE/FlatBuffer entities): stored and served as binary
@@ -20,8 +20,8 @@ namespace jcailloux::relais {
  */
 template<typename Entity, config::FixedString Name, config::CacheConfig Cfg, typename Key>
 requires CacheableEntity<Entity>
-class RedisRepository : public BaseRepository<Entity, Name, Cfg, Key> {
-    using Base = BaseRepository<Entity, Name, Cfg, Key>;
+class RedisRepo : public BaseRepo<Entity, Name, Cfg, Key> {
+    using Base = BaseRepo<Entity, Name, Cfg, Key>;
     using Mapping = typename Entity::MappingType;
 
     public:
@@ -454,4 +454,4 @@ class RedisRepository : public BaseRepository<Entity, Name, Cfg, Key> {
 
 }  // namespace jcailloux::relais
 
-#endif //JCX_RELAIS_REDISREPOSITORY_H
+#endif //JCX_RELAIS_REDISREPO_H

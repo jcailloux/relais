@@ -1,8 +1,8 @@
 /**
  * test_redis_repository.cpp
  *
- * Tests for RedisRepository (L2 - Redis caching on top of database).
- * Uses L2 configurations that resolve to RedisRepository via Repository<>.
+ * Tests for RedisRepo (L2 - Redis caching on top of database).
+ * Uses L2 configurations that resolve to RedisRepo via Repo<>.
  *
  * Progressive complexity:
  *   1. TestItem    — basic CRUD with L2 JSON caching
@@ -62,22 +62,22 @@ inline constexpr auto RedisShortTTL = Redis.with_l2_ttl(std::chrono::seconds{2})
 } // namespace test_l2
 
 // =============================================================================
-// L2 repos — RedisRepository provides invalidate() natively
+// L2 repos — RedisRepo provides invalidate() natively
 // =============================================================================
 
 /// L2 user repo as cross-invalidation target.
-using L2InvTestUserRepository = Repository<TestUserWrapper, "test:user:l2:inv", cfg::Redis>;
+using L2InvTestUserRepo = Repo<TestUserWrapper, "test:user:l2:inv", cfg::Redis>;
 
 /// L2 article repo as cross-invalidation target.
-using L2InvTestArticleRepository = Repository<TestArticleWrapper, "test:article:l2:inv", cfg::Redis>;
+using L2InvTestArticleRepo = Repo<TestArticleWrapper, "test:article:l2:inv", cfg::Redis>;
 
 // =============================================================================
 // Standard cross-invalidation: Purchase → User
 // =============================================================================
 
-using L2TestPurchaseRepository = Repository<TestPurchaseWrapper, "test:purchase:l2",
+using L2TestPurchaseRepo = Repo<TestPurchaseWrapper, "test:purchase:l2",
     cfg::Redis,
-    cache::Invalidate<L2InvTestUserRepository, purchaseUserId>>;
+    cache::Invalidate<L2InvTestUserRepo, purchaseUserId>>;
 
 // =============================================================================
 // Custom cross-invalidation: Purchase → User + Purchase → Articles (via resolver)
@@ -104,10 +104,10 @@ struct UserArticleResolver {
  * - Standard: invalidate the user's Redis cache (direct FK)
  * - Custom:   resolve user_id → article IDs, invalidate each article's Redis cache
  */
-using L2CustomTestPurchaseRepository = Repository<TestPurchaseWrapper, "test:purchase:l2:custom",
+using L2CustomTestPurchaseRepo = Repo<TestPurchaseWrapper, "test:purchase:l2:custom",
     cfg::Redis,
-    cache::Invalidate<L2InvTestUserRepository, purchaseUserId>,
-    cache::InvalidateVia<L2InvTestArticleRepository, purchaseUserId, &UserArticleResolver::resolve>>;
+    cache::Invalidate<L2InvTestUserRepo, purchaseUserId>,
+    cache::InvalidateVia<L2InvTestArticleRepo, purchaseUserId, &UserArticleResolver::resolve>>;
 
 // =============================================================================
 // Cross-invalidation targeting a read-only repo
@@ -116,9 +116,9 @@ using L2CustomTestPurchaseRepository = Repository<TestPurchaseWrapper, "test:pur
 /**
  * L2 purchase repo whose writes invalidate a read-only user repo.
  */
-using L2ReadOnlyInvPurchaseRepository = Repository<TestPurchaseWrapper, "test:purchase:l2:readonly:inv",
+using L2ReadOnlyInvPurchaseRepo = Repo<TestPurchaseWrapper, "test:purchase:l2:readonly:inv",
     cfg::Redis,
-    cache::Invalidate<ReadOnlyL2TestUserRepository, purchaseUserId>>;
+    cache::Invalidate<ReadOnlyL2TestUserRepo, purchaseUserId>>;
 
 // =============================================================================
 // L2 list repos with custom query methods
@@ -127,7 +127,7 @@ using L2ReadOnlyInvPurchaseRepository = Repository<TestPurchaseWrapper, "test:pu
 /**
  * L2 article repo with cached list queries (JSON serialization).
  */
-class L2TestArticleListRepo : public Repository<TestArticleWrapper, "test:article:list:l2", cfg::Redis> {
+class L2TestArticleListRepo : public Repo<TestArticleWrapper, "test:article:list:l2", cfg::Redis> {
 public:
     static io::Task<std::vector<TestArticleWrapper>> getByCategory(
         const std::string& category, int limit = 10)
@@ -158,7 +158,7 @@ public:
 /**
  * L2 article repo with binary list caching (BEVE serialization).
  */
-class L2TestArticleListAsRepo : public Repository<TestArticleWrapper, "test:article:listas:l2", cfg::Redis> {
+class L2TestArticleListAsRepo : public Repo<TestArticleWrapper, "test:article:listas:l2", cfg::Redis> {
 public:
     static io::Task<TestArticleList> getByCategory(
         const std::string& category, int limit = 10)
@@ -184,7 +184,7 @@ public:
 /**
  * L2 purchase list repo: caches purchase lists by user_id.
  */
-class L2TestPurchaseListRepo : public Repository<TestPurchaseWrapper, "test:purchase:list:l2", cfg::Redis> {
+class L2TestPurchaseListRepo : public Repo<TestPurchaseWrapper, "test:purchase:list:l2", cfg::Redis> {
 public:
     static io::Task<std::vector<TestPurchaseWrapper>> getByUserId(
         int64_t user_id, int limit = 10)
@@ -237,9 +237,9 @@ public:
  * - Invalidates the user's entity cache
  * - Invalidates the user's purchase list cache
  */
-using L2ListInvPurchaseRepo = Repository<TestPurchaseWrapper, "test:purchase:l2:listinv",
+using L2ListInvPurchaseRepo = Repo<TestPurchaseWrapper, "test:purchase:l2:listinv",
     cfg::Redis,
-    cache::Invalidate<L2InvTestUserRepository, purchaseUserId>,
+    cache::Invalidate<L2InvTestUserRepo, purchaseUserId>,
     cache::InvalidateList<L2PurchaseListInvalidator>>;
 
 // =============================================================================
@@ -279,9 +279,9 @@ public:
  * - Standard: invalidate user entity cache
  * - Custom:   resolve user_id → article categories → invalidate article list caches
  */
-using L2CustomListPurchaseRepo = Repository<TestPurchaseWrapper, "test:purchase:l2:listcustom",
+using L2CustomListPurchaseRepo = Repo<TestPurchaseWrapper, "test:purchase:l2:listcustom",
     cfg::Redis,
-    cache::Invalidate<L2InvTestUserRepository, purchaseUserId>,
+    cache::Invalidate<L2InvTestUserRepo, purchaseUserId>,
     cache::InvalidateVia<L2ArticleCategoryListInvalidator, purchaseUserId, &PurchaseToArticleCategoryResolver::resolve>>;
 
 // =============================================================================
@@ -292,7 +292,7 @@ using L2CustomListPurchaseRepo = Repository<TestPurchaseWrapper, "test:purchase:
  * L2 article repo with tracked list caching (group tracking for O(M) invalidation).
  * Tracks page keys in a Redis SET for efficient group invalidation.
  */
-class L2TrackedArticleListRepo : public Repository<TestArticleWrapper, "test:article:tracked:list:l2", cfg::Redis> {
+class L2TrackedArticleListRepo : public Repo<TestArticleWrapper, "test:article:tracked:list:l2", cfg::Redis> {
 public:
     static io::Task<std::vector<TestArticleWrapper>> getByCategory(
         const std::string& category, int limit = 10, int offset = 0)
@@ -323,7 +323,7 @@ public:
 /**
  * Same as L2TrackedArticleListRepo but with a short TTL (6s) for timing tests.
  */
-class L2TrackedArticleShortTTLRepo : public Repository<TestArticleWrapper, "test:article:tracked:list:l2:short", test_l2::RedisShortTTL> {
+class L2TrackedArticleShortTTLRepo : public Repo<TestArticleWrapper, "test:article:tracked:list:l2:short", test_l2::RedisShortTTL> {
 public:
     static io::Task<std::vector<TestArticleWrapper>> getByCategory(
         const std::string& category, int limit = 10, int offset = 0)
@@ -367,9 +367,9 @@ public:
  * - Standard: invalidate user entity cache
  * - Custom:   resolve user_id → article categories → invalidate tracked article list groups
  */
-using L2TrackedListPurchaseRepo = Repository<TestPurchaseWrapper, "test:purchase:l2:trackedlist",
+using L2TrackedListPurchaseRepo = Repo<TestPurchaseWrapper, "test:purchase:l2:trackedlist",
     cfg::Redis,
-    cache::Invalidate<L2InvTestUserRepository, purchaseUserId>,
+    cache::Invalidate<L2InvTestUserRepo, purchaseUserId>,
     cache::InvalidateVia<L2TrackedArticleCategoryInvalidator, purchaseUserId, &PurchaseToArticleCategoryResolver::resolve>>;
 
 } // namespace relais_test
@@ -381,14 +381,14 @@ using L2TrackedListPurchaseRepo = Repository<TestPurchaseWrapper, "test:purchase
 //
 // #############################################################################
 
-TEST_CASE("RedisRepository<TestItem> - findById", "[integration][db][redis][item]") {
+TEST_CASE("RedisRepo<TestItem> - findById", "[integration][db][redis][item]") {
     TransactionGuard tx;
 
     SECTION("[findById] caches result in Redis") {
         auto id = insertTestItem("Redis Cached", 100);
 
         // First fetch — from database, populated into Redis
-        auto result1 = sync(L2TestItemRepository::findById(id));
+        auto result1 = sync(L2TestItemRepo::findById(id));
         REQUIRE(result1 != nullptr);
         REQUIRE(result1->name == "Redis Cached");
         REQUIRE(result1->value == 100);
@@ -397,14 +397,14 @@ TEST_CASE("RedisRepository<TestItem> - findById", "[integration][db][redis][item
         updateTestItem(id, "Modified In DB", 999);
 
         // Second fetch — should return cached value from Redis
-        auto result2 = sync(L2TestItemRepository::findById(id));
+        auto result2 = sync(L2TestItemRepo::findById(id));
         REQUIRE(result2 != nullptr);
         REQUIRE(result2->name == "Redis Cached");
         REQUIRE(result2->value == 100);
     }
 
     SECTION("[findById] returns nullptr for non-existent id") {
-        auto result = sync(L2TestItemRepository::findById(999999999));
+        auto result = sync(L2TestItemRepo::findById(999999999));
         REQUIRE(result == nullptr);
     }
 
@@ -413,18 +413,18 @@ TEST_CASE("RedisRepository<TestItem> - findById", "[integration][db][redis][item
         auto id2 = insertTestItem("Second", 2);
         auto id3 = insertTestItem("Third", 3);
 
-        auto result = sync(L2TestItemRepository::findById(id2));
+        auto result = sync(L2TestItemRepo::findById(id2));
         REQUIRE(result != nullptr);
         REQUIRE(result->name == "Second");
         REQUIRE(result->value == 2);
     }
 }
 
-TEST_CASE("RedisRepository<TestItem> - create", "[integration][db][redis][item]") {
+TEST_CASE("RedisRepo<TestItem> - create", "[integration][db][redis][item]") {
     TransactionGuard tx;
 
     SECTION("[create] inserts entity and populates Redis cache") {
-        auto created = sync(L2TestItemRepository::create(makeTestItem("Created L2", 200)));
+        auto created = sync(L2TestItemRepo::create(makeTestItem("Created L2", 200)));
         REQUIRE(created != nullptr);
         REQUIRE(created->id > 0);
 
@@ -432,55 +432,55 @@ TEST_CASE("RedisRepository<TestItem> - create", "[integration][db][redis][item]"
         updateTestItem(created->id, "Modified", 0);
 
         // Should still get cached value from Redis
-        auto fetched = sync(L2TestItemRepository::findById(created->id));
+        auto fetched = sync(L2TestItemRepo::findById(created->id));
         REQUIRE(fetched != nullptr);
         REQUIRE(fetched->name == "Created L2");
         REQUIRE(fetched->value == 200);
     }
 }
 
-TEST_CASE("RedisRepository<TestItem> - update", "[integration][db][redis][item]") {
+TEST_CASE("RedisRepo<TestItem> - update", "[integration][db][redis][item]") {
     TransactionGuard tx;
 
     SECTION("[update] invalidates Redis cache (lazy reload)") {
         auto id = insertTestItem("Original", 10);
 
         // Populate cache
-        sync(L2TestItemRepository::findById(id));
+        sync(L2TestItemRepo::findById(id));
 
         // Update through repository
-        auto success = sync(L2TestItemRepository::update(id, makeTestItem("Updated", 20, "", true, id)));
+        auto success = sync(L2TestItemRepo::update(id, makeTestItem("Updated", 20, "", true, id)));
         REQUIRE(success == true);
 
         // Next read should fetch fresh data (cache was invalidated)
-        auto fetched = sync(L2TestItemRepository::findById(id));
+        auto fetched = sync(L2TestItemRepo::findById(id));
         REQUIRE(fetched != nullptr);
         REQUIRE(fetched->name == "Updated");
         REQUIRE(fetched->value == 20);
     }
 }
 
-TEST_CASE("RedisRepository<TestItem> - remove", "[integration][db][redis][item]") {
+TEST_CASE("RedisRepo<TestItem> - remove", "[integration][db][redis][item]") {
     TransactionGuard tx;
 
     SECTION("[remove] invalidates Redis cache") {
         auto id = insertTestItem("To Remove", 0);
 
         // Populate cache
-        sync(L2TestItemRepository::findById(id));
+        sync(L2TestItemRepo::findById(id));
 
         // Remove through repository
-        auto removed = sync(L2TestItemRepository::remove(id));
+        auto removed = sync(L2TestItemRepo::remove(id));
         REQUIRE(removed.has_value());
         REQUIRE(*removed == 1);
 
         // Should return nullptr (not from cache)
-        auto result = sync(L2TestItemRepository::findById(id));
+        auto result = sync(L2TestItemRepo::findById(id));
         REQUIRE(result == nullptr);
     }
 
     SECTION("[remove] returns 0 for non-existent id") {
-        auto removed = sync(L2TestItemRepository::remove(999999999));
+        auto removed = sync(L2TestItemRepo::remove(999999999));
         REQUIRE(removed.has_value());
         REQUIRE(*removed == 0);
     }
@@ -495,14 +495,14 @@ TEST_CASE("RedisRepository<TestItem> - remove", "[integration][db][redis][item]"
 using jcailloux::relais::wrapper::set;
 using F = TestUserWrapper::Field;
 
-TEST_CASE("RedisRepository<TestUser> - binary caching", "[integration][db][redis][binary]") {
+TEST_CASE("RedisRepo<TestUser> - binary caching", "[integration][db][redis][binary]") {
     TransactionGuard tx;
 
     SECTION("[findById] caches BEVE entity as binary in Redis") {
         auto id = insertTestUser("alice", "alice@example.com", 1000);
 
         // First fetch — DB, cached as binary in Redis
-        auto result1 = sync(L2TestUserRepository::findById(id));
+        auto result1 = sync(L2TestUserRepo::findById(id));
         REQUIRE(result1 != nullptr);
         REQUIRE(result1->username == "alice");
         REQUIRE(result1->balance == 1000);
@@ -511,24 +511,24 @@ TEST_CASE("RedisRepository<TestUser> - binary caching", "[integration][db][redis
         updateTestUserBalance(id, 999);
 
         // Second fetch — cached binary from Redis
-        auto result2 = sync(L2TestUserRepository::findById(id));
+        auto result2 = sync(L2TestUserRepo::findById(id));
         REQUIRE(result2 != nullptr);
         REQUIRE(result2->username == "alice");
         REQUIRE(result2->balance == 1000);  // Still cached
     }
 }
 
-TEST_CASE("RedisRepository<TestUser> - updateBy", "[integration][db][redis][updateBy]") {
+TEST_CASE("RedisRepo<TestUser> - updateBy", "[integration][db][redis][updateBy]") {
     TransactionGuard tx;
 
     SECTION("[updateBy] invalidates Redis then re-fetches") {
         auto id = insertTestUser("bob", "bob@example.com", 500);
 
         // Populate cache
-        sync(L2TestUserRepository::findById(id));
+        sync(L2TestUserRepo::findById(id));
 
         // Partial update: only change balance
-        auto result = sync(L2TestUserRepository::updateBy(id, set<F::balance>(777)));
+        auto result = sync(L2TestUserRepo::updateBy(id, set<F::balance>(777)));
 
         REQUIRE(result != nullptr);
         REQUIRE(result->balance == 777);
@@ -536,7 +536,7 @@ TEST_CASE("RedisRepository<TestUser> - updateBy", "[integration][db][redis][upda
         REQUIRE(result->email == "bob@example.com");
 
         // Independent fetch confirms DB state
-        auto fetched = sync(L2TestUserRepository::findById(id));
+        auto fetched = sync(L2TestUserRepo::findById(id));
         REQUIRE(fetched != nullptr);
         REQUIRE(fetched->balance == 777);
     }
@@ -544,7 +544,7 @@ TEST_CASE("RedisRepository<TestUser> - updateBy", "[integration][db][redis][upda
     SECTION("[updateBy] updates multiple fields") {
         auto id = insertTestUser("carol", "carol@example.com", 200);
 
-        auto result = sync(L2TestUserRepository::updateBy(id,
+        auto result = sync(L2TestUserRepo::updateBy(id,
             set<F::balance>(0),
             set<F::username>(std::string("caroline"))));
 
@@ -561,20 +561,20 @@ TEST_CASE("RedisRepository<TestUser> - updateBy", "[integration][db][redis][upda
 //
 // #############################################################################
 
-TEST_CASE("RedisRepository - findByIdAsJson", "[integration][db][redis][json]") {
+TEST_CASE("RedisRepo - findByIdAsJson", "[integration][db][redis][json]") {
     TransactionGuard tx;
 
     SECTION("[json] returns raw JSON string from Redis") {
         auto id = insertTestItem("JSON Item", 42, std::optional<std::string>{"desc"}, true);
 
-        auto result = sync(L2TestItemRepository::findByIdAsJson(id));
+        auto result = sync(L2TestItemRepo::findByIdAsJson(id));
 
         REQUIRE(result != nullptr);
         REQUIRE(result->find("\"JSON Item\"") != std::string::npos);
     }
 
     SECTION("[json] returns nullptr for non-existent id") {
-        auto result = sync(L2TestItemRepository::findByIdAsJson(999999999));
+        auto result = sync(L2TestItemRepo::findByIdAsJson(999999999));
 
         REQUIRE(result == nullptr);
     }
@@ -583,14 +583,14 @@ TEST_CASE("RedisRepository - findByIdAsJson", "[integration][db][redis][json]") 
         auto id = insertTestItem("Cache JSON", 10);
 
         // First call — DB fetch, cache as JSON
-        auto result1 = sync(L2TestItemRepository::findByIdAsJson(id));
+        auto result1 = sync(L2TestItemRepo::findByIdAsJson(id));
         REQUIRE(result1 != nullptr);
 
         // Modify DB directly
         updateTestItem(id, "Modified", 999);
 
         // Second call — cached JSON
-        auto result2 = sync(L2TestItemRepository::findByIdAsJson(id));
+        auto result2 = sync(L2TestItemRepo::findByIdAsJson(id));
         REQUIRE(result2 != nullptr);
         REQUIRE(result2->find("\"Cache JSON\"") != std::string::npos);
     }
@@ -602,28 +602,28 @@ TEST_CASE("RedisRepository - findByIdAsJson", "[integration][db][redis][json]") 
 //
 // #############################################################################
 
-TEST_CASE("RedisRepository - explicit invalidation", "[integration][db][redis][invalidate]") {
+TEST_CASE("RedisRepo - explicit invalidation", "[integration][db][redis][invalidate]") {
     TransactionGuard tx;
 
     SECTION("[invalidate] invalidateRedis clears cached entry") {
         auto id = insertTestItem("To Invalidate L2", 50);
 
         // Populate cache
-        sync(L2TestItemRepository::findById(id));
+        sync(L2TestItemRepo::findById(id));
 
         // Modify in DB
         updateTestItem(id, "Updated After Invalidate", 999);
 
         // Still cached
-        auto cached = sync(L2TestItemRepository::findById(id));
+        auto cached = sync(L2TestItemRepo::findById(id));
         REQUIRE(cached != nullptr);
         REQUIRE(cached->name == "To Invalidate L2");
 
         // Invalidate
-        sync(L2TestItemRepository::invalidateRedis(id));
+        sync(L2TestItemRepo::invalidateRedis(id));
 
         // Now should fetch from DB
-        auto fresh = sync(L2TestItemRepository::findById(id));
+        auto fresh = sync(L2TestItemRepo::findById(id));
         REQUIRE(fresh != nullptr);
         REQUIRE(fresh->name == "Updated After Invalidate");
         REQUIRE(fresh->value == 999);
@@ -634,19 +634,19 @@ TEST_CASE("RedisRepository - explicit invalidation", "[integration][db][redis][i
         auto id2 = insertTestItem("Invalidate", 2);
 
         // Populate both
-        sync(L2TestItemRepository::findById(id1));
-        sync(L2TestItemRepository::findById(id2));
+        sync(L2TestItemRepo::findById(id1));
+        sync(L2TestItemRepo::findById(id2));
 
         // Modify both in DB
         updateTestItem(id1, "DB Keep", 11);
         updateTestItem(id2, "DB Invalidate", 22);
 
         // Invalidate only id2
-        sync(L2TestItemRepository::invalidateRedis(id2));
+        sync(L2TestItemRepo::invalidateRedis(id2));
 
         // id1 still cached, id2 fresh
-        auto r1 = sync(L2TestItemRepository::findById(id1));
-        auto r2 = sync(L2TestItemRepository::findById(id2));
+        auto r1 = sync(L2TestItemRepo::findById(id1));
+        auto r2 = sync(L2TestItemRepo::findById(id2));
 
         REQUIRE(r1->name == "Keep");         // Still cached
         REQUIRE(r2->name == "DB Invalidate"); // Fresh from DB
@@ -659,7 +659,7 @@ TEST_CASE("RedisRepository - explicit invalidation", "[integration][db][redis][i
 //
 // #############################################################################
 
-TEST_CASE("RedisRepository - read-only", "[integration][db][redis][readonly]") {
+TEST_CASE("RedisRepo - read-only", "[integration][db][redis][readonly]") {
     TransactionGuard tx;
 
     // Compile-time checks
@@ -669,7 +669,7 @@ TEST_CASE("RedisRepository - read-only", "[integration][db][redis][readonly]") {
     SECTION("[readonly] findById works and caches in Redis") {
         auto id = insertTestItem("ReadOnly L2", 42);
 
-        auto result1 = sync(ReadOnlyL2TestItemRepository::findById(id));
+        auto result1 = sync(ReadOnlyL2TestItemRepo::findById(id));
         REQUIRE(result1 != nullptr);
         REQUIRE(result1->name == "ReadOnly L2");
 
@@ -677,13 +677,13 @@ TEST_CASE("RedisRepository - read-only", "[integration][db][redis][readonly]") {
         updateTestItem(id, "Modified", 999);
 
         // Should return cached value
-        auto result2 = sync(ReadOnlyL2TestItemRepository::findById(id));
+        auto result2 = sync(ReadOnlyL2TestItemRepo::findById(id));
         REQUIRE(result2 != nullptr);
         REQUIRE(result2->name == "ReadOnly L2");  // Still cached
     }
 
     SECTION("[readonly] returns nullptr for non-existent id") {
-        auto result = sync(ReadOnlyL2TestItemRepository::findById(999999999));
+        auto result = sync(ReadOnlyL2TestItemRepo::findById(999999999));
         REQUIRE(result == nullptr);
     }
 
@@ -697,14 +697,14 @@ TEST_CASE("RedisRepository - read-only", "[integration][db][redis][readonly]") {
 //
 // #############################################################################
 
-TEST_CASE("RedisRepository - cross-invalidation Purchase → User", "[integration][db][redis][cross-inv]") {
+TEST_CASE("RedisRepo - cross-invalidation Purchase → User", "[integration][db][redis][cross-inv]") {
     TransactionGuard tx;
 
     SECTION("[cross-inv] create purchase invalidates user Redis cache") {
         auto userId = insertTestUser("inv_user", "inv@test.com", 1000);
 
         // Cache user in Redis
-        auto user1 = sync(L2InvTestUserRepository::findById(userId));
+        auto user1 = sync(L2InvTestUserRepo::findById(userId));
         REQUIRE(user1 != nullptr);
         REQUIRE(user1->balance == 1000);
 
@@ -712,15 +712,15 @@ TEST_CASE("RedisRepository - cross-invalidation Purchase → User", "[integratio
         updateTestUserBalance(userId, 500);
 
         // User still cached
-        auto user2 = sync(L2InvTestUserRepository::findById(userId));
+        auto user2 = sync(L2InvTestUserRepo::findById(userId));
         REQUIRE(user2->balance == 1000);
 
         // Create purchase through invalidating repo
-        auto created = sync(L2TestPurchaseRepository::create(makeTestPurchase(userId, "Widget", 100, "pending")));
+        auto created = sync(L2TestPurchaseRepo::create(makeTestPurchase(userId, "Widget", 100, "pending")));
         REQUIRE(created != nullptr);
 
         // User cache should be invalidated — next read gets fresh data
-        auto user3 = sync(L2InvTestUserRepository::findById(userId));
+        auto user3 = sync(L2InvTestUserRepo::findById(userId));
         REQUIRE(user3 != nullptr);
         REQUIRE(user3->balance == 500);  // Fresh from DB
     }
@@ -730,16 +730,16 @@ TEST_CASE("RedisRepository - cross-invalidation Purchase → User", "[integratio
         auto purchaseId = insertTestPurchase(userId, "Product", 50);
 
         // Cache user
-        sync(L2InvTestUserRepository::findById(userId));
+        sync(L2InvTestUserRepo::findById(userId));
 
         // Modify user in DB
         updateTestUserBalance(userId, 750);
 
         // Update purchase through repo
-        sync(L2TestPurchaseRepository::update(purchaseId, makeTestPurchase(userId, "Updated Product", 100, "completed", purchaseId)));
+        sync(L2TestPurchaseRepo::update(purchaseId, makeTestPurchase(userId, "Updated Product", 100, "completed", purchaseId)));
 
         // User cache invalidated
-        auto user = sync(L2InvTestUserRepository::findById(userId));
+        auto user = sync(L2InvTestUserRepo::findById(userId));
         REQUIRE(user != nullptr);
         REQUIRE(user->balance == 750);
     }
@@ -749,14 +749,14 @@ TEST_CASE("RedisRepository - cross-invalidation Purchase → User", "[integratio
         auto purchaseId = insertTestPurchase(userId, "To Delete", 50);
 
         // Cache user
-        sync(L2InvTestUserRepository::findById(userId));
+        sync(L2InvTestUserRepo::findById(userId));
         updateTestUserBalance(userId, 200);
 
         // Delete purchase
-        sync(L2TestPurchaseRepository::remove(purchaseId));
+        sync(L2TestPurchaseRepo::remove(purchaseId));
 
         // User cache invalidated
-        auto user = sync(L2InvTestUserRepository::findById(userId));
+        auto user = sync(L2InvTestUserRepo::findById(userId));
         REQUIRE(user != nullptr);
         REQUIRE(user->balance == 200);
     }
@@ -767,23 +767,23 @@ TEST_CASE("RedisRepository - cross-invalidation Purchase → User", "[integratio
         auto purchaseId = insertTestPurchase(user1Id, "Product", 100);
 
         // Cache both users
-        sync(L2InvTestUserRepository::findById(user1Id));
-        sync(L2InvTestUserRepository::findById(user2Id));
+        sync(L2InvTestUserRepo::findById(user1Id));
+        sync(L2InvTestUserRepo::findById(user2Id));
 
         // Modify both in DB
         updateTestUserBalance(user1Id, 111);
         updateTestUserBalance(user2Id, 222);
 
         // Both still cached
-        REQUIRE(sync(L2InvTestUserRepository::findById(user1Id))->balance == 1000);
-        REQUIRE(sync(L2InvTestUserRepository::findById(user2Id))->balance == 2000);
+        REQUIRE(sync(L2InvTestUserRepo::findById(user1Id))->balance == 1000);
+        REQUIRE(sync(L2InvTestUserRepo::findById(user2Id))->balance == 2000);
 
         // Update purchase to change user_id from user1 to user2
-        sync(L2TestPurchaseRepository::update(purchaseId, makeTestPurchase(user2Id, "Product", 100, "pending", purchaseId)));
+        sync(L2TestPurchaseRepo::update(purchaseId, makeTestPurchase(user2Id, "Product", 100, "pending", purchaseId)));
 
         // Both users should be invalidated
-        auto u1 = sync(L2InvTestUserRepository::findById(user1Id));
-        auto u2 = sync(L2InvTestUserRepository::findById(user2Id));
+        auto u1 = sync(L2InvTestUserRepo::findById(user1Id));
+        auto u2 = sync(L2InvTestUserRepo::findById(user2Id));
         REQUIRE(u1->balance == 111);
         REQUIRE(u2->balance == 222);
     }
@@ -795,7 +795,7 @@ TEST_CASE("RedisRepository - cross-invalidation Purchase → User", "[integratio
 //
 // #############################################################################
 
-TEST_CASE("RedisRepository - custom cross-invalidation via resolver", "[integration][db][redis][custom-inv]") {
+TEST_CASE("RedisRepo - custom cross-invalidation via resolver", "[integration][db][redis][custom-inv]") {
     TransactionGuard tx;
 
     SECTION("[custom-inv] purchase creation invalidates user AND related articles") {
@@ -803,8 +803,8 @@ TEST_CASE("RedisRepository - custom cross-invalidation via resolver", "[integrat
         auto articleId = insertTestArticle("tech", userId, "My Article", 42, true);
 
         // Cache user and article in Redis
-        auto user1 = sync(L2InvTestUserRepository::findById(userId));
-        auto article1 = sync(L2InvTestArticleRepository::findById(articleId));
+        auto user1 = sync(L2InvTestUserRepo::findById(userId));
+        auto article1 = sync(L2InvTestArticleRepo::findById(articleId));
         REQUIRE(user1 != nullptr);
         REQUIRE(article1 != nullptr);
 
@@ -813,18 +813,18 @@ TEST_CASE("RedisRepository - custom cross-invalidation via resolver", "[integrat
         updateTestArticle(articleId, "Updated Title", 999);
 
         // Both still cached
-        REQUIRE(sync(L2InvTestUserRepository::findById(userId))->balance == 1000);
-        REQUIRE(sync(L2InvTestArticleRepository::findById(articleId))->title == "My Article");
+        REQUIRE(sync(L2InvTestUserRepo::findById(userId))->balance == 1000);
+        REQUIRE(sync(L2InvTestArticleRepo::findById(articleId))->title == "My Article");
 
         // Create purchase — triggers standard + custom invalidation
-        sync(L2CustomTestPurchaseRepository::create(makeTestPurchase(userId, "Trigger", 50, "pending")));
+        sync(L2CustomTestPurchaseRepo::create(makeTestPurchase(userId, "Trigger", 50, "pending")));
 
         // User cache invalidated (standard Invalidate<>)
-        auto user2 = sync(L2InvTestUserRepository::findById(userId));
+        auto user2 = sync(L2InvTestUserRepo::findById(userId));
         REQUIRE(user2->balance == 500);
 
         // Article cache invalidated (InvalidateVia resolver found this article)
-        auto article2 = sync(L2InvTestArticleRepository::findById(articleId));
+        auto article2 = sync(L2InvTestArticleRepo::findById(articleId));
         REQUIRE(article2->title == "Updated Title");
         REQUIRE(article2->view_count == 999);
     }
@@ -834,10 +834,10 @@ TEST_CASE("RedisRepository - custom cross-invalidation via resolver", "[integrat
         // No articles for this user
 
         // Cache user
-        sync(L2InvTestUserRepository::findById(userId));
+        sync(L2InvTestUserRepo::findById(userId));
 
         // Should not throw — resolver returns empty vector
-        auto created = sync(L2CustomTestPurchaseRepository::create(makeTestPurchase(userId, "Safe Trigger", 10, "pending")));
+        auto created = sync(L2CustomTestPurchaseRepo::create(makeTestPurchase(userId, "Safe Trigger", 10, "pending")));
         REQUIRE(created != nullptr);
     }
 
@@ -848,9 +848,9 @@ TEST_CASE("RedisRepository - custom cross-invalidation via resolver", "[integrat
         auto a3 = insertTestArticle("tech", userId, "Tech 2", 30, true);
 
         // Cache all articles
-        sync(L2InvTestArticleRepository::findById(a1));
-        sync(L2InvTestArticleRepository::findById(a2));
-        sync(L2InvTestArticleRepository::findById(a3));
+        sync(L2InvTestArticleRepo::findById(a1));
+        sync(L2InvTestArticleRepo::findById(a2));
+        sync(L2InvTestArticleRepo::findById(a3));
 
         // Modify all in DB
         updateTestArticle(a1, "New Tech 1", 100);
@@ -858,12 +858,12 @@ TEST_CASE("RedisRepository - custom cross-invalidation via resolver", "[integrat
         updateTestArticle(a3, "New Tech 2", 300);
 
         // Create purchase — invalidates all 3 articles via resolver
-        sync(L2CustomTestPurchaseRepository::create(makeTestPurchase(userId, "Big Trigger", 999, "completed")));
+        sync(L2CustomTestPurchaseRepo::create(makeTestPurchase(userId, "Big Trigger", 999, "completed")));
 
         // All articles should now return fresh data
-        REQUIRE(sync(L2InvTestArticleRepository::findById(a1))->title == "New Tech 1");
-        REQUIRE(sync(L2InvTestArticleRepository::findById(a2))->title == "New News 1");
-        REQUIRE(sync(L2InvTestArticleRepository::findById(a3))->title == "New Tech 2");
+        REQUIRE(sync(L2InvTestArticleRepo::findById(a1))->title == "New Tech 1");
+        REQUIRE(sync(L2InvTestArticleRepo::findById(a2))->title == "New News 1");
+        REQUIRE(sync(L2InvTestArticleRepo::findById(a3))->title == "New Tech 2");
     }
 }
 
@@ -873,14 +873,14 @@ TEST_CASE("RedisRepository - custom cross-invalidation via resolver", "[integrat
 //
 // #############################################################################
 
-TEST_CASE("RedisRepository - read-only as cross-invalidation target", "[integration][db][redis][readonly-inv]") {
+TEST_CASE("RedisRepo - read-only as cross-invalidation target", "[integration][db][redis][readonly-inv]") {
     TransactionGuard tx;
 
     SECTION("[readonly-inv] purchase creation invalidates read-only user cache") {
         auto userId = insertTestUser("ro_user", "ro@test.com", 1000);
 
         // Cache user via read-only repo
-        auto user1 = sync(ReadOnlyL2TestUserRepository::findById(userId));
+        auto user1 = sync(ReadOnlyL2TestUserRepo::findById(userId));
         REQUIRE(user1 != nullptr);
         REQUIRE(user1->balance == 1000);
 
@@ -888,13 +888,13 @@ TEST_CASE("RedisRepository - read-only as cross-invalidation target", "[integrat
         updateTestUserBalance(userId, 500);
 
         // Still cached (read-only, no writes to trigger invalidation)
-        REQUIRE(sync(ReadOnlyL2TestUserRepository::findById(userId))->balance == 1000);
+        REQUIRE(sync(ReadOnlyL2TestUserRepo::findById(userId))->balance == 1000);
 
         // Create purchase via repo that targets the read-only user cache
-        sync(L2ReadOnlyInvPurchaseRepository::create(makeTestPurchase(userId, "RO Trigger", 50, "pending")));
+        sync(L2ReadOnlyInvPurchaseRepo::create(makeTestPurchase(userId, "RO Trigger", 50, "pending")));
 
         // Read-only user cache should be invalidated — fresh data
-        auto user2 = sync(ReadOnlyL2TestUserRepository::findById(userId));
+        auto user2 = sync(ReadOnlyL2TestUserRepo::findById(userId));
         REQUIRE(user2 != nullptr);
         REQUIRE(user2->balance == 500);
     }
@@ -904,13 +904,13 @@ TEST_CASE("RedisRepository - read-only as cross-invalidation target", "[integrat
         auto purchaseId = insertTestPurchase(userId, "To Delete", 100);
 
         // Cache user
-        sync(ReadOnlyL2TestUserRepository::findById(userId));
+        sync(ReadOnlyL2TestUserRepo::findById(userId));
         updateTestUserBalance(userId, 1);
 
         // Delete purchase
-        sync(L2ReadOnlyInvPurchaseRepository::remove(purchaseId));
+        sync(L2ReadOnlyInvPurchaseRepo::remove(purchaseId));
 
-        auto user = sync(ReadOnlyL2TestUserRepository::findById(userId));
+        auto user = sync(ReadOnlyL2TestUserRepo::findById(userId));
         REQUIRE(user->balance == 1);
     }
 }
@@ -921,7 +921,7 @@ TEST_CASE("RedisRepository - read-only as cross-invalidation target", "[integrat
 //
 // #############################################################################
 
-TEST_CASE("RedisRepository - list caching", "[integration][db][redis][list]") {
+TEST_CASE("RedisRepo - list caching", "[integration][db][redis][list]") {
     TransactionGuard tx;
 
     SECTION("[list] query returns articles from database") {
@@ -998,7 +998,7 @@ TEST_CASE("RedisRepository - list caching", "[integration][db][redis][list]") {
 //
 // #############################################################################
 
-TEST_CASE("RedisRepository - binary list caching", "[integration][db][redis][fb-list]") {
+TEST_CASE("RedisRepo - binary list caching", "[integration][db][redis][fb-list]") {
     TransactionGuard tx;
 
     SECTION("[fb-list] query returns binary list entity") {
@@ -1061,7 +1061,7 @@ TEST_CASE("RedisRepository - binary list caching", "[integration][db][redis][fb-
 //
 // #############################################################################
 
-TEST_CASE("RedisRepository - list cross-invalidation", "[integration][db][redis][list-inv]") {
+TEST_CASE("RedisRepo - list cross-invalidation", "[integration][db][redis][list-inv]") {
     TransactionGuard tx;
 
     SECTION("[list-inv] purchase creation invalidates user's purchase list") {
@@ -1112,7 +1112,7 @@ TEST_CASE("RedisRepository - list cross-invalidation", "[integration][db][redis]
 //
 // #############################################################################
 
-TEST_CASE("RedisRepository - list custom cross-invalidation", "[integration][db][redis][list-custom]") {
+TEST_CASE("RedisRepo - list custom cross-invalidation", "[integration][db][redis][list-custom]") {
     TransactionGuard tx;
 
     SECTION("[list-custom] purchase creation invalidates article list for author's categories") {
@@ -1215,7 +1215,7 @@ constexpr auto kTrackedShortTTLRepoName = "test:article:tracked:list:l2:short";
 
 }  // namespace
 
-TEST_CASE("RedisRepository - tracked list pagination + group invalidation",
+TEST_CASE("RedisRepo - tracked list pagination + group invalidation",
           "[integration][db][redis][list-tracked]") {
     TransactionGuard tx;
 
@@ -1340,7 +1340,7 @@ TEST_CASE("RedisRepository - tracked list pagination + group invalidation",
 //
 // #############################################################################
 
-TEST_CASE("RedisRepository - tracked list Redis tracking data",
+TEST_CASE("RedisRepo - tracked list Redis tracking data",
           "[integration][db][redis][tracked-data]") {
     TransactionGuard tx;
 
@@ -1474,7 +1474,7 @@ namespace list = jcailloux::relais::cache::list;
  *
  * Sort: view_count DESC, Pagination: Offset
  */
-class L2SelectiveArticleListRepo : public Repository<TestArticleWrapper, "test:article:selective:list:l2", cfg::Redis> {
+class L2SelectiveArticleListRepo : public Repo<TestArticleWrapper, "test:article:selective:list:l2", cfg::Redis> {
 public:
     static io::Task<std::vector<TestArticleWrapper>> getByCategory(
         const std::string& category, int limit = 5, int offset = 0)
@@ -1572,7 +1572,7 @@ std::string selectiveTrackingKey(const std::string& category) {
 
 } // namespace
 
-TEST_CASE("RedisRepository - selective list invalidation with SortBounds",
+TEST_CASE("RedisRepo - selective list invalidation with SortBounds",
           "[integration][db][redis][list-selective]")
 {
     TransactionGuard tx;
@@ -1785,7 +1785,7 @@ struct PurchaseToArticleSelectiveResolver {
  * - Enriched resolver finds the user's articles with their sort values
  * - Selective invalidation targets only the affected list pages
  */
-using L2SelectiveListPurchaseRepo = Repository<TestPurchaseWrapper, "test:purchase:l2:selectivelist",
+using L2SelectiveListPurchaseRepo = Repo<TestPurchaseWrapper, "test:purchase:l2:selectivelist",
     cfg::Redis,
     cache::InvalidateListVia<
         L2SelectiveArticleListRepo,
@@ -1796,7 +1796,7 @@ using L2SelectiveListPurchaseRepo = Repository<TestPurchaseWrapper, "test:purcha
 } // namespace relais_test
 
 
-TEST_CASE("RedisRepository - InvalidateListVia enriched resolver",
+TEST_CASE("RedisRepo - InvalidateListVia enriched resolver",
           "[integration][db][redis][list-resolver]")
 {
     TransactionGuard tx;
@@ -2012,22 +2012,22 @@ struct MixedResolver {
 /**
  * Purchase repos for each granularity test.
  */
-using L2PerGroupPurchaseRepo = Repository<TestPurchaseWrapper, "test:purchase:l2:pergroup",
+using L2PerGroupPurchaseRepo = Repo<TestPurchaseWrapper, "test:purchase:l2:pergroup",
     cfg::Redis,
     cache::InvalidateListVia<L2SelectiveArticleListRepo, purchaseUserId, &PerGroupResolver::resolve>>;
 
-using L2FullPatternPurchaseRepo = Repository<TestPurchaseWrapper, "test:purchase:l2:fullpattern",
+using L2FullPatternPurchaseRepo = Repo<TestPurchaseWrapper, "test:purchase:l2:fullpattern",
     cfg::Redis,
     cache::InvalidateListVia<L2SelectiveArticleListRepo, purchaseUserId, &FullPatternResolver::resolve>>;
 
-using L2MixedPurchaseRepo = Repository<TestPurchaseWrapper, "test:purchase:l2:mixed",
+using L2MixedPurchaseRepo = Repo<TestPurchaseWrapper, "test:purchase:l2:mixed",
     cfg::Redis,
     cache::InvalidateListVia<L2SelectiveArticleListRepo, purchaseUserId, &MixedResolver::resolve>>;
 
 } // namespace relais_test
 
 
-TEST_CASE("RedisRepository - InvalidateListVia per-group invalidation",
+TEST_CASE("RedisRepo - InvalidateListVia per-group invalidation",
           "[integration][db][redis][list-granularity]")
 {
     TransactionGuard tx;
@@ -2091,7 +2091,7 @@ TEST_CASE("RedisRepository - InvalidateListVia per-group invalidation",
     }
 }
 
-TEST_CASE("RedisRepository - InvalidateListVia full pattern invalidation",
+TEST_CASE("RedisRepo - InvalidateListVia full pattern invalidation",
           "[integration][db][redis][list-granularity]")
 {
     TransactionGuard tx;
@@ -2129,7 +2129,7 @@ TEST_CASE("RedisRepository - InvalidateListVia full pattern invalidation",
     }
 }
 
-TEST_CASE("RedisRepository - InvalidateListVia mixed granularity",
+TEST_CASE("RedisRepo - InvalidateListVia mixed granularity",
           "[integration][db][redis][list-granularity]")
 {
     TransactionGuard tx;

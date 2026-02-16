@@ -47,20 +47,20 @@ inline constexpr auto WriteThrough = Both
 
 } // namespace test_both
 
-// L1+L2 repos using existing FullCacheTestItemRepository and FullCacheTestUserRepository
+// L1+L2 repos using existing FullCacheTestItemRepo and FullCacheTestUserRepo
 // (already defined in TestRepositories.h)
 
 // Short L1 TTL + L2: for expiration fallback tests
-using ShortL1BothItemRepo = Repository<TestItemWrapper, "test:both:short", test_both::ShortL1>;
+using ShortL1BothItemRepo = Repo<TestItemWrapper, "test:both:short", test_both::ShortL1>;
 
 // Write-through at L1+L2
-using WriteThroughBothItemRepo = Repository<TestItemWrapper, "test:both:wt", test_both::WriteThrough>;
+using WriteThroughBothItemRepo = Repo<TestItemWrapper, "test:both:wt", test_both::WriteThrough>;
 
 // L1+L2 user repo for cross-invalidation target
-using FullCacheInvUserRepo = Repository<TestUserWrapper, "test:user:both:inv", cfg::Both>;
+using FullCacheInvUserRepo = Repo<TestUserWrapper, "test:user:both:inv", cfg::Both>;
 
 // L1+L2 purchase repo with cross-invalidation → user
-using FullCachePurchaseRepo = Repository<TestPurchaseWrapper, "test:purchase:both",
+using FullCachePurchaseRepo = Repo<TestPurchaseWrapper, "test:purchase:both",
     cfg::Both,
     cache::Invalidate<FullCacheInvUserRepo, purchaseUserId>>;
 
@@ -84,26 +84,26 @@ TEST_CASE("FullCache<TestItem> - L1 to L2 promotion",
     SECTION("[findById] cache miss populates L2 then L1") {
         auto id = insertTestItem("both_item", 100);
 
-        auto item = sync(FullCacheTestItemRepository::findById(id));
+        auto item = sync(FullCacheTestItemRepo::findById(id));
         REQUIRE(item != nullptr);
         REQUIRE(item->name == "both_item");
         REQUIRE(item->value == 100);
 
         // L1 should now have the item
-        REQUIRE(getCacheSize<FullCacheTestItemRepository>() > 0);
+        REQUIRE(getCacheSize<FullCacheTestItemRepo>() > 0);
     }
 
     SECTION("[findById] L1 hit does not query DB (staleness test)") {
         auto id = insertTestItem("stale_both", 10);
 
         // Populate L1+L2
-        sync(FullCacheTestItemRepository::findById(id));
+        sync(FullCacheTestItemRepo::findById(id));
 
         // Modify DB directly
         updateTestItem(id, "modified_both", 999);
 
         // L1 hit returns stale value
-        auto item = sync(FullCacheTestItemRepository::findById(id));
+        auto item = sync(FullCacheTestItemRepo::findById(id));
         REQUIRE(item->name == "stale_both");
         REQUIRE(item->value == 10);
     }
@@ -112,22 +112,22 @@ TEST_CASE("FullCache<TestItem> - L1 to L2 promotion",
         auto id = insertTestItem("promote_item", 42);
 
         // Populate both L1 and L2
-        sync(FullCacheTestItemRepository::findById(id));
+        sync(FullCacheTestItemRepo::findById(id));
 
         // Clear L1 only
-        FullCacheTestItemRepository::invalidateL1(id);
+        FullCacheTestItemRepo::invalidateL1(id);
 
         // Modify DB directly — L2 still has old value
         updateTestItem(id, "db_only_value", 999);
 
         // Should read from L2 (not DB), promoting back to L1
-        auto item = sync(FullCacheTestItemRepository::findById(id));
+        auto item = sync(FullCacheTestItemRepo::findById(id));
         REQUIRE(item->name == "promote_item");
         REQUIRE(item->value == 42);
     }
 
     SECTION("[findById] returns nullptr for non-existent id") {
-        auto item = sync(FullCacheTestItemRepository::findById(999999));
+        auto item = sync(FullCacheTestItemRepo::findById(999999));
         REQUIRE(item == nullptr);
     }
 }
@@ -148,16 +148,16 @@ TEST_CASE("FullCache<TestItem> - cascade invalidation",
         auto id = insertTestItem("inv_both", 10);
 
         // Populate both layers
-        sync(FullCacheTestItemRepository::findById(id));
+        sync(FullCacheTestItemRepo::findById(id));
 
         // Modify DB
         updateTestItem(id, "inv_updated", 20);
 
         // Invalidate both layers
-        sync(FullCacheTestItemRepository::invalidate(id));
+        sync(FullCacheTestItemRepo::invalidate(id));
 
         // Next read should get fresh value from DB
-        auto item = sync(FullCacheTestItemRepository::findById(id));
+        auto item = sync(FullCacheTestItemRepo::findById(id));
         REQUIRE(item->name == "inv_updated");
         REQUIRE(item->value == 20);
     }
@@ -166,30 +166,30 @@ TEST_CASE("FullCache<TestItem> - cascade invalidation",
         auto id = insertTestItem("inv_l1_only", 10);
 
         // Populate both layers
-        sync(FullCacheTestItemRepository::findById(id));
+        sync(FullCacheTestItemRepo::findById(id));
 
         // Modify DB
         updateTestItem(id, "inv_l1_updated", 20);
 
         // Clear L1 only
-        FullCacheTestItemRepository::invalidateL1(id);
+        FullCacheTestItemRepo::invalidateL1(id);
 
         // Read should come from L2 (stale)
-        auto item = sync(FullCacheTestItemRepository::findById(id));
+        auto item = sync(FullCacheTestItemRepo::findById(id));
         REQUIRE(item->name == "inv_l1_only");
         REQUIRE(item->value == 10);
     }
 
     SECTION("[create] populates both L1 and L2") {
         auto entity = makeTestItem("created_both", 77);
-        auto created = sync(FullCacheTestItemRepository::create(entity));
+        auto created = sync(FullCacheTestItemRepo::create(entity));
         REQUIRE(created != nullptr);
 
         // Modify DB directly
         updateTestItem(created->id, "sneaky_update", 0);
 
         // L1 cache should serve the original
-        auto cached = sync(FullCacheTestItemRepository::findById(created->id));
+        auto cached = sync(FullCacheTestItemRepo::findById(created->id));
         REQUIRE(cached->name == "created_both");
         REQUIRE(cached->value == 77);
     }
@@ -198,13 +198,13 @@ TEST_CASE("FullCache<TestItem> - cascade invalidation",
         auto id = insertTestItem("before_update", 10);
 
         // Populate caches
-        sync(FullCacheTestItemRepository::findById(id));
+        sync(FullCacheTestItemRepo::findById(id));
 
         auto updated = makeTestItem("after_update", 20, "", true, id);
-        sync(FullCacheTestItemRepository::update(id, updated));
+        sync(FullCacheTestItemRepo::update(id, updated));
 
         // Next read should get updated value
-        auto item = sync(FullCacheTestItemRepository::findById(id));
+        auto item = sync(FullCacheTestItemRepo::findById(id));
         REQUIRE(item->name == "after_update");
         REQUIRE(item->value == 20);
     }
@@ -213,11 +213,11 @@ TEST_CASE("FullCache<TestItem> - cascade invalidation",
         auto id = insertTestItem("to_remove", 10);
 
         // Populate caches
-        sync(FullCacheTestItemRepository::findById(id));
+        sync(FullCacheTestItemRepo::findById(id));
 
-        sync(FullCacheTestItemRepository::remove(id));
+        sync(FullCacheTestItemRepo::remove(id));
 
-        auto item = sync(FullCacheTestItemRepository::findById(id));
+        auto item = sync(FullCacheTestItemRepo::findById(id));
         REQUIRE(item == nullptr);
     }
 }
@@ -321,14 +321,14 @@ TEST_CASE("FullCache<TestUser> - binary entity at L1+L2",
     SECTION("[binary] BEVE entity cached in both L1 and L2") {
         auto id = insertTestUser("beve_user", "beve@test.com", 100);
 
-        auto user = sync(FullCacheTestUserRepository::findById(id));
+        auto user = sync(FullCacheTestUserRepo::findById(id));
         REQUIRE(user != nullptr);
         REQUIRE(user->username == "beve_user");
         REQUIRE(user->balance == 100);
 
         // Staleness confirms L1 caching
         updateTestUserBalance(id, 999);
-        auto cached = sync(FullCacheTestUserRepository::findById(id));
+        auto cached = sync(FullCacheTestUserRepo::findById(id));
         REQUIRE(cached->balance == 100);
     }
 
@@ -336,16 +336,16 @@ TEST_CASE("FullCache<TestUser> - binary entity at L1+L2",
         auto id = insertTestUser("l2_binary", "l2@test.com", 200);
 
         // Populate both
-        sync(FullCacheTestUserRepository::findById(id));
+        sync(FullCacheTestUserRepo::findById(id));
 
         // Clear L1
-        FullCacheTestUserRepository::invalidateL1(id);
+        FullCacheTestUserRepo::invalidateL1(id);
 
         // Modify DB
         updateTestUserBalance(id, 999);
 
         // Should read from L2 (stale binary value)
-        auto user = sync(FullCacheTestUserRepository::findById(id));
+        auto user = sync(FullCacheTestUserRepo::findById(id));
         REQUIRE(user->username == "l2_binary");
         REQUIRE(user->balance == 200);
     }
@@ -354,16 +354,16 @@ TEST_CASE("FullCache<TestUser> - binary entity at L1+L2",
         auto id = insertTestUser("updateby_user", "updateby@test.com", 50);
 
         // Populate cache
-        sync(FullCacheTestUserRepository::findById(id));
+        sync(FullCacheTestUserRepo::findById(id));
 
         // Partial update
-        auto updated = sync(FullCacheTestUserRepository::updateBy(id,
+        auto updated = sync(FullCacheTestUserRepo::updateBy(id,
             set<F::balance>(300)));
         REQUIRE(updated != nullptr);
         REQUIRE(updated->balance == 300);
 
         // Fresh read should reflect the update
-        auto fresh = sync(FullCacheTestUserRepository::findById(id));
+        auto fresh = sync(FullCacheTestUserRepo::findById(id));
         REQUIRE(fresh->balance == 300);
     }
 }
@@ -451,13 +451,13 @@ TEST_CASE("FullCache - hierarchy verification",
         auto id = insertTestItem("hierarchy_item", 10);
 
         // Populate all layers
-        sync(FullCacheTestItemRepository::findById(id));
+        sync(FullCacheTestItemRepo::findById(id));
 
         // Modify DB — L1 and L2 are stale
         updateTestItem(id, "hierarchy_modified", 99);
 
         // L1 serves stale value (short-circuits)
-        auto item = sync(FullCacheTestItemRepository::findById(id));
+        auto item = sync(FullCacheTestItemRepo::findById(id));
         REQUIRE(item->name == "hierarchy_item");
     }
 
@@ -465,16 +465,16 @@ TEST_CASE("FullCache - hierarchy verification",
         auto id = insertTestItem("l2_hit_item", 20);
 
         // Populate all layers
-        sync(FullCacheTestItemRepository::findById(id));
+        sync(FullCacheTestItemRepo::findById(id));
 
         // Clear L1 only
-        FullCacheTestItemRepository::invalidateL1(id);
+        FullCacheTestItemRepo::invalidateL1(id);
 
         // Modify DB — L2 still has old value
         updateTestItem(id, "l2_hit_modified", 99);
 
         // L2 serves old value (promotes to L1)
-        auto item = sync(FullCacheTestItemRepository::findById(id));
+        auto item = sync(FullCacheTestItemRepo::findById(id));
         REQUIRE(item->name == "l2_hit_item");
         REQUIRE(item->value == 20);
     }
@@ -483,20 +483,20 @@ TEST_CASE("FullCache - hierarchy verification",
         auto id = insertTestItem("full_miss_item", 30);
 
         // Populate and then invalidate both
-        sync(FullCacheTestItemRepository::findById(id));
-        sync(FullCacheTestItemRepository::invalidate(id));
+        sync(FullCacheTestItemRepo::findById(id));
+        sync(FullCacheTestItemRepo::invalidate(id));
 
         // Update DB
         updateTestItem(id, "full_miss_updated", 60);
 
         // Full miss → DB fetch → repopulate both
-        auto item = sync(FullCacheTestItemRepository::findById(id));
+        auto item = sync(FullCacheTestItemRepo::findById(id));
         REQUIRE(item->name == "full_miss_updated");
         REQUIRE(item->value == 60);
 
         // Verify it's cached: DB modification won't be visible
         updateTestItem(id, "sneaky", 0);
-        auto cached = sync(FullCacheTestItemRepository::findById(id));
+        auto cached = sync(FullCacheTestItemRepo::findById(id));
         REQUIRE(cached->name == "full_miss_updated");
     }
 }
@@ -516,12 +516,12 @@ TEST_CASE("FullCache - findByIdAsJson at L1+L2",
     SECTION("[json] returns cached JSON from L1") {
         auto id = insertTestItem("json_item", 42);
 
-        auto json1 = sync(FullCacheTestItemRepository::findByIdAsJson(id));
+        auto json1 = sync(FullCacheTestItemRepo::findByIdAsJson(id));
         REQUIRE(json1 != nullptr);
         REQUIRE(json1->find("\"json_item\"") != std::string::npos);
 
         // Second call returns same cached pointer
-        auto json2 = sync(FullCacheTestItemRepository::findByIdAsJson(id));
+        auto json2 = sync(FullCacheTestItemRepo::findByIdAsJson(id));
         REQUIRE(json2 != nullptr);
         REQUIRE(*json1 == *json2);
     }
@@ -530,13 +530,13 @@ TEST_CASE("FullCache - findByIdAsJson at L1+L2",
         auto id = insertTestItem("json_l2_item", 99);
 
         // Populate L1+L2
-        sync(FullCacheTestItemRepository::findByIdAsJson(id));
+        sync(FullCacheTestItemRepo::findByIdAsJson(id));
 
         // Clear L1
-        FullCacheTestItemRepository::invalidateL1(id);
+        FullCacheTestItemRepo::invalidateL1(id);
 
         // Should fall back to L2
-        auto json = sync(FullCacheTestItemRepository::findByIdAsJson(id));
+        auto json = sync(FullCacheTestItemRepo::findByIdAsJson(id));
         REQUIRE(json != nullptr);
         REQUIRE(json->find("\"json_l2_item\"") != std::string::npos);
     }

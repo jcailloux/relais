@@ -23,8 +23,8 @@ namespace jcailloux::relais {
 //
 // Composed concepts for repository constraints:
 //
-//   ReadableEntity    = Readable               (BaseRepository)
-//   CacheableEntity   = Readable + Serializable (RedisRepository, CachedRepository)
+//   ReadableEntity    = Readable               (BaseRepo)
+//   CacheableEntity   = Readable + Serializable (RedisRepo, CachedRepo)
 //   MutableEntity     = Readable + Writable     (create/update methods)
 //   CreatableEntity   = Mutable  + Keyed        (create with cache population)
 // =============================================================================
@@ -60,11 +60,11 @@ concept Keyed = requires(const W& w) {
 // Composed concepts for repository constraints
 // -----------------------------------------------------------------------------
 
-/// Minimum requirement for BaseRepository (DB-only read)
+/// Minimum requirement for BaseRepo (DB-only read)
 template<typename W>
 concept ReadableEntity = Readable<W>;
 
-/// Required for RedisRepository / CachedRepository (read + cache)
+/// Required for RedisRepo / CachedRepo (read + cache)
 template<typename W>
 concept CacheableEntity = ReadableEntity<W> && Serializable<W>;
 

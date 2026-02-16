@@ -1,9 +1,9 @@
 /**
  * test_base_repository_compile.cpp
  *
- * Compile-time and structural tests for BaseRepository.
+ * Compile-time and structural tests for BaseRepo.
  * Verifies that:
- *   - BaseRepository instantiates with all entity types
+ *   - BaseRepo instantiates with all entity types
  *   - Concepts (ReadableEntity, MutableEntity, HasFieldUpdate) are satisfied
  *   - SQL strings are correct
  *   - FieldUpdate utilities (set, fieldColumnName, fieldValue) work
@@ -15,7 +15,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
-#include "jcailloux/relais/repository/BaseRepository.h"
+#include "jcailloux/relais/repository/BaseRepo.h"
 #include "fixtures/generated/TestItemWrapper.h"
 #include "fixtures/generated/TestUserWrapper.h"
 #include "fixtures/generated/TestOrderWrapper.h"
@@ -24,23 +24,23 @@
 using namespace jcailloux::relais;
 
 // =========================================================================
-// Instantiate BaseRepository with each entity type to verify compilation.
-// These are direct BaseRepository instantiations (not Repository<>) to avoid
+// Instantiate BaseRepo with each entity type to verify compilation.
+// These are direct BaseRepo instantiations (not Repo<>) to avoid
 // depending on the full mixin chain (RedisRepo, CachedRepo, etc.) which
 // is not yet refactored.
 // =========================================================================
 
-using ItemRepo = BaseRepository<
+using ItemRepo = BaseRepo<
     entity::generated::TestItemWrapper, "test:item", config::Uncached, int64_t>;
-using UserRepo = BaseRepository<
+using UserRepo = BaseRepo<
     entity::generated::TestUserWrapper, "test:user", config::Uncached, int64_t>;
-using OrderRepo = BaseRepository<
+using OrderRepo = BaseRepo<
     entity::generated::TestOrderWrapper, "test:order", config::Uncached, int64_t>;
-using EventRepo = BaseRepository<
+using EventRepo = BaseRepo<
     entity::generated::TestEventWrapper, "test:event", config::Uncached, int64_t>;
 
 // Read-only repo
-using ReadOnlyItemRepo = BaseRepository<
+using ReadOnlyItemRepo = BaseRepo<
     entity::generated::TestItemWrapper, "test:item:ro",
     config::Uncached.with_read_only(), int64_t>;
 
@@ -48,7 +48,7 @@ using ReadOnlyItemRepo = BaseRepository<
 // Type trait tests
 // =========================================================================
 
-TEST_CASE("BaseRepository type traits", "[base_repo]") {
+TEST_CASE("BaseRepo type traits", "[base_repo]") {
     SECTION("EntityType is correct") {
         STATIC_REQUIRE(std::is_same_v<
             ItemRepo::EntityType, entity::generated::TestItemWrapper>);
@@ -90,7 +90,7 @@ TEST_CASE("BaseRepository type traits", "[base_repo]") {
 // Concept tests
 // =========================================================================
 
-TEST_CASE("BaseRepository concepts", "[base_repo]") {
+TEST_CASE("BaseRepo concepts", "[base_repo]") {
     SECTION("ReadableEntity") {
         STATIC_REQUIRE(ReadableEntity<entity::generated::TestItemWrapper>);
         STATIC_REQUIRE(ReadableEntity<entity::generated::TestUserWrapper>);

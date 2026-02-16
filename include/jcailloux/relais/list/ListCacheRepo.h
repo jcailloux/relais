@@ -1,5 +1,5 @@
-#ifndef CODIBOT_LISTCACHEREPOSITORY_H
-#define CODIBOT_LISTCACHEREPOSITORY_H
+#ifndef CODIBOT_ListCacheRepo_H
+#define CODIBOT_ListCacheRepo_H
 
 #include <memory>
 
@@ -11,15 +11,15 @@
 namespace jcailloux::relais::cache::list {
 
 // =============================================================================
-// ListCacheRepository - Mixin that adds ListCache support to repositories
+// ListCacheRepo - Mixin that adds ListCache support to repositories
 // =============================================================================
 //
 // Usage:
-//   class MyRepository
-//       : public config::repository::Repository<...>
-//       , public cache::list::ListCacheRepository<MyRepository, MyEntity, ...>
+//   class MyRepo
+//       : public config::repo::Repo<...>
+//       , public cache::list::ListCacheRepo<MyRepo, MyEntity, ...>
 //   {
-//       using ListMixin = cache::list::ListCacheRepository<...>;
+//       using ListMixin = cache::list::ListCacheRepo<...>;
 //   public:
 //       static io::Task<ListResult> findItems(ListQuery query) {
 //           co_return co_await cachedListQuery(std::move(query), [&]() {
@@ -31,7 +31,7 @@ namespace jcailloux::relais::cache::list {
 
 template<typename Derived, typename Entity, typename Key = int64_t,
          typename Traits = ListCacheTraits<Entity>>
-class ListCacheRepository {
+class ListCacheRepo {
 public:
     using ListCacheType = ListCache<Entity, Key, Traits>;
     using ListQuery = cache::list::ListQuery<typename Traits::Filters, typename Traits::SortField>;
@@ -40,7 +40,7 @@ public:
     using EntityPtr = std::shared_ptr<const Entity>;
 
     /// Prime the ListCache with dummy operations to force internal allocations.
-    /// Called by CachedRepository::warmup() automatically.
+    /// Called by CachedRepo::warmup() automatically.
     static void warmupListCache() {
         RELAIS_LOG_DEBUG << Derived::name() << ": warmupListCache() called";
 
@@ -198,4 +198,4 @@ protected:
 
 }  // namespace jcailloux::relais::cache::list
 
-#endif  // CODIBOT_LISTCACHEREPOSITORY_H
+#endif  // CODIBOT_ListCacheRepo_H

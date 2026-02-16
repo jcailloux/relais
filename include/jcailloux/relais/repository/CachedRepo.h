@@ -1,15 +1,15 @@
-#ifndef JCX_RELAIS_CACHEDREPOSITORY_H
-#define JCX_RELAIS_CACHEDREPOSITORY_H
+#ifndef JCX_RELAIS_CACHEDREPO_H
+#define JCX_RELAIS_CACHEDREPO_H
 
 #include <atomic>
 #include <chrono>
 #include <memory>
 #include <type_traits>
 #include "jcailloux/relais/io/Task.h"
-#include "jcailloux/relais/repository/RedisRepository.h"
+#include "jcailloux/relais/repository/RedisRepo.h"
 #include "jcailloux/relais/Log.h"
 #include <jcailloux/shardmap/ShardMap.h>
-#include "jcailloux/relais/config/repository_config.h"
+#include "jcailloux/relais/config/repo_config.h"
 
 #ifdef RELAIS_BUILDING_TESTS
 namespace relais_test { struct TestInternals; }
@@ -71,28 +71,28 @@ struct EntityCacheMetadata {
 };
 
 /**
- * Repository with L1 RAM cache.
+ * Repo with L1 RAM cache.
  *
  * Supports two modes based on Cfg.cache_level:
  * - CacheLevel::L1:    RAM -> Database (Redis bypassed)
  * - CacheLevel::L1_L2: RAM -> Redis -> Database (full hierarchy)
  *
- * Note: L1RepoConfig constraint is verified in Repository.h to avoid
+ * Note: L1RepoConfig constraint is verified in Repo.h to avoid
  * eager evaluation issues with std::conditional_t.
  */
 template<typename Entity, config::FixedString Name, config::CacheConfig Cfg, typename Key>
 requires CacheableEntity<Entity>
-class CachedRepository : public std::conditional_t<
+class CachedRepo : public std::conditional_t<
     Cfg.cache_level == config::CacheLevel::L1,
-    BaseRepository<Entity, Name, Cfg, Key>,
-    RedisRepository<Entity, Name, Cfg, Key>
+    BaseRepo<Entity, Name, Cfg, Key>,
+    RedisRepo<Entity, Name, Cfg, Key>
 > {
     static constexpr bool HasRedis = (Cfg.cache_level == config::CacheLevel::L1_L2);
 
     using Base = std::conditional_t<
         HasRedis,
-        RedisRepository<Entity, Name, Cfg, Key>,
-        BaseRepository<Entity, Name, Cfg, Key>
+        RedisRepo<Entity, Name, Cfg, Key>,
+        BaseRepo<Entity, Name, Cfg, Key>
     >;
 
     using Mapping = typename Entity::MappingType;
@@ -352,4 +352,4 @@ protected:
 
 }  // namespace jcailloux::relais
 
-#endif //JCX_RELAIS_CACHEDREPOSITORY_H
+#endif //JCX_RELAIS_CACHEDREPO_H

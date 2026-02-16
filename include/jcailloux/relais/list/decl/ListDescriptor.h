@@ -5,7 +5,7 @@
 #include <tuple>
 #include <type_traits>
 
-#include "jcailloux/relais/config/repository_config.h"
+#include "jcailloux/relais/config/repo_config.h"
 #include "jcailloux/relais/wrapper/EntityConcepts.h"
 
 namespace jcailloux::relais::cache::list::decl {
