@@ -85,7 +85,6 @@ inline std::string buildUpdateReturning(
 //
 // All DB access goes through DbProvider (type-erased PgClient).
 // SQL queries come from Entity::MappingType::SQL.
-// Entity IS the model — no Drogon ORM Model intermediary.
 //
 
 template<typename Entity, config::FixedString Name, config::CacheConfig Cfg, typename Key>

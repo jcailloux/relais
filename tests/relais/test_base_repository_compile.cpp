@@ -1,9 +1,9 @@
 /**
  * test_base_repository_compile.cpp
  *
- * Compile-time and structural tests for BaseRepository after the
- * Drogon -> direct I/O refactoring. Verifies that:
- *   - BaseRepository instantiates with all entity types (no Drogon needed)
+ * Compile-time and structural tests for BaseRepository.
+ * Verifies that:
+ *   - BaseRepository instantiates with all entity types
  *   - Concepts (ReadableEntity, MutableEntity, HasFieldUpdate) are satisfied
  *   - SQL strings are correct
  *   - FieldUpdate utilities (set, fieldColumnName, fieldValue) work

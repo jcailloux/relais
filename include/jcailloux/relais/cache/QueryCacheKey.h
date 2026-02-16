@@ -120,7 +120,7 @@ concept HasAppendToHash = requires(const T& filters, HashBuffer& buf) {
  * - static constexpr auto hashFields = std::tuple{&T::field1, &T::field2, ...}
  *   Fields listed in FIXED ORDER for canonical hash (any consistent order works)
  * - void appendToHash(HashBuffer& buf) const noexcept
- *   Manual implementation (legacy)
+ *   Manual implementation (alternative)
  */
 template<typename T>
 concept HashableFilters = HasHashFields<T> || HasAppendToHash<T>;
@@ -214,7 +214,7 @@ struct SortParam {
  *       };
  *   };
  *
- * Usage (legacy - appendToHash method):
+ * Alternative usage (appendToHash method):
  *   struct MessageFilters {
  *       std::optional<int64_t> user_id;
  *       std::optional<std::string> category;

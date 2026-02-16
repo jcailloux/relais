@@ -3,12 +3,12 @@
  *
  * Compile-time and structural tests for the refactored declarative list system.
  * Verifies that:
- *   - Filter/Sort descriptors work with FixedString column names (no Drogon model)
+ *   - Filter/Sort descriptors work with FixedString column names
  *   - GeneratedFilters, GeneratedTraits compile in new namespace
  *   - buildWhereClause generates SQL with PgParams
  *   - matchesFilters works with entity data members
  *   - compare, extractSortValue, parseSortField work correctly
- *   - HttpQueryParser works with std::unordered_map (no Drogon HttpRequest)
+ *   - HttpQueryParser works with std::unordered_map
  *   - ListCache, ModificationTracker compile in new namespace
  *   - QueryCacheKey, QueryParser in relais::cache namespace
  *
@@ -391,7 +391,7 @@ TEST_CASE("ListDescriptorQuery struct", "[list_system][query]") {
 // =============================================================================
 
 TEST_CASE("All types in jcailloux::relais namespace", "[list_system][namespace]") {
-    // Verify no Drogon namespace remnants
+    // Verify all types are in jcailloux::relais namespace
     STATIC_REQUIRE(std::is_same_v<
         decl::Op, jcailloux::relais::cache::list::decl::Op>);
     STATIC_REQUIRE(std::is_same_v<

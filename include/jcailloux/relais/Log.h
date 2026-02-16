@@ -12,9 +12,8 @@ namespace jcailloux::relais::log {
 // =============================================================================
 // Log — Configurable logging abstraction for relais
 //
-// Replaces trantor::Logger (LOG_ERROR, LOG_WARN, LOG_DEBUG) with macros
-// that the application can configure via a callback. No dependency on any
-// framework — the application provides the routing at startup.
+// Configurable logging abstraction. The application provides the routing
+// at startup via a callback. No dependency on any framework.
 //
 // Usage:
 //   RELAIS_LOG_ERROR << "MyRepo: DB error - " << e.what();
@@ -23,7 +22,7 @@ namespace jcailloux::relais::log {
 //
 // Configuration (in application startup):
 //   jcailloux::relais::log::setCallback([](Level level, const char* msg, size_t len) {
-//       LOG_ERROR << std::string_view(msg, len);  // route to trantor
+//       LOG_ERROR << std::string_view(msg, len);  // route to your logger
 //   });
 // =============================================================================
 
@@ -101,7 +100,7 @@ private:
 }  // namespace jcailloux::relais::log
 
 // =============================================================================
-// Macros — drop-in replacements for trantor LOG_* macros
+// Convenience macros — stream-style logging
 // =============================================================================
 
 #define RELAIS_LOG_ERROR ::jcailloux::relais::log::LogStream(::jcailloux::relais::log::Level::Error)

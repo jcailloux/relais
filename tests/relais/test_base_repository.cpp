@@ -584,7 +584,7 @@ TEST_CASE("BaseRepository - updateBy returns re-fetched entity", "[integration][
 
         // updateBy calls mapper.update which may throw or succeed with 0 rows,
         // then re-fetches which returns nullptr
-        // Behavior depends on Drogon: either nullptr or exception -> nullptr
+        // updateBy on non-existent ID: either nullptr or exception -> nullptr
         REQUIRE(result == nullptr);
     }
 }
