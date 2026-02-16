@@ -8,7 +8,7 @@ and generates:
   - EntityWrapper<Struct, Mapping> type aliases (public API)
   - ListWrapper and ListDescriptor for list entities
 
-No Drogon dependency — uses jcailloux::relais::io directly.
+Uses jcailloux::relais::io for database access.
 
 Usage:
     python generate_entities.py --sources dir/ --output-dir generated/
@@ -86,8 +86,8 @@ class SortConfig:
 @dataclass
 class EntityAnnotation:
     """Parsed @relais annotations for an entity."""
-    table: str = ""       # PostgreSQL table name (new: replaces model=)
-    model: str = ""       # Drogon model class (legacy, ignored)
+    table: str = ""       # PostgreSQL table name
+    model: str = ""       # Parsed but ignored (table= is used instead)
     primary_key: str = "id"
     partition_keys: list[str] = field(default_factory=list)
     db_managed: list[str] = field(default_factory=list)
@@ -424,7 +424,6 @@ class MappingGenerator:
     """Generate Mapping structs + EntityWrapper aliases from parsed entities.
 
     Generates SQL-direct code using jcailloux::relais::io.
-    No Drogon ORM dependency.
     """
 
     def __init__(self):
@@ -926,7 +925,7 @@ class MappingGenerator:
             is_nullable = m.is_optional
             enum_mapping = self._find_enum_mapping(a, m.name)
 
-            # Determine value_type (no more trantor::Date — timestamps are strings)
+            # Determine value_type (timestamps are stored as strings)
             if enum_mapping or m.is_raw_json:
                 value_type = "std::string"
             elif is_nullable:

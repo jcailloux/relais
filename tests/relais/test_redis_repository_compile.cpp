@@ -1,9 +1,9 @@
 /**
  * test_redis_repository_compile.cpp
  *
- * Compile-time and structural tests for RedisRepository and RedisCache
- * after the Drogon -> direct I/O refactoring. Verifies that:
- *   - RedisRepository instantiates with all entity types (no Drogon needed)
+ * Compile-time and structural tests for RedisRepository and RedisCache.
+ * Verifies that:
+ *   - RedisRepository instantiates with all entity types
  *   - Type aliases, config, and l2Ttl are correct
  *   - RedisCache namespace is jcailloux::relais::cache
  *   - InvalidateOn types compile in the new namespace
