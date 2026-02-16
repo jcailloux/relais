@@ -20,7 +20,7 @@ namespace jcailloux::relais::cache {
 
     /**
      * Async Redis cache wrapper for L2 caching.
-     * Entity must implement toJson() and fromJson().
+     * Entity must implement json() and fromJson().
      *
      * All Redis operations go through DbProvider::redis() which wraps
      * io::RedisClient via type-erased std::function.
@@ -63,7 +63,7 @@ namespace jcailloux::relais::cache {
 
                 try {
                     auto ttl_seconds = std::chrono::duration_cast<std::chrono::seconds>(ttl).count();
-                    auto json = entity.toJson();
+                    auto json = entity.json();
                     co_await DbProvider::redis("SETEX", key,
                         ttl_seconds, *json);
                     co_return true;
@@ -274,10 +274,10 @@ namespace jcailloux::relais::cache {
             }
 
             // =================================================================
-            // FlatBuffer List Entity Binary Methods
+            // List Entity Binary Methods
             // =================================================================
 
-            /// Get a FlatBuffer list entity from binary cache.
+            /// Get a list entity from binary cache.
             /// Automatically skips the ListBoundsHeader if present (magic bytes 0x53 0x52).
             template<typename ListEntity>
             static io::Task<std::optional<ListEntity>> getListBinary(const std::string& key)
@@ -299,7 +299,7 @@ namespace jcailloux::relais::cache {
                 co_return std::nullopt;
             }
 
-            /// Get a FlatBuffer list entity with TTL refresh.
+            /// Get a list entity with TTL refresh.
             template<typename ListEntity, typename Rep, typename Period>
             static io::Task<std::optional<ListEntity>> getListBinaryEx(
                 const std::string& key,
@@ -329,10 +329,10 @@ namespace jcailloux::relais::cache {
                 std::chrono::duration<Rep, Period> ttl,
                 std::optional<list::ListBoundsHeader> header = std::nullopt)
                 requires requires(const ListEntity& l) {
-                    { l.toBinary() } -> std::convertible_to<std::shared_ptr<const std::vector<uint8_t>>>;
+                    { l.binary() } -> std::convertible_to<std::shared_ptr<const std::vector<uint8_t>>>;
                 }
             {
-                auto binary = listEntity.toBinary();
+                auto binary = listEntity.binary();
                 if (header) {
                     std::vector<uint8_t> prefixed(list::kListBoundsHeaderSize + binary->size());
                     header->writeTo(prefixed.data());

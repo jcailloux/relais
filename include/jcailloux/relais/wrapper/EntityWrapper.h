@@ -61,8 +61,8 @@ public:
     // Primary key — delegated to Mapping
     // =========================================================================
 
-    [[nodiscard]] auto getPrimaryKey() const noexcept {
-        return Mapping::getPrimaryKey(*this);
+    [[nodiscard]] auto key() const noexcept {
+        return Mapping::key(*this);
     }
 
     // =========================================================================
@@ -87,7 +87,7 @@ public:
     // Binary serialization (Glaze BEVE, thread-safe lazy)
     // =========================================================================
 
-    [[nodiscard]] std::shared_ptr<const std::vector<uint8_t>> toBinary() const {
+    [[nodiscard]] std::shared_ptr<const std::vector<uint8_t>> binary() const {
         std::call_once(beve_flag_, [this] {
             auto buf = std::make_shared<std::vector<uint8_t>>();
             if (glz::write_beve(*this, *buf))
@@ -110,7 +110,7 @@ public:
     // JSON serialization (Glaze JSON, thread-safe lazy)
     // =========================================================================
 
-    [[nodiscard]] std::shared_ptr<const std::string> toJson() const {
+    [[nodiscard]] std::shared_ptr<const std::string> json() const {
         std::call_once(json_flag_, [this] {
             auto json = std::make_shared<std::string>();
             json->reserve(256);
@@ -133,9 +133,9 @@ public:
     // Cache management
     // =========================================================================
 
-    /// Release serialization caches. After this call, toBinary()/toJson()
+    /// Release serialization caches. After this call, binary()/json()
     /// return nullptr. Callers who previously obtained shared_ptrs from
-    /// toBinary()/toJson() retain valid data through reference counting.
+    /// binary()/json() retain valid data through reference counting.
     void releaseCaches() const noexcept {
         beve_cache_.reset();
         json_cache_.reset();

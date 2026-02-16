@@ -29,11 +29,11 @@ namespace jcailloux::relais {
  * Activated when Entity has a ListDescriptor (detected via HasListDescriptor concept).
  * Sits in the mixin chain between the cache layer and InvalidationMixin.
  *
- * Chain: [InvalidationMixin] -> ListMixin -> CachedRepository -> [RedisRepository] -> BaseRepository
+ * Chain: [InvalidationMixin] -> ListMixin -> CachedRepo -> [RedisRepo] -> BaseRepo
  *
  * Provides:
  * - query()           : paginated list queries with L1 caching + lazy invalidation
- * - CRUD interception : automatically notifies list cache on create/update/remove
+ * - CRUD interception : automatically notifies list cache on insert/update/erase
  * - warmup()          : primes both entity and list L1 caches
  *
  * Uses the existing ListCache (shardmap-based) for storage and ModificationTracker
@@ -202,7 +202,7 @@ public:
     using typename Base::WrapperType;
     using typename Base::WrapperPtrType;
     using Base::name;
-    using Base::findById;
+    using Base::find;
 
     /// Augmented descriptor — pass to parseListQueryStrict<ListDescriptorType>(req)
     using ListDescriptorType = Descriptor;
@@ -226,7 +226,7 @@ public:
     }
 
     /// Get L1 list cache size.
-    [[nodiscard]] static size_t listCacheSize() noexcept {
+    [[nodiscard]] static size_t listSize() noexcept {
         return listCache().size();
     }
 
@@ -234,11 +234,11 @@ public:
     // CRUD interception — notifies list cache on entity changes
     // =========================================================================
 
-    /// Create entity and notify list cache.
-    static io::Task<WrapperPtrType> create(WrapperPtrType wrapper)
+    /// insert entity and notify list cache.
+    static io::Task<WrapperPtrType> insert(WrapperPtrType wrapper)
         requires MutableEntity<Entity> && (!Base::config.read_only)
     {
-        auto result = co_await Base::create(std::move(wrapper));
+        auto result = co_await Base::insert(std::move(wrapper));
         if (result) {
             listCache().onEntityCreated(result);
         }
@@ -249,25 +249,25 @@ public:
     static io::Task<bool> update(const Key& id, WrapperPtrType wrapper)
         requires MutableEntity<Entity> && (!Base::config.read_only)
     {
-        auto old = co_await Base::findById(id);
+        auto old = co_await Base::find(id);
         co_return co_await updateWithContext(id, std::move(wrapper), std::move(old));
     }
 
-    /// Remove entity and notify list cache.
-    static io::Task<std::optional<size_t>> remove(const Key& id)
+    /// Erase entity and notify list cache.
+    static io::Task<std::optional<size_t>> erase(const Key& id)
         requires (!Base::config.read_only)
     {
-        auto entity = co_await Base::findById(id);
-        co_return co_await removeWithContext(id, std::move(entity));
+        auto entity = co_await Base::find(id);
+        co_return co_await eraseWithContext(id, std::move(entity));
     }
 
     /// Partial update and notify list cache.
     template<typename... Updates>
-    static io::Task<WrapperPtrType> updateBy(const Key& id, Updates&&... updates)
+    static io::Task<WrapperPtrType> patch(const Key& id, Updates&&... updates)
         requires HasFieldUpdate<Entity> && (!Base::config.read_only)
     {
-        auto old = co_await Base::findById(id);
-        co_return co_await updateByWithContext(id, std::move(old),
+        auto old = co_await Base::find(id);
+        co_return co_await patchWithContext(id, std::move(old),
             std::forward<Updates>(updates)...);
     }
 
@@ -286,19 +286,47 @@ public:
     // Cache management — unified entity + list cleanup
     // =========================================================================
 
-    /// Trigger cleanup on both entity and list L1 caches (non-blocking).
-    static bool triggerCleanup() {
-        bool entity_cleaned = Base::triggerCleanup();
-        bool list_cleaned = listCache().triggerCleanup();
+    /// Try to sweep one shard on both entity and list caches.
+    /// Returns immediately if a sweep is already in progress.
+    static bool trySweep() {
+        bool entity_cleaned = Base::trySweep();
+        bool list_cleaned = listCache().trySweep();
         return entity_cleaned || list_cleaned;
     }
 
-    /// Full cleanup on both entity and list L1 caches (blocking).
-    static size_t fullCleanup() {
-        size_t entity_removed = Base::fullCleanup();
-        size_t list_removed = listCache().fullCleanup();
-        return entity_removed + list_removed;
+    /// Sweep one shard on both entity and list caches.
+    static bool sweep() {
+        bool entity_cleaned = Base::sweep();
+        bool list_cleaned = listCache().sweep();
+        return entity_cleaned || list_cleaned;
     }
+
+    /// Sweep all shards on both entity and list caches.
+    static size_t purge() {
+        size_t entity_erased = Base::purge();
+        size_t list_erased = listCache().purge();
+        return entity_erased + list_erased;
+    }
+
+    /// Try to sweep one entity cache shard.
+    /// Returns immediately if a sweep is already in progress.
+    static bool trySweepEntities() { return Base::trySweep(); }
+
+    /// Sweep one entity cache shard.
+    static bool sweepEntities() { return Base::sweep(); }
+
+    /// Sweep all entity cache shards.
+    static size_t purgeEntities() { return Base::purge(); }
+
+    /// Try to sweep one list cache shard.
+    /// Returns immediately if a sweep is already in progress.
+    static bool trySweepLists() { return listCache().trySweep(); }
+
+    /// Sweep one list cache shard.
+    static bool sweepLists() { return listCache().sweep(); }
+
+    /// Sweep all list cache shards.
+    static size_t purgeLists() { return listCache().purge(); }
 
     /// Invalidate entity cache (list cache invalidation is lazy via ModificationTracker).
     static io::Task<void> invalidate(const Key& id) {
@@ -342,11 +370,11 @@ protected:
         co_return ok;
     }
 
-    static io::Task<std::optional<size_t>> removeWithContext(
+    static io::Task<std::optional<size_t>> eraseWithContext(
         const Key& id, WrapperPtrType old_entity)
         requires (!Base::config.read_only)
     {
-        auto result = co_await Base::remove(id);
+        auto result = co_await Base::erase(id);
         if (result.has_value() && old_entity) {
             listCache().onEntityDeleted(std::move(old_entity));
         }
@@ -354,11 +382,11 @@ protected:
     }
 
     template<typename... Updates>
-    static io::Task<WrapperPtrType> updateByWithContext(
+    static io::Task<WrapperPtrType> patchWithContext(
         const Key& id, WrapperPtrType old_entity, Updates&&... updates)
         requires HasFieldUpdate<Entity> && (!Base::config.read_only)
     {
-        auto result = co_await Base::updateBy(id, std::forward<Updates>(updates)...);
+        auto result = co_await Base::patch(id, std::forward<Updates>(updates)...);
         if (result) {
             listCache().onEntityUpdated(std::move(old_entity), result);
         }

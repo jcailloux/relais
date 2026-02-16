@@ -13,18 +13,18 @@
  * std::atomic<int> counters checked after join.
  *
  * Covers:
- *   1. Concurrent findById (L1, L2, L1+L2)
+ *   1. Concurrent find (L1, L2, L1+L2)
  *   2. Concurrent read + write on same entity
- *   3. Concurrent create + remove
+ *   3. Concurrent insert + erase
  *   4. Concurrent cross-invalidation
  *   5. Concurrent list queries + entity modifications
  *   6. Concurrent warmup + operations
  *   7. Mixed operations storm (all operations interleaved)
- *   8. Concurrent updateBy
+ *   8. Concurrent patch
  *   9. Concurrent cleanup + operations (entity cache)
  *  10. Concurrent list CRUD + list cache cleanup
  *  11a. ModificationTracker drains after concurrent storm
- *  11b. Progressive tracker reduction via triggerCleanup
+ *  11b. Progressive tracker reduction via trySweep
  */
 
 #include <catch2/catch_test_macros.hpp>
@@ -80,24 +80,24 @@ void parallel(int num_threads, Fn&& fn) {
 
 // #############################################################################
 //
-//  1. Concurrent findById
+//  1. Concurrent find
 //
 // #############################################################################
 
-TEST_CASE("Concurrency - concurrent findById",
+TEST_CASE("Concurrency - concurrent find",
           "[integration][db][concurrency][read]")
 {
     TransactionGuard tx;
 
     SECTION("[L1] N threads read the same entity concurrently") {
         auto id = insertTestItem("conc_read_l1", 42);
-        sync(L1TestItemRepository::findById(id));
+        sync(L1TestItemRepo::find(id));
 
         std::atomic<int> null_count{0};
 
         parallel(NUM_THREADS, [&](int) {
             for (int j = 0; j < OPS_PER_THREAD; ++j) {
-                auto item = sync(L1TestItemRepository::findById(id));
+                auto item = sync(L1TestItemRepo::find(id));
                 if (!item) null_count.fetch_add(1, std::memory_order_relaxed);
             }
         });
@@ -107,13 +107,13 @@ TEST_CASE("Concurrency - concurrent findById",
 
     SECTION("[L2] N threads read the same entity concurrently") {
         auto id = insertTestItem("conc_read_l2", 42);
-        sync(L2TestItemRepository::findById(id));
+        sync(L2TestItemRepo::find(id));
 
         std::atomic<int> null_count{0};
 
         parallel(NUM_THREADS, [&](int) {
             for (int j = 0; j < OPS_PER_THREAD; ++j) {
-                auto item = sync(L2TestItemRepository::findById(id));
+                auto item = sync(L2TestItemRepo::find(id));
                 if (!item) null_count.fetch_add(1, std::memory_order_relaxed);
             }
         });
@@ -123,13 +123,13 @@ TEST_CASE("Concurrency - concurrent findById",
 
     SECTION("[L1+L2] N threads read the same entity concurrently") {
         auto id = insertTestItem("conc_read_both", 42);
-        sync(FullCacheTestItemRepository::findById(id));
+        sync(FullCacheTestItemRepo::find(id));
 
         std::atomic<int> null_count{0};
 
         parallel(NUM_THREADS, [&](int) {
             for (int j = 0; j < OPS_PER_THREAD; ++j) {
-                auto item = sync(FullCacheTestItemRepository::findById(id));
+                auto item = sync(FullCacheTestItemRepo::find(id));
                 if (!item) null_count.fetch_add(1, std::memory_order_relaxed);
             }
         });
@@ -147,7 +147,7 @@ TEST_CASE("Concurrency - concurrent findById",
 
         parallel(NUM_THREADS, [&](int i) {
             for (int j = 0; j < OPS_PER_THREAD; ++j) {
-                auto item = sync(L1TestItemRepository::findById(ids[i]));
+                auto item = sync(L1TestItemRepo::find(ids[i]));
                 if (!item) null_count.fetch_add(1, std::memory_order_relaxed);
             }
         });
@@ -170,46 +170,46 @@ TEST_CASE("Concurrency - concurrent read + write",
 
     SECTION("[L1] readers and writers on same entity") {
         auto id = insertTestItem("conc_rw_l1", 0);
-        sync(L1TestItemRepository::findById(id));
+        sync(L1TestItemRepo::find(id));
 
         parallel(NUM_THREADS, [&](int i) {
             for (int j = 0; j < OPS_PER_THREAD; ++j) {
                 if (i % 2 == 0) {
                     // Reader — may see nullptr briefly during invalidation
-                    sync(L1TestItemRepository::findById(id));
+                    sync(L1TestItemRepo::find(id));
                 } else {
                     // Writer
                     auto entity = makeTestItem(
                         "rw_" + std::to_string(i) + "_" + std::to_string(j),
                         i * 1000 + j, "", true, id);
-                    sync(L1TestItemRepository::update(id, entity));
+                    sync(L1TestItemRepo::update(id, entity));
                 }
             }
         });
 
         // Verify the repo is still functional
-        auto final_item = sync(L1TestItemRepository::findById(id));
+        auto final_item = sync(L1TestItemRepo::find(id));
         REQUIRE(final_item != nullptr);
     }
 
     SECTION("[L1+L2] readers and writers on same entity") {
         auto id = insertTestItem("conc_rw_both", 0);
-        sync(FullCacheTestItemRepository::findById(id));
+        sync(FullCacheTestItemRepo::find(id));
 
         parallel(NUM_THREADS, [&](int i) {
             for (int j = 0; j < OPS_PER_THREAD; ++j) {
                 if (i % 2 == 0) {
-                    sync(FullCacheTestItemRepository::findById(id));
+                    sync(FullCacheTestItemRepo::find(id));
                 } else {
                     auto entity = makeTestItem(
                         "rw_both_" + std::to_string(i) + "_" + std::to_string(j),
                         i * 1000 + j, "", true, id);
-                    sync(FullCacheTestItemRepository::update(id, entity));
+                    sync(FullCacheTestItemRepo::update(id, entity));
                 }
             }
         });
 
-        auto final_item = sync(FullCacheTestItemRepository::findById(id));
+        auto final_item = sync(FullCacheTestItemRepo::find(id));
         REQUIRE(final_item != nullptr);
     }
 }
@@ -217,16 +217,16 @@ TEST_CASE("Concurrency - concurrent read + write",
 
 // #############################################################################
 //
-//  3. Concurrent create + remove
+//  3. Concurrent insert + erase
 //
 // #############################################################################
 
-TEST_CASE("Concurrency - concurrent create + remove",
-          "[integration][db][concurrency][create-remove]")
+TEST_CASE("Concurrency - concurrent insert + erase",
+          "[integration][db][concurrency][insert-erase]")
 {
     TransactionGuard tx;
 
-    SECTION("[L1] threads create and remove entities concurrently") {
+    SECTION("[L1] threads insert and erase entities concurrently") {
         std::atomic<int> created_count{0};
 
         parallel(NUM_THREADS, [&](int i) {
@@ -234,10 +234,10 @@ TEST_CASE("Concurrency - concurrent create + remove",
                 auto entity = makeTestItem(
                     "cr_" + std::to_string(i) + "_" + std::to_string(j),
                     i * 1000 + j);
-                auto item = sync(L1TestItemRepository::create(entity));
+                auto item = sync(L1TestItemRepo::insert(entity));
                 if (item) {
                     created_count.fetch_add(1, std::memory_order_relaxed);
-                    sync(L1TestItemRepository::remove(item->id));
+                    sync(L1TestItemRepo::erase(item->id));
                 }
             }
         });
@@ -245,7 +245,7 @@ TEST_CASE("Concurrency - concurrent create + remove",
         REQUIRE(created_count.load() > 0);
     }
 
-    SECTION("[L1+L2] threads create and remove entities concurrently") {
+    SECTION("[L1+L2] threads insert and erase entities concurrently") {
         std::atomic<int> created_count{0};
 
         parallel(NUM_THREADS, [&](int i) {
@@ -253,10 +253,10 @@ TEST_CASE("Concurrency - concurrent create + remove",
                 auto entity = makeTestItem(
                     "cr_both_" + std::to_string(i) + "_" + std::to_string(j),
                     i * 1000 + j);
-                auto item = sync(FullCacheTestItemRepository::create(entity));
+                auto item = sync(FullCacheTestItemRepo::insert(entity));
                 if (item) {
                     created_count.fetch_add(1, std::memory_order_relaxed);
-                    sync(FullCacheTestItemRepository::remove(item->id));
+                    sync(FullCacheTestItemRepo::erase(item->id));
                 }
             }
         });
@@ -279,27 +279,27 @@ TEST_CASE("Concurrency - concurrent cross-invalidation",
 
     SECTION("[L1] purchase creates invalidate user cache under contention") {
         auto userId = insertTestUser("conc_user", "conc@test.com", 1000);
-        sync(L1TestUserRepository::findById(userId));
+        sync(L1TestUserRepo::find(userId));
 
         parallel(NUM_THREADS, [&](int i) {
             for (int j = 0; j < OPS_PER_THREAD / 4; ++j) {
                 if (i % 2 == 0) {
                     // Read user (may be invalidated mid-flight)
-                    sync(L1TestUserRepository::findById(userId));
+                    sync(L1TestUserRepo::find(userId));
                 } else {
-                    // Create purchase -> invalidates user cache
+                    // insert purchase -> invalidates user cache
                     auto purchase = makeTestPurchase(
                         userId, "Widget_" + std::to_string(i * 100 + j), 10 + j);
-                    auto created = sync(L1TestPurchaseRepository::create(purchase));
+                    auto created = sync(L1TestPurchaseRepo::insert(purchase));
                     if (created) {
-                        sync(L1TestPurchaseRepository::remove(created->id));
+                        sync(L1TestPurchaseRepo::erase(created->id));
                     }
                 }
             }
         });
 
         // Repo should still be functional
-        auto user = sync(L1TestUserRepository::findById(userId));
+        auto user = sync(L1TestUserRepo::find(userId));
         REQUIRE(user != nullptr);
         REQUIRE(user->username == "conc_user");
     }
@@ -316,7 +316,7 @@ TEST_CASE("Concurrency - concurrent list queries + modifications",
           "[integration][db][concurrency][list]")
 {
     TransactionGuard tx;
-    TestInternals::resetListCacheState<TestArticleListRepository>();
+    TestInternals::resetListCacheState<TestArticleListRepo>();
 
     SECTION("[L1] list queries and entity creates in parallel") {
         auto userId = insertTestUser("conc_author", "conc_author@test.com", 0);
@@ -330,21 +330,21 @@ TEST_CASE("Concurrency - concurrent list queries + modifications",
             for (int j = 0; j < OPS_PER_THREAD / 4; ++j) {
                 if (i % 2 == 0) {
                     // Query list — size varies due to concurrent inserts
-                    sync(TestArticleListRepository::query(
+                    sync(TestArticleListRepo::query(
                         makeArticleQuery("conc_cat")));
                 } else {
-                    // Create article via repo (triggers list notification)
+                    // insert article via repo (triggers list notification)
                     auto article = makeTestArticle(
                         "conc_cat", userId,
                         "Conc_" + std::to_string(i) + "_" + std::to_string(j),
                         100 + i * 10 + j);
-                    sync(TestArticleListRepository::create(article));
+                    sync(TestArticleListRepo::insert(article));
                 }
             }
         });
 
         // Final query should work
-        auto result = sync(TestArticleListRepository::query(
+        auto result = sync(TestArticleListRepo::query(
             makeArticleQuery("conc_cat")));
         REQUIRE(result->size() >= 5);
     }
@@ -369,19 +369,19 @@ TEST_CASE("Concurrency - warmup during operations",
             if (i == 0) {
                 // One thread does warmup repeatedly
                 for (int j = 0; j < 10; ++j) {
-                    L1TestItemRepository::warmup();
+                    L1TestItemRepo::warmup();
                 }
             } else {
                 // Other threads read
                 for (int j = 0; j < OPS_PER_THREAD; ++j) {
-                    sync(L1TestItemRepository::findById(id));
+                    sync(L1TestItemRepo::find(id));
                     // May be nullptr if warmup disrupts — that's fine
                 }
             }
         });
 
         // Should still be functional
-        auto item = sync(L1TestItemRepository::findById(id));
+        auto item = sync(L1TestItemRepo::find(id));
         REQUIRE(item != nullptr);
     }
 }
@@ -406,7 +406,7 @@ TEST_CASE("Concurrency - mixed operations storm",
 
         // Prime all caches
         for (auto id : ids) {
-            sync(FullCacheTestItemRepository::findById(id));
+            sync(FullCacheTestItemRepo::find(id));
         }
 
         parallel(NUM_THREADS, [&](int i) {
@@ -418,13 +418,13 @@ TEST_CASE("Concurrency - mixed operations storm",
                 auto op = rng() % 6;
 
                 switch (op) {
-                    case 0:  // findById
+                    case 0:  // find
                     case 1:
-                        sync(FullCacheTestItemRepository::findById(id));
+                        sync(FullCacheTestItemRepo::find(id));
                         break;
 
-                    case 2:  // findByIdAsJson
-                        sync(FullCacheTestItemRepository::findByIdAsJson(id));
+                    case 2:  // findJson
+                        sync(FullCacheTestItemRepo::findJson(id));
                         break;
 
                     case 3:  // update
@@ -433,17 +433,17 @@ TEST_CASE("Concurrency - mixed operations storm",
                             "storm_upd_" + std::to_string(i) + "_" + std::to_string(j),
                             static_cast<int32_t>(rng() % 1000),
                             "", true, id);
-                        sync(FullCacheTestItemRepository::update(id, entity));
+                        sync(FullCacheTestItemRepo::update(id, entity));
                         break;
                     }
 
                     case 4:  // invalidate
-                        sync(FullCacheTestItemRepository::invalidate(id));
+                        sync(FullCacheTestItemRepo::invalidate(id));
                         break;
 
-                    case 5:  // invalidateL1 + read
-                        FullCacheTestItemRepository::invalidateL1(id);
-                        sync(FullCacheTestItemRepository::findById(id));
+                    case 5:  // evict + read
+                        FullCacheTestItemRepo::evict(id);
+                        sync(FullCacheTestItemRepo::find(id));
                         break;
                 }
             }
@@ -451,42 +451,42 @@ TEST_CASE("Concurrency - mixed operations storm",
 
         // Verify all entities are still accessible
         for (auto id : ids) {
-            auto item = sync(FullCacheTestItemRepository::findById(id));
+            auto item = sync(FullCacheTestItemRepo::find(id));
             REQUIRE(item != nullptr);
         }
     }
 
-    SECTION("[L1] rapid create-read-update-delete cycles") {
+    SECTION("[L1] rapid insert-read-update-delete cycles") {
         std::atomic<int> delete_mismatches{0};
 
         parallel(NUM_THREADS, [&](int i) {
             for (int j = 0; j < OPS_PER_THREAD / 4; ++j) {
-                // Create
+                // insert
                 auto entity = makeTestItem(
                     "crud_" + std::to_string(i) + "_" + std::to_string(j),
                     i * 100 + j);
-                auto created = sync(L1TestItemRepository::create(entity));
+                auto created = sync(L1TestItemRepo::insert(entity));
                 if (!created) continue;
 
                 auto id = created->id;
 
                 // Read
-                sync(L1TestItemRepository::findById(id));
+                sync(L1TestItemRepo::find(id));
 
                 // Update
                 auto updated = makeTestItem(
                     "crud_upd_" + std::to_string(i) + "_" + std::to_string(j),
                     i * 100 + j + 1, "", true, id);
-                sync(L1TestItemRepository::update(id, updated));
+                sync(L1TestItemRepo::update(id, updated));
 
                 // Read again
-                sync(L1TestItemRepository::findById(id));
+                sync(L1TestItemRepo::find(id));
 
                 // Delete
-                sync(L1TestItemRepository::remove(id));
+                sync(L1TestItemRepo::erase(id));
 
                 // Read after delete -> should be nullptr
-                auto gone = sync(L1TestItemRepository::findById(id));
+                auto gone = sync(L1TestItemRepo::find(id));
                 if (gone != nullptr) {
                     delete_mismatches.fetch_add(1, std::memory_order_relaxed);
                 }
@@ -501,32 +501,32 @@ TEST_CASE("Concurrency - mixed operations storm",
 
 // #############################################################################
 //
-//  8. Concurrent updateBy
+//  8. Concurrent patch
 //
 // #############################################################################
 
-TEST_CASE("Concurrency - concurrent updateBy",
-          "[integration][db][concurrency][updateBy]")
+TEST_CASE("Concurrency - concurrent patch",
+          "[integration][db][concurrency][patch]")
 {
     TransactionGuard tx;
 
     using jcailloux::relais::wrapper::set;
     using F = TestUserWrapper::Field;
 
-    SECTION("[L1] concurrent updateBy on same user") {
-        auto userId = insertTestUser("conc_updateby", "conc_ub@test.com", 0);
-        sync(L1TestUserRepository::findById(userId));
+    SECTION("[L1] concurrent patch on same user") {
+        auto userId = insertTestUser("conc_patch", "conc_ub@test.com", 0);
+        sync(L1TestUserRepo::find(userId));
 
         parallel(NUM_THREADS, [&](int i) {
             for (int j = 0; j < OPS_PER_THREAD / 2; ++j) {
                 auto balance = static_cast<int32_t>(i * 1000 + j);
-                sync(L1TestUserRepository::updateBy(userId,
+                sync(L1TestUserRepo::patch(userId,
                     set<F::balance>(balance)));
             }
         });
 
         // Should still be functional — last writer wins
-        auto user = sync(L1TestUserRepository::findById(userId));
+        auto user = sync(L1TestUserRepo::find(userId));
         REQUIRE(user != nullptr);
     }
 }
@@ -543,7 +543,7 @@ TEST_CASE("Concurrency - cleanup during operations",
 {
     TransactionGuard tx;
 
-    SECTION("[L1] triggerCleanup while reads and writes happen") {
+    SECTION("[L1] trySweep while reads and writes happen") {
         std::vector<int64_t> ids;
         for (int i = 0; i < 20; ++i) {
             ids.push_back(insertTestItem("cleanup_" + std::to_string(i), i));
@@ -551,7 +551,7 @@ TEST_CASE("Concurrency - cleanup during operations",
 
         // Prime caches
         for (auto id : ids) {
-            sync(L1TestItemRepository::findById(id));
+            sync(L1TestItemRepo::find(id));
         }
 
         parallel(NUM_THREADS, [&](int i) {
@@ -562,11 +562,11 @@ TEST_CASE("Concurrency - cleanup during operations",
 
                 if (i == 0) {
                     // One thread continuously triggers cleanup
-                    triggerCleanup<L1TestItemRepository>();
+                    trySweep<L1TestItemRepo>();
                 } else if (i == 1) {
                     // One thread does full cleanup
                     if (j % 10 == 0) {
-                        forceFullCleanup<L1TestItemRepository>();
+                        forcePurge<L1TestItemRepo>();
                     }
                 } else {
                     // Others do reads and writes
@@ -575,9 +575,9 @@ TEST_CASE("Concurrency - cleanup during operations",
                             "cl_" + std::to_string(i) + "_" + std::to_string(j),
                             static_cast<int32_t>(rng() % 1000),
                             "", true, id);
-                        sync(L1TestItemRepository::update(id, entity));
+                        sync(L1TestItemRepo::update(id, entity));
                     } else {
-                        sync(L1TestItemRepository::findById(id));
+                        sync(L1TestItemRepo::find(id));
                     }
                 }
             }
@@ -585,7 +585,7 @@ TEST_CASE("Concurrency - cleanup during operations",
 
         // All entities should still be accessible
         for (auto id : ids) {
-            auto item = sync(L1TestItemRepository::findById(id));
+            auto item = sync(L1TestItemRepo::find(id));
             REQUIRE(item != nullptr);
         }
     }
@@ -602,9 +602,9 @@ TEST_CASE("Concurrency - list CRUD + list cache cleanup",
           "[integration][db][concurrency][list-cleanup]")
 {
     TransactionGuard tx;
-    TestInternals::resetListCacheState<TestArticleListRepository>();
+    TestInternals::resetListCacheState<TestArticleListRepo>();
 
-    SECTION("[L1] concurrent create/update/remove/query with triggerCleanup") {
+    SECTION("[L1] concurrent insert/update/erase/query with trySweep") {
         auto userId = insertTestUser("conc_lc_author", "conc_lc@test.com", 0);
 
         // Seed articles
@@ -621,30 +621,30 @@ TEST_CASE("Concurrency - list CRUD + list cache cleanup",
             for (int j = 0; j < OPS_PER_THREAD; ++j) {
                 if (i == 0) {
                     // Continuous cleanup (entity + list, unified)
-                    triggerCleanup<TestArticleListRepository>();
+                    trySweep<TestArticleListRepo>();
                 } else if (i == 1) {
                     // Query + periodic full cleanup
-                    sync(TestArticleListRepository::query(
+                    sync(TestArticleListRepo::query(
                         makeArticleQuery("conc_lc")));
                     if (j % 10 == 0) {
-                        forceFullCleanup<TestArticleListRepository>();
+                        forcePurge<TestArticleListRepo>();
                     }
                 } else {
                     int op = rng() % 4;
                     if (op == 0) {
-                        // Create
+                        // insert
                         auto article = makeTestArticle(
                             "conc_lc", userId,
                             "CL_" + std::to_string(i) + "_" + std::to_string(j),
                             static_cast<int32_t>(rng() % 1000));
-                        auto created = sync(TestArticleListRepository::create(article));
+                        auto created = sync(TestArticleListRepo::insert(article));
                         if (created) {
                             std::lock_guard lock(ids_mutex);
                             ids.push_back(created->id);
                         }
                     } else if (op == 1) {
                         // Query
-                        sync(TestArticleListRepository::query(
+                        sync(TestArticleListRepo::query(
                             makeArticleQuery("conc_lc")));
                     } else if (op == 2) {
                         // Update (pick random existing)
@@ -657,22 +657,22 @@ TEST_CASE("Concurrency - list CRUD + list cache cleanup",
                             "conc_lc", userId,
                             "Upd_" + std::to_string(i) + "_" + std::to_string(j),
                             static_cast<int32_t>(rng() % 1000), false, id);
-                        sync(TestArticleListRepository::update(id, article));
+                        sync(TestArticleListRepo::update(id, article));
                     } else {
-                        // Remove (pick random existing)
+                        // Erase (pick random existing)
                         int64_t id;
                         {
                             std::lock_guard lock(ids_mutex);
                             id = ids[rng() % ids.size()];
                         }
-                        sync(TestArticleListRepository::remove(id));
+                        sync(TestArticleListRepo::erase(id));
                     }
                 }
             }
         });
 
         // Final query should work — no crash, no corruption
-        auto result = sync(TestArticleListRepository::query(
+        auto result = sync(TestArticleListRepo::query(
             makeArticleQuery("conc_lc")));
         REQUIRE(result != nullptr);
     }
@@ -689,20 +689,20 @@ TEST_CASE("Concurrency - tracker drains after concurrent storm",
           "[integration][db][concurrency][tracker-drain]")
 {
     TransactionGuard tx;
-    TestInternals::resetListCacheState<TestArticleListRepository>();
+    TestInternals::resetListCacheState<TestArticleListRepo>();
 
-    SECTION("[L1] fullCleanup drains all modifications to zero") {
+    SECTION("[L1] purge drains all modifications to zero") {
         auto userId = insertTestUser("conc_drain_author", "conc_drain@test.com", 0);
 
-        // Phase 1: Create modifications without concurrent cleanup (guaranteed pending)
+        // Phase 1: insert modifications without concurrent cleanup (guaranteed pending)
         for (int i = 0; i < 20; ++i) {
             auto article = makeTestArticle(
                 "drain_cat", userId,
                 "Drain_" + std::to_string(i),
                 i * 10);
-            sync(TestArticleListRepository::create(article));
+            sync(TestArticleListRepo::insert(article));
         }
-        auto initial_count = TestInternals::pendingModificationCount<TestArticleListRepository>();
+        auto initial_count = TestInternals::pendingModificationCount<TestArticleListRepo>();
         REQUIRE(initial_count > 0);
 
         // Phase 2: Concurrent storm (creates + cleanups interleaved)
@@ -710,49 +710,49 @@ TEST_CASE("Concurrency - tracker drains after concurrent storm",
             for (int j = 0; j < OPS_PER_THREAD / 2; ++j) {
                 if (i < 2) {
                     // Cleanup threads
-                    triggerCleanup<TestArticleListRepository>();
+                    trySweep<TestArticleListRepo>();
                 } else {
-                    // Create threads
+                    // insert threads
                     auto article = makeTestArticle(
                         "drain_cat", userId,
                         "Storm_" + std::to_string(i) + "_" + std::to_string(j),
                         static_cast<int32_t>(100 + i * 10 + j));
-                    sync(TestArticleListRepository::create(article));
+                    sync(TestArticleListRepo::insert(article));
                 }
             }
         });
         // After join, some modifications have partial cleanup_counts
 
         // Phase 3: Drain (no concurrent writes)
-        TestInternals::forceFullListCleanup<TestArticleListRepository>();
+        TestInternals::forceFullListCleanup<TestArticleListRepo>();
 
         // Phase 4: Verify fully drained
-        REQUIRE(TestInternals::pendingModificationCount<TestArticleListRepository>() == 0);
+        REQUIRE(TestInternals::pendingModificationCount<TestArticleListRepo>() == 0);
 
         // Phase 5: Second storm + drain (verify tracker reusability)
         parallel(NUM_THREADS / 2, [&](int i) {
             for (int j = 0; j < OPS_PER_THREAD / 4; ++j) {
                 if (i == 0) {
-                    triggerCleanup<TestArticleListRepository>();
+                    trySweep<TestArticleListRepo>();
                 } else {
                     auto article = makeTestArticle(
                         "drain_cat", userId,
                         "Storm2_" + std::to_string(i) + "_" + std::to_string(j),
                         static_cast<int32_t>(500 + i * 10 + j));
-                    sync(TestArticleListRepository::create(article));
+                    sync(TestArticleListRepo::insert(article));
                 }
             }
         });
 
-        TestInternals::forceFullListCleanup<TestArticleListRepository>();
-        REQUIRE(TestInternals::pendingModificationCount<TestArticleListRepository>() == 0);
+        TestInternals::forceFullListCleanup<TestArticleListRepo>();
+        REQUIRE(TestInternals::pendingModificationCount<TestArticleListRepo>() == 0);
     }
 }
 
 
 // #############################################################################
 //
-//  11b. Progressive reduction via triggerCleanup
+//  11b. Progressive reduction via trySweep
 //
 // #############################################################################
 
@@ -760,64 +760,64 @@ TEST_CASE("Concurrency - progressive tracker reduction",
           "[integration][db][concurrency][tracker-progressive]")
 {
     TransactionGuard tx;
-    TestInternals::resetListCacheState<TestArticleListRepository>();
+    TestInternals::resetListCacheState<TestArticleListRepo>();
 
-    SECTION("[L1] triggerCleanup progressively reduces modification count") {
+    SECTION("[L1] trySweep progressively reduces modification count") {
         auto userId = insertTestUser("conc_prog_author", "conc_prog@test.com", 0);
 
-        // Create modifications (no concurrent cleanup)
+        // insert modifications (no concurrent cleanup)
         for (int i = 0; i < 10; ++i) {
             auto article = makeTestArticle(
                 "prog_cat", userId,
                 "Prog_" + std::to_string(i),
                 i * 10);
-            sync(TestArticleListRepository::create(article));
+            sync(TestArticleListRepo::insert(article));
         }
 
-        auto initial_count = TestInternals::pendingModificationCount<TestArticleListRepository>();
+        auto initial_count = TestInternals::pendingModificationCount<TestArticleListRepo>();
         REQUIRE(initial_count == 10);
 
         // Run cleanup cycles (2× ShardCount to ensure all bitmap bits are cleared)
-        constexpr auto N = TestInternals::listCacheShardCount<TestArticleListRepository>();
+        constexpr auto N = TestInternals::listCacheShardCount<TestArticleListRepo>();
         for (size_t i = 0; i < 2 * N; ++i) {
-            TestInternals::forceModificationTrackerCleanup<TestArticleListRepository>();
+            TestInternals::forceModificationTrackerCleanup<TestArticleListRepo>();
         }
 
         // After enough cycles, all 10 modifications should have been drained
-        auto final_count = TestInternals::pendingModificationCount<TestArticleListRepository>();
+        auto final_count = TestInternals::pendingModificationCount<TestArticleListRepo>();
         REQUIRE(final_count < initial_count);
     }
 
     SECTION("[L1] concurrent cleanup + queries don't leak modifications") {
-        TestInternals::resetListCacheState<TestArticleListRepository>();
+        TestInternals::resetListCacheState<TestArticleListRepo>();
         auto userId = insertTestUser("conc_prog2_author", "conc_prog2@test.com", 0);
 
-        // Create modifications
+        // insert modifications
         for (int i = 0; i < 10; ++i) {
             auto article = makeTestArticle(
                 "prog2_cat", userId,
                 "Prog2_" + std::to_string(i),
                 i * 10);
-            sync(TestArticleListRepository::create(article));
+            sync(TestArticleListRepo::insert(article));
         }
 
-        auto count_before = TestInternals::pendingModificationCount<TestArticleListRepository>();
+        auto count_before = TestInternals::pendingModificationCount<TestArticleListRepo>();
         REQUIRE(count_before == 10);
 
         // Concurrent cleanup + queries (queries trigger lazy validation via forEachModification)
         parallel(NUM_THREADS, [&](int i) {
             for (int j = 0; j < OPS_PER_THREAD; ++j) {
                 if (i == 0) {
-                    triggerCleanup<TestArticleListRepository>();
+                    trySweep<TestArticleListRepo>();
                 } else {
-                    sync(TestArticleListRepository::query(
+                    sync(TestArticleListRepo::query(
                         makeArticleQuery("prog2_cat")));
                 }
             }
         });
 
         // After concurrent cleanup, count should not have grown
-        auto count_after = TestInternals::pendingModificationCount<TestArticleListRepository>();
+        auto count_after = TestInternals::pendingModificationCount<TestArticleListRepo>();
         REQUIRE(count_after <= count_before);
     }
 }

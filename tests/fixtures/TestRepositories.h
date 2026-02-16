@@ -10,8 +10,8 @@
 
 #pragma once
 
-#include <jcailloux/relais/repository/Repository.h>
-#include <jcailloux/relais/config/repository_config.h>
+#include <jcailloux/relais/repository/Repo.h>
+#include <jcailloux/relais/config/repo_config.h>
 #include <jcailloux/relais/cache/InvalidateOn.h>
 #include "generated/TestItemWrapper.h"
 #include "generated/TestUserWrapper.h"
@@ -22,7 +22,7 @@
 namespace relais_test {
 
 // Convenience aliases
-using jcailloux::relais::Repository;
+using jcailloux::relais::Repo;
 namespace cache = jcailloux::relais::cache;
 namespace cfg = jcailloux::relais::config;
 
@@ -150,79 +150,79 @@ inline constexpr auto ReadOnlyL2 = Redis.with_read_only();
 // Test Repositories - TestItem (no ListDescriptor)
 // =============================================================================
 
-/// No caching — tests BaseRepository directly
-using UncachedTestItemRepository = Repository<TestItemWrapper, "test:uncached", cfg::Uncached>;
+/// No caching — tests BaseRepo directly
+using UncachedTestItemRepo = Repo<TestItemWrapper, "test:uncached", cfg::Uncached>;
 
-/// L1 only — tests CachedRepository without Redis
-using L1TestItemRepository = Repository<TestItemWrapper, "test:l1">;
+/// L1 only — tests CachedRepo without Redis
+using L1TestItemRepo = Repo<TestItemWrapper, "test:l1">;
 
-/// L2 only — tests RedisRepository
-using L2TestItemRepository = Repository<TestItemWrapper, "test:l2", cfg::Redis>;
+/// L2 only — tests RedisRepo
+using L2TestItemRepo = Repo<TestItemWrapper, "test:l2", cfg::Redis>;
 
 /// Both L1+L2 — tests full hierarchy
-using FullCacheTestItemRepository = Repository<TestItemWrapper, "test:both", cfg::Both>;
+using FullCacheTestItemRepo = Repo<TestItemWrapper, "test:both", cfg::Both>;
 
 // Configuration test repositories
-using ShortTTLTestItemRepository = Repository<TestItemWrapper, "test:short_ttl", test_config::ShortTTL>;
-using WriteThroughTestItemRepository = Repository<TestItemWrapper, "test:write_through", test_config::WriteThrough>;
-using NoRefreshTestItemRepository = Repository<TestItemWrapper, "test:no_refresh", test_config::NoRefresh>;
-using AcceptExpiredTestItemRepository = Repository<TestItemWrapper, "test:accept_expired", test_config::AcceptExpired>;
-using FewShardsTestItemRepository = Repository<TestItemWrapper, "test:few_shards", test_config::FewShards>;
+using ShortTTLTestItemRepo = Repo<TestItemWrapper, "test:short_ttl", test_config::ShortTTL>;
+using WriteThroughTestItemRepo = Repo<TestItemWrapper, "test:write_through", test_config::WriteThrough>;
+using NoRefreshTestItemRepo = Repo<TestItemWrapper, "test:no_refresh", test_config::NoRefresh>;
+using AcceptExpiredTestItemRepo = Repo<TestItemWrapper, "test:accept_expired", test_config::AcceptExpired>;
+using FewShardsTestItemRepo = Repo<TestItemWrapper, "test:few_shards", test_config::FewShards>;
 
 // =============================================================================
 // User Repositories (no ListDescriptor)
 // =============================================================================
 
-using UncachedTestUserRepository = Repository<TestUserWrapper, "test:user:uncached", cfg::Uncached>;
-using L1TestUserRepository = Repository<TestUserWrapper, "test:user:l1">;
-using L2TestUserRepository = Repository<TestUserWrapper, "test:user:l2", cfg::Redis>;
-using FullCacheTestUserRepository = Repository<TestUserWrapper, "test:user:both", cfg::Both>;
+using UncachedTestUserRepo = Repo<TestUserWrapper, "test:user:uncached", cfg::Uncached>;
+using L1TestUserRepo = Repo<TestUserWrapper, "test:user:l1">;
+using L2TestUserRepo = Repo<TestUserWrapper, "test:user:l2", cfg::Redis>;
+using FullCacheTestUserRepo = Repo<TestUserWrapper, "test:user:both", cfg::Both>;
 
 // =============================================================================
 // Purchase Repositories (has ListDescriptor → ListMixin auto-detected)
 // =============================================================================
 
 /// Purchase without cross-invalidation
-using UncachedTestPurchaseRepository = Repository<TestPurchaseWrapper, "test:purchase:uncached", cfg::Uncached>;
+using UncachedTestPurchaseRepo = Repo<TestPurchaseWrapper, "test:purchase:uncached", cfg::Uncached>;
 
 /// Purchase L1 with cross-invalidation → User
-using L1TestPurchaseRepository = Repository<TestPurchaseWrapper, "test:purchase:l1", cfg::Local,
-    cache::Invalidate<L1TestUserRepository, purchaseUserId>>;
+using L1TestPurchaseRepo = Repo<TestPurchaseWrapper, "test:purchase:l1", cfg::Local,
+    cache::Invalidate<L1TestUserRepo, purchaseUserId>>;
 
 // =============================================================================
 // Article Repositories (has ListDescriptor → ListMixin auto-detected)
 // =============================================================================
 
-using UncachedTestArticleRepository = Repository<TestArticleWrapper, "test:article:uncached", cfg::Uncached>;
-using L1TestArticleRepository = Repository<TestArticleWrapper, "test:article:l1">;
-using L2TestArticleRepository = Repository<TestArticleWrapper, "test:article:l2", cfg::Redis>;
+using UncachedTestArticleRepo = Repo<TestArticleWrapper, "test:article:uncached", cfg::Uncached>;
+using L1TestArticleRepo = Repo<TestArticleWrapper, "test:article:l1">;
+using L2TestArticleRepo = Repo<TestArticleWrapper, "test:article:l2", cfg::Redis>;
 
 // =============================================================================
 // ListDescriptor Repositories — auto-detected from Entity's embedded descriptor
 // =============================================================================
 
 /// Article list — ListMixin auto-detected (TestArticleWrapper has ListDescriptor)
-using TestArticleListRepository = Repository<TestArticleWrapper, "test:article:list:l1">;
+using TestArticleListRepo = Repo<TestArticleWrapper, "test:article:list:l1">;
 
 /// Alias for the augmented descriptor — used by tests building ListDescriptorQuery
-using TestArticleListDecl = TestArticleListRepository::ListDescriptorType;
+using TestArticleListDecl = TestArticleListRepo::ListDescriptorType;
 
 /// Purchase list — same pattern
-using TestPurchaseListRepository = Repository<TestPurchaseWrapper, "test:purchase:list:l1">;
+using TestPurchaseListRepo = Repo<TestPurchaseWrapper, "test:purchase:list:l1">;
 
 // =============================================================================
 // Read-only Repositories
 // =============================================================================
 
 /// Base-level read-only — no caching, no writes allowed
-using ReadOnlyTestItemRepository = Repository<TestItemWrapper, "test:readonly:uncached", test_config::ReadOnlyUncached>;
+using ReadOnlyTestItemRepo = Repo<TestItemWrapper, "test:readonly:uncached", test_config::ReadOnlyUncached>;
 
 /// L2 read-only — Redis caching, no writes allowed
-using ReadOnlyL2TestItemRepository = Repository<TestItemWrapper, "test:readonly:l2", test_config::ReadOnlyL2>;
+using ReadOnlyL2TestItemRepo = Repo<TestItemWrapper, "test:readonly:l2", test_config::ReadOnlyL2>;
 
 /// L2 read-only user — Redis caching, no writes.
-/// RedisRepository provides invalidate() for cross-invalidation target use.
-using ReadOnlyL2TestUserRepository = Repository<TestUserWrapper, "test:readonly:user:l2", test_config::ReadOnlyL2>;
+/// RedisRepo provides invalidate() for cross-invalidation target use.
+using ReadOnlyL2TestUserRepo = Repo<TestUserWrapper, "test:readonly:user:l2", test_config::ReadOnlyL2>;
 
 // =============================================================================
 // Event Construction Helper
@@ -248,12 +248,12 @@ inline auto makeTestEvent(
 }
 
 // =============================================================================
-// Event Repositories (PartialKey: Key auto-deduced as int64_t from Mapping)
+// Event Repositories (PartitionKey: Key auto-deduced as int64_t from Mapping)
 // =============================================================================
 
-using UncachedTestEventRepository = Repository<TestEventWrapper, "test:event:partial:uncached", cfg::Uncached>;
-using L1TestEventRepository = Repository<TestEventWrapper, "test:event:partial:l1">;
-using L2TestEventRepository = Repository<TestEventWrapper, "test:event:partial:l2", cfg::Redis>;
-using L1L2TestEventRepository = Repository<TestEventWrapper, "test:event:partial:both", cfg::Both>;
+using UncachedTestEventRepo = Repo<TestEventWrapper, "test:event:partial:uncached", cfg::Uncached>;
+using L1TestEventRepo = Repo<TestEventWrapper, "test:event:partial:l1">;
+using L2TestEventRepo = Repo<TestEventWrapper, "test:event:partial:l2", cfg::Redis>;
+using L1L2TestEventRepo = Repo<TestEventWrapper, "test:event:partial:both", cfg::Both>;
 
 } // namespace relais_test

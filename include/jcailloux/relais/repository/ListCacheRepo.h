@@ -1,5 +1,5 @@
-#ifndef CODIBOT_LISTCACHEREPOSITORY_H
-#define CODIBOT_LISTCACHEREPOSITORY_H
+#ifndef CODIBOT_ListCacheRepo_H
+#define CODIBOT_ListCacheRepo_H
 
 #include <memory>
 
@@ -11,15 +11,15 @@
 namespace jcailloux::relais::cache::list {
 
 // =============================================================================
-// ListCacheRepository - Mixin that adds ListCache support to repositories
+// ListCacheRepo - Mixin that adds ListCache support to repositories
 // =============================================================================
 //
 // Usage:
-//   class MyRepository
-//       : public config::repository::Repository<...>
-//       , public cache::list::ListCacheRepository<MyRepository, MyEntity, ...>
+//   class MyRepo
+//       : public config::repo::Repo<...>
+//       , public cache::list::ListCacheRepo<MyRepo, MyEntity, ...>
 //   {
-//       using ListMixin = cache::list::ListCacheRepository<...>;
+//       using ListMixin = cache::list::ListCacheRepo<...>;
 //   public:
 //       static io::Task<ListResult> findItems(ListQuery query) {
 //           co_return co_await cachedListQuery(std::move(query), [&]() {
@@ -31,7 +31,7 @@ namespace jcailloux::relais::cache::list {
 
 template<typename Derived, typename Entity, typename Key = int64_t,
          typename Traits = ListCacheTraits<Entity>>
-class ListCacheRepository {
+class ListCacheRepo {
 public:
     using ListCacheType = ListCache<Entity, Key, Traits>;
     using ListQuery = cache::list::ListQuery<typename Traits::Filters, typename Traits::SortField>;
@@ -40,7 +40,7 @@ public:
     using EntityPtr = std::shared_ptr<const Entity>;
 
     /// Prime the ListCache with dummy operations to force internal allocations.
-    /// Called by CachedRepository::warmup() automatically.
+    /// Called by CachedRepo::warmup() automatically.
     static void warmupListCache() {
         RELAIS_LOG_DEBUG << Derived::name() << ": warmupListCache() called";
 
@@ -54,9 +54,39 @@ public:
 
         // Prime the modification tracker
         lc.onEntityCreated(nullptr);
-        lc.fullCleanup();
+        lc.purge();
 
         RELAIS_LOG_DEBUG << Derived::name() << ": warmupListCache() complete";
+    }
+
+    // =========================================================================
+    // Cache management
+    // =========================================================================
+
+    /// Invalidate a specific query
+    static void invalidateQuery(const ListQuery& query) {
+        listCache().invalidate(query);
+    }
+
+    /// Try to sweep one list cache shard.
+    /// Returns immediately if a sweep is already in progress.
+    static bool trySweepLists() {
+        return listCache().trySweep();
+    }
+
+    /// Sweep one list cache shard.
+    static bool sweepLists() {
+        return listCache().sweep();
+    }
+
+    /// Sweep all list cache shards.
+    static size_t purgeLists() {
+        return listCache().purge();
+    }
+
+    /// Get cache size
+    static size_t listSize() {
+        return listCache().size();
     }
 
 protected:
@@ -154,37 +184,13 @@ protected:
     static void notifyDeleted(EntityPtr entity) {
         listCache().onEntityDeleted(std::move(entity));
     }
-
-    // =========================================================================
-    // Cache management
-    // =========================================================================
-
-    /// Invalidate a specific query
-    static void invalidateQuery(const ListQuery& query) {
-        listCache().invalidate(query);
-    }
-
-    /// Try to trigger cleanup (non-blocking)
-    static bool triggerListCacheCleanup() {
-        return listCache().triggerCleanup();
-    }
-
-    /// Full cleanup (blocking)
-    static size_t fullListCacheCleanup() {
-        return listCache().fullCleanup();
-    }
-
-    /// Get cache size
-    static size_t listCacheSize() {
-        return listCache().size();
-    }
 };
 
 // =============================================================================
 // Helper macros for common patterns (optional)
 // =============================================================================
 
-/// Convenience macro for notifying creation in a repository create() method
+/// Convenience macro for notifying creation in a repository insert() method
 #define LISTCACHE_NOTIFY_CREATED(entity_ptr) \
     ListMixin::notifyCreated((entity_ptr))
 
@@ -192,10 +198,10 @@ protected:
 #define LISTCACHE_NOTIFY_UPDATED(old_ptr, new_ptr) \
     ListMixin::notifyUpdated((old_ptr), (new_ptr))
 
-/// Convenience macro for notifying deletion in a repository remove() method
+/// Convenience macro for notifying deletion in a repository erase() method
 #define LISTCACHE_NOTIFY_DELETED(entity_ptr) \
     ListMixin::notifyDeleted((entity_ptr))
 
 }  // namespace jcailloux::relais::cache::list
 
-#endif  // CODIBOT_LISTCACHEREPOSITORY_H
+#endif  // CODIBOT_ListCacheRepo_H

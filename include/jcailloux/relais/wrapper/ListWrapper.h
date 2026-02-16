@@ -69,14 +69,14 @@ public:
 
     [[nodiscard]] size_t size() const noexcept { return items.size(); }
     [[nodiscard]] bool empty() const noexcept { return items.empty(); }
-    [[nodiscard]] int64_t totalCount() const noexcept { return total_count; }
-    [[nodiscard]] std::string_view nextCursor() const noexcept { return next_cursor; }
+    [[nodiscard]] int64_t count() const noexcept { return total_count; }
+    [[nodiscard]] std::string_view cursor() const noexcept { return next_cursor; }
 
-    [[nodiscard]] const Item* firstItem() const noexcept {
+    [[nodiscard]] const Item* front() const noexcept {
         return items.empty() ? nullptr : &items.front();
     }
 
-    [[nodiscard]] const Item* lastItem() const noexcept {
+    [[nodiscard]] const Item* back() const noexcept {
         return items.empty() ? nullptr : &items.back();
     }
 
@@ -84,7 +84,7 @@ public:
     // Binary serialization (Glaze BEVE)
     // =========================================================================
 
-    [[nodiscard]] std::shared_ptr<const std::vector<uint8_t>> toBinary() const {
+    [[nodiscard]] std::shared_ptr<const std::vector<uint8_t>> binary() const {
         std::call_once(beve_flag_, [this] {
             auto buf = std::make_shared<std::vector<uint8_t>>();
             if (glz::write_beve(*this, *buf))
@@ -107,7 +107,7 @@ public:
     // JSON serialization (Glaze JSON)
     // =========================================================================
 
-    [[nodiscard]] std::shared_ptr<const std::string> toJson() const {
+    [[nodiscard]] std::shared_ptr<const std::string> json() const {
         std::call_once(json_flag_, [this] {
             auto json = std::make_shared<std::string>();
             json->reserve(items.size() * 200 + 64);
@@ -130,9 +130,9 @@ public:
     // Cache management
     // =========================================================================
 
-    /// Release serialization caches. After this call, toBinary()/toJson()
+    /// Release serialization caches. After this call, binary()/json()
     /// return nullptr. Callers who previously obtained shared_ptrs from
-    /// toBinary()/toJson() retain valid data through reference counting.
+    /// binary()/json() retain valid data through reference counting.
     void releaseCaches() const noexcept {
         beve_cache_.reset();
         json_cache_.reset();
