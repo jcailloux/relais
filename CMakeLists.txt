@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(jcailloux-relais VERSION 0.1.0 LANGUAGES CXX)
+project(jcailloux-relais VERSION 0.2.0 LANGUAGES CXX)
 
 add_library(jcailloux-relais INTERFACE)
 add_library(jcailloux::relais ALIAS jcailloux-relais)
@@ -22,22 +22,69 @@ include(FetchContent)
 FetchContent_Declare(
     shardmap
     GIT_REPOSITORY https://github.com/jcailloux/shardmap
-    GIT_TAG        ad69bd2909c9425260a8b36cb16053d72d837cb8
+    GIT_TAG        v1.0.0
+    FIND_PACKAGE_ARGS 1.0
 )
 FetchContent_Declare(
     glaze
     GIT_REPOSITORY https://github.com/stephenberry/glaze.git
     GIT_TAG        v7.0.2
-    FIND_PACKAGE_ARGS
+    FIND_PACKAGE_ARGS 7.0
 )
 FetchContent_MakeAvailable(shardmap glaze)
 
 find_package(PostgreSQL REQUIRED)
 
 target_link_libraries(jcailloux-relais INTERFACE
-    shardmap
-    glaze::glaze
+    $<BUILD_INTERFACE:shardmap>
+    $<BUILD_INTERFACE:glaze::glaze>
     PostgreSQL::PostgreSQL
+)
+
+# =============================================================================
+# Install
+# =============================================================================
+include(CMakePackageConfigHelpers)
+include(GNUInstallDirs)
+
+install(TARGETS jcailloux-relais
+    EXPORT jcailloux-relaisTargets
+)
+
+install(DIRECTORY include/
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+)
+
+install(EXPORT jcailloux-relaisTargets
+    NAMESPACE jcailloux::
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/jcailloux-relais
+)
+
+configure_package_config_file(
+    cmake/jcailloux-relaisConfig.cmake.in
+    ${CMAKE_CURRENT_BINARY_DIR}/jcailloux-relaisConfig.cmake
+    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/jcailloux-relais
+)
+
+write_basic_package_version_file(
+    ${CMAKE_CURRENT_BINARY_DIR}/jcailloux-relaisConfigVersion.cmake
+    COMPATIBILITY SameMajorVersion
+)
+
+install(FILES
+    ${CMAKE_CURRENT_BINARY_DIR}/jcailloux-relaisConfig.cmake
+    ${CMAKE_CURRENT_BINARY_DIR}/jcailloux-relaisConfigVersion.cmake
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/jcailloux-relais
+)
+
+install(FILES
+    cmake/RelaisGenerateWrappers.cmake
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/jcailloux-relais
+)
+
+install(FILES
+    scripts/generate_entities.py
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/jcailloux-relais/scripts
 )
 
 # =============================================================================

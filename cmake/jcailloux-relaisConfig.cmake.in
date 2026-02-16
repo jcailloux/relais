@@ -1,0 +1,21 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+
+find_dependency(PostgreSQL)
+
+if(NOT TARGET shardmap)
+    find_dependency(shardmap 1.0)
+endif()
+if(NOT TARGET glaze::glaze)
+    find_dependency(glaze 7.0)
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/jcailloux-relaisTargets.cmake")
+
+# Re-add FetchContent dependencies stripped from BUILD_INTERFACE
+set_property(TARGET jcailloux::relais APPEND PROPERTY
+    INTERFACE_LINK_LIBRARIES shardmap glaze::glaze)
+
+# Make RelaisGenerateWrappers available
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}")
