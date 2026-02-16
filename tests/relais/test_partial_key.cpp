@@ -58,16 +58,16 @@ using L1PurchaseInvEventRepo = Repo<TestPurchaseWrapper, "test:purchase:l1:event
 //
 // #############################################################################
 
-TEST_CASE("PartialKey<TestEvent> - findById",
+TEST_CASE("PartialKey<TestEvent> - find",
           "[integration][db][partial-key]")
 {
     TransactionGuard tx;
     auto userId = insertTestUser("event_user", "event@test.com", 100);
 
-    SECTION("[findById] finds event in 'eu' partition") {
+    SECTION("[find] finds event in 'eu' partition") {
         auto eventId = insertTestEvent("eu", userId, "EU Conference", 5);
 
-        auto result = sync(UncachedTestEventRepo::findById(eventId));
+        auto result = sync(UncachedTestEventRepo::find(eventId));
         REQUIRE(result != nullptr);
         CHECK(result->id == eventId);
         CHECK(result->region == "eu");
@@ -76,29 +76,29 @@ TEST_CASE("PartialKey<TestEvent> - findById",
         CHECK(result->user_id == userId);
     }
 
-    SECTION("[findById] finds event in 'us' partition") {
+    SECTION("[find] finds event in 'us' partition") {
         auto eventId = insertTestEvent("us", userId, "US Launch", 3);
 
-        auto result = sync(UncachedTestEventRepo::findById(eventId));
+        auto result = sync(UncachedTestEventRepo::find(eventId));
         REQUIRE(result != nullptr);
         CHECK(result->id == eventId);
         CHECK(result->region == "us");
         CHECK(result->title == "US Launch");
     }
 
-    SECTION("[findById] returns nullptr for non-existent id") {
-        auto result = sync(UncachedTestEventRepo::findById(999999));
+    SECTION("[find] returns nullptr for non-existent id") {
+        auto result = sync(UncachedTestEventRepo::find(999999));
         CHECK(result == nullptr);
     }
 
-    SECTION("[findById] correct event among multiple across partitions") {
+    SECTION("[find] correct event among multiple across partitions") {
         auto id1 = insertTestEvent("eu", userId, "Event A", 1);
         auto id2 = insertTestEvent("us", userId, "Event B", 2);
         auto id3 = insertTestEvent("eu", userId, "Event C", 3);
 
-        auto r1 = sync(UncachedTestEventRepo::findById(id1));
-        auto r2 = sync(UncachedTestEventRepo::findById(id2));
-        auto r3 = sync(UncachedTestEventRepo::findById(id3));
+        auto r1 = sync(UncachedTestEventRepo::find(id1));
+        auto r2 = sync(UncachedTestEventRepo::find(id2));
+        auto r3 = sync(UncachedTestEventRepo::find(id3));
 
         REQUIRE(r1 != nullptr);
         REQUIRE(r2 != nullptr);
@@ -141,7 +141,7 @@ TEST_CASE("PartialKey<TestEvent> - create",
             makeTestEvent("eu", userId, "Findable Event")));
         REQUIRE(created != nullptr);
 
-        auto found = sync(UncachedTestEventRepo::findById(created->id));
+        auto found = sync(UncachedTestEventRepo::find(created->id));
         REQUIRE(found != nullptr);
         CHECK(found->title == "Findable Event");
         CHECK(found->region == "eu");
@@ -172,7 +172,7 @@ TEST_CASE("PartialKey<TestEvent> - update",
         auto success = sync(UncachedTestEventRepo::update(eventId, updated));
         REQUIRE(success);
 
-        auto found = sync(UncachedTestEventRepo::findById(eventId));
+        auto found = sync(UncachedTestEventRepo::find(eventId));
         REQUIRE(found != nullptr);
         CHECK(found->title == "Updated");
         CHECK(found->priority == 9);
@@ -184,7 +184,7 @@ TEST_CASE("PartialKey<TestEvent> - update",
         auto updated = makeTestEvent("us", userId, "US Updated", 7, eventId);
         sync(UncachedTestEventRepo::update(eventId, updated));
 
-        auto found = sync(UncachedTestEventRepo::findById(eventId));
+        auto found = sync(UncachedTestEventRepo::find(eventId));
         REQUIRE(found != nullptr);
         CHECK(found->region == "us");
         CHECK(found->title == "US Updated");
@@ -204,7 +204,7 @@ TEST_CASE("PartialKey<TestEvent> - remove",
         REQUIRE(result.has_value());
         CHECK(*result == 1);
 
-        auto found = sync(UncachedTestEventRepo::findById(eventId));
+        auto found = sync(UncachedTestEventRepo::find(eventId));
         CHECK(found == nullptr);
     }
 
@@ -227,11 +227,11 @@ TEST_CASE("PartialKey<TestEvent> - L1 caching",
     TransactionGuard tx;
     auto userId = insertTestUser("cache_user", "cache@test.com", 100);
 
-    SECTION("[findById] caches in L1, returns stale after direct DB change") {
+    SECTION("[find] caches in L1, returns stale after direct DB change") {
         auto eventId = insertTestEvent("eu", userId, "Cacheable", 5);
 
         // Cache in L1
-        auto result1 = sync(L1TestEventRepo::findById(eventId));
+        auto result1 = sync(L1TestEventRepo::find(eventId));
         REQUIRE(result1 != nullptr);
         CHECK(result1->title == "Cacheable");
 
@@ -239,7 +239,7 @@ TEST_CASE("PartialKey<TestEvent> - L1 caching",
         updateTestEvent(eventId, "Modified", 9);
 
         // L1 still returns stale
-        auto result2 = sync(L1TestEventRepo::findById(eventId));
+        auto result2 = sync(L1TestEventRepo::find(eventId));
         REQUIRE(result2 != nullptr);
         CHECK(result2->title == "Cacheable");
     }
@@ -253,7 +253,7 @@ TEST_CASE("PartialKey<TestEvent> - L1 caching",
         updateTestEvent(created->id, "DB Modified", 99);
 
         // L1 returns cached (pre-modification) value
-        auto cached = sync(L1TestEventRepo::findById(created->id));
+        auto cached = sync(L1TestEventRepo::find(created->id));
         REQUIRE(cached != nullptr);
         CHECK(cached->title == "Created via L1");
     }
@@ -262,7 +262,7 @@ TEST_CASE("PartialKey<TestEvent> - L1 caching",
         auto eventId = insertTestEvent("eu", userId, "Before Update", 1);
 
         // Cache in L1
-        sync(L1TestEventRepo::findById(eventId));
+        sync(L1TestEventRepo::find(eventId));
 
         // Modify in DB directly
         updateTestEvent(eventId, "DB Changed", 7);
@@ -272,7 +272,7 @@ TEST_CASE("PartialKey<TestEvent> - L1 caching",
         sync(L1TestEventRepo::update(eventId, wrapper));
 
         // Next read gets fresh data from DB
-        auto found = sync(L1TestEventRepo::findById(eventId));
+        auto found = sync(L1TestEventRepo::find(eventId));
         REQUIRE(found != nullptr);
         CHECK(found->title == "Repo Updated");
     }
@@ -281,13 +281,13 @@ TEST_CASE("PartialKey<TestEvent> - L1 caching",
         auto eventId = insertTestEvent("eu", userId, "To Remove", 1);
 
         // Cache in L1
-        sync(L1TestEventRepo::findById(eventId));
+        sync(L1TestEventRepo::find(eventId));
 
         // Remove via repo
         sync(L1TestEventRepo::remove(eventId));
 
         // Not found
-        auto found = sync(L1TestEventRepo::findById(eventId));
+        auto found = sync(L1TestEventRepo::find(eventId));
         CHECK(found == nullptr);
     }
 }
@@ -304,11 +304,11 @@ TEST_CASE("PartialKey<TestEvent> - L2 caching",
     TransactionGuard tx;
     auto userId = insertTestUser("redis_user", "redis@test.com", 100);
 
-    SECTION("[findById] caches in Redis, returns on second read") {
+    SECTION("[find] caches in Redis, returns on second read") {
         auto eventId = insertTestEvent("us", userId, "Redis Event", 3);
 
         // First read: DB → Redis
-        auto result1 = sync(L2TestEventRepo::findById(eventId));
+        auto result1 = sync(L2TestEventRepo::find(eventId));
         REQUIRE(result1 != nullptr);
         CHECK(result1->title == "Redis Event");
         CHECK(result1->region == "us");
@@ -317,7 +317,7 @@ TEST_CASE("PartialKey<TestEvent> - L2 caching",
         updateTestEvent(eventId, "DB Modified", 99);
 
         // Second read: Redis (stale)
-        auto result2 = sync(L2TestEventRepo::findById(eventId));
+        auto result2 = sync(L2TestEventRepo::find(eventId));
         REQUIRE(result2 != nullptr);
         CHECK(result2->title == "Redis Event");
     }
@@ -326,7 +326,7 @@ TEST_CASE("PartialKey<TestEvent> - L2 caching",
         auto eventId = insertTestEvent("eu", userId, "Redis Before", 1);
 
         // Cache in Redis
-        sync(L2TestEventRepo::findById(eventId));
+        sync(L2TestEventRepo::find(eventId));
 
         // Modify in DB directly
         updateTestEvent(eventId, "DB Changed", 7);
@@ -336,7 +336,7 @@ TEST_CASE("PartialKey<TestEvent> - L2 caching",
         sync(L2TestEventRepo::update(eventId, wrapper));
 
         // Next read gets fresh data
-        auto found = sync(L2TestEventRepo::findById(eventId));
+        auto found = sync(L2TestEventRepo::find(eventId));
         REQUIRE(found != nullptr);
         CHECK(found->title == "Redis After");
     }
@@ -357,7 +357,7 @@ TEST_CASE("PartialKey cross-invalidation - Event as source",
         auto userId = insertTestUser("inv_user", "inv@test.com", 1000);
 
         // Cache user in L1
-        auto user1 = sync(L1EventTargetUserRepo::findById(userId));
+        auto user1 = sync(L1EventTargetUserRepo::find(userId));
         REQUIRE(user1 != nullptr);
         REQUIRE(user1->balance == 1000);
 
@@ -365,7 +365,7 @@ TEST_CASE("PartialKey cross-invalidation - Event as source",
         updateTestUserBalance(userId, 500);
 
         // User still cached (stale)
-        CHECK(sync(L1EventTargetUserRepo::findById(userId))->balance == 1000);
+        CHECK(sync(L1EventTargetUserRepo::find(userId))->balance == 1000);
 
         // Create event → triggers Invalidate<User, &Event::user_id>
         auto created = sync(L1EventSourceRepo::create(
@@ -373,7 +373,7 @@ TEST_CASE("PartialKey cross-invalidation - Event as source",
         REQUIRE(created != nullptr);
 
         // User L1 cache invalidated → fresh data
-        auto user2 = sync(L1EventTargetUserRepo::findById(userId));
+        auto user2 = sync(L1EventTargetUserRepo::find(userId));
         REQUIRE(user2 != nullptr);
         CHECK(user2->balance == 500);
     }
@@ -383,7 +383,7 @@ TEST_CASE("PartialKey cross-invalidation - Event as source",
         auto eventId = insertTestEvent("eu", userId, "Event", 1);
 
         // Cache user
-        sync(L1EventTargetUserRepo::findById(userId));
+        sync(L1EventTargetUserRepo::find(userId));
         updateTestUserBalance(userId, 750);
 
         // Update event through repo
@@ -391,7 +391,7 @@ TEST_CASE("PartialKey cross-invalidation - Event as source",
             makeTestEvent("eu", userId, "Updated Event", 5, eventId)));
 
         // User cache invalidated
-        auto user = sync(L1EventTargetUserRepo::findById(userId));
+        auto user = sync(L1EventTargetUserRepo::find(userId));
         REQUIRE(user != nullptr);
         CHECK(user->balance == 750);
     }
@@ -400,12 +400,12 @@ TEST_CASE("PartialKey cross-invalidation - Event as source",
         auto userId = insertTestUser("del_user", "del@test.com", 1000);
         auto eventId = insertTestEvent("eu", userId, "To Delete", 1);
 
-        sync(L1EventTargetUserRepo::findById(userId));
+        sync(L1EventTargetUserRepo::find(userId));
         updateTestUserBalance(userId, 200);
 
         sync(L1EventSourceRepo::remove(eventId));
 
-        auto user = sync(L1EventTargetUserRepo::findById(userId));
+        auto user = sync(L1EventTargetUserRepo::find(userId));
         REQUIRE(user != nullptr);
         CHECK(user->balance == 200);
     }
@@ -427,7 +427,7 @@ TEST_CASE("PartialKey cross-invalidation - Event as target",
         auto eventId = insertTestEvent("eu", userId, "Cached Event", 5);
 
         // Cache event in L1
-        auto event1 = sync(L1EventAsTargetRepo::findById(eventId));
+        auto event1 = sync(L1EventAsTargetRepo::find(eventId));
         REQUIRE(event1 != nullptr);
         CHECK(event1->title == "Cached Event");
 
@@ -435,7 +435,7 @@ TEST_CASE("PartialKey cross-invalidation - Event as target",
         updateTestEvent(eventId, "DB Modified", 99);
 
         // Event still cached (stale)
-        CHECK(sync(L1EventAsTargetRepo::findById(eventId))->title == "Cached Event");
+        CHECK(sync(L1EventAsTargetRepo::find(eventId))->title == "Cached Event");
 
         // Create purchase for same user → resolver finds event IDs → invalidates event cache
         auto created = sync(L1PurchaseInvEventRepo::create(
@@ -443,7 +443,7 @@ TEST_CASE("PartialKey cross-invalidation - Event as target",
         REQUIRE(created != nullptr);
 
         // Event cache invalidated → fresh data
-        auto event2 = sync(L1EventAsTargetRepo::findById(eventId));
+        auto event2 = sync(L1EventAsTargetRepo::find(eventId));
         REQUIRE(event2 != nullptr);
         CHECK(event2->title == "DB Modified");
         CHECK(event2->priority == 99);
@@ -505,7 +505,7 @@ TEST_CASE("PartialKey - serialization",
     SECTION("[json] round-trip preserves region field") {
         auto eventId = insertTestEvent("eu", userId, "JSON Test", 7);
 
-        auto original = sync(UncachedTestEventRepo::findById(eventId));
+        auto original = sync(UncachedTestEventRepo::find(eventId));
         REQUIRE(original != nullptr);
 
         auto json = original->toJson();
@@ -527,7 +527,7 @@ TEST_CASE("PartialKey - serialization",
     SECTION("[beve] round-trip preserves region field") {
         auto eventId = insertTestEvent("us", userId, "BEVE Test", 3);
 
-        auto original = sync(UncachedTestEventRepo::findById(eventId));
+        auto original = sync(UncachedTestEventRepo::find(eventId));
         REQUIRE(original != nullptr);
 
         auto binary = original->toBinary();
@@ -633,7 +633,7 @@ TEST_CASE("PartialKey<TestEvent> - updateBy (L1)",
         auto eventId = insertTestEvent("eu", userId, "Cached", 5);
 
         // Populate L1 cache
-        auto cached = sync(L1TestEventRepo::findById(eventId));
+        auto cached = sync(L1TestEventRepo::find(eventId));
         REQUIRE(cached != nullptr);
         CHECK(cached->title == "Cached");
 
@@ -641,7 +641,7 @@ TEST_CASE("PartialKey<TestEvent> - updateBy (L1)",
         updateTestEvent(eventId, "DB Changed", 99);
 
         // L1 still returns stale
-        CHECK(sync(L1TestEventRepo::findById(eventId))->title == "Cached");
+        CHECK(sync(L1TestEventRepo::find(eventId))->title == "Cached");
 
         // updateBy invalidates L1 and re-fetches
         auto result = sync(L1TestEventRepo::updateBy(
@@ -656,7 +656,7 @@ TEST_CASE("PartialKey<TestEvent> - updateBy (L1)",
         auto eventId = insertTestEvent("us", userId, "Multi", 1);
 
         // Populate L1
-        sync(L1TestEventRepo::findById(eventId));
+        sync(L1TestEventRepo::find(eventId));
 
         auto result = sync(L1TestEventRepo::updateBy(
             eventId,
@@ -680,13 +680,13 @@ TEST_CASE("PartialKey<TestEvent> - updateBy (L2)",
         auto eventId = insertTestEvent("eu", userId, "Redis Cached", 5);
 
         // Populate Redis
-        sync(L2TestEventRepo::findById(eventId));
+        sync(L2TestEventRepo::find(eventId));
 
         // Modify in DB directly (bypass cache)
         updateTestEvent(eventId, "DB Changed", 99);
 
         // Redis still returns stale data
-        auto stale = sync(L2TestEventRepo::findById(eventId));
+        auto stale = sync(L2TestEventRepo::find(eventId));
         REQUIRE(stale != nullptr);
         CHECK(stale->title == "Redis Cached");
 
@@ -699,7 +699,7 @@ TEST_CASE("PartialKey<TestEvent> - updateBy (L2)",
         CHECK(result->title == "DB Changed");  // Re-fetched from DB, not stale Redis
 
         // Independent fetch confirms correct state
-        auto found = sync(L2TestEventRepo::findById(eventId));
+        auto found = sync(L2TestEventRepo::find(eventId));
         REQUIRE(found != nullptr);
         CHECK(found->priority == 42);
         CHECK(found->title == "DB Changed");
@@ -716,7 +716,7 @@ TEST_CASE("PartialKey<TestEvent> - updateBy cross-invalidation",
         auto eventId = insertTestEvent("eu", userId, "Event", 1);
 
         // Cache user in L1
-        auto user1 = sync(L1EventTargetUserRepo::findById(userId));
+        auto user1 = sync(L1EventTargetUserRepo::find(userId));
         REQUIRE(user1 != nullptr);
         CHECK(user1->balance == 1000);
 
@@ -724,7 +724,7 @@ TEST_CASE("PartialKey<TestEvent> - updateBy cross-invalidation",
         updateTestUserBalance(userId, 500);
 
         // User still cached (stale)
-        CHECK(sync(L1EventTargetUserRepo::findById(userId))->balance == 1000);
+        CHECK(sync(L1EventTargetUserRepo::find(userId))->balance == 1000);
 
         // updateBy on event → triggers cross-invalidation → invalidates user cache
         auto result = sync(L1EventSourceRepo::updateBy(
@@ -732,7 +732,7 @@ TEST_CASE("PartialKey<TestEvent> - updateBy cross-invalidation",
         REQUIRE(result != nullptr);
 
         // User L1 cache invalidated → fresh data
-        auto user2 = sync(L1EventTargetUserRepo::findById(userId));
+        auto user2 = sync(L1EventTargetUserRepo::find(userId));
         REQUIRE(user2 != nullptr);
         CHECK(user2->balance == 500);
     }
@@ -754,7 +754,7 @@ TEST_CASE("PartialKey<TestEvent> - remove with L1 hint",
         auto eventId = insertTestEvent("eu", userId, "L1 Cached", 5);
 
         // Populate L1 cache
-        sync(L1TestEventRepo::findById(eventId));
+        sync(L1TestEventRepo::find(eventId));
 
         // Verify precondition: L1 cache has the entity (hint will be provided)
         auto cached = TestInternals::getFromCache<L1TestEventRepo>(eventId);
@@ -768,7 +768,7 @@ TEST_CASE("PartialKey<TestEvent> - remove with L1 hint",
         CHECK(*result == 1);
 
         // Verify deletion
-        auto found = sync(L1TestEventRepo::findById(eventId));
+        auto found = sync(L1TestEventRepo::find(eventId));
         CHECK(found == nullptr);
     }
 
@@ -785,7 +785,7 @@ TEST_CASE("PartialKey<TestEvent> - remove with L1 hint",
         CHECK(*result == 1);
 
         // Verify deletion
-        auto found = sync(L1TestEventRepo::findById(eventId));
+        auto found = sync(L1TestEventRepo::find(eventId));
         CHECK(found == nullptr);
     }
 }
@@ -800,7 +800,7 @@ TEST_CASE("PartialKey<TestEvent> - remove with L2 hint",
         auto eventId = insertTestEvent("eu", userId, "Redis Cached", 5);
 
         // Populate Redis cache
-        sync(L2TestEventRepo::findById(eventId));
+        sync(L2TestEventRepo::find(eventId));
 
         // Remove (L2 hit → provides hint → full PK delete)
         auto result = sync(L2TestEventRepo::remove(eventId));
@@ -808,7 +808,7 @@ TEST_CASE("PartialKey<TestEvent> - remove with L2 hint",
         CHECK(*result == 1);
 
         // Verify deletion
-        auto found = sync(L2TestEventRepo::findById(eventId));
+        auto found = sync(L2TestEventRepo::find(eventId));
         CHECK(found == nullptr);
     }
 
@@ -835,7 +835,7 @@ TEST_CASE("PartialKey<TestEvent> - remove with L1+L2 hint chain",
         auto eventId = insertTestEvent("eu", userId, "Both Cached", 5);
 
         // Populate L1 + L2
-        sync(L1L2TestEventRepo::findById(eventId));
+        sync(L1L2TestEventRepo::find(eventId));
 
         // Verify precondition: L1 has entity with correct partition key
         auto cached = TestInternals::getFromCache<L1L2TestEventRepo>(eventId);
@@ -847,7 +847,7 @@ TEST_CASE("PartialKey<TestEvent> - remove with L1+L2 hint chain",
         REQUIRE(result.has_value());
         CHECK(*result == 1);
 
-        auto found = sync(L1L2TestEventRepo::findById(eventId));
+        auto found = sync(L1L2TestEventRepo::find(eventId));
         CHECK(found == nullptr);
     }
 
@@ -855,7 +855,7 @@ TEST_CASE("PartialKey<TestEvent> - remove with L1+L2 hint chain",
         auto eventId = insertTestEvent("us", userId, "L2 Only", 3);
 
         // Populate L1 + L2
-        sync(L1L2TestEventRepo::findById(eventId));
+        sync(L1L2TestEventRepo::find(eventId));
 
         // Invalidate L1 only (L2 still has the entity)
         L1L2TestEventRepo::invalidateL1(eventId);
@@ -869,7 +869,7 @@ TEST_CASE("PartialKey<TestEvent> - remove with L1+L2 hint chain",
         REQUIRE(result.has_value());
         CHECK(*result == 1);
 
-        auto found = sync(L1L2TestEventRepo::findById(eventId));
+        auto found = sync(L1L2TestEventRepo::find(eventId));
         CHECK(found == nullptr);
     }
 
@@ -888,7 +888,7 @@ TEST_CASE("PartialKey<TestEvent> - remove with L1+L2 hint chain",
         REQUIRE(result.has_value());
         CHECK(*result == 1);
 
-        auto found = sync(L1L2TestEventRepo::findById(eventId));
+        auto found = sync(L1L2TestEventRepo::find(eventId));
         CHECK(found == nullptr);
     }
 }

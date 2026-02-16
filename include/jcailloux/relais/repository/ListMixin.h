@@ -202,7 +202,7 @@ public:
     using typename Base::WrapperType;
     using typename Base::WrapperPtrType;
     using Base::name;
-    using Base::findById;
+    using Base::find;
 
     /// Augmented descriptor — pass to parseListQueryStrict<ListDescriptorType>(req)
     using ListDescriptorType = Descriptor;
@@ -249,7 +249,7 @@ public:
     static io::Task<bool> update(const Key& id, WrapperPtrType wrapper)
         requires MutableEntity<Entity> && (!Base::config.read_only)
     {
-        auto old = co_await Base::findById(id);
+        auto old = co_await Base::find(id);
         co_return co_await updateWithContext(id, std::move(wrapper), std::move(old));
     }
 
@@ -257,7 +257,7 @@ public:
     static io::Task<std::optional<size_t>> remove(const Key& id)
         requires (!Base::config.read_only)
     {
-        auto entity = co_await Base::findById(id);
+        auto entity = co_await Base::find(id);
         co_return co_await removeWithContext(id, std::move(entity));
     }
 
@@ -266,7 +266,7 @@ public:
     static io::Task<WrapperPtrType> updateBy(const Key& id, Updates&&... updates)
         requires HasFieldUpdate<Entity> && (!Base::config.read_only)
     {
-        auto old = co_await Base::findById(id);
+        auto old = co_await Base::find(id);
         co_return co_await updateByWithContext(id, std::move(old),
             std::forward<Updates>(updates)...);
     }

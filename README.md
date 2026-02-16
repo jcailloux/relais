@@ -129,8 +129,8 @@ using PurchaseRepo = relais::Repo<
 ```
 
 **Inherited methods:**
-- `findById(id)` — `Task<WrapperPtr>` (cached)
-- `findByIdAsJson(id)` — `Task<shared_ptr<const string>>`
+- `find(id)` — `Task<WrapperPtr>` (cached)
+- `findAsJson(id)` — `Task<shared_ptr<const string>>`
 - `create(wrapper)` — `Task<WrapperPtr>` (requires `!read_only`)
 - `update(id, wrapper)` — `Task<bool>` (requires `!read_only`)
 - `updateBy(id, set<F>(v)...)` — `Task<WrapperPtr>` (requires `HasFieldUpdate`)
@@ -200,7 +200,7 @@ using EventRepo = relais::Repo<EventWrapper, "Event", config::Both>;
 ```cpp
 io::Task<void> example() {
     // Find by ID (automatically uses cache)
-    auto user = co_await UserRepo::findById(123);
+    auto user = co_await UserRepo::find(123);
     if (user) {
         std::cout << "Found: " << user->username << "\n";
     }
@@ -343,7 +343,7 @@ Mark repositories as read-only to disable modification operations at compile-tim
 ```cpp
 using AuditLogRepo = Repo<AuditLogWrapper, "AuditLog",
     config::Local.with_read_only()>;
-// findById() — available
+// find() — available
 // create(), update(), remove() — COMPILE ERROR if called
 ```
 
@@ -382,7 +382,7 @@ Requirements:
 Cache handling:
 - **CachedRepo**: L1 is invalidated before the update
 - **RedisRepo**: L2 is invalidated before the update
-- The re-fetched entity repopulates caches on subsequent `findById` calls
+- The re-fetched entity repopulates caches on subsequent `find` calls
 
 ### Partition Key `updateBy`
 
@@ -684,8 +684,8 @@ python scripts/generate_entities.py --files src/entities/User.h --output-dir src
 
 | Method | Return Type | Constraint | Description |
 |--------|-------------|------------|-------------|
-| `findById(id)` | `Task<WrapperPtr>` | - | Find by primary key (cached) |
-| `findByIdAsJson(id)` | `Task<shared_ptr<const string>>` | - | Find and return JSON directly |
+| `find(id)` | `Task<WrapperPtr>` | - | Find by primary key (cached) |
+| `findAsJson(id)` | `Task<shared_ptr<const string>>` | - | Find and return JSON directly |
 | `create(wrapper)` | `Task<WrapperPtr>` | `!read_only` | Insert and cache |
 | `update(id, wrapper)` | `Task<bool>` | `!read_only` | Full update and handle cache |
 | `updateBy(id, set<F>()...)` | `Task<WrapperPtr>` | `!read_only`, `HasFieldUpdate` | Partial update, re-fetches entity |

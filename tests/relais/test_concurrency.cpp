@@ -13,7 +13,7 @@
  * std::atomic<int> counters checked after join.
  *
  * Covers:
- *   1. Concurrent findById (L1, L2, L1+L2)
+ *   1. Concurrent find (L1, L2, L1+L2)
  *   2. Concurrent read + write on same entity
  *   3. Concurrent create + remove
  *   4. Concurrent cross-invalidation
@@ -80,24 +80,24 @@ void parallel(int num_threads, Fn&& fn) {
 
 // #############################################################################
 //
-//  1. Concurrent findById
+//  1. Concurrent find
 //
 // #############################################################################
 
-TEST_CASE("Concurrency - concurrent findById",
+TEST_CASE("Concurrency - concurrent find",
           "[integration][db][concurrency][read]")
 {
     TransactionGuard tx;
 
     SECTION("[L1] N threads read the same entity concurrently") {
         auto id = insertTestItem("conc_read_l1", 42);
-        sync(L1TestItemRepo::findById(id));
+        sync(L1TestItemRepo::find(id));
 
         std::atomic<int> null_count{0};
 
         parallel(NUM_THREADS, [&](int) {
             for (int j = 0; j < OPS_PER_THREAD; ++j) {
-                auto item = sync(L1TestItemRepo::findById(id));
+                auto item = sync(L1TestItemRepo::find(id));
                 if (!item) null_count.fetch_add(1, std::memory_order_relaxed);
             }
         });
@@ -107,13 +107,13 @@ TEST_CASE("Concurrency - concurrent findById",
 
     SECTION("[L2] N threads read the same entity concurrently") {
         auto id = insertTestItem("conc_read_l2", 42);
-        sync(L2TestItemRepo::findById(id));
+        sync(L2TestItemRepo::find(id));
 
         std::atomic<int> null_count{0};
 
         parallel(NUM_THREADS, [&](int) {
             for (int j = 0; j < OPS_PER_THREAD; ++j) {
-                auto item = sync(L2TestItemRepo::findById(id));
+                auto item = sync(L2TestItemRepo::find(id));
                 if (!item) null_count.fetch_add(1, std::memory_order_relaxed);
             }
         });
@@ -123,13 +123,13 @@ TEST_CASE("Concurrency - concurrent findById",
 
     SECTION("[L1+L2] N threads read the same entity concurrently") {
         auto id = insertTestItem("conc_read_both", 42);
-        sync(FullCacheTestItemRepo::findById(id));
+        sync(FullCacheTestItemRepo::find(id));
 
         std::atomic<int> null_count{0};
 
         parallel(NUM_THREADS, [&](int) {
             for (int j = 0; j < OPS_PER_THREAD; ++j) {
-                auto item = sync(FullCacheTestItemRepo::findById(id));
+                auto item = sync(FullCacheTestItemRepo::find(id));
                 if (!item) null_count.fetch_add(1, std::memory_order_relaxed);
             }
         });
@@ -147,7 +147,7 @@ TEST_CASE("Concurrency - concurrent findById",
 
         parallel(NUM_THREADS, [&](int i) {
             for (int j = 0; j < OPS_PER_THREAD; ++j) {
-                auto item = sync(L1TestItemRepo::findById(ids[i]));
+                auto item = sync(L1TestItemRepo::find(ids[i]));
                 if (!item) null_count.fetch_add(1, std::memory_order_relaxed);
             }
         });
@@ -170,13 +170,13 @@ TEST_CASE("Concurrency - concurrent read + write",
 
     SECTION("[L1] readers and writers on same entity") {
         auto id = insertTestItem("conc_rw_l1", 0);
-        sync(L1TestItemRepo::findById(id));
+        sync(L1TestItemRepo::find(id));
 
         parallel(NUM_THREADS, [&](int i) {
             for (int j = 0; j < OPS_PER_THREAD; ++j) {
                 if (i % 2 == 0) {
                     // Reader — may see nullptr briefly during invalidation
-                    sync(L1TestItemRepo::findById(id));
+                    sync(L1TestItemRepo::find(id));
                 } else {
                     // Writer
                     auto entity = makeTestItem(
@@ -188,18 +188,18 @@ TEST_CASE("Concurrency - concurrent read + write",
         });
 
         // Verify the repo is still functional
-        auto final_item = sync(L1TestItemRepo::findById(id));
+        auto final_item = sync(L1TestItemRepo::find(id));
         REQUIRE(final_item != nullptr);
     }
 
     SECTION("[L1+L2] readers and writers on same entity") {
         auto id = insertTestItem("conc_rw_both", 0);
-        sync(FullCacheTestItemRepo::findById(id));
+        sync(FullCacheTestItemRepo::find(id));
 
         parallel(NUM_THREADS, [&](int i) {
             for (int j = 0; j < OPS_PER_THREAD; ++j) {
                 if (i % 2 == 0) {
-                    sync(FullCacheTestItemRepo::findById(id));
+                    sync(FullCacheTestItemRepo::find(id));
                 } else {
                     auto entity = makeTestItem(
                         "rw_both_" + std::to_string(i) + "_" + std::to_string(j),
@@ -209,7 +209,7 @@ TEST_CASE("Concurrency - concurrent read + write",
             }
         });
 
-        auto final_item = sync(FullCacheTestItemRepo::findById(id));
+        auto final_item = sync(FullCacheTestItemRepo::find(id));
         REQUIRE(final_item != nullptr);
     }
 }
@@ -279,13 +279,13 @@ TEST_CASE("Concurrency - concurrent cross-invalidation",
 
     SECTION("[L1] purchase creates invalidate user cache under contention") {
         auto userId = insertTestUser("conc_user", "conc@test.com", 1000);
-        sync(L1TestUserRepo::findById(userId));
+        sync(L1TestUserRepo::find(userId));
 
         parallel(NUM_THREADS, [&](int i) {
             for (int j = 0; j < OPS_PER_THREAD / 4; ++j) {
                 if (i % 2 == 0) {
                     // Read user (may be invalidated mid-flight)
-                    sync(L1TestUserRepo::findById(userId));
+                    sync(L1TestUserRepo::find(userId));
                 } else {
                     // Create purchase -> invalidates user cache
                     auto purchase = makeTestPurchase(
@@ -299,7 +299,7 @@ TEST_CASE("Concurrency - concurrent cross-invalidation",
         });
 
         // Repo should still be functional
-        auto user = sync(L1TestUserRepo::findById(userId));
+        auto user = sync(L1TestUserRepo::find(userId));
         REQUIRE(user != nullptr);
         REQUIRE(user->username == "conc_user");
     }
@@ -374,14 +374,14 @@ TEST_CASE("Concurrency - warmup during operations",
             } else {
                 // Other threads read
                 for (int j = 0; j < OPS_PER_THREAD; ++j) {
-                    sync(L1TestItemRepo::findById(id));
+                    sync(L1TestItemRepo::find(id));
                     // May be nullptr if warmup disrupts — that's fine
                 }
             }
         });
 
         // Should still be functional
-        auto item = sync(L1TestItemRepo::findById(id));
+        auto item = sync(L1TestItemRepo::find(id));
         REQUIRE(item != nullptr);
     }
 }
@@ -406,7 +406,7 @@ TEST_CASE("Concurrency - mixed operations storm",
 
         // Prime all caches
         for (auto id : ids) {
-            sync(FullCacheTestItemRepo::findById(id));
+            sync(FullCacheTestItemRepo::find(id));
         }
 
         parallel(NUM_THREADS, [&](int i) {
@@ -418,13 +418,13 @@ TEST_CASE("Concurrency - mixed operations storm",
                 auto op = rng() % 6;
 
                 switch (op) {
-                    case 0:  // findById
+                    case 0:  // find
                     case 1:
-                        sync(FullCacheTestItemRepo::findById(id));
+                        sync(FullCacheTestItemRepo::find(id));
                         break;
 
-                    case 2:  // findByIdAsJson
-                        sync(FullCacheTestItemRepo::findByIdAsJson(id));
+                    case 2:  // findAsJson
+                        sync(FullCacheTestItemRepo::findAsJson(id));
                         break;
 
                     case 3:  // update
@@ -443,7 +443,7 @@ TEST_CASE("Concurrency - mixed operations storm",
 
                     case 5:  // invalidateL1 + read
                         FullCacheTestItemRepo::invalidateL1(id);
-                        sync(FullCacheTestItemRepo::findById(id));
+                        sync(FullCacheTestItemRepo::find(id));
                         break;
                 }
             }
@@ -451,7 +451,7 @@ TEST_CASE("Concurrency - mixed operations storm",
 
         // Verify all entities are still accessible
         for (auto id : ids) {
-            auto item = sync(FullCacheTestItemRepo::findById(id));
+            auto item = sync(FullCacheTestItemRepo::find(id));
             REQUIRE(item != nullptr);
         }
     }
@@ -471,7 +471,7 @@ TEST_CASE("Concurrency - mixed operations storm",
                 auto id = created->id;
 
                 // Read
-                sync(L1TestItemRepo::findById(id));
+                sync(L1TestItemRepo::find(id));
 
                 // Update
                 auto updated = makeTestItem(
@@ -480,13 +480,13 @@ TEST_CASE("Concurrency - mixed operations storm",
                 sync(L1TestItemRepo::update(id, updated));
 
                 // Read again
-                sync(L1TestItemRepo::findById(id));
+                sync(L1TestItemRepo::find(id));
 
                 // Delete
                 sync(L1TestItemRepo::remove(id));
 
                 // Read after delete -> should be nullptr
-                auto gone = sync(L1TestItemRepo::findById(id));
+                auto gone = sync(L1TestItemRepo::find(id));
                 if (gone != nullptr) {
                     delete_mismatches.fetch_add(1, std::memory_order_relaxed);
                 }
@@ -515,7 +515,7 @@ TEST_CASE("Concurrency - concurrent updateBy",
 
     SECTION("[L1] concurrent updateBy on same user") {
         auto userId = insertTestUser("conc_updateby", "conc_ub@test.com", 0);
-        sync(L1TestUserRepo::findById(userId));
+        sync(L1TestUserRepo::find(userId));
 
         parallel(NUM_THREADS, [&](int i) {
             for (int j = 0; j < OPS_PER_THREAD / 2; ++j) {
@@ -526,7 +526,7 @@ TEST_CASE("Concurrency - concurrent updateBy",
         });
 
         // Should still be functional — last writer wins
-        auto user = sync(L1TestUserRepo::findById(userId));
+        auto user = sync(L1TestUserRepo::find(userId));
         REQUIRE(user != nullptr);
     }
 }
@@ -551,7 +551,7 @@ TEST_CASE("Concurrency - cleanup during operations",
 
         // Prime caches
         for (auto id : ids) {
-            sync(L1TestItemRepo::findById(id));
+            sync(L1TestItemRepo::find(id));
         }
 
         parallel(NUM_THREADS, [&](int i) {
@@ -577,7 +577,7 @@ TEST_CASE("Concurrency - cleanup during operations",
                             "", true, id);
                         sync(L1TestItemRepo::update(id, entity));
                     } else {
-                        sync(L1TestItemRepo::findById(id));
+                        sync(L1TestItemRepo::find(id));
                     }
                 }
             }
@@ -585,7 +585,7 @@ TEST_CASE("Concurrency - cleanup during operations",
 
         // All entities should still be accessible
         for (auto id : ids) {
-            auto item = sync(L1TestItemRepo::findById(id));
+            auto item = sync(L1TestItemRepo::find(id));
             REQUIRE(item != nullptr);
         }
     }

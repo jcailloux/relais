@@ -107,7 +107,7 @@ public:
 
     /// Find by ID with L3 (database) access only.
     /// Returns shared_ptr to immutable entity (nullptr if not found).
-    static io::Task<WrapperPtrType> findById(const Key& id) {
+    static io::Task<WrapperPtrType> find(const Key& id) {
         try {
             auto result = co_await DbProvider::queryArgs(
                 Mapping::SQL::select_by_pk, id);

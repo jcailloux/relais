@@ -116,12 +116,12 @@ public:
 
     /// Find by ID with L1 -> (L2) -> DB fallback.
     /// Returns shared_ptr to immutable entity (nullptr if not found).
-    static io::Task<WrapperPtrType> findById(const Key& id) {
+    static io::Task<WrapperPtrType> find(const Key& id) {
         if (auto cached = getFromCache(id)) {
             co_return cached;
         }
 
-        auto ptr = co_await Base::findById(id);
+        auto ptr = co_await Base::find(id);
         if (ptr) {
             putInCache(id, ptr);
         }
@@ -130,13 +130,13 @@ public:
 
     /// Find by ID and return raw JSON string.
     /// Returns shared_ptr to JSON string (nullptr if not found).
-    static io::Task<std::shared_ptr<const std::string>> findByIdAsJson(const Key& id) {
+    static io::Task<std::shared_ptr<const std::string>> findAsJson(const Key& id) {
         if (auto cached = getFromCache(id)) {
             co_return cached->toJson();
         }
 
         if constexpr (HasRedis) {
-            auto json = co_await Base::findByIdAsJson(id);
+            auto json = co_await Base::findAsJson(id);
             if (json) {
                 if (auto entity = Entity::fromJson(*json)) {
                     putInCache(id, std::make_shared<const Entity>(std::move(*entity)));
@@ -144,7 +144,7 @@ public:
             }
             co_return json;
         } else {
-            auto ptr = co_await Base::findById(id);
+            auto ptr = co_await Base::find(id);
             if (ptr) {
                 putInCache(id, ptr);
                 co_return ptr->toJson();

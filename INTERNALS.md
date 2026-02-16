@@ -54,7 +54,7 @@ Example: `ListMixin::update()` hides `CachedRepo::update()`:
 template<typename Base>
 class ListMixin : public Base {
     static io::Task<bool> update(const Key& id, WrapperPtrType wrapper) {
-        auto old = co_await Base::findById(id);     // cache-aware
+        auto old = co_await Base::find(id);     // cache-aware
         bool ok = co_await Base::update(id, wrapper); // delegates down
         if (ok) listCache().onEntityUpdated(old, wrapper);
         co_return ok;
@@ -272,7 +272,7 @@ co_await redis->execCommandCoro("GETEX %s EX %lld", key, ttl_seconds);
 
 ## Cache Flow on Operations
 
-### Read: `findById(id)`
+### Read: `find(id)`
 
 ```
 L1 Cache Hit? --yes--> Return shared_ptr
@@ -427,7 +427,7 @@ struct Traits {
 
 ```cpp
 static io::Task<bool> update(const Key& id, WrapperPtrType wrapper) {
-    auto old = co_await Base::findById(id);
+    auto old = co_await Base::find(id);
     bool ok = co_await Base::update(id, wrapper);
     if (ok) listCache().onEntityUpdated(old, wrapper);
     co_return ok;
@@ -478,14 +478,14 @@ Each CRUD method fetches the old entity (for propagation data), delegates to `Ba
 
 ```cpp
 static io::Task<bool> update(const Key& id, WrapperPtrType wrapper) {
-    auto old = co_await Base::findById(id);  // cache-aware
+    auto old = co_await Base::find(id);  // cache-aware
     bool ok = co_await Base::update(id, std::move(wrapper));
     if (ok) co_await cache::propagateUpdate<Entity, InvList>(old, wrapper);
     co_return ok;
 }
 ```
 
-`Base::findById()` resolves through the full cache chain (L1 -> L2 -> DB), so the old entity lookup is typically a cache hit.
+`Base::find()` resolves through the full cache chain (L1 -> L2 -> DB), so the old entity lookup is typically a cache hit.
 
 ### Four Invalidation Mechanisms
 
@@ -1015,7 +1015,7 @@ PartialKey is auto-detected at compile time via the `HasPartitionKey` concept, w
 
 | Operation | Standard | PartialKey |
 |-----------|----------|------------|
-| `findById` | `SELECT ... WHERE id = $1` | Same (id is unique across partitions) |
+| `find` | `SELECT ... WHERE id = $1` | Same (id is unique across partitions) |
 | `update` | `UPDATE ... WHERE id = $1` | Same |
 | `updateBy` | `UPDATE ... SET cols WHERE id = $N RETURNING *` | Same |
 | `remove` | `DELETE ... WHERE id = $1` | Opportunistic: `DELETE ... WHERE id=$1 AND region=$2` if entity in L1/L2, else `DELETE ... WHERE id=$1` |
@@ -1069,7 +1069,7 @@ wrapper/
 4. **Lazy validation**: Modifications are checked on `get()`, not on notification
 5. **Sort bounds**: O(1) range checking avoids iterating cache entries during invalidation
 6. **Short-circuit**: `hasModificationsSince()` check avoids iteration when no recent modifications
-7. **Double findById on update**: When both `ListMixin` and `InvalidationMixin` are active, each fetches the old entity — but this is a L1 cache hit (O(1) via shardmap), so overhead is negligible
+7. **Double find on update**: When both `ListMixin` and `InvalidationMixin` are active, each fetches the old entity — but this is a L1 cache hit (O(1) via shardmap), so overhead is negligible
 
 ## Entity Mapping Generator
 

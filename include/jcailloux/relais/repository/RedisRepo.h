@@ -35,7 +35,7 @@ class RedisRepo : public BaseRepo<Entity, Name, Cfg, Key> {
 
         /// Find by ID with L2 (Redis) -> L3 (DB) fallback.
         /// Returns shared_ptr to immutable entity (nullptr if not found).
-        static io::Task<WrapperPtrType> findById(const Key& id) {
+        static io::Task<WrapperPtrType> find(const Key& id) {
             auto redisKey = makeRedisKey(id);
 
             std::optional<Entity> cached = co_await getFromCache(redisKey);
@@ -43,7 +43,7 @@ class RedisRepo : public BaseRepo<Entity, Name, Cfg, Key> {
                 co_return std::make_shared<const Entity>(std::move(*cached));
             }
 
-            auto ptr = co_await Base::findById(id);
+            auto ptr = co_await Base::find(id);
             if (ptr) {
                 co_await setInCache(redisKey, *ptr);
             }
@@ -52,7 +52,7 @@ class RedisRepo : public BaseRepo<Entity, Name, Cfg, Key> {
 
         /// Find by ID and return raw JSON string.
         /// Returns shared_ptr to JSON string (nullptr if not found).
-        static io::Task<std::shared_ptr<const std::string>> findByIdAsJson(const Key& id) {
+        static io::Task<std::shared_ptr<const std::string>> findAsJson(const Key& id) {
             auto redisKey = makeRedisKey(id);
 
             std::optional<std::string> cached;
@@ -66,7 +66,7 @@ class RedisRepo : public BaseRepo<Entity, Name, Cfg, Key> {
                 co_return std::make_shared<const std::string>(std::move(*cached));
             }
 
-            if (auto ptr = co_await Base::findById(id)) {
+            if (auto ptr = co_await Base::find(id)) {
                 auto json = ptr->toJson();
                 if (json) {
                     co_await cache::RedisCache::setRaw(redisKey, *json, l2Ttl());

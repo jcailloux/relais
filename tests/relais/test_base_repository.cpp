@@ -10,7 +10,7 @@
  *   7. Lists       — uncached list queries (cachedList, cachedListAs pass-through)
  *
  * SECTION naming convention:
- *   [findById]     — read by primary key
+ *   [find]     — read by primary key
  *   [create]       — insert new entity
  *   [update]       — modify existing entity
  *   [remove]       — delete entity
@@ -32,13 +32,13 @@ using namespace relais_test;
 //
 // #############################################################################
 
-TEST_CASE("BaseRepo<TestItem> - findById", "[integration][db][base][item]") {
+TEST_CASE("BaseRepo<TestItem> - find", "[integration][db][base][item]") {
     TransactionGuard tx;
 
-    SECTION("[findById] returns entity when it exists") {
+    SECTION("[find] returns entity when it exists") {
         auto id = insertTestItem("Test Item", 42, std::optional<std::string>{"A description"}, true);
 
-        auto result = sync(UncachedTestItemRepo::findById(id));
+        auto result = sync(UncachedTestItemRepo::find(id));
 
         REQUIRE(result != nullptr);
         REQUIRE(result->id == id);
@@ -49,18 +49,18 @@ TEST_CASE("BaseRepo<TestItem> - findById", "[integration][db][base][item]") {
         REQUIRE(result->is_active == true);
     }
 
-    SECTION("[findById] returns nullptr for non-existent id") {
-        auto result = sync(UncachedTestItemRepo::findById(999999999));
+    SECTION("[find] returns nullptr for non-existent id") {
+        auto result = sync(UncachedTestItemRepo::find(999999999));
 
         REQUIRE(result == nullptr);
     }
 
-    SECTION("[findById] returns correct entity among multiple") {
+    SECTION("[find] returns correct entity among multiple") {
         auto id1 = insertTestItem("First", 1);
         auto id2 = insertTestItem("Second", 2);
         auto id3 = insertTestItem("Third", 3);
 
-        auto result = sync(UncachedTestItemRepo::findById(id2));
+        auto result = sync(UncachedTestItemRepo::find(id2));
 
         REQUIRE(result != nullptr);
         REQUIRE(result->id == id2);
@@ -89,7 +89,7 @@ TEST_CASE("BaseRepo<TestItem> - create", "[integration][db][base][item]") {
             makeTestItem("Persistent", 50, "", true)));
         REQUIRE(created != nullptr);
 
-        auto fetched = sync(UncachedTestItemRepo::findById(created->id));
+        auto fetched = sync(UncachedTestItemRepo::find(created->id));
         REQUIRE(fetched != nullptr);
         REQUIRE(fetched->name == "Persistent");
         REQUIRE(fetched->value == 50);
@@ -101,7 +101,7 @@ TEST_CASE("BaseRepo<TestItem> - create", "[integration][db][base][item]") {
             makeTestItem("No Description", 0, "", true)));
         REQUIRE(result != nullptr);
 
-        auto fetched = sync(UncachedTestItemRepo::findById(result->id));
+        auto fetched = sync(UncachedTestItemRepo::find(result->id));
         REQUIRE(fetched != nullptr);
         REQUIRE(fetched->description.empty());
     }
@@ -113,7 +113,7 @@ TEST_CASE("BaseRepo<TestItem> - update", "[integration][db][base][item]") {
     SECTION("[update] modifies existing entity") {
         auto id = insertTestItem("Original", 10);
 
-        auto fetched = sync(UncachedTestItemRepo::findById(id));
+        auto fetched = sync(UncachedTestItemRepo::find(id));
         REQUIRE(fetched);
         REQUIRE(fetched->name == "Original");
 
@@ -121,7 +121,7 @@ TEST_CASE("BaseRepo<TestItem> - update", "[integration][db][base][item]") {
             makeTestItem("Updated", 20, "", true, id)));
         REQUIRE(success == true);
 
-        fetched = sync(UncachedTestItemRepo::findById(id));
+        fetched = sync(UncachedTestItemRepo::find(id));
         REQUIRE(fetched != nullptr);
         REQUIRE(fetched->name == "Updated");
         REQUIRE(fetched->value == 20);
@@ -130,13 +130,13 @@ TEST_CASE("BaseRepo<TestItem> - update", "[integration][db][base][item]") {
     SECTION("[update] preserves fields not changed") {
         auto id = insertTestItem("Keep Name", 10, std::optional<std::string>{"Keep Desc"}, true);
 
-        auto original = sync(UncachedTestItemRepo::findById(id));
+        auto original = sync(UncachedTestItemRepo::find(id));
         REQUIRE(original != nullptr);
 
         sync(UncachedTestItemRepo::update(id,
             makeTestItem(original->name, 999, original->description, original->is_active, id)));
 
-        auto fetched = sync(UncachedTestItemRepo::findById(id));
+        auto fetched = sync(UncachedTestItemRepo::find(id));
         REQUIRE(fetched != nullptr);
         REQUIRE(fetched->name == "Keep Name");
         REQUIRE(fetched->value == 999);
@@ -151,14 +151,14 @@ TEST_CASE("BaseRepo<TestItem> - remove", "[integration][db][base][item]") {
     SECTION("[remove] deletes existing entity") {
         auto id = insertTestItem("To Delete", 0);
 
-        auto before = sync(UncachedTestItemRepo::findById(id));
+        auto before = sync(UncachedTestItemRepo::find(id));
         REQUIRE(before != nullptr);
 
         auto removed = sync(UncachedTestItemRepo::remove(id));
         REQUIRE(removed.has_value());
         REQUIRE(*removed == 1);
 
-        auto after = sync(UncachedTestItemRepo::findById(id));
+        auto after = sync(UncachedTestItemRepo::find(id));
         REQUIRE(after == nullptr);
     }
 
@@ -175,9 +175,9 @@ TEST_CASE("BaseRepo<TestItem> - remove", "[integration][db][base][item]") {
 
         sync(UncachedTestItemRepo::remove(id2));
 
-        REQUIRE(sync(UncachedTestItemRepo::findById(id1)) != nullptr);
-        REQUIRE(sync(UncachedTestItemRepo::findById(id2)) == nullptr);
-        REQUIRE(sync(UncachedTestItemRepo::findById(id3)) != nullptr);
+        REQUIRE(sync(UncachedTestItemRepo::find(id1)) != nullptr);
+        REQUIRE(sync(UncachedTestItemRepo::find(id2)) == nullptr);
+        REQUIRE(sync(UncachedTestItemRepo::find(id3)) != nullptr);
     }
 }
 
@@ -190,7 +190,7 @@ TEST_CASE("BaseRepo<TestItem> - edge cases", "[integration][db][base][item][edge
             makeTestItem(specialName, 0, "", true)));
         REQUIRE(result != nullptr);
 
-        auto fetched = sync(UncachedTestItemRepo::findById(result->id));
+        auto fetched = sync(UncachedTestItemRepo::find(result->id));
         REQUIRE(fetched != nullptr);
         REQUIRE(fetched->name == specialName);
     }
@@ -201,7 +201,7 @@ TEST_CASE("BaseRepo<TestItem> - edge cases", "[integration][db][base][item][edge
             makeTestItem(longName, 0, "", true)));
         REQUIRE(result != nullptr);
 
-        auto fetched = sync(UncachedTestItemRepo::findById(result->id));
+        auto fetched = sync(UncachedTestItemRepo::find(result->id));
         REQUIRE(fetched != nullptr);
         REQUIRE(fetched->name.length() == 100);
     }
@@ -211,7 +211,7 @@ TEST_CASE("BaseRepo<TestItem> - edge cases", "[integration][db][base][item][edge
             makeTestItem("Negative", -12345, "", true)));
         REQUIRE(result != nullptr);
 
-        auto fetched = sync(UncachedTestItemRepo::findById(result->id));
+        auto fetched = sync(UncachedTestItemRepo::find(result->id));
         REQUIRE(fetched != nullptr);
         REQUIRE(fetched->value == -12345);
     }
@@ -221,7 +221,7 @@ TEST_CASE("BaseRepo<TestItem> - edge cases", "[integration][db][base][item][edge
             makeTestItem("Zero", 0, "", true)));
         REQUIRE(result != nullptr);
 
-        auto fetched = sync(UncachedTestItemRepo::findById(result->id));
+        auto fetched = sync(UncachedTestItemRepo::find(result->id));
         REQUIRE(fetched != nullptr);
         REQUIRE(fetched->value == 0);
     }
@@ -231,7 +231,7 @@ TEST_CASE("BaseRepo<TestItem> - edge cases", "[integration][db][base][item][edge
             makeTestItem("Inactive", 0, "", false)));
         REQUIRE(result != nullptr);
 
-        auto fetched = sync(UncachedTestItemRepo::findById(result->id));
+        auto fetched = sync(UncachedTestItemRepo::find(result->id));
         REQUIRE(fetched != nullptr);
         REQUIRE(fetched->is_active == false);
     }
@@ -243,7 +243,7 @@ TEST_CASE("BaseRepo<TestItem> - JSON serialization", "[integration][db][base][it
     SECTION("[json] toJson returns valid JSON with all fields") {
         auto id = insertTestItem("Serialization Test", 42, std::optional<std::string>{"desc"}, true);
 
-        auto original = sync(UncachedTestItemRepo::findById(id));
+        auto original = sync(UncachedTestItemRepo::find(id));
 
         REQUIRE(original != nullptr);
 
@@ -258,7 +258,7 @@ TEST_CASE("BaseRepo<TestItem> - JSON serialization", "[integration][db][base][it
     SECTION("[json] toJson with null description") {
         auto id = insertTestItem("No Desc", 0);
 
-        auto entity = sync(UncachedTestItemRepo::findById(id));
+        auto entity = sync(UncachedTestItemRepo::find(id));
         REQUIRE(entity != nullptr);
 
         auto json = entity->toJson();
@@ -274,13 +274,13 @@ TEST_CASE("BaseRepo<TestItem> - JSON serialization", "[integration][db][base][it
 //
 // #############################################################################
 
-TEST_CASE("BaseRepo<TestUser> - findById", "[integration][db][base][user]") {
+TEST_CASE("BaseRepo<TestUser> - find", "[integration][db][base][user]") {
     TransactionGuard tx;
 
-    SECTION("[findById] returns user when it exists") {
+    SECTION("[find] returns user when it exists") {
         auto id = insertTestUser("alice", "alice@example.com", 1000);
 
-        auto result = sync(UncachedTestUserRepo::findById(id));
+        auto result = sync(UncachedTestUserRepo::find(id));
 
         REQUIRE(result != nullptr);
         REQUIRE(result->id == id);
@@ -289,8 +289,8 @@ TEST_CASE("BaseRepo<TestUser> - findById", "[integration][db][base][user]") {
         REQUIRE(result->balance == 1000);
     }
 
-    SECTION("[findById] returns nullptr for non-existent user") {
-        auto result = sync(UncachedTestUserRepo::findById(999999999));
+    SECTION("[find] returns nullptr for non-existent user") {
+        auto result = sync(UncachedTestUserRepo::find(999999999));
 
         REQUIRE(result == nullptr);
     }
@@ -315,7 +315,7 @@ TEST_CASE("BaseRepo<TestUser> - create", "[integration][db][base][user]") {
             makeTestUser("carol", "carol@example.com", 0)));
         REQUIRE(created != nullptr);
 
-        auto fetched = sync(UncachedTestUserRepo::findById(created->id));
+        auto fetched = sync(UncachedTestUserRepo::find(created->id));
         REQUIRE(fetched != nullptr);
         REQUIRE(fetched->username == "carol");
         REQUIRE(fetched->balance == 0);
@@ -328,7 +328,7 @@ TEST_CASE("BaseRepo<TestUser> - update", "[integration][db][base][user]") {
     SECTION("[update] modifies user balance") {
         auto id = insertTestUser("alice", "alice@example.com", 100);
 
-        auto original = sync(UncachedTestUserRepo::findById(id));
+        auto original = sync(UncachedTestUserRepo::find(id));
         REQUIRE(original != nullptr);
 
         auto success = sync(UncachedTestUserRepo::update(id,
@@ -336,7 +336,7 @@ TEST_CASE("BaseRepo<TestUser> - update", "[integration][db][base][user]") {
                            original->email, 999, id)));
         REQUIRE(success == true);
 
-        auto fetched = sync(UncachedTestUserRepo::findById(id));
+        auto fetched = sync(UncachedTestUserRepo::find(id));
         REQUIRE(fetched != nullptr);
         REQUIRE(fetched->balance == 999);
     }
@@ -352,7 +352,7 @@ TEST_CASE("BaseRepo<TestUser> - remove", "[integration][db][base][user]") {
         REQUIRE(removed.has_value());
         REQUIRE(*removed == 1);
 
-        REQUIRE(sync(UncachedTestUserRepo::findById(id)) == nullptr);
+        REQUIRE(sync(UncachedTestUserRepo::find(id)) == nullptr);
     }
 }
 
@@ -362,14 +362,14 @@ TEST_CASE("BaseRepo<TestUser> - remove", "[integration][db][base][user]") {
 //
 // #############################################################################
 
-TEST_CASE("BaseRepo<TestPurchase> - findById", "[integration][db][base][purchase]") {
+TEST_CASE("BaseRepo<TestPurchase> - find", "[integration][db][base][purchase]") {
     TransactionGuard tx;
 
-    SECTION("[findById] returns purchase when it exists") {
+    SECTION("[find] returns purchase when it exists") {
         auto userId = insertTestUser("buyer", "buyer@example.com", 1000);
         auto id = insertTestPurchase(userId, "Widget", 999, "completed");
 
-        auto result = sync(UncachedTestPurchaseRepo::findById(id));
+        auto result = sync(UncachedTestPurchaseRepo::find(id));
 
         REQUIRE(result != nullptr);
         REQUIRE(result->id == id);
@@ -379,8 +379,8 @@ TEST_CASE("BaseRepo<TestPurchase> - findById", "[integration][db][base][purchase
         REQUIRE(result->status == "completed");
     }
 
-    SECTION("[findById] returns nullptr for non-existent purchase") {
-        auto result = sync(UncachedTestPurchaseRepo::findById(999999999));
+    SECTION("[find] returns nullptr for non-existent purchase") {
+        auto result = sync(UncachedTestPurchaseRepo::find(999999999));
 
         REQUIRE(result == nullptr);
     }
@@ -410,7 +410,7 @@ TEST_CASE("BaseRepo<TestPurchase> - create", "[integration][db][base][purchase]"
             makeTestPurchase(userId, "Doohickey", 75, "pending")));
         REQUIRE(created != nullptr);
 
-        auto fetched = sync(UncachedTestPurchaseRepo::findById(created->id));
+        auto fetched = sync(UncachedTestPurchaseRepo::find(created->id));
         REQUIRE(fetched != nullptr);
         REQUIRE(fetched->product_name == "Doohickey");
     }
@@ -423,14 +423,14 @@ TEST_CASE("BaseRepo<TestPurchase> - update", "[integration][db][base][purchase]"
         auto userId = insertTestUser("buyer", "buyer@example.com", 1000);
         auto id = insertTestPurchase(userId, "Widget", 100, "pending");
 
-        auto original = sync(UncachedTestPurchaseRepo::findById(id));
+        auto original = sync(UncachedTestPurchaseRepo::find(id));
         REQUIRE(original != nullptr);
 
         auto success = sync(UncachedTestPurchaseRepo::update(id,
             makeTestPurchase(userId, original->product_name, 200, "completed", id)));
         REQUIRE(success == true);
 
-        auto fetched = sync(UncachedTestPurchaseRepo::findById(id));
+        auto fetched = sync(UncachedTestPurchaseRepo::find(id));
         REQUIRE(fetched != nullptr);
         REQUIRE(fetched->amount == 200);
         REQUIRE(fetched->status == "completed");
@@ -448,8 +448,8 @@ TEST_CASE("BaseRepo<TestPurchase> - remove", "[integration][db][base][purchase]"
         REQUIRE(removed.has_value());
         REQUIRE(*removed == 1);
 
-        REQUIRE(sync(UncachedTestPurchaseRepo::findById(purchaseId)) == nullptr);
-        REQUIRE(sync(UncachedTestUserRepo::findById(userId)) != nullptr);
+        REQUIRE(sync(UncachedTestPurchaseRepo::find(purchaseId)) == nullptr);
+        REQUIRE(sync(UncachedTestUserRepo::find(userId)) != nullptr);
     }
 }
 
@@ -462,9 +462,9 @@ TEST_CASE("BaseRepo<TestPurchase> - multiple purchases per user", "[integration]
         auto p2 = insertTestPurchase(userId, "Item B", 200, "pending");
         auto p3 = insertTestPurchase(userId, "Item C", 300, "completed");
 
-        auto r1 = sync(UncachedTestPurchaseRepo::findById(p1));
-        auto r2 = sync(UncachedTestPurchaseRepo::findById(p2));
-        auto r3 = sync(UncachedTestPurchaseRepo::findById(p3));
+        auto r1 = sync(UncachedTestPurchaseRepo::find(p1));
+        auto r2 = sync(UncachedTestPurchaseRepo::find(p2));
+        auto r3 = sync(UncachedTestPurchaseRepo::find(p3));
 
         REQUIRE(r1 != nullptr);
         REQUIRE(r2 != nullptr);
@@ -487,9 +487,9 @@ TEST_CASE("BaseRepo<TestPurchase> - multiple purchases per user", "[integration]
 
         sync(UncachedTestPurchaseRepo::remove(p2));
 
-        REQUIRE(sync(UncachedTestPurchaseRepo::findById(p1)) != nullptr);
-        REQUIRE(sync(UncachedTestPurchaseRepo::findById(p2)) == nullptr);
-        REQUIRE(sync(UncachedTestPurchaseRepo::findById(p3)) != nullptr);
+        REQUIRE(sync(UncachedTestPurchaseRepo::find(p1)) != nullptr);
+        REQUIRE(sync(UncachedTestPurchaseRepo::find(p2)) == nullptr);
+        REQUIRE(sync(UncachedTestPurchaseRepo::find(p3)) != nullptr);
     }
 }
 
@@ -572,7 +572,7 @@ TEST_CASE("BaseRepo - updateBy returns re-fetched entity", "[integration][db][ba
         REQUIRE(result != nullptr);
 
         // Verify by independent fetch
-        auto fetched = sync(UncachedTestUserRepo::findById(id));
+        auto fetched = sync(UncachedTestUserRepo::find(id));
         REQUIRE(fetched != nullptr);
         REQUIRE(fetched->balance == 123);
         REQUIRE(fetched->balance == result->balance);
@@ -595,14 +595,14 @@ TEST_CASE("BaseRepo - updateBy returns re-fetched entity", "[integration][db][ba
 //
 // #############################################################################
 
-TEST_CASE("BaseRepo<TestArticle> - findById", "[integration][db][base][article]") {
+TEST_CASE("BaseRepo<TestArticle> - find", "[integration][db][base][article]") {
     TransactionGuard tx;
 
-    SECTION("[findById] returns article when it exists") {
+    SECTION("[find] returns article when it exists") {
         auto userId = insertTestUser("author", "author@example.com", 0);
         auto id = insertTestArticle("tech", userId, "My Article", 42, true);
 
-        auto result = sync(UncachedTestArticleRepo::findById(id));
+        auto result = sync(UncachedTestArticleRepo::find(id));
 
         REQUIRE(result != nullptr);
         REQUIRE(result->id == id);
@@ -613,19 +613,19 @@ TEST_CASE("BaseRepo<TestArticle> - findById", "[integration][db][base][article]"
         REQUIRE(result->is_published == true);
     }
 
-    SECTION("[findById] returns nullptr for non-existent id") {
-        auto result = sync(UncachedTestArticleRepo::findById(999999999));
+    SECTION("[find] returns nullptr for non-existent id") {
+        auto result = sync(UncachedTestArticleRepo::find(999999999));
 
         REQUIRE(result == nullptr);
     }
 
-    SECTION("[findById] returns correct article among multiple") {
+    SECTION("[find] returns correct article among multiple") {
         auto userId = insertTestUser("author", "author@example.com", 0);
         auto id1 = insertTestArticle("tech", userId, "First", 10);
         auto id2 = insertTestArticle("news", userId, "Second", 20, true);
         auto id3 = insertTestArticle("tech", userId, "Third", 30);
 
-        auto result = sync(UncachedTestArticleRepo::findById(id2));
+        auto result = sync(UncachedTestArticleRepo::find(id2));
 
         REQUIRE(result != nullptr);
         REQUIRE(result->id == id2);
@@ -659,7 +659,7 @@ TEST_CASE("BaseRepo<TestArticle> - create", "[integration][db][base][article]") 
             makeTestArticle("tech", userId, "Persistent Article", 5, true)));
         REQUIRE(created != nullptr);
 
-        auto fetched = sync(UncachedTestArticleRepo::findById(created->id));
+        auto fetched = sync(UncachedTestArticleRepo::find(created->id));
         REQUIRE(fetched != nullptr);
         REQUIRE(fetched->title == "Persistent Article");
         REQUIRE(fetched->view_count == 5);
@@ -674,7 +674,7 @@ TEST_CASE("BaseRepo<TestArticle> - update", "[integration][db][base][article]") 
         auto userId = insertTestUser("author", "author@example.com", 0);
         auto id = insertTestArticle("tech", userId, "Original Title", 10);
 
-        auto original = sync(UncachedTestArticleRepo::findById(id));
+        auto original = sync(UncachedTestArticleRepo::find(id));
         REQUIRE(original != nullptr);
 
         auto success = sync(UncachedTestArticleRepo::update(id,
@@ -682,7 +682,7 @@ TEST_CASE("BaseRepo<TestArticle> - update", "[integration][db][base][article]") 
                               "Updated Title", 999, true, id)));
         REQUIRE(success == true);
 
-        auto fetched = sync(UncachedTestArticleRepo::findById(id));
+        auto fetched = sync(UncachedTestArticleRepo::find(id));
         REQUIRE(fetched != nullptr);
         REQUIRE(fetched->title == "Updated Title");
         REQUIRE(fetched->view_count == 999);
@@ -693,14 +693,14 @@ TEST_CASE("BaseRepo<TestArticle> - update", "[integration][db][base][article]") 
         auto userId = insertTestUser("author", "author@example.com", 0);
         auto id = insertTestArticle("news", userId, "Keep Title", 50, true);
 
-        auto original = sync(UncachedTestArticleRepo::findById(id));
+        auto original = sync(UncachedTestArticleRepo::find(id));
         REQUIRE(original != nullptr);
 
         sync(UncachedTestArticleRepo::update(id,
             makeTestArticle(original->category, original->author_id,
                               original->title, 100, original->is_published, id)));
 
-        auto fetched = sync(UncachedTestArticleRepo::findById(id));
+        auto fetched = sync(UncachedTestArticleRepo::find(id));
         REQUIRE(fetched != nullptr);
         REQUIRE(fetched->title == "Keep Title");
         REQUIRE(fetched->category == "news");
@@ -720,7 +720,7 @@ TEST_CASE("BaseRepo<TestArticle> - remove", "[integration][db][base][article]") 
         REQUIRE(removed.has_value());
         REQUIRE(*removed == 1);
 
-        REQUIRE(sync(UncachedTestArticleRepo::findById(id)) == nullptr);
+        REQUIRE(sync(UncachedTestArticleRepo::find(id)) == nullptr);
     }
 
     SECTION("[remove] does not affect parent user") {
@@ -729,8 +729,8 @@ TEST_CASE("BaseRepo<TestArticle> - remove", "[integration][db][base][article]") 
 
         sync(UncachedTestArticleRepo::remove(articleId));
 
-        REQUIRE(sync(UncachedTestArticleRepo::findById(articleId)) == nullptr);
-        REQUIRE(sync(UncachedTestUserRepo::findById(userId)) != nullptr);
+        REQUIRE(sync(UncachedTestArticleRepo::find(articleId)) == nullptr);
+        REQUIRE(sync(UncachedTestUserRepo::find(userId)) != nullptr);
     }
 
     SECTION("[remove] does not affect other articles") {
@@ -741,9 +741,9 @@ TEST_CASE("BaseRepo<TestArticle> - remove", "[integration][db][base][article]") 
 
         sync(UncachedTestArticleRepo::remove(id2));
 
-        REQUIRE(sync(UncachedTestArticleRepo::findById(id1)) != nullptr);
-        REQUIRE(sync(UncachedTestArticleRepo::findById(id2)) == nullptr);
-        REQUIRE(sync(UncachedTestArticleRepo::findById(id3)) != nullptr);
+        REQUIRE(sync(UncachedTestArticleRepo::find(id1)) != nullptr);
+        REQUIRE(sync(UncachedTestArticleRepo::find(id2)) == nullptr);
+        REQUIRE(sync(UncachedTestArticleRepo::find(id3)) != nullptr);
     }
 }
 
@@ -757,7 +757,7 @@ TEST_CASE("BaseRepo<TestArticle> - edge cases", "[integration][db][base][article
             makeTestArticle("tech", userId, "Unpublished", 0, false)));
         REQUIRE(result != nullptr);
 
-        auto fetched = sync(UncachedTestArticleRepo::findById(result->id));
+        auto fetched = sync(UncachedTestArticleRepo::find(result->id));
         REQUIRE(fetched != nullptr);
         REQUIRE(fetched->is_published == false);
     }
@@ -768,9 +768,9 @@ TEST_CASE("BaseRepo<TestArticle> - edge cases", "[integration][db][base][article
         auto a2 = insertTestArticle("news", userId, "News 1", 20, true);
         auto a3 = insertTestArticle("tech", userId, "Tech 2", 30, false);
 
-        auto r1 = sync(UncachedTestArticleRepo::findById(a1));
-        auto r2 = sync(UncachedTestArticleRepo::findById(a2));
-        auto r3 = sync(UncachedTestArticleRepo::findById(a3));
+        auto r1 = sync(UncachedTestArticleRepo::find(a1));
+        auto r2 = sync(UncachedTestArticleRepo::find(a2));
+        auto r3 = sync(UncachedTestArticleRepo::find(a3));
 
         REQUIRE(r1 != nullptr);
         REQUIRE(r2 != nullptr);
@@ -793,7 +793,7 @@ TEST_CASE("BaseRepo<TestArticle> - JSON serialization", "[integration][db][base]
         auto userId = insertTestUser("author", "author@example.com", 0);
         auto id = insertTestArticle("tech", userId, "JSON Test", 42, true);
 
-        auto original = sync(UncachedTestArticleRepo::findById(id));
+        auto original = sync(UncachedTestArticleRepo::find(id));
         REQUIRE(original != nullptr);
 
         auto json = original->toJson();
@@ -817,10 +817,10 @@ TEST_CASE("BaseRepo - read-only configuration", "[integration][db][base][readonl
     static_assert(test_config::ReadOnlyUncached.read_only == true);
     static_assert(cfg::Uncached.read_only == false);
 
-    SECTION("[readonly] findById works on read-only repository") {
+    SECTION("[readonly] find works on read-only repository") {
         auto id = insertTestItem("ReadOnly Test", 42, std::optional<std::string>{"desc"}, true);
 
-        auto result = sync(ReadOnlyTestItemRepo::findById(id));
+        auto result = sync(ReadOnlyTestItemRepo::find(id));
 
         REQUIRE(result != nullptr);
         REQUIRE(result->id == id);
@@ -831,8 +831,8 @@ TEST_CASE("BaseRepo - read-only configuration", "[integration][db][base][readonl
         REQUIRE(result->is_active == true);
     }
 
-    SECTION("[readonly] findById returns nullptr for non-existent id") {
-        auto result = sync(ReadOnlyTestItemRepo::findById(999999999));
+    SECTION("[readonly] find returns nullptr for non-existent id") {
+        auto result = sync(ReadOnlyTestItemRepo::find(999999999));
 
         REQUIRE(result == nullptr);
     }
@@ -842,7 +842,7 @@ TEST_CASE("BaseRepo - read-only configuration", "[integration][db][base][readonl
         auto id2 = insertTestItem("RO Second", 2);
         auto id3 = insertTestItem("RO Third", 3);
 
-        auto result = sync(ReadOnlyTestItemRepo::findById(id2));
+        auto result = sync(ReadOnlyTestItemRepo::find(id2));
 
         REQUIRE(result != nullptr);
         REQUIRE(result->name == "RO Second");

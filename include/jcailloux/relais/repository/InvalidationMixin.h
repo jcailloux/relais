@@ -36,7 +36,7 @@ public:
     using typename Base::WrapperType;
     using typename Base::WrapperPtrType;
     using Base::name;
-    using Base::findById;
+    using Base::find;
 
     // Expose Invalidates type for external detection
     using Invalidates = InvList;
@@ -58,7 +58,7 @@ public:
     static io::Task<bool> update(const Key& id, WrapperPtrType wrapper)
         requires MutableEntity<Entity> && (!Base::config.read_only)
     {
-        auto old = co_await Base::findById(id);
+        auto old = co_await Base::find(id);
         auto new_entity = wrapper;
 
         bool ok;
@@ -80,7 +80,7 @@ public:
     static io::Task<std::optional<size_t>> remove(const Key& id)
         requires (!Base::config.read_only)
     {
-        auto entity = co_await Base::findById(id);
+        auto entity = co_await Base::find(id);
 
         std::optional<size_t> result;
         if constexpr (detail::HasListMixin<Base>) {
@@ -101,7 +101,7 @@ public:
     static io::Task<WrapperPtrType> updateBy(const Key& id, Updates&&... updates)
         requires HasFieldUpdate<Entity> && (!Base::config.read_only)
     {
-        auto old = co_await Base::findById(id);
+        auto old = co_await Base::find(id);
 
         WrapperPtrType result;
         if constexpr (detail::HasListMixin<Base>) {
@@ -120,7 +120,7 @@ public:
 
     /// Invalidate all caches (L1 + L2) and propagate cross-invalidation.
     static io::Task<void> invalidate(const Key& id) {
-        auto entity = co_await Base::findById(id);
+        auto entity = co_await Base::find(id);
         if (entity) {
             co_await cache::propagateDelete<Entity, InvList>(std::move(entity));
         }

@@ -163,7 +163,7 @@ TEST_CASE("L1 Config - l1_ttl",
     SECTION("[ttl] 50ms TTL expires quickly") {
         auto id = insertTestItem("ttl50_item", 10);
 
-        sync(TTL50msRepo::findById(id));
+        sync(TTL50msRepo::find(id));
         REQUIRE(getCacheSize<TTL50msRepo>() > 0);
 
         waitForExpiration(std::chrono::milliseconds{80});
@@ -176,14 +176,14 @@ TEST_CASE("L1 Config - l1_ttl",
     SECTION("[ttl] 500ms TTL survives 200ms wait") {
         auto id = insertTestItem("ttl500_item", 20);
 
-        sync(TTL500msRepo::findById(id));
+        sync(TTL500msRepo::find(id));
 
         waitForExpiration(std::chrono::milliseconds{200});
 
         // Modify DB — cached value should still be served
         updateTestItem(id, "modified", 99);
 
-        auto item = sync(TTL500msRepo::findById(id));
+        auto item = sync(TTL500msRepo::find(id));
         REQUIRE(item->name == "ttl500_item");
         REQUIRE(item->value == 20);
     }
@@ -191,7 +191,7 @@ TEST_CASE("L1 Config - l1_ttl",
     SECTION("[ttl] expired entry triggers DB re-fetch") {
         auto id = insertTestItem("ttl_refetch", 10);
 
-        sync(TTL50msRepo::findById(id));
+        sync(TTL50msRepo::find(id));
 
         // Update DB
         updateTestItem(id, "ttl_refetched", 99);
@@ -200,7 +200,7 @@ TEST_CASE("L1 Config - l1_ttl",
         forceFullCleanup<TTL50msRepo>();
 
         // accept_expired=false, so expired entry is rejected → DB fetch
-        auto item = sync(TTL50msRepo::findById(id));
+        auto item = sync(TTL50msRepo::find(id));
         REQUIRE(item->name == "ttl_refetched");
         REQUIRE(item->value == 99);
     }
@@ -222,11 +222,11 @@ TEST_CASE("L1 Config - l1_refresh_on_get",
         auto id = insertTestItem("refresh_item", 10);
 
         // Populate cache (TTL = 500ms)
-        sync(RefreshTrueRepo::findById(id));
+        sync(RefreshTrueRepo::find(id));
 
         // Wait 300ms, then read again (should extend TTL by 500ms from now)
         waitForExpiration(std::chrono::milliseconds{300});
-        sync(RefreshTrueRepo::findById(id));
+        sync(RefreshTrueRepo::find(id));
 
         // Wait another 300ms (600ms total, past original 500ms TTL)
         // But only 300ms since refresh → 200ms margin before extended TTL expires
@@ -234,7 +234,7 @@ TEST_CASE("L1 Config - l1_refresh_on_get",
 
         // Modify DB — should still serve stale (TTL was extended)
         updateTestItem(id, "modified", 99);
-        auto item = sync(RefreshTrueRepo::findById(id));
+        auto item = sync(RefreshTrueRepo::find(id));
         REQUIRE(item->name == "refresh_item");
     }
 
@@ -242,11 +242,11 @@ TEST_CASE("L1 Config - l1_refresh_on_get",
         auto id = insertTestItem("no_refresh_item", 10);
 
         // Populate cache (TTL = 500ms)
-        sync(RefreshFalseRepo::findById(id));
+        sync(RefreshFalseRepo::find(id));
 
         // Wait 300ms, read (doesn't extend TTL)
         waitForExpiration(std::chrono::milliseconds{300});
-        sync(RefreshFalseRepo::findById(id));
+        sync(RefreshFalseRepo::find(id));
 
         // Wait another 300ms (600ms total, past 500ms TTL → 100ms margin)
         waitForExpiration(std::chrono::milliseconds{300});
@@ -256,7 +256,7 @@ TEST_CASE("L1 Config - l1_refresh_on_get",
         updateTestItem(id, "refreshed_from_db", 99);
 
         // accept_expired=false → expired entry rejected → DB fetch
-        auto item = sync(RefreshFalseRepo::findById(id));
+        auto item = sync(RefreshFalseRepo::find(id));
         REQUIRE(item->name == "refreshed_from_db");
     }
 }
@@ -276,7 +276,7 @@ TEST_CASE("L1 Config - l1_accept_expired_on_get",
     SECTION("[expired] true: expired entry returned until cleanup") {
         auto id = insertTestItem("accept_exp_item", 10);
 
-        sync(AcceptExpTrueRepo::findById(id));
+        sync(AcceptExpTrueRepo::find(id));
 
         // Wait for expiration (80ms TTL)
         waitForExpiration(std::chrono::milliseconds{120});
@@ -285,21 +285,21 @@ TEST_CASE("L1 Config - l1_accept_expired_on_get",
         updateTestItem(id, "should_not_see", 99);
 
         // accept_expired=true → returns stale value
-        auto item = sync(AcceptExpTrueRepo::findById(id));
+        auto item = sync(AcceptExpTrueRepo::find(id));
         REQUIRE(item->name == "accept_exp_item");
     }
 
     SECTION("[expired] false: expired entry rejected, fetches from DB") {
         auto id = insertTestItem("reject_exp_item", 10);
 
-        sync(AcceptExpFalseRepo::findById(id));
+        sync(AcceptExpFalseRepo::find(id));
 
         waitForExpiration(std::chrono::milliseconds{120});
 
         updateTestItem(id, "from_db", 99);
 
         // accept_expired=false → expired entry rejected → DB fetch
-        auto item = sync(AcceptExpFalseRepo::findById(id));
+        auto item = sync(AcceptExpFalseRepo::find(id));
         REQUIRE(item->name == "from_db");
         REQUIRE(item->value == 99);
     }
@@ -307,12 +307,12 @@ TEST_CASE("L1 Config - l1_accept_expired_on_get",
     SECTION("[expired] interaction: accepted entry removed after full cleanup") {
         auto id = insertTestItem("cleanup_exp_item", 10);
 
-        sync(AcceptExpTrueRepo::findById(id));
+        sync(AcceptExpTrueRepo::find(id));
 
         waitForExpiration(std::chrono::milliseconds{120});
 
         // Entry is expired but accepted
-        auto stale = sync(AcceptExpTrueRepo::findById(id));
+        auto stale = sync(AcceptExpTrueRepo::find(id));
         REQUIRE(stale->name == "cleanup_exp_item");
 
         // Full cleanup removes expired entries
@@ -321,7 +321,7 @@ TEST_CASE("L1 Config - l1_accept_expired_on_get",
         updateTestItem(id, "post_cleanup", 99);
 
         // Now must fetch from DB
-        auto fresh = sync(AcceptExpTrueRepo::findById(id));
+        auto fresh = sync(AcceptExpTrueRepo::find(id));
         REQUIRE(fresh->name == "post_cleanup");
     }
 }
@@ -342,8 +342,8 @@ TEST_CASE("L1 Config - l1_shard_count_log2",
         auto id1 = insertTestItem("seg2_a", 1);
         auto id2 = insertTestItem("seg2_b", 2);
 
-        sync(Seg2Repo::findById(id1));
-        sync(Seg2Repo::findById(id2));
+        sync(Seg2Repo::find(id1));
+        sync(Seg2Repo::find(id2));
 
         REQUIRE(getCacheSize<Seg2Repo>() == 2);
 
@@ -357,7 +357,7 @@ TEST_CASE("L1 Config - l1_shard_count_log2",
 
     SECTION("[shards] 16 shards: reset clears all entries") {
         auto id = insertTestItem("seg16_item", 1);
-        sync(Seg16Repo::findById(id));
+        sync(Seg16Repo::find(id));
         REQUIRE(getCacheSize<Seg16Repo>() > 0);
 
         // Reset unconditionally removes all entries (via friend access)
@@ -366,7 +366,7 @@ TEST_CASE("L1 Config - l1_shard_count_log2",
 
         // After reset, next read fetches from DB
         updateTestItem(id, "seg16_updated", 99);
-        auto item = sync(Seg16Repo::findById(id));
+        auto item = sync(Seg16Repo::find(id));
         REQUIRE(item->name == "seg16_updated");
     }
 }
@@ -387,14 +387,14 @@ TEST_CASE("L1 Config - update_strategy",
         auto id = insertTestItem("lazy_item", 10);
 
         // Populate cache
-        sync(LazyReloadRepo::findById(id));
+        sync(LazyReloadRepo::find(id));
 
         // Update
         auto updated = makeTestItem("lazy_updated", 20, "", true, id);
         sync(LazyReloadRepo::update(id, updated));
 
         // Next read fetches from DB (cache was invalidated)
-        auto item = sync(LazyReloadRepo::findById(id));
+        auto item = sync(LazyReloadRepo::find(id));
         REQUIRE(item->name == "lazy_updated");
         REQUIRE(item->value == 20);
     }
@@ -403,7 +403,7 @@ TEST_CASE("L1 Config - update_strategy",
         auto id = insertTestItem("pop_item", 10);
 
         // Populate cache
-        sync(PopImmediateRepo::findById(id));
+        sync(PopImmediateRepo::find(id));
 
         // Update
         auto updated = makeTestItem("pop_updated", 20, "", true, id);
@@ -413,7 +413,7 @@ TEST_CASE("L1 Config - update_strategy",
         updateTestItem(id, "sneaky", 99);
 
         // L1 still serves the write-through value
-        auto item = sync(PopImmediateRepo::findById(id));
+        auto item = sync(PopImmediateRepo::find(id));
         REQUIRE(item->name == "pop_updated");
         REQUIRE(item->value == 20);
     }
@@ -428,7 +428,7 @@ TEST_CASE("L1 Config - update_strategy",
         // Direct DB modification not visible
         updateTestItem(created->id, "invisible", 0);
 
-        auto item = sync(PopImmediateRepo::findById(created->id));
+        auto item = sync(PopImmediateRepo::find(created->id));
         REQUIRE(item->name == "pop_created");
     }
 }
@@ -449,7 +449,7 @@ TEST_CASE("L1 Config - l1_cleanup_every_n_gets",
         auto id = insertTestItem("ac_exp_item", 10);
 
         // Populate cache
-        sync(AutoCleanup5Repo::findById(id));
+        sync(AutoCleanup5Repo::find(id));
         REQUIRE(getCacheSize<AutoCleanup5Repo>() > 0);
 
         // Wait for TTL to expire (50ms)
@@ -457,7 +457,7 @@ TEST_CASE("L1 Config - l1_cleanup_every_n_gets",
 
         // Read 4 times — no cleanup yet (need 5)
         for (int i = 0; i < 4; ++i) {
-            sync(AutoCleanup5Repo::findById(id));
+            sync(AutoCleanup5Repo::find(id));
         }
 
         // Expired entry should still be present (accept_expired=true, no cleanup yet)
@@ -465,7 +465,7 @@ TEST_CASE("L1 Config - l1_cleanup_every_n_gets",
         auto sizeBeforeCleanup = getCacheSize<AutoCleanup5Repo>();
 
         // 5th get triggers auto-cleanup
-        sync(AutoCleanup5Repo::findById(id));
+        sync(AutoCleanup5Repo::find(id));
 
         // After cleanup, expired entry should be removed
         // (the entry will be re-populated from DB, but the old expired one was cleaned)
@@ -479,33 +479,33 @@ TEST_CASE("L1 Config - l1_cleanup_every_n_gets",
     SECTION("[auto-cleanup] disabled (0): no auto-cleanup occurs") {
         auto id = insertTestItem("ac_disabled", 10);
 
-        sync(AutoCleanupOffRepo::findById(id));
+        sync(AutoCleanupOffRepo::find(id));
 
         waitForExpiration(std::chrono::milliseconds{80});
 
         // Many reads — no auto-cleanup should trigger
         for (int i = 0; i < 20; ++i) {
-            sync(AutoCleanupOffRepo::findById(id));
+            sync(AutoCleanupOffRepo::find(id));
         }
 
         // With accept_expired=true, expired entry is still served
-        auto item = sync(AutoCleanupOffRepo::findById(id));
+        auto item = sync(AutoCleanupOffRepo::find(id));
         REQUIRE(item->name == "ac_disabled");
     }
 
     SECTION("[auto-cleanup] non-expired entries survive cleanup trigger") {
         auto id = insertTestItem("ac_alive_item", 10);
 
-        sync(AutoCleanup5Repo::findById(id));
+        sync(AutoCleanup5Repo::find(id));
 
         // Trigger auto-cleanup before TTL expires
         for (int i = 0; i < 5; ++i) {
-            sync(AutoCleanup5Repo::findById(id));
+            sync(AutoCleanup5Repo::find(id));
         }
 
         // Entry should survive (not expired)
         updateTestItem(id, "sneaky", 99);
-        auto item = sync(AutoCleanup5Repo::findById(id));
+        auto item = sync(AutoCleanup5Repo::find(id));
         REQUIRE(item->name == "ac_alive_item");
     }
 }
@@ -526,21 +526,21 @@ TEST_CASE("L1 Config - l1_cleanup_min_interval",
         auto id1 = insertTestItem("ci0_a", 1);
         auto id2 = insertTestItem("ci0_b", 2);
 
-        sync(CleanupInterval0Repo::findById(id1));
-        sync(CleanupInterval0Repo::findById(id2));
+        sync(CleanupInterval0Repo::find(id1));
+        sync(CleanupInterval0Repo::find(id2));
 
         waitForExpiration(std::chrono::milliseconds{80});
 
         // Trigger cleanup (every 3 gets, interval 0ms)
         for (int i = 0; i < 3; ++i) {
-            sync(CleanupInterval0Repo::findById(id1));
+            sync(CleanupInterval0Repo::find(id1));
         }
 
         waitForExpiration(std::chrono::milliseconds{10});
 
         // Second trigger also runs (interval = 0ms, no throttle)
         for (int i = 0; i < 3; ++i) {
-            sync(CleanupInterval0Repo::findById(id1));
+            sync(CleanupInterval0Repo::find(id1));
         }
 
         // The point is that multiple cleanups can fire without throttling
@@ -550,23 +550,23 @@ TEST_CASE("L1 Config - l1_cleanup_min_interval",
     SECTION("[cleanup-interval] long interval: second trigger within interval is skipped") {
         auto id = insertTestItem("cilong_item", 1);
 
-        sync(CleanupIntervalLongRepo::findById(id));
+        sync(CleanupIntervalLongRepo::find(id));
 
         waitForExpiration(std::chrono::milliseconds{80});
 
         // First trigger fires
         for (int i = 0; i < 3; ++i) {
-            sync(CleanupIntervalLongRepo::findById(id));
+            sync(CleanupIntervalLongRepo::find(id));
         }
 
         // Second trigger within 30s interval — should be skipped
         for (int i = 0; i < 3; ++i) {
-            sync(CleanupIntervalLongRepo::findById(id));
+            sync(CleanupIntervalLongRepo::find(id));
         }
 
         // Entry persists because cleanup interval prevents repeated cleanup
         // (accept_expired=true keeps it around)
-        auto item = sync(CleanupIntervalLongRepo::findById(id));
+        auto item = sync(CleanupIntervalLongRepo::find(id));
         REQUIRE(item->name == "cilong_item");
     }
 }
@@ -583,23 +583,23 @@ TEST_CASE("L1 Config - read_only",
 {
     TransactionGuard tx;
 
-    SECTION("[readonly] findById works and caches") {
+    SECTION("[readonly] find works and caches") {
         auto id = insertTestItem("ro_item", 42);
 
-        auto item = sync(ReadOnlyCfgRepo::findById(id));
+        auto item = sync(ReadOnlyCfgRepo::find(id));
         REQUIRE(item != nullptr);
         REQUIRE(item->name == "ro_item");
 
         // Verify caching: DB change not visible
         updateTestItem(id, "modified", 99);
-        auto cached = sync(ReadOnlyCfgRepo::findById(id));
+        auto cached = sync(ReadOnlyCfgRepo::find(id));
         REQUIRE(cached->name == "ro_item");
     }
 
-    SECTION("[readonly] findByIdAsJson works") {
+    SECTION("[readonly] findAsJson works") {
         auto id = insertTestItem("ro_json_item", 10);
 
-        auto json = sync(ReadOnlyCfgRepo::findByIdAsJson(id));
+        auto json = sync(ReadOnlyCfgRepo::findAsJson(id));
         REQUIRE(json != nullptr);
         REQUIRE(json->find("\"ro_json_item\"") != std::string::npos);
     }

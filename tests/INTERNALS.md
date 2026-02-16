@@ -80,7 +80,7 @@ All database modifications within a test are automatically rolled back.
 
 Runs a coroutine synchronously:
 ```cpp
-auto result = sync(Repo::findById(123));
+auto result = sync(Repo::find(123));
 // Blocks until the coroutine completes
 ```
 
@@ -116,7 +116,7 @@ using TestItemEntity = EntityWrapper<TestItem, generated::TestItemMapping>;
 
 Entities are **immutable** (stored as `shared_ptr<const Entity>`). To update:
 ```cpp
-auto original = sync(Repo::findById(id));
+auto original = sync(Repo::find(id));
 TestItemEntity updated = *original;  // Copy
 updated.name = "New Name";
 sync(Repo::update(id, makeEntity(updated)));
@@ -162,11 +162,11 @@ CREATE TABLE relais_test_items (
 TEST_CASE("[Repo] CRUD", "[integration][db]") {
     initTest();
 
-    SECTION("findById returns entity") {
+    SECTION("find returns entity") {
         TransactionGuard tx;
 
         auto id = insertTestItem("Test", 42);
-        auto result = sync(Repo::findById(id));
+        auto result = sync(Repo::find(id));
 
         REQUIRE(result != nullptr);
         REQUIRE(result->name == "Test");
@@ -182,13 +182,13 @@ SECTION("L1 cache returns stale data") {
     auto id = insertTestItem("Original", 1);
 
     // Populate cache
-    sync(L1Repo::findById(id));
+    sync(L1Repo::find(id));
 
     // Modify directly in DB (bypass cache)
     updateTestItem(id, "Modified", 2);
 
     // Should still return cached value
-    auto cached = sync(L1Repo::findById(id));
+    auto cached = sync(L1Repo::find(id));
     REQUIRE(cached->name == "Original");  // Stale!
 }
 ```
@@ -199,12 +199,12 @@ SECTION("invalidate clears cache") {
     TransactionGuard tx;
 
     auto id = insertTestItem("Test", 1);
-    sync(Repo::findById(id));  // Populate cache
+    sync(Repo::find(id));  // Populate cache
 
     updateTestItem(id, "Updated", 2);
     sync(Repo::invalidate(id));  // Clear cache
 
-    auto fresh = sync(Repo::findById(id));
+    auto fresh = sync(Repo::find(id));
     REQUIRE(fresh->name == "Updated");  // Fresh from DB
 }
 ```
@@ -240,13 +240,13 @@ Comprehensive integration tests for the L2 (Redis) cache layer, organized in 17 
 
 | Section | Tag | Content |
 |---------|-----|---------|
-| 1 | `[item]` | `findById` — cache hit, miss, multi-entity |
+| 1 | `[item]` | `find` — cache hit, miss, multi-entity |
 | 2 | `[item]` | `create` — insert + populate Redis |
 | 3 | `[item]` | `update` — invalidate Redis (lazy reload) |
 | 4 | `[item]` | `remove` — invalidate Redis |
 | 5 | `[flatbuffer]` | Binary (BEVE) serialization in Redis |
 | 6 | `[updateBy]` | Partial field updates with Redis invalidation |
-| 7 | `[json]` | `findByIdAsJson` raw JSON retrieval |
+| 7 | `[json]` | `findAsJson` raw JSON retrieval |
 | 8 | `[invalidate]` | Explicit `invalidateRedis` + isolation |
 | 9 | `[readonly]` | Read-only repository caching |
 | 10 | `[cross-inv]` | `Invalidate<>` entity→entity (create, update, delete, FK change) |
@@ -410,7 +410,7 @@ CachedRepo::remove(id)
 
 | Section | Content |
 |---------|---------|
-| 1 | CRUD: findById, create, update, remove (Uncached) |
+| 1 | CRUD: find, create, update, remove (Uncached) |
 | 2 | L1 caching: cache hit, staleness, invalidation |
 | 3 | L2 caching: Redis hit, staleness, invalidation |
 | 4 | Cross-invalidation: Event as source (→ User L1) |

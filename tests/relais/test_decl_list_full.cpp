@@ -221,7 +221,7 @@ TEST_CASE("[DeclList L1+L2] Entity and list on same repo",
         auto articleId = insertTestArticle("tech", userId, "Original", 10);
 
         // Cache both entity and list
-        sync(FullCacheArticleListRepo::findById(articleId));
+        sync(FullCacheArticleListRepo::find(articleId));
         sync(FullCacheArticleListRepo::query(makeFullArticleQuery("tech")));
 
         // Update entity via repo
@@ -229,7 +229,7 @@ TEST_CASE("[DeclList L1+L2] Entity and list on same repo",
         sync(FullCacheArticleListRepo::update(articleId, updated));
 
         // Entity cache should reflect the update
-        auto entity = sync(FullCacheArticleListRepo::findById(articleId));
+        auto entity = sync(FullCacheArticleListRepo::find(articleId));
         REQUIRE(entity != nullptr);
         REQUIRE(entity->title == "Updated");
 

@@ -74,7 +74,7 @@ struct TestInternals {
     }
 
     /// Direct L1 cache get — bypasses coroutine overhead.
-    /// Same path as findById L1 hit, but synchronous (no sync_wait thread).
+    /// Same path as find L1 hit, but synchronous (no sync_wait thread).
     template<typename Repo, typename Key>
     static auto getFromCache(const Key& key) {
         return Repo::getFromCache(key);

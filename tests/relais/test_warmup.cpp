@@ -40,11 +40,11 @@ TEST_CASE("CachedRepo::warmup - L1 entity cache",
         // Second call should be a no-op
     }
 
-    SECTION("[warmup] findById works after warmup") {
+    SECTION("[warmup] find works after warmup") {
         L1TestItemRepo::warmup();
 
         auto id = insertTestItem("warmup_item", 42);
-        auto item = sync(L1TestItemRepo::findById(id));
+        auto item = sync(L1TestItemRepo::find(id));
         REQUIRE(item != nullptr);
         REQUIRE(item->name == "warmup_item");
     }

@@ -120,7 +120,7 @@ public:
 
     // Re-export all Base methods via using declarations
     using Base::name;
-    using Base::findById;
+    using Base::find;
     using Base::config;
 
     // =======================================================================

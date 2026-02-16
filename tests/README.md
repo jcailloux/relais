@@ -164,7 +164,7 @@ See `test_partial_key.cpp` sections 8a-8d for coverage at all cache levels + cro
 | `[item]` | Entity CRUD with Redis caching |
 | `[flatbuffer]` | Binary (BEVE) serialization in Redis |
 | `[updateBy]` | Partial field updates with Redis invalidation |
-| `[json]` | `findByIdAsJson` raw JSON retrieval |
+| `[json]` | `findAsJson` raw JSON retrieval |
 | `[invalidate]` | Explicit `invalidateRedis` operations |
 | `[readonly]` | Read-only repository caching |
 | `[cross-inv]` | `Invalidate<>` entity→entity cross-invalidation |
@@ -219,7 +219,7 @@ Tests for `warmup()` priming cache infrastructure including L1 entity cache and 
 
 | Tag | Description |
 |-----|-------------|
-| `[read]` | Concurrent `findById` (L1, L2, L1+L2) |
+| `[read]` | Concurrent `find` (L1, L2, L1+L2) |
 | `[read-write]` | Concurrent read + write on same entity |
 | `[create-remove]` | Concurrent create + remove |
 | `[cross-inv]` | Concurrent cross-invalidation |
