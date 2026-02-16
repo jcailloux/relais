@@ -274,10 +274,10 @@ namespace jcailloux::relais::cache {
             }
 
             // =================================================================
-            // FlatBuffer List Entity Binary Methods
+            // List Entity Binary Methods
             // =================================================================
 
-            /// Get a FlatBuffer list entity from binary cache.
+            /// Get a list entity from binary cache.
             /// Automatically skips the ListBoundsHeader if present (magic bytes 0x53 0x52).
             template<typename ListEntity>
             static io::Task<std::optional<ListEntity>> getListBinary(const std::string& key)
@@ -299,7 +299,7 @@ namespace jcailloux::relais::cache {
                 co_return std::nullopt;
             }
 
-            /// Get a FlatBuffer list entity with TTL refresh.
+            /// Get a list entity with TTL refresh.
             template<typename ListEntity, typename Rep, typename Period>
             static io::Task<std::optional<ListEntity>> getListBinaryEx(
                 const std::string& key,

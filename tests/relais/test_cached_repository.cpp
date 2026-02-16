@@ -33,7 +33,7 @@
  *   [list-inv]      — entity → ListDescriptor cross-invalidation
  *   [list-resolver] — InvalidateListVia with typed GroupKey
  *   [list-granularity] — per-page, per-group, full pattern dispatch
- *   [flatbuffer]    — binary entity caching
+ *   [binary]    — binary entity caching
  *   [updateBy]      — partial field updates
  *   [json]          — findAsJson raw JSON retrieval
  *   [readonly]      — read-only repository
@@ -1004,11 +1004,11 @@ TEST_CASE("CachedRepo - InvalidateListVia mixed granularity",
 // #############################################################################
 
 TEST_CASE("CachedRepo<TestUser> - binary caching",
-          "[integration][db][cached][flatbuffer]")
+          "[integration][db][cached][binary]")
 {
     TransactionGuard tx;
 
-    SECTION("[flatbuffer] caches binary entity in L1") {
+    SECTION("[binary] caches binary entity in L1") {
         auto id = insertTestUser("alice", "alice@example.com", 1000);
 
         // First fetch — DB, cached in L1
@@ -1027,7 +1027,7 @@ TEST_CASE("CachedRepo<TestUser> - binary caching",
         REQUIRE(result2->balance == 1000);  // Still cached
     }
 
-    SECTION("[flatbuffer] updateBy invalidates L1 binary cache") {
+    SECTION("[binary] updateBy invalidates L1 binary cache") {
         auto id = insertTestUser("fb_update", "fb_up@example.com", 100);
 
         // Populate cache

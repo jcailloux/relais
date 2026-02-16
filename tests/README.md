@@ -159,24 +159,24 @@ See `test_partial_key.cpp` sections 8a-8d for coverage at all cache levels + cro
 
 ### `test_relais_redis` (RedisRepo — L2 cache)
 
-| Tag | Description |
-|-----|-------------|
-| `[item]` | Entity CRUD with Redis caching |
-| `[flatbuffer]` | Binary (BEVE) serialization in Redis |
-| `[updateBy]` | Partial field updates with Redis invalidation |
-| `[json]` | `findAsJson` raw JSON retrieval |
-| `[invalidate]` | Explicit `invalidateRedis` operations |
-| `[readonly]` | Read-only repository caching |
-| `[cross-inv]` | `Invalidate<>` entity→entity cross-invalidation |
-| `[custom-inv]` | `InvalidateVia<>` with custom resolver |
-| `[readonly-inv]` | Cross-invalidation targeting read-only caches |
-| `[list]` | List caching (JSON) |
-| `[fb-list]` | List caching (binary) |
-| `[list-inv]` | `InvalidateList<>` entity→list cross-invalidation |
-| `[list-custom]` | List cross-invalidation with custom resolver |
-| `[list-tracked]` | Tracked pagination with group invalidation |
-| `[list-selective]` | SortBounds selective page invalidation (Lua) |
-| `[list-resolver]` | `InvalidateListVia<>` with typed `GroupKey` resolver |
+| Tag                  | Description |
+|----------------------|-------------|
+| `[item]`             | Entity CRUD with Redis caching |
+| `[binary]`           | Binary (BEVE) serialization in Redis |
+| `[updateBy]`         | Partial field updates with Redis invalidation |
+| `[json]`             | `findAsJson` raw JSON retrieval |
+| `[invalidate]`       | Explicit `invalidateRedis` operations |
+| `[readonly]`         | Read-only repository caching |
+| `[cross-inv]`        | `Invalidate<>` entity→entity cross-invalidation |
+| `[custom-inv]`       | `InvalidateVia<>` with custom resolver |
+| `[readonly-inv]`     | Cross-invalidation targeting read-only caches |
+| `[list]`             | List caching (JSON) |
+| `[fb-list]`          | List caching (binary) |
+| `[list-inv]`         | `InvalidateList<>` entity→list cross-invalidation |
+| `[list-custom]`      | List cross-invalidation with custom resolver |
+| `[list-tracked]`     | Tracked pagination with group invalidation |
+| `[list-selective]`   | SortBounds selective page invalidation (Lua) |
+| `[list-resolver]`    | `InvalidateListVia<>` with typed `GroupKey` resolver |
 | `[list-granularity]` | Three granularities: per-page, per-group, full pattern |
 
 ### `test_relais_decl_list_cache` (ListMixin — L1 list cache)

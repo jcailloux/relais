@@ -11,7 +11,7 @@ namespace jcailloux::relais {
  * Repo with L2 Redis caching on top of L3 database.
  *
  * Automatically selects binary or JSON serialization based on Entity capabilities:
- * - Binary (BEVE/FlatBuffer entities): stored and served as binary
+ * - Binary (BEVE entities): stored and served as binary
  * - JSON (JSON entities): stored and served as JSON
  *
  * The entity's native serialization format is always used -- no cross-format conversion.

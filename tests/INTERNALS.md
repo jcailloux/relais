@@ -238,25 +238,25 @@ L1Repo::clearCache();
 
 Comprehensive integration tests for the L2 (Redis) cache layer, organized in 17 logical sections:
 
-| Section | Tag | Content |
-|---------|-----|---------|
-| 1 | `[item]` | `find` — cache hit, miss, multi-entity |
-| 2 | `[item]` | `insert` — insert + populate Redis |
-| 3 | `[item]` | `update` — invalidate Redis (lazy reload) |
-| 4 | `[item]` | `remove` — invalidate Redis |
-| 5 | `[flatbuffer]` | Binary (BEVE) serialization in Redis |
-| 6 | `[updateBy]` | Partial field updates with Redis invalidation |
-| 7 | `[json]` | `findAsJson` raw JSON retrieval |
-| 8 | `[invalidate]` | Explicit `invalidateRedis` + isolation |
-| 9 | `[readonly]` | Read-only repository caching |
-| 10 | `[cross-inv]` | `Invalidate<>` entity→entity (insert, update, delete, FK change) |
-| 11 | `[custom-inv]` | `InvalidateVia<>` with custom resolver |
-| 12 | `[readonly-inv]` | Cross-invalidation targeting read-only caches |
-| 13 | `[list]` + `[fb-list]` | List caching — JSON and BEVE binary |
-| 14 | `[list-inv]` + `[list-custom]` | `InvalidateList<>` and list custom resolver |
-| 15 | `[list-tracked]` | Tracked pagination + group invalidation + tracking data |
+| Section | Tag                                    | Content |
+|---------|----------------------------------------|---------|
+| 1 | `[item]`                               | `find` — cache hit, miss, multi-entity |
+| 2 | `[item]`                               | `insert` — insert + populate Redis |
+| 3 | `[item]`                               | `update` — invalidate Redis (lazy reload) |
+| 4 | `[item]`                               | `remove` — invalidate Redis |
+| 5 | `[binary]`                             | Binary (BEVE) serialization in Redis |
+| 6 | `[updateBy]`                           | Partial field updates with Redis invalidation |
+| 7 | `[json]`                               | `findAsJson` raw JSON retrieval |
+| 8 | `[invalidate]`                         | Explicit `invalidateRedis` + isolation |
+| 9 | `[readonly]`                           | Read-only repository caching |
+| 10 | `[cross-inv]`                          | `Invalidate<>` entity→entity (insert, update, delete, FK change) |
+| 11 | `[custom-inv]`                         | `InvalidateVia<>` with custom resolver |
+| 12 | `[readonly-inv]`                       | Cross-invalidation targeting read-only caches |
+| 13 | `[list]` + `[fb-list]`                 | List caching — JSON and BEVE binary |
+| 14 | `[list-inv]` + `[list-custom]`         | `InvalidateList<>` and list custom resolver |
+| 15 | `[list-tracked]`                       | Tracked pagination + group invalidation + tracking data |
 | 16 | `[list-selective]` + `[list-resolver]` | SortBounds Lua selective invalidation + `InvalidateListVia` with GroupKey |
-| 17 | `[list-granularity]` | Three granularities: per-page, per-group, full pattern |
+| 17 | `[list-granularity]`                   | Three granularities: per-page, per-group, full pattern |
 
 ## ListDescriptor Tests (`test_decl_list_cache.cpp`)
 
