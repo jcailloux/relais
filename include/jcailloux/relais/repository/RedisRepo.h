@@ -76,12 +76,12 @@ class RedisRepo : public BaseRepo<Entity, Name, Cfg, Key> {
             co_return nullptr;
         }
 
-        /// Create entity in database with L2 cache population.
+        /// insert entity in database with L2 cache population.
         /// Returns shared_ptr to immutable entity (nullptr on error).
-        static io::Task<WrapperPtrType> create(WrapperPtrType wrapper)
+        static io::Task<WrapperPtrType> insert(WrapperPtrType wrapper)
             requires CreatableEntity<Entity, Key> && (!Cfg.read_only)
         {
-            auto inserted = co_await Base::create(wrapper);
+            auto inserted = co_await Base::insert(wrapper);
             if (inserted) {
                 co_await setInCache(makeRedisKey(inserted->getPrimaryKey()), *inserted);
             }

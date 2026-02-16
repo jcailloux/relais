@@ -221,7 +221,7 @@ Tests for `warmup()` priming cache infrastructure including L1 entity cache and 
 |-----|-------------|
 | `[read]` | Concurrent `find` (L1, L2, L1+L2) |
 | `[read-write]` | Concurrent read + write on same entity |
-| `[create-remove]` | Concurrent create + remove |
+| `[insert-remove]` | Concurrent insert + remove |
 | `[cross-inv]` | Concurrent cross-invalidation |
 | `[list]` | Concurrent list queries + entity creates |
 | `[warmup]` | Concurrent warmup + operations |

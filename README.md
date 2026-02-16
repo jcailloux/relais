@@ -17,7 +17,7 @@ A header-only C++23 repository pattern library with integrated multi-tier cachin
 - **Partial updates**: Type-safe `updateBy()` with compile-time field enum — updates only specified columns
 - **Partition key optimization**: `@relais partition_key` enables single-partition DELETE via cache hints (`HasPartitionKey` concept)
 - **Type-safe**: Hierarchical concepts (`ReadableEntity`, `CacheableEntity`, `MutableEntity`, `CreatableEntity`)
-- **Read-only enforcement**: Compile-time `requires` clause prevents create/update/delete on read-only repositories
+- **Read-only enforcement**: Compile-time `requires` clause prevents insert/update/delete on read-only repositories
 - **Annotation-based generator**: Auto-generate ORM mappings from `@relais` annotations in struct headers
 
 ## Requirements
@@ -131,7 +131,7 @@ using PurchaseRepo = relais::Repo<
 **Inherited methods:**
 - `find(id)` — `Task<WrapperPtr>` (cached)
 - `findAsJson(id)` — `Task<shared_ptr<const string>>`
-- `create(wrapper)` — `Task<WrapperPtr>` (requires `!read_only`)
+- `insert(wrapper)` — `Task<WrapperPtr>` (requires `!read_only`)
 - `update(id, wrapper)` — `Task<bool>` (requires `!read_only`)
 - `updateBy(id, set<F>(v)...)` — `Task<WrapperPtr>` (requires `HasFieldUpdate`)
 - `remove(id)` — `Task<optional<size_t>>` (requires `!read_only`)
@@ -205,11 +205,11 @@ io::Task<void> example() {
         std::cout << "Found: " << user->username << "\n";
     }
 
-    // Create (automatically caches result) - only if !read_only
+    // insert (automatically caches result) - only if !read_only
     UserWrapper newUser;
     newUser.username = "alice";
     newUser.email = "alice@example.com";
-    auto created = co_await UserRepo::create(
+    auto created = co_await UserRepo::insert(
         std::make_shared<const UserWrapper>(std::move(newUser)));
 
     // Update - only if !read_only
@@ -344,7 +344,7 @@ Mark repositories as read-only to disable modification operations at compile-tim
 using AuditLogRepo = Repo<AuditLogWrapper, "AuditLog",
     config::Local.with_read_only()>;
 // find() — available
-// create(), update(), remove() — COMPILE ERROR if called
+// insert(), update(), remove() — COMPILE ERROR if called
 ```
 
 This is enforced via `requires` clauses:
@@ -397,7 +397,7 @@ auto updated = co_await EventRepo::updateBy(eventId,
 
 ## Cross-Invalidation System
 
-Cross-invalidation is declared via the variadic `Invalidations...` pack on `Repo`. The `InvalidationMixin` sits at the top of the mixin chain and intercepts create/update/remove to propagate invalidations to dependent caches.
+Cross-invalidation is declared via the variadic `Invalidations...` pack on `Repo`. The `InvalidationMixin` sits at the top of the mixin chain and intercepts insert/update/remove to propagate invalidations to dependent caches.
 
 ### Declaring Dependencies
 
@@ -484,7 +484,7 @@ Each cached list page in Redis is prefixed with a 19-byte binary header containi
 
 ### Propagation Behavior
 
-**Modification operations** (`create`, `update`, `remove`):
+**Modification operations** (`insert`, `update`, `remove`):
 - Fetch old value before operation (for updates/deletes)
 - Perform the database operation
 - Propagate to dependent caches with old/new entity data
@@ -555,7 +555,7 @@ io::Task<std::string> handleAuditLogList(
 
 ### CRUD-to-List Notification
 
-ListMixin intercepts `create()`, `update()`, `remove()`, and `updateBy()` to automatically notify the list cache of entity changes. The ModificationTracker records these changes, and list cache entries are validated lazily on the next `query()` call.
+ListMixin intercepts `insert()`, `update()`, `remove()`, and `updateBy()` to automatically notify the list cache of entity changes. The ModificationTracker records these changes, and list cache entries are validated lazily on the next `query()` call.
 
 No manual `notifyCreated`/`notifyUpdated`/`notifyDeleted` calls are needed for same-repo entities.
 
@@ -686,7 +686,7 @@ python scripts/generate_entities.py --files src/entities/User.h --output-dir src
 |--------|-------------|------------|-------------|
 | `find(id)` | `Task<WrapperPtr>` | - | Find by primary key (cached) |
 | `findAsJson(id)` | `Task<shared_ptr<const string>>` | - | Find and return JSON directly |
-| `create(wrapper)` | `Task<WrapperPtr>` | `!read_only` | Insert and cache |
+| `insert(wrapper)` | `Task<WrapperPtr>` | `!read_only` | Insert and cache |
 | `update(id, wrapper)` | `Task<bool>` | `!read_only` | Full update and handle cache |
 | `updateBy(id, set<F>()...)` | `Task<WrapperPtr>` | `!read_only`, `HasFieldUpdate` | Partial update, re-fetches entity |
 | `remove(id)` | `Task<optional<size_t>>` | `!read_only` | Delete and invalidate cache |
@@ -716,7 +716,7 @@ python scripts/generate_entities.py --files src/entities/User.h --output-dir src
 
 ### InvalidationMixin (auto-activated)
 
-When `Invalidations...` is non-empty, the mixin intercepts `create()`, `update()`, `remove()`, `updateBy()`, and `invalidate()` to propagate cross-invalidation. No additional API — it wraps the existing methods transparently.
+When `Invalidations...` is non-empty, the mixin intercepts `insert()`, `update()`, `remove()`, `updateBy()`, and `invalidate()` to propagate cross-invalidation. No additional API — it wraps the existing methods transparently.
 
 ## Testing
 

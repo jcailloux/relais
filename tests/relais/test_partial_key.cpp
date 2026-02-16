@@ -112,14 +112,14 @@ TEST_CASE("PartialKey<TestEvent> - find",
     }
 }
 
-TEST_CASE("PartialKey<TestEvent> - create",
+TEST_CASE("PartialKey<TestEvent> - insert",
           "[integration][db][partial-key]")
 {
     TransactionGuard tx;
-    auto userId = insertTestUser("create_user", "create@test.com", 100);
+    auto userId = insertTestUser("create_user", "insert@test.com", 100);
 
-    SECTION("[create] inserts into 'eu' partition with generated id") {
-        auto created = sync(UncachedTestEventRepo::create(
+    SECTION("[insert] inserts into 'eu' partition with generated id") {
+        auto created = sync(UncachedTestEventRepo::insert(
             makeTestEvent("eu", userId, "New EU Event", 5)));
         REQUIRE(created != nullptr);
         CHECK(created->id > 0);
@@ -128,16 +128,16 @@ TEST_CASE("PartialKey<TestEvent> - create",
         CHECK(created->priority == 5);
     }
 
-    SECTION("[create] inserts into 'us' partition with generated id") {
-        auto created = sync(UncachedTestEventRepo::create(
+    SECTION("[insert] inserts into 'us' partition with generated id") {
+        auto created = sync(UncachedTestEventRepo::insert(
             makeTestEvent("us", userId, "New US Event", 3)));
         REQUIRE(created != nullptr);
         CHECK(created->id > 0);
         CHECK(created->region == "us");
     }
 
-    SECTION("[create] event retrievable after insert") {
-        auto created = sync(UncachedTestEventRepo::create(
+    SECTION("[insert] event retrievable after insert") {
+        auto created = sync(UncachedTestEventRepo::insert(
             makeTestEvent("eu", userId, "Findable Event")));
         REQUIRE(created != nullptr);
 
@@ -147,10 +147,10 @@ TEST_CASE("PartialKey<TestEvent> - create",
         CHECK(found->region == "eu");
     }
 
-    SECTION("[create] ids are unique across partitions (shared sequence)") {
-        auto eu = sync(UncachedTestEventRepo::create(
+    SECTION("[insert] ids are unique across partitions (shared sequence)") {
+        auto eu = sync(UncachedTestEventRepo::insert(
             makeTestEvent("eu", userId, "EU")));
-        auto us = sync(UncachedTestEventRepo::create(
+        auto us = sync(UncachedTestEventRepo::insert(
             makeTestEvent("us", userId, "US")));
 
         REQUIRE(eu != nullptr);
@@ -244,8 +244,8 @@ TEST_CASE("PartialKey<TestEvent> - L1 caching",
         CHECK(result2->title == "Cacheable");
     }
 
-    SECTION("[create] populates L1 cache") {
-        auto created = sync(L1TestEventRepo::create(
+    SECTION("[insert] populates L1 cache") {
+        auto created = sync(L1TestEventRepo::insert(
             makeTestEvent("eu", userId, "Created via L1")));
         REQUIRE(created != nullptr);
 
@@ -353,7 +353,7 @@ TEST_CASE("PartialKey cross-invalidation - Event as source",
 {
     TransactionGuard tx;
 
-    SECTION("[cross-inv] create event invalidates user L1 cache") {
+    SECTION("[cross-inv] insert event invalidates user L1 cache") {
         auto userId = insertTestUser("inv_user", "inv@test.com", 1000);
 
         // Cache user in L1
@@ -367,8 +367,8 @@ TEST_CASE("PartialKey cross-invalidation - Event as source",
         // User still cached (stale)
         CHECK(sync(L1EventTargetUserRepo::find(userId))->balance == 1000);
 
-        // Create event → triggers Invalidate<User, &Event::user_id>
-        auto created = sync(L1EventSourceRepo::create(
+        // insert event → triggers Invalidate<User, &Event::user_id>
+        auto created = sync(L1EventSourceRepo::insert(
             makeTestEvent("eu", userId, "New Event")));
         REQUIRE(created != nullptr);
 
@@ -437,8 +437,8 @@ TEST_CASE("PartialKey cross-invalidation - Event as target",
         // Event still cached (stale)
         CHECK(sync(L1EventAsTargetRepo::find(eventId))->title == "Cached Event");
 
-        // Create purchase for same user → resolver finds event IDs → invalidates event cache
-        auto created = sync(L1PurchaseInvEventRepo::create(
+        // insert purchase for same user → resolver finds event IDs → invalidates event cache
+        auto created = sync(L1PurchaseInvEventRepo::insert(
             makeTestPurchase(userId, "Widget", 50)));
         REQUIRE(created != nullptr);
 

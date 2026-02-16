@@ -121,13 +121,13 @@ public:
     }
 
     // =====================================================================
-    // Create
+    // insert
     // =====================================================================
 
-    /// Create entity in database.
+    /// insert entity in database.
     /// Returns shared_ptr to immutable entity (nullptr on error).
     /// Uses INSERT ... RETURNING to get the full entity back (with DB-managed fields).
-    static io::Task<WrapperPtrType> create(WrapperPtrType wrapper)
+    static io::Task<WrapperPtrType> insert(WrapperPtrType wrapper)
         requires MutableEntity<Entity> && (!Cfg.read_only)
     {
         if (!wrapper) co_return nullptr;
@@ -141,7 +141,7 @@ public:
             co_return entity ? std::make_shared<const Entity>(std::move(*entity)) : nullptr;
 
         } catch (const io::PgError& e) {
-            RELAIS_LOG_ERROR << name() << ": create error - " << e.what();
+            RELAIS_LOG_ERROR << name() << ": insert error - " << e.what();
             co_return nullptr;
         }
     }

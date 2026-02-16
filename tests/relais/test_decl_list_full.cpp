@@ -146,7 +146,7 @@ TEST_CASE("[DeclList L1+L2] Cascade invalidation",
     TransactionGuard tx;
     TestInternals::resetListCacheState<FullCacheArticleListRepo>();
 
-    SECTION("[invalidation] create invalidates list in both L1 and L2") {
+    SECTION("[invalidation] insert invalidates list in both L1 and L2") {
         auto userId = insertTestUser("author", "author@both.com", 0);
         insertTestArticle("tech", userId, "Tech 1", 10);
 
@@ -155,9 +155,9 @@ TEST_CASE("[DeclList L1+L2] Cascade invalidation",
             makeFullArticleQuery("tech")));
         REQUIRE(r1->size() == 1);
 
-        // Create via repo → should invalidate list
+        // insert via repo → should invalidate list
         auto newArticle = makeTestArticle("tech", userId, "Tech 2", 20);
-        sync(FullCacheArticleListRepo::create(newArticle));
+        sync(FullCacheArticleListRepo::insert(newArticle));
 
         // Next query should reflect the new article
         auto r2 = sync(FullCacheArticleListRepo::query(
@@ -249,9 +249,9 @@ TEST_CASE("[DeclList L1+L2] Entity and list on same repo",
             makeFullArticleQuery("tech")));
         REQUIRE(r1->size() == 1);
 
-        // Create a new entity via repo → invalidates list
+        // insert a new entity via repo → invalidates list
         auto newArticle = makeTestArticle("tech", userId, "Article 2", 20);
-        auto created = sync(FullCacheArticleListRepo::create(newArticle));
+        auto created = sync(FullCacheArticleListRepo::insert(newArticle));
         REQUIRE(created != nullptr);
 
         // List re-fetches from DB, includes new article

@@ -19,7 +19,7 @@
  *
  * SECTION naming convention:
  *   [find]      — read by primary key with caching
- *   [create]        — insert with L1 cache population
+ *   [insert]        — insert with L1 cache population
  *   [update]        — modify with L1 invalidation/population
  *   [remove]        — delete with L1 invalidation
  *   [invalidate]    — explicit cache invalidation
@@ -349,13 +349,13 @@ TEST_CASE("CachedRepo<TestItem> - find",
     }
 }
 
-TEST_CASE("CachedRepo<TestItem> - create",
+TEST_CASE("CachedRepo<TestItem> - insert",
           "[integration][db][cached][item]")
 {
     TransactionGuard tx;
 
-    SECTION("[create] inserts entity and populates L1 cache") {
-        auto created = sync(L1TestItemRepo::create(makeTestItem("New Item", 100, "Created via repo")));
+    SECTION("[insert] inserts entity and populates L1 cache") {
+        auto created = sync(L1TestItemRepo::insert(makeTestItem("New Item", 100, "Created via repo")));
         REQUIRE(created != nullptr);
         REQUIRE(created->id > 0);
         CHECK(created->name == "New Item");
@@ -364,7 +364,7 @@ TEST_CASE("CachedRepo<TestItem> - create",
         // Modify in DB directly
         updateTestItem(created->id, "DB Modified", 999);
 
-        // L1 cache populated by create → returns stale value
+        // L1 cache populated by insert → returns stale value
         auto cached = sync(L1TestItemRepo::find(created->id));
         REQUIRE(cached != nullptr);
         CHECK(cached->name == "New Item");  // From L1 cache
@@ -634,7 +634,7 @@ TEST_CASE("CachedRepo - cross-invalidation Purchase → User",
 {
     TransactionGuard tx;
 
-    SECTION("[cross-inv] create purchase invalidates user L1 cache") {
+    SECTION("[cross-inv] insert purchase invalidates user L1 cache") {
         auto userId = insertTestUser("inv_user", "inv@test.com", 1000);
 
         // Cache user in L1
@@ -648,8 +648,8 @@ TEST_CASE("CachedRepo - cross-invalidation Purchase → User",
         // User still cached (stale)
         CHECK(sync(L1InvTestUserRepo::find(userId))->balance == 1000);
 
-        // Create purchase → triggers Invalidate<User, &Purchase::user_id>
-        auto created = sync(L1InvTestPurchaseRepo::create(makeTestPurchase(userId, "Widget", 100, "pending")));
+        // insert purchase → triggers Invalidate<User, &Purchase::user_id>
+        auto created = sync(L1InvTestPurchaseRepo::insert(makeTestPurchase(userId, "Widget", 100, "pending")));
         REQUIRE(created != nullptr);
 
         // User L1 cache invalidated → next read gets fresh data from DB
@@ -745,8 +745,8 @@ TEST_CASE("CachedRepo - custom cross-invalidation via resolver",
         CHECK(sync(L1InvTestUserRepo::find(userId))->balance == 1000);
         CHECK(sync(L1InvTestArticleRepo::find(articleId))->title == "My Article");
 
-        // Create purchase → triggers Invalidate<User> + InvalidateVia<Article>
-        sync(L1CustomTestPurchaseRepo::create(makeTestPurchase(userId, "Trigger", 50, "pending")));
+        // insert purchase → triggers Invalidate<User> + InvalidateVia<Article>
+        sync(L1CustomTestPurchaseRepo::insert(makeTestPurchase(userId, "Trigger", 50, "pending")));
 
         // User invalidated (standard Invalidate<>)
         CHECK(sync(L1InvTestUserRepo::find(userId))->balance == 500);
@@ -763,7 +763,7 @@ TEST_CASE("CachedRepo - custom cross-invalidation via resolver",
         sync(L1InvTestUserRepo::find(userId));
 
         // Resolver returns empty vector — no crash
-        auto created = sync(L1CustomTestPurchaseRepo::create(makeTestPurchase(userId, "Safe Trigger", 10, "pending")));
+        auto created = sync(L1CustomTestPurchaseRepo::insert(makeTestPurchase(userId, "Safe Trigger", 10, "pending")));
         REQUIRE(created != nullptr);
     }
 
@@ -783,8 +783,8 @@ TEST_CASE("CachedRepo - custom cross-invalidation via resolver",
         updateTestArticle(a2, "New News 1", 200);
         updateTestArticle(a3, "New Tech 2", 300);
 
-        // Create purchase → resolver finds all 3 articles
-        sync(L1CustomTestPurchaseRepo::create(makeTestPurchase(userId, "Big Trigger", 999, "pending")));
+        // insert purchase → resolver finds all 3 articles
+        sync(L1CustomTestPurchaseRepo::insert(makeTestPurchase(userId, "Big Trigger", 999, "pending")));
 
         // All articles refreshed from DB
         CHECK(sync(L1InvTestArticleRepo::find(a1))->title == "New Tech 1");
@@ -823,10 +823,10 @@ TEST_CASE("CachedRepo - entity to ListDescriptor cross-invalidation",
         auto result2 = sync(TestPurchaseListRepo::query(query));
         CHECK(result2->size() == count1);  // Stale
 
-        // Create purchase through cross-invalidating repo
+        // insert purchase through cross-invalidating repo
         // → triggers InvalidateList<L1PurchaseListInvalidator>
         // → resets ListDescriptor cache
-        sync(L1ListInvPurchaseRepo::create(makeTestPurchase(userId, "Via Repo", 100, "pending")));
+        sync(L1ListInvPurchaseRepo::insert(makeTestPurchase(userId, "Via Repo", 100, "pending")));
 
         // ListDescriptor cache invalidated → fresh from DB
         auto result3 = sync(TestPurchaseListRepo::query(query));
@@ -847,11 +847,11 @@ TEST_CASE("CachedRepo - entity to ListDescriptor cross-invalidation",
         auto count1 = result1->size();
         CHECK(count1 == 2);
 
-        // Create one through repo first (so we have an ID to delete)
-        auto created = sync(L1ListInvPurchaseRepo::create(makeTestPurchase(userId, "To Delete", 25, "pending")));
+        // insert one through repo first (so we have an ID to delete)
+        auto created = sync(L1ListInvPurchaseRepo::insert(makeTestPurchase(userId, "To Delete", 25, "pending")));
         REQUIRE(created != nullptr);
 
-        // Cache was reset by create; re-populate
+        // Cache was reset by insert; re-populate
         TestInternals::resetListCacheState<TestPurchaseListRepo>();
         auto result2 = sync(TestPurchaseListRepo::query(query));
         auto count2 = result2->size();
@@ -884,7 +884,7 @@ TEST_CASE("CachedRepo - InvalidateListVia per-page resolver",
     insertTestArticle("news", aliceId, "alice_news_100", 100, true);
 
     SECTION("[list-resolver] per-page resolver sends sort_value for each article") {
-        sync(L1PerPagePurchaseRepo::create(makeTestPurchase(aliceId, "PerPageTest", 100, "completed")));
+        sync(L1PerPagePurchaseRepo::insert(makeTestPurchase(aliceId, "PerPageTest", 100, "completed")));
 
         // Resolver found 3 articles → 3 invalidateByTarget calls
         REQUIRE(L1MockArticleListRepo::invocations.size() == 3);
@@ -920,7 +920,7 @@ TEST_CASE("CachedRepo - InvalidateListVia per-group resolver",
     insertTestArticle("news", aliceId, "alice_news_a", 100, true);
 
     SECTION("[list-granularity] per-group resolver sends nullopt sort_value") {
-        sync(L1PerGroupPurchaseRepo::create(makeTestPurchase(aliceId, "PerGroupTest", 100, "completed")));
+        sync(L1PerGroupPurchaseRepo::insert(makeTestPurchase(aliceId, "PerGroupTest", 100, "completed")));
 
         // DISTINCT categories: "tech" and "news" → 2 invalidateByTarget calls
         REQUIRE(L1MockArticleListRepo::invocations.size() == 2);
@@ -951,7 +951,7 @@ TEST_CASE("CachedRepo - InvalidateListVia full pattern resolver",
     insertTestArticle("tech", aliceId, "alice_tech", 10, true);
 
     SECTION("[list-granularity] full pattern resolver calls invalidateAllListGroups") {
-        sync(L1FullPatternPurchaseRepo::create(makeTestPurchase(aliceId, "FullPatternTest", 100, "completed")));
+        sync(L1FullPatternPurchaseRepo::insert(makeTestPurchase(aliceId, "FullPatternTest", 100, "completed")));
 
         // Resolver returned nullopt → invalidateAllListGroups called
         CHECK(L1MockArticleListRepo::all_groups_invalidated);
@@ -973,7 +973,7 @@ TEST_CASE("CachedRepo - InvalidateListVia mixed granularity",
     insertTestArticle("news", aliceId, "alice_news_200", 200, true);
 
     SECTION("[list-granularity] mixed: per-page tech + per-group news") {
-        sync(L1MixedPurchaseRepo::create(makeTestPurchase(aliceId, "MixedTest", 100, "completed")));
+        sync(L1MixedPurchaseRepo::insert(makeTestPurchase(aliceId, "MixedTest", 100, "completed")));
 
         CHECK_FALSE(L1MockArticleListRepo::all_groups_invalidated);
 
@@ -1177,7 +1177,7 @@ TEST_CASE("CachedRepo - read-only",
         REQUIRE(result == nullptr);
     }
 
-    // Note: create(), update(), remove() are compile-time errors on read-only repos.
+    // Note: insert(), update(), remove() are compile-time errors on read-only repos.
     // They use `requires (!Cfg.read_only)` and will not compile if called.
 }
 
@@ -1207,8 +1207,8 @@ TEST_CASE("CachedRepo - read-only as cross-invalidation target",
         // Still cached (read-only, no writes to trigger invalidation)
         REQUIRE(sync(ReadOnlyL1TestUserRepo::find(userId))->balance == 1000);
 
-        // Create purchase via repo that targets the read-only user cache
-        sync(L1ReadOnlyInvPurchaseRepo::create(makeTestPurchase(userId, "RO Trigger", 50, "pending")));
+        // insert purchase via repo that targets the read-only user cache
+        sync(L1ReadOnlyInvPurchaseRepo::insert(makeTestPurchase(userId, "RO Trigger", 50, "pending")));
 
         // Read-only user cache should be invalidated — fresh data from DB
         auto user2 = sync(ReadOnlyL1TestUserRepo::find(userId));
@@ -1219,8 +1219,8 @@ TEST_CASE("CachedRepo - read-only as cross-invalidation target",
     SECTION("[readonly-inv] purchase deletion invalidates read-only user L1 cache") {
         auto userId = insertTestUser("ro_del", "rodel@test.com", 2000);
 
-        // Create purchase through repo (need an ID to delete later)
-        auto created = sync(L1ReadOnlyInvPurchaseRepo::create(makeTestPurchase(userId, "To Delete", 100, "pending")));
+        // insert purchase through repo (need an ID to delete later)
+        auto created = sync(L1ReadOnlyInvPurchaseRepo::insert(makeTestPurchase(userId, "To Delete", 100, "pending")));
         REQUIRE(created != nullptr);
 
         // Cache user

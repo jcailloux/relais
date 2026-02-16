@@ -180,9 +180,9 @@ TEST_CASE("FullCache<TestItem> - cascade invalidation",
         REQUIRE(item->value == 10);
     }
 
-    SECTION("[create] populates both L1 and L2") {
+    SECTION("[insert] populates both L1 and L2") {
         auto entity = makeTestItem("created_both", 77);
-        auto created = sync(FullCacheTestItemRepo::create(entity));
+        auto created = sync(FullCacheTestItemRepo::insert(entity));
         REQUIRE(created != nullptr);
 
         // Modify DB directly
@@ -380,7 +380,7 @@ TEST_CASE("FullCache - cross-invalidation at L1+L2",
 {
     TransactionGuard tx;
 
-    SECTION("[cross-inv] purchase create invalidates user in both L1 and L2") {
+    SECTION("[cross-inv] purchase insert invalidates user in both L1 and L2") {
         auto userId = insertTestUser("cross_user", "cross@test.com", 100);
 
         // Populate user cache in both layers
@@ -389,9 +389,9 @@ TEST_CASE("FullCache - cross-invalidation at L1+L2",
         // Modify user balance directly in DB
         updateTestUserBalance(userId, 200);
 
-        // Create purchase — should invalidate user in both L1 and L2
+        // insert purchase — should invalidate user in both L1 and L2
         auto purchase = makeTestPurchase(userId, "Widget", 50);
-        sync(FullCachePurchaseRepo::create(purchase));
+        sync(FullCachePurchaseRepo::insert(purchase));
 
         // User should now be re-fetched from DB (both layers invalidated)
         auto user = sync(FullCacheInvUserRepo::find(userId));
@@ -406,9 +406,9 @@ TEST_CASE("FullCache - cross-invalidation at L1+L2",
         sync(FullCacheInvUserRepo::find(user1Id));
         sync(FullCacheInvUserRepo::find(user2Id));
 
-        // Create purchase for user1
+        // insert purchase for user1
         auto purchase = makeTestPurchase(user1Id, "Gadget", 30);
-        auto created = sync(FullCachePurchaseRepo::create(purchase));
+        auto created = sync(FullCachePurchaseRepo::insert(purchase));
 
         // Modify both users directly in DB
         updateTestUserBalance(user1Id, 111);

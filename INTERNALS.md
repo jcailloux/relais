@@ -423,7 +423,7 @@ struct Traits {
 
 ### CRUD Interception
 
-`ListMixin` intercepts `create()`, `update()`, `remove()`, and `updateBy()` to notify the list cache of entity changes:
+`ListMixin` intercepts `insert()`, `update()`, `remove()`, and `updateBy()` to notify the list cache of entity changes:
 
 ```cpp
 static io::Task<bool> update(const Key& id, WrapperPtrType wrapper) {
@@ -501,7 +501,7 @@ cache::InvalidateListVia<ListRepo, &Entity::key, &Resolver::resolve> // table ->
 
 `InvalidateOn<Deps...>` uses fold expressions to dispatch to each dependency:
 
-- `propagateCreate<Entity, InvList>(new_entity)` — called after `create()`
+- `propagateCreate<Entity, InvList>(new_entity)` — called after `insert()`
 - `propagateUpdate<Entity, InvList>(old, new_entity)` — called after `update()`/`updateBy()`
 - `propagateDelete<Entity, InvList>(old_entity)` — called after `remove()`/`invalidate()`
 
@@ -675,7 +675,7 @@ For Redis L2 list caching, each cached page value is prefixed with a 19-byte bin
 
 Two Lua scripts execute atomically within Redis (~100-200us for 10 pages):
 
-**Create/Delete script** (`invalidateListGroupSelective`):
+**Insert/Delete script** (`invalidateListGroupSelective`):
 ```
 SMEMBERS {groupKey}:_keys  -> [page_key_1, page_key_2, ...]
 For each page_key:
@@ -695,8 +695,8 @@ Same as above, but checks interval overlap:
 
 **Invalidation modes by pagination:**
 
-| Mode | Create/Delete | Update |
-|------|---------------|--------|
+| Mode | Insert/Delete                    | Update |
+|------|------------------------------------|--------|
 | Offset | Affected segment + all after (cascade) | Interval overlap `[min(old,new), max(old,new)]` |
 | Cursor | Only affected segment(s) (localized) | Only affected segment(s) |
 
@@ -856,8 +856,8 @@ Composed concepts used in repository `requires` clauses:
 |---------|------------|---------|
 | `ReadableEntity<W>` | Has Mapping with SQL queries | `BaseRepo` |
 | `CacheableEntity<W>` | `Readable + Serializable` | `RedisRepo`, `CachedRepo` |
-| `MutableEntity<W>` | `Readable + has insert/update SQL` | `create()`, `update()` |
-| `CreatableEntity<W, K>` | `Mutable + Keyed` | `create()` with cache population |
+| `MutableEntity<W>` | `Readable + has insert/update SQL` | `insert()`, `update()` |
+| `CreatableEntity<W, K>` | `Mutable + Keyed` | `insert()` with cache population |
 
 ### Serialization Capabilities (`wrapper/SerializationTraits.h`)
 
@@ -1019,7 +1019,7 @@ PartialKey is auto-detected at compile time via the `HasPartitionKey` concept, w
 | `update` | `UPDATE ... WHERE id = $1` | Same |
 | `updateBy` | `UPDATE ... SET cols WHERE id = $N RETURNING *` | Same |
 | `remove` | `DELETE ... WHERE id = $1` | Opportunistic: `DELETE ... WHERE id=$1 AND region=$2` if entity in L1/L2, else `DELETE ... WHERE id=$1` |
-| `create` | Standard | Standard |
+| `insert` | Standard | Standard |
 
 ## Namespace Organization
 

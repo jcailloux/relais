@@ -153,12 +153,12 @@ public:
         }
     }
 
-    /// Create entity and cache it. Returns shared_ptr to immutable entity.
+    /// insert entity and cache it. Returns shared_ptr to immutable entity.
     /// Compile-time error if Cfg.read_only is true.
-    static io::Task<WrapperPtrType> create(WrapperPtrType wrapper)
+    static io::Task<WrapperPtrType> insert(WrapperPtrType wrapper)
         requires CreatableEntity<Entity, Key> && (!Cfg.read_only)
     {
-        auto inserted = co_await Base::create(wrapper);
+        auto inserted = co_await Base::insert(wrapper);
         if (inserted) {
             // Populate L1 cache with the new entity
             putInCache(inserted->getPrimaryKey(), inserted);

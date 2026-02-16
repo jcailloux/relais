@@ -15,7 +15,7 @@
  * Covers:
  *   1. Concurrent find (L1, L2, L1+L2)
  *   2. Concurrent read + write on same entity
- *   3. Concurrent create + remove
+ *   3. Concurrent insert + remove
  *   4. Concurrent cross-invalidation
  *   5. Concurrent list queries + entity modifications
  *   6. Concurrent warmup + operations
@@ -217,16 +217,16 @@ TEST_CASE("Concurrency - concurrent read + write",
 
 // #############################################################################
 //
-//  3. Concurrent create + remove
+//  3. Concurrent insert + remove
 //
 // #############################################################################
 
-TEST_CASE("Concurrency - concurrent create + remove",
-          "[integration][db][concurrency][create-remove]")
+TEST_CASE("Concurrency - concurrent insert + remove",
+          "[integration][db][concurrency][insert-remove]")
 {
     TransactionGuard tx;
 
-    SECTION("[L1] threads create and remove entities concurrently") {
+    SECTION("[L1] threads insert and remove entities concurrently") {
         std::atomic<int> created_count{0};
 
         parallel(NUM_THREADS, [&](int i) {
@@ -234,7 +234,7 @@ TEST_CASE("Concurrency - concurrent create + remove",
                 auto entity = makeTestItem(
                     "cr_" + std::to_string(i) + "_" + std::to_string(j),
                     i * 1000 + j);
-                auto item = sync(L1TestItemRepo::create(entity));
+                auto item = sync(L1TestItemRepo::insert(entity));
                 if (item) {
                     created_count.fetch_add(1, std::memory_order_relaxed);
                     sync(L1TestItemRepo::remove(item->id));
@@ -245,7 +245,7 @@ TEST_CASE("Concurrency - concurrent create + remove",
         REQUIRE(created_count.load() > 0);
     }
 
-    SECTION("[L1+L2] threads create and remove entities concurrently") {
+    SECTION("[L1+L2] threads insert and remove entities concurrently") {
         std::atomic<int> created_count{0};
 
         parallel(NUM_THREADS, [&](int i) {
@@ -253,7 +253,7 @@ TEST_CASE("Concurrency - concurrent create + remove",
                 auto entity = makeTestItem(
                     "cr_both_" + std::to_string(i) + "_" + std::to_string(j),
                     i * 1000 + j);
-                auto item = sync(FullCacheTestItemRepo::create(entity));
+                auto item = sync(FullCacheTestItemRepo::insert(entity));
                 if (item) {
                     created_count.fetch_add(1, std::memory_order_relaxed);
                     sync(FullCacheTestItemRepo::remove(item->id));
@@ -287,10 +287,10 @@ TEST_CASE("Concurrency - concurrent cross-invalidation",
                     // Read user (may be invalidated mid-flight)
                     sync(L1TestUserRepo::find(userId));
                 } else {
-                    // Create purchase -> invalidates user cache
+                    // insert purchase -> invalidates user cache
                     auto purchase = makeTestPurchase(
                         userId, "Widget_" + std::to_string(i * 100 + j), 10 + j);
-                    auto created = sync(L1TestPurchaseRepo::create(purchase));
+                    auto created = sync(L1TestPurchaseRepo::insert(purchase));
                     if (created) {
                         sync(L1TestPurchaseRepo::remove(created->id));
                     }
@@ -333,12 +333,12 @@ TEST_CASE("Concurrency - concurrent list queries + modifications",
                     sync(TestArticleListRepo::query(
                         makeArticleQuery("conc_cat")));
                 } else {
-                    // Create article via repo (triggers list notification)
+                    // insert article via repo (triggers list notification)
                     auto article = makeTestArticle(
                         "conc_cat", userId,
                         "Conc_" + std::to_string(i) + "_" + std::to_string(j),
                         100 + i * 10 + j);
-                    sync(TestArticleListRepo::create(article));
+                    sync(TestArticleListRepo::insert(article));
                 }
             }
         });
@@ -456,16 +456,16 @@ TEST_CASE("Concurrency - mixed operations storm",
         }
     }
 
-    SECTION("[L1] rapid create-read-update-delete cycles") {
+    SECTION("[L1] rapid insert-read-update-delete cycles") {
         std::atomic<int> delete_mismatches{0};
 
         parallel(NUM_THREADS, [&](int i) {
             for (int j = 0; j < OPS_PER_THREAD / 4; ++j) {
-                // Create
+                // insert
                 auto entity = makeTestItem(
                     "crud_" + std::to_string(i) + "_" + std::to_string(j),
                     i * 100 + j);
-                auto created = sync(L1TestItemRepo::create(entity));
+                auto created = sync(L1TestItemRepo::insert(entity));
                 if (!created) continue;
 
                 auto id = created->id;
@@ -604,7 +604,7 @@ TEST_CASE("Concurrency - list CRUD + list cache cleanup",
     TransactionGuard tx;
     TestInternals::resetListCacheState<TestArticleListRepo>();
 
-    SECTION("[L1] concurrent create/update/remove/query with triggerCleanup") {
+    SECTION("[L1] concurrent insert/update/remove/query with triggerCleanup") {
         auto userId = insertTestUser("conc_lc_author", "conc_lc@test.com", 0);
 
         // Seed articles
@@ -632,12 +632,12 @@ TEST_CASE("Concurrency - list CRUD + list cache cleanup",
                 } else {
                     int op = rng() % 4;
                     if (op == 0) {
-                        // Create
+                        // insert
                         auto article = makeTestArticle(
                             "conc_lc", userId,
                             "CL_" + std::to_string(i) + "_" + std::to_string(j),
                             static_cast<int32_t>(rng() % 1000));
-                        auto created = sync(TestArticleListRepo::create(article));
+                        auto created = sync(TestArticleListRepo::insert(article));
                         if (created) {
                             std::lock_guard lock(ids_mutex);
                             ids.push_back(created->id);
@@ -694,13 +694,13 @@ TEST_CASE("Concurrency - tracker drains after concurrent storm",
     SECTION("[L1] fullCleanup drains all modifications to zero") {
         auto userId = insertTestUser("conc_drain_author", "conc_drain@test.com", 0);
 
-        // Phase 1: Create modifications without concurrent cleanup (guaranteed pending)
+        // Phase 1: insert modifications without concurrent cleanup (guaranteed pending)
         for (int i = 0; i < 20; ++i) {
             auto article = makeTestArticle(
                 "drain_cat", userId,
                 "Drain_" + std::to_string(i),
                 i * 10);
-            sync(TestArticleListRepo::create(article));
+            sync(TestArticleListRepo::insert(article));
         }
         auto initial_count = TestInternals::pendingModificationCount<TestArticleListRepo>();
         REQUIRE(initial_count > 0);
@@ -712,12 +712,12 @@ TEST_CASE("Concurrency - tracker drains after concurrent storm",
                     // Cleanup threads
                     triggerCleanup<TestArticleListRepo>();
                 } else {
-                    // Create threads
+                    // insert threads
                     auto article = makeTestArticle(
                         "drain_cat", userId,
                         "Storm_" + std::to_string(i) + "_" + std::to_string(j),
                         static_cast<int32_t>(100 + i * 10 + j));
-                    sync(TestArticleListRepo::create(article));
+                    sync(TestArticleListRepo::insert(article));
                 }
             }
         });
@@ -739,7 +739,7 @@ TEST_CASE("Concurrency - tracker drains after concurrent storm",
                         "drain_cat", userId,
                         "Storm2_" + std::to_string(i) + "_" + std::to_string(j),
                         static_cast<int32_t>(500 + i * 10 + j));
-                    sync(TestArticleListRepo::create(article));
+                    sync(TestArticleListRepo::insert(article));
                 }
             }
         });
@@ -765,13 +765,13 @@ TEST_CASE("Concurrency - progressive tracker reduction",
     SECTION("[L1] triggerCleanup progressively reduces modification count") {
         auto userId = insertTestUser("conc_prog_author", "conc_prog@test.com", 0);
 
-        // Create modifications (no concurrent cleanup)
+        // insert modifications (no concurrent cleanup)
         for (int i = 0; i < 10; ++i) {
             auto article = makeTestArticle(
                 "prog_cat", userId,
                 "Prog_" + std::to_string(i),
                 i * 10);
-            sync(TestArticleListRepo::create(article));
+            sync(TestArticleListRepo::insert(article));
         }
 
         auto initial_count = TestInternals::pendingModificationCount<TestArticleListRepo>();
@@ -792,13 +792,13 @@ TEST_CASE("Concurrency - progressive tracker reduction",
         TestInternals::resetListCacheState<TestArticleListRepo>();
         auto userId = insertTestUser("conc_prog2_author", "conc_prog2@test.com", 0);
 
-        // Create modifications
+        // insert modifications
         for (int i = 0; i < 10; ++i) {
             auto article = makeTestArticle(
                 "prog2_cat", userId,
                 "Prog2_" + std::to_string(i),
                 i * 10);
-            sync(TestArticleListRepo::create(article));
+            sync(TestArticleListRepo::insert(article));
         }
 
         auto count_before = TestInternals::pendingModificationCount<TestArticleListRepo>();

@@ -11,7 +11,7 @@
  *
  * SECTION naming convention:
  *   [find]     — read by primary key
- *   [create]       — insert new entity
+ *   [insert]       — insert new entity
  *   [update]       — modify existing entity
  *   [remove]       — delete entity
  *   [edge]         — edge cases (nulls, special chars, boundaries)
@@ -69,11 +69,11 @@ TEST_CASE("BaseRepo<TestItem> - find", "[integration][db][base][item]") {
     }
 }
 
-TEST_CASE("BaseRepo<TestItem> - create", "[integration][db][base][item]") {
+TEST_CASE("BaseRepo<TestItem> - insert", "[integration][db][base][item]") {
     TransactionGuard tx;
 
-    SECTION("[create] inserts entity and returns with generated id") {
-        auto result = sync(UncachedTestItemRepo::create(
+    SECTION("[insert] inserts entity and returns with generated id") {
+        auto result = sync(UncachedTestItemRepo::insert(
             makeTestItem("Created Item", 100, "Created via repository", true)));
 
         REQUIRE(result != nullptr);
@@ -84,8 +84,8 @@ TEST_CASE("BaseRepo<TestItem> - create", "[integration][db][base][item]") {
         REQUIRE(result->value == 100);
     }
 
-    SECTION("[create] entity is retrievable after insert") {
-        auto created = sync(UncachedTestItemRepo::create(
+    SECTION("[insert] entity is retrievable after insert") {
+        auto created = sync(UncachedTestItemRepo::insert(
             makeTestItem("Persistent", 50, "", true)));
         REQUIRE(created != nullptr);
 
@@ -96,8 +96,8 @@ TEST_CASE("BaseRepo<TestItem> - create", "[integration][db][base][item]") {
         REQUIRE(fetched->is_active);
     }
 
-    SECTION("[create] with null optional field") {
-        auto result = sync(UncachedTestItemRepo::create(
+    SECTION("[insert] with null optional field") {
+        auto result = sync(UncachedTestItemRepo::insert(
             makeTestItem("No Description", 0, "", true)));
         REQUIRE(result != nullptr);
 
@@ -186,7 +186,7 @@ TEST_CASE("BaseRepo<TestItem> - edge cases", "[integration][db][base][item][edge
 
     SECTION("[edge] special characters in string fields") {
         std::string specialName = "Test 'quotes\" and <special> chars & more";
-        auto result = sync(UncachedTestItemRepo::create(
+        auto result = sync(UncachedTestItemRepo::insert(
             makeTestItem(specialName, 0, "", true)));
         REQUIRE(result != nullptr);
 
@@ -197,7 +197,7 @@ TEST_CASE("BaseRepo<TestItem> - edge cases", "[integration][db][base][item][edge
 
     SECTION("[edge] maximum length name (100 chars)") {
         std::string longName(100, 'X');
-        auto result = sync(UncachedTestItemRepo::create(
+        auto result = sync(UncachedTestItemRepo::insert(
             makeTestItem(longName, 0, "", true)));
         REQUIRE(result != nullptr);
 
@@ -207,7 +207,7 @@ TEST_CASE("BaseRepo<TestItem> - edge cases", "[integration][db][base][item][edge
     }
 
     SECTION("[edge] negative numeric value") {
-        auto result = sync(UncachedTestItemRepo::create(
+        auto result = sync(UncachedTestItemRepo::insert(
             makeTestItem("Negative", -12345, "", true)));
         REQUIRE(result != nullptr);
 
@@ -217,7 +217,7 @@ TEST_CASE("BaseRepo<TestItem> - edge cases", "[integration][db][base][item][edge
     }
 
     SECTION("[edge] zero numeric value") {
-        auto result = sync(UncachedTestItemRepo::create(
+        auto result = sync(UncachedTestItemRepo::insert(
             makeTestItem("Zero", 0, "", true)));
         REQUIRE(result != nullptr);
 
@@ -227,7 +227,7 @@ TEST_CASE("BaseRepo<TestItem> - edge cases", "[integration][db][base][item][edge
     }
 
     SECTION("[edge] boolean false is preserved") {
-        auto result = sync(UncachedTestItemRepo::create(
+        auto result = sync(UncachedTestItemRepo::insert(
             makeTestItem("Inactive", 0, "", false)));
         REQUIRE(result != nullptr);
 
@@ -296,11 +296,11 @@ TEST_CASE("BaseRepo<TestUser> - find", "[integration][db][base][user]") {
     }
 }
 
-TEST_CASE("BaseRepo<TestUser> - create", "[integration][db][base][user]") {
+TEST_CASE("BaseRepo<TestUser> - insert", "[integration][db][base][user]") {
     TransactionGuard tx;
 
-    SECTION("[create] inserts user and returns with generated id") {
-        auto result = sync(UncachedTestUserRepo::create(
+    SECTION("[insert] inserts user and returns with generated id") {
+        auto result = sync(UncachedTestUserRepo::insert(
             makeTestUser("bob", "bob@example.com", 500)));
 
         REQUIRE(result != nullptr);
@@ -310,8 +310,8 @@ TEST_CASE("BaseRepo<TestUser> - create", "[integration][db][base][user]") {
         REQUIRE(result->balance == 500);
     }
 
-    SECTION("[create] user is retrievable after insert") {
-        auto created = sync(UncachedTestUserRepo::create(
+    SECTION("[insert] user is retrievable after insert") {
+        auto created = sync(UncachedTestUserRepo::insert(
             makeTestUser("carol", "carol@example.com", 0)));
         REQUIRE(created != nullptr);
 
@@ -386,13 +386,13 @@ TEST_CASE("BaseRepo<TestPurchase> - find", "[integration][db][base][purchase]") 
     }
 }
 
-TEST_CASE("BaseRepo<TestPurchase> - create", "[integration][db][base][purchase]") {
+TEST_CASE("BaseRepo<TestPurchase> - insert", "[integration][db][base][purchase]") {
     TransactionGuard tx;
 
-    SECTION("[create] inserts purchase with valid FK") {
+    SECTION("[insert] inserts purchase with valid FK") {
         auto userId = insertTestUser("buyer", "buyer@example.com", 500);
 
-        auto result = sync(UncachedTestPurchaseRepo::create(
+        auto result = sync(UncachedTestPurchaseRepo::insert(
             makeTestPurchase(userId, "Gadget", 250, "pending")));
 
         REQUIRE(result != nullptr);
@@ -403,10 +403,10 @@ TEST_CASE("BaseRepo<TestPurchase> - create", "[integration][db][base][purchase]"
         REQUIRE(result->status == "pending");
     }
 
-    SECTION("[create] purchase is retrievable after insert") {
+    SECTION("[insert] purchase is retrievable after insert") {
         auto userId = insertTestUser("buyer2", "buyer2@example.com", 100);
 
-        auto created = sync(UncachedTestPurchaseRepo::create(
+        auto created = sync(UncachedTestPurchaseRepo::insert(
             makeTestPurchase(userId, "Doohickey", 75, "pending")));
         REQUIRE(created != nullptr);
 
@@ -635,13 +635,13 @@ TEST_CASE("BaseRepo<TestArticle> - find", "[integration][db][base][article]") {
     }
 }
 
-TEST_CASE("BaseRepo<TestArticle> - create", "[integration][db][base][article]") {
+TEST_CASE("BaseRepo<TestArticle> - insert", "[integration][db][base][article]") {
     TransactionGuard tx;
 
-    SECTION("[create] inserts article and returns with generated id") {
+    SECTION("[insert] inserts article and returns with generated id") {
         auto userId = insertTestUser("author", "author@example.com", 0);
 
-        auto result = sync(UncachedTestArticleRepo::create(
+        auto result = sync(UncachedTestArticleRepo::insert(
             makeTestArticle("science", userId, "Created Article", 0, false)));
 
         REQUIRE(result != nullptr);
@@ -652,10 +652,10 @@ TEST_CASE("BaseRepo<TestArticle> - create", "[integration][db][base][article]") 
         REQUIRE(result->is_published == false);
     }
 
-    SECTION("[create] article is retrievable after insert") {
+    SECTION("[insert] article is retrievable after insert") {
         auto userId = insertTestUser("author", "author@example.com", 0);
 
-        auto created = sync(UncachedTestArticleRepo::create(
+        auto created = sync(UncachedTestArticleRepo::insert(
             makeTestArticle("tech", userId, "Persistent Article", 5, true)));
         REQUIRE(created != nullptr);
 
@@ -753,7 +753,7 @@ TEST_CASE("BaseRepo<TestArticle> - edge cases", "[integration][db][base][article
     SECTION("[edge] boolean false (is_published) is preserved") {
         auto userId = insertTestUser("author", "author@example.com", 0);
 
-        auto result = sync(UncachedTestArticleRepo::create(
+        auto result = sync(UncachedTestArticleRepo::insert(
             makeTestArticle("tech", userId, "Unpublished", 0, false)));
         REQUIRE(result != nullptr);
 
@@ -849,7 +849,7 @@ TEST_CASE("BaseRepo - read-only configuration", "[integration][db][base][readonl
         REQUIRE(result->value == 2);
     }
 
-    // Note: create(), update(), remove() are compile-time errors on read-only repos.
+    // Note: insert(), update(), remove() are compile-time errors on read-only repos.
     // They use `requires (!Cfg.read_only)` and will not compile if called.
     // This is verified by the static_assert above.
 }

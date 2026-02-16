@@ -24,7 +24,7 @@ namespace jcailloux::relais::cache::list {
 // =============================================================================
 
 enum class PaginationMode : uint8_t {
-    Offset = 0,  // Traditional offset+limit (cascade invalidation for create/delete)
+    Offset = 0,  // Traditional offset+limit (cascade invalidation for insert/delete)
     Cursor = 1   // Keyset/cursor-based (localized invalidation)
 };
 
@@ -153,7 +153,7 @@ struct ListBoundsHeader {
         return h;
     }
 
-    /// Check if a create or delete of an entity with this sort value affects this page.
+    /// Check if a insert or delete of an entity with this sort value affects this page.
     ///
     /// - Offset mode (cascade): the segment is affected if entity_val is within or above
     ///   its range, because inserting/deleting shifts all subsequent segments.
@@ -558,7 +558,7 @@ private:
             }
         }
 
-        // Check new_entity if present (for create/update)
+        // Check new_entity if present (for insert/update)
         if (mod.new_entity && Traits::matchesFilters(*mod.new_entity, filters)) {
             if (isEntityInPageRange(*mod.new_entity, query, result, bounds, sort)) {
                 return true;

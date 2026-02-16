@@ -184,7 +184,7 @@ protected:
 // Helper macros for common patterns (optional)
 // =============================================================================
 
-/// Convenience macro for notifying creation in a repository create() method
+/// Convenience macro for notifying creation in a repository insert() method
 #define LISTCACHE_NOTIFY_CREATED(entity_ptr) \
     ListMixin::notifyCreated((entity_ptr))
 

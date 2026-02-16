@@ -16,7 +16,7 @@ concept HasListMixin = requires { typename T::ListDescriptorType; };
  * Optional mixin layer for cross-repository cache invalidation.
  *
  * Activated when the Repo has variadic Invalidations... (non-empty).
- * Sits at the top of the mixin chain and intercepts create/update/remove
+ * Sits at the top of the mixin chain and intercepts insert/update/remove
  * to propagate invalidations to dependent caches.
  *
  * Chain: InvalidationMixin -> [ListMixin] -> CachedRepo -> [RedisRepo] -> BaseRepo
@@ -41,11 +41,11 @@ public:
     // Expose Invalidates type for external detection
     using Invalidates = InvList;
 
-    /// Create entity and propagate cross-invalidation to dependent caches.
-    static io::Task<WrapperPtrType> create(WrapperPtrType wrapper)
+    /// insert entity and propagate cross-invalidation to dependent caches.
+    static io::Task<WrapperPtrType> insert(WrapperPtrType wrapper)
         requires MutableEntity<Entity> && (!Base::config.read_only)
     {
-        auto result = co_await Base::create(std::move(wrapper));
+        auto result = co_await Base::insert(std::move(wrapper));
         if (result) {
             co_await cache::propagateCreate<Entity, InvList>(result);
         }

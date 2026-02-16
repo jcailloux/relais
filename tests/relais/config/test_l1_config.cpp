@@ -423,7 +423,7 @@ TEST_CASE("L1 Config - update_strategy",
 
         // Populate via create
         auto entity = makeTestItem("pop_created", 30);
-        auto created = sync(PopImmediateRepo::create(entity));
+        auto created = sync(PopImmediateRepo::insert(entity));
 
         // Direct DB modification not visible
         updateTestItem(created->id, "invisible", 0);

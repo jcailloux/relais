@@ -22,7 +22,7 @@
  *
  * SECTION naming convention:
  *   [find]      — read by primary key with caching
- *   [create]        — insert with L2 cache population
+ *   [insert]        — insert with L2 cache population
  *   [update]        — modify with L2 invalidation/population
  *   [remove]        — delete with L2 invalidation
  *   [updateBy]      — partial field update
@@ -420,11 +420,11 @@ TEST_CASE("RedisRepo<TestItem> - find", "[integration][db][redis][item]") {
     }
 }
 
-TEST_CASE("RedisRepo<TestItem> - create", "[integration][db][redis][item]") {
+TEST_CASE("RedisRepo<TestItem> - insert", "[integration][db][redis][item]") {
     TransactionGuard tx;
 
-    SECTION("[create] inserts entity and populates Redis cache") {
-        auto created = sync(L2TestItemRepo::create(makeTestItem("Created L2", 200)));
+    SECTION("[insert] inserts entity and populates Redis cache") {
+        auto created = sync(L2TestItemRepo::insert(makeTestItem("Created L2", 200)));
         REQUIRE(created != nullptr);
         REQUIRE(created->id > 0);
 
@@ -687,7 +687,7 @@ TEST_CASE("RedisRepo - read-only", "[integration][db][redis][readonly]") {
         REQUIRE(result == nullptr);
     }
 
-    // Note: create(), update(), remove() are compile-time errors on read-only repos.
+    // Note: insert(), update(), remove() are compile-time errors on read-only repos.
     // They use `requires (!Cfg.read_only)` and will not compile if called.
 }
 
@@ -700,7 +700,7 @@ TEST_CASE("RedisRepo - read-only", "[integration][db][redis][readonly]") {
 TEST_CASE("RedisRepo - cross-invalidation Purchase → User", "[integration][db][redis][cross-inv]") {
     TransactionGuard tx;
 
-    SECTION("[cross-inv] create purchase invalidates user Redis cache") {
+    SECTION("[cross-inv] insert purchase invalidates user Redis cache") {
         auto userId = insertTestUser("inv_user", "inv@test.com", 1000);
 
         // Cache user in Redis
@@ -715,8 +715,8 @@ TEST_CASE("RedisRepo - cross-invalidation Purchase → User", "[integration][db]
         auto user2 = sync(L2InvTestUserRepo::find(userId));
         REQUIRE(user2->balance == 1000);
 
-        // Create purchase through invalidating repo
-        auto created = sync(L2TestPurchaseRepo::create(makeTestPurchase(userId, "Widget", 100, "pending")));
+        // insert purchase through invalidating repo
+        auto created = sync(L2TestPurchaseRepo::insert(makeTestPurchase(userId, "Widget", 100, "pending")));
         REQUIRE(created != nullptr);
 
         // User cache should be invalidated — next read gets fresh data
@@ -816,8 +816,8 @@ TEST_CASE("RedisRepo - custom cross-invalidation via resolver", "[integration][d
         REQUIRE(sync(L2InvTestUserRepo::find(userId))->balance == 1000);
         REQUIRE(sync(L2InvTestArticleRepo::find(articleId))->title == "My Article");
 
-        // Create purchase — triggers standard + custom invalidation
-        sync(L2CustomTestPurchaseRepo::create(makeTestPurchase(userId, "Trigger", 50, "pending")));
+        // insert purchase — triggers standard + custom invalidation
+        sync(L2CustomTestPurchaseRepo::insert(makeTestPurchase(userId, "Trigger", 50, "pending")));
 
         // User cache invalidated (standard Invalidate<>)
         auto user2 = sync(L2InvTestUserRepo::find(userId));
@@ -837,7 +837,7 @@ TEST_CASE("RedisRepo - custom cross-invalidation via resolver", "[integration][d
         sync(L2InvTestUserRepo::find(userId));
 
         // Should not throw — resolver returns empty vector
-        auto created = sync(L2CustomTestPurchaseRepo::create(makeTestPurchase(userId, "Safe Trigger", 10, "pending")));
+        auto created = sync(L2CustomTestPurchaseRepo::insert(makeTestPurchase(userId, "Safe Trigger", 10, "pending")));
         REQUIRE(created != nullptr);
     }
 
@@ -857,8 +857,8 @@ TEST_CASE("RedisRepo - custom cross-invalidation via resolver", "[integration][d
         updateTestArticle(a2, "New News 1", 200);
         updateTestArticle(a3, "New Tech 2", 300);
 
-        // Create purchase — invalidates all 3 articles via resolver
-        sync(L2CustomTestPurchaseRepo::create(makeTestPurchase(userId, "Big Trigger", 999, "completed")));
+        // insert purchase — invalidates all 3 articles via resolver
+        sync(L2CustomTestPurchaseRepo::insert(makeTestPurchase(userId, "Big Trigger", 999, "completed")));
 
         // All articles should now return fresh data
         REQUIRE(sync(L2InvTestArticleRepo::find(a1))->title == "New Tech 1");
@@ -890,8 +890,8 @@ TEST_CASE("RedisRepo - read-only as cross-invalidation target", "[integration][d
         // Still cached (read-only, no writes to trigger invalidation)
         REQUIRE(sync(ReadOnlyL2TestUserRepo::find(userId))->balance == 1000);
 
-        // Create purchase via repo that targets the read-only user cache
-        sync(L2ReadOnlyInvPurchaseRepo::create(makeTestPurchase(userId, "RO Trigger", 50, "pending")));
+        // insert purchase via repo that targets the read-only user cache
+        sync(L2ReadOnlyInvPurchaseRepo::insert(makeTestPurchase(userId, "RO Trigger", 50, "pending")));
 
         // Read-only user cache should be invalidated — fresh data
         auto user2 = sync(ReadOnlyL2TestUserRepo::find(userId));
@@ -1079,8 +1079,8 @@ TEST_CASE("RedisRepo - list cross-invalidation", "[integration][db][redis][list-
         auto list2 = sync(L2TestPurchaseListRepo::getByUserId(userId));
         REQUIRE(list2.size() == 1);
 
-        // Create purchase through the list-invalidating repo
-        sync(L2ListInvPurchaseRepo::create(makeTestPurchase(userId, "Via Repo", 200, "pending")));
+        // insert purchase through the list-invalidating repo
+        sync(L2ListInvPurchaseRepo::insert(makeTestPurchase(userId, "Via Repo", 200, "pending")));
 
         // List cache invalidated — fresh fetch returns all 3 purchases
         auto list3 = sync(L2TestPurchaseListRepo::getByUserId(userId));
@@ -1131,9 +1131,9 @@ TEST_CASE("RedisRepo - list custom cross-invalidation", "[integration][db][redis
         auto list2 = sync(L2TestArticleListRepo::getByCategory("tech"));
         REQUIRE(list2.size() == 2);
 
-        // Create purchase — triggers custom resolver:
+        // insert purchase — triggers custom resolver:
         //   user_id → distinct categories ("tech") → invalidate article list
-        sync(L2CustomListPurchaseRepo::create(makeTestPurchase(userId, "List Custom Trigger", 50, "pending")));
+        sync(L2CustomListPurchaseRepo::insert(makeTestPurchase(userId, "List Custom Trigger", 50, "pending")));
 
         // Article list cache for "tech" should be invalidated
         auto list3 = sync(L2TestArticleListRepo::getByCategory("tech"));
@@ -1154,8 +1154,8 @@ TEST_CASE("RedisRepo - list custom cross-invalidation", "[integration][db][redis
         // Insert directly in DB
         insertTestArticle("news", otherUserId, "News 2", 30, true);
 
-        // Create purchase for userId (author of "tech", not "news")
-        sync(L2CustomListPurchaseRepo::create(makeTestPurchase(userId, "Selective Trigger", 10, "pending")));
+        // insert purchase for userId (author of "tech", not "news")
+        sync(L2CustomListPurchaseRepo::insert(makeTestPurchase(userId, "Selective Trigger", 10, "pending")));
 
         // "tech" list invalidated (userId is author of tech articles)
         // "news" list NOT invalidated (userId has no news articles)
@@ -1254,9 +1254,9 @@ TEST_CASE("RedisRepo - tracked list pagination + group invalidation",
         insertTestArticle("tech", aliceId, "Tech New", 45, true);
         insertTestArticle("news", bobId, "News New", 100, true);
 
-        // Create purchase for Alice → resolver → ["tech", "science"]
+        // insert purchase for Alice → resolver → ["tech", "science"]
         // → invalidates "tech" and "science" tracked groups
-        sync(L2TrackedListPurchaseRepo::create(makeTestPurchase(aliceId, "Tracked Trigger", 100, "pending")));
+        sync(L2TrackedListPurchaseRepo::insert(makeTestPurchase(aliceId, "Tracked Trigger", 100, "pending")));
 
         // tech page 1: invalidated → re-fetch → 5 articles (fresh data)
         auto techP1Fresh = sync(L2TrackedArticleListRepo::getByCategory("tech", 5, 0));
@@ -1298,8 +1298,8 @@ TEST_CASE("RedisRepo - tracked list pagination + group invalidation",
         insertTestArticle("science", aliceId, "Science Extra", 999, true);
         insertTestArticle("news", bobId, "News Extra", 999, true);
 
-        // Create purchase for Alice → resolver → ["tech", "science"]
-        sync(L2TrackedListPurchaseRepo::create(makeTestPurchase(aliceId, "Multi Trigger", 50, "pending")));
+        // insert purchase for Alice → resolver → ["tech", "science"]
+        sync(L2TrackedListPurchaseRepo::insert(makeTestPurchase(aliceId, "Multi Trigger", 50, "pending")));
 
         // tech: invalidated → 4 (was 3)
         REQUIRE(sync(L2TrackedArticleListRepo::getByCategory("tech")).size() == 4);
@@ -1326,8 +1326,8 @@ TEST_CASE("RedisRepo - tracked list pagination + group invalidation",
         // Insert tech article directly in DB
         insertTestArticle("tech", aliceId, "Tech Extra", 99, true);
 
-        // Create purchase for nemo (no articles) → resolver → []
-        sync(L2TrackedListPurchaseRepo::create(makeTestPurchase(noArticlesId, "Empty Resolver Trigger", 10, "pending")));
+        // insert purchase for nemo (no articles) → resolver → []
+        sync(L2TrackedListPurchaseRepo::insert(makeTestPurchase(noArticlesId, "Empty Resolver Trigger", 10, "pending")));
 
         // tech: preserved → still 3 (resolver returned nothing)
         REQUIRE(sync(L2TrackedArticleListRepo::getByCategory("tech")).size() == 3);
@@ -1535,7 +1535,7 @@ public:
         co_return co_await invalidateListGroup("category", category);
     }
 
-    // Selective invalidation for create/delete
+    // Selective invalidation for insert/delete
     static io::Task<size_t> invalidateCategoryListSelective(
         const std::string& category, int64_t entity_sort_val)
     {
@@ -1579,12 +1579,12 @@ TEST_CASE("RedisRepo - selective list invalidation with SortBounds",
 
     auto aliceId = insertTestUser("alice_sel", "alice_sel@test.com", 0);
 
-    // Create 15 "tech" articles with view_count 10, 20, ..., 150
+    // insert 15 "tech" articles with view_count 10, 20, ..., 150
     for (int vc = 10; vc <= 150; vc += 10) {
         insertTestArticle("tech", aliceId, "tech_" + std::to_string(vc), vc, true);
     }
 
-    SECTION("[selective] create cascade only from affected segment") {
+    SECTION("[selective] insert cascade only from affected segment") {
         // Cache 3 pages (limit=5, offset 0/5/10):
         //   Page 0: [150, 140, 130, 120, 110] → bounds(150, 110) complete
         //   Page 1: [100, 90, 80, 70, 60]     → bounds(100, 60)  complete
@@ -1599,7 +1599,7 @@ TEST_CASE("RedisRepo - selective list invalidation with SortBounds",
         // Verify tracking set has 3 members
         REQUIRE(sync(redisSCard(selectiveTrackingKey("tech"))) == 3);
 
-        // Selective invalidation: create entity with view_count=85
+        // Selective invalidation: insert entity with view_count=85
         // Offset mode, DESC: cascade = entity_val >= last_value
         //   Page 0: 85 >= 110? NO  → PRESERVED
         //   Page 1: 85 >= 60?  YES → DELETED
@@ -1723,7 +1723,7 @@ TEST_CASE("RedisRepo - selective list invalidation with SortBounds",
     }
 
     SECTION("[selective] different groups independent") {
-        // Create 3 "news" articles
+        // insert 3 "news" articles
         for (int vc = 100; vc <= 300; vc += 100) {
             insertTestArticle("news", aliceId, "news_" + std::to_string(vc), vc, true);
         }
@@ -1832,7 +1832,7 @@ TEST_CASE("RedisRepo - InvalidateListVia enriched resolver",
         CHECK(sync(redisExists(selectivePageKey("tech", 5, 5))) == 1);
         CHECK(sync(redisExists(selectivePageKey("tech", 5, 10))) == 1);
 
-        // Create a purchase for Alice — triggers InvalidateListVia
+        // insert a purchase for Alice — triggers InvalidateListVia
         // Resolver finds Alice's articles: view_count 10 and 20
         // Cascade check (DESC):
         //   10 >= 110? NO  → page 0 preserved
@@ -1841,7 +1841,7 @@ TEST_CASE("RedisRepo - InvalidateListVia enriched resolver",
         //   20 >= 110? NO  → page 0 still preserved
         //   20 >= 60?  NO  → page 1 still preserved
         //   20 >= 10?  YES → page 2 already invalidated
-        auto result = sync(L2SelectiveListPurchaseRepo::create(makeTestPurchase(aliceId, "Widget", 100, "completed")));
+        auto result = sync(L2SelectiveListPurchaseRepo::insert(makeTestPurchase(aliceId, "Widget", 100, "completed")));
         REQUIRE(result != nullptr);
 
         // Page 0 (bounds 150, 110): PRESERVED (10, 20 < 110)
@@ -1864,11 +1864,11 @@ TEST_CASE("RedisRepo - InvalidateListVia enriched resolver",
         sync(L2SelectiveArticleListRepo::getByCategory("tech", 5, 10));
         sync(L2SelectiveArticleListRepo::getByCategory("news", 5, 0));
 
-        // Create a purchase for Alice
+        // insert a purchase for Alice
         // Resolver returns targets for BOTH tech and news:
         //   tech targets: sort_value 10, 20 → cascade hits only page 2
         //   news targets: sort_value 100, 200, 300 → cascade hits page 0
-        auto result = sync(L2SelectiveListPurchaseRepo::create(makeTestPurchase(aliceId, "Gadget", 200, "completed")));
+        auto result = sync(L2SelectiveListPurchaseRepo::insert(makeTestPurchase(aliceId, "Gadget", 200, "completed")));
         REQUIRE(result != nullptr);
 
         // Tech page 0 (bounds 150, 110): PRESERVED
@@ -1894,9 +1894,9 @@ TEST_CASE("RedisRepo - InvalidateListVia enriched resolver",
         sync(L2SelectiveArticleListRepo::getByCategory("tech", 5, 5));
         sync(L2SelectiveArticleListRepo::getByCategory("tech", 5, 10));
 
-        // Create a purchase for Charlie — resolver finds science articles only
+        // insert a purchase for Charlie — resolver finds science articles only
         // Science group key is different from tech → tech pages untouched
-        auto result = sync(L2SelectiveListPurchaseRepo::create(makeTestPurchase(charlieId, "Book", 50, "completed")));
+        auto result = sync(L2SelectiveListPurchaseRepo::insert(makeTestPurchase(charlieId, "Book", 50, "completed")));
         REQUIRE(result != nullptr);
 
         // All tech pages preserved (Charlie has no tech articles)
@@ -1911,12 +1911,12 @@ TEST_CASE("RedisRepo - InvalidateListVia enriched resolver",
         sync(L2SelectiveArticleListRepo::getByCategory("tech", 5, 5));
         sync(L2SelectiveArticleListRepo::getByCategory("tech", 5, 10));
 
-        // Create a purchase for Alice, then delete it
-        auto created = sync(L2SelectiveListPurchaseRepo::create(makeTestPurchase(aliceId, "Temp", 50, "pending")));
+        // insert a purchase for Alice, then delete it
+        auto created = sync(L2SelectiveListPurchaseRepo::insert(makeTestPurchase(aliceId, "Temp", 50, "pending")));
         REQUIRE(created != nullptr);
         auto purchaseId = created->getPrimaryKey();
 
-        // Pages were partially invalidated by create — re-cache
+        // Pages were partially invalidated by insert — re-cache
         sync(L2SelectiveArticleListRepo::getByCategory("tech", 5, 0));
         sync(L2SelectiveArticleListRepo::getByCategory("tech", 5, 5));
         sync(L2SelectiveArticleListRepo::getByCategory("tech", 5, 10));
@@ -2034,12 +2034,12 @@ TEST_CASE("RedisRepo - InvalidateListVia per-group invalidation",
 
     auto aliceId = insertTestUser("alice_pergroup", "alice_pergroup@test.com", 1000);
 
-    // Create 15 "tech" articles (view_count 10..150)
+    // insert 15 "tech" articles (view_count 10..150)
     for (int vc = 10; vc <= 150; vc += 10) {
         insertTestArticle("tech", aliceId, "tech_pg_" + std::to_string(vc), vc, true);
     }
 
-    // Create 3 "news" articles
+    // insert 3 "news" articles
     for (int vc = 100; vc <= 300; vc += 100) {
         insertTestArticle("news", aliceId, "news_pg_" + std::to_string(vc), vc, true);
     }
@@ -2057,9 +2057,9 @@ TEST_CASE("RedisRepo - InvalidateListVia per-group invalidation",
         CHECK(sync(redisExists(selectivePageKey("tech", 5, 10))) == 1);
         CHECK(sync(redisExists(selectivePageKey("news", 5, 0))) == 1);
 
-        // Create purchase → PerGroupResolver returns targets for "tech" and "news"
+        // insert purchase → PerGroupResolver returns targets for "tech" and "news"
         // without sort_value → all pages in those groups are invalidated
-        auto result = sync(L2PerGroupPurchaseRepo::create(makeTestPurchase(aliceId, "PerGroupTest", 100, "completed")));
+        auto result = sync(L2PerGroupPurchaseRepo::insert(makeTestPurchase(aliceId, "PerGroupTest", 100, "completed")));
         REQUIRE(result != nullptr);
 
         // All tech pages deleted (per-group)
@@ -2080,8 +2080,8 @@ TEST_CASE("RedisRepo - InvalidateListVia per-group invalidation",
         sync(L2SelectiveArticleListRepo::getByCategory("tech", 5, 0));
         sync(L2SelectiveArticleListRepo::getByCategory("science", 5, 0));
 
-        // Create purchase for Bob → PerGroupResolver returns only "science"
-        auto result = sync(L2PerGroupPurchaseRepo::create(makeTestPurchase(bobId, "SciTest", 50, "completed")));
+        // insert purchase for Bob → PerGroupResolver returns only "science"
+        auto result = sync(L2PerGroupPurchaseRepo::insert(makeTestPurchase(bobId, "SciTest", 50, "completed")));
         REQUIRE(result != nullptr);
 
         // Tech preserved (Bob has no tech articles)
@@ -2098,7 +2098,7 @@ TEST_CASE("RedisRepo - InvalidateListVia full pattern invalidation",
 
     auto aliceId = insertTestUser("alice_fullpat", "alice_fullpat@test.com", 0);
 
-    // Create articles in two categories
+    // insert articles in two categories
     for (int vc = 10; vc <= 50; vc += 10) {
         insertTestArticle("tech", aliceId, "tech_fp_" + std::to_string(vc), vc, true);
     }
@@ -2116,9 +2116,9 @@ TEST_CASE("RedisRepo - InvalidateListVia full pattern invalidation",
         CHECK(sync(redisExists(selectiveTrackingKey("tech"))) == 1);
         CHECK(sync(redisExists(selectiveTrackingKey("news"))) == 1);
 
-        // Create purchase → FullPatternResolver returns nullopt
+        // insert purchase → FullPatternResolver returns nullopt
         // → invalidateAllListGroups() → SCAN "test:article:selective:list:l2:list:*"
-        auto result = sync(L2FullPatternPurchaseRepo::create(makeTestPurchase(aliceId, "FullPatternTest", 100, "completed")));
+        auto result = sync(L2FullPatternPurchaseRepo::insert(makeTestPurchase(aliceId, "FullPatternTest", 100, "completed")));
         REQUIRE(result != nullptr);
 
         // All pages AND tracking sets deleted
@@ -2166,7 +2166,7 @@ TEST_CASE("RedisRepo - InvalidateListVia mixed granularity",
         CHECK(sync(redisExists(selectivePageKey("tech", 5, 10))) == 1);
         CHECK(sync(redisExists(selectivePageKey("news", 5, 0))) == 1);
 
-        // Create purchase → MixedResolver returns:
+        // insert purchase → MixedResolver returns:
         //   tech targets (per-page): sort_value=10, sort_value=20
         //     → 10 >= 110? NO  → page 0 preserved
         //     → 10 >= 60?  NO  → page 1 preserved
@@ -2174,7 +2174,7 @@ TEST_CASE("RedisRepo - InvalidateListVia mixed granularity",
         //     → 20 same cascade pattern
         //   news target (per-group): no sort_value
         //     → all news pages deleted
-        auto result = sync(L2MixedPurchaseRepo::create(makeTestPurchase(aliceId, "MixedTest", 100, "completed")));
+        auto result = sync(L2MixedPurchaseRepo::insert(makeTestPurchase(aliceId, "MixedTest", 100, "completed")));
         REQUIRE(result != nullptr);
 
         // Tech page 0 (bounds 150, 110): PRESERVED (per-page, 10,20 < 110)

@@ -33,7 +33,7 @@ namespace jcailloux::relais {
  *
  * Provides:
  * - query()           : paginated list queries with L1 caching + lazy invalidation
- * - CRUD interception : automatically notifies list cache on create/update/remove
+ * - CRUD interception : automatically notifies list cache on insert/update/remove
  * - warmup()          : primes both entity and list L1 caches
  *
  * Uses the existing ListCache (shardmap-based) for storage and ModificationTracker
@@ -234,11 +234,11 @@ public:
     // CRUD interception — notifies list cache on entity changes
     // =========================================================================
 
-    /// Create entity and notify list cache.
-    static io::Task<WrapperPtrType> create(WrapperPtrType wrapper)
+    /// insert entity and notify list cache.
+    static io::Task<WrapperPtrType> insert(WrapperPtrType wrapper)
         requires MutableEntity<Entity> && (!Base::config.read_only)
     {
-        auto result = co_await Base::create(std::move(wrapper));
+        auto result = co_await Base::insert(std::move(wrapper));
         if (result) {
             listCache().onEntityCreated(result);
         }

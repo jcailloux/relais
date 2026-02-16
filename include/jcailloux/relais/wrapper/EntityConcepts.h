@@ -25,8 +25,8 @@ namespace jcailloux::relais {
 //
 //   ReadableEntity    = Readable               (BaseRepo)
 //   CacheableEntity   = Readable + Serializable (RedisRepo, CachedRepo)
-//   MutableEntity     = Readable + Writable     (create/update methods)
-//   CreatableEntity   = Mutable  + Keyed        (create with cache population)
+//   MutableEntity     = Readable + Writable     (insert/update methods)
+//   CreatableEntity   = Mutable  + Keyed        (insert with cache population)
 // =============================================================================
 
 // -----------------------------------------------------------------------------
@@ -68,11 +68,11 @@ concept ReadableEntity = Readable<W>;
 template<typename W>
 concept CacheableEntity = ReadableEntity<W> && Serializable<W>;
 
-/// Required for create() / update() methods (read + DB write)
+/// Required for insert() / update() methods (read + DB write)
 template<typename W>
 concept MutableEntity = ReadableEntity<W> && Writable<W>;
 
-/// Required for create() with cache population (read + DB write + primary key)
+/// Required for insert() with cache population (read + DB write + primary key)
 template<typename W, typename Key = int64_t>
 concept CreatableEntity = MutableEntity<W> && Keyed<W, Key>;
 

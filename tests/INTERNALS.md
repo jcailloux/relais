@@ -241,7 +241,7 @@ Comprehensive integration tests for the L2 (Redis) cache layer, organized in 17 
 | Section | Tag | Content |
 |---------|-----|---------|
 | 1 | `[item]` | `find` — cache hit, miss, multi-entity |
-| 2 | `[item]` | `create` — insert + populate Redis |
+| 2 | `[item]` | `insert` — insert + populate Redis |
 | 3 | `[item]` | `update` — invalidate Redis (lazy reload) |
 | 4 | `[item]` | `remove` — invalidate Redis |
 | 5 | `[flatbuffer]` | Binary (BEVE) serialization in Redis |
@@ -249,7 +249,7 @@ Comprehensive integration tests for the L2 (Redis) cache layer, organized in 17 
 | 7 | `[json]` | `findAsJson` raw JSON retrieval |
 | 8 | `[invalidate]` | Explicit `invalidateRedis` + isolation |
 | 9 | `[readonly]` | Read-only repository caching |
-| 10 | `[cross-inv]` | `Invalidate<>` entity→entity (create, update, delete, FK change) |
+| 10 | `[cross-inv]` | `Invalidate<>` entity→entity (insert, update, delete, FK change) |
 | 11 | `[custom-inv]` | `InvalidateVia<>` with custom resolver |
 | 12 | `[readonly-inv]` | Cross-invalidation targeting read-only caches |
 | 13 | `[list]` + `[fb-list]` | List caching — JSON and BEVE binary |
@@ -268,7 +268,7 @@ Integration tests for the declarative L1 list cache system:
 | 2 | `[itemview]` | Article `ItemView` accessors on cached results |
 | 3 | `[query]` | Purchase list — user_id/status filters |
 | 4 | `[itemview]` | Purchase `ItemView` accessors |
-| 5 | `[sortbounds]` | SortBounds invalidation precision (create, update, delete, filter mismatch) |
+| 5 | `[sortbounds]` | SortBounds invalidation precision (insert, update, delete, filter mismatch) |
 | 6 | `[tracker-cleanup]` | `ModificationTracker` cleanup cycles |
 
 ## Cross-Invalidation Patterns
@@ -408,19 +408,19 @@ CachedRepo::remove(id)
 
 ### Test Coverage
 
-| Section | Content |
-|---------|---------|
-| 1 | CRUD: find, create, update, remove (Uncached) |
-| 2 | L1 caching: cache hit, staleness, invalidation |
-| 3 | L2 caching: Redis hit, staleness, invalidation |
-| 4 | Cross-invalidation: Event as source (→ User L1) |
-| 5 | Cross-invalidation: Event as target (Purchase → Event via resolver) |
-| 6 | PartialKeyValidator runtime checks |
-| 7 | Serialization: JSON + BEVE round-trip |
+| Section | Content                                                                 |
+|---------|-------------------------------------------------------------------------|
+| 1 | CRUD: find, insert, update, remove (Uncached)                           |
+| 2 | L1 caching: cache hit, staleness, invalidation                          |
+| 3 | L2 caching: Redis hit, staleness, invalidation                          |
+| 4 | Cross-invalidation: Event as source (→ User L1)                         |
+| 5 | Cross-invalidation: Event as target (Purchase → Event via resolver)     |
+| 6 | PartialKeyValidator runtime checks                                      |
+| 7 | Serialization: JSON + BEVE round-trip                                   |
 | 8a | updateBy Uncached: single/multi field, partition preservation, re-fetch |
-| 8b | updateBy L1: cache invalidation + re-fetch |
-| 8c | updateBy L2: Redis invalidation + re-fetch |
-| 8d | updateBy cross-invalidation: Event updateBy → User L1 |
-| 9a | remove L1 hint: cache hit vs miss paths |
-| 9b | remove L2 hint: Redis hit vs miss paths |
-| 9c | remove L1+L2 chain: L1 hit, L1 miss/L2 hit, both miss |
+| 8b | updateBy L1: cache invalidation + re-fetch                              |
+| 8c | updateBy L2: Redis invalidation + re-fetch                              |
+| 8d | updateBy cross-invalidation: Event updateBy → User L1                   |
+| 9a | remove L1 hint: cache hit vs miss paths                                 |
+| 9b | remove L2 hint: Redis hit vs miss paths                                 |
+| 9c | remove L1+L2 chain: L1 hit, L1 miss/L2 hit, both miss                   |
