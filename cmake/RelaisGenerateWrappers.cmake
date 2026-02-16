@@ -19,7 +19,12 @@ Usage::
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
-set(_RELAIS_GENERATE_SCRIPT "${CMAKE_CURRENT_LIST_DIR}/../scripts/generate_entities.py")
+# Resolve script path: works both in-tree/FetchContent and after install
+if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/../scripts/generate_entities.py")
+    set(_RELAIS_GENERATE_SCRIPT "${CMAKE_CURRENT_LIST_DIR}/../scripts/generate_entities.py")
+else()
+    set(_RELAIS_GENERATE_SCRIPT "${CMAKE_CURRENT_LIST_DIR}/scripts/generate_entities.py")
+endif()
 
 function(relais_generate_wrappers)
     cmake_parse_arguments(ARG "" "OUTPUT_DIR" "SOURCES" ${ARGN})
