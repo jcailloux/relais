@@ -98,7 +98,7 @@ class RedisRepo : public BaseRepo<Entity, Name, Cfg, Key> {
             bool success = co_await Base::update(id, wrapper);
             if (success) {
                 if constexpr (Cfg.update_strategy == InvalidateAndLazyReload) {
-                    co_await invalidateRedis(id);
+                    co_await evictRedis(id);
                 } else {
                     co_await setInCache(makeRedisKey(id), *wrapper);
                 }
@@ -112,7 +112,7 @@ class RedisRepo : public BaseRepo<Entity, Name, Cfg, Key> {
         static io::Task<WrapperPtrType> patch(const Key& id, Updates&&... updates)
             requires HasFieldUpdate<Entity> && (!Cfg.read_only)
         {
-            co_await invalidateRedis(id);
+            co_await evictRedis(id);
             co_return co_await Base::patch(id, std::forward<Updates>(updates)...);
         }
 
@@ -145,7 +145,7 @@ class RedisRepo : public BaseRepo<Entity, Name, Cfg, Key> {
 
             auto result = co_await Base::eraseImpl(id, std::move(cachedHint));
             if (result.has_value()) {
-                co_await invalidateRedis(id);
+                co_await evictRedis(id);
             }
             co_return result;
         }
@@ -155,11 +155,11 @@ class RedisRepo : public BaseRepo<Entity, Name, Cfg, Key> {
         /// Invalidate Redis cache for a key and return void.
         /// Used as cross-invalidation target interface.
         static io::Task<void> invalidate(const Key& id) {
-            co_await invalidateRedis(id);
+            co_await evictRedis(id);
         }
 
         /// Invalidate Redis cache for a key.
-        static io::Task<bool> invalidateRedis(const Key& id) {
+        static io::Task<bool> evictRedis(const Key& id) {
             co_return co_await cache::RedisCache::invalidate(makeRedisKey(id));
         }
 

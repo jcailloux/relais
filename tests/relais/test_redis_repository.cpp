@@ -8,7 +8,7 @@
  *   1. TestItem    — basic CRUD with L2 JSON caching
  *   2. TestUser  — BEVE binary caching, patch
  *   3. JSON access — findJson raw string path
- *   4. Invalidation— explicit invalidateRedis control
+ *   4. Invalidation— explicit evictRedis control
  *   5. Read-only   — compile-time write enforcement at L2
  *   6. Cross-inv   — Purchase → User (lazy, standard Invalidate<>)
  *   7. Custom inv   — InvalidateVia with async resolver
@@ -598,14 +598,14 @@ TEST_CASE("RedisRepo - findJson", "[integration][db][redis][json]") {
 
 // #############################################################################
 //
-//  4. Explicit invalidation — invalidateRedis
+//  4. Explicit invalidation — evictRedis
 //
 // #############################################################################
 
 TEST_CASE("RedisRepo - explicit invalidation", "[integration][db][redis][invalidate]") {
     TransactionGuard tx;
 
-    SECTION("[invalidate] invalidateRedis clears cached entry") {
+    SECTION("[invalidate] evictRedis clears cached entry") {
         auto id = insertTestItem("To Invalidate L2", 50);
 
         // Populate cache
@@ -620,7 +620,7 @@ TEST_CASE("RedisRepo - explicit invalidation", "[integration][db][redis][invalid
         REQUIRE(cached->name == "To Invalidate L2");
 
         // Invalidate
-        sync(L2TestItemRepo::invalidateRedis(id));
+        sync(L2TestItemRepo::evictRedis(id));
 
         // Now should fetch from DB
         auto fresh = sync(L2TestItemRepo::find(id));
@@ -642,7 +642,7 @@ TEST_CASE("RedisRepo - explicit invalidation", "[integration][db][redis][invalid
         updateTestItem(id2, "DB Invalidate", 22);
 
         // Invalidate only id2
-        sync(L2TestItemRepo::invalidateRedis(id2));
+        sync(L2TestItemRepo::evictRedis(id2));
 
         // id1 still cached, id2 fresh
         auto r1 = sync(L2TestItemRepo::find(id1));

@@ -293,7 +293,7 @@ CachedRepo::erase(id)
     v
 RedisRepo::erase(id)
     |-- co_await BaseRepo::erase(id)  -> deleteByPrimaryKey(id)
-    |-- co_await invalidateRedisInternal(id)
+    |-- co_await evictRedisInternal(id)
 ```
 
 For partition key repositories, `erase` uses an **opportunistic hint** pattern — cache layers pass any already-available entity to the base layer to enable full PK deletion (partition pruning):
@@ -986,7 +986,7 @@ CachedRepo::patch(id, set<F>(v)...)
     |
     v
 RedisRepo::patch(id, set<F>(v)...)
-    |-- co_await invalidateRedisInternal(id)
+    |-- co_await evictRedisInternal(id)
     |
     v
 BaseRepo::patch(id, set<F>(v)...)

@@ -222,7 +222,7 @@ public:
     static io::Task<void> invalidate(const Key& id) {
         evict(id);
         if constexpr (HasRedis) {
-            co_await Base::invalidateRedis(id);
+            co_await Base::evictRedis(id);
         }
     }
 
