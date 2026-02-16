@@ -246,7 +246,7 @@ Comprehensive integration tests for the L2 (Redis) cache layer, organized in 17 
 | 4 | `[item]`                               | `erase` — invalidate Redis |
 | 5 | `[binary]`                             | Binary (BEVE) serialization in Redis |
 | 6 | `[patch]`                           | Partial field updates with Redis invalidation |
-| 7 | `[json]`                               | `findAsJson` raw JSON retrieval |
+| 7 | `[json]`                               | `findJson` raw JSON retrieval |
 | 8 | `[invalidate]`                         | Explicit `invalidateRedis` + isolation |
 | 9 | `[readonly]`                           | Read-only repository caching |
 | 10 | `[cross-inv]`                          | `Invalidate<>` entity→entity (insert, update, delete, FK change) |

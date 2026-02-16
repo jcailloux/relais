@@ -130,13 +130,13 @@ public:
 
     /// Find by ID and return raw JSON string.
     /// Returns shared_ptr to JSON string (nullptr if not found).
-    static io::Task<std::shared_ptr<const std::string>> findAsJson(const Key& id) {
+    static io::Task<std::shared_ptr<const std::string>> findJson(const Key& id) {
         if (auto cached = getFromCache(id)) {
             co_return cached->json();
         }
 
         if constexpr (HasRedis) {
-            auto json = co_await Base::findAsJson(id);
+            auto json = co_await Base::findJson(id);
             if (json) {
                 if (auto entity = Entity::fromJson(*json)) {
                     putInCache(id, std::make_shared<const Entity>(std::move(*entity)));

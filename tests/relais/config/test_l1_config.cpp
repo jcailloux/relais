@@ -596,10 +596,10 @@ TEST_CASE("L1 Config - read_only",
         REQUIRE(cached->name == "ro_item");
     }
 
-    SECTION("[readonly] findAsJson works") {
+    SECTION("[readonly] findJson works") {
         auto id = insertTestItem("ro_json_item", 10);
 
-        auto json = sync(ReadOnlyCfgRepo::findAsJson(id));
+        auto json = sync(ReadOnlyCfgRepo::findJson(id));
         REQUIRE(json != nullptr);
         REQUIRE(json->find("\"ro_json_item\"") != std::string::npos);
     }

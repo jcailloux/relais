@@ -164,7 +164,7 @@ See `test_partition_key.cpp` sections 7a-7d for coverage at all cache levels + c
 | `[item]`             | Entity CRUD with Redis caching |
 | `[binary]`           | Binary (BEVE) serialization in Redis |
 | `[patch]`         | Partial field updates with Redis invalidation |
-| `[json]`             | `findAsJson` raw JSON retrieval |
+| `[json]`             | `findJson` raw JSON retrieval |
 | `[invalidate]`       | Explicit `invalidateRedis` operations |
 | `[readonly]`         | Read-only repository caching |
 | `[cross-inv]`        | `Invalidate<>` entity→entity cross-invalidation |

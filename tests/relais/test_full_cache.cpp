@@ -12,7 +12,7 @@
  *   5. Binary entity at L1+L2
  *   6. Cross-invalidation at L1+L2
  *   7. Hierarchy verification (short-circuit behavior)
- *   8. findAsJson at L1+L2
+ *   8. findJson at L1+L2
  */
 
 #include <catch2/catch_test_macros.hpp>
@@ -504,11 +504,11 @@ TEST_CASE("FullCache - hierarchy verification",
 
 // #############################################################################
 //
-//  8. findAsJson at L1+L2
+//  8. findJson at L1+L2
 //
 // #############################################################################
 
-TEST_CASE("FullCache - findAsJson at L1+L2",
+TEST_CASE("FullCache - findJson at L1+L2",
           "[integration][db][full-cache][json]")
 {
     TransactionGuard tx;
@@ -516,12 +516,12 @@ TEST_CASE("FullCache - findAsJson at L1+L2",
     SECTION("[json] returns cached JSON from L1") {
         auto id = insertTestItem("json_item", 42);
 
-        auto json1 = sync(FullCacheTestItemRepo::findAsJson(id));
+        auto json1 = sync(FullCacheTestItemRepo::findJson(id));
         REQUIRE(json1 != nullptr);
         REQUIRE(json1->find("\"json_item\"") != std::string::npos);
 
         // Second call returns same cached pointer
-        auto json2 = sync(FullCacheTestItemRepo::findAsJson(id));
+        auto json2 = sync(FullCacheTestItemRepo::findJson(id));
         REQUIRE(json2 != nullptr);
         REQUIRE(*json1 == *json2);
     }
@@ -530,13 +530,13 @@ TEST_CASE("FullCache - findAsJson at L1+L2",
         auto id = insertTestItem("json_l2_item", 99);
 
         // Populate L1+L2
-        sync(FullCacheTestItemRepo::findAsJson(id));
+        sync(FullCacheTestItemRepo::findJson(id));
 
         // Clear L1
         FullCacheTestItemRepo::invalidateL1(id);
 
         // Should fall back to L2
-        auto json = sync(FullCacheTestItemRepo::findAsJson(id));
+        auto json = sync(FullCacheTestItemRepo::findJson(id));
         REQUIRE(json != nullptr);
         REQUIRE(json->find("\"json_l2_item\"") != std::string::npos);
     }

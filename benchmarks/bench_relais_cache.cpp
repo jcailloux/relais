@@ -13,7 +13,7 @@
  *   BENCH_DURATION_S=5 ./bench_relais_cache "[throughput]"  # custom duration
  *
  * Covers:
- *   1. L1 cache hit latency (find, findAsJson)
+ *   1. L1 cache hit latency (find, findJson)
  *   2. L2 cache hit latency
  *   3. L1+L2 cache hit latency (L1 serves, L2 fallback)
  *   4. Cache miss latency (DB fetch)
@@ -55,8 +55,8 @@ TEST_CASE("Benchmark - L1 cache hit", "[benchmark][l1]")
         co_await L1TestItemRepo::find(id);
     })));
 
-    results.push_back(sync(benchAsync("findAsJson", [&]() -> io::Task<void> {
-        co_await L1TestItemRepo::findAsJson(id);
+    results.push_back(sync(benchAsync("findJson", [&]() -> io::Task<void> {
+        co_await L1TestItemRepo::findJson(id);
     })));
 
     WARN(formatTable("L1 cache hit", results));
@@ -81,8 +81,8 @@ TEST_CASE("Benchmark - L2 cache hit", "[benchmark][l2]")
         co_await L2TestItemRepo::find(id);
     })));
 
-    results.push_back(sync(benchAsync("findAsJson", [&]() -> io::Task<void> {
-        co_await L2TestItemRepo::findAsJson(id);
+    results.push_back(sync(benchAsync("findJson", [&]() -> io::Task<void> {
+        co_await L2TestItemRepo::findJson(id);
     })));
 
     WARN(formatTable("L2 cache hit (Redis)", results));
@@ -274,7 +274,7 @@ TEST_CASE("Benchmark - L1 raw throughput", "[benchmark][throughput][raw]")
         WARN(formatDurationThroughput("L1 raw (distributed)", THREADS, result));
     }
 
-    SECTION("L1 raw — findAsJson distributed") {
+    SECTION("L1 raw — findJson distributed") {
         auto result = measureDuration(THREADS, [&](int tid, std::atomic<bool>& running) -> int64_t {
             int64_t ops = 0;
             while (running.load(std::memory_order_relaxed)) {
@@ -285,7 +285,7 @@ TEST_CASE("Benchmark - L1 raw throughput", "[benchmark][throughput][raw]")
             }
             return ops;
         });
-        WARN(formatDurationThroughput("L1 raw findAsJson (distributed)", THREADS, result));
+        WARN(formatDurationThroughput("L1 raw findJson (distributed)", THREADS, result));
     }
 
     SECTION("L1 raw — mixed read/write distributed (75R/25W)") {

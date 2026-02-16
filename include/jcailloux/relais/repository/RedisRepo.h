@@ -52,7 +52,7 @@ class RedisRepo : public BaseRepo<Entity, Name, Cfg, Key> {
 
         /// Find by ID and return raw JSON string.
         /// Returns shared_ptr to JSON string (nullptr if not found).
-        static io::Task<std::shared_ptr<const std::string>> findAsJson(const Key& id) {
+        static io::Task<std::shared_ptr<const std::string>> findJson(const Key& id) {
             auto redisKey = makeRedisKey(id);
 
             std::optional<std::string> cached;

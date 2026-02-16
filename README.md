@@ -130,7 +130,7 @@ using PurchaseRepo = relais::Repo<
 
 **Inherited methods:**
 - `find(id)` — `Task<WrapperPtr>` (cached)
-- `findAsJson(id)` — `Task<shared_ptr<const string>>`
+- `findJson(id)` — `Task<shared_ptr<const string>>`
 - `insert(wrapper)` — `Task<WrapperPtr>` (requires `!read_only`)
 - `update(id, wrapper)` — `Task<bool>` (requires `!read_only`)
 - `patch(id, set<F>(v)...)` — `Task<WrapperPtr>` (requires `HasFieldUpdate`)
@@ -685,7 +685,7 @@ python scripts/generate_entities.py --files src/entities/User.h --output-dir src
 | Method | Return Type | Constraint | Description |
 |--------|-------------|------------|-------------|
 | `find(id)` | `Task<WrapperPtr>` | - | Find by primary key (cached) |
-| `findAsJson(id)` | `Task<shared_ptr<const string>>` | - | Find and return JSON directly |
+| `findJson(id)` | `Task<shared_ptr<const string>>` | - | Find and return JSON directly |
 | `insert(wrapper)` | `Task<WrapperPtr>` | `!read_only` | Insert and cache |
 | `update(id, wrapper)` | `Task<bool>` | `!read_only` | Full update and handle cache |
 | `patch(id, set<F>()...)` | `Task<WrapperPtr>` | `!read_only`, `HasFieldUpdate` | Partial update, re-fetches entity |

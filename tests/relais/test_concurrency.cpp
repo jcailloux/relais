@@ -423,8 +423,8 @@ TEST_CASE("Concurrency - mixed operations storm",
                         sync(FullCacheTestItemRepo::find(id));
                         break;
 
-                    case 2:  // findAsJson
-                        sync(FullCacheTestItemRepo::findAsJson(id));
+                    case 2:  // findJson
+                        sync(FullCacheTestItemRepo::findJson(id));
                         break;
 
                     case 3:  // update

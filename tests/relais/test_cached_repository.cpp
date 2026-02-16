@@ -13,7 +13,7 @@
  *   6. ListVia     — InvalidateListVia<> with GroupKey (3 granularities)
  *   7. Binary      — binary entity CRUD with L1 caching
  *   8. patch    — partial field updates with L1 invalidation
- *   9. JSON        — findAsJson with L1 caching
+ *   9. JSON        — findJson with L1 caching
  *  10. ReadOnly    — read-only repository at L1
  *  11. RO+Inv      — read-only as cross-invalidation target at L1
  *
@@ -35,7 +35,7 @@
  *   [list-granularity] — per-page, per-group, full pattern dispatch
  *   [binary]    — binary entity caching
  *   [patch]      — partial field updates
- *   [json]          — findAsJson raw JSON retrieval
+ *   [json]          — findJson raw JSON retrieval
  *   [readonly]      — read-only repository
  *   [readonly-inv]  — read-only as cross-invalidation target
  */
@@ -1094,11 +1094,11 @@ TEST_CASE("CachedRepo<TestUser> - patch",
 
 // #############################################################################
 //
-//  9. findAsJson — raw JSON retrieval with L1 caching
+//  9. findJson — raw JSON retrieval with L1 caching
 //
 // #############################################################################
 
-TEST_CASE("CachedRepo - findAsJson",
+TEST_CASE("CachedRepo - findJson",
           "[integration][db][cached][json]")
 {
     TransactionGuard tx;
@@ -1108,14 +1108,14 @@ TEST_CASE("CachedRepo - findAsJson",
     SECTION("[json] returns JSON string from L1 cache") {
         auto id = insertTestUser("json_user", "json@example.com", 42);
 
-        auto result = sync(L1TestUserRepo::findAsJson(id));
+        auto result = sync(L1TestUserRepo::findJson(id));
 
         REQUIRE(result != nullptr);
         REQUIRE(result->find("json_user") != std::string::npos);
     }
 
     SECTION("[json] returns nullptr for non-existent id") {
-        auto result = sync(L1TestUserRepo::findAsJson(999999999));
+        auto result = sync(L1TestUserRepo::findJson(999999999));
 
         REQUIRE(result == nullptr);
     }
@@ -1124,14 +1124,14 @@ TEST_CASE("CachedRepo - findAsJson",
         auto id = insertTestUser("cache_json", "cj@example.com", 10);
 
         // First call — DB fetch, cache entity in L1
-        auto result1 = sync(L1TestUserRepo::findAsJson(id));
+        auto result1 = sync(L1TestUserRepo::findJson(id));
         REQUIRE(result1 != nullptr);
 
         // Modify DB directly
         updateTestUserBalance(id, 999);
 
         // Second call — L1 cached entity converted to JSON
-        auto result2 = sync(L1TestUserRepo::findAsJson(id));
+        auto result2 = sync(L1TestUserRepo::findJson(id));
         REQUIRE(result2 != nullptr);
         REQUIRE(result2->find("cache_json") != std::string::npos);
         // Balance should still be 10 (stale from L1 cache)

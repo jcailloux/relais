@@ -7,7 +7,7 @@
  * Progressive complexity:
  *   1. TestItem    — basic CRUD with L2 JSON caching
  *   2. TestUser  — BEVE binary caching, patch
- *   3. JSON access — findAsJson raw string path
+ *   3. JSON access — findJson raw string path
  *   4. Invalidation— explicit invalidateRedis control
  *   5. Read-only   — compile-time write enforcement at L2
  *   6. Cross-inv   — Purchase → User (lazy, standard Invalidate<>)
@@ -557,24 +557,24 @@ TEST_CASE("RedisRepo<TestUser> - patch", "[integration][db][redis][patch]") {
 
 // #############################################################################
 //
-//  3. findAsJson — raw JSON string path
+//  3. findJson — raw JSON string path
 //
 // #############################################################################
 
-TEST_CASE("RedisRepo - findAsJson", "[integration][db][redis][json]") {
+TEST_CASE("RedisRepo - findJson", "[integration][db][redis][json]") {
     TransactionGuard tx;
 
     SECTION("[json] returns raw JSON string from Redis") {
         auto id = insertTestItem("JSON Item", 42, std::optional<std::string>{"desc"}, true);
 
-        auto result = sync(L2TestItemRepo::findAsJson(id));
+        auto result = sync(L2TestItemRepo::findJson(id));
 
         REQUIRE(result != nullptr);
         REQUIRE(result->find("\"JSON Item\"") != std::string::npos);
     }
 
     SECTION("[json] returns nullptr for non-existent id") {
-        auto result = sync(L2TestItemRepo::findAsJson(999999999));
+        auto result = sync(L2TestItemRepo::findJson(999999999));
 
         REQUIRE(result == nullptr);
     }
@@ -583,14 +583,14 @@ TEST_CASE("RedisRepo - findAsJson", "[integration][db][redis][json]") {
         auto id = insertTestItem("Cache JSON", 10);
 
         // First call — DB fetch, cache as JSON
-        auto result1 = sync(L2TestItemRepo::findAsJson(id));
+        auto result1 = sync(L2TestItemRepo::findJson(id));
         REQUIRE(result1 != nullptr);
 
         // Modify DB directly
         updateTestItem(id, "Modified", 999);
 
         // Second call — cached JSON
-        auto result2 = sync(L2TestItemRepo::findAsJson(id));
+        auto result2 = sync(L2TestItemRepo::findJson(id));
         REQUIRE(result2 != nullptr);
         REQUIRE(result2->find("\"Cache JSON\"") != std::string::npos);
     }
