@@ -11,6 +11,9 @@ target_include_directories(jcailloux-relais INTERFACE
 
 target_compile_features(jcailloux-relais INTERFACE cxx_std_23)
 
+# CMake modules (available to consumers via FetchContent)
+list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
+
 # =============================================================================
 # Dependencies
 # =============================================================================
@@ -58,6 +61,15 @@ if(RELAIS_BUILD_TESTS)
     list(APPEND CMAKE_MODULE_PATH ${catch2_SOURCE_DIR}/extras)
     include(CTest)
     include(Catch)
+
+    # -------------------------------------------------------------------------
+    # Entity wrapper generation
+    # -------------------------------------------------------------------------
+    include(RelaisGenerateWrappers)
+    relais_generate_wrappers(
+        SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/
+        OUTPUT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/generated/
+    )
 
     # -------------------------------------------------------------------------
     # Helper function: one-liner per test instead of 10 lines

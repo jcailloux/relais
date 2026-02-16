@@ -57,7 +57,7 @@ jobs:
           done
 
       - name: Generate test fixtures
-        run: python3 scripts/generate_entities.py --scan tests/fixtures/ --output-dir tests/
+        run: python3 scripts/generate_entities.py --sources tests/fixtures/ --output-dir tests/fixtures/generated/
 
       - name: Configure
         run: >

@@ -7,7 +7,6 @@
 namespace relais_test {
 
 // @relais table=relais_test_articles
-// @relais output=fixtures/generated/TestArticleWrapper.h
 // @relais_list limits=10,25,50
 struct TestArticle {
     int64_t id = 0; // @relais primary_key db_managed sortable:desc
