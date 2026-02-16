@@ -308,7 +308,7 @@ public:
     ResultPtr get(const Query& query) {
         // Trigger cleanup every N gets
         if (++get_counter_ % config_.cleanup_every_n_gets == 0) {
-            triggerCleanup();
+            trySweep();
         }
 
         auto key = query.hash();
@@ -402,7 +402,7 @@ public:
 
     /// Try to trigger a cleanup (non-blocking)
     /// Returns true if cleanup was performed, false if another cleanup is in progress
-    bool triggerCleanup() {
+    bool trySweep() {
         // Snapshot time BEFORE shard cleanup so that modifications added
         // during cleanup are not counted (they weren't fully considered).
         const auto now = Clock::now();
@@ -449,7 +449,7 @@ public:
     }
 
     /// Full cleanup (blocking) - processes all shards
-    size_t fullCleanup() {
+    size_t purge() {
         const auto now = Clock::now();
 
         CleanupContext ctx{

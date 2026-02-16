@@ -227,9 +227,9 @@ Tests for `warmup()` priming cache infrastructure including L1 entity cache and 
 | `[storm]` | Mixed operations storm (all operations interleaved) |
 | `[patch]` | Concurrent `patch` on same entity |
 | `[cleanup]` | Concurrent entity cache cleanup + reads/writes |
-| `[list-cleanup]` | Concurrent list CRUD + unified `triggerCleanup`/`fullCleanup` |
-| `[tracker-drain]` | `fullCleanup()` drains tracker to zero after concurrent storm |
-| `[tracker-progressive]` | Progressive tracker reduction via `triggerCleanup()` |
+| `[list-cleanup]` | Concurrent list CRUD + unified `trySweep`/`purge` |
+| `[tracker-drain]` | `purge()` drains tracker to zero after concurrent storm |
+| `[tracker-progressive]` | Progressive tracker reduction via `trySweep()` |
 
 ### `config/test_l1_config` and `config/test_l2_config` (Configuration)
 

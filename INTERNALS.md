@@ -239,7 +239,7 @@ struct CleanupContext {
     Clock::time_point now;
 };
 
-static bool triggerCleanup() {
+static bool trySweep() {
     CleanupContext ctx{Clock::now()};
     return cache().try_cleanup(ctx, [](const Key&, const EntityPtr&,
                                         const EntityCacheMetadata& meta,
@@ -593,7 +593,7 @@ Cache entries are validated lazily when retrieved:
 ```cpp
 ResultPtr get(const Query& query) {
     if (++get_counter_ % config_.cleanup_every_n_gets == 0) {
-        triggerCleanup();
+        trySweep();
     }
 
     return cache_.get(query.hash(), [this, &query](const ResultPtr& result, Metadata& meta) {

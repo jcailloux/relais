@@ -105,8 +105,8 @@ TEST_CASE("CachedRepo features", "[repository][compile][cached]") {
         REQUIRE(size == 0);  // empty at start
     }
 
-    SECTION("triggerCleanup") {
-        auto result = L1TestItemRepo::triggerCleanup();
+    SECTION("trySweep") {
+        auto result = L1TestItemRepo::trySweep();
         // Just verify it compiles and returns bool
         (void)result;
     }

@@ -167,7 +167,7 @@ TEST_CASE("L1 Config - l1_ttl",
         REQUIRE(getCacheSize<TTL50msRepo>() > 0);
 
         waitForExpiration(std::chrono::milliseconds{80});
-        forceFullCleanup<TTL50msRepo>();
+        forcePurge<TTL50msRepo>();
 
         // Cache should be empty after cleanup
         REQUIRE(getCacheSize<TTL50msRepo>() == 0);
@@ -197,7 +197,7 @@ TEST_CASE("L1 Config - l1_ttl",
         updateTestItem(id, "ttl_refetched", 99);
 
         waitForExpiration(std::chrono::milliseconds{80});
-        forceFullCleanup<TTL50msRepo>();
+        forcePurge<TTL50msRepo>();
 
         // accept_expired=false, so expired entry is rejected → DB fetch
         auto item = sync(TTL50msRepo::find(id));
@@ -250,7 +250,7 @@ TEST_CASE("L1 Config - l1_refresh_on_get",
 
         // Wait another 300ms (600ms total, past 500ms TTL → 100ms margin)
         waitForExpiration(std::chrono::milliseconds{300});
-        forceFullCleanup<RefreshFalseRepo>();
+        forcePurge<RefreshFalseRepo>();
 
         // Update DB
         updateTestItem(id, "refreshed_from_db", 99);
@@ -316,7 +316,7 @@ TEST_CASE("L1 Config - l1_accept_expired_on_get",
         REQUIRE(stale->name == "cleanup_exp_item");
 
         // Full cleanup removes expired entries
-        forceFullCleanup<AcceptExpTrueRepo>();
+        forcePurge<AcceptExpTrueRepo>();
 
         updateTestItem(id, "post_cleanup", 99);
 
@@ -348,7 +348,7 @@ TEST_CASE("L1 Config - l1_shard_count_log2",
         REQUIRE(getCacheSize<Seg2Repo>() == 2);
 
         // Trigger partial cleanup (1 of 2 shards)
-        triggerCleanup<Seg2Repo>();
+        trySweep<Seg2Repo>();
 
         // After one shard cleanup, 0-2 items may remain depending on distribution
         auto size = getCacheSize<Seg2Repo>();

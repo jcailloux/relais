@@ -522,7 +522,7 @@ TEST_CASE("CachedRepo - AcceptExpired config",
         CHECK(stale->name == "Accept Expired");  // Stale, but accepted
 
         // Cleanup evicts expired entries
-        forceFullCleanup<AcceptExpiredTestItemRepo>();
+        forcePurge<AcceptExpiredTestItemRepo>();
 
         auto fresh = sync(AcceptExpiredTestItemRepo::find(id));
         REQUIRE(fresh != nullptr);
@@ -551,7 +551,7 @@ TEST_CASE("CachedRepo - NoRefresh config",
         updateTestItem(id, "Refreshed", 99);
 
         // Entry expired; cleanup evicts it
-        forceFullCleanup<NoRefreshTestItemRepo>();
+        forcePurge<NoRefreshTestItemRepo>();
 
         auto fresh = sync(NoRefreshTestItemRepo::find(id));
         REQUIRE(fresh != nullptr);
@@ -602,17 +602,17 @@ TEST_CASE("CachedRepo - FewShards config",
         CHECK(sizeBefore >= 3);
 
         // Full cleanup: non-expired entries are NOT erased
-        auto erased = FewShardsTestItemRepo::fullCleanup();
+        auto erased = FewShardsTestItemRepo::purge();
         CHECK(erased == 0);
         CHECK(getCacheSize<FewShardsTestItemRepo>() == sizeBefore);
     }
 
-    SECTION("[cleanup] triggerCleanup processes one shard at a time") {
+    SECTION("[cleanup] trySweep processes one shard at a time") {
         auto id = insertTestItem("Trigger", 1);
         sync(FewShardsTestItemRepo::find(id));
 
-        // triggerCleanup should return true (cleanup performed)
-        auto cleaned = FewShardsTestItemRepo::triggerCleanup();
+        // trySweep should return true (cleanup performed)
+        auto cleaned = FewShardsTestItemRepo::trySweep();
         CHECK(cleaned);
 
         // Non-expired entry survives

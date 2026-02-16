@@ -54,9 +54,39 @@ public:
 
         // Prime the modification tracker
         lc.onEntityCreated(nullptr);
-        lc.fullCleanup();
+        lc.purge();
 
         RELAIS_LOG_DEBUG << Derived::name() << ": warmupListCache() complete";
+    }
+
+    // =========================================================================
+    // Cache management
+    // =========================================================================
+
+    /// Invalidate a specific query
+    static void invalidateQuery(const ListQuery& query) {
+        listCache().invalidate(query);
+    }
+
+    ///try to sweep one list cache shard (non-blocking).
+    /// Returns true if a shard was swept, false if already in progress.
+    static bool trySweepList() {
+        return listCache().trySweep();
+    }
+
+    /// Sweep one list cache shard (waits if another sweep is in progress).
+    static bool sweepList() {
+        return listCache().trySweep();
+    }
+
+    /// Sweep all list cache shards sequentially.
+    static size_t purgeList() {
+        return listCache().purge();
+    }
+
+    /// Get cache size
+    static size_t listCacheSize() {
+        return listCache().size();
     }
 
 protected:
@@ -153,30 +183,6 @@ protected:
     /// Notify cache of entity deletion
     static void notifyDeleted(EntityPtr entity) {
         listCache().onEntityDeleted(std::move(entity));
-    }
-
-    // =========================================================================
-    // Cache management
-    // =========================================================================
-
-    /// Invalidate a specific query
-    static void invalidateQuery(const ListQuery& query) {
-        listCache().invalidate(query);
-    }
-
-    /// Try to trigger cleanup (non-blocking)
-    static bool triggerListCacheCleanup() {
-        return listCache().triggerCleanup();
-    }
-
-    /// Full cleanup (blocking)
-    static size_t fullListCacheCleanup() {
-        return listCache().fullCleanup();
-    }
-
-    /// Get cache size
-    static size_t listCacheSize() {
-        return listCache().size();
     }
 };
 

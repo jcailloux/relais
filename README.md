@@ -698,8 +698,8 @@ python scripts/generate_entities.py --files src/entities/User.h --output-dir src
 
 | Method | Description |
 |--------|-------------|
-| `triggerCleanup()` | Try to cleanup expired entries (non-blocking) |
-| `fullCleanup()` | Force cleanup of all expired entries |
+| `trySweep()` | Try to cleanup expired entries (non-blocking) |
+| `purge()` | Force cleanup of all expired entries |
 | `cacheSize()` | Current L1 cache entry count |
 | `warmup()` | Prime cache structures at startup |
 
@@ -709,8 +709,8 @@ python scripts/generate_entities.py --files src/entities/User.h --output-dir src
 |--------|-------------|
 | `query(ListQuery)` | Execute paginated list query (L1 cached) |
 | `listCacheSize()` | Current list cache entry count |
-| `triggerCleanup()` | Cleanup entity + list L1 caches (non-blocking) |
-| `fullCleanup()` | Full cleanup entity + list L1 caches (blocking) |
+| `trySweep()` | Cleanup entity + list L1 caches (non-blocking) |
+| `purge()` | Full cleanup entity + list L1 caches (blocking) |
 | `warmup()` | Primes both entity and list caches |
 | `ListDescriptorType` | Type alias for `parseListQueryStrict<>()` |
 

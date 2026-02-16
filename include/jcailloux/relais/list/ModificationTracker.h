@@ -183,7 +183,7 @@ public:
     ///   forEachModificationWithBitmap reads via atomic_ref too.
     /// - Phase 2 (unique_lock): erase expired entries via swap-with-last.
     ///   Only taken when there are actual removals.
-    void cleanup(TimePoint cutoff, uint8_t shard_id) {
+    void drainShard(TimePoint cutoff, uint8_t shard_id) {
         std::vector<size_t> to_erase;
         const BitmapType shard_bit = BitmapType{1} << shard_id;
 
@@ -218,7 +218,7 @@ public:
     }
 
     /// Erase all modifications with modified_at <= cutoff in one pass.
-    /// Used by fullCleanup() after processing all segments at once.
+    /// Used by purge() after processing all segments at once.
     void drain(TimePoint cutoff) {
         std::unique_lock lock(mutex_);
         std::erase_if(modifications_, [cutoff](const TrackedModification& t) {

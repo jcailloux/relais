@@ -287,16 +287,16 @@ public:
     // =========================================================================
 
     /// Trigger cleanup on both entity and list L1 caches (non-blocking).
-    static bool triggerCleanup() {
-        bool entity_cleaned = Base::triggerCleanup();
-        bool list_cleaned = listCache().triggerCleanup();
+    static bool trySweep() {
+        bool entity_cleaned = Base::trySweep();
+        bool list_cleaned = listCache().trySweep();
         return entity_cleaned || list_cleaned;
     }
 
     /// Full cleanup on both entity and list L1 caches (blocking).
-    static size_t fullCleanup() {
-        size_t entity_erased = Base::fullCleanup();
-        size_t list_erased = listCache().fullCleanup();
+    static size_t purge() {
+        size_t entity_erased = Base::purge();
+        size_t list_erased = listCache().purge();
         return entity_erased + list_erased;
     }
 

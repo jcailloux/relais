@@ -24,7 +24,7 @@
  *   9. Concurrent cleanup + operations (entity cache)
  *  10. Concurrent list CRUD + list cache cleanup
  *  11a. ModificationTracker drains after concurrent storm
- *  11b. Progressive tracker reduction via triggerCleanup
+ *  11b. Progressive tracker reduction via trySweep
  */
 
 #include <catch2/catch_test_macros.hpp>
@@ -543,7 +543,7 @@ TEST_CASE("Concurrency - cleanup during operations",
 {
     TransactionGuard tx;
 
-    SECTION("[L1] triggerCleanup while reads and writes happen") {
+    SECTION("[L1] trySweep while reads and writes happen") {
         std::vector<int64_t> ids;
         for (int i = 0; i < 20; ++i) {
             ids.push_back(insertTestItem("cleanup_" + std::to_string(i), i));
@@ -562,11 +562,11 @@ TEST_CASE("Concurrency - cleanup during operations",
 
                 if (i == 0) {
                     // One thread continuously triggers cleanup
-                    triggerCleanup<L1TestItemRepo>();
+                    trySweep<L1TestItemRepo>();
                 } else if (i == 1) {
                     // One thread does full cleanup
                     if (j % 10 == 0) {
-                        forceFullCleanup<L1TestItemRepo>();
+                        forcePurge<L1TestItemRepo>();
                     }
                 } else {
                     // Others do reads and writes
@@ -604,7 +604,7 @@ TEST_CASE("Concurrency - list CRUD + list cache cleanup",
     TransactionGuard tx;
     TestInternals::resetListCacheState<TestArticleListRepo>();
 
-    SECTION("[L1] concurrent insert/update/erase/query with triggerCleanup") {
+    SECTION("[L1] concurrent insert/update/erase/query with trySweep") {
         auto userId = insertTestUser("conc_lc_author", "conc_lc@test.com", 0);
 
         // Seed articles
@@ -621,13 +621,13 @@ TEST_CASE("Concurrency - list CRUD + list cache cleanup",
             for (int j = 0; j < OPS_PER_THREAD; ++j) {
                 if (i == 0) {
                     // Continuous cleanup (entity + list, unified)
-                    triggerCleanup<TestArticleListRepo>();
+                    trySweep<TestArticleListRepo>();
                 } else if (i == 1) {
                     // Query + periodic full cleanup
                     sync(TestArticleListRepo::query(
                         makeArticleQuery("conc_lc")));
                     if (j % 10 == 0) {
-                        forceFullCleanup<TestArticleListRepo>();
+                        forcePurge<TestArticleListRepo>();
                     }
                 } else {
                     int op = rng() % 4;
@@ -691,7 +691,7 @@ TEST_CASE("Concurrency - tracker drains after concurrent storm",
     TransactionGuard tx;
     TestInternals::resetListCacheState<TestArticleListRepo>();
 
-    SECTION("[L1] fullCleanup drains all modifications to zero") {
+    SECTION("[L1] purge drains all modifications to zero") {
         auto userId = insertTestUser("conc_drain_author", "conc_drain@test.com", 0);
 
         // Phase 1: insert modifications without concurrent cleanup (guaranteed pending)
@@ -710,7 +710,7 @@ TEST_CASE("Concurrency - tracker drains after concurrent storm",
             for (int j = 0; j < OPS_PER_THREAD / 2; ++j) {
                 if (i < 2) {
                     // Cleanup threads
-                    triggerCleanup<TestArticleListRepo>();
+                    trySweep<TestArticleListRepo>();
                 } else {
                     // insert threads
                     auto article = makeTestArticle(
@@ -733,7 +733,7 @@ TEST_CASE("Concurrency - tracker drains after concurrent storm",
         parallel(NUM_THREADS / 2, [&](int i) {
             for (int j = 0; j < OPS_PER_THREAD / 4; ++j) {
                 if (i == 0) {
-                    triggerCleanup<TestArticleListRepo>();
+                    trySweep<TestArticleListRepo>();
                 } else {
                     auto article = makeTestArticle(
                         "drain_cat", userId,
@@ -752,7 +752,7 @@ TEST_CASE("Concurrency - tracker drains after concurrent storm",
 
 // #############################################################################
 //
-//  11b. Progressive reduction via triggerCleanup
+//  11b. Progressive reduction via trySweep
 //
 // #############################################################################
 
@@ -762,7 +762,7 @@ TEST_CASE("Concurrency - progressive tracker reduction",
     TransactionGuard tx;
     TestInternals::resetListCacheState<TestArticleListRepo>();
 
-    SECTION("[L1] triggerCleanup progressively reduces modification count") {
+    SECTION("[L1] trySweep progressively reduces modification count") {
         auto userId = insertTestUser("conc_prog_author", "conc_prog@test.com", 0);
 
         // insert modifications (no concurrent cleanup)
@@ -808,7 +808,7 @@ TEST_CASE("Concurrency - progressive tracker reduction",
         parallel(NUM_THREADS, [&](int i) {
             for (int j = 0; j < OPS_PER_THREAD; ++j) {
                 if (i == 0) {
-                    triggerCleanup<TestArticleListRepo>();
+                    trySweep<TestArticleListRepo>();
                 } else {
                     sync(TestArticleListRepo::query(
                         makeArticleQuery("prog2_cat")));

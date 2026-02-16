@@ -47,14 +47,14 @@ struct TestInternals {
     /// Force a modification tracker cleanup cycle (partial, one shard).
     template<typename Repo>
     static void forceModificationTrackerCleanup() {
-        Repo::listCache().triggerCleanup();
+        Repo::listCache().trySweep();
     }
 
     /// Full cleanup of list cache only (entity cache untouched).
     /// Processes all shards + drains modification tracker.
     template<typename Repo>
     static size_t forceFullListCleanup() {
-        return Repo::listCache().fullCleanup();
+        return Repo::listCache().purge();
     }
 
     /// Call ModificationTracker::cleanup() directly with a controlled cutoff and shard identity.

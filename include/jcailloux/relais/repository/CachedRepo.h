@@ -248,9 +248,9 @@ public:
         Clock::time_point now;
     };
 
-    /// Try to trigger a cleanup (non-blocking).
-    /// Returns true if cleanup was performed, false if another cleanup is in progress.
-    static bool triggerCleanup() {
+    /// Try to sweep one shard (non-blocking).
+    /// Returns true if a shard was swept, false if already in progress.
+    static bool trySweep() {
         CleanupContext ctx{Clock::now()};
         return cache().try_cleanup(ctx, [](const Key&,
                                             const Metadata& meta,
@@ -259,8 +259,18 @@ public:
         }).has_value();
     }
 
-    /// Full cleanup (blocking) - processes all shards.
-    static size_t fullCleanup() {
+    /// Sweep one shard (waits if another sweep is in progress).
+    static bool sweep() {
+        CleanupContext ctx{Clock::now()};
+        return cache().cleanup(ctx, [](const Key&,
+                                            const Metadata& meta,
+                                            const CleanupContext& ctx) {
+            return meta.expiration() < ctx.now;
+        }).has_value();
+    }
+
+    /// Sweep all shards sequentially
+    static size_t purge() {
         CleanupContext ctx{Clock::now()};
         return cache().full_cleanup(ctx, [](const Key&,
                                              const Metadata& meta,
@@ -330,7 +340,7 @@ protected:
         if (!last_cleanup_time.compare_exchange_strong(last, now, std::memory_order_relaxed))
             return;
 
-        triggerCleanup();
+        trySweep();
     }
 
     /// Put entity in cache (wraps in shared_ptr).

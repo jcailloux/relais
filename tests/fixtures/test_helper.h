@@ -568,13 +568,13 @@ size_t getCacheSize() {
 }
 
 template<typename Repo>
-void forceFullCleanup() {
-    Repo::fullCleanup();
+void forcePurge() {
+    Repo::purge();
 }
 
 template<typename Repo>
-void triggerCleanup() {
-    Repo::triggerCleanup();
+void trySweep() {
+    Repo::trySweep();
 }
 
 } // namespace relais_test

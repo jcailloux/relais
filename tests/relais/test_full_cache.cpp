@@ -244,7 +244,7 @@ TEST_CASE("FullCache<TestItem> - L1 expiration with L2 fallback",
         waitForExpiration(std::chrono::milliseconds{200});
 
         // Ensure L1 cleanup has run
-        forceFullCleanup<ShortL1BothItemRepo>();
+        forcePurge<ShortL1BothItemRepo>();
 
         // Modify DB directly
         updateTestItem(id, "db_modified", 999);
@@ -263,7 +263,7 @@ TEST_CASE("FullCache<TestItem> - L1 expiration with L2 fallback",
 
         // Wait for L1 expiration
         waitForExpiration(std::chrono::milliseconds{200});
-        forceFullCleanup<ShortL1BothItemRepo>();
+        forcePurge<ShortL1BothItemRepo>();
 
         // Read again — should come from L2 and repopulate L1
         auto item = sync(ShortL1BothItemRepo::find(id));
