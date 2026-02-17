@@ -55,10 +55,9 @@ TestListQuery makeViewCountQuery(std::string_view category, uint16_t limit) {
     // Sort index 1 = view_count, DESC
     q.sort = jcailloux::relais::cache::list::SortSpec<size_t>{1, jcailloux::relais::cache::list::SortDirection::Desc};
 
-    // Unique hash per (category, limit, sort)
-    q.query_hash = std::hash<std::string_view>{}(category)
-                 ^ (static_cast<size_t>(limit) * 0x9e3779b9)
-                 ^ 0xDEAD;  // salt to avoid collision with other tests
+    // Canonical cache keys
+    q.group_key = decl::groupCacheKey<TestDecl>(q);
+    q.cache_key = decl::cacheKey<TestDecl>(q);
     return q;
 }
 
@@ -710,7 +709,7 @@ TEST_CASE("[DeclListRepo] Bitmap skip optimization",
 
         // 2. Read the shard_id assigned to this cache entry
         auto shard_id_opt = TestInternals::getListEntryShardId<TestArticleListRepo>(
-            q.query_hash);
+            q.cache_key);
         REQUIRE(shard_id_opt.has_value());
         uint8_t shard_id = *shard_id_opt;
 

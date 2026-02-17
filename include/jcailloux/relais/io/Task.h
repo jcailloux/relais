@@ -139,6 +139,22 @@ private:
     std::coroutine_handle<promise_type> handle_ = nullptr;
 };
 
+// DetachedTask — eager, fire-and-forget coroutine (self-destroying)
+//
+// Starts immediately on creation, self-destructs on completion.
+// Exceptions are swallowed (logged if RELAIS_LOG_ERROR is available).
+// Use for async work that doesn't need to be awaited.
+
+struct DetachedTask {
+    struct promise_type {
+        DetachedTask get_return_object() noexcept { return {}; }
+        std::suspend_never initial_suspend() noexcept { return {}; }
+        std::suspend_never final_suspend() noexcept { return {}; }
+        void return_void() noexcept {}
+        void unhandled_exception() noexcept {}
+    };
+};
+
 } // namespace jcailloux::relais::io
 
 #endif // JCX_RELAIS_IO_TASK_H

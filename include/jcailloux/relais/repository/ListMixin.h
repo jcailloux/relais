@@ -7,6 +7,7 @@
 
 #include "jcailloux/relais/DbProvider.h"
 #include "jcailloux/relais/Log.h"
+#include "jcailloux/relais/cache/RedisCache.h"
 #include "jcailloux/relais/list/ListCache.h"
 #include "jcailloux/relais/list/ListQuery.h"
 #include "jcailloux/relais/list/decl/ListDescriptor.h"
@@ -32,12 +33,12 @@ namespace jcailloux::relais {
  * Chain: [InvalidationMixin] -> ListMixin -> CachedRepo -> [RedisRepo] -> BaseRepo
  *
  * Provides:
- * - query()           : paginated list queries with L1 caching + lazy invalidation
- * - CRUD interception : automatically notifies list cache on insert/update/erase
+ * - query()           : paginated list queries with L1/L2 caching
+ * - CRUD interception : automatically invalidates list caches on insert/update/erase
  * - warmup()          : primes both entity and list L1 caches
  *
- * Uses the existing ListCache (shardmap-based) for storage and ModificationTracker
- * for lazy invalidation.
+ * L1 uses ListCache (shardmap-based) with ModificationTracker for lazy invalidation.
+ * L2 uses Redis with binary (BEVE) storage and active invalidation via Lua scripts.
  */
 template<typename Base>
 class ListMixin : public Base {
@@ -52,6 +53,18 @@ class ListMixin : public Base {
     struct Descriptor : Entity::MappingType::ListDescriptor {
         using Entity = ListMixin::Entity;
     };
+
+    // =========================================================================
+    // Cache level detection (compile-time)
+    // =========================================================================
+
+    static constexpr bool kHasL1 =
+        Base::config.cache_level == config::CacheLevel::L1
+     || Base::config.cache_level == config::CacheLevel::L1_L2;
+
+    static constexpr bool kHasL2 =
+        Base::config.cache_level == config::CacheLevel::L2
+     || Base::config.cache_level == config::CacheLevel::L1_L2;
 
     // =========================================================================
     // Type aliases from list infrastructure
@@ -169,6 +182,28 @@ class ListMixin : public Base {
         return instance;
     }
 
+    // L2 TTL helper
+    static constexpr auto l2Ttl() { return std::chrono::nanoseconds(Base::config.l2_ttl); }
+
+    // Redis key helpers for declarative list caching
+    static std::string redisPageKey(const std::string& cache_key) {
+        std::string key(Base::name());
+        key += ":dlist:p:";
+        key.append(cache_key);
+        return key;
+    }
+
+    static std::string redisGroupKey(const std::string& group_key) {
+        std::string key(Base::name());
+        key += ":dlist:g:";
+        key.append(group_key);
+        return key;
+    }
+
+    static std::string redisMasterSetKey() {
+        return std::string(Base::name()) + ":dlist_groups";
+    }
+
     // =========================================================================
     // Query types
     // =========================================================================
@@ -180,7 +215,7 @@ class ListMixin : public Base {
         cq.filters = q.filters;
         cq.limit = q.limit;
         cq.cursor = q.cursor;
-        cq.query_hash = q.query_hash;
+        cq.cache_key = q.cache_key;
         if (q.sort) {
             cq.sort = *q.sort;
         }
@@ -220,32 +255,41 @@ public:
     // Query interface
     // =========================================================================
 
-    /// Execute a paginated list query with L1 caching and lazy invalidation.
+    /// Execute a paginated list query with L1/L2 caching.
     static io::Task<ListResult> query(const ListQuery& q) {
         co_return co_await cachedListQuery(q);
     }
 
     /// Get L1 list cache size.
     [[nodiscard]] static size_t listSize() noexcept {
-        return listCache().size();
+        if constexpr (kHasL1) {
+            return listCache().size();
+        } else {
+            return 0;
+        }
     }
 
     // =========================================================================
-    // CRUD interception — notifies list cache on entity changes
+    // CRUD interception — invalidates list caches on entity changes
     // =========================================================================
 
-    /// insert entity and notify list cache.
+    /// insert entity and invalidate list caches.
     static io::Task<WrapperPtrType> insert(WrapperPtrType wrapper)
         requires MutableEntity<Entity> && (!Base::config.read_only)
     {
         auto result = co_await Base::insert(std::move(wrapper));
         if (result) {
-            listCache().onEntityCreated(result);
+            if constexpr (kHasL1) {
+                listCache().onEntityCreated(result);
+            }
+            if constexpr (kHasL2) {
+                co_await invalidateRedisListGroups();
+            }
         }
         co_return result;
     }
 
-    /// Update entity and notify list cache with old/new data.
+    /// Update entity and invalidate list caches.
     static io::Task<bool> update(const Key& id, WrapperPtrType wrapper)
         requires MutableEntity<Entity> && (!Base::config.read_only)
     {
@@ -253,7 +297,7 @@ public:
         co_return co_await updateWithContext(id, std::move(wrapper), std::move(old));
     }
 
-    /// Erase entity and notify list cache.
+    /// Erase entity and invalidate list caches.
     static io::Task<std::optional<size_t>> erase(const Key& id)
         requires (!Base::config.read_only)
     {
@@ -261,7 +305,7 @@ public:
         co_return co_await eraseWithContext(id, std::move(entity));
     }
 
-    /// Partial update and notify list cache.
+    /// Partial update and invalidate list caches.
     template<typename... Updates>
     static io::Task<WrapperPtrType> patch(const Key& id, Updates&&... updates)
         requires HasFieldUpdate<Entity> && (!Base::config.read_only)
@@ -272,14 +316,16 @@ public:
     }
 
     // =========================================================================
-    // Warmup — primes both entity and list L1 caches
+    // Warmup — primes entity and list L1 caches
     // =========================================================================
 
     static void warmup() {
         Base::warmup();
-        RELAIS_LOG_DEBUG << name() << ": warming up list cache...";
-        (void)listCache();
-        RELAIS_LOG_DEBUG << name() << ": list cache primed";
+        if constexpr (kHasL1) {
+            RELAIS_LOG_DEBUG << name() << ": warming up list cache...";
+            (void)listCache();
+            RELAIS_LOG_DEBUG << name() << ": list cache primed";
+        }
     }
 
     // =========================================================================
@@ -287,29 +333,33 @@ public:
     // =========================================================================
 
     /// Try to sweep one shard on both entity and list caches.
-    /// Returns immediately if a sweep is already in progress.
     static bool trySweep() {
         bool entity_cleaned = Base::trySweep();
-        bool list_cleaned = listCache().trySweep();
-        return entity_cleaned || list_cleaned;
+        if constexpr (kHasL1) {
+            return entity_cleaned | listCache().trySweep();
+        }
+        return entity_cleaned;
     }
 
     /// Sweep one shard on both entity and list caches.
     static bool sweep() {
         bool entity_cleaned = Base::sweep();
-        bool list_cleaned = listCache().sweep();
-        return entity_cleaned || list_cleaned;
+        if constexpr (kHasL1) {
+            return entity_cleaned | listCache().sweep();
+        }
+        return entity_cleaned;
     }
 
     /// Sweep all shards on both entity and list caches.
     static size_t purge() {
         size_t entity_erased = Base::purge();
-        size_t list_erased = listCache().purge();
-        return entity_erased + list_erased;
+        if constexpr (kHasL1) {
+            return entity_erased + listCache().purge();
+        }
+        return entity_erased;
     }
 
     /// Try to sweep one entity cache shard.
-    /// Returns immediately if a sweep is already in progress.
     static bool trySweepEntities() { return Base::trySweep(); }
 
     /// Sweep one entity cache shard.
@@ -319,34 +369,71 @@ public:
     static size_t purgeEntities() { return Base::purge(); }
 
     /// Try to sweep one list cache shard.
-    /// Returns immediately if a sweep is already in progress.
-    static bool trySweepLists() { return listCache().trySweep(); }
+    static bool trySweepLists() {
+        if constexpr (kHasL1) { return listCache().trySweep(); }
+        return false;
+    }
 
     /// Sweep one list cache shard.
-    static bool sweepLists() { return listCache().sweep(); }
+    static bool sweepLists() {
+        if constexpr (kHasL1) { return listCache().sweep(); }
+        return false;
+    }
 
     /// Sweep all list cache shards.
-    static size_t purgeLists() { return listCache().purge(); }
+    static size_t purgeLists() {
+        if constexpr (kHasL1) { return listCache().purge(); }
+        return 0;
+    }
 
-    /// Invalidate entity cache (list cache invalidation is lazy via ModificationTracker).
+    /// Invalidate entity cache. L1 list cache uses lazy invalidation via ModificationTracker.
     static io::Task<void> invalidate(const Key& id) {
         co_await Base::invalidate(id);
     }
 
+    /// Invalidate all L2 declarative list cache groups for this repository.
+    static io::Task<size_t> invalidateAllListGroups() {
+        if constexpr (kHasL2) {
+            co_return co_await invalidateRedisListGroups();
+        } else {
+            co_return 0;
+        }
+    }
+
     // =========================================================================
-    // Cross-invalidation entry points (used by InvalidateList)
+    // Cross-invalidation entry points
     // =========================================================================
+    //
+    // Synchronous, L1-only — updates ModificationTracker for lazy invalidation.
+    // For L2 invalidation, use CRUD methods (insert/update/erase/patch) which
+    // trigger invalidateRedisListGroups() automatically, or call
+    // invalidateAllListGroups() from a custom InvalidateList handler.
 
     static void notifyCreated(WrapperPtrType entity) {
-        if (entity) listCache().onEntityCreated(std::move(entity));
+        if constexpr (kHasL1) {
+            if (entity) listCache().onEntityCreated(std::move(entity));
+        }
+        if constexpr (kHasL2) {
+            fireAndForgetInvalidateL2();
+        }
     }
 
     static void notifyUpdated(WrapperPtrType old_entity, WrapperPtrType new_entity) {
-        listCache().onEntityUpdated(std::move(old_entity), std::move(new_entity));
+        if constexpr (kHasL1) {
+            listCache().onEntityUpdated(std::move(old_entity), std::move(new_entity));
+        }
+        if constexpr (kHasL2) {
+            fireAndForgetInvalidateL2();
+        }
     }
 
     static void notifyDeleted(WrapperPtrType entity) {
-        if (entity) listCache().onEntityDeleted(std::move(entity));
+        if constexpr (kHasL1) {
+            if (entity) listCache().onEntityDeleted(std::move(entity));
+        }
+        if constexpr (kHasL2) {
+            fireAndForgetInvalidateL2();
+        }
     }
 
 #ifdef RELAIS_BUILDING_TESTS
@@ -365,7 +452,12 @@ protected:
         auto new_entity = wrapper;
         bool ok = co_await Base::update(id, std::move(wrapper));
         if (ok) {
-            listCache().onEntityUpdated(std::move(old_entity), std::move(new_entity));
+            if constexpr (kHasL1) {
+                listCache().onEntityUpdated(std::move(old_entity), std::move(new_entity));
+            }
+            if constexpr (kHasL2) {
+                co_await invalidateRedisListGroups();
+            }
         }
         co_return ok;
     }
@@ -375,8 +467,13 @@ protected:
         requires (!Base::config.read_only)
     {
         auto result = co_await Base::erase(id);
-        if (result.has_value() && old_entity) {
-            listCache().onEntityDeleted(std::move(old_entity));
+        if (result.has_value()) {
+            if constexpr (kHasL1) {
+                if (old_entity) listCache().onEntityDeleted(std::move(old_entity));
+            }
+            if constexpr (kHasL2) {
+                co_await invalidateRedisListGroups();
+            }
         }
         co_return result;
     }
@@ -388,9 +485,59 @@ protected:
     {
         auto result = co_await Base::patch(id, std::forward<Updates>(updates)...);
         if (result) {
-            listCache().onEntityUpdated(std::move(old_entity), result);
+            if constexpr (kHasL1) {
+                listCache().onEntityUpdated(std::move(old_entity), result);
+            }
+            if constexpr (kHasL2) {
+                co_await invalidateRedisListGroups();
+            }
         }
         co_return result;
+    }
+
+    // =========================================================================
+    // Redis L2 declarative list invalidation
+    // =========================================================================
+
+    /// Fire-and-forget L2 invalidation — launched from synchronous notify methods.
+    /// Uses DetachedTask: starts immediately, self-destructs on completion.
+    static io::DetachedTask fireAndForgetInvalidateL2() {
+        co_await invalidateRedisListGroups();
+    }
+
+    /// Invalidate all tracked declarative list groups in Redis.
+    /// Flow: SMEMBERS master → invalidateListGroup(each) → DEL master.
+    static io::Task<size_t> invalidateRedisListGroups() {
+        if constexpr (!kHasL2) {
+            co_return 0;
+        } else {
+            try {
+                if (!DbProvider::hasRedis()) co_return 0;
+
+                auto masterKey = redisMasterSetKey();
+
+                // 1. Get all active group keys
+                auto result = co_await DbProvider::redis("SMEMBERS", masterKey);
+                if (result.isNil() || !result.isArray()) co_return 0;
+
+                auto groups = result.asStringArray();
+                size_t count = 0;
+
+                // 2. Invalidate each group (Lua: SMEMBERS → DEL pages → DEL SET)
+                for (const auto& group : groups) {
+                    count += co_await cache::RedisCache::invalidateListGroup(group);
+                }
+
+                // 3. Delete master set
+                co_await DbProvider::redis("DEL", masterKey);
+
+                co_return count;
+            } catch (const std::exception& e) {
+                RELAIS_LOG_ERROR << Base::name()
+                    << ": invalidateRedisListGroups error - " << e.what();
+                co_return 0;
+            }
+        }
     }
 
     // =========================================================================
@@ -398,15 +545,48 @@ protected:
     // =========================================================================
 
     static io::Task<ListResult> cachedListQuery(const ListQuery& query) {
-        auto& cache = listCache();
-        auto cache_query = toCacheQuery(query);
-
-        // Try cache first — zero copy: return shared_ptr directly
-        if (auto cached = cache.get(cache_query)) {
-            co_return cached;
+        // 1. L1 check — zero copy: return shared_ptr directly
+        if constexpr (kHasL1) {
+            auto cache_query = toCacheQuery(query);
+            if (auto cached = listCache().get(cache_query)) {
+                co_return cached;
+            }
         }
 
-        // Cache miss — query database
+        // 2. L2 check — binary (BEVE) with auto header skip
+        if constexpr (kHasL2) {
+            auto pageKey = redisPageKey(query.cache_key);
+
+            std::optional<ListWrapperType> cached;
+            if constexpr (Base::config.l2_refresh_on_get) {
+                cached = co_await cache::RedisCache::getListBinaryEx<ListWrapperType>(
+                    pageKey, l2Ttl());
+            } else {
+                cached = co_await cache::RedisCache::getListBinary<ListWrapperType>(pageKey);
+            }
+
+            if (cached) {
+                auto wrapper = std::make_shared<ListWrapperType>(std::move(*cached));
+
+                // Populate L1 if available
+                if constexpr (kHasL1) {
+                    auto sort = query.sort.value_or(defaultSortAsListSpec());
+                    cache::list::SortBounds bounds;
+                    if (!wrapper->items.empty()) {
+                        bounds.first_value = cache::list::decl::extractSortValue<Descriptor>(
+                            wrapper->items.front(), sort.field);
+                        bounds.last_value = cache::list::decl::extractSortValue<Descriptor>(
+                            wrapper->items.back(), sort.field);
+                        bounds.is_valid = true;
+                    }
+                    listCache().put(toCacheQuery(query), wrapper, bounds);
+                }
+
+                co_return wrapper;
+            }
+        }
+
+        // 4. Cache miss — query database
         auto entities = co_await queryFromDb(query);
         auto sort = query.sort.value_or(defaultSortAsListSpec());
 
@@ -416,9 +596,8 @@ protected:
 
         // Set cursor for pagination (base64 string in ListWrapper)
         if (wrapper->items.size() >= query.limit && !wrapper->items.empty()) {
-            auto cursor = Traits::extractCursor(
-                wrapper->items.back(),
-                cache_query.sort.value_or(Traits::defaultSort()));
+            auto cache_sort = query.sort.value_or(Traits::defaultSort());
+            auto cursor = Traits::extractCursor(wrapper->items.back(), cache_sort);
             wrapper->next_cursor = cursor.encode();
         }
 
@@ -432,8 +611,32 @@ protected:
             bounds.is_valid = true;
         }
 
-        // Store in cache and return shared_ptr (zero copy on subsequent gets)
-        cache.put(cache_query, wrapper, bounds);
+        // 4. Store in L2 with ListBoundsHeader
+        if constexpr (kHasL2) {
+            cache::list::ListBoundsHeader header;
+            header.bounds = bounds;
+            header.sort_direction = (sort.direction == cache::list::SortDirection::Desc)
+                ? cache::list::SortDirection::Desc : cache::list::SortDirection::Asc;
+            header.is_first_page = query.cursor.data.empty();
+            header.is_incomplete = wrapper->items.size() < static_cast<size_t>(query.limit);
+            header.pagination_mode = cache::list::PaginationMode::Cursor;
+
+            auto pageKey = redisPageKey(query.cache_key);
+            auto groupKey = redisGroupKey(query.group_key);
+
+            // Store page binary with header prepended
+            co_await cache::RedisCache::setListBinary(pageKey, *wrapper, l2Ttl(), header);
+            // Track page in group SET
+            co_await cache::RedisCache::trackListKey(groupKey, pageKey, l2Ttl());
+            // Track group in master SET
+            co_await DbProvider::redis("SADD", redisMasterSetKey(), groupKey);
+        }
+
+        // 5. Store in L1 cache
+        if constexpr (kHasL1) {
+            listCache().put(toCacheQuery(query), wrapper, bounds);
+        }
+
         co_return wrapper;
     }
 

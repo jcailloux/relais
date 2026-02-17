@@ -39,6 +39,8 @@ using FullPurchaseListQuery = FullCachePurchaseListRepo::ListQuery;
 // L1+L2 query helpers
 // =============================================================================
 
+namespace decl = jcailloux::relais::cache::list::decl;
+
 static FullArticleListQuery makeFullArticleQuery(
     std::optional<std::string> category = std::nullopt,
     std::optional<int64_t> author_id = std::nullopt,
@@ -49,10 +51,9 @@ static FullArticleListQuery makeFullArticleQuery(
     if (category) q.filters.template get<0>() = std::move(*category);
     if (author_id) q.filters.template get<1>() = *author_id;
 
-    size_t h = std::hash<uint16_t>{}(limit) ^ 0xF00D;
-    if (q.filters.template get<0>()) h ^= std::hash<std::string_view>{}(*q.filters.template get<0>()) << 1;
-    if (q.filters.template get<1>()) h ^= std::hash<int64_t>{}(*q.filters.template get<1>()) << 2;
-    q.query_hash = h;
+    using Desc = FullCacheArticleListRepo::ListDescriptorType;
+    q.group_key = decl::groupCacheKey<Desc>(q);
+    q.cache_key = decl::cacheKey<Desc>(q);
     return q;
 }
 
@@ -66,10 +67,9 @@ static FullPurchaseListQuery makeFullPurchaseQuery(
     if (user_id) q.filters.template get<0>() = *user_id;
     if (status) q.filters.template get<1>() = std::move(*status);
 
-    size_t h = std::hash<uint16_t>{}(limit) ^ 0xBAAD;
-    if (q.filters.template get<0>()) h ^= std::hash<int64_t>{}(*q.filters.template get<0>()) << 1;
-    if (q.filters.template get<1>()) h ^= std::hash<std::string_view>{}(*q.filters.template get<1>()) << 2;
-    q.query_hash = h;
+    using Desc = FullCachePurchaseListRepo::ListDescriptorType;
+    q.group_key = decl::groupCacheKey<Desc>(q);
+    q.cache_key = decl::cacheKey<Desc>(q);
     return q;
 }
 

@@ -8,8 +8,11 @@
 #pragma once
 
 #include "TestRepositories.h"
+#include "jcailloux/relais/list/decl/HttpQueryParser.h"
 
 namespace relais_test {
+
+namespace ld = jcailloux::relais::cache::list::decl;
 
 using ArticleListQuery = TestArticleListRepo::ListQuery;
 using PurchaseListQuery = TestPurchaseListRepo::ListQuery;
@@ -24,10 +27,9 @@ inline ArticleListQuery makeArticleQuery(
     if (category) q.filters.template get<0>() = std::move(*category);
     if (author_id) q.filters.template get<1>() = *author_id;
 
-    size_t h = std::hash<uint16_t>{}(limit) ^ 0xBEEF;  // salt to avoid collision with purchase
-    if (q.filters.template get<0>()) h ^= std::hash<std::string_view>{}(*q.filters.template get<0>()) << 1;
-    if (q.filters.template get<1>()) h ^= std::hash<int64_t>{}(*q.filters.template get<1>()) << 2;
-    q.query_hash = h;
+    using Desc = TestArticleListRepo::ListDescriptorType;
+    q.group_key = ld::groupCacheKey<Desc>(q);
+    q.cache_key = ld::cacheKey<Desc>(q);
     return q;
 }
 
@@ -41,10 +43,9 @@ inline PurchaseListQuery makePurchaseQuery(
     if (user_id) q.filters.template get<0>() = *user_id;
     if (status) q.filters.template get<1>() = std::move(*status);
 
-    size_t h = std::hash<uint16_t>{}(limit);
-    if (q.filters.template get<0>()) h ^= std::hash<int64_t>{}(*q.filters.template get<0>()) << 1;
-    if (q.filters.template get<1>()) h ^= std::hash<std::string_view>{}(*q.filters.template get<1>()) << 2;
-    q.query_hash = h;
+    using Desc = TestPurchaseListRepo::ListDescriptorType;
+    q.group_key = ld::groupCacheKey<Desc>(q);
+    q.cache_key = ld::cacheKey<Desc>(q);
     return q;
 }
 

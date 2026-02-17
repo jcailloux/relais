@@ -1,7 +1,6 @@
 #ifndef CODIBOT_CACHE_LIST_DECL_HTTPQUERYPARSER_H
 #define CODIBOT_CACHE_LIST_DECL_HTTPQUERYPARSER_H
 
-#include <xxhash.h>
 #include <expected>
 #include <string>
 #include <string_view>
@@ -13,7 +12,7 @@
 #include "GeneratedFilters.h"
 #include "GeneratedTraits.h"
 #include "ListDescriptorQuery.h"
-#include "jcailloux/relais/cache/QueryParser.h"
+#include "jcailloux/relais/cache/ParseUtils.h"
 
 namespace jcailloux::relais::cache::list::decl {
 
@@ -74,19 +73,18 @@ std::optional<T> parseValue(const std::string& str) {
 }  // namespace detail
 
 // =============================================================================
-// Query Hash Computation - Hash from parsed values, not raw query string
+// Canonical Cache Key Computation — deterministic binary buffer from parsed values
 // =============================================================================
 
-/// Compute a canonical hash from parsed query values
-/// This ensures that queries with the same effective parameters produce the same hash,
-/// regardless of parameter order or invalid parameters in the original request.
+/// Build the group-level canonical key (filters + sort).
+/// Same filters+sort = same group, regardless of pagination.
 template<typename Descriptor>
     requires ValidListDescriptor<Descriptor>
-size_t computeQueryHash(const ListDescriptorQuery<Descriptor>& query) {
+std::string groupCacheKey(const ListDescriptorQuery<Descriptor>& query) {
     std::vector<uint8_t> buf;
-    buf.reserve(128);  // Pre-allocate reasonable size
+    buf.reserve(128);
 
-    // Hash each filter value in declaration order
+    // Filters in declaration order (alphabetically sorted by generator)
     [&]<size_t... Is>(std::index_sequence<Is...>) {
         ([&] {
             const auto& filter_value = query.filters.template get<Is>();
@@ -94,7 +92,7 @@ size_t computeQueryHash(const ListDescriptorQuery<Descriptor>& query) {
         }(), ...);
     }(std::make_index_sequence<filter_count<Descriptor>>{});
 
-    // Hash sort specification
+    // Sort specification
     uint8_t has_sort = query.sort.has_value() ? 1 : 0;
     buf.push_back(has_sort);
     if (query.sort) {
@@ -103,10 +101,24 @@ size_t computeQueryHash(const ListDescriptorQuery<Descriptor>& query) {
         buf.push_back(dir);
     }
 
-    // Hash limit
+    return std::string(reinterpret_cast<const char*>(buf.data()), buf.size());
+}
+
+/// Build the full page-level canonical key (group_key + limit + cursor).
+/// Uniquely identifies a specific page within a group.
+template<typename Descriptor>
+    requires ValidListDescriptor<Descriptor>
+std::string cacheKey(const ListDescriptorQuery<Descriptor>& query) {
+    // Start from the group key
+    std::string key = query.group_key;
+
+    std::vector<uint8_t> buf;
+    buf.reserve(32);
+
+    // Limit
     detail::appendToBuffer(buf, query.limit);
 
-    // Hash cursor
+    // Cursor
     if (!query.cursor.data.empty()) {
         uint32_t cursor_len = static_cast<uint32_t>(query.cursor.data.size());
         detail::appendToBuffer(buf, cursor_len);
@@ -115,7 +127,8 @@ size_t computeQueryHash(const ListDescriptorQuery<Descriptor>& query) {
             reinterpret_cast<const uint8_t*>(query.cursor.data.data()) + query.cursor.data.size());
     }
 
-    return XXH3_64bits(buf.data(), buf.size());
+    key.append(reinterpret_cast<const char*>(buf.data()), buf.size());
+    return key;
 }
 
 /// Parse ListQuery from a parameter map (e.g. req->getParameters())
@@ -170,8 +183,9 @@ ListDescriptorQuery<Descriptor> parseListQuery(const Map& params) {
         }
     }
 
-    // Compute hash from parsed values (not raw query string)
-    query.query_hash = computeQueryHash<Descriptor>(query);
+    // Build canonical cache keys from parsed values
+    query.group_key = groupCacheKey<Descriptor>(query);
+    query.cache_key = cacheKey<Descriptor>(query);
 
     return query;
 }
@@ -287,8 +301,9 @@ std::expected<ListDescriptorQuery<Descriptor>, QueryValidationError> parseListQu
         }
     }
 
-    // Compute hash from parsed values (not raw query string)
-    query.query_hash = computeQueryHash<Descriptor>(query);
+    // Build canonical cache keys from parsed values
+    query.group_key = groupCacheKey<Descriptor>(query);
+    query.cache_key = cacheKey<Descriptor>(query);
 
     return query;
 }

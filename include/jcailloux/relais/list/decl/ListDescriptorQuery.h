@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <string>
 
 #include "GeneratedFilters.h"
 #include "jcailloux/relais/list/ListQuery.h"
@@ -22,9 +23,10 @@ struct ListDescriptorQuery {
     std::optional<DescriptorSortSpec<Descriptor>> sort;
     uint16_t limit{20};
     cache::list::Cursor cursor;
-    size_t query_hash{0};
+    std::string group_key;   ///< Canonical key for filters+sort (Redis group tracking)
+    std::string cache_key;   ///< Full canonical key: group_key + limit + cursor
 
-    [[nodiscard]] size_t hash() const noexcept { return query_hash; }
+    [[nodiscard]] const std::string& cacheKey() const noexcept { return cache_key; }
 
     bool operator==(const ListDescriptorQuery&) const = default;
 };
