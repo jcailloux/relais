@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.3.1] - 2026-02-17
+
+### Fixed
+- `patch` now uses explicit `RETURNING` column list instead of `RETURNING *`, ensuring consistent column ordering with `fromRow` index-based mapping
+
 ## [0.3.0] - 2026-02-17
 
 ### Added

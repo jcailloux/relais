@@ -311,27 +311,64 @@ TEST_CASE("FieldUpdate with nullable fields", "[base_repo][field_update]") {
 TEST_CASE("buildUpdateReturning", "[base_repo][sql]") {
     SECTION("single column") {
         auto sql = detail::buildUpdateReturning(
-            "my_table", "id", {"\"name\""});
-        REQUIRE(sql == "UPDATE my_table SET \"name\"=$1 WHERE \"id\"=$2 RETURNING *");
+            "my_table", "id", {"\"name\""}, "id, name");
+        REQUIRE(sql == "UPDATE my_table SET \"name\"=$1 WHERE \"id\"=$2 RETURNING id, name");
     }
 
     SECTION("multiple columns") {
         auto sql = detail::buildUpdateReturning(
-            "my_table", "id", {"\"name\"", "\"value\"", "\"active\""});
+            "my_table", "id", {"\"name\"", "\"value\"", "\"active\""},
+            "id, name, value, active");
         REQUIRE(sql.find("UPDATE my_table SET") == 0);
         REQUIRE(sql.find("\"name\"=$1") != std::string::npos);
         REQUIRE(sql.find("\"value\"=$2") != std::string::npos);
         REQUIRE(sql.find("\"active\"=$3") != std::string::npos);
         REQUIRE(sql.find("WHERE \"id\"=$4") != std::string::npos);
-        REQUIRE(sql.find("RETURNING *") != std::string::npos);
+        REQUIRE(sql.find("RETURNING id, name, value, active") != std::string::npos);
     }
 
-    SECTION("with real mapping table name and pk column") {
+    SECTION("with real mapping returning_columns") {
         using M = entity::generated::TestItemMapping;
         auto sql = detail::buildUpdateReturning(
-            M::table_name, M::primary_key_column, {"\"name\"", "\"value\""});
+            M::table_name, M::primary_key_column,
+            {"\"name\"", "\"value\""}, M::SQL::returning_columns);
         REQUIRE(sql.find("UPDATE relais_test_items SET") == 0);
         REQUIRE(sql.find("WHERE \"id\"=$3") != std::string::npos);
+        REQUIRE(sql.find("RETURNING id, name, value, description, is_active, created_at") != std::string::npos);
+    }
+
+    SECTION("never produces RETURNING *") {
+        using M = entity::generated::TestItemMapping;
+        auto sql = detail::buildUpdateReturning(
+            M::table_name, M::primary_key_column,
+            {"\"name\""}, M::SQL::returning_columns);
+        REQUIRE(sql.find("RETURNING *") == std::string::npos);
+    }
+}
+
+TEST_CASE("returning_columns matches select_by_pk column order", "[base_repo][sql]") {
+    // Ensures that RETURNING and SELECT use the same column list,
+    // so fromRow mapping by index is always consistent.
+
+    SECTION("TestItem") {
+        using M = entity::generated::TestItemMapping;
+        std::string select = M::SQL::select_by_pk;
+        std::string expected_prefix = "SELECT " + std::string(M::SQL::returning_columns) + " FROM";
+        REQUIRE(select.find(expected_prefix) == 0);
+    }
+
+    SECTION("TestOrder") {
+        using M = entity::generated::TestOrderMapping;
+        std::string select = M::SQL::select_by_pk;
+        std::string expected_prefix = "SELECT " + std::string(M::SQL::returning_columns) + " FROM";
+        REQUIRE(select.find(expected_prefix) == 0);
+    }
+
+    SECTION("TestEvent") {
+        using M = entity::generated::TestEventMapping;
+        std::string select = M::SQL::select_by_pk;
+        std::string expected_prefix = "SELECT " + std::string(M::SQL::returning_columns) + " FROM";
+        REQUIRE(select.find(expected_prefix) == 0);
     }
 }
 
