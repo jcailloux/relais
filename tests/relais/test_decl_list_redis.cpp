@@ -7,8 +7,8 @@
  * Covers:
  *   1. Article list query (filters, limit, empty)
  *   2. Purchase list query (filters, combined)
- *   3. SortBounds invalidation precision at L2
- *   4. ModificationTracker cleanup at L2
+ *   3. L2 CRUD invalidation (active invalidation via Redis Lua scripts)
+ *   4. L2 cache lifecycle (Redis store/hit verification)
  */
 
 #include <catch2/catch_test_macros.hpp>
@@ -71,10 +71,9 @@ static L2ArticleListQuery makeL2ArticleQuery(
     if (category) q.filters.template get<0>() = std::move(*category);
     if (author_id) q.filters.template get<1>() = *author_id;
 
-    size_t h = std::hash<uint16_t>{}(limit) ^ 0xCAFE;
-    if (q.filters.template get<0>()) h ^= std::hash<std::string_view>{}(*q.filters.template get<0>()) << 1;
-    if (q.filters.template get<1>()) h ^= std::hash<int64_t>{}(*q.filters.template get<1>()) << 2;
-    q.query_hash = h;
+    using Desc = L2DeclArticleListRepo::ListDescriptorType;
+    q.group_key = decl::groupCacheKey<Desc>(q);
+    q.cache_key = decl::cacheKey<Desc>(q);
     return q;
 }
 
@@ -88,10 +87,9 @@ static L2PurchaseListQuery makeL2PurchaseQuery(
     if (user_id) q.filters.template get<0>() = *user_id;
     if (status) q.filters.template get<1>() = std::move(*status);
 
-    size_t h = std::hash<uint16_t>{}(limit) ^ 0xFACE;
-    if (q.filters.template get<0>()) h ^= std::hash<int64_t>{}(*q.filters.template get<0>()) << 1;
-    if (q.filters.template get<1>()) h ^= std::hash<std::string_view>{}(*q.filters.template get<1>()) << 2;
-    q.query_hash = h;
+    using Desc = L2DeclPurchaseListRepo::ListDescriptorType;
+    q.group_key = decl::groupCacheKey<Desc>(q);
+    q.cache_key = decl::cacheKey<Desc>(q);
     return q;
 }
 
@@ -101,9 +99,9 @@ static L2ArticleDescQuery makeL2ViewCountQuery(std::string_view category, uint16
     q.limit = limit;
     q.filters.get<0>() = category;
     q.sort = jcailloux::relais::cache::list::SortSpec<size_t>{1, jcailloux::relais::cache::list::SortDirection::Desc};
-    q.query_hash = std::hash<std::string_view>{}(category)
-                 ^ (static_cast<size_t>(limit) * 0x9e3779b9)
-                 ^ 0xFEED;
+
+    q.group_key = decl::groupCacheKey<L2ArticleDecl>(q);
+    q.cache_key = decl::cacheKey<L2ArticleDecl>(q);
     return q;
 }
 
@@ -227,179 +225,162 @@ TEST_CASE("[DeclList L2] Purchase list query",
 
 // #############################################################################
 //
-//  3. SortBounds invalidation at L2
+//  3. L2 CRUD invalidation (active invalidation via Redis Lua scripts)
 //
 // #############################################################################
 
-TEST_CASE("[DeclList L2] SortBounds invalidation",
+TEST_CASE("[DeclList L2] CRUD invalidation",
           "[integration][db][redis][list][invalidation]")
 {
     TransactionGuard tx;
     TestInternals::resetListCacheState<L2DeclArticleListRepo>();
 
-    auto alice_id = insertTestUser("alice_l2", "alice_l2@test.com", 0);
+    SECTION("[invalidation] insert via repo invalidates L2 cache") {
+        auto userId = insertTestUser("author", "author@l2inv.com", 0);
+        insertTestArticle("tech", userId, "Tech 1", 10);
 
-    // 8 "tech" articles with view_count 10..80
-    for (int vc = 10; vc <= 80; vc += 10) {
-        insertTestArticle("tech", alice_id, "tech_" + std::to_string(vc), vc);
-    }
-    // 3 "news" articles with view_count 100..300
-    for (int vc = 100; vc <= 300; vc += 100) {
-        insertTestArticle("news", alice_id, "news_" + std::to_string(vc), vc);
-    }
+        // Populate L2 cache
+        auto r1 = sync(L2DeclArticleListRepo::query(makeL2ArticleQuery("tech")));
+        REQUIRE(r1->size() == 1);
 
-    SECTION("[sortbounds] create invalidates only affected range") {
-        // Add 7 more tech articles (90..150) to get 15 total
-        for (int vc = 90; vc <= 150; vc += 10) {
-            insertTestArticle("tech", alice_id, "tech_high_" + std::to_string(vc), vc);
-        }
+        // Insert via repo → triggers invalidateRedisListGroups()
+        auto newArticle = makeTestArticle("tech", userId, "Tech 2", 20);
+        sync(L2DeclArticleListRepo::insert(newArticle));
 
-        auto q1 = makeL2ViewCountQuery("tech", 10);  // bounds(150, 60)
-        auto q2 = makeL2ViewCountQuery("tech", 25);  // bounds(150, 10)
-        auto q3 = makeL2ViewCountQuery("news", 10);  // filter mismatch
-
-        auto r1 = sync(L2DeclArticleListRepo::query(q1));
-        auto r2 = sync(L2DeclArticleListRepo::query(q2));
-        auto r3 = sync(L2DeclArticleListRepo::query(q3));
-
-        REQUIRE(r1->size() == 10);
-        REQUIRE(r2->size() == 15);
-        REQUIRE(r3->size() == 3);
-
-        // Insert tech article with view_count=45
-        insertTestArticle("tech", alice_id, "tech_new_45", 45);
-        auto trigger_entity = makeArticle(999, "tech", alice_id, "tech_trigger_45", 45);
-        L2DeclArticleListRepo::notifyCreated(trigger_entity);
-
-        // q1: 45 < 60 → PRESERVED
-        auto r1_after = sync(L2DeclArticleListRepo::query(q1));
-        CHECK(r1_after->size() == 10);
-
-        // q2: 45 >= 10 → INVALIDATED
-        auto r2_after = sync(L2DeclArticleListRepo::query(q2));
-        CHECK(r2_after->size() == 16);
-
-        // q3: filter mismatch → PRESERVED
-        auto r3_after = sync(L2DeclArticleListRepo::query(q3));
-        CHECK(r3_after->size() == 3);
+        // Next query should hit DB and see the new article
+        auto r2 = sync(L2DeclArticleListRepo::query(makeL2ArticleQuery("tech")));
+        CHECK(r2->size() == 2);
     }
 
-    SECTION("[sortbounds] update invalidates ranges containing old OR new value") {
-        for (int vc = 90; vc <= 150; vc += 10) {
-            insertTestArticle("tech", alice_id, "tech_high_" + std::to_string(vc), vc);
-        }
+    SECTION("[invalidation] update via repo invalidates L2 cache") {
+        auto userId = insertTestUser("author", "author@l2inv.com", 0);
+        auto articleId = insertTestArticle("tech", userId, "Before", 10);
 
-        auto q1 = makeL2ViewCountQuery("tech", 10);  // bounds(150, 60)
-        auto r1 = sync(L2DeclArticleListRepo::query(q1));
-        REQUIRE(r1->size() == 10);
+        // Populate L2 cache
+        sync(L2DeclArticleListRepo::query(makeL2ArticleQuery("tech")));
 
-        auto result_70 = execQueryArgs(
-            "SELECT id FROM relais_test_articles WHERE view_count = 70 AND author_id = $1 LIMIT 1",
-            alice_id);
-        REQUIRE(result_70.rows() > 0);
-        auto article_70_id = result_70[0].get<int64_t>(0);
+        // Update via repo
+        auto updated = makeTestArticle("tech", userId, "After", 20, false, articleId);
+        sync(L2DeclArticleListRepo::update(articleId, updated));
 
-        auto old_entity = makeArticle(article_70_id, "tech", alice_id, "tech_70", 70);
-        updateTestArticle(article_70_id, "tech_70_updated", 25);
-        auto new_entity = makeArticle(article_70_id, "tech", alice_id, "tech_70_updated", 25);
-
-        L2DeclArticleListRepo::notifyUpdated(old_entity, new_entity);
-
-        auto r1_after = sync(L2DeclArticleListRepo::query(q1));
-        CHECK(r1_after->size() == 10);
+        // List should reflect the update
+        auto result = sync(L2DeclArticleListRepo::query(makeL2ArticleQuery("tech")));
+        CHECK(result->size() == 1);
+        CHECK(result->items.front().title == "After");
     }
 
-    SECTION("[sortbounds] delete invalidates affected range") {
-        auto q1 = makeL2ViewCountQuery("tech", 10);
-        auto r1 = sync(L2DeclArticleListRepo::query(q1));
-        REQUIRE(r1->size() == 8);
+    SECTION("[invalidation] delete via repo invalidates L2 cache") {
+        auto userId = insertTestUser("author", "author@l2inv.com", 0);
+        auto articleId = insertTestArticle("tech", userId, "To Delete", 10);
+        insertTestArticle("tech", userId, "To Keep", 20);
 
-        auto result_40 = execQueryArgs(
-            "SELECT id FROM relais_test_articles WHERE view_count = 40 AND author_id = $1 LIMIT 1",
-            alice_id);
-        REQUIRE(result_40.rows() > 0);
-        auto article_40_id = result_40[0].get<int64_t>(0);
+        // Populate L2 cache
+        auto r1 = sync(L2DeclArticleListRepo::query(makeL2ArticleQuery("tech")));
+        REQUIRE(r1->size() == 2);
 
-        auto deleted_entity = makeArticle(article_40_id, "tech", alice_id, "tech_40", 40);
-        deleteTestArticle(article_40_id);
+        // Delete via repo
+        sync(L2DeclArticleListRepo::erase(articleId));
 
-        L2DeclArticleListRepo::notifyDeleted(deleted_entity);
-
-        auto r1_after = sync(L2DeclArticleListRepo::query(q1));
-        CHECK(r1_after->size() == 7);
+        // List should show only the remaining article
+        auto r2 = sync(L2DeclArticleListRepo::query(makeL2ArticleQuery("tech")));
+        CHECK(r2->size() == 1);
     }
 
-    SECTION("[sortbounds] filter mismatch preserves cache across categories") {
-        auto q_tech = makeL2ViewCountQuery("tech", 10);
-        auto q_news = makeL2ViewCountQuery("news", 10);
+    SECTION("[invalidation] invalidation clears all groups for this repo") {
+        auto userId = insertTestUser("author", "author@l2inv.com", 0);
+        insertTestArticle("tech", userId, "Tech 1", 10);
+        insertTestArticle("news", userId, "News 1", 20);
 
-        auto r_tech = sync(L2DeclArticleListRepo::query(q_tech));
-        auto r_news = sync(L2DeclArticleListRepo::query(q_news));
-        REQUIRE(r_tech->size() == 8);
-        REQUIRE(r_news->size() == 3);
+        // Populate two different filter groups in L2
+        auto r_tech = sync(L2DeclArticleListRepo::query(makeL2ArticleQuery("tech")));
+        auto r_news = sync(L2DeclArticleListRepo::query(makeL2ArticleQuery("news")));
+        REQUIRE(r_tech->size() == 1);
+        REQUIRE(r_news->size() == 1);
 
-        auto new_tech_id = insertTestArticle("tech", alice_id, "tech_new", 55);
-        auto tech_entity = makeArticle(new_tech_id, "tech", alice_id, "tech_new", 55);
-        L2DeclArticleListRepo::notifyCreated(tech_entity);
+        // Insert a "tech" article via repo → all groups invalidated (non-selective)
+        auto newArticle = makeTestArticle("tech", userId, "Tech 2", 30);
+        sync(L2DeclArticleListRepo::insert(newArticle));
 
-        auto r_tech_after = sync(L2DeclArticleListRepo::query(q_tech));
-        CHECK(r_tech_after->size() == 9);
+        // Both groups are invalidated (coarse-grained), re-fetched from DB
+        auto r_tech_after = sync(L2DeclArticleListRepo::query(makeL2ArticleQuery("tech")));
+        CHECK(r_tech_after->size() == 2);
 
-        auto r_news_after = sync(L2DeclArticleListRepo::query(q_news));
-        CHECK(r_news_after->size() == 3);
+        auto r_news_after = sync(L2DeclArticleListRepo::query(makeL2ArticleQuery("news")));
+        CHECK(r_news_after->size() == 1);
     }
 }
 
 
 // #############################################################################
 //
-//  4. ModificationTracker cleanup at L2
+//  4. L2 cache lifecycle (Redis store/hit verification)
 //
 // #############################################################################
 
-TEST_CASE("[DeclList L2] ModificationTracker cleanup",
-          "[integration][db][redis][list][cleanup]")
+TEST_CASE("[DeclList L2] Cache lifecycle",
+          "[integration][db][redis][list][lifecycle]")
 {
     TransactionGuard tx;
     TestInternals::resetListCacheState<L2DeclArticleListRepo>();
 
-    auto alice_id = insertTestUser("alice_l2_cleanup", "alice_l2_cleanup@test.com", 0);
-    for (int vc = 10; vc <= 50; vc += 10) {
-        insertTestArticle("tech", alice_id, "cleanup_" + std::to_string(vc), vc);
+    SECTION("[lifecycle] second query hits Redis (stale check)") {
+        auto userId = insertTestUser("author", "author@l2life.com", 0);
+        insertTestArticle("tech", userId, "Tech 1", 10);
+
+        // First query → DB → store Redis
+        auto r1 = sync(L2DeclArticleListRepo::query(makeL2ArticleQuery("tech")));
+        REQUIRE(r1->size() == 1);
+
+        // Insert directly in DB (bypasses repo, no invalidation)
+        insertTestArticle("tech", userId, "Tech 2", 20);
+
+        // Second query → Redis hit → returns stale data (1, not 2)
+        auto r2 = sync(L2DeclArticleListRepo::query(makeL2ArticleQuery("tech")));
+        CHECK(r2->size() == 1);
     }
 
-    SECTION("[tracker-cleanup] old modifications removed after enough cycles") {
-        constexpr auto N = TestInternals::listCacheShardCount<L2DeclArticleListRepo>();
-        auto entity1 = makeArticle(9001, "tech", alice_id, "cleanup_new", 35);
-        L2DeclArticleListRepo::notifyCreated(entity1);
-        CHECK(TestInternals::pendingModificationCount<L2DeclArticleListRepo>() == 1);
+    SECTION("[lifecycle] CRUD clears Redis, next query hits DB") {
+        auto userId = insertTestUser("author", "author@l2life.com", 0);
+        insertTestArticle("tech", userId, "Tech 1", 10);
 
-        for (size_t i = 0; i < N; ++i) {
-            TestInternals::forceModificationTrackerCleanup<L2DeclArticleListRepo>();
-        }
+        // Populate L2 cache
+        sync(L2DeclArticleListRepo::query(makeL2ArticleQuery("tech")));
 
-        CHECK(TestInternals::pendingModificationCount<L2DeclArticleListRepo>() == 0);
+        // Insert directly in DB (not through repo)
+        insertTestArticle("tech", userId, "Tech 2", 20);
+
+        // Still stale from Redis
+        auto r_stale = sync(L2DeclArticleListRepo::query(makeL2ArticleQuery("tech")));
+        CHECK(r_stale->size() == 1);
+
+        // Now insert via repo → triggers L2 invalidation
+        auto newArticle = makeTestArticle("tech", userId, "Tech 3", 30);
+        sync(L2DeclArticleListRepo::insert(newArticle));
+
+        // Query now hits DB → sees all 3 articles
+        auto r_fresh = sync(L2DeclArticleListRepo::query(makeL2ArticleQuery("tech")));
+        CHECK(r_fresh->size() == 3);
     }
 
-    SECTION("[tracker-cleanup] recent modifications survive cleanup") {
-        constexpr auto N = TestInternals::listCacheShardCount<L2DeclArticleListRepo>();
-        auto entity1 = makeArticle(9001, "tech", alice_id, "cleanup_a", 15);
-        L2DeclArticleListRepo::notifyCreated(entity1);
+    SECTION("[lifecycle] different queries are cached independently") {
+        auto userId = insertTestUser("author", "author@l2life.com", 0);
+        insertTestArticle("tech", userId, "Tech", 10);
+        insertTestArticle("news", userId, "News", 20);
 
-        TestInternals::forceModificationTrackerCleanup<L2DeclArticleListRepo>();
-        CHECK(TestInternals::pendingModificationCount<L2DeclArticleListRepo>() == 1);
+        // Cache both queries
+        auto r_tech = sync(L2DeclArticleListRepo::query(makeL2ArticleQuery("tech")));
+        auto r_news = sync(L2DeclArticleListRepo::query(makeL2ArticleQuery("news")));
+        REQUIRE(r_tech->size() == 1);
+        REQUIRE(r_news->size() == 1);
 
-        auto entity2 = makeArticle(9002, "tech", alice_id, "cleanup_b", 25);
-        L2DeclArticleListRepo::notifyCreated(entity2);
-        CHECK(TestInternals::pendingModificationCount<L2DeclArticleListRepo>() == 2);
+        // Insert directly in DB
+        insertTestArticle("tech", userId, "Tech 2", 30);
+        insertTestArticle("news", userId, "News 2", 40);
 
-        for (size_t i = 0; i < N - 1; ++i) {
-            TestInternals::forceModificationTrackerCleanup<L2DeclArticleListRepo>();
-        }
-
-        CHECK(TestInternals::pendingModificationCount<L2DeclArticleListRepo>() == 1);
-
-        TestInternals::forceModificationTrackerCleanup<L2DeclArticleListRepo>();
-        CHECK(TestInternals::pendingModificationCount<L2DeclArticleListRepo>() == 0);
+        // Both return stale from Redis
+        auto r_tech_stale = sync(L2DeclArticleListRepo::query(makeL2ArticleQuery("tech")));
+        auto r_news_stale = sync(L2DeclArticleListRepo::query(makeL2ArticleQuery("news")));
+        CHECK(r_tech_stale->size() == 1);
+        CHECK(r_news_stale->size() == 1);
     }
 }

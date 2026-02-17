@@ -882,6 +882,8 @@ class MappingGenerator:
         ]
 
         if a.filters:
+            # Sort filters alphabetically by param name for deterministic cache keys
+            a.filters.sort(key=lambda f: f.param)
             lines.append("")
             lines.append("        static constexpr auto filters = std::tuple{")
             for i, f in enumerate(a.filters):

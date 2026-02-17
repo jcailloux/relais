@@ -123,21 +123,19 @@ struct Cursor {
 // =============================================================================
 
 /**
- * ListQuery holds both the structured query parameters and a pre-computed hash.
+ * ListQuery holds both the structured query parameters and a canonical cache key.
  *
- * The hash is computed from the raw HTTP query string by QueryHashFilter
- * using XXH3 for maximum performance. This avoids re-hashing on every cache
- * lookup since the hash is computed once at request entry.
+ * The cache_key is a binary canonical buffer built from the parsed query fields
+ * (filters, sort, limit, cursor) in declaration order. This deterministic
+ * representation is used directly as cache key identity — no hashing.
  *
  * Usage:
- *   // In controller, after QueryHashFilter has run:
- *   auto query_hash = req->attributes()->get<size_t>("query_hash");
  *   ListQuery<Filters, SortField> query{
  *       .filters = parseFilters(req),
  *       .sort = parseSort(req),
  *       .limit = parseLimit(req),
  *       .cursor = parseCursor(req),
- *       .query_hash = query_hash
+ *       .cache_key = computedKey
  *   };
  */
 template<typename FilterSet, typename SortFieldEnum>
@@ -150,10 +148,10 @@ struct ListQuery {
     std::optional<Sort> sort;
     uint16_t limit{20};
     Cursor cursor;
-    size_t query_hash{0};  ///< Pre-computed XXH3 hash from QueryHashFilter
+    std::string cache_key;  ///< Canonical binary buffer (L1 cache key identity)
 
-    /// Returns the pre-computed hash (from HTTP query string)
-    [[nodiscard]] size_t hash() const noexcept { return query_hash; }
+    /// Returns the canonical cache key
+    [[nodiscard]] const std::string& cacheKey() const noexcept { return cache_key; }
 
     [[nodiscard]] std::shared_ptr<const std::string> json() const {
         auto buffer = std::make_shared<std::string>();

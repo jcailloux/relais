@@ -1,5 +1,30 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed (Breaking)
+
+- **Cache key identity**: list cache keys are now canonical binary buffers instead of XXH3 hashes — eliminates collision risk and enables direct use as Redis keys
+  - `ListQuery::query_hash` (size_t) → `ListQuery::cache_key` (std::string)
+  - `ListQuery::hash()` → `ListQuery::cacheKey()`
+  - `ListDescriptorQuery` gains `group_key` (filters+sort) and `cache_key` (full page key)
+  - L1 list cache `CacheKey` type changed from `size_t` to `std::string`
+- xxhash dependency removed from list query pipeline
+
+### Added
+
+- **L2 (Redis) declarative list caching** in ListMixin — pages stored as BEVE binary with bounds header, group-level invalidation via Lua scripts
+  - `invalidateAllListGroups()` — manually invalidate all L2 list groups
+  - Redis key scheme: `{name}:dlist:p:{cache_key}` (pages), `{name}:dlist:g:{group_key}` (groups), `{name}:dlist_groups` (master set)
+- `DetachedTask` coroutine type — eager fire-and-forget for async work that doesn't need to be awaited
+- `ParseUtils.h` — lightweight parsing utilities extracted from the removed `QueryParser.h`
+- Entity generator now sorts filters alphabetically for deterministic cache keys
+
+### Removed
+
+- `QueryCacheKey.h` — replaced by canonical binary buffer approach (no more `HashBuffer`, `QueryCacheKey<Filters>`, `HashableFilters` concept)
+- `QueryParser.h` — parsing utilities moved to `ParseUtils.h`, query-level parsing handled by `HttpQueryParser`
+
 ## [0.4.0] - 2026-02-17
 
 ### Added

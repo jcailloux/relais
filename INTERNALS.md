@@ -374,7 +374,7 @@ This augmented descriptor is exposed as `ListDescriptorType` for use with `parse
 ListMixin uses **two independent shardmap instances** — one for entities, one for lists:
 
 - **Entity cache** (from CachedRepo): `shardmap::ShardMap<Key, EntityPtr, EntityCacheMetadata>` — keys = PK values
-- **List cache** (from ListMixin): `shardmap::ShardMap<size_t, ResultPtr, ListCacheMetadata>` — keys = XXH3 hash of query
+- **List cache** (from ListMixin): `shardmap::ShardMap<std::string, ResultPtr, ListCacheMetadata>` — keys = canonical binary buffer of query
 
 These are different template instantiations, so they are distinct static objects with independent `KeyTracker`, cleanup state, and segments. No collision is possible.
 

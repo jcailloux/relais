@@ -267,7 +267,7 @@ public:
     using BitmapType = typename ModTracker::BitmapType;
 
 private:
-    using CacheKey = size_t;  // Hash of query
+    using CacheKey = std::string;  // Canonical binary buffer
     using MetadataImpl = ListCacheMetadataImpl<FilterSet, SortFieldEnum>;
     using MetadataPtr = std::shared_ptr<MetadataImpl>;
 
@@ -311,7 +311,7 @@ public:
             trySweep();
         }
 
-        auto key = query.hash();
+        const auto& key = query.cacheKey();
         const auto now = Clock::now();
 
         return cache_.get(key, [this, &query, now](const ResultPtr& result, MetadataPtr& meta, uint8_t shard_id) {
@@ -341,7 +341,7 @@ public:
 
     /// Store result for a query with optional sort bounds
     void put(const Query& query, ResultPtr result, SortBounds bounds = {}) {
-        auto key = query.hash();
+        const auto& key = query.cacheKey();
 
         auto meta = std::make_shared<MetadataImpl>(
             query, Clock::now(), bounds,
@@ -386,7 +386,7 @@ public:
 
     /// Invalidate a specific query
     void invalidate(const Query& query) {
-        cache_.invalidate(query.hash());
+        cache_.invalidate(query.cacheKey());
     }
 
     // =========================================================================

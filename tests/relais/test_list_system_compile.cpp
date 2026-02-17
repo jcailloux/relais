@@ -10,7 +10,7 @@
  *   - compare, extractSortValue, parseSortField work correctly
  *   - HttpQueryParser works with std::unordered_map
  *   - ListCache, ModificationTracker compile in new namespace
- *   - QueryCacheKey, QueryParser in relais::cache namespace
+ *   - ParseUtils in relais::cache::parse namespace
  *
  * No database or Redis connection needed — all tests are structural.
  */
@@ -31,7 +31,7 @@
 #include "jcailloux/relais/list/ListCache.h"
 #include "jcailloux/relais/list/ModificationTracker.h"
 #include "jcailloux/relais/list/ListCacheTraits.h"
-// QueryCacheKey.h and QueryParser.h require xxhash — tested separately
+// ParseUtils.h — lightweight parsing utilities (no external dependency)
 
 // Entity wrapper for concept satisfaction
 #include "jcailloux/relais/wrapper/EntityWrapper.h"
@@ -39,7 +39,7 @@
 
 namespace decl = jcailloux::relais::cache::list::decl;
 namespace list = jcailloux::relais::cache::list;
-// namespace cache = jcailloux::relais::cache; // needs xxhash for QueryCacheKey
+namespace cache = jcailloux::relais::cache;
 
 // =============================================================================
 // Test entity — simple struct with public data members
@@ -383,7 +383,7 @@ TEST_CASE("ListDescriptorQuery struct", "[list_system][query]") {
     decl::ListDescriptorQuery<TestArticleDesc> query;
     REQUIRE(query.limit == 20);
     REQUIRE(!query.sort.has_value());
-    REQUIRE(query.query_hash == 0);
+    REQUIRE(query.cache_key.empty());
 }
 
 // =============================================================================

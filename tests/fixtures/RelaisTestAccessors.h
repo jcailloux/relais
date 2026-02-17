@@ -95,11 +95,11 @@ struct TestInternals {
     /// Read the shard_id for a cached list entry (for bitmap skip testing).
     /// Computed by ShardMap from the key (deterministic). Returns nullopt if not in cache.
     template<typename Repo>
-    static std::optional<uint8_t> getListEntryShardId(int64_t query_hash) {
+    static std::optional<uint8_t> getListEntryShardId(const std::string& cache_key) {
         auto& cache = Repo::listCache().cache_;
         uint8_t sid = 0;
         bool found = false;
-        cache.get(query_hash, [&](const auto&, const auto&, uint8_t shard_id) {
+        cache.get(cache_key, [&](const auto&, const auto&, uint8_t shard_id) {
             sid = shard_id;
             found = true;
             return jcailloux::shardmap::GetAction::Accept;
