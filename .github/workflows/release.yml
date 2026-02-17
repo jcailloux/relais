@@ -13,7 +13,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Extract changelog section
+        id: changelog
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          notes=$(awk "/^## \\[${version}\\]/{found=1; next} /^## \\[/{if(found) exit} found{print}" CHANGELOG.md)
+          {
+            echo "body<<EOF"
+            echo "$notes"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Create GitHub Release
-        run: gh release create ${{ github.ref_name }} --generate-notes
+        run: gh release create "${{ github.ref_name }}" --notes "${{ steps.changelog.outputs.body }}"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
