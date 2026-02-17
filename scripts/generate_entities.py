@@ -643,6 +643,8 @@ class MappingGenerator:
 
         lines = [
             "    struct SQL {",
+            f'        static constexpr const char* returning_columns =',
+            f'            "{all_cols_str}";',
             f"        static constexpr const char* select_by_pk =",
             f'            "SELECT {all_cols_str} '
             f'FROM {table_name} WHERE {a.primary_key} = $1";',

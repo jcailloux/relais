@@ -37,18 +37,20 @@ concept HasFieldUpdate = requires {
 };
 
 // =========================================================================
-// SQL helper for UPDATE ... RETURNING *
+// SQL helper for UPDATE ... RETURNING
 // =========================================================================
 
 namespace detail {
 
-/// Build: UPDATE "table" SET "col1"=$1, "col2"=$2 WHERE "pk"=$N RETURNING *
+/// Build: UPDATE "table" SET "col1"=$1, "col2"=$2 WHERE "pk"=$N RETURNING cols
 /// table_name is used as-is; pk_column is wrapped in double quotes;
-/// columns are expected pre-quoted (e.g. "\"name\"").
+/// columns are expected pre-quoted (e.g. "\"name\"");
+/// returning_columns is the explicit column list for RETURNING clause.
 inline std::string buildUpdateReturning(
     std::string_view table_name,
     std::string_view pk_column,
-    std::initializer_list<std::string_view> columns)
+    std::initializer_list<std::string_view> columns,
+    std::string_view returning_columns)
 {
     std::string sql;
     sql.reserve(128);
@@ -68,7 +70,8 @@ inline std::string buildUpdateReturning(
     sql += pk_column;
     sql += "\"=$";
     sql += std::to_string(param);
-    sql += " RETURNING *";
+    sql += " RETURNING ";
+    sql += returning_columns;
     return sql;
 }
 
@@ -234,7 +237,7 @@ public:
     // =====================================================================
 
     /// Partial update: modifies only the specified fields in the database.
-    /// Builds UPDATE ... SET col=$1, ... WHERE pk=$N RETURNING * (single query).
+    /// Builds UPDATE ... SET col=$1, ... WHERE pk=$N RETURNING cols (single query).
     /// Returns the re-fetched entity from DB (nullptr on error or not found).
     template<typename... Updates>
     static io::Task<WrapperPtrType> patch(const Key& id, Updates&&... updates)
@@ -248,7 +251,8 @@ public:
             static const auto sql = detail::buildUpdateReturning(
                 Mapping::table_name,
                 Mapping::primary_key_column,
-                {wrapper::fieldColumnName<typename Entity::TraitsType>(updates)...});
+                {wrapper::fieldColumnName<typename Entity::TraitsType>(updates)...},
+                Mapping::SQL::returning_columns);
 
             // Build params: field values first, then PK at the end
             auto params = io::PgParams::make(

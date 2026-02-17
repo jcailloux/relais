@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(jcailloux-relais VERSION 0.3.0 LANGUAGES CXX)
+project(jcailloux-relais VERSION 0.3.1 LANGUAGES CXX)
 
 add_library(jcailloux-relais INTERFACE)
 add_library(jcailloux::relais ALIAS jcailloux-relais)
