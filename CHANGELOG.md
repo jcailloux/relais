@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.4.0] - 2026-02-17
+
+### Added
+
+- `column=` annotation in entity generator: maps C++ field names to different PostgreSQL column names (e.g. `// @relais column=product_name`), falls back to the C++ name when omitted
+
+### Fixed
+
+- `init_test_db.sh` migration directory path resolution
+
 ## [0.3.1] - 2026-02-17
 
 ### Fixed

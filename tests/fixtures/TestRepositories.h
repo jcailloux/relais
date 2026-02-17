@@ -18,6 +18,7 @@
 #include "generated/TestArticleWrapper.h"
 #include "generated/TestPurchaseWrapper.h"
 #include "generated/TestEventWrapper.h"
+#include "generated/TestProductWrapper.h"
 
 namespace relais_test {
 
@@ -34,6 +35,7 @@ using entity::generated::TestPurchaseWrapper;
 using TestArticleList = entity::generated::TestArticleListWrapper;
 using TestPurchaseList = entity::generated::TestPurchaseListWrapper;
 using entity::generated::TestEventWrapper;
+using entity::generated::TestProductWrapper;
 
 // Cross-invalidation key extractors
 inline constexpr auto purchaseUserId = [](const auto& p) -> int64_t { return p.user_id; };
@@ -223,6 +225,30 @@ using ReadOnlyL2TestItemRepo = Repo<TestItemWrapper, "test:readonly:l2", test_co
 /// L2 read-only user — Redis caching, no writes.
 /// RedisRepo provides invalidate() for cross-invalidation target use.
 using ReadOnlyL2TestUserRepo = Repo<TestUserWrapper, "test:readonly:user:l2", test_config::ReadOnlyL2>;
+
+// =============================================================================
+// Product Repositories (column= mapping: C++ field names ≠ DB column names)
+// =============================================================================
+
+using UncachedTestProductRepo = Repo<TestProductWrapper, "test:product:uncached", cfg::Uncached>;
+
+inline auto makeTestProduct(
+    const std::string& productName,
+    int32_t stockLevel = 0,
+    std::optional<int32_t> discountPct = std::nullopt,
+    bool available = true,
+    const std::string& description = {},
+    int64_t id = 0
+) {
+    TestProductWrapper entity;
+    entity.id = id;
+    entity.productName = productName;
+    entity.stockLevel = stockLevel;
+    entity.discountPct = discountPct;
+    entity.available = available;
+    entity.description = description;
+    return std::make_shared<const TestProductWrapper>(std::move(entity));
+}
 
 // =============================================================================
 // Event Construction Helper
