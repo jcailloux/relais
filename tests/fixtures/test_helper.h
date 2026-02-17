@@ -371,6 +371,7 @@ private:
         try { sync(pg->query("DELETE FROM relais_test_articles")); } catch (...) {}
         try { sync(pg->query("DELETE FROM relais_test_users")); } catch (...) {}
         try { sync(pg->query("DELETE FROM relais_test_items")); } catch (...) {}
+        try { sync(pg->query("DELETE FROM relais_test_products")); } catch (...) {}
     }
 };
 
@@ -556,6 +557,34 @@ inline void updateTestEvent(int64_t id, const std::string& title, int32_t priori
         "UPDATE relais_test_events SET title = $1, priority = $2 WHERE id = $3",
         title, priority, id
     );
+}
+
+// =============================================================================
+// Product (column= mapping) helpers
+// =============================================================================
+
+inline int64_t insertTestProduct(
+    const std::string& productName,
+    int32_t stockLevel = 0,
+    std::optional<int32_t> discountPct = std::nullopt,
+    bool available = true,
+    const std::string& description = ""
+) {
+    if (discountPct.has_value()) {
+        auto result = execQueryArgs(
+            "INSERT INTO relais_test_products (product_name, stock_level, discount_pct, is_available, description) "
+            "VALUES ($1, $2, $3, $4, $5) RETURNING id",
+            productName, stockLevel, *discountPct, available, description
+        );
+        return result[0].get<int64_t>(0);
+    } else {
+        auto result = execQueryArgs(
+            "INSERT INTO relais_test_products (product_name, stock_level, is_available, description) "
+            "VALUES ($1, $2, $3, $4) RETURNING id",
+            productName, stockLevel, available, description
+        );
+        return result[0].get<int64_t>(0);
+    }
 }
 
 // =============================================================================

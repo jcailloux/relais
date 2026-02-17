@@ -20,6 +20,7 @@
 #include "fixtures/generated/TestUserWrapper.h"
 #include "fixtures/generated/TestOrderWrapper.h"
 #include "fixtures/generated/TestEventWrapper.h"
+#include "fixtures/generated/TestProductWrapper.h"
 
 using namespace jcailloux::relais;
 
@@ -38,6 +39,8 @@ using OrderRepo = BaseRepo<
     entity::generated::TestOrderWrapper, "test:order", config::Uncached, int64_t>;
 using EventRepo = BaseRepo<
     entity::generated::TestEventWrapper, "test:event", config::Uncached, int64_t>;
+using ProductRepo = BaseRepo<
+    entity::generated::TestProductWrapper, "test:product", config::Uncached, int64_t>;
 
 // Read-only repo
 using ReadOnlyItemRepo = BaseRepo<
@@ -485,5 +488,154 @@ TEST_CASE("List cache key building", "[base_repo]") {
     SECTION("makeGroupKey with mixed parts") {
         auto key = UserRepo::makeGroupKey("guild", int64_t(123));
         REQUIRE(key == "test:user:list:guild:123");
+    }
+}
+
+// =========================================================================
+// column= mapping tests (C++ field names ≠ DB column names)
+// =========================================================================
+
+TEST_CASE("SQL strings with column= mapping", "[base_repo][sql][column_mapping]") {
+    using M = entity::generated::TestProductMapping;
+
+    SECTION("select_by_pk uses DB column names for mapped fields") {
+        std::string sql = M::SQL::select_by_pk;
+        // column= mapped fields use DB names
+        REQUIRE(sql.find("product_name") != std::string::npos);
+        REQUIRE(sql.find("stock_level") != std::string::npos);
+        REQUIRE(sql.find("discount_pct") != std::string::npos);
+        REQUIRE(sql.find("is_available") != std::string::npos);
+        REQUIRE(sql.find("created_at") != std::string::npos);
+        // Non-mapped field keeps its C++ name (which IS the DB name)
+        REQUIRE(sql.find("description") != std::string::npos);
+        // Must NOT contain C++ field names that differ from DB names
+        REQUIRE(sql.find("productName") == std::string::npos);
+        REQUIRE(sql.find("stockLevel") == std::string::npos);
+        REQUIRE(sql.find("discountPct") == std::string::npos);
+        REQUIRE(sql.find("createdAt") == std::string::npos);
+    }
+
+    SECTION("insert uses DB column names for mapped fields and auto for others") {
+        std::string sql = M::SQL::insert;
+        REQUIRE(sql.find("product_name") != std::string::npos);
+        REQUIRE(sql.find("stock_level") != std::string::npos);
+        REQUIRE(sql.find("description") != std::string::npos);
+        REQUIRE(sql.find("productName") == std::string::npos);
+    }
+
+    SECTION("update uses DB column names for mapped fields and auto for others") {
+        std::string sql = M::SQL::update;
+        REQUIRE(sql.find("product_name") != std::string::npos);
+        REQUIRE(sql.find("stock_level") != std::string::npos);
+        REQUIRE(sql.find("description") != std::string::npos);
+        REQUIRE(sql.find("productName") == std::string::npos);
+    }
+
+    SECTION("returning_columns mixes mapped and auto column names") {
+        std::string ret = M::SQL::returning_columns;
+        REQUIRE(ret.find("product_name") != std::string::npos);
+        REQUIRE(ret.find("stock_level") != std::string::npos);
+        REQUIRE(ret.find("is_available") != std::string::npos);
+        REQUIRE(ret.find("created_at") != std::string::npos);
+        REQUIRE(ret.find("description") != std::string::npos);
+        REQUIRE(ret.find("productName") == std::string::npos);
+    }
+
+    SECTION("returning_columns matches select_by_pk column order") {
+        std::string select = M::SQL::select_by_pk;
+        std::string expected_prefix = "SELECT " + std::string(M::SQL::returning_columns) + " FROM";
+        REQUIRE(select.find(expected_prefix) == 0);
+    }
+}
+
+TEST_CASE("column= mapping preserves C++ identifiers", "[base_repo][column_mapping]") {
+    using M = entity::generated::TestProductMapping;
+
+    SECTION("Col enum uses C++ field names") {
+        REQUIRE(M::Col::productName == 1);
+        REQUIRE(M::Col::stockLevel == 2);
+        REQUIRE(M::Col::discountPct == 3);
+        REQUIRE(M::Col::available == 4);
+        REQUIRE(M::Col::description == 5);
+        REQUIRE(M::Col::createdAt == 6);
+    }
+
+    SECTION("Field enum uses C++ field names") {
+        using Field = M::TraitsType::Field;
+        // These compile = C++ names are used in the enum
+        [[maybe_unused]] auto f1 = Field::productName;
+        [[maybe_unused]] auto f2 = Field::stockLevel;
+        [[maybe_unused]] auto f3 = Field::discountPct;
+        [[maybe_unused]] auto f4 = Field::available;
+        [[maybe_unused]] auto f5 = Field::description;
+    }
+
+    SECTION("primary_key_column is DB name") {
+        REQUIRE(std::string(M::primary_key_column) == "id");
+    }
+
+    SECTION("table_name is correct") {
+        REQUIRE(std::string(M::table_name) == "relais_test_products");
+    }
+}
+
+TEST_CASE("FieldInfo column_name uses DB name with column= mapping", "[base_repo][field_update][column_mapping]") {
+    using Traits = entity::generated::TestProductMapping::TraitsType;
+    using Field = Traits::Field;
+
+    SECTION("fieldColumnName returns DB column name") {
+        auto update = wrapper::set<Field::productName>(std::string("test"));
+        auto col = wrapper::fieldColumnName<Traits>(update);
+        REQUIRE(col == "\"product_name\"");
+    }
+
+    SECTION("fieldColumnName for integer field") {
+        auto update = wrapper::set<Field::stockLevel>(42);
+        auto col = wrapper::fieldColumnName<Traits>(update);
+        REQUIRE(col == "\"stock_level\"");
+    }
+
+    SECTION("fieldColumnName for boolean field") {
+        auto update = wrapper::set<Field::available>(true);
+        auto col = wrapper::fieldColumnName<Traits>(update);
+        REQUIRE(col == "\"is_available\"");
+    }
+
+    SECTION("fieldColumnName for nullable field") {
+        auto update = wrapper::setNull<Field::discountPct>();
+        auto col = wrapper::fieldColumnName<Traits>(update);
+        REQUIRE(col == "\"discount_pct\"");
+    }
+
+    SECTION("fieldColumnName for non-mapped field uses C++ name as DB name") {
+        auto update = wrapper::set<Field::description>(std::string("test"));
+        auto col = wrapper::fieldColumnName<Traits>(update);
+        REQUIRE(col == "\"description\"");
+    }
+}
+
+TEST_CASE("buildUpdateReturning with column= mapping", "[base_repo][sql][column_mapping]") {
+    using M = entity::generated::TestProductMapping;
+    using Traits = M::TraitsType;
+    using Field = Traits::Field;
+
+    SECTION("produces SQL with DB column names") {
+        auto update1 = wrapper::set<Field::productName>(std::string("x"));
+        auto update2 = wrapper::set<Field::stockLevel>(10);
+
+        auto sql = detail::buildUpdateReturning(
+            M::table_name, M::primary_key_column,
+            {wrapper::fieldColumnName<Traits>(update1),
+             wrapper::fieldColumnName<Traits>(update2)},
+            M::SQL::returning_columns);
+
+        // SET clause uses DB names
+        REQUIRE(sql.find("\"product_name\"=$1") != std::string::npos);
+        REQUIRE(sql.find("\"stock_level\"=$2") != std::string::npos);
+        // RETURNING uses DB names
+        REQUIRE(sql.find("RETURNING id, product_name, stock_level") != std::string::npos);
+        // No C++ names in SQL
+        REQUIRE(sql.find("productName") == std::string::npos);
+        REQUIRE(sql.find("stockLevel") == std::string::npos);
     }
 }

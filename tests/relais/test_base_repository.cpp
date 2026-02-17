@@ -1116,3 +1116,172 @@ TEST_CASE("BaseRepo - uncached list queries (listAs)", "[integration][db][base][
         REQUIRE(result.empty());
     }
 }
+
+// #############################################################################
+//
+//  8. TestProduct — column= mapping (C++ field names ≠ DB column names)
+//
+// #############################################################################
+
+using ProductField = TestProductWrapper::Field;
+
+TEST_CASE("BaseRepo<TestProduct> - find with column= mapping", "[integration][db][base][product][column_mapping]") {
+    TransactionGuard tx;
+
+    SECTION("[find] returns entity with mapped column names") {
+        auto id = insertTestProduct("Widget", 50, std::optional<int32_t>{10}, true, "A fine widget");
+
+        auto result = sync(UncachedTestProductRepo::find(id));
+
+        REQUIRE(result != nullptr);
+        REQUIRE(result->id == id);
+        REQUIRE(result->productName == "Widget");
+        REQUIRE(result->stockLevel == 50);
+        REQUIRE(result->discountPct == 10);
+        REQUIRE(result->available == true);
+        REQUIRE(result->description == "A fine widget");
+    }
+
+    SECTION("[find] returns nullptr for non-existent id") {
+        auto result = sync(UncachedTestProductRepo::find(999999999));
+        REQUIRE(result == nullptr);
+    }
+}
+
+TEST_CASE("BaseRepo<TestProduct> - insert with column= mapping", "[integration][db][base][product][column_mapping]") {
+    TransactionGuard tx;
+
+    SECTION("[insert] inserts entity and returns with generated id") {
+        auto result = sync(UncachedTestProductRepo::insert(
+            makeTestProduct("Gadget", 100, std::optional<int32_t>{25}, true, "A cool gadget")));
+
+        REQUIRE(result != nullptr);
+        REQUIRE(result->id > 0);
+        REQUIRE(result->productName == "Gadget");
+        REQUIRE(result->stockLevel == 100);
+        REQUIRE(result->discountPct == 25);
+        REQUIRE(result->available == true);
+        REQUIRE(result->description == "A cool gadget");
+    }
+
+    SECTION("[insert] entity is retrievable after insert") {
+        auto created = sync(UncachedTestProductRepo::insert(
+            makeTestProduct("Doohickey", 5)));
+        REQUIRE(created != nullptr);
+
+        auto fetched = sync(UncachedTestProductRepo::find(created->id));
+        REQUIRE(fetched != nullptr);
+        REQUIRE(fetched->productName == "Doohickey");
+        REQUIRE(fetched->stockLevel == 5);
+    }
+
+    SECTION("[insert] with null optional field") {
+        auto result = sync(UncachedTestProductRepo::insert(
+            makeTestProduct("No Discount", 10, std::nullopt, true)));
+        REQUIRE(result != nullptr);
+
+        auto fetched = sync(UncachedTestProductRepo::find(result->id));
+        REQUIRE(fetched != nullptr);
+        REQUIRE_FALSE(fetched->discountPct.has_value());
+    }
+}
+
+TEST_CASE("BaseRepo<TestProduct> - update with column= mapping", "[integration][db][base][product][column_mapping]") {
+    TransactionGuard tx;
+
+    SECTION("[update] modifies existing entity") {
+        auto id = insertTestProduct("Original", 10, std::nullopt, true, "old desc");
+
+        auto success = sync(UncachedTestProductRepo::update(id,
+            makeTestProduct("Updated", 20, std::optional<int32_t>{15}, false, "new desc", id)));
+        REQUIRE(success == true);
+
+        auto fetched = sync(UncachedTestProductRepo::find(id));
+        REQUIRE(fetched != nullptr);
+        REQUIRE(fetched->productName == "Updated");
+        REQUIRE(fetched->stockLevel == 20);
+        REQUIRE(fetched->discountPct == 15);
+        REQUIRE(fetched->available == false);
+        REQUIRE(fetched->description == "new desc");
+    }
+}
+
+TEST_CASE("BaseRepo<TestProduct> - erase with column= mapping", "[integration][db][base][product][column_mapping]") {
+    TransactionGuard tx;
+
+    SECTION("[erase] deletes existing entity") {
+        auto id = insertTestProduct("To Delete", 0);
+
+        auto erased = sync(UncachedTestProductRepo::erase(id));
+        REQUIRE(erased.has_value());
+        REQUIRE(*erased == 1);
+
+        REQUIRE(sync(UncachedTestProductRepo::find(id)) == nullptr);
+    }
+}
+
+TEST_CASE("BaseRepo<TestProduct> - patch with column= mapping", "[integration][db][base][product][column_mapping][patch]") {
+    TransactionGuard tx;
+
+    SECTION("[patch] updates only productName, other fields intact") {
+        auto id = insertTestProduct("Original", 50, std::optional<int32_t>{10}, true);
+
+        auto result = sync(UncachedTestProductRepo::patch(id,
+            set<ProductField::productName>(std::string("Patched"))));
+
+        REQUIRE(result != nullptr);
+        REQUIRE(result->productName == "Patched");
+        REQUIRE(result->stockLevel == 50);
+        REQUIRE(result->discountPct == 10);
+        REQUIRE(result->available == true);
+    }
+
+    SECTION("[patch] updates multiple mapped fields") {
+        auto id = insertTestProduct("Multi", 100, std::optional<int32_t>{5}, true);
+
+        auto result = sync(UncachedTestProductRepo::patch(id,
+            set<ProductField::stockLevel>(200),
+            set<ProductField::available>(false)));
+
+        REQUIRE(result != nullptr);
+        REQUIRE(result->productName == "Multi");
+        REQUIRE(result->stockLevel == 200);
+        REQUIRE(result->available == false);
+        REQUIRE(result->discountPct == 5);
+    }
+
+    SECTION("[patch] setNull on nullable mapped field") {
+        auto id = insertTestProduct("Nullable", 10, std::optional<int32_t>{20}, true);
+
+        auto result = sync(UncachedTestProductRepo::patch(id,
+            setNull<ProductField::discountPct>()));
+
+        REQUIRE(result != nullptr);
+        REQUIRE_FALSE(result->discountPct.has_value());
+    }
+
+    SECTION("[patch] updates non-mapped field (description)") {
+        auto id = insertTestProduct("WithDesc", 10, std::nullopt, true, "original");
+
+        auto result = sync(UncachedTestProductRepo::patch(id,
+            set<ProductField::description>(std::string("patched desc"))));
+
+        REQUIRE(result != nullptr);
+        REQUIRE(result->description == "patched desc");
+        REQUIRE(result->productName == "WithDesc");
+        REQUIRE(result->stockLevel == 10);
+    }
+
+    SECTION("[patch] returned entity reflects DB state") {
+        auto id = insertTestProduct("Verify", 30);
+
+        auto result = sync(UncachedTestProductRepo::patch(id,
+            set<ProductField::stockLevel>(999)));
+        REQUIRE(result != nullptr);
+
+        auto fetched = sync(UncachedTestProductRepo::find(id));
+        REQUIRE(fetched != nullptr);
+        REQUIRE(fetched->stockLevel == 999);
+        REQUIRE(fetched->stockLevel == result->stockLevel);
+    }
+}

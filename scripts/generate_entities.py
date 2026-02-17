@@ -36,10 +36,16 @@ class DataMember:
     name: str
     cpp_type: str
     default: str = ""
+    db_column: str = ""
     tags: set[str] = field(default_factory=set)
     enum_pairs: list[tuple[str, str]] = field(default_factory=list)
     filter_configs: list[FilterConfig] = field(default_factory=list)
     sort_configs: list[SortConfig] = field(default_factory=list)
+
+    @property
+    def col_name(self) -> str:
+        """DB column name (falls back to C++ field name)."""
+        return self.db_column or self.name
 
     @property
     def is_optional(self) -> bool:
@@ -386,6 +392,7 @@ class StructParser:
                 name = m.group(2)
                 default = m.group(3).strip() if m.group(3) else ""
                 tags = set()
+                db_column = ""
                 enum_pairs = []
                 flt_configs = []
                 srt_configs = []
@@ -401,6 +408,8 @@ class StructParser:
                                     enum_pairs.append((parts[0], parts[1]))
                         elif tag == 'enum':
                             tags.add('auto_enum')
+                        elif tag.startswith('column='):
+                            db_column = tag[7:]
                         elif tag.startswith('filterable'):
                             flt_configs.append(
                                 self._parse_filterable_tag(name, tag))
@@ -410,7 +419,7 @@ class StructParser:
                         else:
                             tags.add(tag)
                 members.append(DataMember(
-                    name, cpp_type, default, tags, enum_pairs,
+                    name, cpp_type, default, db_column, tags, enum_pairs,
                     flt_configs, srt_configs))
 
         return members
@@ -565,7 +574,7 @@ class MappingGenerator:
             f"struct {mapping_name} {{",
             f"    static constexpr bool read_only = {'true' if a.read_only else 'false'};",
             f'    static constexpr const char* table_name = "{table_name}";',
-            f'    static constexpr const char* primary_key_column = "{a.primary_key}";',
+            f'    static constexpr const char* primary_key_column = "{self._col(entity, a.primary_key)}";',
             "",
         ]
 
@@ -628,16 +637,17 @@ class MappingGenerator:
 
     def _generate_sql_struct(self, entity: ParsedEntity, table_name: str) -> list[str]:
         a = entity.annotation
-        all_cols = [m.name for m in entity.members]
+        pk_col = self._col(entity, a.primary_key)
+        all_cols = [m.col_name for m in entity.members]
         all_cols_str = ", ".join(all_cols)
 
         # INSERT: skip db_managed fields
-        insert_cols = [m.name for m in entity.members if m.name not in a.db_managed]
+        insert_cols = [m.col_name for m in entity.members if m.name not in a.db_managed]
         insert_cols_str = ", ".join(insert_cols)
         insert_params = ", ".join(f"${i+1}" for i in range(len(insert_cols)))
 
         # UPDATE: skip PK (PK goes in WHERE clause as $1) and db_managed fields
-        update_cols = [m.name for m in entity.members if m.name != a.primary_key and m.name not in a.db_managed]
+        update_cols = [m.col_name for m in entity.members if m.name != a.primary_key and m.name not in a.db_managed]
         update_set = ", ".join(
             f"{col}=${i+2}" for i, col in enumerate(update_cols))
 
@@ -647,7 +657,7 @@ class MappingGenerator:
             f'            "{all_cols_str}";',
             f"        static constexpr const char* select_by_pk =",
             f'            "SELECT {all_cols_str} '
-            f'FROM {table_name} WHERE {a.primary_key} = $1";',
+            f'FROM {table_name} WHERE {pk_col} = $1";',
             f"        static constexpr const char* insert =",
             f'            "INSERT INTO {table_name} ({insert_cols_str}) '
             f'VALUES ({insert_params}) RETURNING {all_cols_str}";',
@@ -657,17 +667,18 @@ class MappingGenerator:
             lines.append(f"        static constexpr const char* update =")
             lines.append(
                 f'            "UPDATE {table_name} SET {update_set} '
-                f'WHERE {a.primary_key} = $1";')
+                f'WHERE {pk_col} = $1";')
 
         lines.append(f"        static constexpr const char* delete_by_pk =")
         lines.append(
-            f'            "DELETE FROM {table_name} WHERE {a.primary_key} = $1";')
+            f'            "DELETE FROM {table_name} WHERE {pk_col} = $1";')
 
         # Full composite key DELETE for partition pruning (when partition_keys present)
         if a.partition_keys:
-            where_parts = [f"{a.primary_key} = $1"]
+            where_parts = [f"{pk_col} = $1"]
             for i, pk in enumerate(a.partition_keys):
-                where_parts.append(f"{pk} = ${i + 2}")
+                pk_db_col = self._col(entity, pk)
+                where_parts.append(f"{pk_db_col} = ${i + 2}")
             where_clause = " AND ".join(where_parts)
             lines.append(f"        static constexpr const char* delete_by_full_pk =")
             lines.append(
@@ -875,16 +886,17 @@ class MappingGenerator:
             lines.append("        static constexpr auto filters = std::tuple{")
             for i, f in enumerate(a.filters):
                 comma = "," if i < len(a.filters) - 1 else ""
+                f_col = self._col(entity, f.field)
                 if f.op == "eq":
                     lines.append(
                         f'            {decl_ns}::Filter<'
-                        f'"{f.param}", &{struct_fqn}::{f.field}, "{f.field}"'
+                        f'"{f.param}", &{struct_fqn}::{f.field}, "{f_col}"'
                         f'>{{}}{comma}')
                 else:
                     op_str = f.op.upper()
                     lines.append(
                         f'            {decl_ns}::Filter<'
-                        f'"{f.param}", &{struct_fqn}::{f.field}, "{f.field}", '
+                        f'"{f.param}", &{struct_fqn}::{f.field}, "{f_col}", '
                         f'{decl_ns}::Op::{op_str}'
                         f'>{{}}{comma}')
             lines.append("        };")
@@ -894,11 +906,12 @@ class MappingGenerator:
             lines.append("        static constexpr auto sorts = std::tuple{")
             for i, s in enumerate(a.sorts):
                 comma = "," if i < len(a.sorts) - 1 else ""
+                s_col = self._col(entity, s.field)
                 direction = ("SortDirection::Desc" if s.direction == "desc"
                              else "SortDirection::Asc")
                 lines.append(
                     f'            {decl_ns}::Sort<'
-                    f'"{s.param}", &{struct_fqn}::{s.field}, "{s.field}", '
+                    f'"{s.param}", &{struct_fqn}::{s.field}, "{s_col}", '
                     f'{decl_ns}::{direction}'
                     f'>{{}}{comma}')
             lines.append("        };")
@@ -938,7 +951,7 @@ class MappingGenerator:
             lines.append(f"template<>")
             lines.append(f"struct {traits_path}::FieldInfo<{traits_path}::Field::{m.name}> {{")
             lines.append(f"    using value_type = {value_type};")
-            lines.append(f'    static constexpr const char* column_name = "\\"{m.name}\\"";')
+            lines.append(f'    static constexpr const char* column_name = "\\"{m.col_name}\\"";')
             lines.append(f"    static constexpr bool is_timestamp = {'true' if is_timestamp else 'false'};")
             lines.append(f"    static constexpr bool is_nullable = {'true' if is_nullable else 'false'};")
             lines.append("};")
@@ -1072,6 +1085,14 @@ class MappingGenerator:
             if em.field_name == field_name:
                 return em
         return None
+
+    @staticmethod
+    def _col(entity: ParsedEntity, field_name: str) -> str:
+        """Resolve DB column name for a field (falls back to field name)."""
+        for m in entity.members:
+            if m.name == field_name:
+                return m.col_name
+        return field_name
 
     @staticmethod
     def _qualify_type(entity: ParsedEntity, cpp_type: str) -> str:

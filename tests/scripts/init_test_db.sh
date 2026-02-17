@@ -15,8 +15,7 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-MIGRATIONS_DIR="$PROJECT_DIR/tests/migrations"
+MIGRATIONS_DIR="$SCRIPT_DIR/migrations"
 
 DB_NAME="relais_test"
 DB_USER="relais_test"
