@@ -59,7 +59,44 @@ namespace relais_test {
 namespace test_l2 {
 using namespace jcailloux::relais::config;
 inline constexpr auto RedisShortTTL = Redis.with_l2_ttl(std::chrono::seconds{2});
+inline constexpr auto RedisJson = Redis.with_l2_format(L2Format::Json);
 } // namespace test_l2
+
+// =============================================================================
+// L2 repos with forced JSON format (for l2_format tests)
+// =============================================================================
+
+/// TestUser normally uses BEVE; this repo forces JSON in Redis.
+using L2JsonTestUserRepo = Repo<TestUserWrapper, "test:user:l2:json", test_l2::RedisJson>;
+
+/// Article list repo with forced JSON format (lists normally stored as BEVE).
+class L2JsonTestArticleListRepo : public Repo<TestArticleWrapper, "test:article:list:l2:json", test_l2::RedisJson> {
+public:
+    static io::Task<std::vector<TestArticleWrapper>> getByCategory(
+        const std::string& category, int limit = 10)
+    {
+        co_return co_await cachedList(
+            [category, limit]() -> io::Task<std::vector<TestArticleWrapper>> {
+                auto result = co_await jcailloux::relais::DbProvider::queryArgs(
+                    "SELECT id, category, author_id, title, view_count, is_published, published_at, created_at "
+                    "FROM relais_test_articles WHERE category = $1 ORDER BY created_at DESC LIMIT $2",
+                    category, limit);
+                std::vector<TestArticleWrapper> entities;
+                for (size_t i = 0; i < result.rows(); ++i) {
+                    if (auto e = entity::generated::TestArticleMapping::fromRow<TestArticleWrapper>(result[i]))
+                        entities.push_back(std::move(*e));
+                }
+                co_return entities;
+            },
+            "category", category
+        );
+    }
+
+    static io::Task<bool> invalidateCategoryList(const std::string& category) {
+        auto key = makeListCacheKey("category", category);
+        co_return co_await jcailloux::relais::cache::RedisCache::invalidate(key);
+    }
+};
 
 // =============================================================================
 // L2 repos — RedisRepo provides invalidate() natively
@@ -593,6 +630,40 @@ TEST_CASE("RedisRepo - findJson", "[integration][db][redis][json]") {
         auto result2 = sync(L2TestItemRepo::findJson(id));
         REQUIRE(result2 != nullptr);
         REQUIRE(result2->find("\"Cache JSON\"") != std::string::npos);
+    }
+}
+
+// #############################################################################
+//
+//  3a-bis. findJson on BEVE entity — direct beve_to_json transcoding
+//
+// #############################################################################
+
+TEST_CASE("RedisRepo - findJson on BEVE entity", "[integration][db][redis][json][beve-to-json]") {
+    TransactionGuard tx;
+
+    SECTION("[json] transcodes BEVE to JSON directly from Redis") {
+        auto id = insertTestUser("beve_json", "bj@test.com", 750);
+
+        // First call — DB fetch, stored as BEVE in Redis, JSON returned via entity
+        auto result1 = sync(L2TestUserRepo::findJson(id));
+        REQUIRE(result1 != nullptr);
+        REQUIRE(result1->find("\"beve_json\"") != std::string::npos);
+        REQUIRE(result1->find("750") != std::string::npos);
+
+        // Modify DB directly
+        updateTestUserBalance(id, 999);
+
+        // Second call — BEVE in Redis transcoded directly to JSON (no entity construction)
+        auto result2 = sync(L2TestUserRepo::findJson(id));
+        REQUIRE(result2 != nullptr);
+        REQUIRE(result2->find("\"beve_json\"") != std::string::npos);
+        REQUIRE(result2->find("750") != std::string::npos);  // Still cached
+    }
+
+    SECTION("[json] returns nullptr for non-existent id") {
+        auto result = sync(L2TestUserRepo::findJson(999999999));
+        REQUIRE(result == nullptr);
     }
 }
 
@@ -2270,5 +2341,106 @@ TEST_CASE("RedisRepo - InvalidateListVia mixed granularity",
 
         // News page 0: INVALIDATED (per-group, all pages deleted)
         CHECK(sync(redisExists(selectivePageKey("news", 5, 0))) == 0);
+    }
+}
+
+
+// #############################################################################
+//
+//  L2 Format — forced JSON serialization for BEVE-capable entities
+//
+// #############################################################################
+
+TEST_CASE("RedisRepo - l2_format Json", "[integration][db][redis][l2-format]") {
+    TransactionGuard tx;
+
+    SECTION("[find] BEVE entity stored as JSON in Redis when l2_format is Json") {
+        auto id = insertTestUser("json_format", "json@test.com", 500);
+
+        // First fetch — DB, cached as JSON (not binary) in Redis
+        auto result1 = sync(L2JsonTestUserRepo::find(id));
+        REQUIRE(result1 != nullptr);
+        REQUIRE(result1->username == "json_format");
+        REQUIRE(result1->balance == 500);
+
+        // Verify Redis contains JSON (not binary) by reading raw string
+        auto rawJson = sync(L2JsonTestUserRepo::findJson(id));
+        REQUIRE(rawJson != nullptr);
+        REQUIRE(rawJson->find("\"json_format\"") != std::string::npos);
+
+        // Modify DB directly
+        updateTestUserBalance(id, 999);
+
+        // Second fetch — served from JSON cache (still old value)
+        auto result2 = sync(L2JsonTestUserRepo::find(id));
+        REQUIRE(result2 != nullptr);
+        REQUIRE(result2->balance == 500);
+    }
+
+    SECTION("[findBinary] returns binary even when cache stores JSON") {
+        auto id = insertTestUser("json_to_bin", "j2b@test.com", 300);
+
+        // findBinary on a Json-format repo: fetches entity (from JSON cache), returns binary
+        auto bin = sync(L2JsonTestUserRepo::findBinary(id));
+        REQUIRE(bin != nullptr);
+        REQUIRE(!bin->empty());
+
+        // Roundtrip: deserialize BEVE back to entity
+        auto entity = TestUserWrapper::fromBinary(*bin);
+        REQUIRE(entity.has_value());
+        REQUIRE(entity->username == "json_to_bin");
+        REQUIRE(entity->balance == 300);
+    }
+
+    SECTION("[insert] populates Redis with JSON for BEVE entity") {
+        auto created = sync(L2JsonTestUserRepo::insert(makeTestUser("json_insert", "ji@test.com", 42)));
+        REQUIRE(created != nullptr);
+
+        // Verify cache is JSON
+        auto rawJson = sync(L2JsonTestUserRepo::findJson(created->id));
+        REQUIRE(rawJson != nullptr);
+        REQUIRE(rawJson->find("\"json_insert\"") != std::string::npos);
+    }
+
+    SECTION("[update] invalidates JSON cache") {
+        auto id = insertTestUser("json_upd", "ju@test.com", 100);
+
+        // Populate cache
+        sync(L2JsonTestUserRepo::find(id));
+
+        // Update — invalidates cache (default strategy)
+        auto success = sync(L2JsonTestUserRepo::update(id,
+            makeTestUser("json_upd_new", "ju@test.com", 200, id)));
+        REQUIRE(success);
+
+        // Re-fetch — should get fresh data from DB
+        auto fetched = sync(L2JsonTestUserRepo::find(id));
+        REQUIRE(fetched != nullptr);
+        REQUIRE(fetched->username == "json_upd_new");
+        REQUIRE(fetched->balance == 200);
+    }
+
+    SECTION("[list] l2_format Json stores lists as JSON in Redis") {
+        auto userId = insertTestUser("list_json_author", "lj@test.com", 0);
+        insertTestArticle("json_list_cat", userId, "JL Article 1", 10, true);
+        insertTestArticle("json_list_cat", userId, "JL Article 2", 20, true);
+
+        // First query — cache miss, stored as JSON in Redis
+        auto result1 = sync(L2JsonTestArticleListRepo::getByCategory("json_list_cat"));
+        REQUIRE(result1.size() == 2);
+        REQUIRE(result1[0].title == "JL Article 2");
+        REQUIRE(result1[1].title == "JL Article 1");
+
+        // Insert directly in DB (bypass repo)
+        insertTestArticle("json_list_cat", userId, "JL Article 3", 30, true);
+
+        // Second query — cache hit, still 2 articles
+        auto result2 = sync(L2JsonTestArticleListRepo::getByCategory("json_list_cat"));
+        REQUIRE(result2.size() == 2);
+
+        // Invalidate and re-query — should see 3 articles
+        sync(L2JsonTestArticleListRepo::invalidateCategoryList("json_list_cat"));
+        auto result3 = sync(L2JsonTestArticleListRepo::getByCategory("json_list_cat"));
+        REQUIRE(result3.size() == 3);
     }
 }

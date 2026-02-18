@@ -10,11 +10,12 @@ namespace jcailloux::relais {
 /**
  * Repo with L2 Redis caching on top of L3 database.
  *
- * Automatically selects binary or JSON serialization based on Entity capabilities:
- * - Binary (BEVE entities): stored and served as binary
- * - JSON (JSON entities): stored and served as JSON
+ * Serialization format is controlled by CacheConfig::l2_format:
+ * - Binary (default): uses BEVE for entities that support HasBinarySerialization
+ * - Json: always uses JSON (useful for interop with non-C++ consumers)
  *
- * The entity's native serialization format is always used -- no cross-format conversion.
+ * When l2_format is Binary but the entity lacks HasBinarySerialization,
+ * JSON is used as an automatic fallback.
  *
  * Cross-invalidation is not handled here; it belongs in InvalidationMixin.
  */
@@ -23,6 +24,9 @@ requires CacheableEntity<Entity>
 class RedisRepo : public BaseRepo<Entity, Name, Cfg, Key> {
     using Base = BaseRepo<Entity, Name, Cfg, Key>;
     using Mapping = typename Entity::MappingType;
+
+    static constexpr bool useL2Binary =
+        (Cfg.l2_format == config::L2Format::Binary) && HasBinarySerialization<Entity>;
 
     public:
         using typename Base::EntityType;
@@ -52,37 +56,67 @@ class RedisRepo : public BaseRepo<Entity, Name, Cfg, Key> {
 
         /// Find by ID and return raw JSON string.
         /// Returns shared_ptr to JSON string (nullptr if not found).
+        /// When L2 stores BEVE, transcodes directly via glz::beve_to_json (no entity construction).
         static io::Task<std::shared_ptr<const std::string>> findJson(const Key& id) {
-            auto ptr = co_await find(id);
-            co_return ptr ? ptr->json() : nullptr;
+            if constexpr (useL2Binary) {
+                auto redisKey = makeRedisKey(id);
+
+                std::optional<std::vector<uint8_t>> beve;
+                if constexpr (Cfg.l2_refresh_on_get) {
+                    beve = co_await cache::RedisCache::getRawBinaryEx(redisKey, l2Ttl());
+                } else {
+                    beve = co_await cache::RedisCache::getRawBinary(redisKey);
+                }
+
+                if (beve) {
+                    auto json = std::make_shared<std::string>();
+                    if (!glz::beve_to_json(*beve, *json)) {
+                        co_return json;
+                    }
+                }
+
+                // Cache miss: fetch entity, populate Redis, serialize to JSON
+                auto ptr = co_await find(id);
+                co_return ptr ? ptr->json() : nullptr;
+            } else {
+                auto ptr = co_await find(id);
+                co_return ptr ? ptr->json() : nullptr;
+            }
         }
 
-        /// Find by ID and return raw binary
+        /// Find by ID and return raw binary.
         /// Returns shared_ptr to binary data (nullptr if not found).
+        /// When l2_format is Binary, reads raw bytes directly from Redis (zero-copy).
+        /// When l2_format is Json, fetches the entity and serializes to binary on the fly.
         static io::Task<std::shared_ptr<const std::vector<uint8_t>>> findBinary(const Key& id)
             requires HasBinarySerialization<Entity>
         {
-            auto redisKey = makeRedisKey(id);
+            if constexpr (useL2Binary) {
+                auto redisKey = makeRedisKey(id);
 
-            std::optional<std::vector<uint8_t>> cached;
-            if constexpr (Cfg.l2_refresh_on_get) {
-                cached = co_await cache::RedisCache::getRawBinaryEx(redisKey, l2Ttl());
-            } else {
-                cached = co_await cache::RedisCache::getRawBinary(redisKey);
-            }
-
-            if (cached) {
-                co_return std::make_shared<const std::vector<uint8_t>>(std::move(*cached));
-            }
-
-            if (auto ptr = co_await Base::find(id)) {
-                auto bin = ptr->binary();
-                if (bin) {
-                    co_await cache::RedisCache::setRawBinary(redisKey, *bin, l2Ttl());
+                std::optional<std::vector<uint8_t>> cached;
+                if constexpr (Cfg.l2_refresh_on_get) {
+                    cached = co_await cache::RedisCache::getRawBinaryEx(redisKey, l2Ttl());
+                } else {
+                    cached = co_await cache::RedisCache::getRawBinary(redisKey);
                 }
-                co_return bin;
+
+                if (cached) {
+                    co_return std::make_shared<const std::vector<uint8_t>>(std::move(*cached));
+                }
+
+                if (auto ptr = co_await Base::find(id)) {
+                    auto bin = ptr->binary();
+                    if (bin) {
+                        co_await cache::RedisCache::setRawBinary(redisKey, *bin, l2Ttl());
+                    }
+                    co_return bin;
+                }
+                co_return nullptr;
+            } else {
+                auto ptr = co_await find(id);
+                co_return ptr ? ptr->binary() : nullptr;
             }
-            co_return nullptr;
         }
 
         /// insert entity in database with L2 cache population.
@@ -224,9 +258,9 @@ class RedisRepo : public BaseRepo<Entity, Name, Cfg, Key> {
         // Serialization-aware cache helpers
         // =====================================================================
 
-        /// Get entity from cache using its native serialization format.
+        /// Get entity from cache using the configured serialization format.
         static io::Task<std::optional<Entity>> getFromCache(const std::string& key) {
-            if constexpr (HasBinarySerialization<Entity>) {
+            if constexpr (useL2Binary) {
                 std::optional<std::vector<uint8_t>> data;
                 if constexpr (Cfg.l2_refresh_on_get) {
                     data = co_await cache::RedisCache::getRawBinaryEx(key, l2Ttl());
@@ -247,9 +281,9 @@ class RedisRepo : public BaseRepo<Entity, Name, Cfg, Key> {
             }
         }
 
-        /// Set entity in cache using its native serialization format.
+        /// Set entity in cache using the configured serialization format.
         static io::Task<bool> setInCache(const std::string& key, const Entity& entity) {
-            if constexpr (HasBinarySerialization<Entity>) {
+            if constexpr (useL2Binary) {
                 co_return co_await cache::RedisCache::setRawBinary(key, *entity.binary(), l2Ttl());
             } else {
                 co_return co_await cache::RedisCache::set(key, entity, l2Ttl());
@@ -257,19 +291,34 @@ class RedisRepo : public BaseRepo<Entity, Name, Cfg, Key> {
         }
 
         template<typename E = Entity>
-        static io::Task<std::optional<std::vector<E>>> getListFromRedis(const std::string& key)
-            requires HasJsonSerialization<E>
-        {
-            co_return co_await cache::RedisCache::getList<E>(key);
+        static io::Task<std::optional<std::vector<E>>> getListFromRedis(const std::string& key) {
+            if constexpr (useL2Binary) {
+                co_return co_await cache::RedisCache::getListBeve<E>(key);
+            } else {
+                co_return co_await cache::RedisCache::getList<E>(key);
+            }
+        }
+
+        template<typename E = Entity>
+        static io::Task<std::optional<std::vector<E>>> getListFromRedisEx(const std::string& key) {
+            if constexpr (useL2Binary) {
+                co_return co_await cache::RedisCache::getListBeveEx<E>(key, l2Ttl());
+            } else {
+                co_return co_await cache::RedisCache::getListEx<E>(key, l2Ttl());
+            }
         }
 
         template<typename E = Entity, typename Rep, typename Period>
         static io::Task<bool> setListInRedis(const std::string& key,
                                                   const std::vector<E>& entities,
-                                                  std::chrono::duration<Rep, Period> ttl)
-            requires HasJsonSerialization<E>
+                                                  std::chrono::duration<Rep, Period> ttl,
+                                                  std::optional<cache::list::ListBoundsHeader> header = std::nullopt)
         {
-            co_return co_await cache::RedisCache::setList(key, entities, ttl);
+            if constexpr (useL2Binary) {
+                co_return co_await cache::RedisCache::setListBeve(key, entities, ttl, header);
+            } else {
+                co_return co_await cache::RedisCache::setList(key, entities, ttl, header);
+            }
         }
 
         template<typename... Args>
@@ -286,7 +335,7 @@ class RedisRepo : public BaseRepo<Entity, Name, Cfg, Key> {
 
             std::optional<std::vector<Entity>> cached;
             if constexpr (Cfg.l2_refresh_on_get) {
-                cached = co_await cache::RedisCache::getListEx<Entity>(cacheKey, l2Ttl());
+                cached = co_await getListFromRedisEx(cacheKey);
             } else {
                 cached = co_await getListFromRedis(cacheKey);
             }
@@ -341,7 +390,7 @@ class RedisRepo : public BaseRepo<Entity, Name, Cfg, Key> {
 
             std::optional<std::vector<Entity>> cached;
             if constexpr (Cfg.l2_refresh_on_get) {
-                cached = co_await cache::RedisCache::getListEx<Entity>(cacheKey, l2Ttl());
+                cached = co_await getListFromRedisEx(cacheKey);
             } else {
                 cached = co_await getListFromRedis(cacheKey);
             }
@@ -357,7 +406,7 @@ class RedisRepo : public BaseRepo<Entity, Name, Cfg, Key> {
                 header = headerBuilder(results, limit, offset);
             }
 
-            co_await cache::RedisCache::setList(cacheKey, results, l2Ttl(), header);
+            co_await setListInRedis(cacheKey, results, l2Ttl(), header);
             co_await cache::RedisCache::trackListKey(groupKey, cacheKey, l2Ttl());
 
             co_return results;

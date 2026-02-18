@@ -18,6 +18,14 @@ namespace jcailloux::relais::config {
     };
 
     // =========================================================================
+    // L2 serialization format - how entities are stored in Redis
+    // =========================================================================
+    enum class L2Format {
+        Binary,  // BEVE binary (default) - compact and fast
+        Json     // JSON - human-readable, interoperable with non-C++ consumers
+    };
+
+    // =========================================================================
     // Update strategy - how cache handles updates
     // =========================================================================
     enum class UpdateStrategy {
@@ -54,6 +62,7 @@ namespace jcailloux::relais::config {
         // L2 (Redis cache)
         Duration l2_ttl = std::chrono::hours(4);
         bool l2_refresh_on_get = false;
+        L2Format l2_format = L2Format::Binary;
 
         // Fluent chainable modifiers (compile-time only)
         consteval CacheConfig with_cache_level(CacheLevel v) const { auto c = *this; c.cache_level = v; return c; }
@@ -67,6 +76,7 @@ namespace jcailloux::relais::config {
         consteval CacheConfig with_l1_cleanup_min_interval(Duration v) const { auto c = *this; c.l1_cleanup_min_interval = v; return c; }
         consteval CacheConfig with_l2_ttl(Duration v) const { auto c = *this; c.l2_ttl = v; return c; }
         consteval CacheConfig with_l2_refresh_on_get(bool v) const { auto c = *this; c.l2_refresh_on_get = v; return c; }
+        consteval CacheConfig with_l2_format(L2Format v) const { auto c = *this; c.l2_format = v; return c; }
 
         constexpr auto operator<=>(const CacheConfig&) const = default;
     };
