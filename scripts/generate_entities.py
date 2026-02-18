@@ -94,7 +94,7 @@ class EntityAnnotation:
     """Parsed @relais annotations for an entity."""
     table: str = ""       # PostgreSQL table name
     model: str = ""       # Parsed but ignored (table= is used instead)
-    primary_key: str = "id"
+    primary_keys: list[str] = field(default_factory=list)  # multiple @relais primary_key fields
     partition_keys: list[str] = field(default_factory=list)
     db_managed: list[str] = field(default_factory=list)
     timestamps: list[str] = field(default_factory=list)
@@ -107,6 +107,16 @@ class EntityAnnotation:
     sorts: list[SortConfig] = field(default_factory=list)
     limits: list[int] = field(default_factory=list)
     entity_fqn: str = ""  # Fully qualified entity class name for Descriptor
+
+    @property
+    def primary_key(self) -> str:
+        """First (or only) primary key field name. Falls back to 'id'."""
+        return self.primary_keys[0] if self.primary_keys else "id"
+
+    @property
+    def is_composite(self) -> bool:
+        """True if entity has a composite primary key (multiple @relais primary_key fields)."""
+        return len(self.primary_keys) > 1
 
     @property
     def has_list(self) -> bool:
@@ -271,7 +281,7 @@ class StructParser:
         """Populate EntityAnnotation fields from inline member @relais tags."""
         for m in members:
             if 'primary_key' in m.tags:
-                annot.primary_key = m.name
+                annot.primary_keys.append(m.name)
             if 'partition_key' in m.tags:
                 annot.partition_keys.append(m.name)
             if 'db_managed' in m.tags:
@@ -529,6 +539,11 @@ class MappingGenerator:
             "#include <string>",
         ]
 
+        # Composite key needs <tuple> and <array>
+        if a.is_composite:
+            lines.append("#include <array>")
+            lines.append("#include <tuple>")
+
         # Glaze for json_fields deserialization
         if a.json_fields:
             lines.append("#include <glaze/glaze.hpp>")
@@ -574,9 +589,15 @@ class MappingGenerator:
             f"struct {mapping_name} {{",
             f"    static constexpr bool read_only = {'true' if a.read_only else 'false'};",
             f'    static constexpr const char* table_name = "{table_name}";',
-            f'    static constexpr const char* primary_key_column = "{self._col(entity, a.primary_key)}";',
-            "",
         ]
+
+        if a.is_composite:
+            pk_cols_str = ", ".join(f'"{self._col(entity, pk)}"' for pk in a.primary_keys)
+            lines.append(f"    static constexpr std::array<const char*, {len(a.primary_keys)}> primary_key_columns = {{{pk_cols_str}}};")
+        else:
+            lines.append(f'    static constexpr const char* primary_key_column = "{self._col(entity, a.primary_key)}";')
+
+        lines.append("")
 
         # Col enum — column indices for O(1) access in fromRow
         col_entries = ", ".join(
@@ -595,16 +616,20 @@ class MappingGenerator:
         # key
         lines.append("    template<typename Entity>")
         lines.append("    static auto key(const Entity& e) noexcept {")
-        lines.append(f"        return e.{a.primary_key};")
+        if a.is_composite:
+            pk_args = ", ".join(f"e.{pk}" for pk in a.primary_keys)
+            lines.append(f"        return std::make_tuple({pk_args});")
+        else:
+            lines.append(f"        return e.{a.primary_key};")
         lines.append("    }")
         lines.append("")
 
-        # makeFullKeyParams (for composite key partition pruning)
+        # makePartitionHintParams (for partition pruning — distinct from composite key)
         if a.partition_keys:
             args = [f"e.{a.primary_key}"] + [f"e.{pk}" for pk in a.partition_keys]
             args_str = ",\n            ".join(args)
             lines.append("    template<typename Entity>")
-            lines.append("    static jcailloux::relais::io::PgParams makeFullKeyParams(const Entity& e) {")
+            lines.append("    static jcailloux::relais::io::PgParams makePartitionHintParams(const Entity& e) {")
             lines.append(f"        return jcailloux::relais::io::PgParams::make(")
             lines.append(f"            {args_str}")
             lines.append(f"        );")
@@ -618,6 +643,11 @@ class MappingGenerator:
         if not a.read_only:
             lines.append("")
             lines.extend(self._generate_to_insert_params(entity))
+
+        # toUpdateParams (skip for read-only; only generated for composite keys)
+        if not a.read_only and a.is_composite:
+            lines.append("")
+            lines.extend(self._generate_to_update_params(entity))
 
         # Glaze metadata template
         lines.append("")
@@ -637,7 +667,6 @@ class MappingGenerator:
 
     def _generate_sql_struct(self, entity: ParsedEntity, table_name: str) -> list[str]:
         a = entity.annotation
-        pk_col = self._col(entity, a.primary_key)
         all_cols = [m.col_name for m in entity.members]
         all_cols_str = ", ".join(all_cols)
 
@@ -646,10 +675,20 @@ class MappingGenerator:
         insert_cols_str = ", ".join(insert_cols)
         insert_params = ", ".join(f"${i+1}" for i in range(len(insert_cols)))
 
-        # UPDATE: skip PK (PK goes in WHERE clause as $1) and db_managed fields
-        update_cols = [m.col_name for m in entity.members if m.name != a.primary_key and m.name not in a.db_managed]
+        # PK columns for WHERE clauses
+        pk_cols = [self._col(entity, pk) for pk in a.primary_keys] if a.primary_keys else [self._col(entity, "id")]
+        pk_count = len(pk_cols)
+
+        # WHERE clause for PK: pk1=$1 AND pk2=$2 ...
+        pk_where = " AND ".join(f"{col} = ${i+1}" for i, col in enumerate(pk_cols))
+
+        # UPDATE: skip all PKs and db_managed fields
+        pk_set = set(a.primary_keys) if a.primary_keys else {"id"}
+        update_cols = [m.col_name for m in entity.members
+                       if m.name not in pk_set and m.name not in a.db_managed]
+        # SET params start after PK params: $pk_count+1, $pk_count+2, ...
         update_set = ", ".join(
-            f"{col}=${i+2}" for i, col in enumerate(update_cols))
+            f"{col}=${i + pk_count + 1}" for i, col in enumerate(update_cols))
 
         lines = [
             "    struct SQL {",
@@ -657,7 +696,7 @@ class MappingGenerator:
             f'            "{all_cols_str}";',
             f"        static constexpr const char* select_by_pk =",
             f'            "SELECT {all_cols_str} '
-            f'FROM {table_name} WHERE {pk_col} = $1";',
+            f'FROM {table_name} WHERE {pk_where}";',
             f"        static constexpr const char* insert =",
             f'            "INSERT INTO {table_name} ({insert_cols_str}) '
             f'VALUES ({insert_params}) RETURNING {all_cols_str}";',
@@ -667,22 +706,22 @@ class MappingGenerator:
             lines.append(f"        static constexpr const char* update =")
             lines.append(
                 f'            "UPDATE {table_name} SET {update_set} '
-                f'WHERE {pk_col} = $1";')
+                f'WHERE {pk_where}";')
 
         lines.append(f"        static constexpr const char* delete_by_pk =")
         lines.append(
-            f'            "DELETE FROM {table_name} WHERE {pk_col} = $1";')
+            f'            "DELETE FROM {table_name} WHERE {pk_where}";')
 
-        # Full composite key DELETE for partition pruning (when partition_keys present)
+        # Partition-pruned DELETE (when partition_keys present, distinct from composite PK)
         if a.partition_keys:
-            where_parts = [f"{pk_col} = $1"]
+            hint_where_parts = [f"{col} = ${i+1}" for i, col in enumerate(pk_cols)]
             for i, pk in enumerate(a.partition_keys):
                 pk_db_col = self._col(entity, pk)
-                where_parts.append(f"{pk_db_col} = ${i + 2}")
-            where_clause = " AND ".join(where_parts)
-            lines.append(f"        static constexpr const char* delete_by_full_pk =")
+                hint_where_parts.append(f"{pk_db_col} = ${pk_count + i + 1}")
+            hint_where_clause = " AND ".join(hint_where_parts)
+            lines.append(f"        static constexpr const char* delete_with_partition =")
             lines.append(
-                f'            "DELETE FROM {table_name} WHERE {where_clause}";')
+                f'            "DELETE FROM {table_name} WHERE {hint_where_clause}";')
 
         lines.append("    };")
 
@@ -808,6 +847,82 @@ class MappingGenerator:
             # Complex case: build params manually for enum/json conversion
             lines.append("        jcailloux::relais::io::PgParams p;")
             for m in insert_members:
+                enum_mapping = self._find_enum_mapping(a, m.name)
+                if m.name in a.json_fields:
+                    if m.is_optional:
+                        lines.append(f"        if (e.{m.name}) {{")
+                        lines.append(f"            std::string json;")
+                        lines.append(f"            glz::write_json(*e.{m.name}, json);")
+                        lines.append(f"            p.push(json);")
+                        lines.append(f"        }} else {{")
+                        lines.append(f"            p.pushNull();")
+                        lines.append(f"        }}")
+                    else:
+                        lines.append(f"        {{ std::string json; glz::write_json(e.{m.name}, json); p.push(json); }}")
+                elif m.is_raw_json:
+                    lines.append(f"        p.push(e.{m.name}.str);")
+                elif enum_mapping:
+                    enum_fqn = self._qualify_type(entity, enum_mapping.cpp_type)
+                    if m.is_optional:
+                        lines.append(f"        if (e.{m.name}.has_value()) {{")
+                        lines.append(f"            switch (*e.{m.name}) {{")
+                        for db_val, enum_val in enum_mapping.pairs:
+                            lines.append(f'                case {enum_fqn}::{enum_val}: p.push("{db_val}"); break;')
+                        lines.append(f"            }}")
+                        lines.append(f"        }} else {{")
+                        lines.append(f"            p.pushNull();")
+                        lines.append(f"        }}")
+                    else:
+                        lines.append(f"        switch (e.{m.name}) {{")
+                        for db_val, enum_val in enum_mapping.pairs:
+                            lines.append(f'            case {enum_fqn}::{enum_val}: p.push("{db_val}"); break;')
+                        lines.append(f"        }}")
+                else:
+                    lines.append(f"        p.push(e.{m.name});")
+            lines.append("        return p;")
+
+        lines.append("    }")
+        return lines
+
+    # =========================================================================
+    # toUpdateParams (for composite keys: only non-PK, non-db_managed fields)
+    # =========================================================================
+
+    def _generate_to_update_params(self, entity: ParsedEntity) -> list[str]:
+        """Generate toUpdateParams for composite key entities.
+
+        Unlike toInsertParams (which includes PK fields), this returns only
+        the SET fields used in UPDATE statements. The caller (BaseRepo) prepends
+        the key params separately.
+        """
+        a = entity.annotation
+        pk_set = set(a.primary_keys)
+
+        # Fields for SET: not PK, not db_managed
+        update_members = [
+            m for m in entity.members
+            if m.name not in pk_set and m.name not in a.db_managed
+        ]
+
+        has_special = any(
+            m.name in a.json_fields or m.is_raw_json or
+            self._find_enum_mapping(a, m.name)
+            for m in update_members
+        )
+
+        lines = [
+            "    template<typename Entity>",
+            "    static jcailloux::relais::io::PgParams toUpdateParams(const Entity& e) {",
+        ]
+
+        if not has_special:
+            args = [f"            e.{m.name}" for m in update_members]
+            lines.append("        return jcailloux::relais::io::PgParams::make(")
+            lines.append(",\n".join(args))
+            lines.append("        );")
+        else:
+            lines.append("        jcailloux::relais::io::PgParams p;")
+            for m in update_members:
                 enum_mapping = self._find_enum_mapping(a, m.name)
                 if m.name in a.json_fields:
                     if m.is_optional:
@@ -1069,11 +1184,12 @@ class MappingGenerator:
         return re.findall(r'"([^"]+)"\s*,\s*(\w+)', enumerate_body)
 
     def _get_updateable_fields(self, entity: ParsedEntity) -> list[DataMember]:
-        """Return fields eligible for Field enum (exclude PK, db_managed, json_fields)."""
+        """Return fields eligible for Field enum (exclude all PKs, db_managed, json_fields)."""
         a = entity.annotation
+        pk_set = set(a.primary_keys) if a.primary_keys else {"id"}
         result = []
         for m in entity.members:
-            if m.name == a.primary_key:
+            if m.name in pk_set:
                 continue
             if m.name in a.db_managed:
                 continue

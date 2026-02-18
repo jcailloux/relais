@@ -720,7 +720,7 @@ TEST_CASE("PartitionKey<TestEvent> - erase with L1 hint",
         REQUIRE(cached != nullptr);
         CHECK(cached->region == "eu");
 
-        // erase (L1 hit → provides hint → delete_by_full_pk)
+        // erase (L1 hit → provides hint → delete_with_partition)
         // If hint had wrong region, DELETE ... WHERE id=$1 AND region=$2 would return 0
         auto result = sync(L1TestEventRepo::erase(eventId));
         REQUIRE(result.has_value());
@@ -801,7 +801,7 @@ TEST_CASE("PartitionKey<TestEvent> - erase with L1+L2 hint chain",
         REQUIRE(cached != nullptr);
         CHECK(cached->region == "eu");
 
-        // erase (L1 hit → hint with region="eu" → delete_by_full_pk)
+        // erase (L1 hit → hint with region="eu" → delete_with_partition)
         auto result = sync(L1L2TestEventRepo::erase(eventId));
         REQUIRE(result.has_value());
         CHECK(*result == 1);
@@ -823,7 +823,7 @@ TEST_CASE("PartitionKey<TestEvent> - erase with L1+L2 hint chain",
         auto cachedL1 = TestInternals::getFromCache<L1L2TestEventRepo>(eventId);
         REQUIRE(cachedL1 == nullptr);
 
-        // erase (L1 miss → L2 hit → hint with region="us" → delete_by_full_pk)
+        // erase (L1 miss → L2 hit → hint with region="us" → delete_with_partition)
         auto result = sync(L1L2TestEventRepo::erase(eventId));
         REQUIRE(result.has_value());
         CHECK(*result == 1);

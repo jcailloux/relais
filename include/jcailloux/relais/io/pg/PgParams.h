@@ -5,7 +5,10 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <vector>
+
+#include "jcailloux/relais/config/TypeTraits.h"
 
 namespace jcailloux::relais::io {
 
@@ -139,6 +142,31 @@ struct PgParams {
     void push(T&& v) { params.push_back(toParam(std::forward<T>(v))); }
 
     void pushNull() { params.push_back(PgParam::null()); }
+
+    /// Build params from a key (expands tuples into individual params).
+    template<typename Key>
+    static PgParams fromKey(const Key& key) {
+        if constexpr (config::is_tuple_v<Key>) {
+            PgParams r;
+            std::apply([&](const auto&... a) {
+                r.params.reserve(sizeof...(a));
+                (r.params.push_back(toParam(a)), ...);
+            }, key);
+            return r;
+        } else {
+            return make(key);
+        }
+    }
+
+    /// Number of params a key expands to (compile-time).
+    template<typename Key>
+    static constexpr size_t keyParamCount() {
+        if constexpr (config::is_tuple_v<Key>) {
+            return std::tuple_size_v<Key>;
+        } else {
+            return 1;
+        }
+    }
 
 private:
     static PgParam toParam(PgParam p) { return p; }

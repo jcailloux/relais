@@ -166,7 +166,7 @@ class ListMixin : public Base {
     // =========================================================================
 
     using ListWrapperType = wrapper::ListWrapper<Entity>;
-    using ListCacheType = cache::list::ListCache<Entity, Base::config.l1_shard_count_log2, int64_t, Traits>;
+    using ListCacheType = cache::list::ListCache<Entity, Base::config.l1_shard_count_log2, Key, Traits>;
 
     static cache::list::ListCacheConfig listCacheConfig() {
         return {

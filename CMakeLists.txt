@@ -182,6 +182,7 @@ if(RELAIS_BUILD_TESTS)
     relais_add_test(test_relais_l2_config       tests/relais/config/test_l2_config.cpp     DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;redis;config"     RESOURCE_LOCK)
     relais_add_test(test_relais_concurrency     tests/relais/test_concurrency.cpp          DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;concurrency"      RESOURCE_LOCK)
     relais_add_test(test_relais_dbprovider_log  tests/relais/test_dbprovider_log.cpp       DEFINITIONS RELAIS_BUILDING_TESTS LABELS "integration;relais"                     RESOURCE_LOCK)
+    relais_add_test(test_relais_composite_key  tests/relais/test_composite_key.cpp        DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;composite-key"    RESOURCE_LOCK)
 
     # Thread Sanitizer support for concurrency tests
     option(RELAIS_ENABLE_TSAN "Enable Thread Sanitizer for concurrency tests" OFF)
@@ -209,6 +210,7 @@ if(RELAIS_BUILD_TESTS)
             test_relais_l1_config
             test_relais_l2_config
             test_relais_concurrency
+            test_relais_composite_key
         COMMENT "Build all relais integration tests"
     )
 
@@ -228,6 +230,7 @@ if(RELAIS_BUILD_TESTS)
         tests/relais/config/test_l1_config.cpp
         tests/relais/config/test_l2_config.cpp
         tests/relais/test_concurrency.cpp
+        tests/relais/test_composite_key.cpp
     )
     target_include_directories(test_relais_all PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
     target_compile_definitions(test_relais_all PRIVATE RELAIS_BUILDING_TESTS RELAIS_COMBINED_TESTS)
