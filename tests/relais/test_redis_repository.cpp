@@ -2444,3 +2444,302 @@ TEST_CASE("RedisRepo - l2_format Json", "[integration][db][redis][l2-format]") {
         REQUIRE(result3.size() == 3);
     }
 }
+
+// #############################################################################
+//
+//  17. RowView — byte-identity tests (row serialization == entity serialization)
+//
+// #############################################################################
+
+TEST_CASE("RedisRepo - RowView byte-identity (TestUser BEVE)", "[integration][db][redis][rowview]") {
+    TransactionGuard tx;
+
+    SECTION("[rowview] findJson on L2 miss produces byte-identical JSON to entity path") {
+        auto id = insertTestUser("rv_l2_user", "rv_l2@test.com", 500);
+
+        // Entity path: construct entity, serialize
+        auto entity = sync(L2TestUserRepo::find(id));
+        REQUIRE(entity != nullptr);
+        auto entityJson = entity->json();
+
+        // Evict L2 so next findJson hits DB via RowView
+        sync(L2TestUserRepo::evictRedis(id));
+
+        // RowView path: L2 miss → DB → rowToJson
+        auto rowJson = sync(L2TestUserRepo::findJson(id));
+        REQUIRE(rowJson != nullptr);
+
+        REQUIRE(*rowJson == *entityJson);
+    }
+
+    SECTION("[rowview] findBinary on L2 miss produces byte-identical BEVE to entity path") {
+        auto id = insertTestUser("rv_l2_beve", "rv_l2b@test.com", 250);
+
+        auto entity = sync(L2TestUserRepo::find(id));
+        REQUIRE(entity != nullptr);
+        auto entityBeve = entity->binary();
+
+        sync(L2TestUserRepo::evictRedis(id));
+
+        auto rowBeve = sync(L2TestUserRepo::findBinary(id));
+        REQUIRE(rowBeve != nullptr);
+
+        REQUIRE(*rowBeve == *entityBeve);
+    }
+}
+
+TEST_CASE("RedisRepo - RowView byte-identity (TestItem JSON format)", "[integration][db][redis][rowview]") {
+    TransactionGuard tx;
+
+    SECTION("[rowview] findJson on L2 miss (JSON format) matches entity->json()") {
+        auto id = insertTestItem("rv_l2_item", 42, std::optional<std::string>{"rv desc"}, true);
+
+        auto entity = sync(L2TestItemRepo::find(id));
+        REQUIRE(entity != nullptr);
+        auto entityJson = entity->json();
+
+        sync(L2TestItemRepo::evictRedis(id));
+
+        auto rowJson = sync(L2TestItemRepo::findJson(id));
+        REQUIRE(rowJson != nullptr);
+
+        REQUIRE(*rowJson == *entityJson);
+    }
+}
+
+// #############################################################################
+//
+//  18. RowView — fire-and-forget L2 population
+//
+// #############################################################################
+
+TEST_CASE("RedisRepo - RowView fire-and-forget L2 population (BEVE)", "[integration][db][redis][rowview][fire-forget]") {
+    TransactionGuard tx;
+
+    SECTION("[fire-forget] findJson on L2 miss populates L2 cache for subsequent find()") {
+        auto id = insertTestUser("ff_user", "ff@test.com", 100);
+
+        // L2 miss → RowView JSON returned + fire-and-forget BEVE stored in L2
+        auto json = sync(L2TestUserRepo::findJson(id));
+        REQUIRE(json != nullptr);
+        REQUIRE(json->find("\"ff_user\"") != std::string::npos);
+
+        // Brief wait for fire-and-forget to complete
+        waitForExpiration(std::chrono::milliseconds{50});
+
+        // Modify DB directly (bypass repo)
+        updateTestUserBalance(id, 999);
+
+        // Second call: find() should hit L2 (not DB) → still has old balance
+        auto entity = sync(L2TestUserRepo::find(id));
+        REQUIRE(entity != nullptr);
+        REQUIRE(entity->balance == 100);  // Cached, not 999
+    }
+
+    SECTION("[fire-forget] findBinary on L2 miss populates L2 cache") {
+        auto id = insertTestUser("ff_beve", "ff_beve@test.com", 200);
+
+        // L2 miss → RowView BEVE returned + fire-and-forget BEVE stored in L2
+        auto beve = sync(L2TestUserRepo::findBinary(id));
+        REQUIRE(beve != nullptr);
+
+        waitForExpiration(std::chrono::milliseconds{50});
+
+        updateTestUserBalance(id, 888);
+
+        // find() should hit L2 (cached BEVE)
+        auto entity = sync(L2TestUserRepo::find(id));
+        REQUIRE(entity != nullptr);
+        REQUIRE(entity->balance == 200);
+    }
+}
+
+TEST_CASE("RedisRepo - RowView fire-and-forget L2 population (JSON format)", "[integration][db][redis][rowview][fire-forget]") {
+    TransactionGuard tx;
+
+    SECTION("[fire-forget] findJson on L2 miss populates L2 JSON cache") {
+        auto id = insertTestItem("ff_item", 77, std::optional<std::string>{"ff desc"}, true);
+
+        // L2 miss → RowView JSON returned + fire-and-forget JSON stored in L2
+        auto json = sync(L2TestItemRepo::findJson(id));
+        REQUIRE(json != nullptr);
+
+        waitForExpiration(std::chrono::milliseconds{50});
+
+        updateTestItem(id, "Modified FF", 0);
+
+        // find() should hit L2 (JSON cached)
+        auto entity = sync(L2TestItemRepo::find(id));
+        REQUIRE(entity != nullptr);
+        REQUIRE(entity->name == "ff_item");  // Cached, not "Modified FF"
+    }
+}
+
+// #############################################################################
+//
+//  19. RowView — L2 hit path unchanged (findJson reads from cache)
+//
+// #############################################################################
+
+TEST_CASE("RedisRepo - findJson L2 hit uses cache (not RowView)", "[integration][db][redis][rowview][l2-hit]") {
+    TransactionGuard tx;
+
+    SECTION("[l2-hit] findJson returns cached BEVE→JSON transcode on L2 hit") {
+        auto id = insertTestUser("l2hit_user", "l2hit@test.com", 400);
+
+        // Populate L2 via find()
+        auto entity = sync(L2TestUserRepo::find(id));
+        REQUIRE(entity != nullptr);
+
+        // Modify DB
+        updateTestUserBalance(id, 999);
+
+        // findJson should transcode BEVE from L2 (not hit DB)
+        auto json = sync(L2TestUserRepo::findJson(id));
+        REQUIRE(json != nullptr);
+        REQUIRE(json->find("400") != std::string::npos);  // Cached value
+        REQUIRE(json->find("999") == std::string::npos);   // Not DB value
+    }
+
+    SECTION("[l2-hit] findJson returns cached JSON on L2 hit (JSON format)") {
+        auto id = insertTestItem("l2hit_item", 55);
+
+        sync(L2TestItemRepo::find(id));
+
+        updateTestItem(id, "Modified", 0);
+
+        auto json = sync(L2TestItemRepo::findJson(id));
+        REQUIRE(json != nullptr);
+        REQUIRE(json->find("\"l2hit_item\"") != std::string::npos);
+    }
+
+    SECTION("[l2-hit] findBinary returns cached BEVE on L2 hit") {
+        auto id = insertTestUser("l2hit_beve", "l2hb@test.com", 300);
+
+        sync(L2TestUserRepo::find(id));
+
+        updateTestUserBalance(id, 888);
+
+        auto beve = sync(L2TestUserRepo::findBinary(id));
+        REQUIRE(beve != nullptr);
+        auto entity = TestUserWrapper::fromBinary(*beve);
+        REQUIRE(entity.has_value());
+        REQUIRE(entity->balance == 300);
+    }
+}
+
+// #############################################################################
+//
+//  20. RowView — L2 JSON format (forced via config)
+//
+// #############################################################################
+
+TEST_CASE("RedisRepo - RowView with L2 JSON format", "[integration][db][redis][rowview][l2-json]") {
+    TransactionGuard tx;
+
+    SECTION("[l2-json] findJson on L2 miss uses RowView + fire-and-forget") {
+        auto id = insertTestUser("rv_json_user", "rv_json@test.com", 600);
+
+        // L2 miss → RowView JSON + fire-and-forget L2 JSON
+        auto json = sync(L2JsonTestUserRepo::findJson(id));
+        REQUIRE(json != nullptr);
+        REQUIRE(json->find("\"rv_json_user\"") != std::string::npos);
+
+        waitForExpiration(std::chrono::milliseconds{50});
+
+        updateTestUserBalance(id, 999);
+
+        // L2 hit: raw JSON from Redis
+        auto json2 = sync(L2JsonTestUserRepo::findJson(id));
+        REQUIRE(json2 != nullptr);
+        REQUIRE(json2->find("600") != std::string::npos);  // Cached
+    }
+
+    SECTION("[l2-json] findBinary on L2 miss uses RowView + fire-and-forget JSON") {
+        auto id = insertTestUser("rv_json_beve", "rv_jb@test.com", 350);
+
+        // L2 miss → RowView BEVE returned + fire-and-forget JSON stored in L2
+        auto beve = sync(L2JsonTestUserRepo::findBinary(id));
+        REQUIRE(beve != nullptr);
+        auto entity = TestUserWrapper::fromBinary(*beve);
+        REQUIRE(entity.has_value());
+        REQUIRE(entity->balance == 350);
+
+        waitForExpiration(std::chrono::milliseconds{50});
+
+        updateTestUserBalance(id, 111);
+
+        // find() should hit L2 (JSON cached) → entity from JSON → balance still 350
+        auto found = sync(L2JsonTestUserRepo::find(id));
+        REQUIRE(found != nullptr);
+        REQUIRE(found->balance == 350);
+    }
+}
+
+// #############################################################################
+//
+//  21. Non-regression — existing CRUD unaffected by RowView additions
+//
+// #############################################################################
+
+TEST_CASE("RedisRepo - non-regression after RowView", "[integration][db][redis][rowview][non-regression]") {
+    TransactionGuard tx;
+
+    SECTION("[non-regression] find still works (BEVE entity)") {
+        auto id = insertTestUser("nr_user", "nr@test.com", 100);
+
+        auto entity = sync(L2TestUserRepo::find(id));
+        REQUIRE(entity != nullptr);
+        REQUIRE(entity->username == "nr_user");
+    }
+
+    SECTION("[non-regression] insert still populates L2") {
+        auto created = sync(L2TestUserRepo::insert(
+            makeTestUser("nr_insert", "nr_i@test.com", 200)));
+        REQUIRE(created != nullptr);
+
+        updateTestUserBalance(created->id, 999);
+
+        // Should be cached
+        auto fetched = sync(L2TestUserRepo::find(created->id));
+        REQUIRE(fetched != nullptr);
+        REQUIRE(fetched->balance == 200);
+    }
+
+    SECTION("[non-regression] update invalidates L2") {
+        auto id = insertTestUser("nr_update", "nr_u@test.com", 100);
+
+        sync(L2TestUserRepo::find(id));
+
+        auto success = sync(L2TestUserRepo::update(id,
+            makeTestUser("nr_update", "nr_u@test.com", 500, id)));
+        REQUIRE(success == true);
+
+        auto fetched = sync(L2TestUserRepo::find(id));
+        REQUIRE(fetched != nullptr);
+        REQUIRE(fetched->balance == 500);
+    }
+
+    SECTION("[non-regression] erase invalidates L2") {
+        auto id = insertTestUser("nr_erase", "nr_e@test.com", 100);
+
+        sync(L2TestUserRepo::find(id));
+
+        auto erased = sync(L2TestUserRepo::erase(id));
+        REQUIRE(erased.has_value());
+        REQUIRE(*erased == 1);
+
+        auto fetched = sync(L2TestUserRepo::find(id));
+        REQUIRE(fetched == nullptr);
+    }
+
+    SECTION("[non-regression] patch invalidates and re-fetches") {
+        auto id = insertTestUser("nr_patch", "nr_p@test.com", 100);
+
+        sync(L2TestUserRepo::find(id));
+
+        auto result = sync(L2TestUserRepo::patch(id, set<F::balance>(777)));
+        REQUIRE(result != nullptr);
+        REQUIRE(result->balance == 777);
+    }
+}

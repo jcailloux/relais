@@ -1285,3 +1285,195 @@ TEST_CASE("BaseRepo<TestProduct> - patch with column= mapping", "[integration][d
         REQUIRE(fetched->stockLevel == result->stockLevel);
     }
 }
+
+// #############################################################################
+//
+//  9. RowView — byte-identity: rowToJson/rowToBeve == entity-path serialization
+//
+// #############################################################################
+
+TEST_CASE("BaseRepo - RowView byte-identity (TestUser)", "[integration][db][base][rowview]") {
+    TransactionGuard tx;
+
+    SECTION("[rowview] rowToJson matches entity->json()") {
+        auto id = insertTestUser("rv_alice", "rv_alice@test.com", 750);
+
+        // Entity-path: find → construct entity → json()
+        auto entity = sync(UncachedTestUserRepo::find(id));
+        REQUIRE(entity != nullptr);
+        auto entityJson = entity->json();
+        REQUIRE(entityJson != nullptr);
+
+        // RowView-path: findJson (uses Mapping::rowToJson under the hood)
+        auto rowJson = sync(UncachedTestUserRepo::findJson(id));
+        REQUIRE(rowJson != nullptr);
+
+        REQUIRE(*rowJson == *entityJson);
+    }
+
+    SECTION("[rowview] rowToBeve matches entity->binary()") {
+        auto id = insertTestUser("rv_bob", "rv_bob@test.com", 300);
+
+        auto entity = sync(UncachedTestUserRepo::find(id));
+        REQUIRE(entity != nullptr);
+        auto entityBeve = entity->binary();
+        REQUIRE(entityBeve != nullptr);
+
+        auto rowBeve = sync(UncachedTestUserRepo::findBinary(id));
+        REQUIRE(rowBeve != nullptr);
+
+        REQUIRE(*rowBeve == *entityBeve);
+    }
+}
+
+TEST_CASE("BaseRepo - RowView byte-identity (TestItem)", "[integration][db][base][rowview]") {
+    TransactionGuard tx;
+
+    SECTION("[rowview] rowToJson matches entity->json() with description") {
+        auto id = insertTestItem("RV Item", 42, std::optional<std::string>{"a desc"}, true);
+
+        auto entity = sync(UncachedTestItemRepo::find(id));
+        REQUIRE(entity != nullptr);
+        auto entityJson = entity->json();
+
+        auto rowJson = sync(UncachedTestItemRepo::findJson(id));
+        REQUIRE(rowJson != nullptr);
+
+        REQUIRE(*rowJson == *entityJson);
+    }
+
+    SECTION("[rowview] rowToJson matches entity->json() with empty description") {
+        auto id = insertTestItem("RV Item2", 0);
+
+        auto entity = sync(UncachedTestItemRepo::find(id));
+        auto entityJson = entity->json();
+
+        auto rowJson = sync(UncachedTestItemRepo::findJson(id));
+        REQUIRE(*rowJson == *entityJson);
+    }
+
+    SECTION("[rowview] rowToBeve matches entity->binary()") {
+        auto id = insertTestItem("RV Beve Item", 99, std::optional<std::string>{"beve desc"}, false);
+
+        auto entity = sync(UncachedTestItemRepo::find(id));
+        auto entityBeve = entity->binary();
+
+        auto rowBeve = sync(UncachedTestItemRepo::findBinary(id));
+        REQUIRE(*rowBeve == *entityBeve);
+    }
+}
+
+TEST_CASE("BaseRepo - RowView byte-identity (TestProduct with column= mapping)", "[integration][db][base][rowview]") {
+    TransactionGuard tx;
+
+    SECTION("[rowview] rowToJson matches entity->json()") {
+        auto id = insertTestProduct("RV Widget", 50, std::optional<int32_t>{10}, true, "rv desc");
+
+        auto entity = sync(UncachedTestProductRepo::find(id));
+        REQUIRE(entity != nullptr);
+        auto entityJson = entity->json();
+
+        auto rowJson = sync(UncachedTestProductRepo::findJson(id));
+        REQUIRE(rowJson != nullptr);
+
+        REQUIRE(*rowJson == *entityJson);
+    }
+
+    SECTION("[rowview] rowToJson with null optional") {
+        auto id = insertTestProduct("RV No Discount", 10, std::nullopt, true);
+
+        auto entity = sync(UncachedTestProductRepo::find(id));
+        auto entityJson = entity->json();
+
+        auto rowJson = sync(UncachedTestProductRepo::findJson(id));
+        REQUIRE(*rowJson == *entityJson);
+    }
+
+    SECTION("[rowview] rowToBeve matches entity->binary()") {
+        auto id = insertTestProduct("RV Beve Widget", 25, std::optional<int32_t>{5}, false, "beve");
+
+        auto entity = sync(UncachedTestProductRepo::find(id));
+        auto entityBeve = entity->binary();
+
+        auto rowBeve = sync(UncachedTestProductRepo::findBinary(id));
+        REQUIRE(*rowBeve == *entityBeve);
+    }
+}
+
+// #############################################################################
+//
+//  10. findJson / findBinary — Uncached (BaseRepo direct, RowView path)
+//
+// #############################################################################
+
+TEST_CASE("BaseRepo - findJson (Uncached)", "[integration][db][base][findJson]") {
+    TransactionGuard tx;
+
+    SECTION("[findJson] returns valid JSON for existing entity") {
+        auto id = insertTestUser("fj_user", "fj@test.com", 100);
+
+        auto json = sync(UncachedTestUserRepo::findJson(id));
+
+        REQUIRE(json != nullptr);
+        REQUIRE(json->find("\"fj_user\"") != std::string::npos);
+        REQUIRE(json->find("100") != std::string::npos);
+    }
+
+    SECTION("[findJson] returns nullptr for non-existent id") {
+        auto json = sync(UncachedTestUserRepo::findJson(999999999));
+        REQUIRE(json == nullptr);
+    }
+
+    SECTION("[findJson] returns fresh data (no caching)") {
+        auto id = insertTestUser("fj_nocache", "fj_nc@test.com", 50);
+
+        auto json1 = sync(UncachedTestUserRepo::findJson(id));
+        REQUIRE(json1 != nullptr);
+
+        // Modify DB directly
+        updateTestUserBalance(id, 999);
+
+        // Second call should see new data (no cache)
+        auto json2 = sync(UncachedTestUserRepo::findJson(id));
+        REQUIRE(json2 != nullptr);
+        REQUIRE(json2->find("999") != std::string::npos);
+    }
+}
+
+TEST_CASE("BaseRepo - findBinary (Uncached)", "[integration][db][base][findBinary]") {
+    TransactionGuard tx;
+
+    SECTION("[findBinary] returns valid BEVE for existing entity") {
+        auto id = insertTestUser("fb_user", "fb@test.com", 200);
+
+        auto beve = sync(UncachedTestUserRepo::findBinary(id));
+
+        REQUIRE(beve != nullptr);
+        REQUIRE(!beve->empty());
+
+        // Roundtrip: BEVE → entity
+        auto entity = TestUserWrapper::fromBinary(*beve);
+        REQUIRE(entity.has_value());
+        REQUIRE(entity->username == "fb_user");
+        REQUIRE(entity->balance == 200);
+    }
+
+    SECTION("[findBinary] returns nullptr for non-existent id") {
+        auto beve = sync(UncachedTestUserRepo::findBinary(999999999));
+        REQUIRE(beve == nullptr);
+    }
+
+    SECTION("[findBinary] returns fresh data (no caching)") {
+        auto id = insertTestUser("fb_nocache", "fb_nc@test.com", 100);
+
+        sync(UncachedTestUserRepo::findBinary(id));
+
+        updateTestUserBalance(id, 777);
+
+        auto beve2 = sync(UncachedTestUserRepo::findBinary(id));
+        REQUIRE(beve2 != nullptr);
+        auto entity = TestUserWrapper::fromBinary(*beve2);
+        REQUIRE(entity.has_value());
+        REQUIRE(entity->balance == 777);
+    }
+}

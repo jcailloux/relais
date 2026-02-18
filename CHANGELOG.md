@@ -4,6 +4,7 @@
 
 ### Added
 
+- **Zero-copy RowView serialization** — `findJson()`, `findBinary()`, `queryJson()`, `queryBinary()` serialize directly from PgResult rows when no L1 cache is in the chain, avoiding entity construction overhead
 - **Configurable L2 serialization format** (`CacheConfig::l2_format`) — `Binary` (BEVE, default) or `Json` for non-C++ interop, applies to entities and lists; `findJson()` transcodes BEVE directly via `glz::beve_to_json`
 - **Composite primary keys** — annotate multiple fields with `@relais primary_key` to get a `std::tuple`-based key with full CRUD, L1/L2 caching, and Redis key support
 - **L2 (Redis) declarative list caching** — list pages stored as BEVE binary in Redis with automatic bounds-based invalidation

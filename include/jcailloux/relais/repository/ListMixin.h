@@ -261,6 +261,84 @@ public:
         co_return co_await cachedListQuery(q);
     }
 
+    /// Execute a paginated list query and return raw JSON string.
+    /// L1 hit: serializes from cached entity.
+    /// L2 hit (BEVE): transcodes via glz::beve_to_json (skips 19-byte ListBoundsHeader).
+    /// L2/DB miss: delegates to entity path (cachedListQuery).
+    static io::Task<std::shared_ptr<const std::string>> queryJson(const ListQuery& q) {
+        // L1 check: serialize from cached entities
+        if constexpr (kHasL1) {
+            auto cache_query = toCacheQuery(q);
+            if (auto cached = listCache().get(cache_query))
+                co_return cached->json();
+        }
+
+        // L2 check: BEVE → JSON transcode (skip ListBoundsHeader)
+        if constexpr (kHasL2) {
+            auto pageKey = redisPageKey(q.cache_key);
+
+            std::optional<std::vector<uint8_t>> beve;
+            if constexpr (Base::config.l2_refresh_on_get) {
+                beve = co_await cache::RedisCache::getRawBinaryEx(pageKey, l2Ttl());
+            } else {
+                beve = co_await cache::RedisCache::getRawBinary(pageKey);
+            }
+
+            if (beve) {
+                // Skip ListBoundsHeader (19 bytes, magic 0x53 0x52)
+                size_t off = (beve->size() > 19
+                    && (*beve)[0] == 0x53 && (*beve)[1] == 0x52) ? 19 : 0;
+                auto json = std::make_shared<std::string>();
+                if (!glz::beve_to_json(
+                        std::span(beve->data() + off, beve->size() - off), *json))
+                    co_return json;
+            }
+        }
+
+        // Miss: entity path (needed for cursor/bounds/L1 population)
+        auto wrapper = co_await cachedListQuery(q);
+        co_return wrapper ? wrapper->json() : nullptr;
+    }
+
+    /// Execute a paginated list query and return raw binary (BEVE).
+    /// L1 hit: serializes from cached entity.
+    /// L2 hit: returns raw binary (skips ListBoundsHeader).
+    /// L2/DB miss: delegates to entity path (cachedListQuery).
+    static io::Task<std::shared_ptr<const std::vector<uint8_t>>> queryBinary(const ListQuery& q)
+        requires HasBinarySerialization<Entity>
+    {
+        // L1 check: serialize from cached entities
+        if constexpr (kHasL1) {
+            auto cache_query = toCacheQuery(q);
+            if (auto cached = listCache().get(cache_query))
+                co_return cached->binary();
+        }
+
+        // L2 check: raw binary from Redis (skip ListBoundsHeader)
+        if constexpr (kHasL2) {
+            auto pageKey = redisPageKey(q.cache_key);
+
+            std::optional<std::vector<uint8_t>> beve;
+            if constexpr (Base::config.l2_refresh_on_get) {
+                beve = co_await cache::RedisCache::getRawBinaryEx(pageKey, l2Ttl());
+            } else {
+                beve = co_await cache::RedisCache::getRawBinary(pageKey);
+            }
+
+            if (beve) {
+                // Skip ListBoundsHeader (19 bytes, magic 0x53 0x52)
+                size_t off = (beve->size() > 19
+                    && (*beve)[0] == 0x53 && (*beve)[1] == 0x52) ? 19 : 0;
+                co_return std::make_shared<std::vector<uint8_t>>(
+                    beve->begin() + static_cast<ptrdiff_t>(off), beve->end());
+            }
+        }
+
+        // Miss: entity path (needed for cursor/bounds/L1 population)
+        auto wrapper = co_await cachedListQuery(q);
+        co_return wrapper ? wrapper->binary() : nullptr;
+    }
+
     /// Get L1 list cache size.
     [[nodiscard]] static size_t listSize() noexcept {
         if constexpr (kHasL1) {

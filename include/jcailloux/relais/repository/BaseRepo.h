@@ -163,6 +163,62 @@ public:
     }
 
     // =====================================================================
+    // Find by ID — direct JSON serialization (L3: database only)
+    // =====================================================================
+
+    /// Find by ID and return raw JSON string (nullptr if not found).
+    /// When Mapping provides rowToJson(), serializes directly from PgResult
+    /// (zero entity construction). Otherwise falls back to entity path.
+    static io::Task<std::shared_ptr<const std::string>> findJson(const Key& id) {
+        try {
+            auto params = io::PgParams::fromKey(id);
+            auto result = co_await DbProvider::queryParams(
+                Mapping::SQL::select_by_pk, params);
+            if (result.empty()) co_return nullptr;
+            if constexpr (requires { Mapping::rowToJson(result[0]); }) {
+                co_return Mapping::rowToJson(result[0]);
+            } else {
+                auto entity = Entity::fromRow(result[0]);
+                co_return entity
+                    ? std::make_shared<const Entity>(std::move(*entity))->json()
+                    : nullptr;
+            }
+        } catch (const io::PgError& e) {
+            RELAIS_LOG_ERROR << name() << ": findJson DB error - " << e.what();
+            co_return nullptr;
+        }
+    }
+
+    // =====================================================================
+    // Find by ID — direct binary serialization (L3: database only)
+    // =====================================================================
+
+    /// Find by ID and return raw binary (BEVE) data (nullptr if not found).
+    /// When Mapping provides rowToBeve(), serializes directly from PgResult
+    /// (zero entity construction). Otherwise falls back to entity path.
+    static io::Task<std::shared_ptr<const std::vector<uint8_t>>> findBinary(const Key& id)
+        requires HasBinarySerialization<Entity>
+    {
+        try {
+            auto params = io::PgParams::fromKey(id);
+            auto result = co_await DbProvider::queryParams(
+                Mapping::SQL::select_by_pk, params);
+            if (result.empty()) co_return nullptr;
+            if constexpr (requires { Mapping::rowToBeve(result[0]); }) {
+                co_return Mapping::rowToBeve(result[0]);
+            } else {
+                auto entity = Entity::fromRow(result[0]);
+                co_return entity
+                    ? std::make_shared<const Entity>(std::move(*entity))->binary()
+                    : nullptr;
+            }
+        } catch (const io::PgError& e) {
+            RELAIS_LOG_ERROR << name() << ": findBinary DB error - " << e.what();
+            co_return nullptr;
+        }
+    }
+
+    // =====================================================================
     // insert
     // =====================================================================
 
