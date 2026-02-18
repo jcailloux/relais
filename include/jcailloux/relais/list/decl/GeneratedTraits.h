@@ -367,7 +367,8 @@ struct QueryValidationError {
     enum class Type : uint8_t {
         InvalidFilter,
         InvalidSort,
-        InvalidLimit
+        InvalidLimit,
+        ConflictingPagination
     };
 
     Type type;
@@ -382,6 +383,8 @@ struct QueryValidationError {
                 return "Invalid sort field: " + field;
             case Type::InvalidLimit:
                 return "Invalid limit: " + std::to_string(limit);
+            case Type::ConflictingPagination:
+                return "Cannot use both 'after' (cursor) and 'offset' simultaneously";
         }
         return "Unknown validation error";
     }

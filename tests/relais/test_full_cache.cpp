@@ -13,6 +13,9 @@
  *   6. Cross-invalidation at L1+L2
  *   7. Hierarchy verification (short-circuit behavior)
  *   8. findJson at L1+L2
+ *   9. Patch at L1+L2 (verifies both layers invalidated)
+ *  10. InvalidateVia custom cross-invalidation at L1+L2
+ *  11. InvalidateList cross-invalidation at L1+L2
  */
 
 #include <catch2/catch_test_macros.hpp>
@@ -20,8 +23,11 @@
 #include "fixtures/test_helper.h"
 #include "fixtures/TestRepositories.h"
 #include "fixtures/TestQueryHelpers.h"
+#include "fixtures/RelaisTestAccessors.h"
 
 using namespace relais_test;
+
+namespace decl = jcailloux::relais::cache::list::decl;
 
 // #############################################################################
 //
@@ -66,6 +72,49 @@ using FullCachePurchaseRepo = Repo<TestPurchaseWrapper, "test:purchase:both",
 
 using jcailloux::relais::wrapper::set;
 using F = TestUserWrapper::Field;
+
+// L1+L2 article repo for InvalidateVia target
+using FullCacheInvArticleRepo = Repo<TestArticleWrapper, "test:article:both:inv", cfg::Both>;
+
+// Resolver: Purchase user_id → Article IDs by same author
+struct BothUserArticleResolver {
+    static io::Task<std::vector<int64_t>> resolve(int64_t user_id) {
+        auto result = co_await jcailloux::relais::DbProvider::queryArgs(
+            "SELECT id FROM relais_test_articles WHERE author_id = $1", user_id);
+        std::vector<int64_t> ids;
+        for (size_t i = 0; i < result.rows(); ++i)
+            ids.push_back(result[i].get<int64_t>(0));
+        co_return ids;
+    }
+};
+
+// Purchase repo with Invalidate<User> + InvalidateVia<Article> at cfg::Both
+using FullCacheCustomPurchaseRepo = Repo<TestPurchaseWrapper, "test:purchase:both:custom",
+    cfg::Both,
+    cache::Invalidate<FullCacheInvUserRepo, purchaseUserId>,
+    cache::InvalidateVia<FullCacheInvArticleRepo, purchaseUserId, &BothUserArticleResolver::resolve>>;
+
+// L1+L2 purchase list repo (target of InvalidateList cross-invalidation)
+using BothPurchaseListRepo = Repo<TestPurchaseWrapper, "test:purchase:list:both:forinv", cfg::Both>;
+using BothPurchaseListQuery = BothPurchaseListRepo::ListQuery;
+
+// Invalidator that clears both L1 and L2 for the purchase list
+class BothPurchaseListInvalidator {
+public:
+    static io::Task<void> onEntityModified(
+        std::shared_ptr<const TestPurchaseWrapper> entity)
+    {
+        if (entity) {
+            TestInternals::resetListCacheState<BothPurchaseListRepo>();
+            co_await BothPurchaseListRepo::invalidateAllListGroups();
+        }
+    }
+};
+
+// Purchase repo with InvalidateList at cfg::Both
+using FullCacheListInvPurchaseRepo = Repo<TestPurchaseWrapper, "test:purchase:both:listinv",
+    cfg::Both,
+    cache::InvalidateList<BothPurchaseListInvalidator>>;
 
 } // namespace relais_test
 
@@ -539,5 +588,243 @@ TEST_CASE("FullCache - findJson at L1+L2",
         auto json = sync(FullCacheTestItemRepo::findJson(id));
         REQUIRE(json != nullptr);
         REQUIRE(json->find("\"json_l2_item\"") != std::string::npos);
+    }
+}
+
+
+// =============================================================================
+// Helper: build a purchase list query for the L1+L2 purchase list repo
+// =============================================================================
+
+static BothPurchaseListQuery makeBothPurchaseQuery(
+    std::optional<int64_t> user_id = std::nullopt,
+    std::optional<std::string> status = std::nullopt,
+    uint16_t limit = 10
+) {
+    BothPurchaseListQuery q;
+    q.limit = limit;
+    if (user_id) q.filters.template get<0>() = *user_id;
+    if (status)  q.filters.template get<1>() = std::move(*status);
+
+    using Desc = BothPurchaseListRepo::ListDescriptorType;
+    q.group_key = decl::groupCacheKey<Desc>(q);
+    q.cache_key = decl::cacheKey<Desc>(q);
+    return q;
+}
+
+
+// #############################################################################
+//
+//  9. Patch at L1+L2 (verifies both layers invalidated)
+//
+// #############################################################################
+
+TEST_CASE("FullCache<TestUser> - patch at L1+L2",
+          "[integration][db][full-cache][patch]")
+{
+    TransactionGuard tx;
+
+    SECTION("[patch] single field invalidates both L1 and L2") {
+        auto id = insertTestUser("patch_both", "patch@both.com", 100);
+
+        // Populate both layers
+        sync(FullCacheTestUserRepo::find(id));
+
+        // Patch single field
+        auto result = sync(FullCacheTestUserRepo::patch(id, set<F::balance>(500)));
+        REQUIRE(result != nullptr);
+        REQUIRE(result->balance == 500);
+
+        // Evict L1 to force L2 read — verifies L2 was also invalidated
+        FullCacheTestUserRepo::evict(id);
+
+        auto fresh = sync(FullCacheTestUserRepo::find(id));
+        REQUIRE(fresh->balance == 500);
+    }
+
+    SECTION("[patch] multiple fields invalidates both L1 and L2") {
+        auto id = insertTestUser("carol", "carol@both.com", 200);
+
+        // Populate both layers
+        sync(FullCacheTestUserRepo::find(id));
+
+        // Patch multiple fields
+        auto result = sync(FullCacheTestUserRepo::patch(id,
+            set<F::balance>(0),
+            set<F::username>(std::string("caroline"))));
+        REQUIRE(result->balance == 0);
+        REQUIRE(result->username == "caroline");
+        REQUIRE(result->email == "carol@both.com");
+
+        // Evict L1 to verify L2 invalidation
+        FullCacheTestUserRepo::evict(id);
+
+        auto fresh = sync(FullCacheTestUserRepo::find(id));
+        REQUIRE(fresh->balance == 0);
+        REQUIRE(fresh->username == "caroline");
+    }
+}
+
+
+// #############################################################################
+//
+//  10. InvalidateVia custom cross-invalidation at L1+L2
+//
+// #############################################################################
+
+TEST_CASE("FullCache - custom cross-invalidation via resolver at L1+L2",
+          "[integration][db][full-cache][custom-inv]")
+{
+    TransactionGuard tx;
+
+    SECTION("[custom-inv] purchase creation invalidates user AND related articles") {
+        auto userId    = insertTestUser("author", "author@both.com", 1000);
+        auto articleId = insertTestArticle("tech", userId, "My Article", 42, true);
+
+        // Populate user and article caches in both L1+L2
+        auto user1    = sync(FullCacheInvUserRepo::find(userId));
+        auto article1 = sync(FullCacheInvArticleRepo::find(articleId));
+        REQUIRE(user1 != nullptr);
+        REQUIRE(article1 != nullptr);
+
+        // Modify DB directly (bypasses cache)
+        updateTestUserBalance(userId, 500);
+        updateTestArticle(articleId, "Updated Title", 999);
+
+        // Caches should return stale values
+        CHECK(sync(FullCacheInvUserRepo::find(userId))->balance == 1000);
+        CHECK(sync(FullCacheInvArticleRepo::find(articleId))->title == "My Article");
+
+        // Insert purchase → triggers Invalidate<User> + InvalidateVia<Article>
+        sync(FullCacheCustomPurchaseRepo::insert(
+            makeTestPurchase(userId, "Trigger", 50, "pending")));
+
+        // Both user and article should now return fresh values
+        CHECK(sync(FullCacheInvUserRepo::find(userId))->balance == 500);
+        auto article2 = sync(FullCacheInvArticleRepo::find(articleId));
+        CHECK(article2->title == "Updated Title");
+        CHECK(article2->view_count == 999);
+    }
+
+    SECTION("[custom-inv] L2 is also invalidated (not just L1)") {
+        auto userId    = insertTestUser("author", "author@both.com", 1000);
+        auto articleId = insertTestArticle("tech", userId, "My Article", 42, true);
+
+        // Populate both layers
+        sync(FullCacheInvUserRepo::find(userId));
+        sync(FullCacheInvArticleRepo::find(articleId));
+
+        // Modify DB directly
+        updateTestUserBalance(userId, 500);
+        updateTestArticle(articleId, "Updated Title", 999);
+
+        // Insert purchase → triggers cross-invalidation
+        sync(FullCacheCustomPurchaseRepo::insert(
+            makeTestPurchase(userId, "Trigger", 50, "pending")));
+
+        // Evict L1 to force L2 read — verifies L2 was also invalidated
+        FullCacheInvUserRepo::evict(userId);
+        FullCacheInvArticleRepo::evict(articleId);
+
+        CHECK(sync(FullCacheInvUserRepo::find(userId))->balance == 500);
+        CHECK(sync(FullCacheInvArticleRepo::find(articleId))->title == "Updated Title");
+    }
+
+    SECTION("[custom-inv] resolver with no related articles does not crash") {
+        auto userId = insertTestUser("orphan", "orphan@both.com", 100);
+
+        // No articles for this user
+        sync(FullCacheInvUserRepo::find(userId));
+
+        // Should not crash even though resolver returns empty
+        sync(FullCacheCustomPurchaseRepo::insert(
+            makeTestPurchase(userId, "Safe", 50, "pending")));
+
+        auto user = sync(FullCacheInvUserRepo::find(userId));
+        CHECK(user != nullptr);
+    }
+
+    SECTION("[custom-inv] resolver invalidates multiple articles") {
+        auto userId = insertTestUser("author", "author@both.com", 1000);
+        auto a1 = insertTestArticle("tech", userId, "Article 1", 10, true);
+        auto a2 = insertTestArticle("news", userId, "Article 2", 20, true);
+        auto a3 = insertTestArticle("tech", userId, "Article 3", 30, true);
+
+        // Populate all caches
+        sync(FullCacheInvArticleRepo::find(a1));
+        sync(FullCacheInvArticleRepo::find(a2));
+        sync(FullCacheInvArticleRepo::find(a3));
+
+        // Modify all articles in DB
+        updateTestArticle(a1, "New 1", 100);
+        updateTestArticle(a2, "New 2", 200);
+        updateTestArticle(a3, "New 3", 300);
+
+        // Stale check
+        CHECK(sync(FullCacheInvArticleRepo::find(a1))->title == "Article 1");
+
+        // Insert purchase → resolver returns 3 article IDs → all invalidated
+        sync(FullCacheCustomPurchaseRepo::insert(
+            makeTestPurchase(userId, "Trigger", 50, "pending")));
+
+        CHECK(sync(FullCacheInvArticleRepo::find(a1))->title == "New 1");
+        CHECK(sync(FullCacheInvArticleRepo::find(a2))->title == "New 2");
+        CHECK(sync(FullCacheInvArticleRepo::find(a3))->title == "New 3");
+    }
+}
+
+
+// #############################################################################
+//
+//  11. InvalidateList cross-invalidation at L1+L2
+//
+// #############################################################################
+
+TEST_CASE("FullCache - list cross-invalidation at L1+L2",
+          "[integration][db][full-cache][list-inv]")
+{
+    TransactionGuard tx;
+    TestInternals::resetListCacheState<BothPurchaseListRepo>();
+
+    SECTION("[list-inv] purchase creation invalidates purchase list in both L1 and L2") {
+        auto userId = insertTestUser("list_user", "list@both.com", 1000);
+        insertTestPurchase(userId, "Existing Product", 50);
+
+        // Populate L1+L2 list cache
+        auto query   = makeBothPurchaseQuery(userId);
+        auto result1 = sync(BothPurchaseListRepo::query(query));
+        REQUIRE(result1->size() == 1);
+
+        // Insert directly in DB (bypasses cache)
+        insertTestPurchase(userId, "Direct Insert", 75);
+
+        // Should be stale from L1 cache
+        CHECK(sync(BothPurchaseListRepo::query(query))->size() == 1);
+
+        // Insert via repo → triggers InvalidateList<BothPurchaseListInvalidator>
+        sync(FullCacheListInvPurchaseRepo::insert(
+            makeTestPurchase(userId, "Via Repo", 100, "pending")));
+
+        // Both L1 and L2 invalidated → should see all 3
+        auto result3 = sync(BothPurchaseListRepo::query(query));
+        CHECK(result3->size() == 3);
+    }
+
+    SECTION("[list-inv] purchase deletion invalidates purchase list in both layers") {
+        auto userId = insertTestUser("list_user", "list@both.com", 1000);
+        auto p1 = insertTestPurchase(userId, "Keep", 50);
+        auto p2 = insertTestPurchase(userId, "Delete", 100);
+
+        // Populate L1+L2 list cache
+        auto query   = makeBothPurchaseQuery(userId);
+        auto result1 = sync(BothPurchaseListRepo::query(query));
+        REQUIRE(result1->size() == 2);
+
+        // Delete via repo → triggers cross-invalidation
+        sync(FullCacheListInvPurchaseRepo::erase(p2));
+
+        // Should see only 1 purchase
+        auto result2 = sync(BothPurchaseListRepo::query(query));
+        CHECK(result2->size() == 1);
     }
 }

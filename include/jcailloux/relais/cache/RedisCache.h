@@ -368,10 +368,10 @@ namespace jcailloux::relais::cache {
                 }
 
                 try {
-                    co_await DbProvider::redis("DEL", key);
+                    co_await DbProvider::redis("UNLINK", key);
                     co_return true;
                 } catch (const std::exception& e) {
-                    RELAIS_LOG_WARN << "RedisCache DEL error: " << e.what();
+                    RELAIS_LOG_WARN << "RedisCache UNLINK error: " << e.what();
                     co_return false;
                 }
             }
@@ -416,7 +416,7 @@ namespace jcailloux::relais::cache {
 
                         for (const auto& k : batch_keys) {
                             try {
-                                co_await DbProvider::redis("DEL", k);
+                                co_await DbProvider::redis("UNLINK", k);
                                 ++count;
                             } catch (...) {}
                         }
@@ -475,10 +475,10 @@ namespace jcailloux::relais::cache {
                         local keys = redis.call('SMEMBERS', KEYS[1])
                         local count = 0
                         for _, key in ipairs(keys) do
-                            redis.call('DEL', key)
+                            redis.call('UNLINK', key)
                             count = count + 1
                         end
-                        redis.call('DEL', KEYS[1])
+                        redis.call('UNLINK', KEYS[1])
                         return count
                     )";
 
@@ -574,7 +574,7 @@ for _, page_key in ipairs(keys) do
     end
 end
 
-if count == #keys then redis.call('DEL', KEYS[1]) end
+if count == #keys then redis.call('UNLINK', KEYS[1]) end
 return count
 )";
 
@@ -667,7 +667,7 @@ for _, page_key in ipairs(keys) do
     end
 end
 
-if count == #keys then redis.call('DEL', KEYS[1]) end
+if count == #keys then redis.call('UNLINK', KEYS[1]) end
 return count
 )";
 
@@ -679,6 +679,415 @@ return count
                     co_return result.isNil() ? 0 : static_cast<size_t>(result.asInteger());
                 } catch (const std::exception& e) {
                     RELAIS_LOG_WARN << "RedisCache invalidateListGroupSelectiveUpdate error: " << e.what();
+                    co_return 0;
+                }
+            }
+
+            // =================================================================
+            // All-in-one List Group Invalidation (single Lua EVAL, 1 RTT)
+            // =================================================================
+
+            /// Invalidate all matching list groups for a single entity (create/delete).
+            /// Lua does: HGETALL master → filter match → SortBounds → DEL pages.
+            static io::Task<size_t> invalidateListGroupsSelective(
+                const std::string& masterKey,
+                size_t prefixLen,
+                const std::string& filterSchema,
+                const std::string& entityBlob,
+                const std::string& sortValues)
+            {
+                if (!DbProvider::hasRedis()) co_return 0;
+
+                try {
+                    static constexpr std::string_view lua = R"(
+local master = KEYS[1]
+local prefix_len = tonumber(ARGV[1])
+local hdr_size = tonumber(ARGV[2])
+local schema = ARGV[3]
+local eblob = ARGV[4]
+local sort_csv = ARGV[5]
+
+local sort_vals = {}
+for v in string.gmatch(sort_csv, '([^,]+)') do
+    sort_vals[#sort_vals + 1] = tonumber(v)
+end
+local n_filters = #schema / 2
+local total = 0
+
+local function u32(s, p)
+    local b1,b2,b3,b4 = string.byte(s, p, p+3)
+    if not b4 then return 0 end
+    return b1 + b2*256 + b3*65536 + b4*16777216
+end
+
+local function i64(s, p)
+    local b1,b2,b3,b4,b5,b6,b7,b8 = string.byte(s, p, p+7)
+    if not b8 then return 0 end
+    local val = b1 + b2*256 + b3*65536 + b4*16777216
+              + b5*4294967296 + b6*1099511627776
+              + b7*281474976710656 + b8*72057594037927936
+    if val >= 2^63 then val = val - 2^64 end
+    return val
+end
+
+local function skip(s, pos, ft)
+    if ft == 115 then return pos + 4 + u32(s, pos)
+    elseif ft == 56 then return pos + 8
+    elseif ft == 52 then return pos + 4
+    else return pos + 1 end
+end
+
+local function cmp(bin, gp, blob, ep, ft, fo)
+    if ft == 115 then
+        local gl = u32(bin, gp); local el = u32(blob, ep)
+        if fo == 61 then
+            return gl == el and (gl == 0 or string.sub(bin, gp+4, gp+3+gl) == string.sub(blob, ep+4, ep+3+el))
+        elseif fo == 33 then
+            return gl ~= el or (gl > 0 and string.sub(bin, gp+4, gp+3+gl) ~= string.sub(blob, ep+4, ep+3+el))
+        end
+        return true
+    elseif ft == 56 then
+        if fo == 61 then return string.sub(bin, gp, gp+7) == string.sub(blob, ep, ep+7)
+        elseif fo == 33 then return string.sub(bin, gp, gp+7) ~= string.sub(blob, ep, ep+7)
+        else
+            local gv = i64(bin, gp); local ev = i64(blob, ep)
+            if fo == 62 then return ev > gv
+            elseif fo == 71 then return ev >= gv
+            elseif fo == 60 then return ev < gv
+            elseif fo == 76 then return ev <= gv end
+        end
+    elseif ft == 52 then
+        if fo == 61 then return string.sub(bin, gp, gp+3) == string.sub(blob, ep, ep+3)
+        elseif fo == 33 then return string.sub(bin, gp, gp+3) ~= string.sub(blob, ep, ep+3)
+        else
+            local function r32(s, p)
+                local a,b,c,d = string.byte(s, p, p+3)
+                if not d then return 0 end
+                local v = a + b*256 + c*65536 + d*16777216
+                if v >= 2^31 then v = v - 2^32 end; return v
+            end
+            local gv = r32(bin, gp); local ev = r32(blob, ep)
+            if fo == 62 then return ev > gv
+            elseif fo == 71 then return ev >= gv
+            elseif fo == 60 then return ev < gv
+            elseif fo == 76 then return ev <= gv end
+        end
+    else
+        local gv = string.byte(bin, gp); local ev = string.byte(blob, ep)
+        if fo == 61 then return gv == ev
+        elseif fo == 33 then return gv ~= ev end
+        return true
+    end
+    return true
+end
+
+local function fmatch(bin, blob)
+    local gp = 1; local ep = 1
+    for f = 0, n_filters - 1 do
+        local ft = string.byte(schema, f*2+1)
+        local fo = string.byte(schema, f*2+2)
+        if gp > #bin or ep > #blob then break end
+        local gx = string.byte(bin, gp); local ex = string.byte(blob, ep)
+        gp = gp + 1; ep = ep + 1
+        if gx == 0 then
+            if ex == 1 then ep = skip(blob, ep, ft) end
+        elseif ex == 0 then
+            gp = skip(bin, gp, ft)
+            if fo == 61 then return false end
+        else
+            if not cmp(bin, gp, blob, ep, ft, fo) then return false end
+            gp = skip(bin, gp, ft); ep = skip(blob, ep, ft)
+        end
+    end
+    return true
+end
+
+local function chk(pk, ev)
+    local hdr = redis.call('GETRANGE', pk, 0, hdr_size - 1)
+    if #hdr < hdr_size or string.byte(hdr, 1) ~= 0x53 or string.byte(hdr, 2) ~= 0x52 then
+        return true
+    end
+    local first = i64(hdr, 3); local last = i64(hdr, 11)
+    local fl = string.byte(hdr, 19)
+    local desc = (fl % 2) == 1
+    local fp = (math.floor(fl / 2) % 2) == 1
+    local inc = (math.floor(fl / 4) % 2) == 1
+    local off = (math.floor(fl / 8) % 2) == 0
+    if off then
+        if inc then return true end
+        if desc then return ev >= last else return ev <= last end
+    else
+        if fp or inc then return true end
+        if desc then
+            return ev <= first and ev >= last
+        else
+            return ev >= first and ev <= last
+        end
+    end
+end
+
+local groups = redis.call('HGETALL', master)
+if not groups or #groups == 0 then return 0 end
+
+for gi = 1, #groups, 2 do
+    local gk = groups[gi]
+    local si = tonumber(groups[gi + 1])
+    local bin = string.sub(gk, prefix_len + 1)
+    if fmatch(bin, eblob) then
+        local ev = sort_vals[si + 1] or 0
+        local tk = gk .. ':_keys'
+        local pages = redis.call('SMEMBERS', tk)
+        if pages and #pages > 0 then
+            local c = 0
+            for _, pk in ipairs(pages) do
+                if chk(pk, ev) then
+                    redis.call('DEL', pk)
+                    redis.call('SREM', tk, pk)
+                    c = c + 1
+                end
+            end
+            if c == #pages then redis.call('UNLINK', tk) end
+            total = total + c
+        end
+    end
+end
+return total
+)";
+
+                    auto result = co_await DbProvider::redis(
+                        "EVAL", lua, "1", masterKey,
+                        std::to_string(prefixLen),
+                        static_cast<int>(list::kListBoundsHeaderSize),
+                        filterSchema,
+                        entityBlob,
+                        sortValues);
+
+                    co_return result.isNil() ? 0 : static_cast<size_t>(result.asInteger());
+                } catch (const std::exception& e) {
+                    RELAIS_LOG_WARN << "RedisCache invalidateListGroupsSelective error: " << e.what();
+                    co_return 0;
+                }
+            }
+
+            /// Invalidate all matching list groups for an update (two entities).
+            /// Lua does: HGETALL master → filter match old+new → SortBounds → DEL pages.
+            static io::Task<size_t> invalidateListGroupsSelectiveUpdate(
+                const std::string& masterKey,
+                size_t prefixLen,
+                const std::string& filterSchema,
+                const std::string& newEntityBlob,
+                const std::string& newSortValues,
+                const std::string& oldEntityBlob,
+                const std::string& oldSortValues)
+            {
+                if (!DbProvider::hasRedis()) co_return 0;
+
+                try {
+                    static constexpr std::string_view lua = R"(
+local master = KEYS[1]
+local prefix_len = tonumber(ARGV[1])
+local hdr_size = tonumber(ARGV[2])
+local schema = ARGV[3]
+local new_blob = ARGV[4]
+local new_csv = ARGV[5]
+local old_blob = ARGV[6]
+local old_csv = ARGV[7]
+
+local new_sv = {}
+for v in string.gmatch(new_csv, '([^,]+)') do new_sv[#new_sv+1] = tonumber(v) end
+local old_sv = {}
+for v in string.gmatch(old_csv, '([^,]+)') do old_sv[#old_sv+1] = tonumber(v) end
+local n_filters = #schema / 2
+local total = 0
+
+local function u32(s, p)
+    local b1,b2,b3,b4 = string.byte(s, p, p+3)
+    if not b4 then return 0 end
+    return b1 + b2*256 + b3*65536 + b4*16777216
+end
+
+local function i64(s, p)
+    local b1,b2,b3,b4,b5,b6,b7,b8 = string.byte(s, p, p+7)
+    if not b8 then return 0 end
+    local val = b1 + b2*256 + b3*65536 + b4*16777216
+              + b5*4294967296 + b6*1099511627776
+              + b7*281474976710656 + b8*72057594037927936
+    if val >= 2^63 then val = val - 2^64 end
+    return val
+end
+
+local function skip(s, pos, ft)
+    if ft == 115 then return pos + 4 + u32(s, pos)
+    elseif ft == 56 then return pos + 8
+    elseif ft == 52 then return pos + 4
+    else return pos + 1 end
+end
+
+local function cmp(bin, gp, blob, ep, ft, fo)
+    if ft == 115 then
+        local gl = u32(bin, gp); local el = u32(blob, ep)
+        if fo == 61 then
+            return gl == el and (gl == 0 or string.sub(bin, gp+4, gp+3+gl) == string.sub(blob, ep+4, ep+3+el))
+        elseif fo == 33 then
+            return gl ~= el or (gl > 0 and string.sub(bin, gp+4, gp+3+gl) ~= string.sub(blob, ep+4, ep+3+el))
+        end
+        return true
+    elseif ft == 56 then
+        if fo == 61 then return string.sub(bin, gp, gp+7) == string.sub(blob, ep, ep+7)
+        elseif fo == 33 then return string.sub(bin, gp, gp+7) ~= string.sub(blob, ep, ep+7)
+        else
+            local gv = i64(bin, gp); local ev = i64(blob, ep)
+            if fo == 62 then return ev > gv
+            elseif fo == 71 then return ev >= gv
+            elseif fo == 60 then return ev < gv
+            elseif fo == 76 then return ev <= gv end
+        end
+    elseif ft == 52 then
+        if fo == 61 then return string.sub(bin, gp, gp+3) == string.sub(blob, ep, ep+3)
+        elseif fo == 33 then return string.sub(bin, gp, gp+3) ~= string.sub(blob, ep, ep+3)
+        else
+            local function r32(s, p)
+                local a,b,c,d = string.byte(s, p, p+3)
+                if not d then return 0 end
+                local v = a + b*256 + c*65536 + d*16777216
+                if v >= 2^31 then v = v - 2^32 end; return v
+            end
+            local gv = r32(bin, gp); local ev = r32(blob, ep)
+            if fo == 62 then return ev > gv
+            elseif fo == 71 then return ev >= gv
+            elseif fo == 60 then return ev < gv
+            elseif fo == 76 then return ev <= gv end
+        end
+    else
+        local gv = string.byte(bin, gp); local ev = string.byte(blob, ep)
+        if fo == 61 then return gv == ev
+        elseif fo == 33 then return gv ~= ev end
+        return true
+    end
+    return true
+end
+
+local function fmatch(bin, blob)
+    local gp = 1; local ep = 1
+    for f = 0, n_filters - 1 do
+        local ft = string.byte(schema, f*2+1)
+        local fo = string.byte(schema, f*2+2)
+        if gp > #bin or ep > #blob then break end
+        local gx = string.byte(bin, gp); local ex = string.byte(blob, ep)
+        gp = gp + 1; ep = ep + 1
+        if gx == 0 then
+            if ex == 1 then ep = skip(blob, ep, ft) end
+        elseif ex == 0 then
+            gp = skip(bin, gp, ft)
+            if fo == 61 then return false end
+        else
+            if not cmp(bin, gp, blob, ep, ft, fo) then return false end
+            gp = skip(bin, gp, ft); ep = skip(blob, ep, ft)
+        end
+    end
+    return true
+end
+
+local function chk_single(pk, ev)
+    local hdr = redis.call('GETRANGE', pk, 0, hdr_size - 1)
+    if #hdr < hdr_size or string.byte(hdr, 1) ~= 0x53 or string.byte(hdr, 2) ~= 0x52 then
+        return true
+    end
+    local first = i64(hdr, 3); local last = i64(hdr, 11)
+    local fl = string.byte(hdr, 19)
+    local desc = (fl % 2) == 1
+    local fp = (math.floor(fl / 2) % 2) == 1
+    local inc = (math.floor(fl / 4) % 2) == 1
+    local off = (math.floor(fl / 8) % 2) == 0
+    if off then
+        if inc then return true end
+        if desc then return ev >= last else return ev <= last end
+    else
+        if fp or inc then return true end
+        if desc then
+            return ev <= first and ev >= last
+        else
+            return ev >= first and ev <= last
+        end
+    end
+end
+
+local function chk_range(pk, v1, v2)
+    local hdr = redis.call('GETRANGE', pk, 0, hdr_size - 1)
+    if #hdr < hdr_size or string.byte(hdr, 1) ~= 0x53 or string.byte(hdr, 2) ~= 0x52 then
+        return true
+    end
+    local first = i64(hdr, 3); local last = i64(hdr, 11)
+    local fl = string.byte(hdr, 19)
+    local desc = (fl % 2) == 1
+    local fp = (math.floor(fl / 2) % 2) == 1
+    local inc = (math.floor(fl / 4) % 2) == 1
+    local off = (math.floor(fl / 8) % 2) == 0
+    local rmin = math.min(v1, v2)
+    local rmax = math.max(v1, v2)
+    if off then
+        local pmin = desc and last or first
+        local pmax = desc and first or last
+        if inc then return pmin <= rmax end
+        return (pmin <= rmax) and (rmin <= pmax)
+    else
+        local function inr(val)
+            if fp or inc then return true end
+            if desc then return val <= first and val >= last
+            else return val >= first and val <= last end
+        end
+        return inr(v1) or inr(v2)
+    end
+end
+
+local groups = redis.call('HGETALL', master)
+if not groups or #groups == 0 then return 0 end
+
+for gi = 1, #groups, 2 do
+    local gk = groups[gi]
+    local si = tonumber(groups[gi + 1])
+    local bin = string.sub(gk, prefix_len + 1)
+    local nm = fmatch(bin, new_blob)
+    local om = fmatch(bin, old_blob)
+    if nm or om then
+        local nv = new_sv[si + 1] or 0
+        local ov = old_sv[si + 1] or 0
+        local tk = gk .. ':_keys'
+        local pages = redis.call('SMEMBERS', tk)
+        if pages and #pages > 0 then
+            local c = 0
+            for _, pk in ipairs(pages) do
+                local del = false
+                if nm and om then
+                    if nv == ov then del = chk_single(pk, nv)
+                    else del = chk_range(pk, ov, nv) end
+                elseif nm then del = chk_single(pk, nv)
+                else del = chk_single(pk, ov) end
+                if del then
+                    redis.call('DEL', pk)
+                    redis.call('SREM', tk, pk)
+                    c = c + 1
+                end
+            end
+            if c == #pages then redis.call('UNLINK', tk) end
+            total = total + c
+        end
+    end
+end
+return total
+)";
+
+                    auto result = co_await DbProvider::redis(
+                        "EVAL", lua, "1", masterKey,
+                        std::to_string(prefixLen),
+                        static_cast<int>(list::kListBoundsHeaderSize),
+                        filterSchema,
+                        newEntityBlob, newSortValues,
+                        oldEntityBlob, oldSortValues);
+
+                    co_return result.isNil() ? 0 : static_cast<size_t>(result.asInteger());
+                } catch (const std::exception& e) {
+                    RELAIS_LOG_WARN << "RedisCache invalidateListGroupsSelectiveUpdate error: " << e.what();
                     co_return 0;
                 }
             }

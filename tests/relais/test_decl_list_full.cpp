@@ -266,3 +266,157 @@ TEST_CASE("[DeclList L1+L2] Entity and list on same repo",
         REQUIRE(r3->size() == 2);  // Stale from cache
     }
 }
+
+
+// #############################################################################
+//
+//  4. L1+L2 notify* path (synchronous invalidation)
+//
+// #############################################################################
+
+TEST_CASE("[DeclList L1+L2] notify* path (L1 sync + L2 invalidation)",
+          "[integration][db][list][full-cache][notify]")
+{
+    TransactionGuard tx;
+    TestInternals::resetListCacheState<FullCacheArticleListRepo>();
+
+    SECTION("[notify] notifyCreated invalidates both L1 and L2") {
+        auto userId = insertTestUser("author", "author@notify.com", 0);
+        insertTestArticle("tech", userId, "Tech 1", 10);
+
+        // Populate L1+L2
+        auto r1 = sync(FullCacheArticleListRepo::query(makeFullArticleQuery("tech")));
+        REQUIRE(r1->size() == 1);
+
+        // Insert sentinel in DB
+        insertTestArticle("tech", userId, "Sentinel", 20);
+
+        // Verify cache returns stale
+        REQUIRE(sync(FullCacheArticleListRepo::query(
+            makeFullArticleQuery("tech")))->size() == 1);
+
+        // notifyCreatedSync → invalidates both L1 and L2
+        auto entity = makeTestArticle("tech", userId, "Notified", 30);
+        TestInternals::notifyCreatedSync<FullCacheArticleListRepo>(entity);
+
+        // Both layers invalidated → DB hit → sentinel visible
+        auto r2 = sync(FullCacheArticleListRepo::query(makeFullArticleQuery("tech")));
+        CHECK(r2->size() == 2);
+    }
+
+    SECTION("[notify] notifyUpdated invalidates both layers") {
+        auto userId = insertTestUser("author", "author@notify.com", 0);
+        auto articleId = insertTestArticle("tech", userId, "Before", 10);
+
+        // Populate L1+L2
+        sync(FullCacheArticleListRepo::query(makeFullArticleQuery("tech")));
+
+        // Update DB directly
+        updateTestArticle(articleId, "After", 20);
+
+        // notifyUpdatedSync
+        auto oldEntity = makeTestArticle("tech", userId, "Before", 10, false, articleId);
+        auto newEntity = makeTestArticle("tech", userId, "After", 20, false, articleId);
+        TestInternals::notifyUpdatedSync<FullCacheArticleListRepo>(oldEntity, newEntity);
+
+        // Both layers invalidated → DB hit
+        auto result = sync(FullCacheArticleListRepo::query(makeFullArticleQuery("tech")));
+        CHECK(result->size() == 1);
+        CHECK(result->items.front().title == "After");
+    }
+
+    SECTION("[notify] notifyDeleted invalidates both layers") {
+        auto userId = insertTestUser("author", "author@notify.com", 0);
+        auto articleId = insertTestArticle("tech", userId, "To Delete", 10);
+        insertTestArticle("tech", userId, "To Keep", 20);
+
+        // Populate L1+L2
+        REQUIRE(sync(FullCacheArticleListRepo::query(
+            makeFullArticleQuery("tech")))->size() == 2);
+
+        // Delete from DB
+        deleteTestArticle(articleId);
+
+        // notifyDeletedSync
+        auto entity = makeTestArticle("tech", userId, "To Delete", 10, false, articleId);
+        TestInternals::notifyDeletedSync<FullCacheArticleListRepo>(entity);
+
+        // Both layers invalidated
+        CHECK(sync(FullCacheArticleListRepo::query(
+            makeFullArticleQuery("tech")))->size() == 1);
+    }
+}
+
+
+// #############################################################################
+//
+//  5. L1+L2 Filter-based selective invalidation
+//
+// #############################################################################
+
+TEST_CASE("[DeclList L1+L2] Filter-based selective invalidation",
+          "[integration][db][list][full-cache][filter-match]")
+{
+    TransactionGuard tx;
+    TestInternals::resetListCacheState<FullCacheArticleListRepo>();
+
+    SECTION("[filter-match] insert tech: tech supprimé, news conservé") {
+        auto userId = insertTestUser("author", "author@fm.com", 0);
+        insertTestArticle("tech", userId, "Tech 1", 10);
+        insertTestArticle("news", userId, "News 1", 20);
+
+        // Populate both groups in L1+L2
+        sync(FullCacheArticleListRepo::query(makeFullArticleQuery("tech")));
+        sync(FullCacheArticleListRepo::query(makeFullArticleQuery("news")));
+
+        // Insert sentinels
+        insertTestArticle("tech", userId, "Tech Sentinel", 30);
+        insertTestArticle("news", userId, "News Sentinel", 40);
+
+        // notifyCreatedSync with tech entity → selective invalidation
+        auto entity = makeTestArticle("tech", userId, "Tech Notify", 50);
+        TestInternals::notifyCreatedSync<FullCacheArticleListRepo>(entity);
+
+        // tech SUPPRIMÉ: DB hit → original + sentinel
+        CHECK(sync(FullCacheArticleListRepo::query(
+            makeFullArticleQuery("tech")))->size() == 2);
+        // news CONSERVÉ: L1 cache hit → sentinel invisible
+        CHECK(sync(FullCacheArticleListRepo::query(
+            makeFullArticleQuery("news")))->size() == 1);
+    }
+
+    SECTION("[filter-match] update tech→news: tech+news supprimés, sports conservé") {
+        auto userId = insertTestUser("author", "author@fm.com", 0);
+        auto articleId = insertTestArticle("tech", userId, "Migrating", 10);
+        insertTestArticle("news", userId, "News 1", 20);
+        insertTestArticle("sports", userId, "Sports 1", 30);
+
+        // Populate 3 groups
+        sync(FullCacheArticleListRepo::query(makeFullArticleQuery("tech")));
+        sync(FullCacheArticleListRepo::query(makeFullArticleQuery("news")));
+        sync(FullCacheArticleListRepo::query(makeFullArticleQuery("sports")));
+
+        // Insert sentinels
+        insertTestArticle("tech", userId, "Tech Sentinel", 40);
+        insertTestArticle("news", userId, "News Sentinel", 50);
+        insertTestArticle("sports", userId, "Sports Sentinel", 60);
+
+        // Update DB
+        updateTestArticleCategory(articleId, "news");
+
+        // notifyUpdatedSync: old=tech, new=news
+        auto oldEntity = makeTestArticle("tech", userId, "Migrating", 10, false, articleId);
+        auto newEntity = makeTestArticle("news", userId, "Migrating", 10, false, articleId);
+        TestInternals::notifyUpdatedSync<FullCacheArticleListRepo>(oldEntity, newEntity);
+
+        // tech SUPPRIMÉ (old group): sentinel only
+        CHECK(sync(FullCacheArticleListRepo::query(
+            makeFullArticleQuery("tech")))->size() == 1);
+        // news SUPPRIMÉ (new group): existing + migrated + sentinel
+        CHECK(sync(FullCacheArticleListRepo::query(
+            makeFullArticleQuery("news")))->size() == 3);
+        // sports CONSERVÉ
+        CHECK(sync(FullCacheArticleListRepo::query(
+            makeFullArticleQuery("sports")))->size() == 1);
+    }
+}

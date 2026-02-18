@@ -15,6 +15,7 @@
 #include "jcailloux/relais/list/decl/GeneratedFilters.h"
 #include "jcailloux/relais/list/decl/GeneratedTraits.h"
 #include "jcailloux/relais/list/decl/GeneratedCriteria.h"
+#include "jcailloux/relais/list/decl/HttpQueryParser.h"
 #include "jcailloux/relais/wrapper/EntityConcepts.h"
 #include "jcailloux/relais/wrapper/ListWrapper.h"
 
@@ -279,12 +280,8 @@ public:
     {
         auto result = co_await Base::insert(std::move(wrapper));
         if (result) {
-            if constexpr (kHasL1) {
-                listCache().onEntityCreated(result);
-            }
-            if constexpr (kHasL2) {
-                co_await invalidateRedisListGroups();
-            }
+            if constexpr (kHasL1) { listCache().onEntityCreated(result); }
+            if constexpr (kHasL2) { co_await invalidateL2Created(*result); }
         }
         co_return result;
     }
@@ -404,36 +401,23 @@ public:
     // Cross-invalidation entry points
     // =========================================================================
     //
-    // Synchronous, L1-only — updates ModificationTracker for lazy invalidation.
-    // For L2 invalidation, use CRUD methods (insert/update/erase/patch) which
-    // trigger invalidateRedisListGroups() automatically, or call
-    // invalidateAllListGroups() from a custom InvalidateList handler.
+    // Synchronous API: L1 invalidation inline + L2 fire-and-forget (DetachedTask).
+    // Called by InvalidateList<> cross-invalidation and external sync callers.
+    // CRUD methods use co_await for L2 instead (no fire-and-forget).
 
     static void notifyCreated(WrapperPtrType entity) {
-        if constexpr (kHasL1) {
-            if (entity) listCache().onEntityCreated(std::move(entity));
-        }
-        if constexpr (kHasL2) {
-            fireAndForgetInvalidateL2();
-        }
+        if constexpr (kHasL1) { listCache().onEntityCreated(entity); }
+        if constexpr (kHasL2) { fireL2Created(std::move(entity)); }
     }
 
     static void notifyUpdated(WrapperPtrType old_entity, WrapperPtrType new_entity) {
-        if constexpr (kHasL1) {
-            listCache().onEntityUpdated(std::move(old_entity), std::move(new_entity));
-        }
-        if constexpr (kHasL2) {
-            fireAndForgetInvalidateL2();
-        }
+        if constexpr (kHasL1) { listCache().onEntityUpdated(old_entity, new_entity); }
+        if constexpr (kHasL2) { fireL2Updated(std::move(old_entity), std::move(new_entity)); }
     }
 
     static void notifyDeleted(WrapperPtrType entity) {
-        if constexpr (kHasL1) {
-            if (entity) listCache().onEntityDeleted(std::move(entity));
-        }
-        if constexpr (kHasL2) {
-            fireAndForgetInvalidateL2();
-        }
+        if constexpr (kHasL1) { listCache().onEntityDeleted(entity); }
+        if constexpr (kHasL2) { fireL2Deleted(std::move(entity)); }
     }
 
 #ifdef RELAIS_BUILDING_TESTS
@@ -452,12 +436,8 @@ protected:
         auto new_entity = wrapper;
         bool ok = co_await Base::update(id, std::move(wrapper));
         if (ok) {
-            if constexpr (kHasL1) {
-                listCache().onEntityUpdated(std::move(old_entity), std::move(new_entity));
-            }
-            if constexpr (kHasL2) {
-                co_await invalidateRedisListGroups();
-            }
+            if constexpr (kHasL1) { listCache().onEntityUpdated(old_entity, new_entity); }
+            if constexpr (kHasL2) { co_await invalidateL2Updated(*old_entity, *new_entity); }
         }
         co_return ok;
     }
@@ -467,13 +447,9 @@ protected:
         requires (!Base::config.read_only)
     {
         auto result = co_await Base::erase(id);
-        if (result.has_value()) {
-            if constexpr (kHasL1) {
-                if (old_entity) listCache().onEntityDeleted(std::move(old_entity));
-            }
-            if constexpr (kHasL2) {
-                co_await invalidateRedisListGroups();
-            }
+        if (result.has_value() && old_entity) {
+            if constexpr (kHasL1) { listCache().onEntityDeleted(old_entity); }
+            if constexpr (kHasL2) { co_await invalidateL2Deleted(*old_entity); }
         }
         co_return result;
     }
@@ -485,28 +461,77 @@ protected:
     {
         auto result = co_await Base::patch(id, std::forward<Updates>(updates)...);
         if (result) {
-            if constexpr (kHasL1) {
-                listCache().onEntityUpdated(std::move(old_entity), result);
-            }
-            if constexpr (kHasL2) {
-                co_await invalidateRedisListGroups();
-            }
+            if constexpr (kHasL1) { listCache().onEntityUpdated(old_entity, result); }
+            if constexpr (kHasL2) { co_await invalidateL2Updated(*old_entity, *result); }
         }
         co_return result;
     }
 
     // =========================================================================
-    // Redis L2 declarative list invalidation
+    // Redis L2 selective invalidation (all-in-one Lua, 1 RTT)
     // =========================================================================
 
-    /// Fire-and-forget L2 invalidation — launched from synchronous notify methods.
-    /// Uses DetachedTask: starts immediately, self-destructs on completion.
-    static io::DetachedTask fireAndForgetInvalidateL2() {
-        co_await invalidateRedisListGroups();
+    /// Build comma-separated sort values for all sort fields.
+    static std::string buildSortValues(const Entity& entity) {
+        std::string result;
+        [&]<size_t... Is>(std::index_sequence<Is...>) {
+            size_t count = 0;
+            ((result += (count++ > 0 ? "," : ""),
+              result += std::to_string(Traits::extractSortValue(entity, Is))), ...);
+        }(std::make_index_sequence<cache::list::decl::sort_count<Descriptor>>{});
+        return result;
     }
 
-    /// Invalidate all tracked declarative list groups in Redis.
-    /// Flow: SMEMBERS master → invalidateListGroup(each) → DEL master.
+    /// Selective L2 invalidation for entity creation (or deletion).
+    /// Single Lua EVAL: HGETALL master → filter match → SortBounds → DEL pages.
+    static io::Task<size_t> invalidateL2Created(const Entity& entity) {
+        auto masterKey = redisMasterSetKey();
+        auto prefixLen = std::string(Base::name()).size() + 9; // ":dlist:g:"
+        auto schema = cache::list::decl::filterSchema<Descriptor>();
+        auto blob = cache::list::decl::encodeEntityFilterBlob<Descriptor>(entity);
+        auto sortVals = buildSortValues(entity);
+
+        co_return co_await cache::RedisCache::invalidateListGroupsSelective(
+            masterKey, prefixLen, schema, blob, sortVals);
+    }
+
+    /// Selective L2 invalidation for entity update (old + new entities).
+    /// Single Lua EVAL: HGETALL master → filter match both → SortBounds → DEL pages.
+    static io::Task<size_t> invalidateL2Updated(const Entity& old_e, const Entity& new_e) {
+        auto masterKey = redisMasterSetKey();
+        auto prefixLen = std::string(Base::name()).size() + 9;
+        auto schema = cache::list::decl::filterSchema<Descriptor>();
+        auto newBlob = cache::list::decl::encodeEntityFilterBlob<Descriptor>(new_e);
+        auto newSortVals = buildSortValues(new_e);
+        auto oldBlob = cache::list::decl::encodeEntityFilterBlob<Descriptor>(old_e);
+        auto oldSortVals = buildSortValues(old_e);
+
+        co_return co_await cache::RedisCache::invalidateListGroupsSelectiveUpdate(
+            masterKey, prefixLen, schema, newBlob, newSortVals, oldBlob, oldSortVals);
+    }
+
+    /// Selective L2 invalidation for entity deletion (same logic as creation).
+    static io::Task<size_t> invalidateL2Deleted(const Entity& entity) {
+        return invalidateL2Created(entity);
+    }
+
+    /// Fire-and-forget L2 invalidation for entity creation.
+    static io::DetachedTask fireL2Created(WrapperPtrType entity) {
+        try { co_await invalidateL2Created(*entity); } catch (...) {}
+    }
+
+    /// Fire-and-forget L2 invalidation for entity update.
+    static io::DetachedTask fireL2Updated(WrapperPtrType old_e, WrapperPtrType new_e) {
+        try { co_await invalidateL2Updated(*old_e, *new_e); } catch (...) {}
+    }
+
+    /// Fire-and-forget L2 invalidation for entity deletion.
+    static io::DetachedTask fireL2Deleted(WrapperPtrType entity) {
+        try { co_await invalidateL2Deleted(*entity); } catch (...) {}
+    }
+
+    /// Coarse L2 invalidation — fallback that invalidates all groups.
+    /// Flow: HKEYS master → invalidateListGroup(each) → UNLINK master.
     static io::Task<size_t> invalidateRedisListGroups() {
         if constexpr (!kHasL2) {
             co_return 0;
@@ -516,20 +541,17 @@ protected:
 
                 auto masterKey = redisMasterSetKey();
 
-                // 1. Get all active group keys
-                auto result = co_await DbProvider::redis("SMEMBERS", masterKey);
+                auto result = co_await DbProvider::redis("HKEYS", masterKey);
                 if (result.isNil() || !result.isArray()) co_return 0;
 
                 auto groups = result.asStringArray();
                 size_t count = 0;
 
-                // 2. Invalidate each group (Lua: SMEMBERS → DEL pages → DEL SET)
                 for (const auto& group : groups) {
                     count += co_await cache::RedisCache::invalidateListGroup(group);
                 }
 
-                // 3. Delete master set
-                co_await DbProvider::redis("DEL", masterKey);
+                co_await DbProvider::redis("UNLINK", masterKey);
 
                 co_return count;
             } catch (const std::exception& e) {
@@ -617,9 +639,11 @@ protected:
             header.bounds = bounds;
             header.sort_direction = (sort.direction == cache::list::SortDirection::Desc)
                 ? cache::list::SortDirection::Desc : cache::list::SortDirection::Asc;
-            header.is_first_page = query.cursor.data.empty();
+            header.is_first_page = query.cursor.data.empty() && query.offset == 0;
             header.is_incomplete = wrapper->items.size() < static_cast<size_t>(query.limit);
-            header.pagination_mode = cache::list::PaginationMode::Cursor;
+            header.pagination_mode = query.cursor.data.empty()
+                ? cache::list::PaginationMode::Offset
+                : cache::list::PaginationMode::Cursor;
 
             auto pageKey = redisPageKey(query.cache_key);
             auto groupKey = redisGroupKey(query.group_key);
@@ -628,8 +652,8 @@ protected:
             co_await cache::RedisCache::setListBinary(pageKey, *wrapper, l2Ttl(), header);
             // Track page in group SET
             co_await cache::RedisCache::trackListKey(groupKey, pageKey, l2Ttl());
-            // Track group in master SET
-            co_await DbProvider::redis("SADD", redisMasterSetKey(), groupKey);
+            // Track group in master HASH (stores sort field index per group)
+            co_await DbProvider::redis("HSET", redisMasterSetKey(), groupKey, std::to_string(sort.field));
         }
 
         // 5. Store in L1 cache
@@ -652,10 +676,36 @@ protected:
             // Parse sort
             auto sort = query.sort.value_or(defaultSortAsListSpec());
             auto sort_col = cache::list::decl::sortColumnName<Descriptor>(sort.field);
-            const char* sort_dir = (sort.direction == cache::list::SortDirection::Asc)
-                                  ? "ASC" : "DESC";
+            const bool is_desc = (sort.direction == cache::list::SortDirection::Desc);
 
-            // Build SQL: SELECT * FROM "table" [WHERE ...] ORDER BY "col" DIR LIMIT N
+            // Cursor keyset condition (page 2+ with cursor)
+            if (!query.cursor.data.empty() && query.cursor.data.size() >= sizeof(int64_t) * 2) {
+                int64_t cursor_sort_value = 0;
+                int64_t cursor_id = 0;
+                std::memcpy(&cursor_sort_value, query.cursor.data.data(),
+                            sizeof(cursor_sort_value));
+                std::memcpy(&cursor_id,
+                            query.cursor.data.data() + sizeof(cursor_sort_value),
+                            sizeof(cursor_id));
+
+                if (!where.sql.empty()) where.sql += " AND ";
+                where.sql += "(COALESCE(\"";
+                where.sql += sort_col;
+                where.sql += "\", 0), \"";
+                where.sql += Mapping::primary_key_column;
+                where.sql += "\") ";
+                where.sql += is_desc ? "< " : "> ";
+                where.sql += "($";
+                where.sql += std::to_string(where.next_param++);
+                where.sql += ", $";
+                where.sql += std::to_string(where.next_param++);
+                where.sql += ")";
+
+                where.params.params.push_back(io::PgParam::bigint(cursor_sort_value));
+                where.params.params.push_back(io::PgParam::bigint(cursor_id));
+            }
+
+            // Build SQL
             std::string sql;
             sql.reserve(256);
             sql += "SELECT * FROM ";
@@ -664,12 +714,22 @@ protected:
                 sql += " WHERE ";
                 sql += where.sql;
             }
-            sql += " ORDER BY \"";
+            sql += " ORDER BY COALESCE(\"";
             sql += sort_col;
+            sql += "\", 0) ";
+            sql += is_desc ? "DESC" : "ASC";
+            sql += ", \"";
+            sql += Mapping::primary_key_column;
             sql += "\" ";
-            sql += sort_dir;
+            sql += is_desc ? "DESC" : "ASC";
             sql += " LIMIT ";
             sql += std::to_string(query.limit);
+
+            // Offset pagination (mutually exclusive with cursor)
+            if (query.offset > 0 && query.cursor.data.empty()) {
+                sql += " OFFSET ";
+                sql += std::to_string(query.offset);
+            }
 
             // Execute
             auto result = co_await DbProvider::queryParams(sql.c_str(), where.params);

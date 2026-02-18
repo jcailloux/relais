@@ -19,31 +19,24 @@ using WrapperPtr = std::shared_ptr<const Entity>;
 /// Invalidation data for cross-repository notifications
 template<typename Entity>
 struct InvalidationData {
-    std::optional<WrapperPtr<Entity>> old_entity;  // Before mutation (null for insert)
-    std::optional<WrapperPtr<Entity>> new_entity;  // After mutation (null for delete)
+    WrapperPtr<Entity> old_entity;  // null for insert
+    WrapperPtr<Entity> new_entity;  // null for delete
 
     static InvalidationData forCreate(WrapperPtr<Entity> entity) {
-        InvalidationData data;
-        data.new_entity = std::move(entity);
-        return data;
+        return {{}, std::move(entity)};
     }
 
     static InvalidationData forUpdate(WrapperPtr<Entity> old_e, WrapperPtr<Entity> new_e) {
-        InvalidationData data;
-        data.old_entity = std::move(old_e);
-        data.new_entity = std::move(new_e);
-        return data;
+        return {std::move(old_e), std::move(new_e)};
     }
 
     static InvalidationData forDelete(WrapperPtr<Entity> entity) {
-        InvalidationData data;
-        data.old_entity = std::move(entity);
-        return data;
+        return {std::move(entity), {}};
     }
 
-    bool isCreate() const { return !old_entity.has_value() && new_entity.has_value(); }
-    bool isUpdate() const { return old_entity.has_value() && new_entity.has_value(); }
-    bool isDelete() const { return old_entity.has_value() && !new_entity.has_value(); }
+    bool isCreate() const { return !old_entity && new_entity; }
+    bool isUpdate() const { return old_entity && new_entity; }
+    bool isDelete() const { return old_entity && !new_entity; }
 };
 
 // =============================================================================
@@ -68,11 +61,11 @@ struct Invalidate {
         std::optional<decltype(extractKey(std::declval<Entity>()))> old_key;
         std::optional<decltype(extractKey(std::declval<Entity>()))> new_key;
 
-        if (data.old_entity && *data.old_entity) {
-            old_key = extractKey(**data.old_entity);
+        if (data.old_entity) {
+            old_key = extractKey(*data.old_entity);
         }
-        if (data.new_entity && *data.new_entity) {
-            new_key = extractKey(**data.new_entity);
+        if (data.new_entity) {
+            new_key = extractKey(*data.new_entity);
         }
 
         if (old_key) {
@@ -110,6 +103,9 @@ struct InvalidateList {
             co_await ListCache::onEntityModified(std::move(entity_ptr));
         } else if constexpr (requires { ListCache::onEntityCreated(entity_ptr); }) {
             co_await ListCache::onEntityCreated(std::move(entity_ptr));
+        } else if constexpr (requires { ListCache::notifyCreated(entity_ptr); }) {
+            ListCache::notifyCreated(std::move(entity_ptr));
+            co_return;
         }
     }
 
@@ -122,33 +118,43 @@ struct InvalidateList {
             std::declval<WrapperPtr<Entity>>(),
             std::declval<WrapperPtr<Entity>>()); }) {
 
-            WrapperPtr<Entity> old_ptr = data.old_entity.value_or(nullptr);
-            WrapperPtr<Entity> new_ptr = data.new_entity.value_or(nullptr);
-
-            if (data.isCreate() && new_ptr) {
-                if constexpr (requires { ListCache::onEntityCreated(new_ptr); }) {
-                    co_await ListCache::onEntityCreated(std::move(new_ptr));
+            if (data.isCreate() && data.new_entity) {
+                if constexpr (requires { ListCache::onEntityCreated(data.new_entity); }) {
+                    co_await ListCache::onEntityCreated(data.new_entity);
                 } else {
-                    co_await ListCache::onEntityUpdated(nullptr, std::move(new_ptr));
+                    co_await ListCache::onEntityUpdated(nullptr, data.new_entity);
                 }
-            } else if (data.isDelete() && old_ptr) {
-                if constexpr (requires { ListCache::onEntityDeleted(old_ptr); }) {
-                    co_await ListCache::onEntityDeleted(std::move(old_ptr));
+            } else if (data.isDelete() && data.old_entity) {
+                if constexpr (requires { ListCache::onEntityDeleted(data.old_entity); }) {
+                    co_await ListCache::onEntityDeleted(data.old_entity);
                 } else {
-                    co_await ListCache::onEntityUpdated(std::move(old_ptr), nullptr);
+                    co_await ListCache::onEntityUpdated(data.old_entity, nullptr);
                 }
             } else if (data.isUpdate()) {
-                co_await ListCache::onEntityUpdated(std::move(old_ptr), std::move(new_ptr));
+                co_await ListCache::onEntityUpdated(data.old_entity, data.new_entity);
             }
+        }
+        else if constexpr (requires { ListCache::notifyUpdated(
+            std::declval<WrapperPtr<Entity>>(),
+            std::declval<WrapperPtr<Entity>>()); }) {
+
+            if (data.isCreate() && data.new_entity) {
+                ListCache::notifyCreated(data.new_entity);
+            } else if (data.isDelete() && data.old_entity) {
+                ListCache::notifyDeleted(data.old_entity);
+            } else if (data.isUpdate()) {
+                ListCache::notifyUpdated(data.old_entity, data.new_entity);
+            }
+            co_return;
         }
         else if constexpr (requires { ListCache::onEntityModified(
             std::declval<WrapperPtr<Entity>>()); }) {
 
-            if (data.new_entity && *data.new_entity) {
-                co_await ListCache::onEntityModified(*data.new_entity);
+            if (data.new_entity) {
+                co_await ListCache::onEntityModified(data.new_entity);
             }
-            else if (data.old_entity && *data.old_entity) {
-                co_await ListCache::onEntityModified(*data.old_entity);
+            else if (data.old_entity) {
+                co_await ListCache::onEntityModified(data.old_entity);
             }
         }
     }
@@ -174,10 +180,10 @@ struct InvalidateVia {
         using KeyT = decltype(extractKey(std::declval<Entity>()));
         std::optional<KeyT> old_key, new_key;
 
-        if (data.old_entity && *data.old_entity)
-            old_key = extractKey(**data.old_entity);
-        if (data.new_entity && *data.new_entity)
-            new_key = extractKey(**data.new_entity);
+        if (data.old_entity)
+            old_key = extractKey(*data.old_entity);
+        if (data.new_entity)
+            new_key = extractKey(*data.new_entity);
 
         if (old_key) {
             auto targets = co_await Resolver(*old_key);
@@ -233,10 +239,10 @@ struct InvalidateListVia {
         using KeyT = decltype(extractKey(std::declval<Entity>()));
         std::optional<KeyT> old_key, new_key;
 
-        if (data.old_entity && *data.old_entity)
-            old_key = extractKey(**data.old_entity);
-        if (data.new_entity && *data.new_entity)
-            new_key = extractKey(**data.new_entity);
+        if (data.old_entity)
+            old_key = extractKey(*data.old_entity);
+        if (data.new_entity)
+            new_key = extractKey(*data.new_entity);
 
         if (old_key)
             co_await resolveAndInvalidate(*old_key);
