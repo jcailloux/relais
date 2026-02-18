@@ -127,9 +127,84 @@ std::string cacheKey(const ListDescriptorQuery<Descriptor>& query) {
             reinterpret_cast<const uint8_t*>(query.cursor.data.data()) + query.cursor.data.size());
     }
 
+    // Offset (mutually exclusive with cursor — cursor takes precedence)
+    if (query.offset > 0 && query.cursor.data.empty()) {
+        uint8_t offset_marker = 0x4F;  // 'O' — distinguishes from cursor data
+        buf.push_back(offset_marker);
+        detail::appendToBuffer(buf, query.offset);
+    }
+
     key.append(reinterpret_cast<const char*>(buf.data()), buf.size());
     return key;
 }
+
+// =============================================================================
+// Entity Filter Blob — binary encoding of entity filter values for Lua matching
+// =============================================================================
+
+/// Encode entity filter values as a binary blob in the same format as groupCacheKey().
+/// For each filter: [0x01][value_bytes] if entity has a value, [0x00] if optional and null.
+/// Lua compares this blob against the binary portion of the group key for filter matching.
+template<typename Descriptor>
+    requires ValidListDescriptor<Descriptor>
+std::string encodeEntityFilterBlob(const typename Descriptor::Entity& entity) {
+    std::vector<uint8_t> buf;
+    buf.reserve(64);
+
+    [&]<size_t... Is>(std::index_sequence<Is...>) {
+        ([&] {
+            using FilterType = filter_at<Descriptor, Is>;
+            const auto value = detail::extractMemberValue<FilterType::entity_ptr>(entity);
+
+            if constexpr (FilterType::is_optional_member) {
+                detail::appendOptional(buf, value);
+            } else {
+                buf.push_back(0x01);
+                detail::appendToBuffer(buf, value);
+            }
+        }(), ...);
+    }(std::make_index_sequence<filter_count<Descriptor>>{});
+
+    return std::string(reinterpret_cast<const char*>(buf.data()), buf.size());
+}
+
+/// Generate a compact filter schema string for Lua binary parsing.
+/// 2 characters per filter: type char + operator char.
+/// Type: 's'=string, '8'=int64_t, '4'=int32_t, '1'=bool/uint8_t.
+/// Operator: '='=EQ, '!'=NE, '>'=GT, 'G'=GE, '<'=LT, 'L'=LE.
+template<typename Descriptor>
+    requires ValidListDescriptor<Descriptor>
+std::string filterSchema() {
+    std::string schema;
+    schema.reserve(filter_count<Descriptor> * 2);
+
+    [&]<size_t... Is>(std::index_sequence<Is...>) {
+        ([&] {
+            using FilterType = filter_at<Descriptor, Is>;
+            using ValueType = typename FilterType::value_type;
+
+            if constexpr (std::is_same_v<ValueType, std::string>)
+                schema += 's';
+            else if constexpr (sizeof(ValueType) == 8) schema += '8';
+            else if constexpr (sizeof(ValueType) == 4) schema += '4';
+            else schema += '1';
+
+            constexpr Op op = FilterType::op;
+            if constexpr (op == Op::EQ) schema += '=';
+            else if constexpr (op == Op::NE) schema += '!';
+            else if constexpr (op == Op::GT) schema += '>';
+            else if constexpr (op == Op::GE) schema += 'G';
+            else if constexpr (op == Op::LT) schema += '<';
+            else if constexpr (op == Op::LE) schema += 'L';
+        }(), ...);
+    }(std::make_index_sequence<filter_count<Descriptor>>{});
+
+    return schema;
+}
+
+// =============================================================================
+// HTTP Query Parser - Auto-parse filters from HTTP request
+// =============================================================================
 
 /// Parse ListQuery from a parameter map (e.g. req->getParameters())
 template<typename Descriptor, typename Map = std::unordered_map<std::string, std::string>>
@@ -183,6 +258,13 @@ ListDescriptorQuery<Descriptor> parseListQuery(const Map& params) {
         }
     }
 
+    // Parse offset (ignored if cursor is present — cursor takes precedence)
+    if (query.cursor.data.empty()) {
+        if (auto it = params.find("offset"); it != params.end()) {
+            query.offset = static_cast<uint32_t>(cache::parse::toInt(it->second));
+        }
+    }
+
     // Build canonical cache keys from parsed values
     query.group_key = groupCacheKey<Descriptor>(query);
     query.cache_key = cacheKey<Descriptor>(query);
@@ -214,7 +296,7 @@ std::expected<ListDescriptorQuery<Descriptor>, QueryValidationError> parseListQu
     // Parse and validate each parameter
     for (const auto& [key, value] : params) {
         // Skip known non-filter parameters
-        if (key == "sort" || key == "limit" || key == "after" || key == "cursor") {
+        if (key == "sort" || key == "limit" || key == "after" || key == "cursor" || key == "offset") {
             continue;
         }
 
@@ -299,6 +381,20 @@ std::expected<ListDescriptorQuery<Descriptor>, QueryValidationError> parseListQu
         if (auto cursor = cache::list::Cursor::decode(it->second)) {
             query.cursor = std::move(*cursor);
         }
+    }
+
+    // Parse offset
+    if (auto it = params.find("offset"); it != params.end()) {
+        query.offset = static_cast<uint32_t>(cache::parse::toInt(it->second));
+    }
+
+    // Reject conflicting pagination: cursor + offset
+    if (!query.cursor.data.empty() && query.offset > 0) {
+        return std::unexpected(QueryValidationError{
+            .type = QueryValidationError::Type::ConflictingPagination,
+            .field = {},
+            .limit = 0
+        });
     }
 
     // Build canonical cache keys from parsed values

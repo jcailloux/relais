@@ -27,6 +27,7 @@
 #include "jcailloux/relais/list/decl/GeneratedTraits.h"
 #include "jcailloux/relais/list/decl/GeneratedCriteria.h"
 #include "jcailloux/relais/list/decl/ListDescriptorQuery.h"
+#include "jcailloux/relais/list/decl/HttpQueryParser.h"
 #include "jcailloux/relais/list/ListQuery.h"
 #include "jcailloux/relais/list/ListCache.h"
 #include "jcailloux/relais/list/ModificationTracker.h"
@@ -409,4 +410,48 @@ TEST_CASE("opToSql conversion", "[list_system][sql]") {
     REQUIRE(std::string_view(decl::opToSql(decl::Op::GE)) == ">=");
     REQUIRE(std::string_view(decl::opToSql(decl::Op::LT)) == "<");
     REQUIRE(std::string_view(decl::opToSql(decl::Op::LE)) == "<=");
+}
+
+// =============================================================================
+// parseListQueryStrict — conflicting pagination
+// =============================================================================
+
+TEST_CASE("parseListQueryStrict rejects cursor + offset", "[list_system][query][pagination]") {
+    // Build a valid cursor (16 bytes: sort_value + entity_id)
+    list::Cursor cursor;
+    cursor.data.resize(16, std::byte{0});
+    auto cursor_b64 = cursor.encode();
+
+    SECTION("cursor + offset → ConflictingPagination error") {
+        std::unordered_map<std::string, std::string> params{
+            {"after", cursor_b64},
+            {"offset", "20"}
+        };
+
+        auto result = decl::parseListQueryStrict<TestArticleDesc>(params);
+        REQUIRE(!result.has_value());
+        REQUIRE(result.error().type == decl::QueryValidationError::Type::ConflictingPagination);
+    }
+
+    SECTION("cursor only → OK") {
+        std::unordered_map<std::string, std::string> params{
+            {"after", cursor_b64}
+        };
+
+        auto result = decl::parseListQueryStrict<TestArticleDesc>(params);
+        REQUIRE(result.has_value());
+        REQUIRE(!result->cursor.data.empty());
+        REQUIRE(result->offset == 0);
+    }
+
+    SECTION("offset only → OK") {
+        std::unordered_map<std::string, std::string> params{
+            {"offset", "20"}
+        };
+
+        auto result = decl::parseListQueryStrict<TestArticleDesc>(params);
+        REQUIRE(result.has_value());
+        REQUIRE(result->cursor.data.empty());
+        REQUIRE(result->offset == 20);
+    }
 }

@@ -1617,6 +1617,22 @@ public:
         co_return co_await invalidateListGroupSelectiveUpdate(
             old_sort_val, new_sort_val, "category", category);
     }
+
+    // Override: invalidate all manually-tracked list groups via KEYS scan.
+    // The declarative ListMixin::invalidateAllListGroups() only knows about
+    // the master HASH (dlist_groups). Manual caching uses separate tracking SETs.
+    static io::Task<size_t> invalidateAllListGroups() {
+        auto pattern = std::string(name()) + ":list:*:_keys";
+        auto result = co_await jcailloux::relais::DbProvider::redis("KEYS", pattern);
+        if (result.isNil() || !result.isArray()) co_return 0;
+        auto keys = result.asStringArray();
+        size_t count = 0;
+        for (const auto& trackingKey : keys) {
+            auto groupKey = trackingKey.substr(0, trackingKey.size() - 6);
+            count += co_await cache::RedisCache::invalidateListGroup(groupKey);
+        }
+        co_return count;
+    }
 };
 
 } // namespace relais_test

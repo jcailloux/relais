@@ -9,13 +9,18 @@
   - `ListQuery::hash()` → `ListQuery::cacheKey()`
   - `ListDescriptorQuery` gains `group_key` (filters+sort) and `cache_key` (full page key)
   - L1 list cache `CacheKey` type changed from `size_t` to `std::string`
+  - InvalidationData: `optional<shared_ptr<const T>>` → `shared_ptr<const T>` — affects custom invalidation handlers that access `old_entity`/`new_entity`
+  - Master group tracking: `{name}:dlist_groups` changed from Redis SET to HASH (stores sort field index per group)
 - xxhash dependency removed from list query pipeline
 
 ### Added
 
-- **L2 (Redis) declarative list caching** in ListMixin — pages stored as BEVE binary with bounds header, group-level invalidation via Lua scripts
+- **L2 (Redis) declarative list caching** in ListMixin — pages stored as BEVE binary with bounds header
   - `invalidateAllListGroups()` — manually invalidate all L2 list groups
-  - Redis key scheme: `{name}:dlist:p:{cache_key}` (pages), `{name}:dlist:g:{group_key}` (groups), `{name}:dlist_groups` (master set)
+  - Redis key scheme: `{name}:dlist:p:{cache_key}` (pages), `{name}:dlist:g:{group_key}` (groups), `{name}:dlist_groups` (master hash)
+- **Selective L2 list eviction** — mutations now invalidate only matching groups (filter-match) and affected pages (SortBounds check) in a single Redis round-trip instead of flushing all groups
+- **Offset pagination** — `ListDescriptorQuery::offset` for traditional offset+limit pagination, mutually exclusive with cursor; `parseListQueryStrict` rejects conflicting cursor + offset (`ConflictingPagination` error)
+- **Deterministic keyset pagination** — `COALESCE` null-safe sort + secondary sort on primary key for stable cursor ordering
 - `DetachedTask` coroutine type — eager fire-and-forget for async work that doesn't need to be awaited
 - `ParseUtils.h` — lightweight parsing utilities extracted from the removed `QueryParser.h`
 - Entity generator now sorts filters alphabetically for deterministic cache keys

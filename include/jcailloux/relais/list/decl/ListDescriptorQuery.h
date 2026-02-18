@@ -23,8 +23,9 @@ struct ListDescriptorQuery {
     std::optional<DescriptorSortSpec<Descriptor>> sort;
     uint16_t limit{20};
     cache::list::Cursor cursor;
+    uint32_t offset{0};      ///< Offset for traditional offset+limit pagination
     std::string group_key;   ///< Canonical key for filters+sort (Redis group tracking)
-    std::string cache_key;   ///< Full canonical key: group_key + limit + cursor
+    std::string cache_key;   ///< Full canonical key: group_key + limit + cursor + offset
 
     [[nodiscard]] const std::string& cacheKey() const noexcept { return cache_key; }
 
