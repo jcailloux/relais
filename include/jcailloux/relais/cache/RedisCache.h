@@ -134,6 +134,46 @@ namespace jcailloux::relais::cache {
                 }
             }
 
+            // =================================================================
+            // List BEVE Methods (vector<Entity> via glz::write_beve/read_beve)
+            // =================================================================
+
+            template<typename Entity>
+            static io::Task<std::optional<std::vector<Entity>>> getListBeve(const std::string& key) {
+                auto data = co_await getRawBinary(key);
+                if (!data) co_return std::nullopt;
+                co_return parseListBeveWithHeader<Entity>(*data);
+            }
+
+            template<typename Entity, typename Rep, typename Period>
+            static io::Task<std::optional<std::vector<Entity>>> getListBeveEx(
+                const std::string& key,
+                std::chrono::duration<Rep, Period> ttl)
+            {
+                auto data = co_await getRawBinaryEx(key, ttl);
+                if (!data) co_return std::nullopt;
+                co_return parseListBeveWithHeader<Entity>(*data);
+            }
+
+            template<typename Entity, typename Rep, typename Period>
+            static io::Task<bool> setListBeve(const std::string& key,
+                                                   const std::vector<Entity>& entities,
+                                                   std::chrono::duration<Rep, Period> ttl,
+                                                   std::optional<list::ListBoundsHeader> header = std::nullopt) {
+                auto beve = serializeListBeve(entities);
+                if (beve.empty() && !entities.empty()) co_return false;
+
+                if (header) {
+                    std::vector<uint8_t> prefixed(list::kListBoundsHeaderSize + beve.size());
+                    header->writeTo(prefixed.data());
+                    std::memcpy(prefixed.data() + list::kListBoundsHeaderSize,
+                                beve.data(), beve.size());
+                    co_return co_await setRawBinary(key, prefixed, ttl);
+                } else {
+                    co_return co_await setRawBinary(key, beve, ttl);
+                }
+            }
+
             /// Get raw JSON string without deserialization.
             static io::Task<std::optional<std::string>> getRaw(const std::string& key) {
                 if (!DbProvider::hasRedis()) {
@@ -1122,6 +1162,40 @@ return total
                     data.remove_prefix(list::kListBoundsHeaderSize);
                 }
                 return parseList<Entity>(data);
+            }
+
+            // ----- BEVE list helpers -----
+
+            template<typename Entity>
+            static std::vector<uint8_t> serializeListBeve(const std::vector<Entity>& entities) {
+                std::vector<uint8_t> buffer;
+                if (glz::write_beve(entities, buffer)) {
+                    buffer.clear();
+                }
+                return buffer;
+            }
+
+            template<typename Entity>
+            static std::optional<std::vector<Entity>> parseListBeve(std::span<const uint8_t> data) {
+                if (data.empty()) return std::nullopt;
+                std::vector<Entity> result;
+                if (glz::read_beve(result, std::string_view{
+                        reinterpret_cast<const char*>(data.data()), data.size()})) {
+                    return std::nullopt;
+                }
+                return result;
+            }
+
+            template<typename Entity>
+            static std::optional<std::vector<Entity>> parseListBeveWithHeader(
+                    const std::vector<uint8_t>& raw) {
+                std::span<const uint8_t> data(raw);
+                if (data.size() >= list::kListBoundsHeaderSize
+                    && data[0] == list::kListBoundsHeaderMagic[0]
+                    && data[1] == list::kListBoundsHeaderMagic[1]) {
+                    data = data.subspan(list::kListBoundsHeaderSize);
+                }
+                return parseListBeve<Entity>(data);
             }
     };
 
