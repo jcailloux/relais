@@ -944,3 +944,361 @@ TEST_CASE("[DeclList L2] Lua all-in-one — multi-group correctness",
         CHECK(deleted == 1);
     }
 }
+
+
+// #############################################################################
+//
+//  10. ListBoundsHeader binary verification
+//
+// #############################################################################
+
+namespace {
+namespace list_ns = jcailloux::relais::cache::list;
+
+/// Build the Redis page key for a declarative list query (reproduces ListMixin::redisPageKey).
+template<typename RepoT>
+std::string buildRedisPageKey(const std::string& cache_key) {
+    std::string key(RepoT::name());
+    key += ":dlist:p:";
+    key.append(cache_key);
+    return key;
+}
+} // anonymous namespace
+
+TEST_CASE("[DeclList L2] ListBoundsHeader binary verification",
+          "[integration][db][redis][list][header]")
+{
+    TransactionGuard tx;
+    TestInternals::resetListCacheState<L2DeclArticleListRepo>();
+
+    SECTION("[header] sorted query stores correct bounds and flags") {
+        auto userId = insertTestUser("author", "author@header.com", 0);
+        insertTestArticle("tech", userId, "A100", 100);
+        insertTestArticle("tech", userId, "A80", 80);
+        insertTestArticle("tech", userId, "A60", 60);
+
+        // Sorted query: view_count DESC, limit=10
+        auto q = makeL2ViewCountQuery("tech", 10);
+        auto result = sync(L2DeclArticleListRepo::query(q));
+        REQUIRE(result->size() == 3);
+
+        // Read raw binary from Redis (includes 19-byte header)
+        auto redisKey = buildRedisPageKey<L2DeclArticleListRepo>(q.cache_key);
+        auto raw = sync(jcailloux::relais::cache::RedisCache::getRawBinary(redisKey));
+        REQUIRE(raw.has_value());
+        REQUIRE(raw->size() >= list_ns::kListBoundsHeaderSize);
+
+        // Verify magic bytes
+        CHECK((*raw)[0] == list_ns::kListBoundsHeaderMagic[0]);  // 0x53
+        CHECK((*raw)[1] == list_ns::kListBoundsHeaderMagic[1]);  // 0x52
+
+        // Parse header
+        auto header = list_ns::ListBoundsHeader::readFrom(raw->data(), raw->size());
+        REQUIRE(header.has_value());
+
+        // Verify sort bounds
+        CHECK(header->bounds.first_value == 100);
+        CHECK(header->bounds.last_value == 60);
+        CHECK(header->bounds.is_valid == true);
+
+        // Verify flags
+        CHECK(header->sort_direction == list_ns::SortDirection::Desc);
+        CHECK(header->is_first_page == true);
+        CHECK(header->is_incomplete == true);   // 3 items < limit 10
+        CHECK(header->pagination_mode == list_ns::PaginationMode::Offset);
+    }
+
+    SECTION("[header] page 2 via cursor has correct bounds and flags") {
+        auto userId = insertTestUser("author", "author@header.com", 0);
+        insertTestArticle("tech", userId, "A100", 100);
+        insertTestArticle("tech", userId, "A80", 80);
+        insertTestArticle("tech", userId, "A60", 60);
+        insertTestArticle("tech", userId, "A40", 40);
+
+        // Page 1: [100, 80] — limit=2, sorted by view_count DESC
+        auto q1 = makeL2ViewCountQuery("tech", 2);
+        auto p1 = sync(L2DeclArticleListRepo::query(q1));
+        REQUIRE(p1->size() == 2);
+        REQUIRE(p1->items[0].view_count.value() == 100);
+        REQUIRE(p1->items[1].view_count.value() == 80);
+
+        // Page 2 via cursor: [60, 40]
+        auto q2 = makeL2ViewCountQuery("tech", 2);
+        q2.cursor = list_ns::Cursor::decode(std::string(p1->cursor())).value();
+        q2.cache_key = decl::cacheKey<L2ArticleDecl>(q2);
+        auto p2 = sync(L2DeclArticleListRepo::query(q2));
+        REQUIRE(p2->size() == 2);
+
+        // Read raw binary for page 2
+        auto redisKey = buildRedisPageKey<L2DeclArticleListRepo>(q2.cache_key);
+        auto raw = sync(jcailloux::relais::cache::RedisCache::getRawBinary(redisKey));
+        REQUIRE(raw.has_value());
+
+        auto header = list_ns::ListBoundsHeader::readFrom(raw->data(), raw->size());
+        REQUIRE(header.has_value());
+
+        CHECK(header->bounds.first_value == 60);
+        CHECK(header->bounds.last_value == 40);
+        CHECK(header->is_first_page == false);
+        CHECK(header->is_incomplete == false);   // 2 items == limit 2
+        CHECK(header->pagination_mode == list_ns::PaginationMode::Cursor);
+        CHECK(header->sort_direction == list_ns::SortDirection::Desc);
+    }
+
+    SECTION("[header] default sort (id DESC) stores article IDs as bounds") {
+        auto userId = insertTestUser("author", "author@header.com", 0);
+        auto id1 = insertTestArticle("tech", userId, "First", 10);
+        auto id2 = insertTestArticle("tech", userId, "Second", 20);
+
+        // Default query — no explicit sort, uses default (id DESC)
+        auto q = makeL2ArticleQuery("tech");
+        auto result = sync(L2DeclArticleListRepo::query(q));
+        REQUIRE(result->size() == 2);
+
+        auto redisKey = buildRedisPageKey<L2DeclArticleListRepo>(q.cache_key);
+        auto raw = sync(jcailloux::relais::cache::RedisCache::getRawBinary(redisKey));
+        REQUIRE(raw.has_value());
+
+        auto header = list_ns::ListBoundsHeader::readFrom(raw->data(), raw->size());
+        REQUIRE(header.has_value());
+
+        // Default sort is id DESC → first_value = max(id), last_value = min(id)
+        CHECK(header->bounds.first_value == std::max(id1, id2));
+        CHECK(header->bounds.last_value == std::min(id1, id2));
+        CHECK(header->sort_direction == list_ns::SortDirection::Desc);
+        CHECK(header->is_first_page == true);
+    }
+}
+
+
+// #############################################################################
+//
+//  11. Insertion invalidation edge cases (L2)
+//
+// #############################################################################
+
+/// Build a L2 sorted query with explicit offset (offset-based pagination, no cursor).
+static L2ArticleDescQuery makeL2ViewCountQueryOffset(
+    std::string_view category, uint16_t limit, uint32_t offset)
+{
+    L2ArticleDescQuery q;
+    q.limit = limit;
+    q.offset = offset;
+    q.filters.get<0>() = category;
+    q.sort = jcailloux::relais::cache::list::SortSpec<size_t>{
+        1, jcailloux::relais::cache::list::SortDirection::Desc};
+    q.group_key = decl::groupCacheKey<L2ArticleDecl>(q);
+    q.cache_key = decl::cacheKey<L2ArticleDecl>(q);
+    return q;
+}
+
+TEST_CASE("[DeclList L2] Insertion invalidation edge cases",
+          "[integration][db][redis][list][edge-invalidation]")
+{
+    TransactionGuard tx;
+    TestInternals::resetListCacheState<L2DeclArticleListRepo>();
+
+    SECTION("[edge] insert when no list queries are cached") {
+        auto userId = insertTestUser("author", "author@edge.com", 0);
+        insertTestArticle("tech", userId, "Tech 1", 10);
+
+        // No query executed — no cache populated
+        // Insert via repo should NOT error even with no groups/pages in Redis
+        auto newArticle = makeTestArticle("tech", userId, "Tech 2", 20);
+        auto created = sync(L2DeclArticleListRepo::insert(newArticle));
+        CHECK(created != nullptr);
+
+        // Query now sees both articles
+        auto result = sync(L2DeclArticleListRepo::query(makeL2ArticleQuery("tech")));
+        CHECK(result->size() == 2);
+    }
+
+    SECTION("[edge] rapid sequential inserts each invalidate L2") {
+        auto userId = insertTestUser("author", "author@edge.com", 0);
+        insertTestArticle("tech", userId, "Tech 1", 10);
+
+        // Populate L2 cache
+        auto r1 = sync(L2DeclArticleListRepo::query(makeL2ArticleQuery("tech")));
+        REQUIRE(r1->size() == 1);
+
+        // 3 rapid sequential inserts via repo
+        sync(L2DeclArticleListRepo::insert(
+            makeTestArticle("tech", userId, "Tech 2", 20)));
+        sync(L2DeclArticleListRepo::insert(
+            makeTestArticle("tech", userId, "Tech 3", 30)));
+        sync(L2DeclArticleListRepo::insert(
+            makeTestArticle("tech", userId, "Tech 4", 40)));
+
+        // Each insert invalidated L2 → query hits DB → sees all 4
+        auto result = sync(L2DeclArticleListRepo::query(makeL2ArticleQuery("tech")));
+        CHECK(result->size() == 4);
+    }
+
+    SECTION("[edge] insert with sort value at exact page boundary") {
+        auto userId = insertTestUser("author", "author@edge.com", 0);
+        insertTestArticle("tech", userId, "A100", 100);
+        insertTestArticle("tech", userId, "A80", 80);
+        insertTestArticle("tech", userId, "A60", 60);
+        insertTestArticle("tech", userId, "A40", 40);
+
+        // Page 1 [100, 80]: first_page=true, offset, complete (2==limit)
+        auto q1 = makeL2ViewCountQuery("tech", 2);
+        auto p1 = sync(L2DeclArticleListRepo::query(q1));
+        REQUIRE(p1->size() == 2);
+        REQUIRE(p1->items[0].view_count.value() == 100);
+
+        // Page 2 [60, 40] via cursor: first_page=false, cursor, complete
+        auto q2 = makeL2ViewCountQuery("tech", 2);
+        q2.cursor = list_ns::Cursor::decode(std::string(p1->cursor())).value();
+        q2.cache_key = decl::cacheKey<L2ArticleDecl>(q2);
+        auto p2 = sync(L2DeclArticleListRepo::query(q2));
+        REQUIRE(p2->size() == 2);
+
+        // Insert sentinel in DB with view_count=80 (exact last_value of page 1)
+        insertTestArticle("tech", userId, "Boundary80", 80);
+
+        // notifyCreated with sort value = 80
+        // Page 1 (first_page, offset): DESC → 80 >= 80? YES → INVALIDATED
+        // Page 2 (cursor, [60,40], complete): 80 <= 60? NO → PRESERVED
+        auto entity = makeTestArticle("tech", userId, "Boundary80", 80);
+        auto deleted = TestInternals::notifyCreatedSync<L2DeclArticleListRepo>(entity);
+        CHECK(deleted >= 1);
+
+        // Page 2 PRESERVED: stale data (sentinel not visible)
+        auto p2_cached = sync(L2DeclArticleListRepo::query(q2));
+        CHECK(p2_cached->items[0].view_count.value() == 60);
+        CHECK(p2_cached->items[1].view_count.value() == 40);
+    }
+
+    SECTION("[edge] L2 offset incomplete page always invalidated (contrast with cursor)") {
+        auto userId = insertTestUser("author", "author@edge.com", 0);
+        insertTestArticle("tech", userId, "A100", 100);
+        insertTestArticle("tech", userId, "A80", 80);
+        insertTestArticle("tech", userId, "A60", 60);
+
+        // -- Part A: Offset mode — incomplete page IS always invalidated --
+
+        // Page 1 (offset=0, first, complete): [100, 80]
+        auto q_off1 = makeL2ViewCountQueryOffset("tech", 2, 0);
+        auto p_off1 = sync(L2DeclArticleListRepo::query(q_off1));
+        REQUIRE(p_off1->size() == 2);
+
+        // Page 2 (offset=2, NOT first, incomplete): [60]
+        auto q_off2 = makeL2ViewCountQueryOffset("tech", 2, 2);
+        auto p_off2 = sync(L2DeclArticleListRepo::query(q_off2));
+        REQUIRE(p_off2->size() == 1);  // 1 < limit 2 → incomplete
+
+        // Insert sentinel in DB
+        insertTestArticle("tech", userId, "Sentinel1", 1);
+
+        // notifyCreated with sort value = 1 (below all ranges)
+        // Page 1 (offset, first, complete, [100,80]): DESC → 1 >= 80? NO → PRESERVED
+        // Page 2 (offset, NOT first, incomplete): is_incomplete → return true → INVALIDATED
+        auto entity1 = makeTestArticle("tech", userId, "E1", 1);
+        TestInternals::notifyCreatedSync<L2DeclArticleListRepo>(entity1);
+
+        // Page 1 PRESERVED: cache hit → stale
+        auto p_off1_after = sync(L2DeclArticleListRepo::query(q_off1));
+        CHECK(p_off1_after->size() == 2);
+
+        // Page 2 INVALIDATED: DB hit → sees [60, 1] (sentinel visible)
+        auto p_off2_after = sync(L2DeclArticleListRepo::query(q_off2));
+        CHECK(p_off2_after->size() == 2);  // was 1, now 2 (sentinel visible)
+    }
+
+    SECTION("[edge] cursor incomplete page NOT always invalidated (contrast with offset)") {
+        auto userId = insertTestUser("author", "author@edge.com", 0);
+        insertTestArticle("tech", userId, "A100", 100);
+        insertTestArticle("tech", userId, "A80", 80);
+        insertTestArticle("tech", userId, "A60", 60);
+        insertTestArticle("tech", userId, "A40", 40);
+        insertTestArticle("tech", userId, "A20", 20);
+
+        // Page 1 [100, 80]: first, offset, complete
+        auto q1 = makeL2ViewCountQuery("tech", 2);
+        auto p1 = sync(L2DeclArticleListRepo::query(q1));
+        REQUIRE(p1->size() == 2);
+
+        // Page 2 [60, 40] via cursor: complete
+        auto q2 = makeL2ViewCountQuery("tech", 2);
+        q2.cursor = list_ns::Cursor::decode(std::string(p1->cursor())).value();
+        q2.cache_key = decl::cacheKey<L2ArticleDecl>(q2);
+        auto p2 = sync(L2DeclArticleListRepo::query(q2));
+        REQUIRE(p2->size() == 2);
+
+        // Page 3 [20] via cursor: incomplete (1 < limit 2)
+        auto q3 = makeL2ViewCountQuery("tech", 2);
+        q3.cursor = list_ns::Cursor::decode(std::string(p2->cursor())).value();
+        q3.cache_key = decl::cacheKey<L2ArticleDecl>(q3);
+        auto p3 = sync(L2DeclArticleListRepo::query(q3));
+        REQUIRE(p3->size() == 1);
+
+        // Insert sentinel in DB
+        insertTestArticle("tech", userId, "Sentinel999", 999);
+
+        // notifyCreated with sort value = 999 (above all ranges, DESC)
+        // Page 1 (first, offset): DESC → 999 >= 80? YES → INVALIDATED
+        // Page 2 (cursor, [60,40], complete): 999 <= 60? NO → PRESERVED
+        // Page 3 (cursor, [20], incomplete): isValueInRange(999, false, true, true)
+        //   → 999 <= 20? NO → PRESERVED (cursor mode does range check for incomplete)
+        auto entity = makeTestArticle("tech", userId, "E999", 999);
+        TestInternals::notifyCreatedSync<L2DeclArticleListRepo>(entity);
+
+        // Page 2 PRESERVED: cache hit → stale
+        auto p2_cached = sync(L2DeclArticleListRepo::query(q2));
+        CHECK(p2_cached->size() == 2);
+        CHECK(p2_cached->items[0].view_count.value() == 60);
+
+        // Page 3 PRESERVED: cache hit → stale (cursor incomplete NOT always invalidated)
+        auto p3_cached = sync(L2DeclArticleListRepo::query(q3));
+        CHECK(p3_cached->size() == 1);
+        CHECK(p3_cached->items[0].view_count.value() == 20);
+    }
+
+    SECTION("[edge] insert into empty cached list") {
+        auto userId = insertTestUser("author", "author@edge.com", 0);
+
+        // Query empty category → cache empty result
+        auto r1 = sync(L2DeclArticleListRepo::query(makeL2ArticleQuery("empty_cat")));
+        REQUIRE(r1->size() == 0);
+        REQUIRE(r1->empty());
+
+        // Insert sentinel directly in DB
+        insertTestArticle("empty_cat", userId, "First", 10);
+
+        // Cache still returns empty (stale from L2)
+        auto r_stale = sync(L2DeclArticleListRepo::query(makeL2ArticleQuery("empty_cat")));
+        CHECK(r_stale->size() == 0);
+
+        // notifyCreated → page with is_valid=false → always invalidated
+        auto entity = makeTestArticle("empty_cat", userId, "Notify", 20);
+        TestInternals::notifyCreatedSync<L2DeclArticleListRepo>(entity);
+
+        // L2 invalidated → DB hit → sentinel visible
+        auto r_fresh = sync(L2DeclArticleListRepo::query(makeL2ArticleQuery("empty_cat")));
+        CHECK(r_fresh->size() == 1);
+    }
+
+    SECTION("[edge] insert with nullopt sort value") {
+        auto userId = insertTestUser("author", "author@edge.com", 0);
+        insertTestArticle("tech", userId, "A100", 100);
+        insertTestArticle("tech", userId, "A50", 50);
+
+        // Sorted query: first+incomplete (2 items, limit=10) → always invalidated
+        auto q = makeL2ViewCountQuery("tech", 10);
+        auto r1 = sync(L2DeclArticleListRepo::query(q));
+        REQUIRE(r1->size() == 2);
+
+        // Insert sentinel in DB
+        insertTestArticle("tech", userId, "Sentinel", 30);
+
+        // notifyCreated with nullopt view_count → sort_value = 0
+        // Page is first+incomplete → always invalidated regardless
+        auto entity = makeTestArticle("tech", userId, "NullSort", std::nullopt);
+        TestInternals::notifyCreatedSync<L2DeclArticleListRepo>(entity);
+
+        // L2 invalidated → DB hit → sentinel visible
+        auto r_fresh = sync(L2DeclArticleListRepo::query(q));
+        CHECK(r_fresh->size() == 3);
+    }
+}
