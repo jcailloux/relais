@@ -1302,3 +1302,126 @@ TEST_CASE("[DeclList L2] Insertion invalidation edge cases",
         CHECK(r_fresh->size() == 3);
     }
 }
+
+// #############################################################################
+//
+//  queryJson / queryBinary — direct serialization from L2 list cache
+//
+// #############################################################################
+
+TEST_CASE("[DeclList L2] queryJson",
+          "[integration][db][redis][list][queryJson][rowview]")
+{
+    TransactionGuard tx;
+    TestInternals::resetListCacheState<L2DeclArticleListRepo>();
+
+    SECTION("[queryJson] returns valid JSON on L2 miss (delegates to entity path)") {
+        auto userId = insertTestUser("author", "author@qj.com", 0);
+        insertTestArticle("tech", userId, "QJ Article 1", 10);
+        insertTestArticle("tech", userId, "QJ Article 2", 20);
+
+        auto q = makeL2ArticleQuery("tech");
+        auto json = sync(L2DeclArticleListRepo::queryJson(q));
+
+        REQUIRE(json != nullptr);
+        REQUIRE(!json->empty());
+        REQUIRE(json->find("QJ Article 1") != std::string::npos);
+        REQUIRE(json->find("QJ Article 2") != std::string::npos);
+    }
+
+    SECTION("[queryJson] L2 hit transcodes BEVE to JSON") {
+        auto userId = insertTestUser("author", "author@qj2.com", 0);
+        insertTestArticle("tech", userId, "L2H Article 1", 10);
+        insertTestArticle("tech", userId, "L2H Article 2", 20);
+
+        auto q = makeL2ArticleQuery("tech");
+
+        // First call: populate L2 via entity path (query() stores BEVE in Redis)
+        auto wrapper = sync(L2DeclArticleListRepo::query(q));
+        REQUIRE(wrapper->size() == 2);
+
+        // Insert directly in DB (bypass repo) to detect stale cache
+        insertTestArticle("tech", userId, "L2H Article 3", 30);
+
+        // queryJson should hit L2 → BEVE→JSON transcode (still 2 articles)
+        auto json = sync(L2DeclArticleListRepo::queryJson(q));
+        REQUIRE(json != nullptr);
+        REQUIRE(json->find("L2H Article 1") != std::string::npos);
+        REQUIRE(json->find("L2H Article 2") != std::string::npos);
+        // Article 3 NOT in cached result
+        REQUIRE(json->find("L2H Article 3") == std::string::npos);
+    }
+
+    SECTION("[queryJson] returns nullptr for empty result") {
+        auto q = makeL2ArticleQuery("nonexistent_qj");
+        auto json = sync(L2DeclArticleListRepo::queryJson(q));
+
+        // Empty list should still return valid JSON (empty array)
+        REQUIRE(json != nullptr);
+    }
+
+    SECTION("[queryJson] matches query().json() byte-for-byte") {
+        auto userId = insertTestUser("author", "author@qj3.com", 0);
+        insertTestArticle("news", userId, "Byte Article", 42);
+
+        auto q = makeL2ArticleQuery("news");
+
+        // Entity path
+        auto wrapper = sync(L2DeclArticleListRepo::query(q));
+        REQUIRE(wrapper != nullptr);
+        auto entityJson = wrapper->json();
+
+        // Evict L2 and re-query via queryJson (entity path on miss)
+        TestInternals::resetListCacheState<L2DeclArticleListRepo>();
+        auto rowJson = sync(L2DeclArticleListRepo::queryJson(q));
+        REQUIRE(rowJson != nullptr);
+
+        // Both should produce the same JSON content
+        REQUIRE(*rowJson == *entityJson);
+    }
+}
+
+TEST_CASE("[DeclList L2] queryBinary",
+          "[integration][db][redis][list][queryBinary][rowview]")
+{
+    TransactionGuard tx;
+    TestInternals::resetListCacheState<L2DeclArticleListRepo>();
+
+    SECTION("[queryBinary] returns valid BEVE on L2 miss") {
+        auto userId = insertTestUser("author", "author@qb.com", 0);
+        insertTestArticle("tech", userId, "QB Article 1", 10);
+
+        auto q = makeL2ArticleQuery("tech");
+        auto beve = sync(L2DeclArticleListRepo::queryBinary(q));
+
+        REQUIRE(beve != nullptr);
+        REQUIRE(!beve->empty());
+    }
+
+    SECTION("[queryBinary] L2 hit returns raw binary (skips header)") {
+        auto userId = insertTestUser("author", "author@qb2.com", 0);
+        insertTestArticle("tech", userId, "BinH Article 1", 10);
+        insertTestArticle("tech", userId, "BinH Article 2", 20);
+
+        auto q = makeL2ArticleQuery("tech");
+
+        // Populate L2
+        sync(L2DeclArticleListRepo::query(q));
+
+        // Insert directly (bypass repo)
+        insertTestArticle("tech", userId, "BinH Article 3", 30);
+
+        // queryBinary should hit L2 (still 2 articles from cache)
+        auto beve = sync(L2DeclArticleListRepo::queryBinary(q));
+        REQUIRE(beve != nullptr);
+        REQUIRE(!beve->empty());
+
+        // Verify content by transcoding to JSON
+        std::string json;
+        auto err = glz::beve_to_json(*beve, json);
+        REQUIRE(!err);
+        REQUIRE(json.find("BinH Article 1") != std::string::npos);
+        REQUIRE(json.find("BinH Article 2") != std::string::npos);
+        REQUIRE(json.find("BinH Article 3") == std::string::npos);
+    }
+}

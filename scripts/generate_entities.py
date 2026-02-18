@@ -513,15 +513,19 @@ class MappingGenerator:
         lines.append("")
         lines.append("}  // namespace entity::generated")
 
-        # === glz::meta for struct and enums (outside namespace) ===
+        # === glz::meta for struct, enums, and RowView (outside namespace) ===
         struct_meta = self._generate_struct_meta(entity, source_content)
         enum_metas = self._generate_enum_metas(entity, source_content)
+        row_view_meta = self._generate_row_view_meta(entity, mapping_name)
         if struct_meta:
             lines.append("")
             lines.extend(struct_meta)
         if enum_metas:
             lines.append("")
             lines.extend(enum_metas)
+        if row_view_meta:
+            lines.append("")
+            lines.extend(row_view_meta)
 
         lines.append("")
 
@@ -537,6 +541,7 @@ class MappingGenerator:
             "#include <cstdint>",
             "#include <optional>",
             "#include <string>",
+            "#include <string_view>",
         ]
 
         # Composite key needs <tuple> and <array>
@@ -652,6 +657,10 @@ class MappingGenerator:
         # Glaze metadata template
         lines.append("")
         lines.extend(self._generate_glaze_value(entity))
+
+        # RowView + rowToJson + rowToBeve (direct serialization from PgResult)
+        lines.append("")
+        lines.extend(self._generate_row_view(entity))
 
         # Embedded ListDescriptor (if list annotations present)
         if a.has_list:
@@ -975,6 +984,191 @@ class MappingGenerator:
             lines.append(f'        "{m.name}", &T::{m.name}{comma}')
         lines.append("    );")
         return lines
+
+    # =========================================================================
+    # RowView — zero-copy view for direct serialization from PgResult
+    # =========================================================================
+
+    def _rowview_type(self, member: DataMember, annotation: EntityAnnotation,
+                      entity: ParsedEntity) -> str:
+        """Map entity type to RowView type (string_view for strings, raw_json_view for raw_json)."""
+        if member.name in annotation.json_fields:
+            return self._qualify_cpp_type(member.cpp_type, entity)
+        if member.is_raw_json:
+            return "glz::raw_json_view"
+        if member.cpp_type == "std::string":
+            return "std::string_view"
+        if member.cpp_type == "std::optional<std::string>":
+            return "std::optional<std::string_view>"
+        return self._qualify_cpp_type(member.cpp_type, entity)
+
+    _FUNDAMENTAL_TYPES = frozenset((
+        "int8_t", "int16_t", "int32_t", "int64_t",
+        "uint8_t", "uint16_t", "uint32_t", "uint64_t",
+        "float", "double", "bool", "char",
+    ))
+
+    def _qualify_cpp_type(self, cpp_type: str, entity: ParsedEntity) -> str:
+        """Qualify user-defined types with entity's namespace (for use in generated namespace)."""
+        # Standard library templates: qualify inner type
+        for prefix in ("std::optional<", "std::vector<"):
+            if cpp_type.startswith(prefix):
+                inner = cpp_type[len(prefix):-1]
+                return f"{prefix}{self._qualify_cpp_type(inner, entity)}>"
+        # Standard/Glaze types: no qualification
+        if cpp_type.startswith("std::") or cpp_type.startswith("glz::"):
+            return cpp_type
+        if cpp_type in self._FUNDAMENTAL_TYPES:
+            return cpp_type
+        # Already qualified
+        if "::" in cpp_type:
+            return cpp_type
+        # User-defined type: qualify with entity namespace
+        if entity.namespace:
+            return f"{entity.namespace}::{cpp_type}"
+        return cpp_type
+
+    def _generate_row_view(self, entity: ParsedEntity) -> list[str]:
+        """Generate RowView struct + rowToJson + rowToBeve inside the Mapping."""
+        a = entity.annotation
+        lines = [
+            "    // RowView — zero-copy view for direct serialization from PgResult",
+            "    struct RowView {",
+        ]
+
+        _FUNDAMENTAL = frozenset((
+            "int8_t", "int16_t", "int32_t", "int64_t",
+            "uint8_t", "uint16_t", "uint32_t", "uint64_t",
+            "float", "double", "bool",
+        ))
+
+        for m in entity.members:
+            rv_type = self._rowview_type(m, a, entity)
+            enum_mapping = self._find_enum_mapping(a, m.name)
+            # Zero-init for fundamental types and non-optional enums
+            if rv_type in _FUNDAMENTAL:
+                default = " = {}"
+            elif enum_mapping and not m.is_optional:
+                default = " = {}"
+            else:
+                default = ""
+            lines.append(f"        {rv_type} {m.name}{default};")
+
+        lines.append("    };")
+        lines.append("")
+
+        # rowToJson
+        lines.extend(self._generate_row_to_json(entity))
+        lines.append("")
+
+        # rowToBeve
+        lines.extend(self._generate_row_to_beve(entity))
+
+        return lines
+
+    def _generate_rowview_populate(self, entity: ParsedEntity, var: str = "v") -> list[str]:
+        """Generate code to populate a RowView from a PgResult::Row."""
+        a = entity.annotation
+        lines = []
+
+        for m in entity.members:
+            enum_mapping = self._find_enum_mapping(a, m.name)
+
+            if m.name in a.json_fields:
+                # JSON field: parse from string_view (avoids intermediate std::string alloc)
+                if m.is_optional:
+                    lines.append(f"        if (!row.isNull(Col::{m.name})) {{")
+                    lines.append(f"            auto json_sv = row.get<std::string_view>(Col::{m.name});")
+                    lines.append(f"            if (!json_sv.empty()) {{")
+                    lines.append(f"                typename std::remove_reference_t<decltype(*{var}.{m.name})> tmp;")
+                    lines.append(f"                if (!glz::read_json(tmp, json_sv))")
+                    lines.append(f"                    {var}.{m.name} = std::move(tmp);")
+                    lines.append(f"            }}")
+                    lines.append(f"        }}")
+                else:
+                    lines.append(f"        (void)glz::read_json({var}.{m.name}, row.get<std::string_view>(Col::{m.name}));")
+            elif m.is_raw_json:
+                # Raw JSON: zero-copy string_view into raw_json_view
+                lines.append(f"        {var}.{m.name}.str = row.get<std::string_view>(Col::{m.name});")
+            elif enum_mapping:
+                # Enum: compare string_view (zero alloc)
+                enum_fqn = self._qualify_type(entity, enum_mapping.cpp_type)
+                if m.is_optional:
+                    lines.append(f"        if (!row.isNull(Col::{m.name})) {{")
+                    lines.append(f"            auto s = row.get<std::string_view>(Col::{m.name});")
+                    for db_val, enum_val in enum_mapping.pairs:
+                        lines.append(f'            if (s == "{db_val}") {var}.{m.name} = {enum_fqn}::{enum_val};')
+                    lines.append(f"        }}")
+                else:
+                    lines.append(f"        {{")
+                    lines.append(f"            auto s = row.get<std::string_view>(Col::{m.name});")
+                    for db_val, enum_val in enum_mapping.pairs:
+                        lines.append(f'            if (s == "{db_val}") {var}.{m.name} = {enum_fqn}::{enum_val};')
+                    lines.append(f"        }}")
+            elif m.is_optional:
+                # Optional: use getOpt with RowView-appropriate inner type
+                inner = m.inner_type
+                if inner == "std::string":
+                    inner = "std::string_view"
+                lines.append(f"        {var}.{m.name} = row.getOpt<{inner}>(Col::{m.name});")
+            else:
+                # Simple field: direct get with RowView type
+                rv_type = self._rowview_type(m, a, entity)
+                lines.append(f"        {var}.{m.name} = row.get<{rv_type}>(Col::{m.name});")
+
+        return lines
+
+    def _generate_row_to_json(self, entity: ParsedEntity) -> list[str]:
+        """Generate rowToJson() static method inside the Mapping.
+        Uses template<typename V = RowView> so that v's type is dependent, deferring
+        glz::meta<RowView> lookup to instantiation time (after the specialization is visible)."""
+        lines = [
+            "    template<typename V = RowView>",
+            "    static std::shared_ptr<const std::string> rowToJson(",
+            "            const jcailloux::relais::io::PgResult::Row& row) {",
+            "        V v;",
+        ]
+        lines.extend(self._generate_rowview_populate(entity))
+        lines.extend([
+            "        auto json = std::make_shared<std::string>();",
+            "        json->reserve(256);",
+            "        if (glz::write_json(v, *json))",
+            "            return nullptr;",
+            "        return json;",
+            "    }",
+        ])
+        return lines
+
+    def _generate_row_to_beve(self, entity: ParsedEntity) -> list[str]:
+        """Generate rowToBeve() static method inside the Mapping.
+        Uses template<typename V = RowView> so that v's type is dependent, deferring
+        glz::meta<RowView> lookup to instantiation time (after the specialization is visible)."""
+        lines = [
+            "    template<typename V = RowView>",
+            "    static std::shared_ptr<const std::vector<uint8_t>> rowToBeve(",
+            "            const jcailloux::relais::io::PgResult::Row& row) {",
+            "        V v;",
+        ]
+        lines.extend(self._generate_rowview_populate(entity))
+        lines.extend([
+            "        auto buf = std::make_shared<std::vector<uint8_t>>();",
+            "        if (glz::write_beve(v, *buf))",
+            "            return nullptr;",
+            "        return buf;",
+            "    }",
+        ])
+        return lines
+
+    def _generate_row_view_meta(self, entity: ParsedEntity, mapping_name: str) -> list[str]:
+        """Generate glz::meta<Mapping::RowView> specialization (outside namespace)."""
+        fqn = f"entity::generated::{mapping_name}"
+        return [
+            f"template<>",
+            f"struct glz::meta<{fqn}::RowView> {{",
+            f"    using T = {fqn}::RowView;",
+            f"    static constexpr auto value = {fqn}::glaze_value<T>;",
+            f"}};",
+        ]
 
     # =========================================================================
     # Embedded ListDescriptor (nested inside Mapping — auto-detected by ListMixin)

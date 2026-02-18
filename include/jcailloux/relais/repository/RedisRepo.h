@@ -56,66 +56,164 @@ class RedisRepo : public BaseRepo<Entity, Name, Cfg, Key> {
 
         /// Find by ID and return raw JSON string.
         /// Returns shared_ptr to JSON string (nullptr if not found).
-        /// When L2 stores BEVE, transcodes directly via glz::beve_to_json (no entity construction).
+        /// L2 hit (BEVE): transcodes via glz::beve_to_json (no entity construction).
+        /// L2 hit (JSON): returns raw string directly.
+        /// L2 miss: serializes from PgResult rows (RowView), fire-and-forget L2 population.
         static io::Task<std::shared_ptr<const std::string>> findJson(const Key& id) {
-            if constexpr (useL2Binary) {
-                auto redisKey = makeRedisKey(id);
+            auto redisKey = makeRedisKey(id);
 
+            if constexpr (useL2Binary) {
+                // L2 hit path: BEVE → JSON transcode
                 std::optional<std::vector<uint8_t>> beve;
                 if constexpr (Cfg.l2_refresh_on_get) {
                     beve = co_await cache::RedisCache::getRawBinaryEx(redisKey, l2Ttl());
                 } else {
                     beve = co_await cache::RedisCache::getRawBinary(redisKey);
                 }
-
                 if (beve) {
                     auto json = std::make_shared<std::string>();
-                    if (!glz::beve_to_json(*beve, *json)) {
+                    if (!glz::beve_to_json(*beve, *json))
                         co_return json;
-                    }
                 }
 
-                // Cache miss: fetch entity, populate Redis, serialize to JSON
-                auto ptr = co_await find(id);
-                co_return ptr ? ptr->json() : nullptr;
+                // L2 miss: RowView direct serialization + fire-and-forget L2
+                if constexpr (requires { Mapping::rowToJson(std::declval<const io::PgResult::Row&>()); }) {
+                    try {
+                        auto params = io::PgParams::fromKey(id);
+                        auto result = co_await DbProvider::queryParams(
+                            Mapping::SQL::select_by_pk, params);
+                        if (result.empty()) co_return nullptr;
+                        auto json = Mapping::rowToJson(result[0]);
+                        if (json) {
+                            // Fire-and-forget: serialize BEVE from same row and populate L2
+                            auto beveData = Mapping::rowToBeve(result[0]);
+                            if (beveData)
+                                populateL2Binary(std::move(redisKey), std::move(beveData), l2Ttl());
+                        }
+                        co_return json;
+                    } catch (const io::PgError& e) {
+                        RELAIS_LOG_ERROR << name() << ": findJson DB error - " << e.what();
+                        co_return nullptr;
+                    }
+                } else {
+                    auto ptr = co_await find(id);
+                    co_return ptr ? ptr->json() : nullptr;
+                }
             } else {
-                auto ptr = co_await find(id);
-                co_return ptr ? ptr->json() : nullptr;
+                // L2 JSON format
+                std::optional<std::string> cached;
+                if constexpr (Cfg.l2_refresh_on_get) {
+                    cached = co_await cache::RedisCache::getRawEx(redisKey, l2Ttl());
+                } else {
+                    cached = co_await cache::RedisCache::getRaw(redisKey);
+                }
+                if (cached)
+                    co_return std::make_shared<const std::string>(std::move(*cached));
+
+                // L2 miss: RowView direct serialization + fire-and-forget L2
+                if constexpr (requires { Mapping::rowToJson(std::declval<const io::PgResult::Row&>()); }) {
+                    try {
+                        auto params = io::PgParams::fromKey(id);
+                        auto result = co_await DbProvider::queryParams(
+                            Mapping::SQL::select_by_pk, params);
+                        if (result.empty()) co_return nullptr;
+                        auto json = Mapping::rowToJson(result[0]);
+                        if (json)
+                            populateL2Json(std::move(redisKey), json, l2Ttl());
+                        co_return json;
+                    } catch (const io::PgError& e) {
+                        RELAIS_LOG_ERROR << name() << ": findJson DB error - " << e.what();
+                        co_return nullptr;
+                    }
+                } else {
+                    auto ptr = co_await find(id);
+                    co_return ptr ? ptr->json() : nullptr;
+                }
             }
         }
 
-        /// Find by ID and return raw binary.
+        /// Find by ID and return raw binary (BEVE).
         /// Returns shared_ptr to binary data (nullptr if not found).
-        /// When l2_format is Binary, reads raw bytes directly from Redis (zero-copy).
-        /// When l2_format is Json, fetches the entity and serializes to binary on the fly.
+        /// L2 hit (Binary): returns raw bytes directly from Redis.
+        /// L2 miss: serializes from PgResult rows (RowView), fire-and-forget L2 population.
         static io::Task<std::shared_ptr<const std::vector<uint8_t>>> findBinary(const Key& id)
             requires HasBinarySerialization<Entity>
         {
-            if constexpr (useL2Binary) {
-                auto redisKey = makeRedisKey(id);
+            auto redisKey = makeRedisKey(id);
 
+            if constexpr (useL2Binary) {
+                // L2 hit path: raw binary from Redis
                 std::optional<std::vector<uint8_t>> cached;
                 if constexpr (Cfg.l2_refresh_on_get) {
                     cached = co_await cache::RedisCache::getRawBinaryEx(redisKey, l2Ttl());
                 } else {
                     cached = co_await cache::RedisCache::getRawBinary(redisKey);
                 }
-
-                if (cached) {
+                if (cached)
                     co_return std::make_shared<const std::vector<uint8_t>>(std::move(*cached));
+
+                // L2 miss: RowView direct serialization + fire-and-forget L2
+                if constexpr (requires { Mapping::rowToBeve(std::declval<const io::PgResult::Row&>()); }) {
+                    try {
+                        auto params = io::PgParams::fromKey(id);
+                        auto result = co_await DbProvider::queryParams(
+                            Mapping::SQL::select_by_pk, params);
+                        if (result.empty()) co_return nullptr;
+                        auto beveData = Mapping::rowToBeve(result[0]);
+                        if (beveData)
+                            populateL2Binary(std::move(redisKey), beveData, l2Ttl());
+                        co_return beveData;
+                    } catch (const io::PgError& e) {
+                        RELAIS_LOG_ERROR << name() << ": findBinary DB error - " << e.what();
+                        co_return nullptr;
+                    }
+                } else {
+                    if (auto ptr = co_await Base::find(id)) {
+                        auto bin = ptr->binary();
+                        if (bin)
+                            populateL2Binary(std::move(redisKey), bin, l2Ttl());
+                        co_return bin;
+                    }
+                    co_return nullptr;
+                }
+            } else {
+                // L2 JSON format: check cache, fallback to RowView
+                std::optional<std::string> cached;
+                if constexpr (Cfg.l2_refresh_on_get) {
+                    cached = co_await cache::RedisCache::getRawEx(redisKey, l2Ttl());
+                } else {
+                    cached = co_await cache::RedisCache::getRaw(redisKey);
+                }
+                if (cached) {
+                    // JSON → entity → binary
+                    auto entity = Entity::fromJson(*cached);
+                    co_return entity
+                        ? std::make_shared<const Entity>(std::move(*entity))->binary()
+                        : nullptr;
                 }
 
-                if (auto ptr = co_await Base::find(id)) {
-                    auto bin = ptr->binary();
-                    if (bin) {
-                        co_await cache::RedisCache::setRawBinary(redisKey, *bin, l2Ttl());
+                // L2 miss: RowView for both binary return and JSON L2 population
+                if constexpr (requires { Mapping::rowToBeve(std::declval<const io::PgResult::Row&>()); }) {
+                    try {
+                        auto params = io::PgParams::fromKey(id);
+                        auto result = co_await DbProvider::queryParams(
+                            Mapping::SQL::select_by_pk, params);
+                        if (result.empty()) co_return nullptr;
+                        auto beveData = Mapping::rowToBeve(result[0]);
+                        if (beveData) {
+                            auto jsonData = Mapping::rowToJson(result[0]);
+                            if (jsonData)
+                                populateL2Json(std::move(redisKey), std::move(jsonData), l2Ttl());
+                        }
+                        co_return beveData;
+                    } catch (const io::PgError& e) {
+                        RELAIS_LOG_ERROR << name() << ": findBinary DB error - " << e.what();
+                        co_return nullptr;
                     }
-                    co_return bin;
+                } else {
+                    auto ptr = co_await find(id);
+                    co_return ptr ? ptr->binary() : nullptr;
                 }
-                co_return nullptr;
-            } else {
-                auto ptr = co_await find(id);
-                co_return ptr ? ptr->binary() : nullptr;
             }
         }
 
@@ -221,6 +319,25 @@ class RedisRepo : public BaseRepo<Entity, Name, Cfg, Key> {
         }
 
     private:
+        /// Fire-and-forget L2 population with binary (BEVE) data.
+        /// shared_ptr keeps data alive through the DetachedTask lifetime.
+        static io::DetachedTask populateL2Binary(
+            std::string key,
+            std::shared_ptr<const std::vector<uint8_t>> data,
+            std::chrono::nanoseconds ttl)
+        {
+            try { co_await cache::RedisCache::setRawBinary(key, *data, ttl); } catch (...) {}
+        }
+
+        /// Fire-and-forget L2 population with JSON data.
+        static io::DetachedTask populateL2Json(
+            std::string key,
+            std::shared_ptr<const std::string> data,
+            std::chrono::nanoseconds ttl)
+        {
+            try { co_await cache::RedisCache::setRaw(key, *data, ttl); } catch (...) {}
+        }
+
         template<typename T>
         static std::string keyPartToString(const T& v) {
             if constexpr (std::is_integral_v<T>) {
