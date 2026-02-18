@@ -68,8 +68,8 @@ static L2ArticleListQuery makeL2ArticleQuery(
 ) {
     L2ArticleListQuery q;
     q.limit = limit;
-    if (category) q.filters.template get<0>() = std::move(*category);
-    if (author_id) q.filters.template get<1>() = *author_id;
+    if (author_id) q.filters.template get<0>() = *author_id;
+    if (category) q.filters.template get<1>() = std::move(*category);
 
     using Desc = L2DeclArticleListRepo::ListDescriptorType;
     q.group_key = decl::groupCacheKey<Desc>(q);
@@ -84,8 +84,8 @@ static L2PurchaseListQuery makeL2PurchaseQuery(
 ) {
     L2PurchaseListQuery q;
     q.limit = limit;
-    if (user_id) q.filters.template get<0>() = *user_id;
-    if (status) q.filters.template get<1>() = std::move(*status);
+    if (status) q.filters.template get<0>() = std::move(*status);
+    if (user_id) q.filters.template get<1>() = *user_id;
 
     using Desc = L2DeclPurchaseListRepo::ListDescriptorType;
     q.group_key = decl::groupCacheKey<Desc>(q);
@@ -97,7 +97,7 @@ static L2PurchaseListQuery makeL2PurchaseQuery(
 static L2ArticleDescQuery makeL2ViewCountQuery(std::string_view category, uint16_t limit) {
     L2ArticleDescQuery q;
     q.limit = limit;
-    q.filters.get<0>() = category;
+    q.filters.get<1>() = category;
     q.sort = jcailloux::relais::cache::list::SortSpec<size_t>{1, jcailloux::relais::cache::list::SortDirection::Desc};
 
     q.group_key = decl::groupCacheKey<L2ArticleDecl>(q);
@@ -1084,7 +1084,7 @@ static L2ArticleDescQuery makeL2ViewCountQueryOffset(
     L2ArticleDescQuery q;
     q.limit = limit;
     q.offset = offset;
-    q.filters.get<0>() = category;
+    q.filters.get<1>() = category;
     q.sort = jcailloux::relais::cache::list::SortSpec<size_t>{
         1, jcailloux::relais::cache::list::SortDirection::Desc};
     q.group_key = decl::groupCacheKey<L2ArticleDecl>(q);

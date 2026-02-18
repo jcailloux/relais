@@ -603,8 +603,8 @@ static BothPurchaseListQuery makeBothPurchaseQuery(
 ) {
     BothPurchaseListQuery q;
     q.limit = limit;
-    if (user_id) q.filters.template get<0>() = *user_id;
-    if (status)  q.filters.template get<1>() = std::move(*status);
+    if (status)  q.filters.template get<0>() = std::move(*status);
+    if (user_id) q.filters.template get<1>() = *user_id;
 
     using Desc = BothPurchaseListRepo::ListDescriptorType;
     q.group_key = decl::groupCacheKey<Desc>(q);

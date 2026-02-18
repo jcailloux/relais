@@ -24,8 +24,8 @@ inline ArticleListQuery makeArticleQuery(
 ) {
     ArticleListQuery q;
     q.limit = limit;
-    if (category) q.filters.template get<0>() = std::move(*category);
-    if (author_id) q.filters.template get<1>() = *author_id;
+    if (author_id) q.filters.template get<0>() = *author_id;
+    if (category) q.filters.template get<1>() = std::move(*category);
 
     using Desc = TestArticleListRepo::ListDescriptorType;
     q.group_key = ld::groupCacheKey<Desc>(q);
@@ -40,8 +40,8 @@ inline PurchaseListQuery makePurchaseQuery(
 ) {
     PurchaseListQuery q;
     q.limit = limit;
-    if (user_id) q.filters.template get<0>() = *user_id;
-    if (status) q.filters.template get<1>() = std::move(*status);
+    if (status) q.filters.template get<0>() = std::move(*status);
+    if (user_id) q.filters.template get<1>() = *user_id;
 
     using Desc = TestPurchaseListRepo::ListDescriptorType;
     q.group_key = ld::groupCacheKey<Desc>(q);

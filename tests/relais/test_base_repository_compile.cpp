@@ -124,11 +124,11 @@ TEST_CASE("BaseRepo concepts", "[base_repo]") {
         STATIC_REQUIRE(HasFieldUpdate<entity::generated::TestEventWrapper>);
     }
 
-    SECTION("HasPartitionKey") {
-        STATIC_REQUIRE(HasPartitionKey<entity::generated::TestEventWrapper>);
-        STATIC_REQUIRE_FALSE(HasPartitionKey<entity::generated::TestItemWrapper>);
-        STATIC_REQUIRE_FALSE(HasPartitionKey<entity::generated::TestOrderWrapper>);
-        STATIC_REQUIRE_FALSE(HasPartitionKey<entity::generated::TestUserWrapper>);
+    SECTION("HasPartitionHint") {
+        STATIC_REQUIRE(HasPartitionHint<entity::generated::TestEventWrapper>);
+        STATIC_REQUIRE_FALSE(HasPartitionHint<entity::generated::TestItemWrapper>);
+        STATIC_REQUIRE_FALSE(HasPartitionHint<entity::generated::TestOrderWrapper>);
+        STATIC_REQUIRE_FALSE(HasPartitionHint<entity::generated::TestUserWrapper>);
     }
 }
 
@@ -210,17 +210,17 @@ TEST_CASE("SQL strings for partition key entity", "[base_repo][sql][partition_ke
         REQUIRE(sql.find("region") == std::string::npos);
     }
 
-    SECTION("delete_by_full_pk includes partition key") {
-        std::string sql = EventMapping::SQL::delete_by_full_pk;
+    SECTION("delete_with_partition includes partition key") {
+        std::string sql = EventMapping::SQL::delete_with_partition;
         REQUIRE(sql.starts_with("DELETE"));
         REQUIRE(sql.find("WHERE id = $1 AND region = $2") != std::string::npos);
     }
 
-    SECTION("makeFullKeyParams produces correct params") {
+    SECTION("makePartitionHintParams produces correct params") {
         entity::generated::TestEventWrapper event;
         event.id = 42;
         event.region = "eu";
-        auto params = EventMapping::makeFullKeyParams(event);
+        auto params = EventMapping::makePartitionHintParams(event);
         // PgParams::make(42, "eu") produces 2 parameters
         REQUIRE(params.params.size() == 2);
     }

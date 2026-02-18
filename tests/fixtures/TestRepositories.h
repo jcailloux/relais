@@ -19,6 +19,7 @@
 #include "generated/TestPurchaseWrapper.h"
 #include "generated/TestEventWrapper.h"
 #include "generated/TestProductWrapper.h"
+#include "generated/TestMembershipWrapper.h"
 
 namespace relais_test {
 
@@ -36,6 +37,7 @@ using TestArticleList = entity::generated::TestArticleListWrapper;
 using TestPurchaseList = entity::generated::TestPurchaseListWrapper;
 using entity::generated::TestEventWrapper;
 using entity::generated::TestProductWrapper;
+using entity::generated::TestMembershipWrapper;
 
 // Cross-invalidation key extractors
 inline constexpr auto purchaseUserId = [](const auto& p) -> int64_t { return p.user_id; };
@@ -281,5 +283,26 @@ using UncachedTestEventRepo = Repo<TestEventWrapper, "test:event:partial:uncache
 using L1TestEventRepo = Repo<TestEventWrapper, "test:event:partial:l1">;
 using L2TestEventRepo = Repo<TestEventWrapper, "test:event:partial:l2", cfg::Redis>;
 using L1L2TestEventRepo = Repo<TestEventWrapper, "test:event:partial:both", cfg::Both>;
+
+// =============================================================================
+// Membership Repositories (composite key: user_id + group_id)
+// =============================================================================
+
+using UncachedTestMembershipRepo = Repo<TestMembershipWrapper, "test:member:uncached", cfg::Uncached>;
+using L1TestMembershipRepo = Repo<TestMembershipWrapper, "test:member:l1">;
+using L2TestMembershipRepo = Repo<TestMembershipWrapper, "test:member:l2", cfg::Redis>;
+using FullCacheTestMembershipRepo = Repo<TestMembershipWrapper, "test:member:both", cfg::Both>;
+
+inline auto makeTestMembership(
+    int64_t user_id,
+    int64_t group_id,
+    const std::string& role = ""
+) {
+    TestMembershipWrapper entity;
+    entity.user_id = user_id;
+    entity.group_id = group_id;
+    entity.role = role;
+    return std::make_shared<const TestMembershipWrapper>(std::move(entity));
+}
 
 } // namespace relais_test

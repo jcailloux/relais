@@ -49,8 +49,8 @@ TestListQuery makeViewCountQuery(std::string_view category, uint16_t limit) {
     TestListQuery q;
     q.limit = limit;
 
-    // Filter index 0 = category (string_view — must point to stable storage)
-    q.filters.get<0>() = category;
+    // Filter index 1 = category (alphabetical: author_id=0, category=1)
+    q.filters.get<1>() = category;
 
     // Sort index 1 = view_count, DESC
     q.sort = jcailloux::relais::cache::list::SortSpec<size_t>{1, jcailloux::relais::cache::list::SortDirection::Desc};

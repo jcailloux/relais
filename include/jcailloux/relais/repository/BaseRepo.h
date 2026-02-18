@@ -13,6 +13,7 @@
 #include "jcailloux/relais/Log.h"
 #include "jcailloux/relais/config/repo_config.h"
 #include "jcailloux/relais/config/FixedString.h"
+#include "jcailloux/relais/config/TypeTraits.h"
 #include "jcailloux/relais/wrapper/EntityConcepts.h"
 #include "jcailloux/relais/wrapper/FieldUpdate.h"
 
@@ -75,6 +76,43 @@ inline std::string buildUpdateReturning(
     return sql;
 }
 
+/// Build UPDATE ... RETURNING for composite primary keys.
+/// pk_columns: array of PK column names (e.g. {"user_id", "group_id"}).
+/// SET params are $1..$N, PK params are $(N+1)..$(N+K).
+template<size_t N>
+inline std::string buildUpdateReturning(
+    std::string_view table_name,
+    const std::array<const char*, N>& pk_columns,
+    std::initializer_list<std::string_view> columns,
+    std::string_view returning_columns)
+{
+    std::string sql;
+    sql.reserve(128);
+    sql += "UPDATE ";
+    sql += table_name;
+    sql += " SET ";
+    size_t param = 1;
+    bool first = true;
+    for (auto col : columns) {
+        if (!first) sql += ',';
+        first = false;
+        sql += col;
+        sql += "=$";
+        sql += std::to_string(param++);
+    }
+    sql += " WHERE ";
+    for (size_t i = 0; i < N; ++i) {
+        if (i > 0) sql += " AND ";
+        sql += "\"";
+        sql += pk_columns[i];
+        sql += "\"=$";
+        sql += std::to_string(param++);
+    }
+    sql += " RETURNING ";
+    sql += returning_columns;
+    return sql;
+}
+
 }  // namespace detail
 
 // =========================================================================
@@ -112,8 +150,9 @@ public:
     /// Returns shared_ptr to immutable entity (nullptr if not found).
     static io::Task<WrapperPtrType> find(const Key& id) {
         try {
-            auto result = co_await DbProvider::queryArgs(
-                Mapping::SQL::select_by_pk, id);
+            auto params = io::PgParams::fromKey(id);
+            auto result = co_await DbProvider::queryParams(
+                Mapping::SQL::select_by_pk, params);
             if (result.empty()) co_return nullptr;
             auto entity = Entity::fromRow(result[0]);
             co_return entity ? std::make_shared<const Entity>(std::move(*entity)) : nullptr;
@@ -162,16 +201,23 @@ public:
         if (!wrapper) co_return false;
 
         try {
-            // toInsertParams returns fields without PK (db_managed).
-            // SQL::update expects PK as $1, then fields as $2...$N.
-            auto insertParams = Entity::toInsertParams(*wrapper);
+            // SQL::update expects PK as $1...$K, then SET fields as $(K+1)...$N.
+            auto keyParams = io::PgParams::fromKey(id);
+            io::PgParams fieldParams;
+            if constexpr (config::is_tuple_v<Key>) {
+                // Composite key: toUpdateParams returns only SET fields (no PK)
+                fieldParams = Entity::toUpdateParams(*wrapper);
+            } else {
+                // Mono-key: toInsertParams already excludes PK (it's db_managed)
+                fieldParams = Entity::toInsertParams(*wrapper);
+            }
             io::PgParams params;
-            params.params.reserve(insertParams.params.size() + 1);
-            // $1 = primary key
-            params.params.push_back(
-                io::PgParams::make(id).params[0]);
-            // $2...$N = fields (same order as toInsertParams)
-            for (auto& p : insertParams.params)
+            params.params.reserve(keyParams.params.size() + fieldParams.params.size());
+            // $1...$K = primary key(s)
+            for (auto& p : keyParams.params)
+                params.params.push_back(std::move(p));
+            // $(K+1)...$N = SET fields
+            for (auto& p : fieldParams.params)
                 params.params.push_back(std::move(p));
 
             auto affected = co_await DbProvider::execute(
@@ -198,30 +244,32 @@ public:
 
 protected:
     /// Internal erase with optional entity hint (used by cache layers for
-    /// partition pruning optimization on composite-key entities).
-    /// When a hint is available AND the entity has a composite key, uses the
-    /// full PK SQL for single-partition deletion. Otherwise falls back to
-    /// partial key SQL (scans all partitions — acceptable).
+    /// partition pruning optimization on partitioned entities).
+    /// When a hint is available AND the entity has a partition hint, uses the
+    /// partition-pruned SQL for single-partition deletion. Otherwise falls back
+    /// to standard PK SQL (scans all partitions — acceptable).
     static io::Task<std::optional<size_t>> eraseImpl(
         const Key& id, WrapperPtrType cachedHint = nullptr)
         requires (!Cfg.read_only)
     {
         try {
             int affected;
-            if constexpr (HasPartitionKey<Entity>) {
+            if constexpr (HasPartitionHint<Entity>) {
                 if (cachedHint) {
-                    // Full composite key: prunes to 1 partition
-                    auto params = Mapping::makeFullKeyParams(*cachedHint);
+                    // Partition-pruned: uses PK + partition column
+                    auto params = Mapping::makePartitionHintParams(*cachedHint);
                     affected = co_await DbProvider::execute(
-                        Mapping::SQL::delete_by_full_pk, params);
+                        Mapping::SQL::delete_with_partition, params);
                 } else {
-                    // Partial key: scans all partitions
-                    affected = co_await DbProvider::executeArgs(
-                        Mapping::SQL::delete_by_pk, id);
+                    // Standard PK delete (may scan all partitions)
+                    auto params = io::PgParams::fromKey(id);
+                    affected = co_await DbProvider::execute(
+                        Mapping::SQL::delete_by_pk, params);
                 }
             } else {
-                affected = co_await DbProvider::executeArgs(
-                    Mapping::SQL::delete_by_pk, id);
+                auto params = io::PgParams::fromKey(id);
+                affected = co_await DbProvider::execute(
+                    Mapping::SQL::delete_by_pk, params);
             }
             co_return static_cast<size_t>(affected);
         } catch (const io::PgError& e) {
@@ -247,18 +295,34 @@ public:
 
         try {
             // Build SQL at first call (thread-safe static init).
-            // Field values are $1..$N, PK is $N+1.
-            static const auto sql = detail::buildUpdateReturning(
-                Mapping::table_name,
-                Mapping::primary_key_column,
-                {wrapper::fieldColumnName<typename Entity::TraitsType>(updates)...},
-                Mapping::SQL::returning_columns);
+            // Field values are $1..$N, PK is $(N+1)..[$(N+K)] for composite keys.
+            static const auto sql = []{
+                if constexpr (config::is_tuple_v<Key>) {
+                    return detail::buildUpdateReturning(
+                        Mapping::table_name,
+                        Mapping::primary_key_columns,
+                        {wrapper::fieldColumnName<typename Entity::TraitsType>(Updates{})...},
+                        Mapping::SQL::returning_columns);
+                } else {
+                    return detail::buildUpdateReturning(
+                        Mapping::table_name,
+                        Mapping::primary_key_column,
+                        {wrapper::fieldColumnName<typename Entity::TraitsType>(Updates{})...},
+                        Mapping::SQL::returning_columns);
+                }
+            }();
 
-            // Build params: field values first, then PK at the end
-            auto params = io::PgParams::make(
+            // Build params: field values first, then PK key(s) at the end
+            io::PgParams params;
+            auto fieldParams = io::PgParams::make(
                 wrapper::fieldValue<typename Entity::TraitsType>(
-                    std::forward<Updates>(updates))...,
-                id);
+                    std::forward<Updates>(updates))...);
+            auto keyParams = io::PgParams::fromKey(id);
+            params.params.reserve(fieldParams.params.size() + keyParams.params.size());
+            for (auto& p : fieldParams.params)
+                params.params.push_back(std::move(p));
+            for (auto& p : keyParams.params)
+                params.params.push_back(std::move(p));
 
             auto result = co_await DbProvider::queryParams(sql.c_str(), params);
             if (result.empty()) co_return nullptr;
@@ -414,7 +478,16 @@ protected:
 
     template<typename T>
     static std::string toString(const T& value) {
-        if constexpr (std::is_integral_v<T>) {
+        if constexpr (config::is_tuple_v<T>) {
+            std::string result;
+            std::apply([&](const auto&... parts) {
+                bool first = true;
+                ((result += (first ? "" : ":"),
+                  result += toString(parts),
+                  first = false), ...);
+            }, value);
+            return result;
+        } else if constexpr (std::is_integral_v<T>) {
             return std::to_string(value);
         } else {
             return std::string(value);

@@ -221,10 +221,10 @@ TEST_CASE("GeneratedFilters struct", "[list_system][filters]") {
     }
 
     SECTION("set a filter by index") {
-        filters.get<0>() = "tech";
+        filters.get<1>() = "tech";
         REQUIRE(filters.hasAnyFilter());
         REQUIRE(filters.activeFilterCount() == 1);
-        REQUIRE(*filters.get<0>() == "tech");
+        REQUIRE(*filters.get<1>() == "tech");
     }
 
     SECTION("set a filter by name") {
@@ -234,21 +234,21 @@ TEST_CASE("GeneratedFilters struct", "[list_system][filters]") {
     }
 
     SECTION("matchesFilters — matching tags") {
-        filters.get<0>() = "tech";
-        filters.get<1>() = int64_t(42);
+        filters.get<0>() = int64_t(42);
+        filters.get<1>() = "tech";
 
         decl::Filters<TestArticleDesc> tags;
-        tags.get<0>() = "tech";
-        tags.get<1>() = int64_t(42);
+        tags.get<0>() = int64_t(42);
+        tags.get<1>() = "tech";
 
         REQUIRE(tags.matchesFilters(filters));
     }
 
     SECTION("matchesFilters — non-matching tag") {
-        filters.get<0>() = "tech";
+        filters.get<1>() = "tech";
 
         decl::Filters<TestArticleDesc> tags;
-        tags.get<0>() = "science";
+        tags.get<1>() = "science";
 
         REQUIRE(!tags.matchesFilters(filters));
     }

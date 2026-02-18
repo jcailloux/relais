@@ -2,33 +2,29 @@
 
 ## [Unreleased]
 
-### Changed (Breaking)
-
-- **Cache key identity**: list cache keys are now canonical binary buffers instead of XXH3 hashes — eliminates collision risk and enables direct use as Redis keys
-  - `ListQuery::query_hash` (size_t) → `ListQuery::cache_key` (std::string)
-  - `ListQuery::hash()` → `ListQuery::cacheKey()`
-  - `ListDescriptorQuery` gains `group_key` (filters+sort) and `cache_key` (full page key)
-  - L1 list cache `CacheKey` type changed from `size_t` to `std::string`
-  - InvalidationData: `optional<shared_ptr<const T>>` → `shared_ptr<const T>` — affects custom invalidation handlers that access `old_entity`/`new_entity`
-  - Master group tracking: `{name}:dlist_groups` changed from Redis SET to HASH (stores sort field index per group)
-- xxhash dependency removed from list query pipeline
-
 ### Added
 
-- **L2 (Redis) declarative list caching** in ListMixin — pages stored as BEVE binary with bounds header
-  - `invalidateAllListGroups()` — manually invalidate all L2 list groups
-  - Redis key scheme: `{name}:dlist:p:{cache_key}` (pages), `{name}:dlist:g:{group_key}` (groups), `{name}:dlist_groups` (master hash)
-- **Selective L2 list eviction** — mutations now invalidate only matching groups (filter-match) and affected pages (SortBounds check) in a single Redis round-trip instead of flushing all groups
-- **Offset pagination** — `ListDescriptorQuery::offset` for traditional offset+limit pagination, mutually exclusive with cursor; `parseListQueryStrict` rejects conflicting cursor + offset (`ConflictingPagination` error)
+- **Composite primary keys** — annotate multiple fields with `@relais primary_key` to get a `std::tuple`-based key with full CRUD, L1/L2 caching, and Redis key support
+- **L2 (Redis) declarative list caching** — list pages stored as BEVE binary in Redis with automatic bounds-based invalidation
+  - `invalidateAllListGroups()` for manual L2 list cache flush
+- **Selective L2 list eviction** — mutations invalidate only matching filter groups and affected pages (single Redis round-trip via Lua)
+- **Offset pagination** — `ListDescriptorQuery::offset` for offset+limit pagination, mutually exclusive with cursor
 - **Deterministic keyset pagination** — `COALESCE` null-safe sort + secondary sort on primary key for stable cursor ordering
-- `DetachedTask` coroutine type — eager fire-and-forget for async work that doesn't need to be awaited
-- `ParseUtils.h` — lightweight parsing utilities extracted from the removed `QueryParser.h`
-- Entity generator now sorts filters alphabetically for deterministic cache keys
+- `DetachedTask` coroutine type for fire-and-forget async work
+
+### Changed (Breaking)
+
+- **Composite key entity generator output**: `key()` returns `std::tuple`, SQL uses multi-column WHERE clauses, mapping exposes `primary_key_columns` array
+- **Partition key concept renamed**: `HasPartitionKey` → `HasPartitionHint`, generated SQL `delete_by_full_pk` → `delete_with_partition`, `makeFullKeyParams()` → `makePartitionHintParams()`
+- **List cache keys**: canonical binary buffers replace XXH3 hashes — `ListQuery::query_hash` → `cache_key`, `ListQuery::hash()` → `cacheKey()`
+- `InvalidationData`: `optional<shared_ptr<const T>>` → `shared_ptr<const T>`
+- `Keyed` and `CreatableEntity` concepts no longer default `Key` to `int64_t`
+- xxhash dependency removed from list query pipeline
 
 ### Removed
 
-- `QueryCacheKey.h` — replaced by canonical binary buffer approach (no more `HashBuffer`, `QueryCacheKey<Filters>`, `HashableFilters` concept)
-- `QueryParser.h` — parsing utilities moved to `ParseUtils.h`, query-level parsing handled by `HttpQueryParser`
+- `QueryCacheKey.h` — replaced by canonical binary buffer approach
+- `QueryParser.h` — parsing moved to `ParseUtils.h` and `HttpQueryParser`
 
 ## [0.4.0] - 2026-02-17
 

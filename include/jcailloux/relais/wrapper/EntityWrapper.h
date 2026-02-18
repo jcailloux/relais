@@ -77,6 +77,12 @@ public:
         return Mapping::template toInsertParams<EntityWrapper>(e);
     }
 
+    static io::PgParams toUpdateParams(const EntityWrapper& e)
+        requires requires { Mapping::template toUpdateParams<EntityWrapper>(e); }
+    {
+        return Mapping::template toUpdateParams<EntityWrapper>(e);
+    }
+
     // =========================================================================
     // Mapping type — exposed for concept detection
     // =========================================================================

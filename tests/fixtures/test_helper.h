@@ -372,6 +372,7 @@ private:
         try { sync(pg->query("DELETE FROM relais_test_users")); } catch (...) {}
         try { sync(pg->query("DELETE FROM relais_test_items")); } catch (...) {}
         try { sync(pg->query("DELETE FROM relais_test_products")); } catch (...) {}
+        try { sync(pg->query("DELETE FROM relais_test_memberships")); } catch (...) {}
     }
 };
 
@@ -585,6 +586,22 @@ inline int64_t insertTestProduct(
         );
         return result[0].get<int64_t>(0);
     }
+}
+
+// =============================================================================
+// Membership (composite key) helpers
+// =============================================================================
+
+inline void insertTestMembership(
+    int64_t user_id,
+    int64_t group_id,
+    const std::string& role = ""
+) {
+    execQueryArgs(
+        "INSERT INTO relais_test_memberships (user_id, group_id, role) "
+        "VALUES ($1, $2, $3)",
+        user_id, group_id, role
+    );
 }
 
 // =============================================================================

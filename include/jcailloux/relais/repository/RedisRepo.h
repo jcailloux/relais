@@ -143,7 +143,7 @@ class RedisRepo : public BaseRepo<Entity, Name, Cfg, Key> {
             requires (!Cfg.read_only)
         {
             // L2 hint fallback for partition pruning
-            if constexpr (HasPartitionKey<Entity>) {
+            if constexpr (HasPartitionHint<Entity>) {
                 if (!cachedHint) {
                     auto cached = co_await getFromCache(makeRedisKey(id));
                     if (cached) {
@@ -173,12 +173,30 @@ class RedisRepo : public BaseRepo<Entity, Name, Cfg, Key> {
         }
 
         static std::string makeRedisKey(const Key& id) {
-            if constexpr (std::is_integral_v<Key>) {
+            if constexpr (config::is_tuple_v<Key>) {
+                std::string key = std::string(name());
+                std::apply([&](const auto&... parts) {
+                    ((key += ":" + keyPartToString(parts)), ...);
+                }, id);
+                return key;
+            } else if constexpr (std::is_integral_v<Key>) {
                 return std::string(name()) + ":" + std::to_string(id);
             } else {
                 return std::string(name()) + ":" + std::string(id);
             }
         }
+
+    private:
+        template<typename T>
+        static std::string keyPartToString(const T& v) {
+            if constexpr (std::is_integral_v<T>) {
+                return std::to_string(v);
+            } else {
+                return std::string(v);
+            }
+        }
+
+    public:
 
         /// Build a group key from key parts.
         template<typename... GroupArgs>

@@ -51,7 +51,7 @@ concept Writable = requires(const W& w) {
 };
 
 /// Has a primary key for cache key generation
-template<typename W, typename Key = int64_t>
+template<typename W, typename Key>
 concept Keyed = requires(const W& w) {
     { w.key() } -> std::convertible_to<Key>;
 };
@@ -73,7 +73,7 @@ template<typename W>
 concept MutableEntity = ReadableEntity<W> && Writable<W>;
 
 /// Required for insert() with cache population (read + DB write + primary key)
-template<typename W, typename Key = int64_t>
+template<typename W, typename Key>
 concept CreatableEntity = MutableEntity<W> && Keyed<W, Key>;
 
 // -----------------------------------------------------------------------------
@@ -86,16 +86,16 @@ concept HasListDescriptor = requires {
     typename Entity::MappingType::ListDescriptor;
 };
 
-/// Entity's Mapping has partition key support (partition-pruned DELETE).
-/// Auto-detected from Mapping providing delete_by_full_pk SQL and
-/// makeFullKeyParams method (generated when @relais partition_key is used).
-/// Distinct from a future HasCompositeKey where ALL key parts are required
-/// for identification — here, the cache key alone suffices but the partition
+/// Entity's Mapping has partition hint support (partition-pruned DELETE).
+/// Auto-detected from Mapping providing delete_with_partition SQL and
+/// makePartitionHintParams method (generated when @relais partition_key is used).
+/// Distinct from composite keys where ALL key parts are required for
+/// identification — here, the cache key alone suffices but the partition
 /// column enables single-partition pruning when available from cache.
 template<typename Entity>
-concept HasPartitionKey = requires(const Entity& e) {
-    { Entity::MappingType::SQL::delete_by_full_pk } -> std::convertible_to<const char*>;
-    { Entity::MappingType::makeFullKeyParams(e) } -> std::convertible_to<io::PgParams>;
+concept HasPartitionHint = requires(const Entity& e) {
+    { Entity::MappingType::SQL::delete_with_partition } -> std::convertible_to<const char*>;
+    { Entity::MappingType::makePartitionHintParams(e) } -> std::convertible_to<io::PgParams>;
 };
 
 }  // namespace jcailloux::relais
