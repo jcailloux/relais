@@ -118,27 +118,13 @@ namespace test_config {
 
 using namespace jcailloux::relais::config;
 
-/// Short TTL for expiration tests — L1 expires quickly, no expired acceptance
+/// Short TTL for expiration tests — L1 expires quickly, GDSF evicts on cleanup
 inline constexpr auto ShortTTL = Local
-    .with_l1_ttl(std::chrono::milliseconds{100})
-    .with_l1_accept_expired_on_get(false)
-    .with_l1_refresh_on_get(false);
+    .with_l1_ttl(std::chrono::milliseconds{100});
 
 /// Write-through strategy — PopulateImmediately on update
 inline constexpr auto WriteThrough = Local
     .with_update_strategy(UpdateStrategy::PopulateImmediately);
-
-/// No refresh on get — TTL not extended on cache hit
-inline constexpr auto NoRefresh = Local
-    .with_l1_ttl(std::chrono::milliseconds{200})
-    .with_l1_refresh_on_get(false)
-    .with_l1_accept_expired_on_get(true);
-
-/// Accept expired entries — returns expired entries until cleanup
-inline constexpr auto AcceptExpired = Local
-    .with_l1_ttl(std::chrono::milliseconds{100})
-    .with_l1_accept_expired_on_get(true)
-    .with_l1_refresh_on_get(false);
 
 /// Few shards for predictable cleanup testing
 inline constexpr auto FewShards = Local
@@ -169,8 +155,6 @@ using FullCacheTestItemRepo = Repo<TestItemWrapper, "test:both", cfg::Both>;
 // Configuration test repositories
 using ShortTTLTestItemRepo = Repo<TestItemWrapper, "test:short_ttl", test_config::ShortTTL>;
 using WriteThroughTestItemRepo = Repo<TestItemWrapper, "test:write_through", test_config::WriteThrough>;
-using NoRefreshTestItemRepo = Repo<TestItemWrapper, "test:no_refresh", test_config::NoRefresh>;
-using AcceptExpiredTestItemRepo = Repo<TestItemWrapper, "test:accept_expired", test_config::AcceptExpired>;
 using FewShardsTestItemRepo = Repo<TestItemWrapper, "test:few_shards", test_config::FewShards>;
 
 // =============================================================================

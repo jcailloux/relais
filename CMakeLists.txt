@@ -11,6 +11,12 @@ target_include_directories(jcailloux-relais INTERFACE
 
 target_compile_features(jcailloux-relais INTERFACE cxx_std_23)
 
+# L1 memory budget for GDSF eviction (0 = disabled, default)
+set(RELAIS_L1_MAX_MEMORY 0 CACHE STRING "L1 max memory budget in bytes for GDSF eviction (0=disabled)")
+if(RELAIS_L1_MAX_MEMORY GREATER 0)
+    target_compile_definitions(jcailloux-relais INTERFACE RELAIS_L1_MAX_MEMORY=${RELAIS_L1_MAX_MEMORY})
+endif()
+
 # CMake modules (available to consumers via FetchContent)
 list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
 
@@ -183,6 +189,8 @@ if(RELAIS_BUILD_TESTS)
     relais_add_test(test_relais_concurrency     tests/relais/test_concurrency.cpp          DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;concurrency"      RESOURCE_LOCK)
     relais_add_test(test_relais_dbprovider_log  tests/relais/test_dbprovider_log.cpp       DEFINITIONS RELAIS_BUILDING_TESTS LABELS "integration;relais"                     RESOURCE_LOCK)
     relais_add_test(test_relais_composite_key  tests/relais/test_composite_key.cpp        DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;composite-key"    RESOURCE_LOCK)
+    relais_add_test(test_relais_gdsf          tests/relais/test_gdsf.cpp                DEFINITIONS RELAIS_BUILDING_TESTS "RELAIS_L1_MAX_MEMORY=268435456" LABELS "relais;integration;db;gdsf"             RESOURCE_LOCK)
+    relais_add_test(test_relais_gdsf_disabled tests/relais/test_gdsf_disabled.cpp       DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;gdsf")
 
     # Thread Sanitizer support for concurrency tests
     option(RELAIS_ENABLE_TSAN "Enable Thread Sanitizer for concurrency tests" OFF)
@@ -211,10 +219,14 @@ if(RELAIS_BUILD_TESTS)
             test_relais_l2_config
             test_relais_concurrency
             test_relais_composite_key
+            test_relais_gdsf
+            test_relais_gdsf_disabled
         COMMENT "Build all relais integration tests"
     )
 
-    # Single binary combining all relais tests
+    # Single binary combining all relais tests (excluding GDSF tests which
+    # require RELAIS_L1_MAX_MEMORY and would change behavior of all repos).
+    # GDSF tests are run via standalone binaries: test_relais_gdsf, test_relais_gdsf_disabled.
     add_executable(test_relais_all
         tests/relais/test_all_runner.cpp
         tests/relais/test_generated_wrapper.cpp

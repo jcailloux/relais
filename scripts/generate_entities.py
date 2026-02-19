@@ -654,6 +654,10 @@ class MappingGenerator:
             lines.append("")
             lines.extend(self._generate_to_update_params(entity))
 
+        # dynamicSize (heap memory for strings/vectors)
+        lines.append("")
+        lines.extend(self._generate_dynamic_size(entity))
+
         # Glaze metadata template
         lines.append("")
         lines.extend(self._generate_glaze_value(entity))
@@ -972,6 +976,34 @@ class MappingGenerator:
     # =========================================================================
     # Glaze metadata (variable template inside Mapping)
     # =========================================================================
+
+    def _generate_dynamic_size(self, entity: ParsedEntity) -> list[str]:
+        """Generate dynamicSize() — heap memory used by dynamic fields (strings, vectors, raw_json)."""
+        a = entity.annotation
+        # Collect fields with dynamic heap allocations
+        dynamic_fields = []
+        for m in entity.members:
+            if m.cpp_type == "std::string":
+                dynamic_fields.append(f"s.{m.name}.capacity()")
+            elif m.cpp_type == "std::optional<std::string>":
+                dynamic_fields.append(f"(s.{m.name} ? s.{m.name}->capacity() : 0)")
+            elif m.cpp_type == "std::vector<char>":
+                dynamic_fields.append(f"s.{m.name}.capacity()")
+            elif m.cpp_type == "std::optional<std::vector<char>>":
+                dynamic_fields.append(f"(s.{m.name} ? s.{m.name}->capacity() : 0)")
+            elif m.is_raw_json:
+                dynamic_fields.append(f"s.{m.name}.str.capacity()")
+
+        if not dynamic_fields:
+            return []
+
+        struct_fqn = f"{entity.namespace}::{entity.class_name}" if entity.namespace else entity.class_name
+        lines = [
+            f"    static size_t dynamicSize(const {struct_fqn}& s) {{",
+            f"        return {' + '.join(dynamic_fields)};",
+            f"    }}",
+        ]
+        return lines
 
     def _generate_glaze_value(self, entity: ParsedEntity) -> list[str]:
         """Generate template<typename T> static constexpr auto glaze_value."""

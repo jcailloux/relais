@@ -5,11 +5,14 @@
  *
  * Test-only accessor for relais internal state.
  * Compiled only when RELAIS_BUILDING_TESTS is defined.
- * Provides cache reset, modification count inspection, and forced cleanup
- * via friend access to CachedRepo, ListMixin, ListCache, and ModificationTracker.
+ * Provides cache reset, modification count inspection, forced cleanup,
+ * and GDSF policy access via friend access to CachedRepo, ListMixin,
+ * ListCache, ModificationTracker, and GDSFPolicy.
  */
 
+#include <optional>
 #include <shared_mutex>
+#include <jcailloux/relais/cache/GDSFPolicy.h>
 
 namespace relais_test {
 
@@ -105,6 +108,55 @@ struct TestInternals {
             return jcailloux::shardmap::GetAction::Accept;
         });
         return found ? std::optional<uint8_t>{sid} : std::nullopt;
+    }
+
+    // =========================================================================
+    // GDSF state access
+    // =========================================================================
+
+    /// Reset GDSF global state (generations, memory counters, correction).
+    static void resetGDSF() {
+        jcailloux::relais::cache::GDSFPolicy::instance().reset();
+    }
+
+    /// Reset per-repo GDSF state (avg_construction_time, repo_score).
+    template<typename Repo>
+    static void resetRepoGDSFState() {
+        Repo::avg_construction_time_us_.store(0.0f, std::memory_order_relaxed);
+        Repo::repo_score_.store(0.0f, std::memory_order_relaxed);
+    }
+
+    /// Set per-repo GDSF repo_score (for testing threshold-based eviction).
+    template<typename Repo>
+    static void setRepoScore(float score) {
+        Repo::repo_score_.store(score, std::memory_order_relaxed);
+    }
+
+    /// Type-erased GDSF metadata for test assertions.
+    struct GDSFTestMetadata {
+        float score{0.0f};
+        uint32_t last_generation{0};
+        int64_t ttl_expiration_rep{0};
+    };
+
+    /// Get GDSF metadata for a cached entity (read-only, no score bump).
+    /// Returns type-erased metadata compatible with all CacheMetadata variants.
+    template<typename Repo, typename Key>
+    static std::optional<GDSFTestMetadata> getEntityGDSFMetadata(const Key& key) {
+        std::optional<GDSFTestMetadata> result;
+        Repo::cache().get(key, [&](const auto&, auto& meta) {
+            GDSFTestMetadata m;
+            if constexpr (requires { meta.score; }) {
+                m.score = meta.score.load(std::memory_order_relaxed);
+                m.last_generation = meta.last_generation.load(std::memory_order_relaxed);
+            }
+            if constexpr (requires { meta.ttl_expiration_rep; }) {
+                m.ttl_expiration_rep = meta.ttl_expiration_rep;
+            }
+            result = m;
+            return jcailloux::shardmap::GetAction::Accept;
+        });
+        return result;
     }
 
     // =========================================================================

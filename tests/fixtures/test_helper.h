@@ -18,6 +18,7 @@
 
 #include <fixtures/EpollIoContext.h>
 #include <fixtures/TestRunner.h>
+#include <jcailloux/relais/cache/GDSFPolicy.h>
 
 #include <catch2/reporters/catch_reporter_event_listener.hpp>
 #include <catch2/reporters/catch_reporter_registrars.hpp>
@@ -373,6 +374,9 @@ private:
         try { sync(pg->query("DELETE FROM relais_test_items")); } catch (...) {}
         try { sync(pg->query("DELETE FROM relais_test_products")); } catch (...) {}
         try { sync(pg->query("DELETE FROM relais_test_memberships")); } catch (...) {}
+
+        // Reset GDSF global state for test isolation
+        jcailloux::relais::cache::GDSFPolicy::instance().resetForTesting();
     }
 };
 

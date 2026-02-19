@@ -133,19 +133,13 @@ TEST_CASE("CachedRepo features", "[repository][compile][cached]") {
 TEST_CASE("Config presets", "[repository][compile]") {
     SECTION("ShortTTL") {
         constexpr auto cfg = ShortTTLTestItemRepo::config;
-        STATIC_REQUIRE(!cfg.l1_accept_expired_on_get);
-        STATIC_REQUIRE(!cfg.l1_refresh_on_get);
+        STATIC_REQUIRE(cfg.cache_level == jcailloux::relais::config::CacheLevel::L1);
     }
 
     SECTION("WriteThrough") {
         constexpr auto cfg = WriteThroughTestItemRepo::config;
         STATIC_REQUIRE(cfg.update_strategy ==
             jcailloux::relais::config::UpdateStrategy::PopulateImmediately);
-    }
-
-    SECTION("AcceptExpired") {
-        constexpr auto cfg = AcceptExpiredTestItemRepo::config;
-        STATIC_REQUIRE(cfg.l1_accept_expired_on_get);
     }
 
     SECTION("FewShards") {
