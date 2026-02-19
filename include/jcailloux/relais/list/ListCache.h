@@ -12,6 +12,8 @@
 #include "ListCacheTraits.h"
 #include "ModificationTracker.h"
 #include "jcailloux/relais/wrapper/ListWrapper.h"
+#include "jcailloux/relais/cache/GDSFMetadata.h"
+#include "jcailloux/relais/cache/GDSFPolicy.h"
 
 #ifdef RELAIS_BUILDING_TESTS
 namespace relais_test { struct TestInternals; }
@@ -35,8 +37,6 @@ enum class PaginationMode : uint8_t {
 struct ListCacheConfig {
     size_t cleanup_every_n_gets = 1000;       // Trigger cleanup every N gets
     std::chrono::seconds default_ttl{3600};   // 1 hour
-    bool accept_expired_on_get = false;       // Accept expired entries on get
-    bool refresh_on_get = false;              // Refresh TTL on get
 };
 
 // =============================================================================
@@ -212,16 +212,21 @@ struct ListCacheMetadataImpl {
     std::atomic<int64_t> cached_at_rep{0};  // Atomic for shared-lock safety
     SortBounds sort_bounds;
     uint16_t result_count{0};
+    cache::GDSFScoreData gdsf;              // GDSF score tracking
+    float construction_time_us{0.0f};      // Measured cost for this page
 
     ListCacheMetadataImpl() = default;
 
     ListCacheMetadataImpl(ListQuery<FilterSet, SortFieldEnum> q,
                           Clock::time_point cached_at,
-                          SortBounds bounds, uint16_t count)
+                          SortBounds bounds, uint16_t count,
+                          float cost_us = 0.0f, uint32_t gen = 0, int64_t ttl_rep = 0)
         : query(std::move(q))
         , cached_at_rep(cached_at.time_since_epoch().count())
         , sort_bounds(bounds)
         , result_count(count)
+        , gdsf(cost_us, gen)
+        , construction_time_us(cost_us)
     {}
 
     Clock::time_point cachedAt() const {
@@ -248,7 +253,8 @@ struct ListCacheMetadataImpl {
 //
 
 template<typename Entity, uint8_t ShardCountLog2 = 3,
-         typename Key = int64_t, typename Traits = ListCacheTraits<Entity>>
+         typename Key = int64_t, typename Traits = ListCacheTraits<Entity>,
+         bool GDSF = true>
 class ListCache {
 public:
     static constexpr size_t ShardCount = size_t{1} << ShardCountLog2;
@@ -304,7 +310,7 @@ public:
     // Core API
     // =========================================================================
 
-    /// Get cached result for a query (with lazy validation via callback)
+    /// Get cached result for a query (with lazy validation + GDSF score bump)
     ResultPtr get(const Query& query) {
         // Trigger cleanup every N gets
         if (++get_counter_ % config_.cleanup_every_n_gets == 0) {
@@ -312,40 +318,42 @@ public:
         }
 
         const auto& key = query.cacheKey();
-        const auto now = Clock::now();
 
-        return cache_.get(key, [this, &query, now](const ResultPtr& result, MetadataPtr& meta, uint8_t shard_id) {
-            const auto cached_at = meta->cachedAt();
-
-            // 1. TTL check
-            if (!config_.accept_expired_on_get) {
-                if (cached_at + config_.default_ttl < now) {
-                    return shardmap::GetAction::Invalidate;
-                }
-            }
-
-            // 2. Lazy validation: check if modifications affect this result
-            if (isAffectedByModifications(cached_at, meta->sort_bounds,
+        return cache_.get(key, [this, &query](const ResultPtr& result, MetadataPtr& meta, uint8_t shard_id) {
+            // 1. Lazy validation: check if modifications affect this result
+            if (isAffectedByModifications(meta->cachedAt(), meta->sort_bounds,
                                            *result, query, shard_id)) {
                 return shardmap::GetAction::Invalidate;
             }
 
-            // 3. Optionally refresh TTL (atomic store under shared lock)
-            if (config_.refresh_on_get) {
-                meta->setCachedAt(now);
+            // 2. GDSF: decay + score bump by construction cost
+            if constexpr (GDSF) {
+                auto& policy = cache::GDSFPolicy::instance();
+                policy.decay(meta->gdsf);
+                meta->gdsf.score.fetch_add(meta->construction_time_us,
+                                            std::memory_order_relaxed);
             }
 
             return shardmap::GetAction::Accept;
         });
     }
 
-    /// Store result for a query with optional sort bounds
-    void put(const Query& query, ResultPtr result, SortBounds bounds = {}) {
+    /// Store result for a query with optional sort bounds and construction cost.
+    void put(const Query& query, ResultPtr result, SortBounds bounds = {},
+             float construction_time_us = 0.0f) {
         const auto& key = query.cacheKey();
+        const auto now = Clock::now();
+
+        uint32_t gen = 0;
+        if constexpr (GDSF) {
+            gen = cache::GDSFPolicy::instance().generation();
+        }
+        int64_t ttl_rep = (now + config_.default_ttl).time_since_epoch().count();
 
         auto meta = std::make_shared<MetadataImpl>(
-            query, Clock::now(), bounds,
-            static_cast<uint16_t>(result->items.size()));
+            query, now, bounds,
+            static_cast<uint16_t>(result->items.size()),
+            construction_time_us, gen, ttl_rep);
 
         cache_.put(key, std::move(result), std::move(meta));
     }
@@ -393,9 +401,10 @@ public:
     // Cleanup API
     // =========================================================================
 
-    /// Context passed to cleanup callbacks
+    /// Context passed to cleanup callbacks.
     struct CleanupContext {
-        TimePoint expiration_limit;
+        TimePoint now;
+        float threshold;
         const ModTracker& modifications;
         const ListCache& cache;
     };
@@ -407,8 +416,14 @@ public:
         // during cleanup are not counted (they weren't fully considered).
         const auto now = Clock::now();
 
+        float threshold = 0.0f;
+        if constexpr (GDSF) {
+            threshold = cache::GDSFPolicy::instance().threshold();
+        }
+
         CleanupContext ctx{
-            .expiration_limit = now - config_.default_ttl,
+            .now = now,
+            .threshold = threshold,
             .modifications = modifications_,
             .cache = *this
         };
@@ -416,12 +431,18 @@ public:
         auto shard = cache_.try_cleanup(ctx,
             [](const CacheKey&, const ResultPtr& result, const MetadataPtr& meta,
                const CleanupContext& ctx, uint8_t shard_id) {
-                // 1. TTL check
-                if (meta->cachedAt() < ctx.expiration_limit) {
-                    return true;  // Expired, erase
+                // 1. GDSF: decay + threshold check
+                if constexpr (GDSF) {
+                    auto& policy = cache::GDSFPolicy::instance();
+                    policy.decay(meta->gdsf);
+                    float score = meta->gdsf.score.load(std::memory_order_relaxed);
+                    if (score < ctx.threshold) return true;
                 }
 
-                // 2. Check if affected by modifications (with bitmap skip)
+                // 2. TTL check (cached_at + default_ttl)
+                if (ctx.now > meta->cachedAt() + ctx.cache.config_.default_ttl) return true;
+
+                // 3. Check if affected by modifications (with bitmap skip)
                 bool affected = false;
                 ctx.modifications.forEachModificationWithBitmap(
                     [&](const Modification& mod, BitmapType pending_segments) {
@@ -453,8 +474,14 @@ public:
     bool sweep() {
         const auto now = Clock::now();
 
+        float threshold = 0.0f;
+        if constexpr (GDSF) {
+            threshold = cache::GDSFPolicy::instance().threshold();
+        }
+
         CleanupContext ctx{
-            .expiration_limit = now - config_.default_ttl,
+            .now = now,
+            .threshold = threshold,
             .modifications = modifications_,
             .cache = *this
         };
@@ -462,12 +489,18 @@ public:
         auto result = cache_.cleanup(ctx,
             [](const CacheKey&, const ResultPtr& result, const MetadataPtr& meta,
                const CleanupContext& ctx, uint8_t shard_id) {
-                // 1. TTL check
-                if (meta->cachedAt() < ctx.expiration_limit) {
-                    return true;  // Expired, erase
+                // 1. GDSF: decay + threshold check
+                if constexpr (GDSF) {
+                    auto& policy = cache::GDSFPolicy::instance();
+                    policy.decay(meta->gdsf);
+                    float score = meta->gdsf.score.load(std::memory_order_relaxed);
+                    if (score < ctx.threshold) return true;
                 }
 
-                // 2. Check if affected by modifications (with bitmap skip)
+                // 2. TTL check (cached_at + default_ttl)
+                if (ctx.now > meta->cachedAt() + ctx.cache.config_.default_ttl) return true;
+
+                // 3. Check if affected by modifications (with bitmap skip)
                 bool affected = false;
                 ctx.modifications.forEachModificationWithBitmap(
                     [&](const Modification& mod, BitmapType pending_segments) {
@@ -496,8 +529,14 @@ public:
     size_t purge() {
         const auto now = Clock::now();
 
+        float threshold = 0.0f;
+        if constexpr (GDSF) {
+            threshold = cache::GDSFPolicy::instance().threshold();
+        }
+
         CleanupContext ctx{
-            .expiration_limit = now - config_.default_ttl,
+            .now = now,
+            .threshold = threshold,
             .modifications = modifications_,
             .cache = *this
         };
@@ -505,10 +544,18 @@ public:
         size_t erased = cache_.full_cleanup(ctx,
             [](const CacheKey&, const ResultPtr& result, const MetadataPtr& meta,
                const CleanupContext& ctx) {
-                if (meta->cachedAt() < ctx.expiration_limit) {
-                    return true;
+                // 1. GDSF: decay + threshold check
+                if constexpr (GDSF) {
+                    auto& policy = cache::GDSFPolicy::instance();
+                    policy.decay(meta->gdsf);
+                    float score = meta->gdsf.score.load(std::memory_order_relaxed);
+                    if (score < ctx.threshold) return true;
                 }
 
+                // 2. TTL check (cached_at + default_ttl)
+                if (ctx.now > meta->cachedAt() + ctx.cache.config_.default_ttl) return true;
+
+                // 3. Modification check
                 bool affected = false;
                 ctx.modifications.forEachModification([&](const Modification& mod) {
                     if (affected) return;

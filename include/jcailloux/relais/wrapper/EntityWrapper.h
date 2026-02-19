@@ -90,6 +90,23 @@ public:
     using MappingType = Mapping;
 
     // =========================================================================
+    // Memory tracking hook (set by CachedWrapper, nullptr for non-cached)
+    // =========================================================================
+
+    using MemoryHook = void(*)(int64_t);
+
+    /// Approximate heap memory used by this entity (struct + dynamic fields + buffers).
+    [[nodiscard]] size_t memoryUsage() const {
+        size_t size = sizeof(*this);
+        if constexpr (requires(const Struct& s) { Mapping::dynamicSize(s); }) {
+            size += Mapping::dynamicSize(static_cast<const Struct&>(*this));
+        }
+        if (beve_cache_) size += beve_cache_->capacity();
+        if (json_cache_) size += json_cache_->capacity();
+        return size;
+    }
+
+    // =========================================================================
     // Binary serialization (Glaze BEVE, thread-safe lazy)
     // =========================================================================
 
@@ -99,6 +116,9 @@ public:
             if (glz::write_beve(*this, *buf))
                 buf->clear();
             beve_cache_ = std::move(buf);
+            if (memory_hook_) {
+                memory_hook_(static_cast<int64_t>(beve_cache_->capacity()));
+            }
         });
         return beve_cache_;
     }
@@ -124,6 +144,9 @@ public:
                 json_cache_ = std::make_shared<std::string>("{}");
             else
                 json_cache_ = std::move(json);
+            if (memory_hook_) {
+                memory_hook_(static_cast<int64_t>(json_cache_->capacity()));
+            }
         });
         return json_cache_;
     }
@@ -146,6 +169,9 @@ public:
         beve_cache_.reset();
         json_cache_.reset();
     }
+
+protected:
+    mutable MemoryHook memory_hook_ = nullptr;
 
 private:
     mutable std::once_flag beve_flag_;

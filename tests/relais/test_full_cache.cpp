@@ -43,9 +43,7 @@ using namespace jcailloux::relais::config;
 
 /// Short L1 TTL for expiration tests — L1 expires quickly, L2 stays
 inline constexpr auto ShortL1 = Both
-    .with_l1_ttl(std::chrono::milliseconds{150})
-    .with_l1_accept_expired_on_get(false)
-    .with_l1_refresh_on_get(false);
+    .with_l1_ttl(std::chrono::milliseconds{150});
 
 /// Write-through strategy at L1+L2
 inline constexpr auto WriteThrough = Both

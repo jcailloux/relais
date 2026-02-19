@@ -165,16 +165,16 @@ class ListMixin : public Base {
     // Cache infrastructure
     // =========================================================================
 
+    static constexpr bool HasGDSF = (cache::GDSFPolicy::kMaxMemory > 0);
+
     using ListWrapperType = wrapper::ListWrapper<Entity>;
-    using ListCacheType = cache::list::ListCache<Entity, Base::config.l1_shard_count_log2, Key, Traits>;
+    using ListCacheType = cache::list::ListCache<Entity, Base::config.l1_shard_count_log2, Key, Traits, HasGDSF>;
 
     static cache::list::ListCacheConfig listCacheConfig() {
         return {
             .cleanup_every_n_gets = Base::config.l1_cleanup_every_n_gets,
             .default_ttl = std::chrono::duration_cast<std::chrono::seconds>(
                 std::chrono::nanoseconds(Base::config.l1_ttl)),
-            .accept_expired_on_get = Base::config.l1_accept_expired_on_get,
-            .refresh_on_get = Base::config.l1_refresh_on_get,
         };
     }
 

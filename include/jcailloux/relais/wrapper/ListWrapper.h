@@ -31,6 +31,7 @@ class ListWrapper {
 public:
     using Format = jcailloux::relais::StructFormat;
     using ItemType = Item;
+    using MemoryHook = void(*)(int64_t);
     static constexpr bool read_only = true;
 
     std::vector<Item> items;
@@ -90,6 +91,9 @@ public:
             if (glz::write_beve(*this, *buf))
                 buf->clear();
             beve_cache_ = std::move(buf);
+            if (memory_hook_) {
+                memory_hook_(static_cast<int64_t>(beve_cache_->capacity()));
+            }
         });
         return beve_cache_;
     }
@@ -115,6 +119,9 @@ public:
                 json_cache_ = std::make_shared<std::string>(R"({"items":[]})");
             else
                 json_cache_ = std::move(json);
+            if (memory_hook_) {
+                memory_hook_(static_cast<int64_t>(json_cache_->capacity()));
+            }
         });
         return json_cache_;
     }
@@ -124,6 +131,25 @@ public:
         ListWrapper list;
         if (glz::read_json(list, json)) return std::nullopt;
         return list;
+    }
+
+    // =========================================================================
+    // Memory tracking
+    // =========================================================================
+
+    /// Approximate heap memory used by this list (items + cursors + buffers).
+    [[nodiscard]] size_t memoryUsage() const {
+        size_t size = sizeof(*this);
+        size += items.capacity() * sizeof(Item);
+        for (const auto& item : items) {
+            if constexpr (requires(const Item& i) { i.memoryUsage(); }) {
+                size += item.memoryUsage() - sizeof(Item);
+            }
+        }
+        size += next_cursor.capacity();
+        if (beve_cache_) size += beve_cache_->capacity();
+        if (json_cache_) size += json_cache_->capacity();
+        return size;
     }
 
     // =========================================================================
@@ -166,6 +192,8 @@ public:
         list.next_cursor = std::string(cursor);
         return list;
     }
+
+    mutable MemoryHook memory_hook_ = nullptr;
 
 private:
     mutable std::once_flag beve_flag_;

@@ -4,6 +4,18 @@
 
 ### Added
 
+- **GDSF eviction policy** — L1 cache eviction based on Greedy Dual-Size Frequency (score = frequency x cost), with lazy generation-based decay and per-repo score tracking
+  - `RELAIS_L1_MAX_MEMORY` CMake option to set the global L1 memory budget (0 = disabled, default)
+  - `CachedWrapper<Entity>` for automatic memory tracking (charge on construction, discharge on destruction, lazy serialization buffers)
+  - Pressure factor: quadratic scaling `min(1, (usage/budget)^2)` — lax eviction when memory is low, aggressive near the limit
+  - Emergency cleanup when memory exceeds budget (3-round sweep across all repos)
+  - Striped atomic counter (64 slots) for low-contention memory accounting
+  - Zero overhead when disabled: `if constexpr` guards eliminate all GDSF code paths at compile time
+- **4-variant cache metadata** — compile-time selection via `CacheMetadata<HasGDSF, HasTTL>`:
+  - `<false, false>`: empty struct (0 bytes via EBO) — no cleanup overhead
+  - `<false, true>`: 8 bytes — TTL-only expiration
+  - `<true, false>`: 8 bytes — GDSF score tracking only
+  - `<true, true>`: 16 bytes — GDSF + TTL
 - **Zero-copy RowView serialization** — `findJson()`, `findBinary()`, `queryJson()`, `queryBinary()` serialize directly from PgResult rows when no L1 cache is in the chain, avoiding entity construction overhead
 - **Configurable L2 serialization format** (`CacheConfig::l2_format`) — `Binary` (BEVE, default) or `Json` for non-C++ interop, applies to entities and lists; `findJson()` transcodes BEVE directly via `glz::beve_to_json`
 - **Composite primary keys** — annotate multiple fields with `@relais primary_key` to get a `std::tuple`-based key with full CRUD, L1/L2 caching, and Redis key support

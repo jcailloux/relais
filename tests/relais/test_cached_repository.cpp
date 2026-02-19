@@ -6,7 +6,7 @@
  *
  * Progressive complexity:
  *   1. TestItem    — basic CRUD with L1 cache (staleness, populate, invalidate)
- *   2. Config      — TTL, refresh, accept-expired, write-through, cleanup
+ *   2. Config      — TTL, write-through, cleanup (GDSF eviction)
  *   3. Cross-inv   — Invalidate<> Purchase → User at L1
  *   4. Custom-inv  — InvalidateVia<> with async resolver at L1
  *   5. List-inv    — InvalidateList<> entity → ListDescriptor bridge at L1
@@ -483,7 +483,7 @@ TEST_CASE("CachedRepo - ShortTTL config",
 {
     TransactionGuard tx;
 
-    SECTION("[ttl] expired entry not returned (l1_accept_expired_on_get = false)") {
+    SECTION("[ttl] expired entry evicted by GDSF cleanup, re-fetched from DB") {
         auto id = insertTestItem("Short TTL", 42);
 
         // Populate cache (TTL = 100ms)
@@ -495,67 +495,11 @@ TEST_CASE("CachedRepo - ShortTTL config",
         // Wait for TTL expiration
         waitForExpiration(std::chrono::milliseconds{150});
 
-        // Expired entry rejected → fetches fresh from DB
+        // GDSF: TTL-expired entry is evicted on get (Invalidate action)
+        // → re-fetches fresh from DB
         auto r2 = sync(ShortTTLTestItemRepo::find(id));
         REQUIRE(r2 != nullptr);
         CHECK(r2->name == "After Expiry");
-    }
-}
-
-TEST_CASE("CachedRepo - AcceptExpired config",
-          "[integration][db][cached][config][expired]")
-{
-    TransactionGuard tx;
-
-    SECTION("[expired] expired entry returned until cleanup") {
-        auto id = insertTestItem("Accept Expired", 42);
-
-        // Populate cache (TTL = 100ms)
-        sync(AcceptExpiredTestItemRepo::find(id));
-        updateTestItem(id, "Fresh", 99);
-
-        waitForExpiration(std::chrono::milliseconds{150});
-
-        // Expired but accepted (l1_accept_expired_on_get = true)
-        auto stale = sync(AcceptExpiredTestItemRepo::find(id));
-        REQUIRE(stale != nullptr);
-        CHECK(stale->name == "Accept Expired");  // Stale, but accepted
-
-        // Cleanup evicts expired entries
-        forcePurge<AcceptExpiredTestItemRepo>();
-
-        auto fresh = sync(AcceptExpiredTestItemRepo::find(id));
-        REQUIRE(fresh != nullptr);
-        CHECK(fresh->name == "Fresh");
-    }
-}
-
-TEST_CASE("CachedRepo - NoRefresh config",
-          "[integration][db][cached][config][refresh]")
-{
-    TransactionGuard tx;
-
-    SECTION("[refresh] TTL not extended on get (l1_refresh_on_get = false)") {
-        auto id = insertTestItem("No Refresh", 42);
-
-        // Populate cache (TTL = 200ms, no refresh, accept expired)
-        sync(NoRefreshTestItemRepo::find(id));
-
-        // Read at 120ms (within TTL)
-        waitForExpiration(std::chrono::milliseconds{120});
-        sync(NoRefreshTestItemRepo::find(id));
-
-        // Wait until past original 200ms TTL (total ~220ms)
-        waitForExpiration(std::chrono::milliseconds{100});
-
-        updateTestItem(id, "Refreshed", 99);
-
-        // Entry expired; cleanup evicts it
-        forcePurge<NoRefreshTestItemRepo>();
-
-        auto fresh = sync(NoRefreshTestItemRepo::find(id));
-        REQUIRE(fresh != nullptr);
-        CHECK(fresh->name == "Refreshed");
     }
 }
 

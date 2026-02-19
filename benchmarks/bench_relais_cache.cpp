@@ -163,10 +163,10 @@ TEST_CASE("Benchmark - write operations", "[benchmark][write]")
 
     std::vector<BenchResult> results;
 
-    results.push_back(sync(benchAsync("create + remove (L1)", [&]() -> io::Task<void> {
+    results.push_back(sync(benchAsync("insert + erase (L1)", [&]() -> io::Task<void> {
         auto entity = makeTestItem("bench_cr", 42);
-        auto created = co_await L1TestItemRepo::create(entity);
-        if (created) co_await L1TestItemRepo::remove(created->id);
+        auto created = co_await L1TestItemRepo::insert(entity);
+        if (created) co_await L1TestItemRepo::erase(created->id);
     })));
 
     results.push_back(sync(benchAsync("update (L1)", [&]() -> io::Task<void> {
