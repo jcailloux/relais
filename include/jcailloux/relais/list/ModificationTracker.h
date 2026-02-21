@@ -80,11 +80,11 @@ namespace detail {
 // ModificationTracker - Bitmap-based tracker for list cache invalidation
 // =============================================================================
 //
-// Each modification tracks a bitmap of pending shard identities.
-// When a shard is cleaned, its bit is cleared. When all bits are 0,
-// all shards have seen this modification and it can be erased.
+// Each modification tracks a bitmap of pending chunk identities.
+// When a chunk is cleaned, its bit is cleared. When all bits are 0,
+// all chunks have seen this modification and it can be erased.
 //
-// TotalSegments = number of shards, known at compile time (from ShardMap config).
+// TotalSegments = number of chunks, known at compile time (from ChunkMap config).
 //
 
 template<typename Entity, size_t TotalSegments>
@@ -104,7 +104,7 @@ public:
             ? static_cast<BitmapType>(~BitmapType{0})
             : static_cast<BitmapType>((BitmapType{1} << TotalSegments) - 1);
 
-    /// Wrapper that tracks which segments have seen this modification via a bitmap.
+    /// Wrapper that tracks which chunks have seen this modification via a bitmap.
     struct TrackedModification {
         Modification modification;
         alignas(std::atomic_ref<BitmapType>::required_alignment)
@@ -169,12 +169,12 @@ public:
     // Cleanup lifecycle
     // =========================================================================
 
-    /// Called after each successful try_cleanup() of the cache.
-    /// Clears the bit for shard_id in each modification's bitmap.
-    /// Erases modifications whose bitmap becomes 0 (all shards processed).
+    /// Called after each successful cleanup_chunk() of the cache.
+    /// Clears the bit for chunk_id in each modification's bitmap.
+    /// Erases modifications whose bitmap becomes 0 (all chunks processed).
     ///
     /// Only modifications with modified_at <= cutoff are processed. The cutoff
-    /// must be captured BEFORE the shard cleanup, so that modifications added
+    /// must be captured BEFORE the chunk cleanup, so that modifications added
     /// during cleanup are excluded and not prematurely drained.
     ///
     /// Two-phase approach:
@@ -183,9 +183,9 @@ public:
     ///   forEachModificationWithBitmap reads via atomic_ref too.
     /// - Phase 2 (unique_lock): erase expired entries via swap-with-last.
     ///   Only taken when there are actual removals.
-    void drainShard(TimePoint cutoff, uint8_t shard_id) {
+    void drainChunk(TimePoint cutoff, uint8_t chunk_id) {
         std::vector<size_t> to_erase;
-        const BitmapType shard_bit = BitmapType{1} << shard_id;
+        const BitmapType chunk_bit = BitmapType{1} << chunk_id;
 
         {
             std::shared_lock lock(mutex_);
@@ -194,8 +194,8 @@ public:
 
                 std::atomic_ref<BitmapType> bitmap(modifications_[i].pending_segments);
                 BitmapType remaining = bitmap.fetch_and(
-                    static_cast<BitmapType>(~shard_bit), std::memory_order_relaxed)
-                    & static_cast<BitmapType>(~shard_bit);
+                    static_cast<BitmapType>(~chunk_bit), std::memory_order_relaxed)
+                    & static_cast<BitmapType>(~chunk_bit);
 
                 if (remaining == 0) {
                     to_erase.push_back(i);
@@ -218,7 +218,7 @@ public:
     }
 
     /// Erase all modifications with modified_at <= cutoff in one pass.
-    /// Used by purge() after processing all segments at once.
+    /// Used by purge() after processing all chunks at once.
     void drain(TimePoint cutoff) {
         std::unique_lock lock(mutex_);
         std::erase_if(modifications_, [cutoff](const TrackedModification& t) {

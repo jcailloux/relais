@@ -4,41 +4,39 @@
 
 ### Added
 
-- **GDSF eviction policy** — L1 cache eviction based on Greedy Dual-Size Frequency (score = frequency x cost), with lazy generation-based decay and per-repo score tracking
-  - `RELAIS_L1_MAX_MEMORY` CMake option to set the global L1 memory budget (0 = disabled, default)
-  - `CachedWrapper<Entity>` for automatic memory tracking (charge on construction, discharge on destruction, lazy serialization buffers)
-  - Pressure factor: quadratic scaling `min(1, (usage/budget)^2)` — lax eviction when memory is low, aggressive near the limit
-  - Emergency cleanup when memory exceeds budget (3-round sweep across all repos)
-  - Striped atomic counter (64 slots) for low-contention memory accounting
-  - Zero overhead when disabled: `if constexpr` guards eliminate all GDSF code paths at compile time
-- **4-variant cache metadata** — compile-time selection via `CacheMetadata<HasGDSF, HasTTL>`:
-  - `<false, false>`: empty struct (0 bytes via EBO) — no cleanup overhead
-  - `<false, true>`: 8 bytes — TTL-only expiration
-  - `<true, false>`: 8 bytes — GDSF score tracking only
-  - `<true, true>`: 16 bytes — GDSF + TTL
-- **Zero-copy RowView serialization** — `findJson()`, `findBinary()`, `queryJson()`, `queryBinary()` serialize directly from PgResult rows when no L1 cache is in the chain, avoiding entity construction overhead
-- **Configurable L2 serialization format** (`CacheConfig::l2_format`) — `Binary` (BEVE, default) or `Json` for non-C++ interop, applies to entities and lists; `findJson()` transcodes BEVE directly via `glz::beve_to_json`
-- **Composite primary keys** — annotate multiple fields with `@relais primary_key` to get a `std::tuple`-based key with full CRUD, L1/L2 caching, and Redis key support
-- **L2 (Redis) declarative list caching** — list pages stored as BEVE binary in Redis with automatic bounds-based invalidation
-  - `invalidateAllListGroups()` for manual L2 list cache flush
-- **Selective L2 list eviction** — mutations invalidate only matching filter groups and affected pages (single Redis round-trip via Lua)
-- **Offset pagination** — `ListDescriptorQuery::offset` for offset+limit pagination, mutually exclusive with cursor
-- **Deterministic keyset pagination** — `COALESCE` null-safe sort + secondary sort on primary key for stable cursor ordering
+- **Lock-free L1 cache** — replaced ShardMap with ParlayHash-backed `ChunkMap` and epoch-based reclamation; all `find`/`insert`/`patch` return lightweight `EntityView` (12 bytes) instead of `shared_ptr`
+- **Epoch-guarded views** — `EntityView<Entity>`, `JsonView`, `BinaryView` hold an `EpochGuard` ticket preventing reclamation while alive; thread-agnostic and safe across `co_await`
+- **`Task::fromValue(T)` / `Task<void>::ready()`** — pre-resolved coroutine tasks that skip heap allocation (`await_ready() = true`)
+- **GDSF eviction policy** — L1 eviction via score = frequency x cost, controlled by `RELAIS_L1_MAX_MEMORY` CMake option (0 = disabled, default); quadratic pressure factor, 4-variant `CacheMetadata` (0/8/8/16 bytes), zero overhead when disabled via `if constexpr`
+- **`RELAIS_CLEANUP_FREQUENCY_LOG2`** CMake option — compile-time L1 sweep frequency (default 9 = every 512 insertions)
+- **Zero-copy RowView serialization** — `findJson()`/`findBinary()`/`queryJson()`/`queryBinary()` serialize directly from PgResult rows when no L1 cache is in the chain
+- **Configurable L2 serialization format** (`CacheConfig::l2_format`) — `Binary` (BEVE, default) or `Json` for non-C++ interop; `findJson()` transcodes BEVE directly via `glz::beve_to_json`
+- **Composite primary keys** — `std::tuple`-based keys from multiple `@relais primary_key` fields, with full CRUD, L1/L2 caching, and Redis support
+- **L2 (Redis) declarative list caching** — list pages stored as BEVE binary in Redis with bounds-based and selective Lua-based invalidation
+- **Offset pagination** — `ListDescriptorQuery::offset` for offset+limit, mutually exclusive with cursor
+- **Deterministic keyset pagination** — `COALESCE` null-safe sort + secondary PK sort for stable cursor ordering
 - `DetachedTask` coroutine type for fire-and-forget async work
 
 ### Changed (Breaking)
 
-- **Composite key entity generator output**: `key()` returns `std::tuple`, SQL uses multi-column WHERE clauses, mapping exposes `primary_key_columns` array
-- **Partition key concept renamed**: `HasPartitionKey` → `HasPartitionHint`, generated SQL `delete_by_full_pk` → `delete_with_partition`, `makeFullKeyParams()` → `makePartitionHintParams()`
-- **List cache keys**: canonical binary buffers replace XXH3 hashes — `ListQuery::query_hash` → `cache_key`, `ListQuery::hash()` → `cacheKey()`
+- **Return types**: `find`/`insert`/`patch` return `EntityView<Entity>` instead of `shared_ptr<const Entity>`; `findJson` returns `JsonView`; `findBinary` returns `BinaryView`
+- **Serialization accessors**: `json()` returns `const std::string*`, `binary()` returns `const std::vector<uint8_t>*` (was `shared_ptr`); lazy init via atomic CAS instead of `std::call_once`
+- **L1 backend**: ShardMap replaced by lock-free ChunkMap (ParlayHash + epoch-based reclamation); `l1_shard_count_log2` → `l1_chunk_count_log2`
+- **GDSF sweep**: `emergencyCleanup()` → `sweep()` with `atomic_flag`; striped memory slots now use per-cache-line alignment to eliminate false sharing
+- **Dependency**: `shardmap` replaced by `parlayhash`
+- **Composite key entity generator output**: `key()` returns `std::tuple`, SQL uses multi-column WHERE clauses
+- **Partition key concept renamed**: `HasPartitionKey` → `HasPartitionHint`
+- **List cache keys**: canonical binary buffers replace XXH3 hashes — `ListQuery::query_hash` → `cache_key`
 - `InvalidationData`: `optional<shared_ptr<const T>>` → `shared_ptr<const T>`
 - `Keyed` and `CreatableEntity` concepts no longer default `Key` to `int64_t`
-- xxhash dependency removed from list query pipeline
 
 ### Removed
 
 - `QueryCacheKey.h` — replaced by canonical binary buffer approach
 - `QueryParser.h` — parsing moved to `ParseUtils.h` and `HttpQueryParser`
+- `EntityWrapper::releaseCaches()` — no longer needed with atomic pointer caches
+- `CacheConfig::l1_cleanup_every_n_gets` / `l1_cleanup_min_interval` — replaced by `RELAIS_CLEANUP_FREQUENCY_LOG2`
+- `shardmap` dependency
 
 ## [0.4.0] - 2026-02-17
 

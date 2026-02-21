@@ -40,6 +40,7 @@
  *   [list-resolver]  — InvalidateListVia with enriched resolver
  */
 
+#include <set>
 #include <catch2/catch_test_macros.hpp>
 
 #include "fixtures/test_helper.h"

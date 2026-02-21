@@ -17,6 +17,12 @@ if(RELAIS_L1_MAX_MEMORY GREATER 0)
     target_compile_definitions(jcailloux-relais INTERFACE RELAIS_L1_MAX_MEMORY=${RELAIS_L1_MAX_MEMORY})
 endif()
 
+# L1 cleanup frequency: sweep every 2^N insertions (0 = disabled, default 9 = every 512)
+set(RELAIS_CLEANUP_FREQUENCY_LOG2 9 CACHE STRING "L1 cleanup frequency as log2 (0=disabled, 9=every 512 insertions)")
+if(NOT RELAIS_CLEANUP_FREQUENCY_LOG2 EQUAL 9)
+    target_compile_definitions(jcailloux-relais INTERFACE RELAIS_CLEANUP_FREQUENCY_LOG2=${RELAIS_CLEANUP_FREQUENCY_LOG2})
+endif()
+
 # CMake modules (available to consumers via FetchContent)
 list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
 
@@ -26,24 +32,26 @@ list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
 include(FetchContent)
 
 FetchContent_Declare(
-    shardmap
-    GIT_REPOSITORY https://github.com/jcailloux/shardmap
-    GIT_TAG        v1.0.0
-    FIND_PACKAGE_ARGS 1.0
-)
-FetchContent_Declare(
     glaze
     GIT_REPOSITORY https://github.com/stephenberry/glaze.git
     GIT_TAG        v7.0.2
     FIND_PACKAGE_ARGS 7.0
 )
-FetchContent_MakeAvailable(shardmap glaze)
+FetchContent_MakeAvailable(glaze)
 
+# ParlayHash (vendored) — lock-free hash map + epoch-based reclamation
+add_library(parlayhash INTERFACE)
+target_include_directories(parlayhash INTERFACE
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/parlayhash/include")
+target_compile_features(parlayhash INTERFACE cxx_std_17)
+
+find_package(Threads REQUIRED)
 find_package(PostgreSQL REQUIRED)
 
 target_link_libraries(jcailloux-relais INTERFACE
-    $<BUILD_INTERFACE:shardmap>
     $<BUILD_INTERFACE:glaze::glaze>
+    $<BUILD_INTERFACE:parlayhash>
+    Threads::Threads
     PostgreSQL::PostgreSQL
 )
 
@@ -190,7 +198,9 @@ if(RELAIS_BUILD_TESTS)
     relais_add_test(test_relais_dbprovider_log  tests/relais/test_dbprovider_log.cpp       DEFINITIONS RELAIS_BUILDING_TESTS LABELS "integration;relais"                     RESOURCE_LOCK)
     relais_add_test(test_relais_composite_key  tests/relais/test_composite_key.cpp        DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;composite-key"    RESOURCE_LOCK)
     relais_add_test(test_relais_gdsf          tests/relais/test_gdsf.cpp                DEFINITIONS RELAIS_BUILDING_TESTS "RELAIS_L1_MAX_MEMORY=268435456" LABELS "relais;integration;db;gdsf"             RESOURCE_LOCK)
-    relais_add_test(test_relais_gdsf_disabled tests/relais/test_gdsf_disabled.cpp       DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;gdsf")
+    if(RELAIS_L1_MAX_MEMORY EQUAL 0)
+        relais_add_test(test_relais_gdsf_disabled tests/relais/test_gdsf_disabled.cpp       DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;gdsf")
+    endif()
 
     # Thread Sanitizer support for concurrency tests
     option(RELAIS_ENABLE_TSAN "Enable Thread Sanitizer for concurrency tests" OFF)

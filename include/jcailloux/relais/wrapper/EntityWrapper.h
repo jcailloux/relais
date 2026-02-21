@@ -1,9 +1,8 @@
 #ifndef JCX_RELAIS_WRAPPER_ENTITY_WRAPPER_H
 #define JCX_RELAIS_WRAPPER_ENTITY_WRAPPER_H
 
+#include <atomic>
 #include <cstdint>
-#include <memory>
-#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
@@ -22,7 +21,7 @@ namespace jcailloux::relais::wrapper {
 // EntityWrapper<Struct, Mapping> — API-side wrapper for pure data structs
 //
 // Inherits from Struct (pure declarative data) and adds:
-// - Thread-safe lazy BEVE/JSON serialization via std::call_once
+// - Thread-safe lazy BEVE/JSON serialization via atomic CAS
 // - SQL row mapping (fromRow/toInsertParams) delegated to Mapping
 // - Primary key access delegated to Mapping
 //
@@ -44,16 +43,33 @@ public:
     explicit EntityWrapper(const Struct& s) : Struct(s) {}
     explicit EntityWrapper(Struct&& s) noexcept : Struct(std::move(s)) {}
 
-    // std::once_flag is non-copyable/non-movable — caches are transient
-    // and will be lazily recomputed after copy/move.
+    ~EntityWrapper() {
+        delete beve_cache_.load(std::memory_order_relaxed);
+        delete json_cache_.load(std::memory_order_relaxed);
+    }
+
+    // Serialization caches are not copied — lazy recompute on demand.
     EntityWrapper(const EntityWrapper& o) : Struct(static_cast<const Struct&>(o)) {}
-    EntityWrapper(EntityWrapper&& o) noexcept : Struct(static_cast<Struct&&>(std::move(o))) {}
+    EntityWrapper(EntityWrapper&& o) noexcept : Struct(static_cast<Struct&&>(std::move(o))) {
+        beve_cache_.store(o.beve_cache_.exchange(nullptr, std::memory_order_relaxed), std::memory_order_relaxed);
+        json_cache_.store(o.json_cache_.exchange(nullptr, std::memory_order_relaxed), std::memory_order_relaxed);
+    }
     EntityWrapper& operator=(const EntityWrapper& o) {
-        if (this != &o) Struct::operator=(static_cast<const Struct&>(o));
+        if (this != &o) {
+            delete beve_cache_.exchange(nullptr, std::memory_order_relaxed);
+            delete json_cache_.exchange(nullptr, std::memory_order_relaxed);
+            Struct::operator=(static_cast<const Struct&>(o));
+        }
         return *this;
     }
     EntityWrapper& operator=(EntityWrapper&& o) noexcept {
-        if (this != &o) Struct::operator=(static_cast<Struct&&>(std::move(o)));
+        if (this != &o) {
+            delete beve_cache_.exchange(nullptr, std::memory_order_relaxed);
+            delete json_cache_.exchange(nullptr, std::memory_order_relaxed);
+            Struct::operator=(static_cast<Struct&&>(std::move(o)));
+            beve_cache_.store(o.beve_cache_.exchange(nullptr, std::memory_order_relaxed), std::memory_order_relaxed);
+            json_cache_.store(o.json_cache_.exchange(nullptr, std::memory_order_relaxed), std::memory_order_relaxed);
+        }
         return *this;
     }
 
@@ -101,8 +117,10 @@ public:
         if constexpr (requires(const Struct& s) { Mapping::dynamicSize(s); }) {
             size += Mapping::dynamicSize(static_cast<const Struct&>(*this));
         }
-        if (beve_cache_) size += beve_cache_->capacity();
-        if (json_cache_) size += json_cache_->capacity();
+        auto* beve = beve_cache_.load(std::memory_order_relaxed);
+        if (beve) size += beve->capacity();
+        auto* json = json_cache_.load(std::memory_order_relaxed);
+        if (json) size += json->capacity();
         return size;
     }
 
@@ -110,17 +128,19 @@ public:
     // Binary serialization (Glaze BEVE, thread-safe lazy)
     // =========================================================================
 
-    [[nodiscard]] std::shared_ptr<const std::vector<uint8_t>> binary() const {
-        std::call_once(beve_flag_, [this] {
-            auto buf = std::make_shared<std::vector<uint8_t>>();
-            if (glz::write_beve(*this, *buf))
-                buf->clear();
-            beve_cache_ = std::move(buf);
-            if (memory_hook_) {
-                memory_hook_(static_cast<int64_t>(beve_cache_->capacity()));
-            }
-        });
-        return beve_cache_;
+    [[nodiscard]] const std::vector<uint8_t>* binary() const {
+        auto* cached = beve_cache_.load(std::memory_order_acquire);
+        if (cached) return cached;
+        auto* buf = new std::vector<uint8_t>();
+        if (glz::write_beve(*this, *buf)) buf->clear();
+        const std::vector<uint8_t>* expected = nullptr;
+        if (beve_cache_.compare_exchange_strong(expected, buf,
+                std::memory_order_release, std::memory_order_acquire)) {
+            if (memory_hook_) memory_hook_(static_cast<int64_t>(buf->capacity()));
+            return buf;
+        }
+        delete buf;
+        return expected;
     }
 
     static std::optional<EntityWrapper> fromBinary(std::span<const uint8_t> data) {
@@ -136,19 +156,20 @@ public:
     // JSON serialization (Glaze JSON, thread-safe lazy)
     // =========================================================================
 
-    [[nodiscard]] std::shared_ptr<const std::string> json() const {
-        std::call_once(json_flag_, [this] {
-            auto json = std::make_shared<std::string>();
-            json->reserve(256);
-            if (glz::write_json(*this, *json))
-                json_cache_ = std::make_shared<std::string>("{}");
-            else
-                json_cache_ = std::move(json);
-            if (memory_hook_) {
-                memory_hook_(static_cast<int64_t>(json_cache_->capacity()));
-            }
-        });
-        return json_cache_;
+    [[nodiscard]] const std::string* json() const {
+        auto* cached = json_cache_.load(std::memory_order_acquire);
+        if (cached) return cached;
+        auto* buf = new std::string();
+        buf->reserve(256);
+        if (glz::write_json(*this, *buf)) *buf = "{}";
+        const std::string* expected = nullptr;
+        if (json_cache_.compare_exchange_strong(expected, buf,
+                std::memory_order_release, std::memory_order_acquire)) {
+            if (memory_hook_) memory_hook_(static_cast<int64_t>(buf->capacity()));
+            return buf;
+        }
+        delete buf;
+        return expected;
     }
 
     static std::optional<EntityWrapper> fromJson(std::string_view json) {
@@ -158,26 +179,12 @@ public:
         return entity;
     }
 
-    // =========================================================================
-    // Cache management
-    // =========================================================================
-
-    /// Release serialization caches. After this call, binary()/json()
-    /// return nullptr. Callers who previously obtained shared_ptrs from
-    /// binary()/json() retain valid data through reference counting.
-    void releaseCaches() const noexcept {
-        beve_cache_.reset();
-        json_cache_.reset();
-    }
-
 protected:
     mutable MemoryHook memory_hook_ = nullptr;
 
 private:
-    mutable std::once_flag beve_flag_;
-    mutable std::once_flag json_flag_;
-    mutable std::shared_ptr<const std::vector<uint8_t>> beve_cache_;
-    mutable std::shared_ptr<const std::string> json_cache_;
+    mutable std::atomic<const std::vector<uint8_t>*> beve_cache_{nullptr};
+    mutable std::atomic<const std::string*> json_cache_{nullptr};
 };
 
 }  // namespace jcailloux::relais::wrapper

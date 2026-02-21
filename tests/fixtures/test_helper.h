@@ -291,8 +291,16 @@ inline void initTest() {
     auto& io = detail::testIo();
 
     // Phase 1: Synchronous initialization (no background thread yet)
+    int pg_min = 2, pg_max = 4;
+    if (auto* env = std::getenv("BENCH_PG_POOL_MAX")) {
+        int v = std::atoi(env);
+        if (v >= 2 && v <= 64) {
+            pg_max = v;
+            pg_min = std::max(2, v / 4);
+        }
+    }
     auto pool = io::test::runTask(io,
-        io::PgPool<IoCtx>::create(io, getConnInfo(), 2, 4));
+        io::PgPool<IoCtx>::create(io, getConnInfo(), pg_min, pg_max));
 
     detail::testPg() = std::make_shared<io::PgClient<IoCtx>>(pool);
 

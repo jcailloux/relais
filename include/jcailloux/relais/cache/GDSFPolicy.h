@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <mutex>
 #include <shared_mutex>
+#include <thread>
 #include <vector>
 
 #include "jcailloux/relais/cache/GDSFMetadata.h"
@@ -13,6 +14,10 @@
 
 #ifndef RELAIS_L1_MAX_MEMORY
 #define RELAIS_L1_MAX_MEMORY 0
+#endif
+
+#ifndef RELAIS_CLEANUP_FREQUENCY_LOG2
+#define RELAIS_CLEANUP_FREQUENCY_LOG2 9
 #endif
 
 #ifdef RELAIS_BUILDING_TESTS
@@ -36,7 +41,7 @@ struct GDSFConfig {
 // =========================================================================
 
 struct RepoRegistryEntry {
-    bool (*sweep_fn)();         // blocking cleanup of one shard, returns true if evicted
+    bool (*sweep_fn)();         // cleanup one chunk, returns true if evicted
     size_t (*size_fn)();        // current L1 cache size (entry count)
     float (*repo_score_fn)();   // current repo_score atomic
     const char* name;           // compile-time repo name (for logging)
@@ -59,6 +64,13 @@ public:
     /// Compile-time memory budget from CMake define.
     /// 0 = GDSF disabled (default). CachedRepo uses this for if constexpr guards.
     static constexpr size_t kMaxMemory = RELAIS_L1_MAX_MEMORY;
+
+    /// Compile-time cleanup frequency: sweep every 2^N insertions.
+    /// 0 = disabled. Default 9 = every 512 insertions.
+    /// The mask is an immediate in the `and` instruction — sub-nanosecond check.
+    static constexpr uint8_t kCleanupFrequencyLog2 = RELAIS_CLEANUP_FREQUENCY_LOG2;
+    static constexpr size_t kCleanupMask = kCleanupFrequencyLog2 > 0
+        ? (size_t{1} << kCleanupFrequencyLog2) - 1 : ~size_t{0};
 
     static GDSFPolicy& instance() {
         static auto* p = new GDSFPolicy();
@@ -210,16 +222,16 @@ public:
 
     /// Charge or discharge memory. Positive = allocation, negative = deallocation.
     void charge(int64_t delta) {
-        static thread_local uint32_t tl_idx = 0;
+        static thread_local uint32_t tl_idx = static_cast<uint32_t>(std::hash<std::thread::id>{}(std::this_thread::get_id()));
         size_t slot = tl_idx++ & (memory_slot_count_ - 1);
-        memory_slots_[slot].fetch_add(delta, std::memory_order_relaxed);
+        memory_slots_[slot].value.fetch_add(delta, std::memory_order_relaxed);
     }
 
     /// Sum of all memory counter slots (approximate under contention).
     int64_t totalMemory() const {
         int64_t total = 0;
         for (size_t i = 0; i < memory_slot_count_; ++i) {
-            total += memory_slots_[i].load(std::memory_order_relaxed);
+            total += memory_slots_[i].value.load(std::memory_order_relaxed);
         }
         return total;
     }
@@ -229,37 +241,38 @@ public:
     }
 
     // =====================================================================
-    // Emergency Cleanup (level 2)
+    // Global Sweep
     // =====================================================================
 
-    /// Triggered when memory exceeds budget. Iterates all repos, sweeps one
-    /// shard per repo. Launches up to 3 rounds if budget is still exceeded.
-    void emergencyCleanup() {
-        std::unique_lock emergency_lock(emergency_mutex_, std::try_to_lock);
-        if (!emergency_lock.owns_lock()) return;
+    /// Global sweep: iterates all repos, sweeps one chunk per repo.
+    /// Uses atomic_flag for instant abandon if a sweep is already in progress.
+    /// Runs a second pass if memory is still over budget after the first.
+    void sweep() {
+        if (sweep_flag_.test_and_set(std::memory_order_acquire)) return;
 
-        RELAIS_LOG_WARN << "GDSF: emergency cleanup triggered (memory: "
-                        << totalMemory() << " / " << kMaxMemory << ")";
-
-        for (int round = 0; round < 3; ++round) {
-            {
-                std::shared_lock lock(registry_mutex_);
-                for (const auto& entry : registry_) {
-                    entry.sweep_fn();  // blocking: waits if shard cleanup in progress
-                }
+        {
+            std::shared_lock rlock(registry_mutex_);
+            for (const auto& entry : registry_) {
+                entry.sweep_fn();
             }
-            global_generation_.fetch_add(1, std::memory_order_relaxed);
+        }
+        global_generation_.fetch_add(1, std::memory_order_relaxed);
 
-            if (!isOverBudget()) {
-                RELAIS_LOG_DEBUG << "GDSF: emergency cleanup resolved in "
-                                << (round + 1) << " round(s)";
-                return;
+        // Second pass if over budget (without releasing the flag)
+        if constexpr (kMaxMemory > 0) {
+            if (isOverBudget()) {
+                RELAIS_LOG_WARN << "GDSF: over budget after sweep ("
+                                << totalMemory() << " / " << kMaxMemory
+                                << "), running second pass";
+                std::shared_lock rlock(registry_mutex_);
+                for (const auto& entry : registry_) {
+                    entry.sweep_fn();
+                }
+                global_generation_.fetch_add(1, std::memory_order_relaxed);
             }
         }
 
-        RELAIS_LOG_WARN << "GDSF: emergency cleanup exhausted 3 rounds, "
-                        << "still over budget (" << totalMemory()
-                        << " / " << kMaxMemory << ")";
+        sweep_flag_.clear(std::memory_order_release);
     }
 
 private:
@@ -281,7 +294,7 @@ private:
         global_counter_.store(0, std::memory_order_relaxed);
         correction_.store(1.0f, std::memory_order_relaxed);
         for (size_t i = 0; i < kMaxMemorySlots; ++i) {
-            memory_slots_[i].store(0, std::memory_order_relaxed);
+            memory_slots_[i].value.store(0, std::memory_order_relaxed);
         }
         // Registry intentionally NOT cleared — repos are static objects.
     }
@@ -290,10 +303,14 @@ private:
     float decay_table_[kDecayTableSize]{};
     size_t memory_slot_count_{kMaxMemorySlots};
 
-    // Striped memory counter — aligned to avoid false sharing with other fields
-    alignas(64) std::atomic<int64_t> memory_slots_[kMaxMemorySlots]{};
+    // Striped memory counter — one slot per cache line to eliminate false sharing.
+    // Each slot is 64-byte aligned (one cache line), costing 4 KB total (negligible).
+    struct alignas(64) MemorySlot {
+        std::atomic<int64_t> value{0};
+    };
+    MemorySlot memory_slots_[kMaxMemorySlots];
 
-    // Repo registry (reader-writer lock: enroll=write, threshold/emergency=read)
+    // Repo registry (reader-writer lock: enroll=write, threshold/sweep=read)
     mutable std::shared_mutex registry_mutex_;
     std::vector<RepoRegistryEntry> registry_;
 
@@ -304,8 +321,8 @@ private:
     // Correction coefficient (EMA)
     std::atomic<float> correction_{1.0f};
 
-    // Emergency cleanup serialization
-    std::mutex emergency_mutex_;
+    // Sweep serialization — lock-free, guaranteed on all platforms
+    std::atomic_flag sweep_flag_{};
 
 #ifdef RELAIS_BUILDING_TESTS
     friend struct ::relais_test::TestInternals;

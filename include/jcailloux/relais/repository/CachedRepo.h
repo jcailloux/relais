@@ -10,10 +10,13 @@
 #include "jcailloux/relais/repository/RedisRepo.h"
 #include "jcailloux/relais/Log.h"
 #include "jcailloux/relais/cache/CachedWrapper.h"
+#include "jcailloux/relais/cache/ChunkMap.h"
 #include "jcailloux/relais/cache/GDSFMetadata.h"
 #include "jcailloux/relais/cache/GDSFPolicy.h"
-#include <jcailloux/shardmap/ShardMap.h>
+#include "jcailloux/relais/wrapper/EntityView.h"
+#include "jcailloux/relais/wrapper/BufferView.h"
 #include "jcailloux/relais/config/repo_config.h"
+#include "jcailloux/relais/config/CachedClock.h"
 
 #ifdef RELAIS_BUILDING_TESTS
 namespace relais_test { struct TestInternals; }
@@ -22,11 +25,14 @@ namespace relais_test { struct TestInternals; }
 namespace jcailloux::relais {
 
 /**
- * Repo with L1 RAM cache.
+ * Repo with L1 RAM cache backed by lock-free ChunkMap (ParlayHash).
  *
  * Supports two modes based on Cfg.cache_level:
  * - CacheLevel::L1:    RAM -> Database (Redis bypassed)
  * - CacheLevel::L1_L2: RAM -> Redis -> Database (full hierarchy)
+ *
+ * All find methods return epoch-guarded views (EntityView / JsonView / BinaryView).
+ * Views are thread-agnostic and safe to hold across co_await.
  *
  * Eviction policy depends on compile-time configuration:
  * - GDSF (score = frequency x cost) when RELAIS_L1_MAX_MEMORY > 0
@@ -47,7 +53,7 @@ class CachedRepo : public std::conditional_t<
     static constexpr bool HasTTL = (std::chrono::nanoseconds(Cfg.l1_ttl).count() > 0);
     static constexpr bool HasGDSF = (cache::GDSFPolicy::kMaxMemory > 0);
     static constexpr bool HasCleanup = HasGDSF || HasTTL;
-    static constexpr size_t kShardCount = 1u << Cfg.l1_shard_count_log2;
+    static constexpr long kChunkCount = 1L << Cfg.l1_chunk_count_log2;
 
     using Base = std::conditional_t<
         HasRedis,
@@ -58,132 +64,72 @@ class CachedRepo : public std::conditional_t<
     using Mapping = typename Entity::MappingType;
     using Clock = std::chrono::steady_clock;
     using Metadata = cache::CacheMetadata<HasGDSF, HasTTL>;
+    using ValueType = std::conditional_t<HasGDSF, cache::CachedWrapper<Entity>, Entity>;
 
 public:
     using typename Base::EntityType;
     using typename Base::KeyType;
     using typename Base::WrapperType;
     using typename Base::WrapperPtrType;
+    using FindResultType = wrapper::EntityView<Entity>;
     using Base::name;
-
-    using EntityPtr = WrapperPtrType;
 
     static constexpr auto l1Ttl() { return std::chrono::nanoseconds(Cfg.l1_ttl); }
 
-    static constexpr shardmap::ShardMapConfig kShardMapConfig{
-        .shard_count_log2 = Cfg.l1_shard_count_log2
-    };
+    // =========================================================================
+    // Queries
+    // =========================================================================
 
     /// Find by ID with L1 -> (L2) -> DB fallback.
-    /// Returns shared_ptr to immutable entity (nullptr if not found).
-    static io::Task<WrapperPtrType> find(const Key& id) {
-        if (auto cached = getFromCache(id)) {
-            co_return cached;
-        }
-
-        if constexpr (HasGDSF) {
-            auto start = Clock::now();
-            auto ptr = co_await Base::find(id);
-            if (ptr) {
-                auto elapsed_us = static_cast<float>(
-                    std::chrono::duration_cast<std::chrono::microseconds>(
-                        Clock::now() - start).count());
-                updateAvgConstructionTime(elapsed_us);
-                putInCache(id, ptr);
-            }
-            co_return ptr;
-        } else {
-            auto ptr = co_await Base::find(id);
-            if (ptr) {
-                putInCache(id, ptr);
-            }
-            co_return ptr;
-        }
+    /// Returns epoch-guarded EntityView (empty if not found).
+    /// Non-coroutine on L1 hit (zero allocation via Task::fromValue).
+    static io::Task<wrapper::EntityView<Entity>> find(const Key& id) {
+        if (auto view = getFromCache(id))
+            return io::Task<wrapper::EntityView<Entity>>::fromValue(std::move(view));
+        return findSlow(id);
     }
 
-    /// Find by ID and return raw JSON string.
-    /// Returns shared_ptr to JSON string (nullptr if not found).
-    static io::Task<std::shared_ptr<const std::string>> findJson(const Key& id) {
-        if (auto cached = getFromCache(id)) {
-            co_return cached->json();
-        }
-
-        auto ptr = co_await find(id);
-        co_return ptr ? ptr->json() : nullptr;
+    /// Find by ID and return JSON buffer view.
+    /// Returns epoch-guarded JsonView (empty if not found).
+    /// Non-coroutine on L1 hit.
+    static io::Task<wrapper::JsonView> findJson(const Key& id) {
+        auto result = findInCache(id);
+        if (result)
+            return io::Task<wrapper::JsonView>::fromValue(
+                wrapper::JsonView(result.entry->value.json(), std::move(result.guard)));
+        return findJsonSlow(id);
     }
 
-    /// Find by ID and return raw binary (BEVE).
-    /// Returns shared_ptr to binary data (nullptr if not found).
-    static io::Task<std::shared_ptr<const std::vector<uint8_t>>> findBinary(const Key& id)
+    /// Find by ID and return binary (BEVE) buffer view.
+    /// Returns epoch-guarded BinaryView (empty if not found).
+    /// Non-coroutine on L1 hit.
+    static io::Task<wrapper::BinaryView> findBinary(const Key& id)
         requires HasBinarySerialization<Entity>
     {
-        if (auto cached = getFromCache(id)) {
-            co_return cached->binary();
-        }
-
-        if constexpr (HasRedis) {
-            if constexpr (HasGDSF) {
-                auto start = Clock::now();
-                auto bin = co_await Base::findBinary(id);
-                if (bin) {
-                    auto elapsed_us = static_cast<float>(
-                        std::chrono::duration_cast<std::chrono::microseconds>(
-                            Clock::now() - start).count());
-                    updateAvgConstructionTime(elapsed_us);
-                    if (auto entity = Entity::fromBinary(*bin)) {
-                        putInCache(id, std::make_shared<const Entity>(std::move(*entity)));
-                    }
-                }
-                co_return bin;
-            } else {
-                auto bin = co_await Base::findBinary(id);
-                if (bin) {
-                    if (auto entity = Entity::fromBinary(*bin)) {
-                        putInCache(id, std::make_shared<const Entity>(std::move(*entity)));
-                    }
-                }
-                co_return bin;
-            }
-        } else {
-            if constexpr (HasGDSF) {
-                auto start = Clock::now();
-                auto ptr = co_await Base::find(id);
-                if (ptr) {
-                    auto elapsed_us = static_cast<float>(
-                        std::chrono::duration_cast<std::chrono::microseconds>(
-                            Clock::now() - start).count());
-                    updateAvgConstructionTime(elapsed_us);
-                    putInCache(id, ptr);
-                    co_return ptr->binary();
-                }
-                co_return nullptr;
-            } else {
-                auto ptr = co_await Base::find(id);
-                if (ptr) {
-                    putInCache(id, ptr);
-                    co_return ptr->binary();
-                }
-                co_return nullptr;
-            }
-        }
+        auto result = findInCache(id);
+        if (result)
+            return io::Task<wrapper::BinaryView>::fromValue(
+                wrapper::BinaryView(result.entry->value.binary(), std::move(result.guard)));
+        return findBinarySlow(id);
     }
 
-    /// Insert entity and cache it. Returns shared_ptr to immutable entity.
-    /// Compile-time error if Cfg.read_only is true.
-    static io::Task<WrapperPtrType> insert(WrapperPtrType wrapper)
+    // =========================================================================
+    // Mutations
+    // =========================================================================
+
+    /// Insert entity and cache it. Returns epoch-guarded view.
+    static io::Task<wrapper::EntityView<Entity>> insert(WrapperPtrType wrapper)
         requires CreatableEntity<Entity, Key> && (!Cfg.read_only)
     {
-        auto inserted = co_await Base::insert(wrapper);
-        if (inserted) {
-            putInCache(inserted->key(), inserted);
-            co_return inserted;
+        auto entity = co_await Base::insertRaw(std::move(wrapper));
+        if (entity) {
+            co_return putInCacheAndView(entity->key(), std::move(*entity));
         }
-        co_return nullptr;
+        co_return {};
     }
 
     /// Update entity in database with L1 cache handling.
     /// Returns true on success, false on error.
-    /// Compile-time error if Cfg.read_only is true.
     static io::Task<bool> update(const Key& id, WrapperPtrType wrapper)
         requires MutableEntity<Entity> && (!Cfg.read_only)
     {
@@ -194,34 +140,37 @@ public:
             if constexpr (Cfg.update_strategy == InvalidateAndLazyReload) {
                 evict(id);
             } else {
-                putInCache(id, wrapper);
+                putInCache(id, *wrapper);
             }
         }
         co_return success;
     }
 
-    /// Partial update: invalidates L1 then delegates to Base::patch.
-    /// Returns the re-fetched entity (nullptr on error or not found).
+    /// Partial update: invalidates L1, delegates to Base::patchRaw,
+    /// then moves result into cache.
     template<typename... Updates>
-    static io::Task<WrapperPtrType> patch(const Key& id, Updates&&... updates)
+    static io::Task<wrapper::EntityView<Entity>> patch(const Key& id, Updates&&... updates)
         requires HasFieldUpdate<Entity> && (!Cfg.read_only)
     {
         evict(id);
-        co_return co_await Base::patch(id, std::forward<Updates>(updates)...);
+        auto entity = co_await Base::patchRaw(id, std::forward<Updates>(updates)...);
+        if (entity) {
+            co_return putInCacheAndView(id, std::move(*entity));
+        }
+        co_return {};
     }
 
     /// Erase entity by ID.
     /// Returns: rows deleted (0 if not found), or nullopt on DB error.
     /// Invalidates L1 cache unless DB error occurred (self-healing).
-    /// For CompositeKey entities, provides L1 cache hint for partition pruning.
-    /// Compile-time error if Cfg.read_only is true.
     static io::Task<std::optional<size_t>> erase(const Key& id)
         requires (!Cfg.read_only)
     {
         // Provide L1 hint for partition pruning (free: ~0ns RAM lookup)
         WrapperPtrType hint = nullptr;
         if constexpr (HasPartitionHint<Entity>) {
-            hint = getFromCache(id);
+            auto view = getFromCache(id);
+            if (view) hint = std::make_shared<const Entity>(*view);
         }
 
         auto result = co_await Base::eraseImpl(id, std::move(hint));
@@ -240,16 +189,21 @@ public:
     }
 
     /// Invalidate L1 cache only. Non-coroutine since there is no async work.
+    /// Note: the retired entry is destroyed asynchronously via epoch-based reclamation.
     static void evict(const Key& id) {
         cache().invalidate(id);
     }
 
     [[nodiscard]] static size_t size() {
-        return cache().size();
+        return static_cast<size_t>(cache().size());
     }
 
+    // =========================================================================
+    // Cleanup
+    // =========================================================================
+
     /// Context passed to cleanup predicates. Accumulates score statistics
-    /// across all entries visited in the shard (mutable for const& access).
+    /// across all entries visited in the chunk (mutable for const& access).
     struct CleanupContext {
         Clock::time_point now;
         float threshold;
@@ -259,41 +213,36 @@ public:
         mutable size_t kept_count{0};
     };
 
-    /// Try to sweep one shard (non-blocking).
-    /// Returns immediately if a sweep is already in progress.
+    /// Sweep one chunk (lock-free, always succeeds).
     static bool trySweep() {
         if constexpr (!HasCleanup) {
             return false;
         } else {
             CleanupContext ctx{Clock::now(), HasGDSF ? cache::GDSFPolicy::instance().threshold() : 0.0f};
-            auto result = cache().try_cleanup(ctx, cleanupPredicate);
-            if (result.has_value()) {
-                if constexpr (HasGDSF) postCleanup(ctx);
-                return true;
-            }
-            return false;
-        }
-    }
-
-    /// Sweep one shard (blocking, waits if cleanup in progress).
-    static bool sweep() {
-        if constexpr (!HasCleanup) {
-            return false;
-        } else {
-            CleanupContext ctx{Clock::now(), HasGDSF ? cache::GDSFPolicy::instance().threshold() : 0.0f};
-            auto result = cache().cleanup(ctx, cleanupPredicate);
+            auto removed = cache().cleanup_next_chunk(kChunkCount,
+                [&ctx](const Key&, auto& entry) {
+                    return cleanupPredicate(entry.metadata, ctx);
+                });
             if constexpr (HasGDSF) postCleanup(ctx);
-            return result.removed > 0;
+            return removed > 0;
         }
     }
 
-    /// Sweep all shards.
+    /// Sweep one chunk (identical to trySweep in lock-free design).
+    static bool sweep() {
+        return trySweep();
+    }
+
+    /// Sweep all chunks.
     static size_t purge() {
         if constexpr (!HasCleanup) {
             return 0;
         } else {
             CleanupContext ctx{Clock::now(), HasGDSF ? cache::GDSFPolicy::instance().threshold() : 0.0f};
-            auto removed = cache().full_cleanup(ctx, cleanupPredicate);
+            auto removed = cache().full_cleanup(
+                [&ctx](const Key&, auto& entry) {
+                    return cleanupPredicate(entry.metadata, ctx);
+                });
             if constexpr (HasGDSF) postCleanup(ctx);
             return removed;
         }
@@ -303,7 +252,7 @@ public:
     /// ListMixin overrides this via method hiding to also warm up the list cache.
     static void warmup() {
         RELAIS_LOG_DEBUG << name() << ": warming up L1 cache...";
-        // Ensure the static ShardMap instance is constructed + repo registered.
+        // Ensure the static ChunkMap instance is constructed + repo registered.
         (void)cache();
         RELAIS_LOG_DEBUG << name() << ": L1 cache primed";
     }
@@ -319,14 +268,18 @@ public:
     }
 
 protected:
-    using L1Cache = shardmap::ShardMap<Key, EntityPtr, Metadata, kShardMapConfig>;
+    using L1Cache = cache::ChunkMap<Key, ValueType, Metadata>;
 
-    /// Returns the static ShardMap instance.
+    /// Returns the static ChunkMap instance.
     /// On first call, auto-registers this repo with GDSFPolicy for global coordination
-    /// (only when GDSF is enabled).
+    /// (when cleanup is enabled: GDSF or TTL > 0).
     static L1Cache& cache() {
         static L1Cache instance;
-        if constexpr (HasGDSF) {
+        static std::once_flag init_flag;
+        std::call_once(init_flag, []() {
+            config::CachedClock::ensureStarted();
+        });
+        if constexpr (HasCleanup) {
             static std::once_flag registry_flag;
             std::call_once(registry_flag, []() {
                 cache::GDSFPolicy::instance().enroll({
@@ -342,96 +295,186 @@ protected:
         return instance;
     }
 
-    /// Get from cache with optional GDSF score bump + optional TTL check.
-    /// Returns nullptr if not found or TTL-expired (invalidated).
-    static EntityPtr getFromCache(const Key& key) {
-        auto result = cache().get(key, [](const EntityPtr&, auto& meta) {
-            if constexpr (HasTTL && !HasGDSF) {
-                if (meta.isExpired(Clock::now())) {
-                    return shardmap::GetAction::Invalidate;
-                }
-            }
-            if constexpr (HasGDSF) {
-                if constexpr (HasTTL) {
-                    if (meta.isExpired(Clock::now())) {
-                        return shardmap::GetAction::Invalidate;
-                    }
-                }
-                auto& policy = cache::GDSFPolicy::instance();
-                policy.decay(meta);
-                float cost = avg_construction_time_us_.load(std::memory_order_relaxed);
-                meta.score.fetch_add(cost, std::memory_order_relaxed);
-            }
-            return shardmap::GetAction::Accept;
-        });
+    /// L1 cache lookup with TTL check and GDSF score bump.
+    /// Returns raw FindResult for flexible use by find/findJson/findBinary.
+    static typename L1Cache::FindResult findInCache(const Key& key) {
+        auto result = cache().find(key);
+        if (!result) return {};
 
-        if constexpr (HasCleanup && Cfg.l1_cleanup_every_n_gets > 0) {
-            maybeCleanup();
+        auto* entry = result.entry;
+
+        // TTL expiration check: two-phase eviction (find → check → evict)
+        if constexpr (HasTTL) {
+            if (entry->metadata.isExpired(config::CachedClock::now())) {
+                // Remove only if pointer identity matches (guards against concurrent Upsert)
+                cache().remove_if(key, [entry](auto* e) { return e == entry; });
+                return {};
+            }
         }
+
+        if constexpr (HasGDSF) bumpScore(entry->metadata);
 
         return result;
     }
 
-    /// Attempt a partial cleanup if N gets have elapsed and min interval has passed.
-    static void maybeCleanup() {
-        static std::atomic<uint32_t> get_counter{0};
-        static std::atomic<typename Clock::rep> last_cleanup_time{0};
-
-        if (get_counter.fetch_add(1, std::memory_order_relaxed) % Cfg.l1_cleanup_every_n_gets != 0)
-            return;
-
-        const auto now = Clock::now().time_since_epoch().count();
-        auto last = last_cleanup_time.load(std::memory_order_relaxed);
-        const auto min_interval = std::chrono::duration_cast<typename Clock::duration>(
-            std::chrono::nanoseconds(Cfg.l1_cleanup_min_interval)).count();
-
-        if (now - last < min_interval)
-            return;
-
-        if (!last_cleanup_time.compare_exchange_strong(last, now, std::memory_order_relaxed))
-            return;
-
-        // Check memory budget first — emergency cleanup if over budget
-        if constexpr (HasGDSF) {
-            auto& policy = cache::GDSFPolicy::instance();
-            if (policy.isOverBudget()) {
-                policy.emergencyCleanup();
-                return;
-            }
-        }
-        trySweep();
+    /// Get from cache as EntityView (convenience wrapper around findInCache).
+    static wrapper::EntityView<Entity> getFromCache(const Key& key) {
+        auto result = findInCache(key);
+        if (!result) return {};
+        return wrapper::EntityView<Entity>(&result.entry->value, std::move(result.guard));
     }
 
-    /// Put shared_ptr in cache with appropriate metadata.
-    /// When GDSF is enabled, wraps the entity in CachedWrapper for memory tracking.
-    static void putInCache(const Key& key, EntityPtr ptr) {
-        if constexpr (HasGDSF) {
-            float cost = avg_construction_time_us_.load(std::memory_order_relaxed);
-            uint32_t gen = cache::GDSFPolicy::instance().generation();
-
-            int64_t ttl_rep = 0;
-            if constexpr (HasTTL) {
-                ttl_rep = (Clock::now() + l1Ttl()).time_since_epoch().count();
+    /// Put entity in cache (copy). Returns FindResult for flexible use.
+    /// Triggers a global sweep on insertion when the hash check passes.
+    static typename L1Cache::FindResult putInCache(const Key& key, const Entity& src,
+        Clock::time_point now = Clock::now())
+    {
+        auto hk = L1Cache::make_key(key);
+        auto result = cache().upsert(hk, buildValue(src), buildMetadata(now));
+        if constexpr (HasCleanup) {
+            if (result.was_insert
+                && (L1Cache::get_hash(hk) & cache::GDSFPolicy::kCleanupMask) == 0) {
+                fireCleanup();
             }
-
-            constexpr size_t kOverhead = sizeof(Key) + sizeof(Metadata);
-            auto cached = std::make_shared<const cache::CachedWrapper<Entity>>(
-                Entity(*ptr), kOverhead);
-            // Implicit conversion: shared_ptr<const CachedWrapper<Entity>> -> shared_ptr<const Entity>
-            EntityPtr tracked = cached;
-
-            cache().put(key, std::move(tracked), Metadata{cost, gen, ttl_rep});
-        } else if constexpr (HasTTL) {
-            int64_t ttl_rep = (Clock::now() + l1Ttl()).time_since_epoch().count();
-            cache().put(key, ptr, Metadata{ttl_rep});
-        } else {
-            cache().put(key, ptr, Metadata{});
         }
+        return result;
+    }
+
+    /// Put entity in cache (move — zero copy). Returns FindResult.
+    static typename L1Cache::FindResult putInCache(const Key& key, Entity&& src,
+        Clock::time_point now = Clock::now())
+    {
+        auto hk = L1Cache::make_key(key);
+        auto result = cache().upsert(hk, buildValue(std::move(src)), buildMetadata(now));
+        if constexpr (HasCleanup) {
+            if (result.was_insert
+                && (L1Cache::get_hash(hk) & cache::GDSFPolicy::kCleanupMask) == 0) {
+                fireCleanup();
+            }
+        }
+        return result;
+    }
+
+    /// Put entity in cache and return EntityView (copy path).
+    static wrapper::EntityView<Entity> putInCacheAndView(const Key& key, const Entity& src) {
+        auto result = putInCache(key, src);
+        return wrapper::EntityView<Entity>(&result.entry->value, std::move(result.guard));
+    }
+
+    /// Put entity in cache and return EntityView (move path — zero copy).
+    static wrapper::EntityView<Entity> putInCacheAndView(const Key& key, Entity&& src) {
+        auto result = putInCache(key, std::move(src));
+        return wrapper::EntityView<Entity>(&result.entry->value, std::move(result.guard));
+    }
+
+    /// Fire a global sweep as a detached coroutine (fire-and-forget).
+    static io::DetachedTask fireCleanup() {
+        cache::GDSFPolicy::instance().sweep();
+        co_return;
     }
 
 private:
+    /// Slow path for find(): L1 miss → (L2) → DB → cache.
+    static io::Task<wrapper::EntityView<Entity>> findSlow(const Key& id) {
+        auto result = co_await fetchAndCache(id);
+        if (result) {
+            co_return wrapper::EntityView<Entity>(&result.entry->value, std::move(result.guard));
+        }
+        co_return {};
+    }
+
+    /// Slow path for findJson(): L1 miss → (L2) → DB → cache → JSON.
+    static io::Task<wrapper::JsonView> findJsonSlow(const Key& id) {
+        auto result = co_await fetchAndCache(id);
+        if (result) {
+            co_return wrapper::JsonView(result.entry->value.json(), std::move(result.guard));
+        }
+        co_return {};
+    }
+
+    /// Slow path for findBinary(): L1 miss → (L2) → DB → cache → binary.
+    static io::Task<wrapper::BinaryView> findBinarySlow(const Key& id)
+        requires HasBinarySerialization<Entity>
+    {
+        auto result = co_await fetchAndCache(id);
+        if (result) {
+            co_return wrapper::BinaryView(result.entry->value.binary(), std::move(result.guard));
+        }
+        co_return {};
+    }
+
+    /// Fetch from Base via findRaw (entity by value), measure construction
+    /// time (GDSF), move into cache. Reuses Clock::now() for both GDSF
+    /// timing and TTL metadata (saves one vDSO call ~25ns).
+    static io::Task<typename L1Cache::FindResult> fetchAndCache(const Key& id) {
+        if constexpr (HasGDSF) {
+            auto start = Clock::now();
+            auto entity = co_await Base::findRaw(id);
+            if (entity) {
+                auto now = Clock::now();
+                auto elapsed_us = static_cast<float>(
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        now - start).count());
+                updateAvgConstructionTime(elapsed_us);
+                co_return putInCache(id, std::move(*entity), now);
+            }
+        } else {
+            auto entity = co_await Base::findRaw(id);
+            if (entity) {
+                co_return putInCache(id, std::move(*entity));
+            }
+        }
+        co_return {};
+    }
+
+    /// Build ValueType from entity (copy path).
+    static ValueType buildValue(const Entity& src) {
+        if constexpr (HasGDSF) {
+            constexpr size_t kOverhead = sizeof(Key) + sizeof(Metadata);
+            return cache::CachedWrapper<Entity>(Entity(src), kOverhead);
+        } else {
+            return Entity(src);
+        }
+    }
+
+    /// Build ValueType from entity (move path — zero copy).
+    static ValueType buildValue(Entity&& src) {
+        if constexpr (HasGDSF) {
+            constexpr size_t kOverhead = sizeof(Key) + sizeof(Metadata);
+            return cache::CachedWrapper<Entity>(std::move(src), kOverhead);
+        } else {
+            return std::move(src);
+        }
+    }
+
+    /// Build metadata. Accepts a pre-computed timestamp to avoid redundant
+    /// Clock::now() calls (e.g., reuse timing from GDSF measurement).
+    static Metadata buildMetadata(Clock::time_point now = Clock::now()) {
+        if constexpr (HasGDSF) {
+            float cost = avg_construction_time_us_.load(std::memory_order_relaxed);
+            uint32_t gen = cache::GDSFPolicy::instance().generation();
+            int64_t ttl_rep = 0;
+            if constexpr (HasTTL) {
+                ttl_rep = (now + l1Ttl()).time_since_epoch().count();
+            }
+            return Metadata{cost, gen, ttl_rep};
+        } else if constexpr (HasTTL) {
+            return Metadata{(now + l1Ttl()).time_since_epoch().count()};
+        } else {
+            return Metadata{};
+        }
+    }
+
+    /// Bump GDSF score: lazy decay then add construction cost.
+    static void bumpScore(Metadata& meta) {
+        auto& policy = cache::GDSFPolicy::instance();
+        policy.decay(meta);
+        float cost = avg_construction_time_us_.load(std::memory_order_relaxed);
+        meta.score.fetch_add(cost, std::memory_order_relaxed);
+    }
+
     /// Cleanup predicate: evict based on GDSF score and/or TTL expiration.
-    static bool cleanupPredicate(const Key&, const Metadata& meta, const CleanupContext& ctx) {
+    static bool cleanupPredicate(const Metadata& meta, CleanupContext& ctx) {
         if constexpr (HasGDSF) {
             cache::GDSFPolicy::instance().decay(meta);
 
@@ -463,8 +506,8 @@ private:
         if (ctx.kept_count > 0) {
             float avg_kept = ctx.kept_score_sum / static_cast<float>(ctx.kept_count);
             float old_rs = repo_score_.load(std::memory_order_relaxed);
-            float new_rs = (old_rs * static_cast<float>(kShardCount - 1) + avg_kept)
-                         / static_cast<float>(kShardCount);
+            float new_rs = (old_rs * static_cast<float>(kChunkCount - 1) + avg_kept)
+                         / static_cast<float>(kChunkCount);
 
             // CAS without retry — approximation is fine
             repo_score_.compare_exchange_weak(old_rs, new_rs, std::memory_order_relaxed);

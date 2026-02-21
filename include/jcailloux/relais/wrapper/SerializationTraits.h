@@ -3,7 +3,6 @@
 
 #include <concepts>
 #include <cstdint>
-#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -19,20 +18,20 @@ namespace jcailloux::relais {
 // =============================================================================
 
 /// Entity supports JSON serialization (json/fromJson).
-/// json() returns shared_ptr<const string> — cacheable, nullable, zero-copy.
+/// json() returns const string* — epoch-guarded, nullable, zero-copy.
 /// fromJson(string_view) is the canonical input form.
 template<typename Entity>
 concept HasJsonSerialization = requires(const Entity& e, std::string_view json) {
-    { e.json() } -> std::convertible_to<std::shared_ptr<const std::string>>;
+    { e.json() } -> std::convertible_to<const std::string*>;
     { Entity::fromJson(json) } -> std::convertible_to<std::optional<Entity>>;
 };
 
 /// Entity supports binary serialization (binary/fromBinary).
-/// binary() returns shared_ptr<const vector<uint8_t>> — cacheable, nullable, zero-copy.
+/// binary() returns const vector<uint8_t>* — epoch-guarded, nullable, zero-copy.
 /// fromBinary(span) is the canonical input form.
 template<typename Entity>
 concept HasBinarySerialization = requires(const Entity& e, std::span<const uint8_t> data) {
-    { e.binary() } -> std::convertible_to<std::shared_ptr<const std::vector<uint8_t>>>;
+    { e.binary() } -> std::convertible_to<const std::vector<uint8_t>*>;
     { Entity::fromBinary(data) } -> std::convertible_to<std::optional<Entity>>;
 };
 

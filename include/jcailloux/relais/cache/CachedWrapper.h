@@ -16,8 +16,8 @@ namespace jcailloux::relais::cache {
 //   - Destruction discharges the same amount
 //   - Lazy json()/binary() buffer generation charges additional memory
 //
-// Always stored behind shared_ptr<const Entity>; the control block retains
-// the CachedWrapper type so the destructor fires correctly.
+// Stored inside ChunkMap::CacheEntry by-value; epoch-based reclamation
+// ensures the destructor fires at the correct time.
 // =============================================================================
 
 template<typename Entity>
@@ -31,12 +31,24 @@ public:
         chargeHook(static_cast<int64_t>(this->memoryUsage() + extra_overhead_));
     }
 
+    /// Move constructor: transfers memory tracking to the new object.
+    /// The moved-from object will not discharge memory on destruction.
+    CachedWrapper(CachedWrapper&& o) noexcept
+        : Entity(static_cast<Entity&&>(std::move(o)))
+        , extra_overhead_(o.extra_overhead_)
+    {
+        this->memory_hook_ = o.memory_hook_;
+        o.memory_hook_ = nullptr;
+        o.extra_overhead_ = 0;
+    }
+
     ~CachedWrapper() {
-        chargeHook(-static_cast<int64_t>(this->memoryUsage() + extra_overhead_));
+        if (this->memory_hook_) {
+            this->memory_hook_(-static_cast<int64_t>(this->memoryUsage() + extra_overhead_));
+        }
     }
 
     CachedWrapper(const CachedWrapper&) = delete;
-    CachedWrapper(CachedWrapper&&) = delete;
     CachedWrapper& operator=(const CachedWrapper&) = delete;
     CachedWrapper& operator=(CachedWrapper&&) = delete;
 

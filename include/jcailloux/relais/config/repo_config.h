@@ -53,9 +53,7 @@ namespace jcailloux::relais::config {
 
         // L1 (RAM cache) — eviction is GDSF-based (score = frequency × cost)
         Duration l1_ttl = std::chrono::hours(1);  // Duration{0} = no TTL
-        uint8_t l1_shard_count_log2 = 3;  // 2^3 = 8 shards (ShardMap default)
-        size_t l1_cleanup_every_n_gets = 500;
-        Duration l1_cleanup_min_interval = std::chrono::seconds(30);
+        uint8_t l1_chunk_count_log2 = 3;  // 2^3 = 8 chunks (ChunkMap default)
 
         // L2 (Redis cache)
         Duration l2_ttl = std::chrono::hours(4);
@@ -67,9 +65,7 @@ namespace jcailloux::relais::config {
         consteval CacheConfig with_read_only(bool v = true) const { auto c = *this; c.read_only = v; return c; }
         consteval CacheConfig with_update_strategy(UpdateStrategy v) const { auto c = *this; c.update_strategy = v; return c; }
         consteval CacheConfig with_l1_ttl(Duration v) const { auto c = *this; c.l1_ttl = v; return c; }
-        consteval CacheConfig with_l1_shard_count_log2(uint8_t v) const { auto c = *this; c.l1_shard_count_log2 = v; return c; }
-        consteval CacheConfig with_l1_cleanup_every_n_gets(size_t v) const { auto c = *this; c.l1_cleanup_every_n_gets = v; return c; }
-        consteval CacheConfig with_l1_cleanup_min_interval(Duration v) const { auto c = *this; c.l1_cleanup_min_interval = v; return c; }
+        consteval CacheConfig with_l1_chunk_count_log2(uint8_t v) const { auto c = *this; c.l1_chunk_count_log2 = v; return c; }
         consteval CacheConfig with_l2_ttl(Duration v) const { auto c = *this; c.l2_ttl = v; return c; }
         consteval CacheConfig with_l2_refresh_on_get(bool v) const { auto c = *this; c.l2_refresh_on_get = v; return c; }
         consteval CacheConfig with_l2_format(L2Format v) const { auto c = *this; c.l2_format = v; return c; }

@@ -444,7 +444,7 @@ TEST_CASE("[DeclList L1+L2] L2 hit repopulates L1",
             makeFullArticleQuery("tech")));
         REQUIRE(r1->size() == 2);
 
-        // Clear L1 only (shardmap + ModificationTracker + get_counter). L2 intact.
+        // Clear L1 only (ChunkMap + ModificationTracker + get_counter). L2 intact.
         TestInternals::resetListCacheState<FullCacheArticleListRepo>();
 
         // Insert sentinel directly in DB (bypasses repo, no invalidation)

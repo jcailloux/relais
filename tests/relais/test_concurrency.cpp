@@ -777,8 +777,8 @@ TEST_CASE("Concurrency - progressive tracker reduction",
         auto initial_count = TestInternals::pendingModificationCount<TestArticleListRepo>();
         REQUIRE(initial_count == 10);
 
-        // Run cleanup cycles (2× ShardCount to ensure all bitmap bits are cleared)
-        constexpr auto N = TestInternals::listCacheShardCount<TestArticleListRepo>();
+        // Run cleanup cycles (2× ChunkCount to ensure all bitmap bits are cleared)
+        constexpr auto N = TestInternals::listCacheChunkCount<TestArticleListRepo>();
         for (size_t i = 0; i < 2 * N; ++i) {
             TestInternals::forceModificationTrackerCleanup<TestArticleListRepo>();
         }

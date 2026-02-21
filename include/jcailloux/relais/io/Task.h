@@ -3,6 +3,7 @@
 
 #include <coroutine>
 #include <exception>
+#include <optional>
 #include <type_traits>
 #include <utility>
 #include <variant>
@@ -36,6 +37,14 @@ struct PromiseBase {
 } // namespace detail
 
 // Task<T> — lazy, awaitable, move-only coroutine with symmetric transfer
+//
+// Two creation paths:
+// 1. Coroutine: co_return / co_await → allocates coroutine frame on heap
+// 2. fromValue(T): pre-resolved result → zero allocation, await_ready() = true
+//
+// When a caller co_awaits a fromValue Task, the coroutine machinery is
+// completely bypassed: await_ready() returns true, await_suspend() is never
+// called, and await_resume() returns the stored value directly.
 
 template<typename T>
 class Task {
@@ -56,22 +65,31 @@ public:
         }
     };
 
+    /// Construct a pre-resolved Task (no coroutine frame, zero heap allocation).
+    /// co_await on this Task completes synchronously via await_ready() = true.
+    static Task fromValue(T value) noexcept(std::is_nothrow_move_constructible_v<T>) {
+        return Task{std::move(value)};
+    }
+
     Task() noexcept = default;
     explicit Task(std::coroutine_handle<promise_type> h) noexcept : handle_(h) {}
     ~Task() { if (handle_) handle_.destroy(); }
 
-    Task(Task&& o) noexcept : handle_(std::exchange(o.handle_, nullptr)) {}
+    Task(Task&& o) noexcept
+        : handle_(std::exchange(o.handle_, nullptr))
+        , ready_value_(std::move(o.ready_value_)) {}
     Task& operator=(Task&& o) noexcept {
         if (this != &o) {
             if (handle_) handle_.destroy();
             handle_ = std::exchange(o.handle_, nullptr);
+            ready_value_ = std::move(o.ready_value_);
         }
         return *this;
     }
     Task(const Task&) = delete;
     Task& operator=(const Task&) = delete;
 
-    [[nodiscard]] bool await_ready() const noexcept { return false; }
+    [[nodiscard]] bool await_ready() const noexcept { return ready_value_.has_value(); }
 
     std::coroutine_handle<> await_suspend(std::coroutine_handle<> caller) noexcept {
         handle_.promise().continuation_ = caller;
@@ -79,6 +97,7 @@ public:
     }
 
     T await_resume() {
+        if (ready_value_) return std::move(*ready_value_);
         auto& result = handle_.promise().result_;
         if (auto* ex = std::get_if<2>(&result))
             std::rethrow_exception(*ex);
@@ -86,7 +105,11 @@ public:
     }
 
 private:
+    explicit Task(T value) noexcept(std::is_nothrow_move_constructible_v<T>)
+        : ready_value_(std::move(value)) {}
+
     std::coroutine_handle<promise_type> handle_ = nullptr;
+    std::optional<T> ready_value_;
 };
 
 // Task<void> specialization
@@ -108,22 +131,32 @@ public:
         }
     };
 
+    /// Construct a pre-resolved void Task (no coroutine frame).
+    static Task ready() noexcept {
+        Task t;
+        t.ready_ = true;
+        return t;
+    }
+
     Task() noexcept = default;
     explicit Task(std::coroutine_handle<promise_type> h) noexcept : handle_(h) {}
     ~Task() { if (handle_) handle_.destroy(); }
 
-    Task(Task&& o) noexcept : handle_(std::exchange(o.handle_, nullptr)) {}
+    Task(Task&& o) noexcept
+        : handle_(std::exchange(o.handle_, nullptr))
+        , ready_(o.ready_) {}
     Task& operator=(Task&& o) noexcept {
         if (this != &o) {
             if (handle_) handle_.destroy();
             handle_ = std::exchange(o.handle_, nullptr);
+            ready_ = o.ready_;
         }
         return *this;
     }
     Task(const Task&) = delete;
     Task& operator=(const Task&) = delete;
 
-    [[nodiscard]] bool await_ready() const noexcept { return false; }
+    [[nodiscard]] bool await_ready() const noexcept { return ready_; }
 
     std::coroutine_handle<> await_suspend(std::coroutine_handle<> caller) noexcept {
         handle_.promise().continuation_ = caller;
@@ -131,12 +164,14 @@ public:
     }
 
     void await_resume() {
+        if (ready_) return;
         if (handle_.promise().exception_)
             std::rethrow_exception(handle_.promise().exception_);
     }
 
 private:
     std::coroutine_handle<promise_type> handle_ = nullptr;
+    bool ready_ = false;
 };
 
 // DetachedTask — eager, fire-and-forget coroutine (self-destroying)
