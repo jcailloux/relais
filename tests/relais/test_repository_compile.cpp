@@ -142,9 +142,9 @@ TEST_CASE("Config presets", "[repository][compile]") {
             jcailloux::relais::config::UpdateStrategy::PopulateImmediately);
     }
 
-    SECTION("FewShards") {
-        constexpr auto cfg = FewShardsTestItemRepo::config;
-        STATIC_REQUIRE(cfg.l1_shard_count_log2 == 1);
+    SECTION("FewChunks") {
+        constexpr auto cfg = FewChunksTestItemRepo::config;
+        STATIC_REQUIRE(cfg.l1_chunk_count_log2 == 1);
     }
 }
 

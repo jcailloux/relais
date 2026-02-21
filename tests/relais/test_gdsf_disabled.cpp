@@ -36,14 +36,20 @@ namespace relais_test::gdsf_disabled {
 
 using namespace jcailloux::relais::config;
 
-// Default Local config (no TTL, no GDSF)
-using NoGDSFRepo = relais_test::Repo<TestItemWrapper, "gdsf_dis:item", Local>;
+// Default Local config (has default TTL of 1h, no GDSF)
+using DefaultTTLRepo = relais_test::Repo<TestItemWrapper, "gdsf_dis:item", Local>;
 
-// TTL-only (no GDSF, but TTL active)
+// TTL-only (no GDSF, but explicit TTL active)
 inline constexpr auto WithTTL = Local
     .with_l1_ttl(std::chrono::seconds{60});
 
 using TTLOnlyRepo = relais_test::Repo<TestItemWrapper, "gdsf_dis:ttl", WithTTL>;
+
+// No TTL, no GDSF — truly no cleanup
+inline constexpr auto NoCleanup = Local
+    .with_l1_ttl(std::chrono::nanoseconds{0});
+
+using NoCleanupRepo = relais_test::Repo<TestItemWrapper, "gdsf_dis:noclean", NoCleanup>;
 
 } // namespace relais_test::gdsf_disabled
 
@@ -86,17 +92,20 @@ TEST_CASE("GDSF disabled - zero overhead when kMaxMemory == 0",
         REQUIRE_FALSE(meta.isExpired(not_expired_tp));
     }
 
-    SECTION("no GDSFPolicy registration from disabled repos") {
+    SECTION("TTL repos register for global sweep, no-cleanup repos do not") {
         size_t before = GDSFPolicy::instance().nbRepos();
 
-        // warmup() triggers cache() construction — should NOT register with GDSFPolicy
-        NoGDSFRepo::warmup();
+        // DefaultTTLRepo has default TTL (1h) -> HasCleanup == true -> registers
+        DefaultTTLRepo::warmup();
+        REQUIRE(GDSFPolicy::instance().nbRepos() == before + 1);
+
+        // TTLOnlyRepo has explicit TTL (60s) -> HasCleanup == true -> registers
         TTLOnlyRepo::warmup();
+        REQUIRE(GDSFPolicy::instance().nbRepos() == before + 2);
 
-        size_t after = GDSFPolicy::instance().nbRepos();
-
-        // No new registrations (HasGDSF == false -> if constexpr skips enrollment)
-        REQUIRE(after == before);
+        // NoCleanupRepo has no TTL and no GDSF -> HasCleanup == false -> no registration
+        NoCleanupRepo::warmup();
+        REQUIRE(GDSFPolicy::instance().nbRepos() == before + 2);
     }
 }
 

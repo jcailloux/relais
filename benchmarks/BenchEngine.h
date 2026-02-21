@@ -143,29 +143,47 @@ inline BenchResult computeStats(const std::string& name, std::vector<double>& ti
 }
 
 template<typename Fn>
+inline BenchResult bench(const std::string& name, Fn&& fn) {
+    for (int i = 0; i < WARMUP; ++i) fn();
+
+    const int samples = benchSamples();
+    std::vector<double> times(samples);
+    for (int i = 0; i < samples; ++i) {
+        auto t0 = Clock::now();
+        fn();
+        times[i] = std::chrono::duration<double, std::micro>(Clock::now() - t0).count();
+    }
+
+    return computeStats(name, times);
+}
+
+template<typename SetupFn, typename Fn>
+inline BenchResult benchWithSetup(
+        const std::string& name, SetupFn&& setup, Fn&& fn) {
+    for (int i = 0; i < WARMUP; ++i) { setup(); fn(); }
+
+    const int samples = benchSamples();
+    std::vector<double> times(samples);
+    for (int i = 0; i < samples; ++i) {
+        setup();
+        auto t0 = Clock::now();
+        fn();
+        times[i] = std::chrono::duration<double, std::micro>(Clock::now() - t0).count();
+    }
+
+    return computeStats(name, times);
+}
+
+// Coroutine variants — used by I/O layer benchmarks (bench_io_redis, bench_io_pg)
+// where the overhead (~40ns) is negligible vs μs-scale I/O round-trips.
+
+template<typename Fn>
 inline io::Task<BenchResult> benchAsync(const std::string& name, Fn&& fn) {
     for (int i = 0; i < WARMUP; ++i) co_await fn();
 
     const int samples = benchSamples();
     std::vector<double> times(samples);
     for (int i = 0; i < samples; ++i) {
-        auto t0 = Clock::now();
-        co_await fn();
-        times[i] = std::chrono::duration<double, std::micro>(Clock::now() - t0).count();
-    }
-
-    co_return computeStats(name, times);
-}
-
-template<typename SetupFn, typename Fn>
-inline io::Task<BenchResult> benchWithSetupAsync(
-        const std::string& name, SetupFn&& setup, Fn&& fn) {
-    for (int i = 0; i < WARMUP; ++i) { co_await setup(); co_await fn(); }
-
-    const int samples = benchSamples();
-    std::vector<double> times(samples);
-    for (int i = 0; i < samples; ++i) {
-        co_await setup();
         auto t0 = Clock::now();
         co_await fn();
         times[i] = std::chrono::duration<double, std::micro>(Clock::now() - t0).count();
@@ -345,7 +363,9 @@ inline std::string formatDurationThroughput(
         const DurationResult& result) {
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(result.elapsed).count();
     auto ops_per_sec = (us > 0) ? result.total_ops * 1'000'000.0 / us : 0.0;
-    auto avg_us = (result.total_ops > 0) ? static_cast<double>(us) / result.total_ops : 0.0;
+    // Per-thread avg latency: wall_time / ops_per_thread
+    auto ops_per_thread = result.total_ops / std::max(threads, 1);
+    auto avg_us = (ops_per_thread > 0) ? static_cast<double>(us) / ops_per_thread : 0.0;
 
     auto bar = std::string(50, '-');
     std::ostringstream out;
@@ -360,6 +380,53 @@ inline std::string formatDurationThroughput(
         << "  throughput:   " << fmtOps(ops_per_sec) << "\n"
         << "  avg latency:  " << fmtDuration(avg_us) << "\n"
         << "  " << bar;
+    return out.str();
+}
+
+inline std::string formatMixedThroughput(
+        const std::string& label, int threads,
+        const DurationResult& result,
+        int64_t total_reads, int64_t total_writes,
+        double read_only_ops_per_sec = 0.0) {
+    auto us = std::chrono::duration_cast<std::chrono::microseconds>(result.elapsed).count();
+    auto read_ops_s = (us > 0) ? total_reads * 1'000'000.0 / us : 0.0;
+    auto write_ops_s = (us > 0) ? total_writes * 1'000'000.0 / us : 0.0;
+    auto total_ops_s = (us > 0) ? result.total_ops * 1'000'000.0 / us : 0.0;
+
+    // Per-thread avg operation time (blended reads + writes)
+    auto ops_per_thread = result.total_ops / std::max(threads, 1);
+    auto avg_op_us = (ops_per_thread > 0) ? static_cast<double>(us) / ops_per_thread : 0.0;
+
+    // Estimate per-write cost: if read cost = avg_op from read-only benchmark,
+    // then 0.75 * read_cost + 0.25 * write_cost = avg_op
+    // => write_cost = (avg_op - 0.75 * read_cost) / 0.25
+    double read_ratio = (result.total_ops > 0)
+        ? static_cast<double>(total_reads) / result.total_ops : 0.75;
+    double write_ratio = 1.0 - read_ratio;
+
+    auto bar = std::string(50, '-');
+    std::ostringstream out;
+    out << "\n"
+        << "  " << bar << "\n"
+        << "  " << label << "\n"
+        << "  " << bar << "\n"
+        << "  threads:         " << threads << "\n"
+        << "  duration:        " << std::fixed << std::setprecision(2)
+                                 << static_cast<double>(us) / 1'000'000 << " s\n"
+        << "  read  throughput:" << std::setw(15) << fmtOps(read_ops_s) << "\n"
+        << "  write throughput:" << std::setw(15) << fmtOps(write_ops_s) << "\n"
+        << "  total throughput:" << std::setw(15) << fmtOps(total_ops_s) << "\n"
+        << "  avg op latency:  " << fmtDuration(avg_op_us) << " /thread\n";
+
+    if (read_only_ops_per_sec > 0.0) {
+        double read_only_lat = 1'000'000.0 / (read_only_ops_per_sec / threads);
+        double est_write_lat = (avg_op_us - read_ratio * read_only_lat)
+                             / std::max(write_ratio, 0.01);
+        out << "  est. read cost:  " << fmtDuration(read_only_lat) << "\n"
+            << "  est. write cost: " << fmtDuration(est_write_lat) << "\n";
+    }
+
+    out << "  " << bar;
     return out.str();
 }
 

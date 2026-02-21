@@ -6,11 +6,9 @@
  *
  * Covers:
  *   1. l1_ttl               — cache entry lifetime (GDSF evicts on cleanup)
- *   2. l1_shard_count_log2  — cleanup granularity
+ *   2. l1_chunk_count_log2  — cleanup granularity
  *   3. update_strategy      — InvalidateAndLazyReload vs PopulateImmediately
- *   4. l1_cleanup_every_n_gets  — auto-cleanup trigger
- *   5. l1_cleanup_min_interval  — cleanup throttling
- *   6. read_only            — write restriction at L1
+ *   4. read_only            — write restriction at L1
  */
 
 #include <catch2/catch_test_macros.hpp>
@@ -38,9 +36,9 @@ inline constexpr auto TTL50ms = Local
 inline constexpr auto TTL500ms = Local
     .with_l1_ttl(std::chrono::milliseconds{500});
 
-// --- l1_shard_count_log2 ---
-inline constexpr auto Seg2 = Local.with_l1_shard_count_log2(1);    // 2^1 = 2 shards
-inline constexpr auto Seg16 = Local.with_l1_shard_count_log2(4);   // 2^4 = 16 shards
+// --- l1_chunk_count_log2 ---
+inline constexpr auto Seg2 = Local.with_l1_chunk_count_log2(1);    // 2^1 = 2 chunks
+inline constexpr auto Seg16 = Local.with_l1_chunk_count_log2(4);   // 2^4 = 16 chunks
 
 // --- update_strategy ---
 inline constexpr auto LazyReload = Local
@@ -48,27 +46,6 @@ inline constexpr auto LazyReload = Local
 
 inline constexpr auto PopImmediate = Local
     .with_update_strategy(UpdateStrategy::PopulateImmediately);
-
-// --- l1_cleanup_every_n_gets ---
-inline constexpr auto AutoCleanup5 = Local
-    .with_l1_ttl(std::chrono::milliseconds{50})
-    .with_l1_cleanup_every_n_gets(5)
-    .with_l1_cleanup_min_interval(std::chrono::milliseconds{0});
-
-inline constexpr auto AutoCleanupDisabled = Local
-    .with_l1_ttl(std::chrono::milliseconds{50})
-    .with_l1_cleanup_every_n_gets(0);
-
-// --- l1_cleanup_min_interval ---
-inline constexpr auto CleanupInterval0 = Local
-    .with_l1_ttl(std::chrono::milliseconds{50})
-    .with_l1_cleanup_every_n_gets(3)
-    .with_l1_cleanup_min_interval(std::chrono::milliseconds{0});
-
-inline constexpr auto CleanupIntervalLong = Local
-    .with_l1_ttl(std::chrono::milliseconds{50})
-    .with_l1_cleanup_every_n_gets(3)
-    .with_l1_cleanup_min_interval(std::chrono::seconds{30});
 
 // --- read_only ---
 inline constexpr auto ReadOnlyL1 = Local.with_read_only();
@@ -90,14 +67,6 @@ using Seg16Repo = Repo<TestItemWrapper, "cfg:l1:seg16", ct::Seg16>;
 // Strategy repos
 using LazyReloadRepo  = Repo<TestItemWrapper, "cfg:l1:lazy",  ct::LazyReload>;
 using PopImmediateRepo = Repo<TestItemWrapper, "cfg:l1:pop",   ct::PopImmediate>;
-
-// Auto-cleanup repos
-using AutoCleanup5Repo = Repo<TestItemWrapper, "cfg:l1:ac5",  ct::AutoCleanup5>;
-using AutoCleanupOffRepo = Repo<TestItemWrapper, "cfg:l1:ac0", ct::AutoCleanupDisabled>;
-
-// Cleanup interval repos
-using CleanupInterval0Repo = Repo<TestItemWrapper, "cfg:l1:ci0",   ct::CleanupInterval0>;
-using CleanupIntervalLongRepo = Repo<TestItemWrapper, "cfg:l1:cilong", ct::CleanupIntervalLong>;
 
 // Read-only repo
 using ReadOnlyCfgRepo = Repo<TestItemWrapper, "cfg:l1:ro", ct::ReadOnlyL1>;
@@ -167,16 +136,16 @@ TEST_CASE("L1 Config - l1_ttl",
 
 // #############################################################################
 //
-//  4. l1_shard_count_log2
+//  4. l1_chunk_count_log2
 //
 // #############################################################################
 
-TEST_CASE("L1 Config - l1_shard_count_log2",
-          "[integration][db][config][l1][shards]")
+TEST_CASE("L1 Config - l1_chunk_count_log2",
+          "[integration][db][config][l1][chunks]")
 {
     TransactionGuard tx;
 
-    SECTION("[shards] 2 shards: cleanup processes half the cache per cycle") {
+    SECTION("[chunks] 2 chunks: cleanup processes half the cache per cycle") {
         auto id1 = insertTestItem("seg2_a", 1);
         auto id2 = insertTestItem("seg2_b", 2);
 
@@ -185,15 +154,15 @@ TEST_CASE("L1 Config - l1_shard_count_log2",
 
         REQUIRE(getCacheSize<Seg2Repo>() == 2);
 
-        // Trigger partial cleanup (1 of 2 shards)
+        // Trigger partial cleanup (1 of 2 chunks)
         trySweep<Seg2Repo>();
 
-        // After one shard cleanup, 0-2 items may remain depending on distribution
+        // After one chunk cleanup, 0-2 items may remain depending on distribution
         auto size = getCacheSize<Seg2Repo>();
         REQUIRE(size <= 2);
     }
 
-    SECTION("[shards] 16 shards: reset clears all entries") {
+    SECTION("[chunks] 16 chunks: reset clears all entries") {
         auto id = insertTestItem("seg16_item", 1);
         sync(Seg16Repo::find(id));
         REQUIRE(getCacheSize<Seg16Repo>() > 0);
@@ -274,137 +243,7 @@ TEST_CASE("L1 Config - update_strategy",
 
 // #############################################################################
 //
-//  6. l1_cleanup_every_n_gets
-//
-// #############################################################################
-
-TEST_CASE("L1 Config - l1_cleanup_every_n_gets",
-          "[integration][db][config][l1][auto-cleanup]")
-{
-    TransactionGuard tx;
-
-    SECTION("[auto-cleanup] expired entries removed on trigger") {
-        auto id = insertTestItem("ac_exp_item", 10);
-
-        // Populate cache
-        sync(AutoCleanup5Repo::find(id));
-        REQUIRE(getCacheSize<AutoCleanup5Repo>() > 0);
-
-        // Wait for TTL to expire (50ms)
-        waitForExpiration(std::chrono::milliseconds{80});
-
-        // GDSF: TTL-expired entries are evicted on get (Invalidate action in getFromCache)
-        // The reads trigger re-fetch from DB. Auto-cleanup fires every 5 gets.
-        for (int i = 0; i < 5; ++i) {
-            sync(AutoCleanup5Repo::find(id));
-        }
-
-        // Wait a moment to ensure async cleanup completes
-        waitForExpiration(std::chrono::milliseconds{10});
-
-        // The point is that cleanup was triggered — cache infra works
-        REQUIRE(true);
-    }
-
-    SECTION("[auto-cleanup] disabled (0): no auto-cleanup occurs") {
-        auto id = insertTestItem("ac_disabled", 10);
-
-        sync(AutoCleanupOffRepo::find(id));
-
-        waitForExpiration(std::chrono::milliseconds{80});
-
-        // Many reads — no auto-cleanup should trigger
-        for (int i = 0; i < 20; ++i) {
-            sync(AutoCleanupOffRepo::find(id));
-        }
-
-        // GDSF: TTL-expired entry is evicted on get (Invalidate action)
-        // but without auto-cleanup, the entry is simply re-fetched from DB
-        // The point is that no cleanup callback fires
-        REQUIRE(true);
-    }
-
-    SECTION("[auto-cleanup] non-expired entries survive cleanup trigger") {
-        auto id = insertTestItem("ac_alive_item", 10);
-
-        sync(AutoCleanup5Repo::find(id));
-
-        // Trigger auto-cleanup before TTL expires
-        for (int i = 0; i < 5; ++i) {
-            sync(AutoCleanup5Repo::find(id));
-        }
-
-        // Entry should survive (not expired)
-        updateTestItem(id, "sneaky", 99);
-        auto item = sync(AutoCleanup5Repo::find(id));
-        REQUIRE(item->name == "ac_alive_item");
-    }
-}
-
-
-// #############################################################################
-//
-//  7. l1_cleanup_min_interval
-//
-// #############################################################################
-
-TEST_CASE("L1 Config - l1_cleanup_min_interval",
-          "[integration][db][config][l1][cleanup-interval]")
-{
-    TransactionGuard tx;
-
-    SECTION("[cleanup-interval] 0ms: cleanup runs every time counter triggers") {
-        auto id1 = insertTestItem("ci0_a", 1);
-        auto id2 = insertTestItem("ci0_b", 2);
-
-        sync(CleanupInterval0Repo::find(id1));
-        sync(CleanupInterval0Repo::find(id2));
-
-        waitForExpiration(std::chrono::milliseconds{80});
-
-        // Trigger cleanup (every 3 gets, interval 0ms)
-        for (int i = 0; i < 3; ++i) {
-            sync(CleanupInterval0Repo::find(id1));
-        }
-
-        waitForExpiration(std::chrono::milliseconds{10});
-
-        // Second trigger also runs (interval = 0ms, no throttle)
-        for (int i = 0; i < 3; ++i) {
-            sync(CleanupInterval0Repo::find(id1));
-        }
-
-        // The point is that multiple cleanups can fire without throttling
-        REQUIRE(true);
-    }
-
-    SECTION("[cleanup-interval] long interval: second trigger within interval is skipped") {
-        auto id = insertTestItem("cilong_item", 1);
-
-        sync(CleanupIntervalLongRepo::find(id));
-
-        waitForExpiration(std::chrono::milliseconds{80});
-
-        // First trigger fires
-        for (int i = 0; i < 3; ++i) {
-            sync(CleanupIntervalLongRepo::find(id));
-        }
-
-        // Second trigger within 30s interval — should be skipped
-        for (int i = 0; i < 3; ++i) {
-            sync(CleanupIntervalLongRepo::find(id));
-        }
-
-        // Cleanup interval prevents repeated cleanup
-        auto item = sync(CleanupIntervalLongRepo::find(id));
-        REQUIRE(item->name == "cilong_item");
-    }
-}
-
-
-// #############################################################################
-//
-//  8. read_only
+//  4. read_only
 //
 // #############################################################################
 

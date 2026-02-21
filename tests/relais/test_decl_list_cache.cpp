@@ -508,7 +508,7 @@ TEST_CASE("[DeclListRepo] ModificationTracker cleanup",
         // ModificationTracker uses a bitmap with ShardCount bits (one per shard).
         // Each cleanup cycle clears one shard's bit. After ShardCount cycles,
         // all bits are cleared → bitmap=0 → modification removed.
-        constexpr auto N = TestInternals::listCacheShardCount<TestArticleListRepo>();
+        constexpr auto N = TestInternals::listCacheChunkCount<TestArticleListRepo>();
         for (size_t i = 0; i < N; ++i) {
             TestInternals::forceModificationTrackerCleanup<TestArticleListRepo>();
         }
@@ -517,7 +517,7 @@ TEST_CASE("[DeclListRepo] ModificationTracker cleanup",
     }
 
     SECTION("[tracker-cleanup] recent modifications survive cleanup") {
-        constexpr auto N = TestInternals::listCacheShardCount<TestArticleListRepo>();
+        constexpr auto N = TestInternals::listCacheChunkCount<TestArticleListRepo>();
 
         // Build entities manually
         auto entity1 = makeArticle(9001, "tech", alice_id, "cleanup_a", 15);
@@ -609,7 +609,7 @@ TEST_CASE("[DeclListRepo] Modification cutoff safety",
 
         // Run ShardCount cleanup cycles with the cutoff, one per shard identity.
         // Only M1 (before cutoff) has its bits cleared. M2 (after cutoff) is skipped.
-        constexpr auto N = TestInternals::listCacheShardCount<TestArticleListRepo>();
+        constexpr auto N = TestInternals::listCacheChunkCount<TestArticleListRepo>();
         for (uint8_t i = 0; i < static_cast<uint8_t>(N); ++i) {
             TestInternals::cleanupModificationsWithCutoff<TestArticleListRepo>(cutoff, i);
         }
@@ -707,11 +707,11 @@ TEST_CASE("[DeclListRepo] Bitmap skip optimization",
         REQUIRE(r1->size() == 5);
         CHECK(TestArticleListRepo::listSize() == 1);
 
-        // 2. Read the shard_id assigned to this cache entry
-        auto shard_id_opt = TestInternals::getListEntryShardId<TestArticleListRepo>(
+        // 2. Read the chunk_id assigned to this cache entry
+        auto chunk_id_opt = TestInternals::getListEntryChunkId<TestArticleListRepo>(
             q.cache_key);
-        REQUIRE(shard_id_opt.has_value());
-        uint8_t shard_id = *shard_id_opt;
+        REQUIRE(chunk_id_opt.has_value());
+        uint8_t chunk_id = *chunk_id_opt;
 
         // 3. Insert a new article in DB AND notify the list cache.
         //    This modification would normally invalidate Q:
@@ -721,16 +721,16 @@ TEST_CASE("[DeclListRepo] Bitmap skip optimization",
         TestArticleListRepo::notifyCreated(entity);
         CHECK(TestInternals::pendingModificationCount<TestArticleListRepo>() == 1);
 
-        // 4. Clear ONLY the bit for the entry's shard identity in the ModificationTracker.
-        //    The modification still exists (other bits remain set), but bit shard_id = 0.
+        // 4. Clear ONLY the bit for the entry's chunk identity in the ModificationTracker.
+        //    The modification still exists (other bits remain set), but bit chunk_id = 0.
         auto cutoff = std::chrono::steady_clock::now();
         TestInternals::cleanupModificationsWithCutoff<TestArticleListRepo>(
-            cutoff, shard_id);
+            cutoff, chunk_id);
         // M still in tracker (other bits remain)
         CHECK(TestInternals::pendingModificationCount<TestArticleListRepo>() == 1);
 
         // 5. Re-query: lazy validation in get() checks modification M.
-        //    pending_segments & (1 << shard_id) == 0 → SKIP M → entry not affected → cache HIT.
+        //    pending_segments & (1 << chunk_id) == 0 → SKIP M → entry not affected → cache HIT.
         //    Cache HIT returns 5 (stale). Cache MISS would return 6 (DB has new article).
         auto r2 = sync(TestArticleListRepo::query(q));
         CHECK(r2->size() == 5);  // Cache HIT — bitmap skip prevented invalidation

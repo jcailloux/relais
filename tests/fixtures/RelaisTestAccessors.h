@@ -21,16 +21,14 @@ struct TestInternals {
     template<typename Repo>
     static void resetEntityCacheState() {
         auto& cache = Repo::cache();
-        cache.full_cleanup(0,
-            [](const auto&, const auto&, const auto&, const auto&) { return true; });
+        cache.full_cleanup([](const auto&, const auto&) { return true; });
     }
 
-    /// Reset list cache state: clear shardmap entries, modifications, and counter.
+    /// Reset list cache state: clear ChunkMap entries, modifications, and counter.
     template<typename Repo>
     static void resetListCacheState() {
         auto& cache = Repo::listCache();
-        cache.cache_.full_cleanup(0,
-            [](const auto&, const auto&, const auto&, const auto&) { return true; });
+        cache.cache_.full_cleanup([](const auto&, const auto&) { return true; });
         resetModificationTracker(cache.modifications_);
         cache.get_counter_ = 0;
     }
@@ -41,31 +39,31 @@ struct TestInternals {
         return Repo::listCache().modifications_.size();
     }
 
-    /// Number of shards in the list cache (= number of cleanup cycles to drain all bitmap bits).
+    /// Number of chunks in the list cache (= number of cleanup cycles to drain all bitmap bits).
     template<typename Repo>
-    static constexpr size_t listCacheShardCount() {
-        return std::remove_reference_t<decltype(Repo::listCache())>::ShardCount;
+    static constexpr size_t listCacheChunkCount() {
+        return std::remove_reference_t<decltype(Repo::listCache())>::ChunkCount;
     }
 
-    /// Force a modification tracker cleanup cycle (partial, one shard).
+    /// Force a modification tracker cleanup cycle (partial, one chunk).
     template<typename Repo>
     static void forceModificationTrackerCleanup() {
         Repo::listCache().trySweep();
     }
 
     /// Full cleanup of list cache only (entity cache untouched).
-    /// Processes all shards + drains modification tracker.
+    /// Processes all chunks + drains modification tracker.
     template<typename Repo>
     static size_t forceFullListCleanup() {
         return Repo::listCache().purge();
     }
 
-    /// Call ModificationTracker::cleanup() directly with a controlled cutoff and shard identity.
-    /// Clears the bit for shard_id in modifications with modified_at <= cutoff.
+    /// Call ModificationTracker::drainChunk() directly with a controlled cutoff and chunk identity.
+    /// Clears the bit for chunk_id in modifications with modified_at <= cutoff.
     template<typename Repo>
     static void cleanupModificationsWithCutoff(
-            std::chrono::steady_clock::time_point cutoff, uint8_t shard_id) {
-        Repo::listCache().modifications_.drainShard(cutoff, shard_id);
+            std::chrono::steady_clock::time_point cutoff, uint8_t chunk_id) {
+        Repo::listCache().modifications_.drainChunk(cutoff, chunk_id);
     }
 
     /// Call ModificationTracker::drain() directly with a controlled cutoff.
@@ -85,8 +83,8 @@ struct TestInternals {
 
     /// Direct L1 cache put — bypasses coroutine overhead.
     template<typename Repo, typename Key>
-    static void putInCache(const Key& key, typename Repo::EntityPtr ptr) {
-        Repo::putInCache(key, std::move(ptr));
+    static void putInCache(const Key& key, const typename Repo::EntityType& entity) {
+        Repo::putInCache(key, entity);
     }
 
     /// Direct L1 cache invalidate.
@@ -95,19 +93,16 @@ struct TestInternals {
         Repo::evict(key);
     }
 
-    /// Read the shard_id for a cached list entry (for bitmap skip testing).
-    /// Computed by ShardMap from the key (deterministic). Returns nullopt if not in cache.
+    /// Read the chunk_id for a cached list entry (for bitmap skip testing).
+    /// Computed by ChunkMap from the key (deterministic). Returns nullopt if not in cache.
     template<typename Repo>
-    static std::optional<uint8_t> getListEntryShardId(const std::string& cache_key) {
+    static std::optional<uint8_t> getListEntryChunkId(const std::string& cache_key) {
         auto& cache = Repo::listCache().cache_;
-        uint8_t sid = 0;
-        bool found = false;
-        cache.get(cache_key, [&](const auto&, const auto&, uint8_t shard_id) {
-            sid = shard_id;
-            found = true;
-            return jcailloux::shardmap::GetAction::Accept;
-        });
-        return found ? std::optional<uint8_t>{sid} : std::nullopt;
+        constexpr long n_chunks = static_cast<long>(
+            std::remove_reference_t<decltype(Repo::listCache())>::ChunkCount);
+        long chunk = cache.key_chunk(cache_key, n_chunks);
+        if (chunk < 0) return std::nullopt;
+        return static_cast<uint8_t>(chunk);
     }
 
     // =========================================================================
@@ -143,20 +138,19 @@ struct TestInternals {
     /// Returns type-erased metadata compatible with all CacheMetadata variants.
     template<typename Repo, typename Key>
     static std::optional<GDSFTestMetadata> getEntityGDSFMetadata(const Key& key) {
-        std::optional<GDSFTestMetadata> result;
-        Repo::cache().get(key, [&](const auto&, auto& meta) {
-            GDSFTestMetadata m;
-            if constexpr (requires { meta.score; }) {
-                m.score = meta.score.load(std::memory_order_relaxed);
-                m.last_generation = meta.last_generation.load(std::memory_order_relaxed);
-            }
-            if constexpr (requires { meta.ttl_expiration_rep; }) {
-                m.ttl_expiration_rep = meta.ttl_expiration_rep;
-            }
-            result = m;
-            return jcailloux::shardmap::GetAction::Accept;
-        });
-        return result;
+        auto result = Repo::cache().find(key);
+        if (!result) return std::nullopt;
+
+        auto& meta = result.entry->metadata;
+        GDSFTestMetadata m;
+        if constexpr (requires { meta.score; }) {
+            m.score = meta.score.load(std::memory_order_relaxed);
+            m.last_generation = meta.last_generation.load(std::memory_order_relaxed);
+        }
+        if constexpr (requires { meta.ttl_expiration_rep; }) {
+            m.ttl_expiration_rep = meta.ttl_expiration_rep;
+        }
+        return m;
     }
 
     // =========================================================================

@@ -52,7 +52,7 @@ struct GDSFScoreData {
 //   using Metadata = cache::CacheMetadata<HasGDSF, HasTTL>;
 //
 // Sizes:
-//   <false, false>  0 bytes (EBO via [[no_unique_address]] in ShardMap)
+//   <false, false>  0 bytes (EBO via [[no_unique_address]] in ChunkMap)
 //   <false, true>   8 bytes (TTL only)
 //   <true,  false>  8 bytes (GDSF only, inherits GDSFScoreData)
 //   <true,  true>  16 bytes (GDSF + TTL)

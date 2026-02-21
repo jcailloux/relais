@@ -4,16 +4,17 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
-#include <memory>
 #include <type_traits>
 
-#include <jcailloux/shardmap/ShardMap.h>
+#include "jcailloux/relais/cache/ChunkMap.h"
 #include "ListQuery.h"
 #include "ListCacheTraits.h"
 #include "ModificationTracker.h"
 #include "jcailloux/relais/wrapper/ListWrapper.h"
+#include "jcailloux/relais/wrapper/BufferView.h"
 #include "jcailloux/relais/cache/GDSFMetadata.h"
 #include "jcailloux/relais/cache/GDSFPolicy.h"
+#include "jcailloux/relais/config/CachedClock.h"
 
 #ifdef RELAIS_BUILDING_TESTS
 namespace relais_test { struct TestInternals; }
@@ -154,37 +155,27 @@ struct ListBoundsHeader {
     }
 
     /// Check if a insert or delete of an entity with this sort value affects this page.
-    ///
-    /// - Offset mode (cascade): the segment is affected if entity_val is within or above
-    ///   its range, because inserting/deleting shifts all subsequent segments.
-    /// - Cursor mode (localized): only the segment whose range contains entity_val is affected.
     [[nodiscard]] bool isAffectedByCreateOrDelete(int64_t entity_val) const noexcept {
         if (!bounds.is_valid) return true;
 
         bool is_desc = (sort_direction == SortDirection::Desc);
 
         if (pagination_mode == PaginationMode::Offset) {
-            // CASCADE: affected if entity_val is in or above range
             if (is_incomplete) return true;
             return is_desc ? (entity_val >= bounds.last_value)
                            : (entity_val <= bounds.last_value);
         } else {
-            // LOCALIZED: use existing range check
             return bounds.isValueInRange(entity_val, is_first_page, is_incomplete, is_desc);
         }
     }
 
     /// Check if an update moving sort value from old_val to new_val affects this page.
-    ///
-    /// - Offset mode: uses interval overlap between the page range and [min(old,new), max(old,new)].
-    /// - Cursor mode: checks if old OR new value is in the page range (localized).
     [[nodiscard]] bool isAffectedByUpdate(int64_t old_val, int64_t new_val) const noexcept {
         if (!bounds.is_valid) return true;
 
         bool is_desc = (sort_direction == SortDirection::Desc);
 
         if (pagination_mode == PaginationMode::Offset) {
-            // INTERVAL OVERLAP: [page_min, page_max] ∩ [range_min, range_max]
             int64_t page_min = is_desc ? bounds.last_value : bounds.first_value;
             int64_t page_max = is_desc ? bounds.first_value : bounds.last_value;
             int64_t range_min = std::min(old_val, new_val);
@@ -193,7 +184,6 @@ struct ListBoundsHeader {
             if (is_incomplete) return (page_min <= range_max);
             return (page_min <= range_max) && (range_min <= page_max);
         } else {
-            // LOCALIZED: old OR new in range
             return bounds.isValueInRange(old_val, is_first_page, is_incomplete, is_desc)
                 || bounds.isValueInRange(new_val, is_first_page, is_incomplete, is_desc);
         }
@@ -201,7 +191,7 @@ struct ListBoundsHeader {
 };
 
 // =============================================================================
-// ListCacheMetadataImpl - Stored behind shared_ptr alongside cache entries
+// ListCacheMetadataImpl - Stored inline in ChunkMap CacheEntry
 // =============================================================================
 
 template<typename FilterSet, typename SortFieldEnum>
@@ -209,18 +199,18 @@ struct ListCacheMetadataImpl {
     using Clock = std::chrono::steady_clock;
 
     ListQuery<FilterSet, SortFieldEnum> query;
-    std::atomic<int64_t> cached_at_rep{0};  // Atomic for shared-lock safety
+    int64_t cached_at_rep{0};  // steady_clock rep (immutable after construction)
     SortBounds sort_bounds;
     uint16_t result_count{0};
-    cache::GDSFScoreData gdsf;              // GDSF score tracking
-    float construction_time_us{0.0f};      // Measured cost for this page
+    cache::GDSFScoreData gdsf;              // GDSF score tracking (mutable atomics)
+    float construction_time_us{0.0f};       // Measured cost for this page
 
     ListCacheMetadataImpl() = default;
 
     ListCacheMetadataImpl(ListQuery<FilterSet, SortFieldEnum> q,
                           Clock::time_point cached_at,
                           SortBounds bounds, uint16_t count,
-                          float cost_us = 0.0f, uint32_t gen = 0, int64_t ttl_rep = 0)
+                          float cost_us = 0.0f, uint32_t gen = 0)
         : query(std::move(q))
         , cached_at_rep(cached_at.time_since_epoch().count())
         , sort_bounds(bounds)
@@ -229,12 +219,31 @@ struct ListCacheMetadataImpl {
         , construction_time_us(cost_us)
     {}
 
-    Clock::time_point cachedAt() const {
-        return Clock::time_point{
-            Clock::duration{cached_at_rep.load(std::memory_order_relaxed)}};
+    // Explicit move (GDSFScoreData has atomics requiring manual move)
+    ListCacheMetadataImpl(ListCacheMetadataImpl&& o) noexcept
+        : query(std::move(o.query))
+        , cached_at_rep(o.cached_at_rep)
+        , sort_bounds(o.sort_bounds)
+        , result_count(o.result_count)
+        , gdsf(std::move(o.gdsf))
+        , construction_time_us(o.construction_time_us)
+    {}
+
+    ListCacheMetadataImpl& operator=(ListCacheMetadataImpl&& o) noexcept {
+        query = std::move(o.query);
+        cached_at_rep = o.cached_at_rep;
+        sort_bounds = o.sort_bounds;
+        result_count = o.result_count;
+        gdsf = std::move(o.gdsf);
+        construction_time_us = o.construction_time_us;
+        return *this;
     }
-    void setCachedAt(Clock::time_point tp) {
-        cached_at_rep.store(tp.time_since_epoch().count(), std::memory_order_relaxed);
+
+    ListCacheMetadataImpl(const ListCacheMetadataImpl&) = delete;
+    ListCacheMetadataImpl& operator=(const ListCacheMetadataImpl&) = delete;
+
+    Clock::time_point cachedAt() const {
+        return Clock::time_point{Clock::duration{cached_at_rep}};
     }
 };
 
@@ -242,61 +251,54 @@ struct ListCacheMetadataImpl {
 // ListCache - L1 cache for paginated list queries with lazy validation
 // =============================================================================
 //
-// Uses shardmap for storage with callback-based validation on get().
-// Modifications are tracked by ModificationTracker and validated lazily.
+// Uses ChunkMap (lock-free ParlayHash) for storage with epoch-based reclamation.
+// Modifications are tracked by ModificationTracker and validated lazily on get().
 //
 // Template parameters:
 //   - Entity: The entity type being cached
-//   - ShardCountLog2: log2 of shard count (default: 3 = 8 shards, from CacheConfig NTTP)
+//   - ChunkCountLog2: log2 of chunk count (default: 3 = 8 chunks, from CacheConfig NTTP)
 //   - Key: The entity ID type (default: int64_t)
 //   - Traits: Traits for filter matching, sorting, etc.
+//   - GDSF: Enable GDSF score tracking
 //
 
-template<typename Entity, uint8_t ShardCountLog2 = 3,
+template<typename Entity, uint8_t ChunkCountLog2 = 3,
          typename Key = int64_t, typename Traits = ListCacheTraits<Entity>,
          bool GDSF = true>
 class ListCache {
 public:
-    static constexpr size_t ShardCount = size_t{1} << ShardCountLog2;
+    static constexpr size_t ChunkCount = size_t{1} << ChunkCountLog2;
 
     using FilterSet = typename Traits::Filters;
     using SortFieldEnum = typename Traits::SortField;
     using Query = ListQuery<FilterSet, SortFieldEnum>;
     using Result = jcailloux::relais::wrapper::ListWrapper<Entity>;
-    using ResultPtr = std::shared_ptr<const Result>;
+    using ResultView = jcailloux::relais::wrapper::BufferView<Result>;
     using Modification = EntityModification<Entity>;
     using Clock = std::chrono::steady_clock;
     using TimePoint = Clock::time_point;
     using Duration = Clock::duration;
 
-    using ModTracker = ModificationTracker<Entity, ShardCount>;
+    using ModTracker = ModificationTracker<Entity, ChunkCount>;
     using BitmapType = typename ModTracker::BitmapType;
 
 private:
     using CacheKey = std::string;  // Canonical binary buffer
     using MetadataImpl = ListCacheMetadataImpl<FilterSet, SortFieldEnum>;
-    using MetadataPtr = std::shared_ptr<MetadataImpl>;
+    using L1Cache = cache::ChunkMap<CacheKey, Result, MetadataImpl>;
 
-    static constexpr shardmap::ShardMapConfig kShardMapConfig{
-        .shard_count_log2 = ShardCountLog2
-    };
-
-    // The ShardMap-based storage (Metadata = shared_ptr<MetadataImpl>)
-    shardmap::ShardMap<CacheKey, ResultPtr, MetadataPtr, kShardMapConfig> cache_;
-
-    // Tracks recently modified entities for lazy validation
+    L1Cache cache_;
     ModTracker modifications_;
-
-    // Configuration
     ListCacheConfig config_;
-
-    // Counter for cleanup triggers
     std::atomic<size_t> get_counter_{0};
+    std::atomic<long> cleanup_cursor_{0};  // Own cursor for chunk-based cleanup
 
 public:
     explicit ListCache(ListCacheConfig config = {})
         : config_(std::move(config))
-    {}
+    {
+        config::CachedClock::ensureStarted();
+    }
 
     ~ListCache() = default;
 
@@ -310,8 +312,9 @@ public:
     // Core API
     // =========================================================================
 
-    /// Get cached result for a query (with lazy validation + GDSF score bump)
-    ResultPtr get(const Query& query) {
+    /// Get cached result for a query (with lazy validation + GDSF score bump).
+    /// Returns epoch-guarded ResultView (empty if miss or invalidated).
+    ResultView get(const Query& query) {
         // Trigger cleanup every N gets
         if (++get_counter_ % config_.cleanup_every_n_gets == 0) {
             trySweep();
@@ -319,27 +322,34 @@ public:
 
         const auto& key = query.cacheKey();
 
-        return cache_.get(key, [this, &query](const ResultPtr& result, MetadataPtr& meta, uint8_t shard_id) {
-            // 1. Lazy validation: check if modifications affect this result
-            if (isAffectedByModifications(meta->cachedAt(), meta->sort_bounds,
-                                           *result, query, shard_id)) {
-                return shardmap::GetAction::Invalidate;
-            }
+        auto result = cache_.find(key);
+        if (!result) return {};
 
-            // 2. GDSF: decay + score bump by construction cost
-            if constexpr (GDSF) {
-                auto& policy = cache::GDSFPolicy::instance();
-                policy.decay(meta->gdsf);
-                meta->gdsf.score.fetch_add(meta->construction_time_us,
-                                            std::memory_order_relaxed);
-            }
+        auto* entry = result.entry;
+        auto& meta = entry->metadata;
+        auto& value = entry->value;
 
-            return shardmap::GetAction::Accept;
-        });
+        // Lazy validation: check if modifications affect this result (with bitmap skip)
+        long chunk_id = cache_.chunk_for_key(key, static_cast<long>(ChunkCount));
+        if (isAffectedByModificationsForChunk(meta, value, config::CachedClock::now(), chunk_id)) {
+            // Two-phase eviction: remove only if same entry (guards against concurrent Upsert)
+            cache_.remove_if(key, [entry](auto* e) { return e == entry; });
+            return {};
+        }
+
+        // GDSF: decay + score bump by construction cost
+        if constexpr (GDSF) {
+            auto& policy = cache::GDSFPolicy::instance();
+            policy.decay(meta.gdsf);
+            meta.gdsf.score.fetch_add(meta.construction_time_us,
+                                       std::memory_order_relaxed);
+        }
+
+        return ResultView(&value, std::move(result.guard));
     }
 
     /// Store result for a query with optional sort bounds and construction cost.
-    void put(const Query& query, ResultPtr result, SortBounds bounds = {},
+    void put(const Query& query, Result result, SortBounds bounds = {},
              float construction_time_us = 0.0f) {
         const auto& key = query.cacheKey();
         const auto now = Clock::now();
@@ -348,14 +358,13 @@ public:
         if constexpr (GDSF) {
             gen = cache::GDSFPolicy::instance().generation();
         }
-        int64_t ttl_rep = (now + config_.default_ttl).time_since_epoch().count();
 
-        auto meta = std::make_shared<MetadataImpl>(
+        MetadataImpl meta(
             query, now, bounds,
-            static_cast<uint16_t>(result->items.size()),
-            construction_time_us, gen, ttl_rep);
+            static_cast<uint16_t>(result.items.size()),
+            construction_time_us, gen);
 
-        cache_.put(key, std::move(result), std::move(meta));
+        cache_.upsert(key, std::move(result), std::move(meta));
     }
 
     /// Helper to extract sort bounds from a result
@@ -401,131 +410,35 @@ public:
     // Cleanup API
     // =========================================================================
 
-    /// Context passed to cleanup callbacks.
-    struct CleanupContext {
-        TimePoint now;
-        float threshold;
-        const ModTracker& modifications;
-        const ListCache& cache;
-    };
-
-    /// Try to sweep one shard.
-    /// Returns immediately if a sweep is already in progress.
+    /// Sweep one chunk (lock-free, always succeeds).
     bool trySweep() {
-        // Snapshot time BEFORE shard cleanup so that modifications added
+        // Snapshot time BEFORE chunk cleanup so that modifications added
         // during cleanup are not counted (they weren't fully considered).
         const auto now = Clock::now();
+        long chunk = cleanup_cursor_.fetch_add(1, std::memory_order_relaxed)
+                   % static_cast<long>(ChunkCount);
 
         float threshold = 0.0f;
         if constexpr (GDSF) {
             threshold = cache::GDSFPolicy::instance().threshold();
         }
 
-        CleanupContext ctx{
-            .now = now,
-            .threshold = threshold,
-            .modifications = modifications_,
-            .cache = *this
-        };
-
-        auto shard = cache_.try_cleanup(ctx,
-            [](const CacheKey&, const ResultPtr& result, const MetadataPtr& meta,
-               const CleanupContext& ctx, uint8_t shard_id) {
-                // 1. GDSF: decay + threshold check
-                if constexpr (GDSF) {
-                    auto& policy = cache::GDSFPolicy::instance();
-                    policy.decay(meta->gdsf);
-                    float score = meta->gdsf.score.load(std::memory_order_relaxed);
-                    if (score < ctx.threshold) return true;
-                }
-
-                // 2. TTL check (cached_at + default_ttl)
-                if (ctx.now > meta->cachedAt() + ctx.cache.config_.default_ttl) return true;
-
-                // 3. Check if affected by modifications (with bitmap skip)
-                bool affected = false;
-                ctx.modifications.forEachModificationWithBitmap(
-                    [&](const Modification& mod, BitmapType pending_segments) {
-                        if (affected) return;
-
-                        // Skip: shard already cleaned for this modification
-                        if ((pending_segments & (BitmapType{1} << shard_id)) == 0) return;
-
-                        // Skip: data created after modification
-                        if (mod.modified_at <= meta->cachedAt()) return;
-
-                        if (ctx.cache.isModificationAffecting(mod, meta, *result)) {
-                            affected = true;
-                        }
-                    });
-
-                return affected;
+        auto removed = cache_.cleanup_chunk(chunk, static_cast<long>(ChunkCount),
+            [this, now, threshold, chunk](const CacheKey&, auto& entry) {
+                return cleanupPredicate(entry.metadata, entry.value, now, threshold, chunk);
             });
 
-        if (shard) {
-            modifications_.drainShard(now, *shard);
-        }
+        modifications_.drainChunk(now, static_cast<uint8_t>(chunk));
 
-        return shard.has_value();
+        return removed > 0;
     }
 
-    /// Sweep one shard.
-    /// Returns true if entries were removed.
+    /// Sweep one chunk (identical to trySweep in lock-free design).
     bool sweep() {
-        const auto now = Clock::now();
-
-        float threshold = 0.0f;
-        if constexpr (GDSF) {
-            threshold = cache::GDSFPolicy::instance().threshold();
-        }
-
-        CleanupContext ctx{
-            .now = now,
-            .threshold = threshold,
-            .modifications = modifications_,
-            .cache = *this
-        };
-
-        auto result = cache_.cleanup(ctx,
-            [](const CacheKey&, const ResultPtr& result, const MetadataPtr& meta,
-               const CleanupContext& ctx, uint8_t shard_id) {
-                // 1. GDSF: decay + threshold check
-                if constexpr (GDSF) {
-                    auto& policy = cache::GDSFPolicy::instance();
-                    policy.decay(meta->gdsf);
-                    float score = meta->gdsf.score.load(std::memory_order_relaxed);
-                    if (score < ctx.threshold) return true;
-                }
-
-                // 2. TTL check (cached_at + default_ttl)
-                if (ctx.now > meta->cachedAt() + ctx.cache.config_.default_ttl) return true;
-
-                // 3. Check if affected by modifications (with bitmap skip)
-                bool affected = false;
-                ctx.modifications.forEachModificationWithBitmap(
-                    [&](const Modification& mod, BitmapType pending_segments) {
-                        if (affected) return;
-
-                        // Skip: shard already cleaned for this modification
-                        if ((pending_segments & (BitmapType{1} << shard_id)) == 0) return;
-
-                        // Skip: data created after modification
-                        if (mod.modified_at <= meta->cachedAt()) return;
-
-                        if (ctx.cache.isModificationAffecting(mod, meta, *result)) {
-                            affected = true;
-                        }
-                    });
-
-                return affected;
-            });
-
-        modifications_.drainShard(now, result.shard_id);
-
-        return result.removed > 0;
+        return trySweep();
     }
 
-    /// Sweep all shards.
+    /// Sweep all chunks.
     size_t purge() {
         const auto now = Clock::now();
 
@@ -534,42 +447,12 @@ public:
             threshold = cache::GDSFPolicy::instance().threshold();
         }
 
-        CleanupContext ctx{
-            .now = now,
-            .threshold = threshold,
-            .modifications = modifications_,
-            .cache = *this
-        };
-
-        size_t erased = cache_.full_cleanup(ctx,
-            [](const CacheKey&, const ResultPtr& result, const MetadataPtr& meta,
-               const CleanupContext& ctx) {
-                // 1. GDSF: decay + threshold check
-                if constexpr (GDSF) {
-                    auto& policy = cache::GDSFPolicy::instance();
-                    policy.decay(meta->gdsf);
-                    float score = meta->gdsf.score.load(std::memory_order_relaxed);
-                    if (score < ctx.threshold) return true;
-                }
-
-                // 2. TTL check (cached_at + default_ttl)
-                if (ctx.now > meta->cachedAt() + ctx.cache.config_.default_ttl) return true;
-
-                // 3. Modification check
-                bool affected = false;
-                ctx.modifications.forEachModification([&](const Modification& mod) {
-                    if (affected) return;
-                    if (mod.modified_at <= meta->cachedAt()) return;
-
-                    if (ctx.cache.isModificationAffecting(mod, meta, *result)) {
-                        affected = true;
-                    }
-                });
-
-                return affected;
+        size_t erased = cache_.full_cleanup(
+            [this, now, threshold](const CacheKey&, auto& entry) {
+                return cleanupPredicateFull(entry.metadata, entry.value, now, threshold);
             });
 
-        // All shards processed — drain modifications that existed before cleanup
+        // All chunks processed — drain modifications that existed before cleanup
         modifications_.drain(now);
 
         return erased;
@@ -579,8 +462,8 @@ public:
     // Accessors
     // =========================================================================
 
-    [[nodiscard]] size_t size() const { return cache_.size(); }
-    [[nodiscard]] static constexpr size_t shardCount() { return ShardCount; }
+    [[nodiscard]] size_t size() { return static_cast<size_t>(cache_.size()); }
+    [[nodiscard]] static constexpr size_t chunkCount() { return ChunkCount; }
     [[nodiscard]] const ListCacheConfig& config() const { return config_; }
 
 #ifdef RELAIS_BUILDING_TESTS
@@ -592,34 +475,22 @@ private:
     // Validation logic
     // =========================================================================
 
-    /// Check if any recent modifications affect the cached result (with bitmap skip)
-    bool isAffectedByModifications(TimePoint cached_at,
-                                    const SortBounds& bounds,
+    /// Check if any recent modifications affect the cached result.
+    /// Used by get() — no chunk_id available, checks all modifications.
+    bool isAffectedByModifications(const MetadataImpl& meta,
                                     const Result& result,
-                                    const Query& query,
-                                    uint8_t shard_id) const {
-        // Short-circuit: if no modifications since cache creation, it's still valid
+                                    const Query& query) const {
+        auto cached_at = meta.cachedAt();
         if (!modifications_.hasModificationsSince(cached_at)) {
             return false;
         }
 
         bool affected = false;
-        modifications_.forEachModificationWithBitmap(
-            [&](const Modification& mod, BitmapType pending_segments) {
+        modifications_.forEachModification(
+            [&](const Modification& mod) {
                 if (affected) return;
-
-                // 1. Skip: shard already cleaned for this modification
-                if ((pending_segments & (BitmapType{1} << shard_id)) == 0) {
-                    return;
-                }
-
-                // 2. Skip: data created after the modification
-                if (mod.modified_at <= cached_at) {
-                    return;
-                }
-
-                // 3+4. Filter match + range check
-                if (isModificationAffecting(mod, query, bounds, result)) {
+                if (mod.modified_at <= cached_at) return;
+                if (isModificationAffecting(mod, query, meta.sort_bounds, result)) {
                     affected = true;
                 }
             });
@@ -627,11 +498,80 @@ private:
         return affected;
     }
 
-    /// Check if a single modification affects a cached page (MetadataPtr overload)
-    bool isModificationAffecting(const Modification& mod,
-                                  const MetadataPtr& meta,
-                                  const Result& result) const {
-        return isModificationAffecting(mod, meta->query, meta->sort_bounds, result);
+    /// Check if any recent modifications affect the cached result (with bitmap skip).
+    /// Used by cleanup — chunk_id is known.
+    bool isAffectedByModificationsForChunk(const MetadataImpl& meta,
+                                            const Result& result,
+                                            TimePoint now,
+                                            long chunk_id) const {
+        auto cached_at = meta.cachedAt();
+        if (!modifications_.hasModificationsSince(cached_at)) {
+            return false;
+        }
+
+        bool affected = false;
+        modifications_.forEachModificationWithBitmap(
+            [&](const Modification& mod, BitmapType pending_chunks) {
+                if (affected) return;
+
+                // Skip: chunk already cleaned for this modification
+                if ((pending_chunks & (BitmapType{1} << chunk_id)) == 0) return;
+
+                // Skip: data created after modification
+                if (mod.modified_at <= cached_at) return;
+
+                if (isModificationAffecting(mod, meta.query, meta.sort_bounds, result)) {
+                    affected = true;
+                }
+            });
+
+        return affected;
+    }
+
+    /// Cleanup predicate for chunk-based cleanup (with bitmap skip).
+    bool cleanupPredicate(const MetadataImpl& meta, const Result& result,
+                           TimePoint now, float threshold, long chunk_id) const {
+        // 1. GDSF: decay + threshold check
+        if constexpr (GDSF) {
+            auto& policy = cache::GDSFPolicy::instance();
+            policy.decay(meta.gdsf);
+            float score = meta.gdsf.score.load(std::memory_order_relaxed);
+            if (score < threshold) return true;
+        }
+
+        // 2. TTL check (cached_at + default_ttl)
+        if (now > meta.cachedAt() + config_.default_ttl) return true;
+
+        // 3. Check if affected by modifications (with bitmap skip)
+        return isAffectedByModificationsForChunk(meta, result, now, chunk_id);
+    }
+
+    /// Cleanup predicate for full cleanup (no bitmap).
+    bool cleanupPredicateFull(const MetadataImpl& meta, const Result& result,
+                               TimePoint now, float threshold) const {
+        // 1. GDSF: decay + threshold check
+        if constexpr (GDSF) {
+            auto& policy = cache::GDSFPolicy::instance();
+            policy.decay(meta.gdsf);
+            float score = meta.gdsf.score.load(std::memory_order_relaxed);
+            if (score < threshold) return true;
+        }
+
+        // 2. TTL check (cached_at + default_ttl)
+        if (now > meta.cachedAt() + config_.default_ttl) return true;
+
+        // 3. Modification check (without bitmap)
+        auto cached_at = meta.cachedAt();
+        bool affected = false;
+        modifications_.forEachModification([&](const Modification& mod) {
+            if (affected) return;
+            if (mod.modified_at <= cached_at) return;
+            if (isModificationAffecting(mod, meta.query, meta.sort_bounds, result)) {
+                affected = true;
+            }
+        });
+
+        return affected;
     }
 
     /// Check if a single modification affects a cached page

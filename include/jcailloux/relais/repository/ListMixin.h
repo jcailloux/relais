@@ -38,7 +38,7 @@ namespace jcailloux::relais {
  * - CRUD interception : automatically invalidates list caches on insert/update/erase
  * - warmup()          : primes both entity and list L1 caches
  *
- * L1 uses ListCache (shardmap-based) with ModificationTracker for lazy invalidation.
+ * L1 uses ListCache (ChunkMap-based) with ModificationTracker for lazy invalidation.
  * L2 uses Redis with binary (BEVE) storage and active invalidation via Lua scripts.
  */
 template<typename Base>
@@ -168,11 +168,10 @@ class ListMixin : public Base {
     static constexpr bool HasGDSF = (cache::GDSFPolicy::kMaxMemory > 0);
 
     using ListWrapperType = wrapper::ListWrapper<Entity>;
-    using ListCacheType = cache::list::ListCache<Entity, Base::config.l1_shard_count_log2, Key, Traits, HasGDSF>;
+    using ListCacheType = cache::list::ListCache<Entity, Base::config.l1_chunk_count_log2, Key, Traits, HasGDSF>;
 
     static cache::list::ListCacheConfig listCacheConfig() {
         return {
-            .cleanup_every_n_gets = Base::config.l1_cleanup_every_n_gets,
             .default_ttl = std::chrono::duration_cast<std::chrono::seconds>(
                 std::chrono::nanoseconds(Base::config.l1_ttl)),
         };
@@ -237,6 +236,7 @@ public:
     using typename Base::KeyType;
     using typename Base::WrapperType;
     using typename Base::WrapperPtrType;
+    using typename Base::FindResultType;
     using Base::name;
     using Base::find;
 
@@ -257,8 +257,16 @@ public:
     // =========================================================================
 
     /// Execute a paginated list query with L1/L2 caching.
+    /// L1 hit returns fromValue (zero-alloc, synchronous). Miss goes through coroutine.
     static io::Task<ListResult> query(const ListQuery& q) {
-        co_return co_await cachedListQuery(q);
+        if constexpr (kHasL1) {
+            auto cache_query = toCacheQuery(q);
+            if (auto cached = listCache().get(cache_query)) {
+                return io::Task<ListResult>::fromValue(
+                    std::make_shared<const ListWrapperType>(*cached));
+            }
+        }
+        return cachedListQuery(q);
     }
 
     /// Execute a paginated list query and return raw JSON string.
@@ -352,14 +360,15 @@ public:
     // CRUD interception — invalidates list caches on entity changes
     // =========================================================================
 
-    /// insert entity and invalidate list caches.
-    static io::Task<WrapperPtrType> insert(WrapperPtrType wrapper)
+    /// Insert entity and invalidate list caches.
+    static io::Task<wrapper::EntityView<Entity>> insert(WrapperPtrType wrapper)
         requires MutableEntity<Entity> && (!Base::config.read_only)
     {
         auto result = co_await Base::insert(std::move(wrapper));
         if (result) {
-            if constexpr (kHasL1) { listCache().onEntityCreated(result); }
-            if constexpr (kHasL2) { co_await invalidateL2Created(*result); }
+            auto ptr = std::make_shared<const Entity>(*result);
+            if constexpr (kHasL1) { listCache().onEntityCreated(ptr); }
+            if constexpr (kHasL2) { co_await invalidateL2Created(*ptr); }
         }
         co_return result;
     }
@@ -368,7 +377,11 @@ public:
     static io::Task<bool> update(const Key& id, WrapperPtrType wrapper)
         requires MutableEntity<Entity> && (!Base::config.read_only)
     {
-        auto old = co_await Base::find(id);
+        WrapperPtrType old;
+        {
+            auto view = co_await Base::find(id);
+            if (view) old = std::make_shared<const Entity>(*view);
+        }
         co_return co_await updateWithContext(id, std::move(wrapper), std::move(old));
     }
 
@@ -376,16 +389,24 @@ public:
     static io::Task<std::optional<size_t>> erase(const Key& id)
         requires (!Base::config.read_only)
     {
-        auto entity = co_await Base::find(id);
+        WrapperPtrType entity;
+        {
+            auto view = co_await Base::find(id);
+            if (view) entity = std::make_shared<const Entity>(*view);
+        }
         co_return co_await eraseWithContext(id, std::move(entity));
     }
 
     /// Partial update and invalidate list caches.
     template<typename... Updates>
-    static io::Task<WrapperPtrType> patch(const Key& id, Updates&&... updates)
+    static io::Task<wrapper::EntityView<Entity>> patch(const Key& id, Updates&&... updates)
         requires HasFieldUpdate<Entity> && (!Base::config.read_only)
     {
-        auto old = co_await Base::find(id);
+        WrapperPtrType old;
+        {
+            auto view = co_await Base::find(id);
+            if (view) old = std::make_shared<const Entity>(*view);
+        }
         co_return co_await patchWithContext(id, std::move(old),
             std::forward<Updates>(updates)...);
     }
@@ -407,7 +428,7 @@ public:
     // Cache management — unified entity + list cleanup
     // =========================================================================
 
-    /// Try to sweep one shard on both entity and list caches.
+    /// Try to sweep one chunk on both entity and list caches.
     static bool trySweep() {
         bool entity_cleaned = Base::trySweep();
         if constexpr (kHasL1) {
@@ -416,7 +437,7 @@ public:
         return entity_cleaned;
     }
 
-    /// Sweep one shard on both entity and list caches.
+    /// Sweep one chunk on both entity and list caches.
     static bool sweep() {
         bool entity_cleaned = Base::sweep();
         if constexpr (kHasL1) {
@@ -425,7 +446,7 @@ public:
         return entity_cleaned;
     }
 
-    /// Sweep all shards on both entity and list caches.
+    /// Sweep all chunks on both entity and list caches.
     static size_t purge() {
         size_t entity_erased = Base::purge();
         if constexpr (kHasL1) {
@@ -434,28 +455,28 @@ public:
         return entity_erased;
     }
 
-    /// Try to sweep one entity cache shard.
+    /// Try to sweep one entity cache chunk.
     static bool trySweepEntities() { return Base::trySweep(); }
 
-    /// Sweep one entity cache shard.
+    /// Sweep one entity cache chunk.
     static bool sweepEntities() { return Base::sweep(); }
 
-    /// Sweep all entity cache shards.
+    /// Sweep all entity cache chunks.
     static size_t purgeEntities() { return Base::purge(); }
 
-    /// Try to sweep one list cache shard.
+    /// Try to sweep one list cache chunk.
     static bool trySweepLists() {
         if constexpr (kHasL1) { return listCache().trySweep(); }
         return false;
     }
 
-    /// Sweep one list cache shard.
+    /// Sweep one list cache chunk.
     static bool sweepLists() {
         if constexpr (kHasL1) { return listCache().sweep(); }
         return false;
     }
 
-    /// Sweep all list cache shards.
+    /// Sweep all list cache chunks.
     static size_t purgeLists() {
         if constexpr (kHasL1) { return listCache().purge(); }
         return 0;
@@ -533,14 +554,18 @@ protected:
     }
 
     template<typename... Updates>
-    static io::Task<WrapperPtrType> patchWithContext(
+    static io::Task<wrapper::EntityView<Entity>> patchWithContext(
         const Key& id, WrapperPtrType old_entity, Updates&&... updates)
         requires HasFieldUpdate<Entity> && (!Base::config.read_only)
     {
         auto result = co_await Base::patch(id, std::forward<Updates>(updates)...);
         if (result) {
-            if constexpr (kHasL1) { listCache().onEntityUpdated(old_entity, result); }
-            if constexpr (kHasL2) { co_await invalidateL2Updated(*old_entity, *result); }
+            auto ptr = std::make_shared<const Entity>(*result);
+            if constexpr (kHasL1) { listCache().onEntityUpdated(old_entity, ptr); }
+            if constexpr (kHasL2) {
+                co_await invalidateL2Updated(
+                    old_entity ? *old_entity : *ptr, *ptr);
+            }
         }
         co_return result;
     }
@@ -561,7 +586,6 @@ protected:
     }
 
     /// Selective L2 invalidation for entity creation (or deletion).
-    /// Single Lua EVAL: HGETALL master → filter match → SortBounds → DEL pages.
     static io::Task<size_t> invalidateL2Created(const Entity& entity) {
         auto masterKey = redisMasterSetKey();
         auto prefixLen = std::string(Base::name()).size() + 9; // ":dlist:g:"
@@ -574,7 +598,6 @@ protected:
     }
 
     /// Selective L2 invalidation for entity update (old + new entities).
-    /// Single Lua EVAL: HGETALL master → filter match both → SortBounds → DEL pages.
     static io::Task<size_t> invalidateL2Updated(const Entity& old_e, const Entity& new_e) {
         auto masterKey = redisMasterSetKey();
         auto prefixLen = std::string(Base::name()).size() + 9;
@@ -609,7 +632,6 @@ protected:
     }
 
     /// Coarse L2 invalidation — fallback that invalidates all groups.
-    /// Flow: HKEYS master → invalidateListGroup(each) → UNLINK master.
     static io::Task<size_t> invalidateRedisListGroups() {
         if constexpr (!kHasL2) {
             co_return 0;
@@ -645,13 +667,17 @@ protected:
     // =========================================================================
 
     static io::Task<ListResult> cachedListQuery(const ListQuery& query) {
-        // 1. L1 check — zero copy: return shared_ptr directly
+        using Clock = std::chrono::steady_clock;
+
+        // 1. L1 check — epoch-guarded view, copy to shared_ptr
         if constexpr (kHasL1) {
             auto cache_query = toCacheQuery(query);
             if (auto cached = listCache().get(cache_query)) {
-                co_return cached;
+                co_return std::make_shared<const ListWrapperType>(*cached);
             }
         }
+
+        auto start = Clock::now();
 
         // 2. L2 check — binary (BEVE) with auto header skip
         if constexpr (kHasL2) {
@@ -670,6 +696,10 @@ protected:
 
                 // Populate L1 if available
                 if constexpr (kHasL1) {
+                    auto elapsed_us = static_cast<float>(
+                        std::chrono::duration_cast<std::chrono::microseconds>(
+                            Clock::now() - start).count());
+
                     auto sort = query.sort.value_or(defaultSortAsListSpec());
                     cache::list::SortBounds bounds;
                     if (!wrapper->items.empty()) {
@@ -679,16 +709,21 @@ protected:
                             wrapper->items.back(), sort.field);
                         bounds.is_valid = true;
                     }
-                    listCache().put(toCacheQuery(query), wrapper, bounds);
+                    listCache().put(toCacheQuery(query), ListWrapperType(*wrapper),
+                                    bounds, elapsed_us);
                 }
 
                 co_return wrapper;
             }
         }
 
-        // 4. Cache miss — query database
+        // 3. Cache miss — query database
         auto entities = co_await queryFromDb(query);
         auto sort = query.sort.value_or(defaultSortAsListSpec());
+
+        auto elapsed_us = static_cast<float>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                Clock::now() - start).count());
 
         // Build ListWrapper directly from entities
         auto wrapper = std::make_shared<ListWrapperType>();
@@ -736,7 +771,8 @@ protected:
 
         // 5. Store in L1 cache
         if constexpr (kHasL1) {
-            listCache().put(toCacheQuery(query), wrapper, bounds);
+            listCache().put(toCacheQuery(query), ListWrapperType(*wrapper),
+                            bounds, elapsed_us);
         }
 
         co_return wrapper;

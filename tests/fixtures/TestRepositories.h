@@ -126,9 +126,9 @@ inline constexpr auto ShortTTL = Local
 inline constexpr auto WriteThrough = Local
     .with_update_strategy(UpdateStrategy::PopulateImmediately);
 
-/// Few shards for predictable cleanup testing
-inline constexpr auto FewShards = Local
-    .with_l1_shard_count_log2(1);  // 2^1 = 2 shards
+/// Few chunks for predictable cleanup testing
+inline constexpr auto FewChunks = Local
+    .with_l1_chunk_count_log2(1);  // 2^1 = 2 chunks
 
 /// Read-only presets
 inline constexpr auto ReadOnlyUncached = Uncached.with_read_only();
@@ -155,7 +155,7 @@ using FullCacheTestItemRepo = Repo<TestItemWrapper, "test:both", cfg::Both>;
 // Configuration test repositories
 using ShortTTLTestItemRepo = Repo<TestItemWrapper, "test:short_ttl", test_config::ShortTTL>;
 using WriteThroughTestItemRepo = Repo<TestItemWrapper, "test:write_through", test_config::WriteThrough>;
-using FewShardsTestItemRepo = Repo<TestItemWrapper, "test:few_shards", test_config::FewShards>;
+using FewChunksTestItemRepo = Repo<TestItemWrapper, "test:few_chunks", test_config::FewChunks>;
 
 // =============================================================================
 // User Repositories (no ListDescriptor)

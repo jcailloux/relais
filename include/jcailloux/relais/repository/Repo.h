@@ -103,8 +103,8 @@ class Repo
     static_assert(
         Cfg.cache_level != config::CacheLevel::L1 &&
         Cfg.cache_level != config::CacheLevel::L1_L2 ||
-        (Cfg.l1_shard_count_log2 >= 1),
-        "L1 cache requires l1_shard_count_log2 >= 1");
+        (Cfg.l1_chunk_count_log2 >= 1),
+        "L1 cache requires l1_chunk_count_log2 >= 1");
 
     static_assert(
         Cfg.cache_level != config::CacheLevel::L2 &&
@@ -117,6 +117,7 @@ public:
     using typename Base::KeyType;
     using typename Base::WrapperType;
     using typename Base::WrapperPtrType;
+    using typename Base::FindResultType;
 
     // Re-export all Base methods via using declarations
     using Base::name;

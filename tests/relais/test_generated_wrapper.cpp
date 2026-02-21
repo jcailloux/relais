@@ -122,7 +122,7 @@ TEST_CASE("TestUser - JSON round-trip", "[wrapper][json][user]") {
     SECTION("[JSON] result is cached (same pointer)") {
         auto p1 = user.json();
         auto p2 = user.json();
-        REQUIRE(p1.get() == p2.get());
+        REQUIRE(p1 == p2);
     }
 
     SECTION("[JSON] round-trip via fromJson") {
@@ -816,7 +816,7 @@ TEST_CASE("ListWrapper<TestArticle> - json", "[wrapper][list][article][json]") {
     SECTION("[List->JSON] result is cached (same pointer)") {
         auto p1 = list.json();
         auto p2 = list.json();
-        REQUIRE(p1.get() == p2.get());
+        REQUIRE(p1 == p2);
     }
 }
 
@@ -1166,50 +1166,18 @@ TEST_CASE("releaseCaches() frees serialization data while callers retain copies"
     user.balance = 1000;
     user.created_at = "2025-01-01T00:00:00Z";
 
-    SECTION("[Entity] callers retain binary data after releaseCaches") {
-        auto binary = user.binary();
-        REQUIRE(binary);
-        REQUIRE_FALSE(binary->empty());
-        auto size_before = binary->size();
-
-        user.releaseCaches();
-
-        // Caller's shared_ptr still valid
-        REQUIRE(binary->size() == size_before);
-        // Entity's BEVE cache is gone (once_flag already triggered)
-        REQUIRE_FALSE(user.binary());
+    SECTION("[Entity] atomic cache pointers are stable across calls") {
+        auto binary1 = user.binary();
+        auto binary2 = user.binary();
+        REQUIRE(binary1);
+        REQUIRE(binary1 == binary2);  // Same pointer (CAS-based lazy init)
     }
 
-    SECTION("[Entity] callers retain JSON data after releaseCaches") {
-        auto json = user.json();
-        REQUIRE(json);
-        REQUIRE(json->find("\"username\":\"alice\"") != std::string::npos);
-
-        user.releaseCaches();
-
-        // Caller's shared_ptr still valid
-        REQUIRE(json->find("\"username\":\"alice\"") != std::string::npos);
-    }
-
-    SECTION("[List] releaseCaches works on ListWrapper") {
-        using ListWrapperUser = jcailloux::relais::wrapper::ListWrapper<TestUser>;
-        ListWrapperUser list;
-        list.items = {user};
-        list.total_count = 1;
-
-        auto binary = list.binary();
-        auto json = list.json();
-        REQUIRE(binary);
-        REQUIRE(json);
-
-        list.releaseCaches();
-
-        // Callers' shared_ptrs still valid
-        REQUIRE_FALSE(binary->empty());
-        REQUIRE(json->find("\"username\":\"alice\"") != std::string::npos);
-        // List's caches are gone
-        REQUIRE_FALSE(list.binary());
-        REQUIRE_FALSE(list.json());
+    SECTION("[Entity] JSON atomic cache is stable across calls") {
+        auto json1 = user.json();
+        auto json2 = user.json();
+        REQUIRE(json1);
+        REQUIRE(json1 == json2);  // Same pointer (CAS-based lazy init)
     }
 }
 

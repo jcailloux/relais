@@ -1,6 +1,7 @@
 #ifndef JCX_RELAIS_BASEREPO_H
 #define JCX_RELAIS_BASEREPO_H
 
+#include <atomic>
 #include <optional>
 #include <string>
 #include <vector>
@@ -15,12 +16,14 @@
 #include "jcailloux/relais/config/FixedString.h"
 #include "jcailloux/relais/config/TypeTraits.h"
 #include "jcailloux/relais/wrapper/EntityConcepts.h"
+#include "jcailloux/relais/wrapper/EntityView.h"
+#include "jcailloux/relais/wrapper/BufferView.h"
 #include "jcailloux/relais/wrapper/FieldUpdate.h"
 
 namespace jcailloux::relais {
 
 // =========================================================================
-// Wrapper pointer type - immutable shared pointer to entity
+// Wrapper pointer type - immutable shared pointer to entity (input params)
 // =========================================================================
 
 template<typename Entity>
@@ -44,9 +47,6 @@ concept HasFieldUpdate = requires {
 namespace detail {
 
 /// Build: UPDATE "table" SET "col1"=$1, "col2"=$2 WHERE "pk"=$N RETURNING cols
-/// table_name is used as-is; pk_column is wrapped in double quotes;
-/// columns are expected pre-quoted (e.g. "\"name\"");
-/// returning_columns is the explicit column list for RETURNING clause.
 inline std::string buildUpdateReturning(
     std::string_view table_name,
     std::string_view pk_column,
@@ -77,8 +77,6 @@ inline std::string buildUpdateReturning(
 }
 
 /// Build UPDATE ... RETURNING for composite primary keys.
-/// pk_columns: array of PK column names (e.g. {"user_id", "group_id"}).
-/// SET params are $1..$N, PK params are $(N+1)..$(N+K).
 template<size_t N>
 inline std::string buildUpdateReturning(
     std::string_view table_name,
@@ -119,14 +117,11 @@ inline std::string buildUpdateReturning(
 // BaseRepo - CRUD operations with L3 (database) access only
 // =========================================================================
 //
-// Hierarchy: BaseRepo -> RedisRepo -> CachedRepo
+// All methods return epoch-guarded views (EntityView / JsonView / BinaryView).
+// Entities are allocated in a static memory_pool and immediately retired.
+// The EpochGuard prevents reclamation until the view is destroyed.
 //
-// No CRTP. Config is a CacheConfig NTTP. Cross-invalidation is handled
-// by InvalidationMixin at a higher layer.
-//
-// All DB access goes through DbProvider (type-erased PgClient).
-// SQL queries come from Entity::MappingType::SQL.
-//
+// WrapperPtrType (shared_ptr) is kept for input parameters (insert/update).
 
 template<typename Entity, config::FixedString Name, config::CacheConfig Cfg, typename Key>
 requires ReadableEntity<Entity>
@@ -138,6 +133,7 @@ public:
     using KeyType = Key;
     using WrapperType = Entity;
     using WrapperPtrType = WrapperPtr<Entity>;
+    using FindResultType = wrapper::EntityView<Entity>;
 
     static constexpr auto config = Cfg;
     static constexpr const char* name() { return Name; }
@@ -146,75 +142,58 @@ public:
     // Find by ID (L3: database only)
     // =====================================================================
 
-    /// Find by ID with L3 (database) access only.
-    /// Returns shared_ptr to immutable entity (nullptr if not found).
-    static io::Task<WrapperPtrType> find(const Key& id) {
-        try {
-            auto params = io::PgParams::fromKey(id);
-            auto result = co_await DbProvider::queryParams(
-                Mapping::SQL::select_by_pk, params);
-            if (result.empty()) co_return nullptr;
-            auto entity = Entity::fromRow(result[0]);
-            co_return entity ? std::make_shared<const Entity>(std::move(*entity)) : nullptr;
-        } catch (const io::PgError& e) {
-            RELAIS_LOG_ERROR << name() << ": DB error - " << e.what();
-            co_return nullptr;
-        }
+    /// Find by ID. Returns epoch-guarded EntityView (empty if not found).
+    static io::Task<wrapper::EntityView<Entity>> find(const Key& id) {
+        auto entity = co_await findRaw(id);
+        if (!entity) co_return {};
+        co_return makeView(std::move(*entity));
     }
 
     // =====================================================================
-    // Find by ID — direct JSON serialization (L3: database only)
+    // Find by ID — JSON serialization (L3: database only)
     // =====================================================================
 
-    /// Find by ID and return raw JSON string (nullptr if not found).
-    /// When Mapping provides rowToJson(), serializes directly from PgResult
-    /// (zero entity construction). Otherwise falls back to entity path.
-    static io::Task<std::shared_ptr<const std::string>> findJson(const Key& id) {
+    /// Find by ID and return JSON buffer view (empty if not found).
+    static io::Task<wrapper::JsonView> findJson(const Key& id) {
         try {
             auto params = io::PgParams::fromKey(id);
             auto result = co_await DbProvider::queryParams(
                 Mapping::SQL::select_by_pk, params);
-            if (result.empty()) co_return nullptr;
-            if constexpr (requires { Mapping::rowToJson(result[0]); }) {
-                co_return Mapping::rowToJson(result[0]);
-            } else {
-                auto entity = Entity::fromRow(result[0]);
-                co_return entity
-                    ? std::make_shared<const Entity>(std::move(*entity))->json()
-                    : nullptr;
-            }
+            if (result.empty()) co_return {};
+            auto entity = Entity::fromRow(result[0]);
+            if (!entity) co_return {};
+            auto guard = epoch::EpochGuard::acquire();
+            auto* ptr = pool().New(std::move(*entity));
+            pool().Retire(ptr);
+            co_return wrapper::JsonView(ptr->json(), std::move(guard));
         } catch (const io::PgError& e) {
             RELAIS_LOG_ERROR << name() << ": findJson DB error - " << e.what();
-            co_return nullptr;
+            co_return {};
         }
     }
 
     // =====================================================================
-    // Find by ID — direct binary serialization (L3: database only)
+    // Find by ID — binary serialization (L3: database only)
     // =====================================================================
 
-    /// Find by ID and return raw binary (BEVE) data (nullptr if not found).
-    /// When Mapping provides rowToBeve(), serializes directly from PgResult
-    /// (zero entity construction). Otherwise falls back to entity path.
-    static io::Task<std::shared_ptr<const std::vector<uint8_t>>> findBinary(const Key& id)
+    /// Find by ID and return binary (BEVE) buffer view (empty if not found).
+    static io::Task<wrapper::BinaryView> findBinary(const Key& id)
         requires HasBinarySerialization<Entity>
     {
         try {
             auto params = io::PgParams::fromKey(id);
             auto result = co_await DbProvider::queryParams(
                 Mapping::SQL::select_by_pk, params);
-            if (result.empty()) co_return nullptr;
-            if constexpr (requires { Mapping::rowToBeve(result[0]); }) {
-                co_return Mapping::rowToBeve(result[0]);
-            } else {
-                auto entity = Entity::fromRow(result[0]);
-                co_return entity
-                    ? std::make_shared<const Entity>(std::move(*entity))->binary()
-                    : nullptr;
-            }
+            if (result.empty()) co_return {};
+            auto entity = Entity::fromRow(result[0]);
+            if (!entity) co_return {};
+            auto guard = epoch::EpochGuard::acquire();
+            auto* ptr = pool().New(std::move(*entity));
+            pool().Retire(ptr);
+            co_return wrapper::BinaryView(ptr->binary(), std::move(guard));
         } catch (const io::PgError& e) {
             RELAIS_LOG_ERROR << name() << ": findBinary DB error - " << e.what();
-            co_return nullptr;
+            co_return {};
         }
     }
 
@@ -222,57 +201,37 @@ public:
     // insert
     // =====================================================================
 
-    /// insert entity in database.
-    /// Returns shared_ptr to immutable entity (nullptr on error).
-    /// Uses INSERT ... RETURNING to get the full entity back (with DB-managed fields).
-    static io::Task<WrapperPtrType> insert(WrapperPtrType wrapper)
+    /// Insert entity in database. Returns epoch-guarded EntityView (empty on error).
+    static io::Task<wrapper::EntityView<Entity>> insert(WrapperPtrType wrapper)
         requires MutableEntity<Entity> && (!Cfg.read_only)
     {
-        if (!wrapper) co_return nullptr;
-
-        try {
-            auto params = Entity::toInsertParams(*wrapper);
-            auto result = co_await DbProvider::queryParams(
-                Mapping::SQL::insert, params);
-            if (result.empty()) co_return nullptr;
-            auto entity = Entity::fromRow(result[0]);
-            co_return entity ? std::make_shared<const Entity>(std::move(*entity)) : nullptr;
-
-        } catch (const io::PgError& e) {
-            RELAIS_LOG_ERROR << name() << ": insert error - " << e.what();
-            co_return nullptr;
-        }
+        auto entity = co_await insertRaw(std::move(wrapper));
+        if (!entity) co_return {};
+        co_return makeView(std::move(*entity));
     }
 
     // =====================================================================
     // Update
     // =====================================================================
 
-    /// Full update of entity in database.
-    /// Builds params as: PK ($1), then insert fields ($2...$N).
-    /// Returns true on success, false on error.
+    /// Full update of entity in database. Returns true on success.
     static io::Task<bool> update(const Key& id, WrapperPtrType wrapper)
         requires MutableEntity<Entity> && (!Cfg.read_only)
     {
         if (!wrapper) co_return false;
 
         try {
-            // SQL::update expects PK as $1...$K, then SET fields as $(K+1)...$N.
             auto keyParams = io::PgParams::fromKey(id);
             io::PgParams fieldParams;
             if constexpr (config::is_tuple_v<Key>) {
-                // Composite key: toUpdateParams returns only SET fields (no PK)
                 fieldParams = Entity::toUpdateParams(*wrapper);
             } else {
-                // Mono-key: toInsertParams already excludes PK (it's db_managed)
                 fieldParams = Entity::toInsertParams(*wrapper);
             }
             io::PgParams params;
             params.params.reserve(keyParams.params.size() + fieldParams.params.size());
-            // $1...$K = primary key(s)
             for (auto& p : keyParams.params)
                 params.params.push_back(std::move(p));
-            // $(K+1)...$N = SET fields
             for (auto& p : fieldParams.params)
                 params.params.push_back(std::move(p));
 
@@ -299,11 +258,8 @@ public:
     }
 
 protected:
-    /// Internal erase with optional entity hint (used by cache layers for
-    /// partition pruning optimization on partitioned entities).
-    /// When a hint is available AND the entity has a partition hint, uses the
-    /// partition-pruned SQL for single-partition deletion. Otherwise falls back
-    /// to standard PK SQL (scans all partitions — acceptable).
+    /// Internal erase with optional entity hint (for partition pruning).
+    /// Hint remains as shared_ptr for compatibility with cache layers.
     static io::Task<std::optional<size_t>> eraseImpl(
         const Key& id, WrapperPtrType cachedHint = nullptr)
         requires (!Cfg.read_only)
@@ -312,12 +268,10 @@ protected:
             int affected;
             if constexpr (HasPartitionHint<Entity>) {
                 if (cachedHint) {
-                    // Partition-pruned: uses PK + partition column
                     auto params = Mapping::makePartitionHintParams(*cachedHint);
                     affected = co_await DbProvider::execute(
                         Mapping::SQL::delete_with_partition, params);
                 } else {
-                    // Standard PK delete (may scan all partitions)
                     auto params = io::PgParams::fromKey(id);
                     affected = co_await DbProvider::execute(
                         Mapping::SQL::delete_by_pk, params);
@@ -340,18 +294,102 @@ public:
     // Partial update (patch)
     // =====================================================================
 
-    /// Partial update: modifies only the specified fields in the database.
-    /// Builds UPDATE ... SET col=$1, ... WHERE pk=$N RETURNING cols (single query).
-    /// Returns the re-fetched entity from DB (nullptr on error or not found).
+    /// Partial update. Returns epoch-guarded EntityView (empty on error).
     template<typename... Updates>
-    static io::Task<WrapperPtrType> patch(const Key& id, Updates&&... updates)
+    static io::Task<wrapper::EntityView<Entity>> patch(const Key& id, Updates&&... updates)
+        requires HasFieldUpdate<Entity> && (!Cfg.read_only)
+    {
+        auto entity = co_await patchRaw(id, std::forward<Updates>(updates)...);
+        if (!entity) co_return {};
+        co_return makeView(std::move(*entity));
+    }
+
+    // =====================================================================
+    // Invalidation pass-through (public interface)
+    // =====================================================================
+
+    static io::Task<void> invalidate([[maybe_unused]] const Key& id) {
+        co_return;
+    }
+
+    template<typename... GroupArgs>
+    static std::string makeGroupKey(GroupArgs&&... groupParts) {
+        return makeListGroupKey(std::forward<GroupArgs>(groupParts)...);
+    }
+
+    static io::Task<size_t> invalidateListGroupByKey(
+        [[maybe_unused]] const std::string& groupKey,
+        [[maybe_unused]] int64_t entity_sort_val)
+    {
+        co_return 0;
+    }
+
+    static io::Task<size_t> invalidateAllListGroups()
+    {
+        co_return 0;
+    }
+
+protected:
+
+    // =====================================================================
+    // Epoch memory pool for temporary entity allocations
+    // =====================================================================
+
+    static epoch::memory_pool<Entity>& pool() {
+        static epoch::memory_pool<Entity> p;
+        return p;
+    }
+
+    /// Allocate entity in pool, retire immediately, return epoch-guarded view.
+    static wrapper::EntityView<Entity> makeView(Entity entity) {
+        auto guard = epoch::EpochGuard::acquire();
+        auto* ptr = pool().New(std::move(entity));
+        pool().Retire(ptr);
+        return wrapper::EntityView<Entity>(ptr, std::move(guard));
+    }
+
+    // =====================================================================
+    // Raw methods returning entity by value (for CachedRepo move path)
+    // =====================================================================
+
+    /// Find by ID, returning entity by value (no pool/view allocation).
+    static io::Task<std::optional<Entity>> findRaw(const Key& id) {
+        try {
+            auto params = io::PgParams::fromKey(id);
+            auto result = co_await DbProvider::queryParams(
+                Mapping::SQL::select_by_pk, params);
+            if (result.empty()) co_return std::nullopt;
+            co_return Entity::fromRow(result[0]);
+        } catch (const io::PgError& e) {
+            RELAIS_LOG_ERROR << name() << ": DB error - " << e.what();
+            co_return std::nullopt;
+        }
+    }
+
+    /// Insert entity in database, returning entity by value.
+    static io::Task<std::optional<Entity>> insertRaw(WrapperPtrType wrapper)
+        requires MutableEntity<Entity> && (!Cfg.read_only)
+    {
+        if (!wrapper) co_return std::nullopt;
+        try {
+            auto params = Entity::toInsertParams(*wrapper);
+            auto result = co_await DbProvider::queryParams(
+                Mapping::SQL::insert, params);
+            if (result.empty()) co_return std::nullopt;
+            co_return Entity::fromRow(result[0]);
+        } catch (const io::PgError& e) {
+            RELAIS_LOG_ERROR << name() << ": insert error - " << e.what();
+            co_return std::nullopt;
+        }
+    }
+
+    /// Partial update, returning entity by value.
+    template<typename... Updates>
+    static io::Task<std::optional<Entity>> patchRaw(const Key& id, Updates&&... updates)
         requires HasFieldUpdate<Entity> && (!Cfg.read_only)
     {
         static_assert(sizeof...(Updates) > 0, "patch requires at least one field update");
-
         try {
-            // Build SQL at first call (thread-safe static init).
-            // Field values are $1..$N, PK is $(N+1)..[$(N+K)] for composite keys.
             static const auto sql = []{
                 if constexpr (config::is_tuple_v<Key>) {
                     return detail::buildUpdateReturning(
@@ -368,7 +406,6 @@ public:
                 }
             }();
 
-            // Build params: field values first, then PK key(s) at the end
             io::PgParams params;
             auto fieldParams = io::PgParams::make(
                 wrapper::fieldValue<typename Entity::TraitsType>(
@@ -381,48 +418,14 @@ public:
                 params.params.push_back(std::move(p));
 
             auto result = co_await DbProvider::queryParams(sql.c_str(), params);
-            if (result.empty()) co_return nullptr;
-
-            auto entity = Entity::fromRow(result[0]);
-            co_return entity ? std::make_shared<const Entity>(std::move(*entity)) : nullptr;
-
+            if (result.empty()) co_return std::nullopt;
+            co_return Entity::fromRow(result[0]);
         } catch (const io::PgError& e) {
             RELAIS_LOG_ERROR << name() << ": patch error - " << e.what();
-            co_return nullptr;
+            co_return std::nullopt;
         }
     }
 
-    // =====================================================================
-    // Invalidation pass-through (public interface)
-    // =====================================================================
-
-    /// Invalidate cache for a key. No-op at BaseRepo level.
-    static io::Task<void> invalidate([[maybe_unused]] const Key& id) {
-        co_return;
-    }
-
-    /// Build a group key from key parts.
-    template<typename... GroupArgs>
-    static std::string makeGroupKey(GroupArgs&&... groupParts) {
-        return makeListGroupKey(std::forward<GroupArgs>(groupParts)...);
-    }
-
-    /// Selectively invalidate list pages for a pre-built group key.
-    /// No-op at BaseRepo level.
-    static io::Task<size_t> invalidateListGroupByKey(
-        [[maybe_unused]] const std::string& groupKey,
-        [[maybe_unused]] int64_t entity_sort_val)
-    {
-        co_return 0;
-    }
-
-    /// Invalidate all list cache groups. No-op at BaseRepo level.
-    static io::Task<size_t> invalidateAllListGroups()
-    {
-        co_return 0;
-    }
-
-protected:
     // =====================================================================
     // List query pass-through methods (no caching at L3 level)
     // =====================================================================
@@ -441,7 +444,6 @@ protected:
         return key;
     }
 
-    /// Execute a list query directly (no caching).
     template<typename QueryFn, typename... KeyArgs>
     static io::Task<std::vector<Entity>> cachedList(
         QueryFn&& query,
@@ -450,7 +452,6 @@ protected:
         co_return co_await query();
     }
 
-    /// Execute a tracked list query directly (no caching, no tracking).
     template<typename QueryFn, typename... GroupArgs>
     static io::Task<std::vector<Entity>> cachedListTracked(
         QueryFn&& query,
@@ -461,7 +462,6 @@ protected:
         co_return co_await query();
     }
 
-    /// Execute a tracked list query with header directly (no caching, no header).
     template<typename QueryFn, typename HeaderBuilder, typename... GroupArgs>
     static io::Task<std::vector<Entity>> cachedListTrackedWithHeader(
         QueryFn&& query,
@@ -473,7 +473,6 @@ protected:
         co_return co_await query();
     }
 
-    /// Invalidate all cached list pages for a group. No-op at base level.
     template<typename... GroupArgs>
     static io::Task<size_t> invalidateListGroup(
         [[maybe_unused]] GroupArgs&&... groupParts)
@@ -481,7 +480,6 @@ protected:
         co_return 0;
     }
 
-    /// Selectively invalidate list pages based on a sort value. No-op at base level.
     template<typename... GroupArgs>
     static io::Task<size_t> invalidateListGroupSelective(
         [[maybe_unused]] int64_t entity_sort_val,
@@ -490,7 +488,6 @@ protected:
         co_return 0;
     }
 
-    /// Selectively invalidate list pages based on old and new sort values. No-op.
     template<typename... GroupArgs>
     static io::Task<size_t> invalidateListGroupSelectiveUpdate(
         [[maybe_unused]] int64_t old_sort_val,
@@ -500,7 +497,6 @@ protected:
         co_return 0;
     }
 
-    /// Execute a list query and return as a custom list entity (no caching).
     template<typename ListEntity, typename QueryFn, typename... KeyArgs>
     static io::Task<ListEntity> cachedListAs(
         QueryFn&& query,
@@ -509,7 +505,6 @@ protected:
         co_return co_await query();
     }
 
-    /// Execute a tracked list query and return as a custom list entity (no caching).
     template<typename ListEntity, typename QueryFn, typename... GroupArgs>
     static io::Task<ListEntity> cachedListAsTracked(
         QueryFn&& query,
@@ -520,7 +515,6 @@ protected:
         co_return co_await query();
     }
 
-    /// Execute a tracked list query with header as custom list entity (no caching).
     template<typename ListEntity, typename QueryFn, typename HeaderBuilder, typename... GroupArgs>
     static io::Task<ListEntity> cachedListAsTrackedWithHeader(
         QueryFn&& query,

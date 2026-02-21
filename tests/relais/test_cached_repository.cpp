@@ -40,6 +40,7 @@
  *   [readonly-inv]  — read-only as cross-invalidation target
  */
 
+#include <set>
 #include <catch2/catch_test_macros.hpp>
 
 #include "fixtures/test_helper.h"
@@ -492,8 +493,8 @@ TEST_CASE("CachedRepo - ShortTTL config",
 
         updateTestItem(id, "After Expiry", 99);
 
-        // Wait for TTL expiration
-        waitForExpiration(std::chrono::milliseconds{150});
+        // Wait for TTL expiration (100ms TTL + 150ms margin for CachedClock refresh)
+        waitForExpiration(std::chrono::milliseconds{250});
 
         // GDSF: TTL-expired entry is evicted on get (Invalidate action)
         // → re-fetches fresh from DB
@@ -528,7 +529,7 @@ TEST_CASE("CachedRepo - WriteThrough config",
     }
 }
 
-TEST_CASE("CachedRepo - FewShards config",
+TEST_CASE("CachedRepo - FewChunks config",
           "[integration][db][cached][config][cleanup]")
 {
     TransactionGuard tx;
@@ -538,29 +539,29 @@ TEST_CASE("CachedRepo - FewShards config",
         auto id2 = insertTestItem("Seg2", 2);
         auto id3 = insertTestItem("Seg3", 3);
 
-        sync(FewShardsTestItemRepo::find(id1));
-        sync(FewShardsTestItemRepo::find(id2));
-        sync(FewShardsTestItemRepo::find(id3));
+        sync(FewChunksTestItemRepo::find(id1));
+        sync(FewChunksTestItemRepo::find(id2));
+        sync(FewChunksTestItemRepo::find(id3));
 
-        auto sizeBefore = getCacheSize<FewShardsTestItemRepo>();
+        auto sizeBefore = getCacheSize<FewChunksTestItemRepo>();
         CHECK(sizeBefore >= 3);
 
         // Full cleanup: non-expired entries are NOT erased
-        auto erased = FewShardsTestItemRepo::purge();
+        auto erased = FewChunksTestItemRepo::purge();
         CHECK(erased == 0);
-        CHECK(getCacheSize<FewShardsTestItemRepo>() == sizeBefore);
+        CHECK(getCacheSize<FewChunksTestItemRepo>() == sizeBefore);
     }
 
-    SECTION("[cleanup] trySweep processes one shard at a time") {
+    SECTION("[cleanup] trySweep processes one chunk at a time") {
         auto id = insertTestItem("Trigger", 1);
-        sync(FewShardsTestItemRepo::find(id));
+        sync(FewChunksTestItemRepo::find(id));
 
-        // trySweep should return true (cleanup performed)
-        auto cleaned = FewShardsTestItemRepo::trySweep();
-        CHECK(cleaned);
+        // trySweep runs but removes nothing (entry not expired)
+        auto cleaned = FewChunksTestItemRepo::trySweep();
+        CHECK_FALSE(cleaned);
 
         // Non-expired entry survives
-        auto result = sync(FewShardsTestItemRepo::find(id));
+        auto result = sync(FewChunksTestItemRepo::find(id));
         REQUIRE(result != nullptr);
         CHECK(result->name == "Trigger");
     }
