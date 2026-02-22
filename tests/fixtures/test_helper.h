@@ -316,7 +316,7 @@ inline void initTest() {
     }
     detail::testRedis() = redis;
 
-    jcailloux::relais::DbProvider::init(pool, redis);
+    jcailloux::relais::DbProvider::init(io, pool, redis, pg_max);
 
     // Phase 2: Start background event loop thread
     detail::testLoop().start();

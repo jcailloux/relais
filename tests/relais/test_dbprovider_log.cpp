@@ -107,7 +107,7 @@ TEST_CASE("DbProvider: init with PgPool", "[dbprovider][integration]") {
     runTask(io, [](EpollIoContext& io, const std::string& conninfo) -> jcailloux::relais::io::Task<void> {
         auto pool = co_await jcailloux::relais::io::PgPool<EpollIoContext>::create(
             io, conninfo, 1, 4);
-        DbProvider::init(pool);
+        DbProvider::init(io, pool);
 
         REQUIRE(DbProvider::initialized());
         REQUIRE_FALSE(DbProvider::hasRedis());
@@ -149,7 +149,7 @@ TEST_CASE("DbProvider: init with Redis", "[dbprovider][integration]") {
             io, conninfo, 1, 4);
         auto redis = co_await jcailloux::relais::io::RedisClient<EpollIoContext>::connect(io);
 
-        DbProvider::init(pool, redis);
+        DbProvider::init(io, pool, redis);
         REQUIRE(DbProvider::initialized());
         REQUIRE(DbProvider::hasRedis());
 

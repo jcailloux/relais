@@ -17,6 +17,7 @@
 #include "jcailloux/relais/wrapper/BufferView.h"
 #include "jcailloux/relais/config/repo_config.h"
 #include "jcailloux/relais/config/CachedClock.h"
+#include <array>
 
 #ifdef RELAIS_BUILDING_TESTS
 namespace relais_test { struct TestInternals; }
@@ -70,7 +71,6 @@ public:
     using typename Base::EntityType;
     using typename Base::KeyType;
     using typename Base::WrapperType;
-    using typename Base::WrapperPtrType;
     using FindResultType = wrapper::EntityView<Entity>;
     using Base::name;
 
@@ -118,32 +118,35 @@ public:
     // =========================================================================
 
     /// Insert entity and cache it. Returns epoch-guarded view.
-    static io::Task<wrapper::EntityView<Entity>> insert(WrapperPtrType wrapper)
+    static io::Task<wrapper::EntityView<Entity>> insert(const Entity& entity)
         requires CreatableEntity<Entity, Key> && (!Cfg.read_only)
     {
-        auto entity = co_await Base::insertRaw(std::move(wrapper));
-        if (entity) {
-            co_return putInCacheAndView(entity->key(), std::move(*entity));
+        auto result = co_await Base::insertRaw(entity);
+        if (result) {
+            bumpGeneration(result->key());
+            co_return putInCacheAndView(result->key(), std::move(*result));
         }
         co_return {};
     }
 
     /// Update entity in database with L1 cache handling.
     /// Returns true on success, false on error.
-    static io::Task<bool> update(const Key& id, WrapperPtrType wrapper)
+    /// Skips L1 cache operations when the write was coalesced (follower).
+    static io::Task<bool> update(const Key& id, const Entity& entity)
         requires MutableEntity<Entity> && (!Cfg.read_only)
     {
         using enum config::UpdateStrategy;
 
-        bool success = co_await Base::update(id, wrapper);
-        if (success) {
+        auto outcome = co_await Base::updateOutcome(id, entity);
+        if (outcome.success && !outcome.coalesced) {
             if constexpr (Cfg.update_strategy == InvalidateAndLazyReload) {
-                evict(id);
+                evict(id);  // evict() calls bumpGeneration internally
             } else {
-                putInCache(id, *wrapper);
+                bumpGeneration(id);
+                putInCache(id, entity);
             }
         }
-        co_return success;
+        co_return outcome.success;
     }
 
     /// Partial update: invalidates L1, delegates to Base::patchRaw,
@@ -152,6 +155,7 @@ public:
     static io::Task<wrapper::EntityView<Entity>> patch(const Key& id, Updates&&... updates)
         requires HasFieldUpdate<Entity> && (!Cfg.read_only)
     {
+        bumpGeneration(id);
         evict(id);
         auto entity = co_await Base::patchRaw(id, std::forward<Updates>(updates)...);
         if (entity) {
@@ -162,22 +166,23 @@ public:
 
     /// Erase entity by ID.
     /// Returns: rows deleted (0 if not found), or nullopt on DB error.
-    /// Invalidates L1 cache unless DB error occurred (self-healing).
+    /// Invalidates L1 cache unless DB error occurred or write was coalesced.
     static io::Task<std::optional<size_t>> erase(const Key& id)
         requires (!Cfg.read_only)
     {
         // Provide L1 hint for partition pruning (free: ~0ns RAM lookup)
-        WrapperPtrType hint = nullptr;
+        const Entity* hint = nullptr;
+        std::optional<Entity> local_hint;
         if constexpr (HasPartitionHint<Entity>) {
             auto view = getFromCache(id);
-            if (view) hint = std::make_shared<const Entity>(*view);
+            if (view) { local_hint.emplace(*view); hint = &*local_hint; }
         }
 
-        auto result = co_await Base::eraseImpl(id, std::move(hint));
-        if (result.has_value()) {
+        auto outcome = co_await Base::eraseOutcome(id, hint);
+        if (outcome.affected.has_value() && !outcome.coalesced) {
             evict(id);
         }
-        co_return result;
+        co_return outcome.affected;
     }
 
     /// Invalidate L1 and L2 caches for a key.
@@ -190,7 +195,9 @@ public:
 
     /// Invalidate L1 cache only. Non-coroutine since there is no async work.
     /// Note: the retired entry is destroyed asynchronously via epoch-based reclamation.
+    /// Increments the generation counter to prevent stale fetches from caching.
     static void evict(const Key& id) {
+        bumpGeneration(id);
         cache().invalidate(id);
     }
 
@@ -406,6 +413,13 @@ private:
     /// Fetch from Base via findRaw (entity by value), measure construction
     /// time (GDSF), move into cache. Reuses Clock::now() for both GDSF
     /// timing and TTL metadata (saves one vDSO call ~25ns).
+    ///
+    /// Generation counter: reads the generation before fetching. If a write
+    /// (update/evict/invalidate) happened during the fetch, the generation
+    /// will have changed. Currently we cache anyway since the fetch window
+    /// is very short without batching. When BatchScheduler is wired in
+    /// (wider fetch windows), this will be upgraded to skip caching and
+    /// return the entity via an alternate path (requires EntityView changes).
     static io::Task<typename L1Cache::FindResult> fetchAndCache(const Key& id) {
         if constexpr (HasGDSF) {
             auto start = Clock::now();
@@ -537,6 +551,33 @@ private:
     // Kept even when !HasGDSF (2 floats per type, negligible) to simplify test accessors.
     static inline std::atomic<float> avg_construction_time_us_{0.0f};
     static inline std::atomic<float> repo_score_{0.0f};
+
+    // =========================================================================
+    // Generation counter — stale write prevention (lock-free, cross-thread)
+    // =========================================================================
+    //
+    // Flat array of atomic counters indexed by hash(key) % kGenSlots.
+    // Zero allocation, zero epoch overhead (unlike ParlayHash Upsert which
+    // allocates + retires a node on every update).
+    //
+    // Hash collisions are safe: two keys sharing a slot may cause an
+    // unnecessary cache miss (pessimistic), never stale data.
+
+    static constexpr size_t kGenSlots = 4096;
+    using GenHash = cache::detail::AutoHash<Key>;
+    static inline std::array<std::atomic<uint32_t>, kGenSlots> generation_slots_{};
+
+    /// Increment the generation for a key (called on every write path).
+    static void bumpGeneration(const Key& id) {
+        generation_slots_[GenHash{}(id) & (kGenSlots - 1)]
+            .fetch_add(1, std::memory_order_relaxed);
+    }
+
+    /// Read current generation for a key's slot.
+    static uint32_t readGeneration(const Key& id) {
+        return generation_slots_[GenHash{}(id) & (kGenSlots - 1)]
+            .load(std::memory_order_relaxed);
+    }
 
 #ifdef RELAIS_BUILDING_TESTS
     friend struct ::relais_test::TestInternals;

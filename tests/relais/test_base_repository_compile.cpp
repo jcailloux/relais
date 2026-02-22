@@ -69,12 +69,6 @@ TEST_CASE("BaseRepo type traits", "[base_repo]") {
         STATIC_REQUIRE(std::is_same_v<EventRepo::KeyType, int64_t>);
     }
 
-    SECTION("WrapperPtr type") {
-        STATIC_REQUIRE(std::is_same_v<
-            ItemRepo::WrapperPtrType,
-            std::shared_ptr<const entity::generated::TestItemWrapper>>);
-    }
-
     SECTION("name() returns correct name") {
         REQUIRE(std::string(ItemRepo::name()) == "test:item");
         REQUIRE(std::string(UserRepo::name()) == "test:user");

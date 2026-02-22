@@ -176,12 +176,17 @@ if(RELAIS_BUILD_TESTS)
     relais_add_test(test_io_redis_types   tests/io/test_io_redis_types.cpp        LABELS "io")
     relais_add_test(test_io_pg_pool_compile tests/io/test_io_pg_pool_compile.cpp  LABELS "io")
     relais_add_test(test_io_resp2         tests/io/test_io_resp2.cpp              LABELS "io")
+    relais_add_test(test_epoll_io_context tests/io/test_epoll_io_context.cpp    LABELS "io;epoll")
+    relais_add_test(test_batch_scheduler  tests/io/test_batch_scheduler.cpp     LABELS "io;batch")
 
     # -------------------------------------------------------------------------
     # Integration tests (require PostgreSQL + Redis)
     # -------------------------------------------------------------------------
     relais_add_test(test_io_pg_integration    tests/io/test_io_pg_integration.cpp    LABELS "io;integration" RESOURCE_LOCK)
     relais_add_test(test_io_redis_integration tests/io/test_io_redis_integration.cpp LABELS "io;integration" RESOURCE_LOCK)
+    relais_add_test(test_io_pg_pipeline       tests/io/test_pg_pipeline.cpp          LABELS "io;integration;pipeline" RESOURCE_LOCK)
+    relais_add_test(test_io_redis_pool        tests/io/test_redis_pool.cpp           LABELS "io;integration;redis-pool" RESOURCE_LOCK)
+    relais_add_test(test_batch_scheduler_integration tests/io/test_batch_scheduler_integration.cpp LABELS "io;integration;batch" RESOURCE_LOCK)
 
     relais_add_test(test_relais_base            tests/relais/test_base_repository.cpp      DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db"                 RESOURCE_LOCK)
     relais_add_test(test_relais_redis           tests/relais/test_redis_repository.cpp     DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;redis"            RESOURCE_LOCK)
@@ -293,4 +298,11 @@ if(RELAIS_BUILD_BENCHMARKS)
         ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks
         ${CMAKE_CURRENT_SOURCE_DIR}/tests)
     target_link_libraries(bench_io_pg PRIVATE jcailloux::relais Catch2::Catch2WithMain)
+
+    add_executable(bench_io_batch benchmarks/bench_io_batch.cpp)
+    target_include_directories(bench_io_batch PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_compile_definitions(bench_io_batch PRIVATE RELAIS_BUILDING_TESTS)
+    target_link_libraries(bench_io_batch PRIVATE jcailloux::relais Catch2::Catch2WithMain)
 endif()

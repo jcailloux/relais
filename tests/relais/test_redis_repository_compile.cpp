@@ -75,12 +75,6 @@ TEST_CASE("RedisRepo type traits", "[redis_repo]") {
         STATIC_REQUIRE(std::is_same_v<OrderRedisRepo::KeyType, int64_t>);
     }
 
-    SECTION("WrapperPtrType is shared_ptr<const Entity>") {
-        STATIC_REQUIRE(std::is_same_v<
-            ItemRedisRepo::WrapperPtrType,
-            std::shared_ptr<const entity::generated::TestItemWrapper>>);
-    }
-
     SECTION("name() returns correct name") {
         REQUIRE(std::string(ItemRedisRepo::name()) == "test:item:redis");
         REQUIRE(std::string(UserRedisRepo::name()) == "test:user:redis");
@@ -187,34 +181,34 @@ TEST_CASE("InvalidationData helpers", "[redis_repo][invalidation]") {
     using Data = cache::InvalidationData<Entity>;
 
     SECTION("forCreate") {
-        auto entity = std::make_shared<const Entity>();
+        Entity entity{};
         auto data = Data::forCreate(entity);
         REQUIRE(data.isCreate());
         REQUIRE(!data.isUpdate());
         REQUIRE(!data.isDelete());
-        REQUIRE(!data.old_entity.has_value());
-        REQUIRE(data.new_entity.has_value());
+        REQUIRE(data.old_entity == nullptr);
+        REQUIRE(data.new_entity != nullptr);
     }
 
     SECTION("forUpdate") {
-        auto old_e = std::make_shared<const Entity>();
-        auto new_e = std::make_shared<const Entity>();
-        auto data = Data::forUpdate(old_e, new_e);
+        Entity old_e{};
+        Entity new_e{};
+        auto data = Data::forUpdate(&old_e, new_e);
         REQUIRE(!data.isCreate());
         REQUIRE(data.isUpdate());
         REQUIRE(!data.isDelete());
-        REQUIRE(data.old_entity.has_value());
-        REQUIRE(data.new_entity.has_value());
+        REQUIRE(data.old_entity != nullptr);
+        REQUIRE(data.new_entity != nullptr);
     }
 
     SECTION("forDelete") {
-        auto entity = std::make_shared<const Entity>();
+        Entity entity{};
         auto data = Data::forDelete(entity);
         REQUIRE(!data.isCreate());
         REQUIRE(!data.isUpdate());
         REQUIRE(data.isDelete());
-        REQUIRE(data.old_entity.has_value());
-        REQUIRE(!data.new_entity.has_value());
+        REQUIRE(data.old_entity != nullptr);
+        REQUIRE(data.new_entity == nullptr);
     }
 }
 

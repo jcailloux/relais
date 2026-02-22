@@ -721,6 +721,20 @@ class MappingGenerator:
                 f'            "UPDATE {table_name} SET {update_set} '
                 f'WHERE {pk_where}";')
 
+        # SELECT ... WHERE pk = ANY($1) for batch reads
+        if pk_count == 1:
+            # Simple key: WHERE pk_col = ANY($1)
+            batch_where = f"{pk_cols[0]} = ANY($1)"
+        else:
+            # Composite key: WHERE (k1, k2) IN (SELECT unnest($1::type[]), unnest($2::type[]))
+            unnest_parts = ", ".join(f"unnest(${i+1})" for i in range(pk_count))
+            key_tuple = ", ".join(pk_cols)
+            batch_where = f"({key_tuple}) IN (SELECT {unnest_parts})"
+        lines.append(f"        static constexpr const char* select_by_pk_batch =")
+        lines.append(
+            f'            "SELECT {all_cols_str} '
+            f'FROM {table_name} WHERE {batch_where}";')
+
         lines.append(f"        static constexpr const char* delete_by_pk =")
         lines.append(
             f'            "DELETE FROM {table_name} WHERE {pk_where}";')

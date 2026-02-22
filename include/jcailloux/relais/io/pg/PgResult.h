@@ -64,6 +64,11 @@ public:
     explicit PgResult(PGresult* result) noexcept
         : result_(result, &PQclear) {}
 
+    /// Construct from a shared_ptr (for pipeline coalescing — multiple waiters
+    /// can share the same PGresult without copying).
+    explicit PgResult(std::shared_ptr<PGresult> shared) noexcept
+        : result_(std::move(shared)) {}
+
     [[nodiscard]] bool valid() const noexcept { return result_ != nullptr; }
     [[nodiscard]] bool empty() const noexcept { return rows() == 0; }
 
@@ -80,6 +85,12 @@ public:
         auto s = PQresultStatus(result_.get());
         return s == PGRES_TUPLES_OK || s == PGRES_COMMAND_OK
             || s == PGRES_SINGLE_TUPLE;
+    }
+
+    /// Check if this result represents a pipeline aborted state.
+    [[nodiscard]] bool pipelineAborted() const noexcept {
+        if (!result_) return false;
+        return PQresultStatus(result_.get()) == PGRES_PIPELINE_ABORTED;
     }
 
     /// Number of rows affected by INSERT/UPDATE/DELETE.
@@ -99,8 +110,13 @@ public:
 
     [[nodiscard]] PGresult* raw() const noexcept { return result_.get(); }
 
+    /// Get the underlying shared_ptr (for pipeline coalescing).
+    [[nodiscard]] const std::shared_ptr<PGresult>& shared() const noexcept {
+        return result_;
+    }
+
 private:
-    std::unique_ptr<PGresult, decltype(&PQclear)> result_{nullptr, &PQclear};
+    std::shared_ptr<PGresult> result_{nullptr, &PQclear};
 };
 
 // Type specializations for Row::get<T>

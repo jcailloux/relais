@@ -261,11 +261,9 @@ public:
 class L2PurchaseListInvalidator {
 public:
     static io::Task<void> onEntityModified(
-        std::shared_ptr<const TestPurchaseWrapper> entity)
+        const TestPurchaseWrapper& entity)
     {
-        if (entity) {
-            co_await L2TestPurchaseListRepo::invalidateUserList(entity->user_id);
-        }
+        co_await L2TestPurchaseListRepo::invalidateUserList(entity.user_id);
     }
 };
 

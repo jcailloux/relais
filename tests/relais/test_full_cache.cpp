@@ -100,12 +100,10 @@ using BothPurchaseListQuery = BothPurchaseListRepo::ListQuery;
 class BothPurchaseListInvalidator {
 public:
     static io::Task<void> onEntityModified(
-        std::shared_ptr<const TestPurchaseWrapper> entity)
+        const TestPurchaseWrapper&)
     {
-        if (entity) {
-            TestInternals::resetListCacheState<BothPurchaseListRepo>();
-            co_await BothPurchaseListRepo::invalidateAllListGroups();
-        }
+        TestInternals::resetListCacheState<BothPurchaseListRepo>();
+        co_await BothPurchaseListRepo::invalidateAllListGroups();
     }
 };
 

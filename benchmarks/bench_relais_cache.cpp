@@ -243,7 +243,7 @@ TEST_CASE("Benchmark - L1 throughput", "[benchmark][throughput]")
     TransactionGuard tx;
 
     static constexpr int THREADS = 6;
-    static constexpr int NUM_KEYS = 64;
+    static constexpr int NUM_KEYS = 10000;
 
     std::vector<int64_t> ids;
     ids.reserve(NUM_KEYS);
@@ -582,7 +582,7 @@ std::string runProductionBench(
 TEST_CASE("Benchmark - production simulation", "[benchmark][production]") {
     TransactionGuard tx;
 
-    static constexpr int NUM_KEYS = 256;
+    static constexpr int NUM_KEYS = 16384;
     static constexpr int CORO_COUNT = 128;
 
     // Pin event loop thread to a dedicated core.
@@ -641,6 +641,89 @@ TEST_CASE("Benchmark - production simulation", "[benchmark][production]") {
             "L1+DB (98R/1E/1I, no Redis)",
             ids, NUM_KEYS, CORO_COUNT, io_core);
         WARN(msg);
+    }
+
+    // ---------- L1+DB high-miss variant (50R/25E/25I) ----------
+
+    SECTION("L1+DB high-miss workload (50R/25E/25I)") {
+        std::vector<int64_t> ids;
+        ids.reserve(NUM_KEYS);
+        for (int i = 0; i < NUM_KEYS; ++i) {
+            auto kid = insertTestItem("bench_hmiss_" + std::to_string(i), i);
+            sync(L1TestItemRepo::find(kid));
+            ids.push_back(kid);
+        }
+
+        // High-miss variant: 50% reads, 25% evictions, 25% invalidations
+        // ~50% DB miss rate → batch sizes of 10-50 → demonstrates pipelining gains
+        std::vector<ProdStats<L1TestItemRepo>> coro_stats(CORO_COUNT);
+        std::atomic<bool> running{true};
+        std::latch done{CORO_COUNT};
+
+        auto t0 = Clock::now();
+
+        for (int cid = 0; cid < CORO_COUNT; ++cid) {
+            detail::testLoop().dispatch(
+                [&ids, cid, &running, &coro_stats, &done]() {
+                    [](const std::vector<int64_t>& ids, int cid, int num_keys,
+                       std::atomic<bool>& running, ProdStats<L1TestItemRepo>& stats,
+                       std::latch& done) -> DetachedHandle {
+                        std::mt19937 rng(cid * 42 + 7);
+                        while (running.load(std::memory_order_relaxed)) {
+                            auto kid = ids[(cid * 11 + stats.reads + stats.l1_evicts
+                                            + stats.invalidates) % num_keys];
+                            auto roll = rng() % 4;
+                            if (roll < 2) {  // 50% reads
+                                auto task = L1TestItemRepo::find(kid);
+                                bool was_l1 = task.await_ready();
+                                auto result = co_await std::move(task);
+                                doNotOptimize(result);
+                                ++stats.reads;
+                                if (was_l1) ++stats.l1_hits;
+                            } else if (roll == 2) {  // 25% L1 evictions
+                                L1TestItemRepo::evict(kid);
+                                ++stats.l1_evicts;
+                            } else {  // 25% full invalidations
+                                co_await L1TestItemRepo::invalidate(kid);
+                                ++stats.invalidates;
+                            }
+                        }
+                        done.count_down();
+                    }(ids, cid, NUM_KEYS, running, coro_stats[cid], done);
+                });
+        }
+
+        std::this_thread::sleep_for(std::chrono::seconds(benchDurationSeconds()));
+        running.store(false, std::memory_order_relaxed);
+        done.wait();
+        auto elapsed = Clock::now() - t0;
+
+        ProdStats<L1TestItemRepo> total{};
+        for (auto& s : coro_stats) {
+            total.reads += s.reads;
+            total.l1_evicts += s.l1_evicts;
+            total.invalidates += s.invalidates;
+            total.l1_hits += s.l1_hits;
+        }
+
+        int64_t total_ops = total.reads + total.l1_evicts + total.invalidates;
+        int64_t total_writes = total.l1_evicts + total.invalidates;
+        DurationResult result{elapsed, total_ops};
+
+        auto msg = formatMixedThroughput("L1+DB high-miss (50R/25E/25I)",
+                                         1, result, total.reads, total_writes);
+
+        double l1_pct = (total.reads > 0) ? 100.0 * total.l1_hits / total.reads : 0.0;
+        int64_t l1_misses = total.reads - total.l1_hits;
+
+        std::ostringstream extra;
+        extra << "\n  L1 hit rate:     " << std::fixed << std::setprecision(1) << l1_pct << "%"
+              << "\n  L1 misses:       " << l1_misses << " (\xe2\x86\x92 DB)"
+              << "\n  L1 evictions:    " << total.l1_evicts
+              << "\n  invalidations:   " << total.invalidates
+              << "\n  coroutines:      " << CORO_COUNT
+              << "\n  IO pinned:       core " << io_core;
+        WARN(msg + extra.str());
     }
 
     // ---------- L1+L2+DB variant (with Redis) ----------

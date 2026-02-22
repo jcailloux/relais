@@ -4,39 +4,46 @@
 
 ### Added
 
-- **Lock-free L1 cache** — replaced ShardMap with ParlayHash-backed `ChunkMap` and epoch-based reclamation; all `find`/`insert`/`patch` return lightweight `EntityView` (12 bytes) instead of `shared_ptr`
-- **Epoch-guarded views** — `EntityView<Entity>`, `JsonView`, `BinaryView` hold an `EpochGuard` ticket preventing reclamation while alive; thread-agnostic and safe across `co_await`
-- **`Task::fromValue(T)` / `Task<void>::ready()`** — pre-resolved coroutine tasks that skip heap allocation (`await_ready() = true`)
-- **GDSF eviction policy** — L1 eviction via score = frequency x cost, controlled by `RELAIS_L1_MAX_MEMORY` CMake option (0 = disabled, default); quadratic pressure factor, 4-variant `CacheMetadata` (0/8/8/16 bytes), zero overhead when disabled via `if constexpr`
-- **`RELAIS_CLEANUP_FREQUENCY_LOG2`** CMake option — compile-time L1 sweep frequency (default 9 = every 512 insertions)
-- **Zero-copy RowView serialization** — `findJson()`/`findBinary()`/`queryJson()`/`queryBinary()` serialize directly from PgResult rows when no L1 cache is in the chain
-- **Configurable L2 serialization format** (`CacheConfig::l2_format`) — `Binary` (BEVE, default) or `Json` for non-C++ interop; `findJson()` transcodes BEVE directly via `glz::beve_to_json`
-- **Composite primary keys** — `std::tuple`-based keys from multiple `@relais primary_key` fields, with full CRUD, L1/L2 caching, and Redis support
-- **L2 (Redis) declarative list caching** — list pages stored as BEVE binary in Redis with bounds-based and selective Lua-based invalidation
-- **Offset pagination** — `ListDescriptorQuery::offset` for offset+limit, mutually exclusive with cursor
-- **Deterministic keyset pagination** — `COALESCE` null-safe sort + secondary PK sort for stable cursor ordering
+- **Lock-free L1 cache** — ParlayHash-backed `ChunkMap` with epoch-based reclamation; `find`/`insert`/`patch` return lightweight `EntityView` instead of `shared_ptr`
+- **GDSF eviction** — L1 eviction via `RELAIS_L1_MAX_MEMORY` CMake option (0 = disabled); zero overhead when disabled
+- **Zero-copy RowView serialization** — `findJson()`/`findBinary()`/`queryJson()`/`queryBinary()` serialize directly from PgResult rows, skipping entity construction
+- **Configurable L2 format** — `CacheConfig::l2_format`: `Binary` (BEVE, default) or `Json` for non-C++ interop
+- **Composite primary keys** — `std::tuple`-based keys from multiple `@relais primary_key` fields with full CRUD and caching support
+- **L2 declarative list caching** — Redis-backed list pages with selective Lua-based invalidation
+- **Offset pagination** — `ListDescriptorQuery::offset`, mutually exclusive with cursor
+- **Deterministic keyset cursor** — null-safe COALESCE sort with PK tiebreaker
+- **Adaptive I/O batching** — `BatchScheduler` with Nagle-like strategy: first query immediate, subsequent batched during RTT
+- **PostgreSQL pipeline mode** — batched reads via `ANY()` arrays, pipelined writes with sync-point error isolation
+- **Redis command pipelining** — `RedisClient::pipelineExec()` queues N commands, single flush/read cycle
+- **Write coalescing** — identical concurrent writes share a single DB round-trip; `WriteOutcome::coalesced` flag
+- **Multi-worker I/O pool** — `IoPool` with per-worker event loop, connection pools, and batch scheduler; optional core pinning
+- **`RedisPool`** — fixed-size connection pool with atomic round-robin dispatch
+- **`EpollIoContext`** — production epoll event loop with timers and thread-safe `post()`
+- **`TimingEstimator`** — adaptive RTT profiling for batch readiness heuristics (EMA, bootstrap, staleness detection)
+- `ConcurrencyGate` coroutine semaphore for shared PG+Redis I/O budget
 - `DetachedTask` coroutine type for fire-and-forget async work
+- `Task::fromValue(T)` / `Task<void>::ready()` for pre-resolved coroutines
 
 ### Changed (Breaking)
 
-- **Return types**: `find`/`insert`/`patch` return `EntityView<Entity>` instead of `shared_ptr<const Entity>`; `findJson` returns `JsonView`; `findBinary` returns `BinaryView`
-- **Serialization accessors**: `json()` returns `const std::string*`, `binary()` returns `const std::vector<uint8_t>*` (was `shared_ptr`); lazy init via atomic CAS instead of `std::call_once`
-- **L1 backend**: ShardMap replaced by lock-free ChunkMap (ParlayHash + epoch-based reclamation); `l1_shard_count_log2` → `l1_chunk_count_log2`
-- **GDSF sweep**: `emergencyCleanup()` → `sweep()` with `atomic_flag`; striped memory slots now use per-cache-line alignment to eliminate false sharing
-- **Dependency**: `shardmap` replaced by `parlayhash`
-- **Composite key entity generator output**: `key()` returns `std::tuple`, SQL uses multi-column WHERE clauses
-- **Partition key concept renamed**: `HasPartitionKey` → `HasPartitionHint`
-- **List cache keys**: canonical binary buffers replace XXH3 hashes — `ListQuery::query_hash` → `cache_key`
+- **Return types**: `find`/`insert`/`patch` return `EntityView<Entity>` instead of `shared_ptr<const Entity>`
+- **Serialization accessors**: `json()` returns `const std::string*`, `binary()` returns `const std::vector<uint8_t>*`; lazy init via atomic CAS
+- **L1 backend**: ShardMap → lock-free ChunkMap; `l1_shard_count_log2` → `l1_chunk_count_log2`
+- **Insert/update signatures**: take `const Entity&` instead of `shared_ptr<const Entity>`
+- **`DbProvider::execute()`** returns `std::pair<int, bool>` (row count + coalesced flag)
+- **`DbProvider::init()`** now requires an `io` context parameter
+- **Composite keys**: `key()` returns `std::tuple`, SQL uses multi-column WHERE clauses
+- **Partition key concept**: `HasPartitionKey` → `HasPartitionHint`
+- **List cache keys**: canonical binary buffers replace XXH3 hashes (`query_hash` → `cache_key`)
 - `InvalidationData`: `optional<shared_ptr<const T>>` → `shared_ptr<const T>`
-- `Keyed` and `CreatableEntity` concepts no longer default `Key` to `int64_t`
+- `Keyed`/`CreatableEntity` concepts no longer default `Key` to `int64_t`
 
 ### Removed
 
-- `QueryCacheKey.h` — replaced by canonical binary buffer approach
-- `QueryParser.h` — parsing moved to `ParseUtils.h` and `HttpQueryParser`
-- `EntityWrapper::releaseCaches()` — no longer needed with atomic pointer caches
-- `CacheConfig::l1_cleanup_every_n_gets` / `l1_cleanup_min_interval` — replaced by `RELAIS_CLEANUP_FREQUENCY_LOG2`
-- `shardmap` dependency
+- `QueryCacheKey.h`, `QueryParser.h`
+- `EntityWrapper::releaseCaches()`
+- `CacheConfig::l1_cleanup_every_n_gets` / `l1_cleanup_min_interval`
+- `shardmap` dependency (replaced by vendored ParlayHash)
 
 ## [0.4.0] - 2026-02-17
 

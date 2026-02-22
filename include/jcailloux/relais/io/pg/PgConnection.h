@@ -139,7 +139,218 @@ public:
         co_return result.affectedRows();
     }
 
+    // =========================================================================
+    // Pipeline mode — batch multiple queries on a single connection
+    // =========================================================================
+
+    /// Enter pipeline mode. Must be called before sendPreparedPipelined().
+    void enterPipelineMode() {
+        if (!PQenterPipelineMode(conn_))
+            throw PgError(std::string("PQenterPipelineMode failed: ") + PQerrorMessage(conn_));
+    }
+
+    /// Exit pipeline mode. Call after all pipeline results have been read.
+    void exitPipelineMode() {
+        if (!PQexitPipelineMode(conn_))
+            throw PgError(std::string("PQexitPipelineMode failed: ") + PQerrorMessage(conn_));
+    }
+
+    /// Ensure a statement is prepared in pipeline mode (non-blocking).
+    /// If the statement is not yet prepared, queues a PQsendPrepare into the pipeline.
+    /// Returns true if a prepare was queued (caller must account for an extra result).
+    bool ensurePreparedPipelined(const char* sql, int nParams) {
+        auto it = prepared_.find(sql);
+        if (it != prepared_.end())
+            return false;
+
+        auto name = "s" + std::to_string(prepared_.size());
+        if (!PQsendPrepare(conn_, name.c_str(), sql, nParams, nullptr))
+            throw PgError(std::string("PQsendPrepare (pipeline) failed: ") + PQerrorMessage(conn_));
+
+        prepared_.emplace(sql, std::move(name));
+        return true;
+    }
+
+    /// Send a prepared query into the pipeline without waiting for the result.
+    void sendPreparedPipelined(const char* sql, const PgParams& params) {
+        auto it = prepared_.find(sql);
+        assert(it != prepared_.end() && "statement not prepared");
+
+        const int n = params.count();
+        static constexpr int kInlineMax = 16;
+        const char* val_buf[kInlineMax]; int len_buf[kInlineMax]; int fmt_buf[kInlineMax];
+        std::vector<const char*> val_vec; std::vector<int> len_vec, fmt_vec;
+        const char** values; int* lengths; int* formats;
+
+        if (n <= kInlineMax) {
+            values = val_buf; lengths = len_buf; formats = fmt_buf;
+        } else {
+            val_vec.resize(n); len_vec.resize(n); fmt_vec.resize(n);
+            values = val_vec.data(); lengths = len_vec.data(); formats = fmt_vec.data();
+        }
+        params.fillArrays(values, lengths, formats);
+
+        if (!PQsendQueryPrepared(conn_, it->second.c_str(),
+                n, values, lengths, formats, 0))
+        {
+            throw PgError(std::string("PQsendQueryPrepared (pipeline) failed: ") + PQerrorMessage(conn_));
+        }
+    }
+
+    /// Insert a sync point in the pipeline. Separates segments for error isolation.
+    void pipelineSync() {
+        if (!PQpipelineSync(conn_))
+            throw PgError(std::string("PQpipelineSync failed: ") + PQerrorMessage(conn_));
+    }
+
+    /// Flush the pipeline output buffer to the server.
+    Task<void> flushPipeline() {
+        while (true) {
+            int ret = PQflush(conn_);
+            if (ret == 0) co_return;         // All flushed
+            if (ret < 0)
+                throw PgError(std::string("PQflush failed: ") + PQerrorMessage(conn_));
+            // ret == 1: need to wait for socket write-ready, then retry
+            co_await awaitWriteReady();
+        }
+    }
+
+    /// Result from a single pipeline segment (query result + processing time).
+    struct PipelineResult {
+        PgResult result;
+        int64_t processing_time_us = 0;  // inter-result interval for GDSF cost
+    };
+
+    /// Read n pipeline segment results (one per query, between syncs).
+    /// Each segment: read PQgetResult until NULL (= one query's result),
+    /// then read the sync result (PGRES_PIPELINE_SYNC).
+    /// Returns exactly n PipelineResults in pipeline order.
+    Task<std::vector<PipelineResult>> readPipelineResults(int n) {
+        std::vector<PipelineResult> results;
+        results.reserve(n);
+
+        auto prev = std::chrono::steady_clock::now();
+
+        for (int i = 0; i < n; ++i) {
+            // Read the query result for this segment
+            PgResult query_result = co_await awaitPipelineResult();
+            auto now = std::chrono::steady_clock::now();
+            auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(now - prev);
+            prev = now;
+
+            results.push_back({std::move(query_result), elapsed.count()});
+
+            // Consume the sync point result (PGRES_PIPELINE_SYNC)
+            co_await consumePipelineSync();
+        }
+
+        co_return results;
+    }
+
 private:
+    // Write-ready awaiter for pipeline flushing
+    struct WriteAwaiter {
+        PgConnection* self;
+        std::coroutine_handle<> continuation;
+
+        bool await_ready() const noexcept { return false; }
+
+        void await_suspend(std::coroutine_handle<> h) {
+            continuation = h;
+            self->registerWatch(IoEvent::Write, [this](IoEvent) {
+                self->removeCurrentWatch();
+                continuation.resume();
+            });
+        }
+
+        void await_resume() noexcept {}
+    };
+
+    WriteAwaiter awaitWriteReady() { return {this, {}}; }
+
+    // Read a single query's result from the pipeline (everything up to NULL).
+    Task<PgResult> awaitPipelineResult() {
+        while (true) {
+            if (!PQconsumeInput(conn_))
+                throw PgError(std::string("PQconsumeInput failed: ") + PQerrorMessage(conn_));
+
+            if (PQisBusy(conn_)) {
+                co_await awaitReadReady();
+                continue;
+            }
+
+            // Read all PGresults for this query (last non-NULL before NULL)
+            PGresult* last = nullptr;
+            while (PGresult* r = PQgetResult(conn_)) {
+                if (last) PQclear(last);
+                last = r;
+
+                // In pipeline mode, check if we hit a PIPELINE_SYNC or PIPELINE_ABORTED
+                auto status = PQresultStatus(last);
+                if (status == PGRES_PIPELINE_SYNC) {
+                    // Put back for consumePipelineSync — but we can't put it back.
+                    // This shouldn't happen here since sync comes after the NULL.
+                    // Actually in pipeline mode: query results end with NULL,
+                    // then the sync result is a separate PQgetResult call.
+                    break;
+                }
+
+                // Check if the next result is available without blocking
+                if (PQisBusy(conn_)) {
+                    co_await awaitReadReady();
+                    if (!PQconsumeInput(conn_))
+                        throw PgError(std::string("PQconsumeInput failed: ") + PQerrorMessage(conn_));
+                }
+            }
+
+            co_return PgResult(last);
+        }
+    }
+
+    // Consume the pipeline sync point result.
+    Task<void> consumePipelineSync() {
+        while (true) {
+            if (!PQconsumeInput(conn_))
+                throw PgError(std::string("PQconsumeInput failed: ") + PQerrorMessage(conn_));
+
+            if (PQisBusy(conn_)) {
+                co_await awaitReadReady();
+                continue;
+            }
+
+            PGresult* r = PQgetResult(conn_);
+            if (r) {
+                auto status = PQresultStatus(r);
+                PQclear(r);
+                if (status == PGRES_PIPELINE_SYNC)
+                    co_return;
+                // If not sync, keep reading
+                continue;
+            }
+            // NULL without sync — unexpected, but don't loop forever
+            co_return;
+        }
+    }
+
+    // Read-ready awaiter (shared between pipeline and normal mode)
+    struct ReadAwaiter {
+        PgConnection* self;
+        std::coroutine_handle<> continuation;
+
+        bool await_ready() const noexcept { return false; }
+
+        void await_suspend(std::coroutine_handle<> h) {
+            continuation = h;
+            self->registerWatch(IoEvent::Read, [this](IoEvent) {
+                self->removeCurrentWatch();
+                continuation.resume();
+            });
+        }
+
+        void await_resume() noexcept {}
+    };
+
+    ReadAwaiter awaitReadReady() { return {this, {}}; }
     // Async connect polling
 
     struct ConnectAwaiter {

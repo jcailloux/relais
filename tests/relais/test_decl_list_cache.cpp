@@ -27,7 +27,7 @@ namespace decl = jcailloux::relais::cache::list::decl;
 // Helper: build a TestArticleWrapper from raw values (no DB round-trip)
 // =============================================================================
 
-std::shared_ptr<const TestArticleWrapper> makeArticle(
+TestArticleWrapper makeArticle(
     int64_t id,
     const std::string& category,
     int64_t author_id,

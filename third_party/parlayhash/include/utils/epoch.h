@@ -401,10 +401,11 @@ private:
 #else
     int delay = 2;
 #endif
-    if (pid.epoch + delay < get_epoch().get_current()) {
+    long current = get_epoch().get_current();
+    if (pid.epoch + delay < current) {
       pid.reserve.splice_back(pid.old);
       pid.old = std::move(pid.current);
-      pid.epoch = get_epoch().get_current();
+      pid.epoch = current;
     }
     // a heuristic
 #ifdef USE_STEPPING
@@ -612,10 +613,11 @@ private:
   }
 
   void advance_epoch(int i, old_current& pid) {
-    if (pid.epoch + 1 < get_epoch().get_current()) {
+    long current = get_epoch().get_current();
+    if (pid.epoch + 1 < current) {
       clear_list(pid.old);
       pid.old = std::move(pid.current);
-      pid.epoch = get_epoch().get_current();
+      pid.epoch = current;
     }
 #ifdef USE_STEPPING
     long update_threshold = 10;

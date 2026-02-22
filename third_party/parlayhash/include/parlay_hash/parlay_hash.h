@@ -665,6 +665,32 @@ struct parlay_hash {
     }
   }
 
+  // Same as Find but without epoch protection.
+  // Caller must already hold epoch protection (e.g., EpochGuard ticket).
+  template <typename F>
+  auto Find_in_epoch(const K& k, const F& f)
+    -> std::optional<typename std::invoke_result<F,Entry>::type>
+  {
+    table_version* ht = current_table_version.load();
+    long idx = ht->get_index(k);
+    bckt* b = &(ht->buckets[idx].v);
+    if constexpr (Entry::Direct) {
+      auto [s, tag] = b->ll();
+      if (s.is_forwarded())
+	check_bucket_and_state(ht, k, b, s, tag, idx);
+      for (long i = 0; i < std::min(s.buffer_cnt(), buffer_size); i++)
+	if (s.buffer[i].equal(k))
+	  return std::optional(f(s.buffer[i]));
+      if (s.buffer_cnt() <= buffer_size) return std::nullopt;
+      // overflow: caller holds epoch, skip with_epoch
+      if (b->lv(tag)) return find_in_list(s.overflow_list(), k, f).first;
+      return find_in_bucket_rec(ht, b, k, f);
+    } else {
+      __builtin_prefetch(b);
+      return find_in_bucket_rec(ht, b, k, f);
+    }
+  }
+
   // Inserts at key, and does nothing if key already in the table.
   // The constr function construct the entry to be inserted if needed.
   // Returns an optional, which is empty if sucessfully inserted or
@@ -678,6 +704,18 @@ struct parlay_hash {
 			       auto [e, flag] = insert_(key, constr);
 			       if (flag) return {};
 			       return rtype(f(e));});
+  }
+
+  // Same as Insert but without epoch protection.
+  // Caller must already hold epoch protection (e.g., EpochGuard ticket).
+  template <typename Constr, typename F>
+  auto Insert_in_epoch(const K& key, const Constr& constr, const F& f)
+    -> std::optional<typename std::invoke_result<F,Entry>::type>
+  {
+    using rtype = std::optional<typename std::invoke_result<F,Entry>::type>;
+    auto [e, flag] = insert_(key, constr);
+    if (flag) return {};
+    return rtype(f(e));
   }
 
   template <typename Constr>
@@ -791,6 +829,74 @@ struct parlay_hash {
     });
   }
 
+  // Same as Upsert but without epoch protection.
+  // Caller must already hold epoch protection (e.g., EpochGuard ticket).
+  template <typename Constr, typename G>
+  auto Upsert_in_epoch(const K& key, const Constr& constr, G& g)
+    -> std::optional<typename std::invoke_result<G,Entry>::type>
+  {
+    using rtype = std::optional<typename std::invoke_result<G,Entry>::type>;
+    table_version* ht = current_table_version.load();
+    long idx = ht->get_index(key);
+    auto b = &(ht->buckets[idx].v);
+    int delay = 200;
+    while (true) {
+      auto [s, tag] = b->ll();
+      state out_s = s;
+      copy_if_needed(ht, idx);
+      check_bucket_and_state(ht, key, b, s, tag, idx);
+      long len = s.buffer_cnt();
+      bool cont = false;
+      for (long i = 0; i < std::min(len, buffer_size); i++) {
+	if (s.buffer[i].equal(key)) {
+	  Entry new_e = constr(std::optional(s.buffer[i]));
+	  out_s.buffer[i] = new_e;
+	  if (b->sc(tag, out_s)) {
+	    rtype r = g(s.buffer[i]);
+	    entries_->retire_entry(s.buffer[i]);
+	    return r;
+	  } else {
+	    entries_->retire_entry(new_e);
+	    cont = true;
+	    break;
+	  }
+	}
+      }
+      if (cont) continue;
+      if (len < buffer_size) {
+	Entry new_e = constr(std::optional<Entry>());
+	if (b->sc(tag, state(s, new_e))) return std::nullopt;
+	entries_->retire_entry(new_e);
+      } else if (len == buffer_size) {
+	link* new_head = new_link(constr(std::optional<Entry>()), nullptr);
+	if (b->sc(tag, state(s, new_head)))
+	  return std::nullopt;
+	entries_->retire_entry(new_head->entry);
+	retire_link(new_head);
+      } else {
+	link* old_head = s.overflow_list();
+	auto [list_len, new_head, updated] = update_list(old_head, key, constr);
+	if (new_head != nullptr) {
+	  if (b->sc(tag, state(s, new_head))) {
+	    rtype r = std::optional(g(updated->entry));
+	    entries_->retire_entry(updated->entry);
+	    retire_list_n(old_head, list_len);
+	    return r;
+	  } else retire_list_n(new_head, list_len);
+	} else {
+	  if (list_len + buffer_size > ht->overflow_size) expand_table(ht);
+	  new_head = new_link(constr(std::optional<Entry>()), old_head);
+	  if (b->sc(tag, state(s, new_head)))
+	    return std::nullopt;
+	  entries_->retire_entry(new_head->entry);
+	  retire_link(new_head);
+	}
+      }
+      for (volatile int i=0; i < delay; i++);
+      delay = std::min(2*delay, 5000);
+    }
+  }
+
   // Removes entry with given key
   // Returns an optional which is empty if the key is not in the table,
   // and contains f(e) otherwise, where e is the entry that is removed.
@@ -860,6 +966,57 @@ struct parlay_hash {
 	delay = std::min(2*delay, 5000); // 1000-10000 are about equally good
       }
     });
+  }
+
+  // Same as Remove but without epoch protection.
+  // Caller must already hold epoch protection (e.g., EpochGuard ticket).
+  template <typename F>
+  auto Remove_in_epoch(const K& key, const F& f)
+    -> std::optional<typename std::invoke_result<F,Entry>::type>
+  {
+    using rtype = std::optional<typename std::invoke_result<F,Entry>::type>;
+    table_version* ht = current_table_version.load();
+    long idx = ht->get_index(key);
+    auto b = &(ht->buckets[idx].v);
+    int delay = 200;
+    while (true) {
+      auto [s, tag] = b->ll();
+      copy_if_needed(ht, idx);
+      check_bucket_and_state(ht, key, b, s, tag, idx);
+      int i = find_in_buffer(s, key);
+      if (i >= 0) {
+	if (s.buffer_cnt() > buffer_size) {
+	  link* l = s.overflow_list();
+	  if (b->sc(tag, state(s, l, i))) {
+	    rtype r = f(s.buffer[i]);
+	    entries_->retire_entry(s.buffer[i]);
+	    retire_link(l);
+	    return r;
+	  }
+	} else {
+	  if (b->sc(tag, state(s, i))) {
+	    rtype r = f(s.buffer[i]);
+	    entries_->retire_entry(s.buffer[i]);
+	    return r;
+	  }
+	}
+      } else {
+	if (s.buffer_cnt() <= buffer_size)
+	  return std::nullopt;
+	auto [cnt, new_list, removed] = remove_from_list(s.overflow_list(), key);
+	if (cnt == 0)
+	  return std::nullopt;
+	if (b->sc(tag, state(s, new_list))) {
+	  rtype r = f(removed->entry);
+	  entries_->retire_entry(removed->entry);
+	  retire_list_n(s.overflow_list(), cnt);
+	  return r;
+	}
+	retire_list_n(new_list, cnt - 1);
+      }
+      for (volatile int i=0; i < delay; i++);
+      delay = std::min(2*delay, 5000);
+    }
   }
 
   // Size of bucket, or if forwarded, then sum sizes of all forwarded

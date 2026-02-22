@@ -116,7 +116,6 @@ public:
     using typename Base::EntityType;
     using typename Base::KeyType;
     using typename Base::WrapperType;
-    using typename Base::WrapperPtrType;
     using typename Base::FindResultType;
 
     // Re-export all Base methods via using declarations
@@ -129,31 +128,29 @@ public:
     // =======================================================================
 
     /// Update entity from JSON string.
-    /// Parses JSON to create wrapper, then updates via the full mixin chain.
+    /// Parses JSON to create entity, then updates via the full mixin chain.
     static io::Task<bool> updateJson(const Key& id, std::string_view json)
         requires MutableEntity<Entity> && (!Cfg.read_only)
     {
-        auto wrapper_opt = Entity::fromJson(json);
-        if (!wrapper_opt) {
+        auto entity_opt = Entity::fromJson(json);
+        if (!entity_opt) {
             RELAIS_LOG_ERROR << name() << ": updateJson failed to parse JSON";
             co_return false;
         }
-        auto wrapper = std::make_shared<const Entity>(std::move(*wrapper_opt));
-        co_return co_await Base::update(id, std::move(wrapper));
+        co_return co_await Base::update(id, *entity_opt);
     }
 
     /// Update entity from binary data.
-    /// Creates wrapper from binary, then updates via the full mixin chain.
+    /// Creates entity from binary, then updates via the full mixin chain.
     static io::Task<bool> updateBinary(const Key& id, std::span<const uint8_t> buffer)
         requires MutableEntity<Entity> && HasBinarySerialization<Entity> && (!Cfg.read_only)
     {
-        auto wrapper_opt = Entity::fromBinary(buffer);
-        if (!wrapper_opt) {
+        auto entity_opt = Entity::fromBinary(buffer);
+        if (!entity_opt) {
             RELAIS_LOG_ERROR << name() << ": updateBinary failed to parse binary data";
             co_return false;
         }
-        auto wrapper = std::make_shared<const Entity>(std::move(*wrapper_opt));
-        co_return co_await Base::update(id, std::move(wrapper));
+        co_return co_await Base::update(id, *entity_opt);
     }
 };
 
