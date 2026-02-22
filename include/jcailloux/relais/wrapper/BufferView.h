@@ -40,6 +40,14 @@ public:
     const T* operator->() const { return ptr_; }
     const T* get() const { return ptr_; }
 
+    /// Transfer guard ownership (e.g., BufferView<ListWrapper> → JsonView/BinaryView).
+    /// Leaves this view empty (ptr_ = nullptr, guard moved out).
+    epoch::EpochGuard take_guard() {
+        auto g = std::move(guard_);
+        ptr_ = nullptr;
+        return g;
+    }
+
     friend bool operator==(const BufferView& v, std::nullptr_t) { return v.ptr_ == nullptr; }
     friend bool operator!=(const BufferView& v, std::nullptr_t) { return v.ptr_ != nullptr; }
 };

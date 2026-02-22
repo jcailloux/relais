@@ -204,6 +204,70 @@ namespace parlay {
         });
     }
 
+    // =================================================================
+    // _in_epoch variants: skip internal epoch protection.
+    // Caller must already hold epoch protection (e.g., EpochGuard ticket).
+    // =================================================================
+
+    template <typename F = decltype(get_value)>
+    auto Find_in_epoch(const K& k, const F& f = get_value) {
+      auto g = [&] (const Entry& e) {return f(e.get_entry());};
+      return m.Find_in_epoch(Entry::make_key(k), g);
+    }
+
+    template <typename F = decltype(get_value)>
+    auto Find_in_epoch(const hashed_key& k, const F& f = get_value) {
+      auto g = [&] (const Entry& e) {return f(e.get_entry());};
+      return m.Find_in_epoch(k, g);
+    }
+
+    template <typename F>
+    auto Upsert_in_epoch(const K& key, const F& f) -> std::optional<mapped_type> {
+      auto k = Entry::make_key(key);
+      auto g = [&] (const Entry& e) {return get_value(e.get_entry());};
+      auto constr = [&] (const std::optional<Entry>& e) -> Entry {
+          if (e.has_value())
+            return entries_.make_entry(k, value_type(key, f(std::optional(get_value((*e).get_entry())))));
+          return entries_.make_entry(k, value_type(key, f(std::optional<V>())));
+      };
+      return m.Upsert_in_epoch(k, constr, g);
+    }
+
+    template <typename F>
+    auto Upsert_in_epoch(const hashed_key& k, const F& f) -> std::optional<mapped_type> {
+      const K& key = Entry::user_key(k);
+      auto g = [&] (const Entry& e) {return get_value(e.get_entry());};
+      auto constr = [&] (const std::optional<Entry>& e) -> Entry {
+          if (e.has_value())
+            return entries_.make_entry(k, value_type(key, f(std::optional(get_value((*e).get_entry())))));
+          return entries_.make_entry(k, value_type(key, f(std::optional<V>())));
+      };
+      return m.Upsert_in_epoch(k, constr, g);
+    }
+
+    auto Insert_in_epoch(const K& key, const V& value) -> std::optional<mapped_type> {
+      auto k = Entry::make_key(key);
+      auto g = [&] (const Entry& e) {return get_value(e.get_entry());};
+      return m.Insert_in_epoch(k, [&] {return entries_.make_entry(k, value_type(key, value));}, g);
+    }
+
+    auto Insert_in_epoch(const hashed_key& k, const V& value) -> std::optional<mapped_type> {
+      const K& key = Entry::user_key(k);
+      auto g = [&] (const Entry& e) {return get_value(e.get_entry());};
+      return m.Insert_in_epoch(k, [&] {return entries_.make_entry(k, value_type(key, value));}, g);
+    }
+
+    auto Remove_in_epoch(const K& k) -> std::optional<mapped_type> {
+      auto g = [&] (const Entry& e) {return get_value(e.get_entry());};
+      return m.Remove_in_epoch(Entry::make_key(k), g);
+    }
+
+    template <typename F>
+    auto Remove_in_epoch(const K& k, const F& f) {
+      auto g = [&] (const Entry& e) {return f(e.get_entry());};
+      return m.Remove_in_epoch(Entry::make_key(k), g);
+    }
+
   };
 
   // Entries are stored directly in the bucket, avoiding a cache miss

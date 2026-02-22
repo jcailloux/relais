@@ -185,6 +185,29 @@ class ListMixin : public Base {
     // L2 TTL helper
     static constexpr auto l2Ttl() { return std::chrono::nanoseconds(Base::config.l2_ttl); }
 
+    // Epoch pools for list wrappers and serialization buffers (non-L1 paths)
+    static epoch::memory_pool<ListWrapperType>& listPool() {
+        static epoch::memory_pool<ListWrapperType> p;
+        return p;
+    }
+
+    static wrapper::BufferView<ListWrapperType> makeListView(ListWrapperType&& w) {
+        auto guard = epoch::EpochGuard::acquire();
+        auto* ptr = listPool().New(std::move(w));
+        listPool().Retire(ptr);
+        return wrapper::BufferView<ListWrapperType>(ptr, std::move(guard));
+    }
+
+    static epoch::memory_pool<std::string>& jsonPool() {
+        static epoch::memory_pool<std::string> p;
+        return p;
+    }
+
+    static epoch::memory_pool<std::vector<uint8_t>>& binaryPool() {
+        static epoch::memory_pool<std::vector<uint8_t>> p;
+        return p;
+    }
+
     // Redis key helpers for declarative list caching
     static std::string redisPageKey(const std::string& cache_key) {
         std::string key(Base::name());
@@ -235,7 +258,6 @@ public:
     using typename Base::EntityType;
     using typename Base::KeyType;
     using typename Base::WrapperType;
-    using typename Base::WrapperPtrType;
     using typename Base::FindResultType;
     using Base::name;
     using Base::find;
@@ -246,8 +268,8 @@ public:
     /// List query type — compatible with parseListQueryStrict return type
     using ListQuery = cache::list::decl::ListDescriptorQuery<Descriptor>;
 
-    /// List result type — returned by query()
-    using ListResult = std::shared_ptr<const ListWrapperType>;
+    /// List result type — returned by query() (epoch-guarded, zero-copy)
+    using ListResult = wrapper::BufferView<ListWrapperType>;
 
     /// Traits type — exposed for controllers (sort parsing, limit normalization, etc.)
     using ListTraits = Traits;
@@ -260,25 +282,24 @@ public:
     /// L1 hit returns fromValue (zero-alloc, synchronous). Miss goes through coroutine.
     static io::Task<ListResult> query(const ListQuery& q) {
         if constexpr (kHasL1) {
-            auto cache_query = toCacheQuery(q);
-            if (auto cached = listCache().get(cache_query)) {
-                return io::Task<ListResult>::fromValue(
-                    std::make_shared<const ListWrapperType>(*cached));
-            }
+            if (auto cached = listCache().getByKey(q.cache_key))
+                return io::Task<ListResult>::fromValue(std::move(cached));
         }
         return cachedListQuery(q);
     }
 
     /// Execute a paginated list query and return raw JSON string.
-    /// L1 hit: serializes from cached entity.
+    /// L1 hit: serializes from cached entity (lazy, epoch-guarded).
     /// L2 hit (BEVE): transcodes via glz::beve_to_json (skips 19-byte ListBoundsHeader).
     /// L2/DB miss: delegates to entity path (cachedListQuery).
-    static io::Task<std::shared_ptr<const std::string>> queryJson(const ListQuery& q) {
+    static io::Task<wrapper::JsonView> queryJson(const ListQuery& q) {
         // L1 check: serialize from cached entities
         if constexpr (kHasL1) {
-            auto cache_query = toCacheQuery(q);
-            if (auto cached = listCache().get(cache_query))
-                co_return cached->json();
+            if (auto cached = listCache().getByKey(q.cache_key)) {
+                auto json_sp = cached->json();  // lazy serialization, returns shared_ptr
+                auto guard = cached.take_guard();
+                co_return wrapper::JsonView(json_sp.get(), std::move(guard));
+            }
         }
 
         // L2 check: BEVE → JSON transcode (skip ListBoundsHeader)
@@ -296,30 +317,39 @@ public:
                 // Skip ListBoundsHeader (19 bytes, magic 0x53 0x52)
                 size_t off = (beve->size() > 19
                     && (*beve)[0] == 0x53 && (*beve)[1] == 0x52) ? 19 : 0;
-                auto json = std::make_shared<std::string>();
+                std::string json;
                 if (!glz::beve_to_json(
-                        std::span(beve->data() + off, beve->size() - off), *json))
-                    co_return json;
+                        std::span(beve->data() + off, beve->size() - off), json)) {
+                    auto guard = epoch::EpochGuard::acquire();
+                    auto* ptr = jsonPool().New(std::move(json));
+                    jsonPool().Retire(ptr);
+                    co_return wrapper::JsonView(ptr, std::move(guard));
+                }
             }
         }
 
         // Miss: entity path (needed for cursor/bounds/L1 population)
         auto wrapper = co_await cachedListQuery(q);
-        co_return wrapper ? wrapper->json() : nullptr;
+        if (!wrapper) co_return wrapper::JsonView{};
+        auto json_sp = wrapper->json();
+        auto guard = wrapper.take_guard();
+        co_return wrapper::JsonView(json_sp.get(), std::move(guard));
     }
 
     /// Execute a paginated list query and return raw binary (BEVE).
-    /// L1 hit: serializes from cached entity.
+    /// L1 hit: serializes from cached entity (lazy, epoch-guarded).
     /// L2 hit: returns raw binary (skips ListBoundsHeader).
     /// L2/DB miss: delegates to entity path (cachedListQuery).
-    static io::Task<std::shared_ptr<const std::vector<uint8_t>>> queryBinary(const ListQuery& q)
+    static io::Task<wrapper::BinaryView> queryBinary(const ListQuery& q)
         requires HasBinarySerialization<Entity>
     {
         // L1 check: serialize from cached entities
         if constexpr (kHasL1) {
-            auto cache_query = toCacheQuery(q);
-            if (auto cached = listCache().get(cache_query))
-                co_return cached->binary();
+            if (auto cached = listCache().getByKey(q.cache_key)) {
+                auto bin_sp = cached->binary();  // lazy serialization, returns shared_ptr
+                auto guard = cached.take_guard();
+                co_return wrapper::BinaryView(bin_sp.get(), std::move(guard));
+            }
         }
 
         // L2 check: raw binary from Redis (skip ListBoundsHeader)
@@ -337,14 +367,20 @@ public:
                 // Skip ListBoundsHeader (19 bytes, magic 0x53 0x52)
                 size_t off = (beve->size() > 19
                     && (*beve)[0] == 0x53 && (*beve)[1] == 0x52) ? 19 : 0;
-                co_return std::make_shared<std::vector<uint8_t>>(
+                auto guard = epoch::EpochGuard::acquire();
+                auto* ptr = binaryPool().New(
                     beve->begin() + static_cast<ptrdiff_t>(off), beve->end());
+                binaryPool().Retire(ptr);
+                co_return wrapper::BinaryView(ptr, std::move(guard));
             }
         }
 
         // Miss: entity path (needed for cursor/bounds/L1 population)
         auto wrapper = co_await cachedListQuery(q);
-        co_return wrapper ? wrapper->binary() : nullptr;
+        if (!wrapper) co_return wrapper::BinaryView{};
+        auto bin_sp = wrapper->binary();
+        auto guard = wrapper.take_guard();
+        co_return wrapper::BinaryView(bin_sp.get(), std::move(guard));
     }
 
     /// Get L1 list cache size.
@@ -361,40 +397,39 @@ public:
     // =========================================================================
 
     /// Insert entity and invalidate list caches.
-    static io::Task<wrapper::EntityView<Entity>> insert(WrapperPtrType wrapper)
+    static io::Task<wrapper::EntityView<Entity>> insert(const Entity& entity)
         requires MutableEntity<Entity> && (!Base::config.read_only)
     {
-        auto result = co_await Base::insert(std::move(wrapper));
+        auto result = co_await Base::insert(entity);
         if (result) {
-            auto ptr = std::make_shared<const Entity>(*result);
-            if constexpr (kHasL1) { listCache().onEntityCreated(ptr); }
-            if constexpr (kHasL2) { co_await invalidateL2Created(*ptr); }
+            if constexpr (kHasL1) { listCache().onEntityCreated(*result); }
+            if constexpr (kHasL2) { co_await invalidateL2Created(*result); }
         }
         co_return result;
     }
 
     /// Update entity and invalidate list caches.
-    static io::Task<bool> update(const Key& id, WrapperPtrType wrapper)
+    static io::Task<bool> update(const Key& id, const Entity& entity)
         requires MutableEntity<Entity> && (!Base::config.read_only)
     {
-        WrapperPtrType old;
+        std::optional<Entity> old;
         {
             auto view = co_await Base::find(id);
-            if (view) old = std::make_shared<const Entity>(*view);
+            if (view) old.emplace(*view);
         }
-        co_return co_await updateWithContext(id, std::move(wrapper), std::move(old));
+        co_return co_await updateWithContext(id, entity, old ? &*old : nullptr);
     }
 
     /// Erase entity and invalidate list caches.
     static io::Task<std::optional<size_t>> erase(const Key& id)
         requires (!Base::config.read_only)
     {
-        WrapperPtrType entity;
+        std::optional<Entity> old;
         {
             auto view = co_await Base::find(id);
-            if (view) entity = std::make_shared<const Entity>(*view);
+            if (view) old.emplace(*view);
         }
-        co_return co_await eraseWithContext(id, std::move(entity));
+        co_return co_await eraseWithContext(id, old ? &*old : nullptr);
     }
 
     /// Partial update and invalidate list caches.
@@ -402,12 +437,12 @@ public:
     static io::Task<wrapper::EntityView<Entity>> patch(const Key& id, Updates&&... updates)
         requires HasFieldUpdate<Entity> && (!Base::config.read_only)
     {
-        WrapperPtrType old;
+        std::optional<Entity> old;
         {
             auto view = co_await Base::find(id);
-            if (view) old = std::make_shared<const Entity>(*view);
+            if (view) old.emplace(*view);
         }
-        co_return co_await patchWithContext(id, std::move(old),
+        co_return co_await patchWithContext(id, old ? &*old : nullptr,
             std::forward<Updates>(updates)...);
     }
 
@@ -504,19 +539,19 @@ public:
     // Called by InvalidateList<> cross-invalidation and external sync callers.
     // CRUD methods use co_await for L2 instead (no fire-and-forget).
 
-    static void notifyCreated(WrapperPtrType entity) {
+    static void notifyCreated(const Entity& entity) {
         if constexpr (kHasL1) { listCache().onEntityCreated(entity); }
-        if constexpr (kHasL2) { fireL2Created(std::move(entity)); }
+        if constexpr (kHasL2) { fireL2Created(Entity(entity)); }
     }
 
-    static void notifyUpdated(WrapperPtrType old_entity, WrapperPtrType new_entity) {
+    static void notifyUpdated(const Entity& old_entity, const Entity& new_entity) {
         if constexpr (kHasL1) { listCache().onEntityUpdated(old_entity, new_entity); }
-        if constexpr (kHasL2) { fireL2Updated(std::move(old_entity), std::move(new_entity)); }
+        if constexpr (kHasL2) { fireL2Updated(Entity(old_entity), Entity(new_entity)); }
     }
 
-    static void notifyDeleted(WrapperPtrType entity) {
+    static void notifyDeleted(const Entity& entity) {
         if constexpr (kHasL1) { listCache().onEntityDeleted(entity); }
-        if constexpr (kHasL2) { fireL2Deleted(std::move(entity)); }
+        if constexpr (kHasL2) { fireL2Deleted(Entity(entity)); }
     }
 
 #ifdef RELAIS_BUILDING_TESTS
@@ -529,25 +564,32 @@ protected:
     // =========================================================================
 
     static io::Task<bool> updateWithContext(
-        const Key& id, WrapperPtrType wrapper, WrapperPtrType old_entity)
+        const Key& id, const Entity& entity, const Entity* old_entity)
         requires MutableEntity<Entity> && (!Base::config.read_only)
     {
-        auto new_entity = wrapper;
-        bool ok = co_await Base::update(id, std::move(wrapper));
+        bool ok = co_await Base::update(id, entity);
         if (ok) {
-            if constexpr (kHasL1) { listCache().onEntityUpdated(old_entity, new_entity); }
-            if constexpr (kHasL2) { co_await invalidateL2Updated(*old_entity, *new_entity); }
+            if constexpr (kHasL1) {
+                if (old_entity) {
+                    listCache().onEntityUpdated(*old_entity, entity);
+                } else {
+                    listCache().onEntityCreated(entity);
+                }
+            }
+            if constexpr (kHasL2) {
+                co_await invalidateL2Updated(old_entity ? *old_entity : entity, entity);
+            }
         }
         co_return ok;
     }
 
     static io::Task<std::optional<size_t>> eraseWithContext(
-        const Key& id, WrapperPtrType old_entity)
+        const Key& id, const Entity* old_entity)
         requires (!Base::config.read_only)
     {
         auto result = co_await Base::erase(id);
         if (result.has_value() && old_entity) {
-            if constexpr (kHasL1) { listCache().onEntityDeleted(old_entity); }
+            if constexpr (kHasL1) { listCache().onEntityDeleted(*old_entity); }
             if constexpr (kHasL2) { co_await invalidateL2Deleted(*old_entity); }
         }
         co_return result;
@@ -555,16 +597,21 @@ protected:
 
     template<typename... Updates>
     static io::Task<wrapper::EntityView<Entity>> patchWithContext(
-        const Key& id, WrapperPtrType old_entity, Updates&&... updates)
+        const Key& id, const Entity* old_entity, Updates&&... updates)
         requires HasFieldUpdate<Entity> && (!Base::config.read_only)
     {
         auto result = co_await Base::patch(id, std::forward<Updates>(updates)...);
         if (result) {
-            auto ptr = std::make_shared<const Entity>(*result);
-            if constexpr (kHasL1) { listCache().onEntityUpdated(old_entity, ptr); }
+            if constexpr (kHasL1) {
+                if (old_entity) {
+                    listCache().onEntityUpdated(*old_entity, *result);
+                } else {
+                    listCache().onEntityCreated(*result);
+                }
+            }
             if constexpr (kHasL2) {
                 co_await invalidateL2Updated(
-                    old_entity ? *old_entity : *ptr, *ptr);
+                    old_entity ? *old_entity : *result, *result);
             }
         }
         co_return result;
@@ -617,18 +664,18 @@ protected:
     }
 
     /// Fire-and-forget L2 invalidation for entity creation.
-    static io::DetachedTask fireL2Created(WrapperPtrType entity) {
-        try { co_await invalidateL2Created(*entity); } catch (...) {}
+    static io::DetachedTask fireL2Created(Entity entity) {
+        try { co_await invalidateL2Created(entity); } catch (...) {}
     }
 
     /// Fire-and-forget L2 invalidation for entity update.
-    static io::DetachedTask fireL2Updated(WrapperPtrType old_e, WrapperPtrType new_e) {
-        try { co_await invalidateL2Updated(*old_e, *new_e); } catch (...) {}
+    static io::DetachedTask fireL2Updated(Entity old_e, Entity new_e) {
+        try { co_await invalidateL2Updated(old_e, new_e); } catch (...) {}
     }
 
     /// Fire-and-forget L2 invalidation for entity deletion.
-    static io::DetachedTask fireL2Deleted(WrapperPtrType entity) {
-        try { co_await invalidateL2Deleted(*entity); } catch (...) {}
+    static io::DetachedTask fireL2Deleted(Entity entity) {
+        try { co_await invalidateL2Deleted(entity); } catch (...) {}
     }
 
     /// Coarse L2 invalidation — fallback that invalidates all groups.
@@ -669,12 +716,10 @@ protected:
     static io::Task<ListResult> cachedListQuery(const ListQuery& query) {
         using Clock = std::chrono::steady_clock;
 
-        // 1. L1 check — epoch-guarded view, copy to shared_ptr
+        // 1. L1 check — epoch-guarded view, zero-copy
         if constexpr (kHasL1) {
-            auto cache_query = toCacheQuery(query);
-            if (auto cached = listCache().get(cache_query)) {
-                co_return std::make_shared<const ListWrapperType>(*cached);
-            }
+            if (auto cached = listCache().getByKey(query.cache_key))
+                co_return std::move(cached);
         }
 
         auto start = Clock::now();
@@ -692,28 +737,26 @@ protected:
             }
 
             if (cached) {
-                auto wrapper = std::make_shared<ListWrapperType>(std::move(*cached));
-
-                // Populate L1 if available
                 if constexpr (kHasL1) {
+                    // Move into L1 cache, return epoch-guarded view
                     auto elapsed_us = static_cast<float>(
                         std::chrono::duration_cast<std::chrono::microseconds>(
                             Clock::now() - start).count());
 
                     auto sort = query.sort.value_or(defaultSortAsListSpec());
                     cache::list::SortBounds bounds;
-                    if (!wrapper->items.empty()) {
+                    if (!cached->items.empty()) {
                         bounds.first_value = cache::list::decl::extractSortValue<Descriptor>(
-                            wrapper->items.front(), sort.field);
+                            cached->items.front(), sort.field);
                         bounds.last_value = cache::list::decl::extractSortValue<Descriptor>(
-                            wrapper->items.back(), sort.field);
+                            cached->items.back(), sort.field);
                         bounds.is_valid = true;
                     }
-                    listCache().put(toCacheQuery(query), ListWrapperType(*wrapper),
-                                    bounds, elapsed_us);
+                    co_return listCache().put(toCacheQuery(query), std::move(*cached),
+                                              bounds, elapsed_us);
+                } else {
+                    co_return makeListView(std::move(*cached));
                 }
-
-                co_return wrapper;
             }
         }
 
@@ -726,34 +769,34 @@ protected:
                 Clock::now() - start).count());
 
         // Build ListWrapper directly from entities
-        auto wrapper = std::make_shared<ListWrapperType>();
-        wrapper->items = std::move(entities);
+        ListWrapperType wrapper;
+        wrapper.items = std::move(entities);
 
         // Set cursor for pagination (base64 string in ListWrapper)
-        if (wrapper->items.size() >= query.limit && !wrapper->items.empty()) {
+        if (wrapper.items.size() >= query.limit && !wrapper.items.empty()) {
             auto cache_sort = query.sort.value_or(Traits::defaultSort());
-            auto cursor = Traits::extractCursor(wrapper->items.back(), cache_sort);
-            wrapper->next_cursor = cursor.encode();
+            auto cursor = Traits::extractCursor(wrapper.items.back(), cache_sort);
+            wrapper.next_cursor = cursor.encode();
         }
 
         // Extract sort bounds from entities
         cache::list::SortBounds bounds;
-        if (!wrapper->items.empty()) {
+        if (!wrapper.items.empty()) {
             bounds.first_value = cache::list::decl::extractSortValue<Descriptor>(
-                wrapper->items.front(), sort.field);
+                wrapper.items.front(), sort.field);
             bounds.last_value = cache::list::decl::extractSortValue<Descriptor>(
-                wrapper->items.back(), sort.field);
+                wrapper.items.back(), sort.field);
             bounds.is_valid = true;
         }
 
-        // 4. Store in L2 with ListBoundsHeader
+        // 4. Store in L2 with ListBoundsHeader (BEFORE moving into L1)
         if constexpr (kHasL2) {
             cache::list::ListBoundsHeader header;
             header.bounds = bounds;
             header.sort_direction = (sort.direction == cache::list::SortDirection::Desc)
                 ? cache::list::SortDirection::Desc : cache::list::SortDirection::Asc;
             header.is_first_page = query.cursor.data.empty() && query.offset == 0;
-            header.is_incomplete = wrapper->items.size() < static_cast<size_t>(query.limit);
+            header.is_incomplete = wrapper.items.size() < static_cast<size_t>(query.limit);
             header.pagination_mode = query.cursor.data.empty()
                 ? cache::list::PaginationMode::Offset
                 : cache::list::PaginationMode::Cursor;
@@ -761,21 +804,21 @@ protected:
             auto pageKey = redisPageKey(query.cache_key);
             auto groupKey = redisGroupKey(query.group_key);
 
-            // Store page binary with header prepended
-            co_await cache::RedisCache::setListBinary(pageKey, *wrapper, l2Ttl(), header);
+            // Store page binary with header prepended (reads wrapper, does not consume)
+            co_await cache::RedisCache::setListBinary(pageKey, wrapper, l2Ttl(), header);
             // Track page in group SET
             co_await cache::RedisCache::trackListKey(groupKey, pageKey, l2Ttl());
             // Track group in master HASH (stores sort field index per group)
             co_await DbProvider::redis("HSET", redisMasterSetKey(), groupKey, std::to_string(sort.field));
         }
 
-        // 5. Store in L1 cache
+        // 5. Store in L1 cache or epoch pool
         if constexpr (kHasL1) {
-            listCache().put(toCacheQuery(query), ListWrapperType(*wrapper),
-                            bounds, elapsed_us);
+            co_return listCache().put(toCacheQuery(query), std::move(wrapper),
+                                      bounds, elapsed_us);
+        } else {
+            co_return makeListView(std::move(wrapper));
         }
-
-        co_return wrapper;
     }
 
     // =========================================================================

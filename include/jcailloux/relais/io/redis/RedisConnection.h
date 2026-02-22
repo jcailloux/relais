@@ -191,6 +191,40 @@ public:
     [[nodiscard]] RespParser& parser() noexcept { return parser_; }
     [[nodiscard]] const RespParser& parser() const noexcept { return parser_; }
 
+    // =========================================================================
+    // Pipeline mode — queue multiple commands, flush once, read N responses
+    // =========================================================================
+
+    /// Queue a command into the write buffer without flushing.
+    void queueCommand(int argc, const char** argv, const size_t* argvlen) {
+        writer_.writeCommand(argc, argv, argvlen);
+    }
+
+    /// Flush the entire write buffer (all queued commands) to the server.
+    Task<void> flushPipeline() {
+        co_await flushWrite();
+    }
+
+    /// Read N pipeline responses sequentially.
+    /// Returns a vector of shared RespParsers, one per response.
+    Task<std::vector<std::shared_ptr<RespParser>>> readPipelineResults(int n) {
+        std::vector<std::shared_ptr<RespParser>> results;
+        results.reserve(n);
+
+        for (int i = 0; i < n; ++i) {
+            parser_.reset();
+            bool ok = co_await readResponse();
+            if (!ok)
+                throw RedisError("Redis connection closed during pipeline read");
+
+            auto p = std::make_shared<RespParser>();
+            std::swap(*p, parser_);
+            results.push_back(std::move(p));
+        }
+
+        co_return results;
+    }
+
 private:
     explicit RedisConnection(Io& io, int fd) noexcept : io_(&io), fd_(fd) {}
 

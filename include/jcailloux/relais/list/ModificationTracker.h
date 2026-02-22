@@ -21,7 +21,7 @@ namespace jcailloux::relais::cache::list {
 
 template<typename Entity>
 struct EntityModification {
-    using EntityPtr = std::shared_ptr<const Entity>;
+    using EntityPtr = std::unique_ptr<const Entity>;
     using Clock = std::chrono::steady_clock;
     using TimePoint = Clock::time_point;
 
@@ -37,28 +37,28 @@ struct EntityModification {
     TimePoint modified_at;
 
     // Factory methods
-    static EntityModification created(EntityPtr entity) {
+    static EntityModification created(const Entity& entity) {
         return EntityModification{
             .type = Type::Created,
             .old_entity = nullptr,
-            .new_entity = std::move(entity),
+            .new_entity = std::make_unique<const Entity>(entity),
             .modified_at = Clock::now()
         };
     }
 
-    static EntityModification updated(EntityPtr old_entity, EntityPtr new_entity) {
+    static EntityModification updated(const Entity& old_entity, const Entity& new_entity) {
         return EntityModification{
             .type = Type::Updated,
-            .old_entity = std::move(old_entity),
-            .new_entity = std::move(new_entity),
+            .old_entity = std::make_unique<const Entity>(old_entity),
+            .new_entity = std::make_unique<const Entity>(new_entity),
             .modified_at = Clock::now()
         };
     }
 
-    static EntityModification deleted(EntityPtr entity) {
+    static EntityModification deleted(const Entity& entity) {
         return EntityModification{
             .type = Type::Deleted,
-            .old_entity = std::move(entity),
+            .old_entity = std::make_unique<const Entity>(entity),
             .new_entity = nullptr,
             .modified_at = Clock::now()
         };
@@ -94,7 +94,6 @@ public:
                   "TotalSegments must be between 2 and 64");
 
     using Modification = EntityModification<Entity>;
-    using EntityPtr = typename Modification::EntityPtr;
     using Clock = std::chrono::steady_clock;
     using TimePoint = Clock::time_point;
     using BitmapType = detail::SmallestUintFor<TotalSegments>;
@@ -133,16 +132,16 @@ public:
     // Track modifications
     // =========================================================================
 
-    void notifyCreated(EntityPtr entity) {
-        track(Modification::created(std::move(entity)));
+    void notifyCreated(const Entity& entity) {
+        track(Modification::created(entity));
     }
 
-    void notifyUpdated(EntityPtr old_entity, EntityPtr new_entity) {
-        track(Modification::updated(std::move(old_entity), std::move(new_entity)));
+    void notifyUpdated(const Entity& old_entity, const Entity& new_entity) {
+        track(Modification::updated(old_entity, new_entity));
     }
 
-    void notifyDeleted(EntityPtr entity) {
-        track(Modification::deleted(std::move(entity)));
+    void notifyDeleted(const Entity& entity) {
+        track(Modification::deleted(entity));
     }
 
 private:

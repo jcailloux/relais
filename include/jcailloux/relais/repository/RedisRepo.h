@@ -35,7 +35,6 @@ class RedisRepo : public BaseRepo<Entity, Name, Cfg, Key> {
         using typename Base::EntityType;
         using typename Base::KeyType;
         using typename Base::WrapperType;
-        using typename Base::WrapperPtrType;
         using typename Base::FindResultType;
         using Base::name;
 
@@ -146,30 +145,21 @@ class RedisRepo : public BaseRepo<Entity, Name, Cfg, Key> {
 
         /// Insert entity in database with L2 cache population.
         /// Returns epoch-guarded EntityView (empty on error).
-        static io::Task<wrapper::EntityView<Entity>> insert(WrapperPtrType wrapper)
+        static io::Task<wrapper::EntityView<Entity>> insert(const Entity& entity)
             requires CreatableEntity<Entity, Key> && (!Cfg.read_only)
         {
-            auto entity = co_await insertRaw(std::move(wrapper));
-            if (!entity) co_return {};
-            co_return Base::makeView(std::move(*entity));
+            auto result = co_await insertRaw(entity);
+            if (!result) co_return {};
+            co_return Base::makeView(std::move(*result));
         }
 
         /// Update entity in database with L2 cache handling.
         /// Returns true on success, false on error.
-        static io::Task<bool> update(const Key& id, WrapperPtrType wrapper)
+        static io::Task<bool> update(const Key& id, const Entity& entity)
             requires MutableEntity<Entity> && (!Cfg.read_only)
         {
-            using enum config::UpdateStrategy;
-
-            bool success = co_await Base::update(id, wrapper);
-            if (success) {
-                if constexpr (Cfg.update_strategy == InvalidateAndLazyReload) {
-                    co_await evictRedis(id);
-                } else {
-                    co_await setInCache(makeRedisKey(id), *wrapper);
-                }
-            }
-            co_return success;
+            auto outcome = co_await updateOutcome(id, entity);
+            co_return outcome.success;
         }
 
         /// Partial update: invalidates Redis then delegates to Base::patchRaw.
@@ -193,28 +183,56 @@ class RedisRepo : public BaseRepo<Entity, Name, Cfg, Key> {
         }
 
     protected:
+        using WriteOutcome = typename Base::WriteOutcome;
+        using EraseOutcome = typename Base::EraseOutcome;
+
+        /// Update returning full outcome. Skips L2 ops when coalesced.
+        static io::Task<WriteOutcome> updateOutcome(const Key& id, const Entity& entity)
+            requires MutableEntity<Entity> && (!Cfg.read_only)
+        {
+            using enum config::UpdateStrategy;
+
+            auto outcome = co_await Base::updateOutcome(id, entity);
+            if (outcome.success && !outcome.coalesced) {
+                if constexpr (Cfg.update_strategy == InvalidateAndLazyReload) {
+                    co_await evictRedis(id);
+                } else {
+                    co_await setInCache(makeRedisKey(id), entity);
+                }
+            }
+            co_return outcome;
+        }
+
         /// Internal erase with optional entity hint.
         /// For CompositeKey entities: if L1 didn't provide a hint,
         /// try L2 (Redis) as a near-free fallback (~0.1-1ms).
         static io::Task<std::optional<size_t>> eraseImpl(
-            const Key& id, typename Base::WrapperPtrType cachedHint = nullptr)
+            const Key& id, const Entity* hint = nullptr)
+            requires (!Cfg.read_only)
+        {
+            auto outcome = co_await eraseOutcome(id, hint);
+            co_return outcome.affected;
+        }
+
+        /// Erase returning full outcome. Skips L2 ops when coalesced.
+        static io::Task<EraseOutcome> eraseOutcome(
+            const Key& id, const Entity* hint = nullptr)
             requires (!Cfg.read_only)
         {
             // L2 hint fallback for partition pruning
+            std::optional<Entity> local_hint;
             if constexpr (HasPartitionHint<Entity>) {
-                if (!cachedHint) {
-                    auto cached = co_await getFromCache(makeRedisKey(id));
-                    if (cached) {
-                        cachedHint = std::make_shared<const Entity>(std::move(*cached));
-                    }
+                if (!hint) {
+                    local_hint = co_await getFromCache(makeRedisKey(id));
+                    if (local_hint) hint = &*local_hint;
                 }
             }
 
-            auto result = co_await Base::eraseImpl(id, std::move(cachedHint));
-            if (result.has_value()) {
+            auto outcome = co_await Base::eraseOutcome(id, hint);
+            if (outcome.affected.has_value() && !outcome.coalesced) {
                 co_await evictRedis(id);
             }
-            co_return result;
+            co_return outcome;
         }
 
     public:
@@ -308,14 +326,14 @@ class RedisRepo : public BaseRepo<Entity, Name, Cfg, Key> {
         }
 
         /// Insert with L2 cache population, returning entity by value.
-        static io::Task<std::optional<Entity>> insertRaw(WrapperPtrType wrapper)
+        static io::Task<std::optional<Entity>> insertRaw(const Entity& entity)
             requires CreatableEntity<Entity, Key> && (!Cfg.read_only)
         {
-            auto entity = co_await Base::insertRaw(std::move(wrapper));
-            if (entity) {
-                co_await setInCache(makeRedisKey(entity->key()), *entity);
+            auto result = co_await Base::insertRaw(entity);
+            if (result) {
+                co_await setInCache(makeRedisKey(result->key()), *result);
             }
-            co_return entity;
+            co_return result;
         }
 
         /// Partial update: invalidates Redis, returning entity by value.

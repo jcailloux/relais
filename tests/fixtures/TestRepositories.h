@@ -46,7 +46,7 @@ inline constexpr auto purchaseUserId = [](const auto& p) -> int64_t { return p.u
 // Entity Construction Helpers
 // =============================================================================
 
-inline auto makeTestItem(
+inline TestItemWrapper makeTestItem(
     const std::string& name,
     int32_t value = 0,
     const std::string& description = {},
@@ -59,10 +59,10 @@ inline auto makeTestItem(
     entity.value = value;
     entity.description = description;
     entity.is_active = is_active;
-    return std::make_shared<const TestItemWrapper>(std::move(entity));
+    return entity;
 }
 
-inline auto makeTestUser(
+inline TestUserWrapper makeTestUser(
     const std::string& username,
     const std::string& email,
     int32_t balance = 0,
@@ -73,10 +73,10 @@ inline auto makeTestUser(
     entity.username = username;
     entity.email = email;
     entity.balance = balance;
-    return std::make_shared<const TestUserWrapper>(std::move(entity));
+    return entity;
 }
 
-inline auto makeTestPurchase(
+inline TestPurchaseWrapper makeTestPurchase(
     int64_t user_id,
     const std::string& product_name,
     int32_t amount,
@@ -89,10 +89,10 @@ inline auto makeTestPurchase(
     entity.product_name = product_name;
     entity.amount = amount;
     entity.status = status;
-    return std::make_shared<const TestPurchaseWrapper>(std::move(entity));
+    return entity;
 }
 
-inline auto makeTestArticle(
+inline TestArticleWrapper makeTestArticle(
     const std::string& category,
     int64_t author_id,
     const std::string& title,
@@ -107,7 +107,7 @@ inline auto makeTestArticle(
     entity.title = title;
     entity.view_count = view_count;
     entity.is_published = is_published;
-    return std::make_shared<const TestArticleWrapper>(std::move(entity));
+    return entity;
 }
 
 // =============================================================================
@@ -218,7 +218,7 @@ using ReadOnlyL2TestUserRepo = Repo<TestUserWrapper, "test:readonly:user:l2", te
 
 using UncachedTestProductRepo = Repo<TestProductWrapper, "test:product:uncached", cfg::Uncached>;
 
-inline auto makeTestProduct(
+inline TestProductWrapper makeTestProduct(
     const std::string& productName,
     int32_t stockLevel = 0,
     std::optional<int32_t> discountPct = std::nullopt,
@@ -233,7 +233,7 @@ inline auto makeTestProduct(
     entity.discountPct = discountPct;
     entity.available = available;
     entity.description = description;
-    return std::make_shared<const TestProductWrapper>(std::move(entity));
+    return entity;
 }
 
 // =============================================================================
@@ -243,7 +243,7 @@ inline auto makeTestProduct(
 // Cross-invalidation key extractor: Event -> User
 inline constexpr auto eventUserId = [](const auto& e) -> int64_t { return e.user_id; };
 
-inline auto makeTestEvent(
+inline TestEventWrapper makeTestEvent(
     const std::string& region,
     int64_t user_id,
     const std::string& title,
@@ -256,7 +256,7 @@ inline auto makeTestEvent(
     entity.user_id = user_id;
     entity.title = title;
     entity.priority = priority;
-    return std::make_shared<const TestEventWrapper>(std::move(entity));
+    return entity;
 }
 
 // =============================================================================
@@ -277,7 +277,7 @@ using L1TestMembershipRepo = Repo<TestMembershipWrapper, "test:member:l1">;
 using L2TestMembershipRepo = Repo<TestMembershipWrapper, "test:member:l2", cfg::Redis>;
 using FullCacheTestMembershipRepo = Repo<TestMembershipWrapper, "test:member:both", cfg::Both>;
 
-inline auto makeTestMembership(
+inline TestMembershipWrapper makeTestMembership(
     int64_t user_id,
     int64_t group_id,
     const std::string& role = ""
@@ -286,7 +286,7 @@ inline auto makeTestMembership(
     entity.user_id = user_id;
     entity.group_id = group_id;
     entity.role = role;
-    return std::make_shared<const TestMembershipWrapper>(std::move(entity));
+    return entity;
 }
 
 } // namespace relais_test

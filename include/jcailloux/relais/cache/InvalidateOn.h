@@ -1,7 +1,6 @@
 #ifndef JCX_RELAIS_INVALIDATEON_H
 #define JCX_RELAIS_INVALIDATEON_H
 
-#include <memory>
 #include <optional>
 #include <utility>
 #include "jcailloux/relais/io/Task.h"
@@ -12,26 +11,25 @@ namespace jcailloux::relais::cache {
 // InvalidationData - Carries old/new entity values for cross-invalidation
 // =============================================================================
 
-/// Wrapper pointer type
-template<typename Entity>
-using WrapperPtr = std::shared_ptr<const Entity>;
-
-/// Invalidation data for cross-repository notifications
+/// Invalidation data for cross-repository notifications.
+/// Raw pointers to data owned by the caller's coroutine frame (const Entity&
+/// parameter or local optional<Entity>). Safe because the fold expression
+/// `(co_await Dependencies::invalidateWithData(data), ...)` is sequential.
 template<typename Entity>
 struct InvalidationData {
-    WrapperPtr<Entity> old_entity;  // null for insert
-    WrapperPtr<Entity> new_entity;  // null for delete
+    const Entity* old_entity = nullptr;  // null for insert
+    const Entity* new_entity = nullptr;  // null for delete
 
-    static InvalidationData forCreate(WrapperPtr<Entity> entity) {
-        return {{}, std::move(entity)};
+    static InvalidationData forCreate(const Entity& e) {
+        return {nullptr, &e};
     }
 
-    static InvalidationData forUpdate(WrapperPtr<Entity> old_e, WrapperPtr<Entity> new_e) {
-        return {std::move(old_e), std::move(new_e)};
+    static InvalidationData forUpdate(const Entity* old_e, const Entity& new_e) {
+        return {old_e, &new_e};
     }
 
-    static InvalidationData forDelete(WrapperPtr<Entity> entity) {
-        return {std::move(entity), {}};
+    static InvalidationData forDelete(const Entity& e) {
+        return {&e, nullptr};
     }
 
     bool isCreate() const { return !old_entity && new_entity; }
@@ -58,8 +56,9 @@ struct Invalidate {
 
     template<typename Entity>
     static io::Task<void> invalidateWithData(const InvalidationData<Entity>& data) {
-        std::optional<decltype(extractKey(std::declval<Entity>()))> old_key;
-        std::optional<decltype(extractKey(std::declval<Entity>()))> new_key;
+        using KeyT = decltype(extractKey(std::declval<Entity>()));
+        std::optional<KeyT> old_key;
+        std::optional<KeyT> new_key;
 
         if (data.old_entity) {
             old_key = extractKey(*data.old_entity);
@@ -98,13 +97,12 @@ struct InvalidateList {
 
     template<typename Entity>
     static io::Task<void> invalidate(const Entity& entity) {
-        auto entity_ptr = std::make_shared<const Entity>(entity);
-        if constexpr (requires { ListCache::onEntityModified(entity_ptr); }) {
-            co_await ListCache::onEntityModified(std::move(entity_ptr));
-        } else if constexpr (requires { ListCache::onEntityCreated(entity_ptr); }) {
-            co_await ListCache::onEntityCreated(std::move(entity_ptr));
-        } else if constexpr (requires { ListCache::notifyCreated(entity_ptr); }) {
-            ListCache::notifyCreated(std::move(entity_ptr));
+        if constexpr (requires { ListCache::onEntityModified(entity); }) {
+            co_await ListCache::onEntityModified(entity);
+        } else if constexpr (requires { ListCache::onEntityCreated(entity); }) {
+            co_await ListCache::onEntityCreated(entity);
+        } else if constexpr (requires { ListCache::notifyCreated(entity); }) {
+            ListCache::notifyCreated(entity);
             co_return;
         }
     }
@@ -115,46 +113,42 @@ struct InvalidateList {
             co_await ListCache::onEntityModified(data);
         }
         else if constexpr (requires { ListCache::onEntityUpdated(
-            std::declval<WrapperPtr<Entity>>(),
-            std::declval<WrapperPtr<Entity>>()); }) {
+            std::declval<const Entity&>(),
+            std::declval<const Entity&>()); }) {
 
             if (data.isCreate() && data.new_entity) {
-                if constexpr (requires { ListCache::onEntityCreated(data.new_entity); }) {
-                    co_await ListCache::onEntityCreated(data.new_entity);
-                } else {
-                    co_await ListCache::onEntityUpdated(nullptr, data.new_entity);
+                if constexpr (requires { ListCache::onEntityCreated(std::declval<const Entity&>()); }) {
+                    co_await ListCache::onEntityCreated(*data.new_entity);
                 }
             } else if (data.isDelete() && data.old_entity) {
-                if constexpr (requires { ListCache::onEntityDeleted(data.old_entity); }) {
-                    co_await ListCache::onEntityDeleted(data.old_entity);
-                } else {
-                    co_await ListCache::onEntityUpdated(data.old_entity, nullptr);
+                if constexpr (requires { ListCache::onEntityDeleted(std::declval<const Entity&>()); }) {
+                    co_await ListCache::onEntityDeleted(*data.old_entity);
                 }
             } else if (data.isUpdate()) {
-                co_await ListCache::onEntityUpdated(data.old_entity, data.new_entity);
+                co_await ListCache::onEntityUpdated(*data.old_entity, *data.new_entity);
             }
         }
         else if constexpr (requires { ListCache::notifyUpdated(
-            std::declval<WrapperPtr<Entity>>(),
-            std::declval<WrapperPtr<Entity>>()); }) {
+            std::declval<const Entity&>(),
+            std::declval<const Entity&>()); }) {
 
             if (data.isCreate() && data.new_entity) {
-                ListCache::notifyCreated(data.new_entity);
+                ListCache::notifyCreated(*data.new_entity);
             } else if (data.isDelete() && data.old_entity) {
-                ListCache::notifyDeleted(data.old_entity);
+                ListCache::notifyDeleted(*data.old_entity);
             } else if (data.isUpdate()) {
-                ListCache::notifyUpdated(data.old_entity, data.new_entity);
+                ListCache::notifyUpdated(*data.old_entity, *data.new_entity);
             }
             co_return;
         }
         else if constexpr (requires { ListCache::onEntityModified(
-            std::declval<WrapperPtr<Entity>>()); }) {
+            std::declval<const Entity&>()); }) {
 
             if (data.new_entity) {
-                co_await ListCache::onEntityModified(data.new_entity);
+                co_await ListCache::onEntityModified(*data.new_entity);
             }
             else if (data.old_entity) {
-                co_await ListCache::onEntityModified(data.old_entity);
+                co_await ListCache::onEntityModified(*data.old_entity);
             }
         }
     }
@@ -319,20 +313,20 @@ io::Task<void> propagateInvalidationsWithData(const InvalidationData<Entity>& da
 }
 
 template<typename Entity, typename InvalidatesType>
-io::Task<void> propagateCreate(WrapperPtr<Entity> entity) {
-    auto data = InvalidationData<Entity>::forCreate(std::move(entity));
+io::Task<void> propagateCreate(const Entity& entity) {
+    auto data = InvalidationData<Entity>::forCreate(entity);
     co_await propagateInvalidationsWithData<Entity, InvalidatesType>(data);
 }
 
 template<typename Entity, typename InvalidatesType>
-io::Task<void> propagateUpdate(WrapperPtr<Entity> old_entity, WrapperPtr<Entity> new_entity) {
-    auto data = InvalidationData<Entity>::forUpdate(std::move(old_entity), std::move(new_entity));
+io::Task<void> propagateUpdate(const Entity* old_entity, const Entity& new_entity) {
+    auto data = InvalidationData<Entity>::forUpdate(old_entity, new_entity);
     co_await propagateInvalidationsWithData<Entity, InvalidatesType>(data);
 }
 
 template<typename Entity, typename InvalidatesType>
-io::Task<void> propagateDelete(WrapperPtr<Entity> entity) {
-    auto data = InvalidationData<Entity>::forDelete(std::move(entity));
+io::Task<void> propagateDelete(const Entity& entity) {
+    auto data = InvalidationData<Entity>::forDelete(entity);
     co_await propagateInvalidationsWithData<Entity, InvalidatesType>(data);
 }
 

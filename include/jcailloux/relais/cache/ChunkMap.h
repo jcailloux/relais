@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <tuple>
 #include <variant>
 #include <vector>
@@ -97,7 +98,15 @@ public:
     /// The returned CacheEntry* is valid as long as FindResult lives.
     FindResult find(const K& key) {
         auto guard = epoch::EpochGuard::acquire();
-        auto opt = map_.Find(key);
+        auto opt = map_.Find_in_epoch(key);
+        if (!opt) return {};
+        return {*opt, std::move(guard)};
+    }
+
+    /// Find entry by pre-computed hashed key (avoids re-hashing).
+    FindResult find(const hashed_key& hk) {
+        auto guard = epoch::EpochGuard::acquire();
+        auto opt = map_.Find_in_epoch(hk);
         if (!opt) return {};
         return {*opt, std::move(guard)};
     }
@@ -109,10 +118,12 @@ public:
     /// Insert or replace entry. Returns epoch-guarded result pointing to the
     /// NEW entry. EpochGuard is acquired BEFORE the Upsert to protect the new
     /// entry from concurrent Upsert + Retire by another thread.
+    /// Uses Upsert_in_epoch: the ticket-based EpochGuard already pins the
+    /// epoch, making ParlayHash's internal with_epoch() redundant.
     FindResult upsert(const K& key, V value, Metadata meta = {}) {
         auto guard = epoch::EpochGuard::acquire();
         auto* new_entry = pool_.New(std::move(value), std::move(meta));
-        auto old = map_.Upsert(key, [&](std::optional<CacheEntry*>) -> CacheEntry* {
+        auto old = map_.Upsert_in_epoch(key, [&](std::optional<CacheEntry*>) -> CacheEntry* {
             return new_entry;
         });
         bool inserted = !old.has_value();
@@ -126,7 +137,7 @@ public:
     FindResult upsert(const hashed_key& hk, V value, Metadata meta = {}) {
         auto guard = epoch::EpochGuard::acquire();
         auto* new_entry = pool_.New(std::move(value), std::move(meta));
-        auto old = map_.Upsert(hk, [&](std::optional<CacheEntry*>) -> CacheEntry* {
+        auto old = map_.Upsert_in_epoch(hk, [&](std::optional<CacheEntry*>) -> CacheEntry* {
             return new_entry;
         });
         bool inserted = !old.has_value();
@@ -197,6 +208,18 @@ public:
         long nb = map_.num_buckets();
         long chunk_size = (nb + n_chunks - 1) / n_chunks;
         long bucket = map_.bucket_for_key(key);
+        return bucket / chunk_size;
+    }
+
+    /// Compute which chunk a pre-computed hash falls into (avoids re-hashing).
+    /// Uses ParlayHash's high-bit bucket mapping: (hash >> (48 - log2(size))) & (size - 1).
+    /// Use with get_hash(make_key(key)) for single-hash lookup + chunk computation.
+    long chunk_for_hash(size_t hash, long n_chunks) {
+        long nb = map_.num_buckets();
+        long chunk_size = (nb + n_chunks - 1) / n_chunks;
+        int num_bits = std::countr_zero(static_cast<unsigned long>(nb));
+        long bucket = static_cast<long>(
+            (hash >> (48 - num_bits)) & static_cast<size_t>(nb - 1));
         return bucket / chunk_size;
     }
 

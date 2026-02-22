@@ -23,13 +23,6 @@
 namespace jcailloux::relais {
 
 // =========================================================================
-// Wrapper pointer type - immutable shared pointer to entity (input params)
-// =========================================================================
-
-template<typename Entity>
-using WrapperPtr = std::shared_ptr<const Entity>;
-
-// =========================================================================
 // Concepts
 // =========================================================================
 
@@ -120,8 +113,6 @@ inline std::string buildUpdateReturning(
 // All methods return epoch-guarded views (EntityView / JsonView / BinaryView).
 // Entities are allocated in a static memory_pool and immediately retired.
 // The EpochGuard prevents reclamation until the view is destroyed.
-//
-// WrapperPtrType (shared_ptr) is kept for input parameters (insert/update).
 
 template<typename Entity, config::FixedString Name, config::CacheConfig Cfg, typename Key>
 requires ReadableEntity<Entity>
@@ -132,7 +123,6 @@ public:
     using EntityType = Entity;
     using KeyType = Key;
     using WrapperType = Entity;
-    using WrapperPtrType = WrapperPtr<Entity>;
     using FindResultType = wrapper::EntityView<Entity>;
 
     static constexpr auto config = Cfg;
@@ -202,12 +192,12 @@ public:
     // =====================================================================
 
     /// Insert entity in database. Returns epoch-guarded EntityView (empty on error).
-    static io::Task<wrapper::EntityView<Entity>> insert(WrapperPtrType wrapper)
+    static io::Task<wrapper::EntityView<Entity>> insert(const Entity& entity)
         requires MutableEntity<Entity> && (!Cfg.read_only)
     {
-        auto entity = co_await insertRaw(std::move(wrapper));
-        if (!entity) co_return {};
-        co_return makeView(std::move(*entity));
+        auto result = co_await insertRaw(entity);
+        if (!result) co_return {};
+        co_return makeView(std::move(*result));
     }
 
     // =====================================================================
@@ -215,34 +205,11 @@ public:
     // =====================================================================
 
     /// Full update of entity in database. Returns true on success.
-    static io::Task<bool> update(const Key& id, WrapperPtrType wrapper)
+    static io::Task<bool> update(const Key& id, const Entity& entity)
         requires MutableEntity<Entity> && (!Cfg.read_only)
     {
-        if (!wrapper) co_return false;
-
-        try {
-            auto keyParams = io::PgParams::fromKey(id);
-            io::PgParams fieldParams;
-            if constexpr (config::is_tuple_v<Key>) {
-                fieldParams = Entity::toUpdateParams(*wrapper);
-            } else {
-                fieldParams = Entity::toInsertParams(*wrapper);
-            }
-            io::PgParams params;
-            params.params.reserve(keyParams.params.size() + fieldParams.params.size());
-            for (auto& p : keyParams.params)
-                params.params.push_back(std::move(p));
-            for (auto& p : fieldParams.params)
-                params.params.push_back(std::move(p));
-
-            auto affected = co_await DbProvider::execute(
-                Mapping::SQL::update, params);
-            co_return affected > 0;
-
-        } catch (const io::PgError& e) {
-            RELAIS_LOG_ERROR << name() << ": update error - " << e.what();
-            co_return false;
-        }
+        auto outcome = co_await updateOutcome(id, entity);
+        co_return outcome.success;
     }
 
     // =====================================================================
@@ -259,33 +226,12 @@ public:
 
 protected:
     /// Internal erase with optional entity hint (for partition pruning).
-    /// Hint remains as shared_ptr for compatibility with cache layers.
     static io::Task<std::optional<size_t>> eraseImpl(
-        const Key& id, WrapperPtrType cachedHint = nullptr)
+        const Key& id, const Entity* hint = nullptr)
         requires (!Cfg.read_only)
     {
-        try {
-            int affected;
-            if constexpr (HasPartitionHint<Entity>) {
-                if (cachedHint) {
-                    auto params = Mapping::makePartitionHintParams(*cachedHint);
-                    affected = co_await DbProvider::execute(
-                        Mapping::SQL::delete_with_partition, params);
-                } else {
-                    auto params = io::PgParams::fromKey(id);
-                    affected = co_await DbProvider::execute(
-                        Mapping::SQL::delete_by_pk, params);
-                }
-            } else {
-                auto params = io::PgParams::fromKey(id);
-                affected = co_await DbProvider::execute(
-                    Mapping::SQL::delete_by_pk, params);
-            }
-            co_return static_cast<size_t>(affected);
-        } catch (const io::PgError& e) {
-            RELAIS_LOG_ERROR << name() << ": erase error - " << e.what();
-            co_return std::nullopt;
-        }
+        auto outcome = co_await eraseOutcome(id, hint);
+        co_return outcome.affected;
     }
 
 public:
@@ -367,12 +313,11 @@ protected:
     }
 
     /// Insert entity in database, returning entity by value.
-    static io::Task<std::optional<Entity>> insertRaw(WrapperPtrType wrapper)
+    static io::Task<std::optional<Entity>> insertRaw(const Entity& entity)
         requires MutableEntity<Entity> && (!Cfg.read_only)
     {
-        if (!wrapper) co_return std::nullopt;
         try {
-            auto params = Entity::toInsertParams(*wrapper);
+            auto params = Entity::toInsertParams(entity);
             auto result = co_await DbProvider::queryParams(
                 Mapping::SQL::insert, params);
             if (result.empty()) co_return std::nullopt;
@@ -423,6 +368,84 @@ protected:
         } catch (const io::PgError& e) {
             RELAIS_LOG_ERROR << name() << ": patch error - " << e.what();
             co_return std::nullopt;
+        }
+    }
+
+    // =====================================================================
+    // Write outcome types (for write coalescing propagation)
+    // =====================================================================
+    //
+    // When the BatchScheduler coalesces identical writes (same SQL + same
+    // params), followers receive the leader's result with coalesced=true.
+    // Upper layers (RedisRepo, CachedRepo) use this to skip redundant
+    // cache operations (L1 evict, L2 Redis SET/DEL).
+
+    struct WriteOutcome {
+        bool success = false;
+        bool coalesced = false;
+    };
+
+    struct EraseOutcome {
+        std::optional<size_t> affected;
+        bool coalesced = false;
+    };
+
+    /// Update returning full outcome (success + coalesced flag).
+    static io::Task<WriteOutcome> updateOutcome(const Key& id, const Entity& entity)
+        requires MutableEntity<Entity> && (!Cfg.read_only)
+    {
+        try {
+            auto keyParams = io::PgParams::fromKey(id);
+            io::PgParams fieldParams;
+            if constexpr (config::is_tuple_v<Key>) {
+                fieldParams = Entity::toUpdateParams(entity);
+            } else {
+                fieldParams = Entity::toInsertParams(entity);
+            }
+            io::PgParams params;
+            params.params.reserve(keyParams.params.size() + fieldParams.params.size());
+            for (auto& p : keyParams.params)
+                params.params.push_back(std::move(p));
+            for (auto& p : fieldParams.params)
+                params.params.push_back(std::move(p));
+
+            auto [affected, coalesced] = co_await DbProvider::execute(
+                Mapping::SQL::update, params);
+            co_return WriteOutcome{affected > 0, coalesced};
+
+        } catch (const io::PgError& e) {
+            RELAIS_LOG_ERROR << name() << ": update error - " << e.what();
+            co_return WriteOutcome{};
+        }
+    }
+
+    /// Erase returning full outcome (affected + coalesced flag).
+    static io::Task<EraseOutcome> eraseOutcome(
+        const Key& id, const Entity* hint = nullptr)
+        requires (!Cfg.read_only)
+    {
+        try {
+            int affected;
+            bool coalesced;
+            if constexpr (HasPartitionHint<Entity>) {
+                if (hint) {
+                    auto params = Mapping::makePartitionHintParams(*hint);
+                    std::tie(affected, coalesced) = co_await DbProvider::execute(
+                        Mapping::SQL::delete_with_partition, params);
+                } else {
+                    auto params = io::PgParams::fromKey(id);
+                    std::tie(affected, coalesced) = co_await DbProvider::execute(
+                        Mapping::SQL::delete_by_pk, params);
+                }
+            } else {
+                auto params = io::PgParams::fromKey(id);
+                std::tie(affected, coalesced) = co_await DbProvider::execute(
+                    Mapping::SQL::delete_by_pk, params);
+            }
+            co_return EraseOutcome{static_cast<size_t>(affected), coalesced};
+        } catch (const io::PgError& e) {
+            RELAIS_LOG_ERROR << name() << ": erase error - " << e.what();
+            co_return EraseOutcome{};
         }
     }
 

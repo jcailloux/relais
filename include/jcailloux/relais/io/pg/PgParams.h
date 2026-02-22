@@ -83,6 +83,12 @@ private:
 
     std::string value_;
     bool null_ = true;
+
+    friend bool operator==(const PgParam& a, const PgParam& b) noexcept {
+        if (a.null_ != b.null_) return false;
+        if (a.null_) return true;
+        return a.value_ == b.value_;
+    }
 };
 
 // PgParams — helper to build parameter arrays for PQsendQueryParams
@@ -182,6 +188,10 @@ private:
     template<typename T>
     static PgParam toParam(const std::optional<T>& v) {
         return PgParam::fromOptional(v);
+    }
+
+    friend bool operator==(const PgParams& a, const PgParams& b) noexcept {
+        return a.params == b.params;
     }
 };
 

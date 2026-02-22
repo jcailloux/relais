@@ -112,7 +112,7 @@ using L1CustomTestPurchaseRepo = Repo<TestPurchaseWrapper, "test:purchase:l1:cus
 class L1PurchaseListInvalidator {
 public:
     static io::Task<void> onEntityModified(
-        std::shared_ptr<const TestPurchaseWrapper>)
+        const TestPurchaseWrapper&)
     {
         TestInternals::resetListCacheState<TestPurchaseListRepo>();
         co_return;

@@ -160,7 +160,7 @@ struct TestInternals {
     /// Synchronous notifyCreated: L1 inline + L2 co_await (not DetachedTask).
     /// Returns number of L2 pages deleted. Requires sync() from test_helper.h.
     template<typename Repo>
-    static size_t notifyCreatedSync(typename Repo::WrapperPtrType entity) {
+    static size_t notifyCreatedSync(const typename Repo::EntityType& entity) {
         constexpr auto level = Repo::config.cache_level;
         constexpr bool hasL1 = level == jcailloux::relais::config::CacheLevel::L1
                             || level == jcailloux::relais::config::CacheLevel::L1_L2;
@@ -168,14 +168,14 @@ struct TestInternals {
                             || level == jcailloux::relais::config::CacheLevel::L1_L2;
 
         if constexpr (hasL1) { Repo::listCache().onEntityCreated(entity); }
-        if constexpr (hasL2) { return sync(Repo::invalidateL2Created(*entity)); }
+        if constexpr (hasL2) { return sync(Repo::invalidateL2Created(entity)); }
         return 0;
     }
 
     /// Synchronous notifyUpdated: L1 inline + L2 co_await.
     template<typename Repo>
-    static size_t notifyUpdatedSync(typename Repo::WrapperPtrType old_e,
-                                    typename Repo::WrapperPtrType new_e) {
+    static size_t notifyUpdatedSync(const typename Repo::EntityType& old_e,
+                                    const typename Repo::EntityType& new_e) {
         constexpr auto level = Repo::config.cache_level;
         constexpr bool hasL1 = level == jcailloux::relais::config::CacheLevel::L1
                             || level == jcailloux::relais::config::CacheLevel::L1_L2;
@@ -183,13 +183,13 @@ struct TestInternals {
                             || level == jcailloux::relais::config::CacheLevel::L1_L2;
 
         if constexpr (hasL1) { Repo::listCache().onEntityUpdated(old_e, new_e); }
-        if constexpr (hasL2) { return sync(Repo::invalidateL2Updated(*old_e, *new_e)); }
+        if constexpr (hasL2) { return sync(Repo::invalidateL2Updated(old_e, new_e)); }
         return 0;
     }
 
     /// Synchronous notifyDeleted: L1 inline + L2 co_await.
     template<typename Repo>
-    static size_t notifyDeletedSync(typename Repo::WrapperPtrType entity) {
+    static size_t notifyDeletedSync(const typename Repo::EntityType& entity) {
         constexpr auto level = Repo::config.cache_level;
         constexpr bool hasL1 = level == jcailloux::relais::config::CacheLevel::L1
                             || level == jcailloux::relais::config::CacheLevel::L1_L2;
@@ -197,7 +197,7 @@ struct TestInternals {
                             || level == jcailloux::relais::config::CacheLevel::L1_L2;
 
         if constexpr (hasL1) { Repo::listCache().onEntityDeleted(entity); }
-        if constexpr (hasL2) { return sync(Repo::invalidateL2Deleted(*entity)); }
+        if constexpr (hasL2) { return sync(Repo::invalidateL2Deleted(entity)); }
         return 0;
     }
 

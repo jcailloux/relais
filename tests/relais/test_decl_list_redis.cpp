@@ -47,7 +47,7 @@ using L2ArticleDescQuery = decl::ListDescriptorQuery<L2ArticleDecl>;
 // Helper: build a TestArticleWrapper from raw values (for SortBounds tests)
 // =============================================================================
 
-static std::shared_ptr<const TestArticleWrapper> makeArticle(
+static TestArticleWrapper makeArticle(
     int64_t id,
     const std::string& category,
     int64_t author_id,

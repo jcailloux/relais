@@ -315,22 +315,29 @@ public:
     /// Get cached result for a query (with lazy validation + GDSF score bump).
     /// Returns epoch-guarded ResultView (empty if miss or invalidated).
     ResultView get(const Query& query) {
+        return getByKey(query.cacheKey());
+    }
+
+    /// Get cached result by pre-computed cache key (avoids toCacheQuery overhead).
+    /// Single-hash: hashes the key once for both lookup and chunk computation.
+    ResultView getByKey(const std::string& key) {
         // Trigger cleanup every N gets
         if (++get_counter_ % config_.cleanup_every_n_gets == 0) {
             trySweep();
         }
 
-        const auto& key = query.cacheKey();
-
-        auto result = cache_.find(key);
+        auto hk = L1Cache::make_key(key);
+        auto result = cache_.find(hk);
         if (!result) return {};
 
         auto* entry = result.entry;
         auto& meta = entry->metadata;
         auto& value = entry->value;
 
-        // Lazy validation: check if modifications affect this result (with bitmap skip)
-        long chunk_id = cache_.chunk_for_key(key, static_cast<long>(ChunkCount));
+        // Single-hash chunk computation: extract hash from pre-computed hashed_key
+        size_t hash = L1Cache::get_hash(hk);
+        long chunk_id = cache_.chunk_for_hash(hash, static_cast<long>(ChunkCount));
+
         if (isAffectedByModificationsForChunk(meta, value, config::CachedClock::now(), chunk_id)) {
             // Two-phase eviction: remove only if same entry (guards against concurrent Upsert)
             cache_.remove_if(key, [entry](auto* e) { return e == entry; });
@@ -349,8 +356,9 @@ public:
     }
 
     /// Store result for a query with optional sort bounds and construction cost.
-    void put(const Query& query, Result result, SortBounds bounds = {},
-             float construction_time_us = 0.0f) {
+    /// Returns epoch-guarded ResultView pointing to the cached entry.
+    ResultView put(const Query& query, Result result, SortBounds bounds = {},
+                   float construction_time_us = 0.0f) {
         const auto& key = query.cacheKey();
         const auto now = Clock::now();
 
@@ -364,7 +372,8 @@ public:
             static_cast<uint16_t>(result.items.size()),
             construction_time_us, gen);
 
-        cache_.upsert(key, std::move(result), std::move(meta));
+        auto find_result = cache_.upsert(key, std::move(result), std::move(meta));
+        return ResultView(&find_result.entry->value, std::move(find_result.guard));
     }
 
     /// Helper to extract sort bounds from a result
@@ -386,19 +395,18 @@ public:
     // =========================================================================
 
     /// Record entity creation for invalidation
-    void onEntityCreated(std::shared_ptr<const Entity> entity) {
-        modifications_.notifyCreated(std::move(entity));
+    void onEntityCreated(const Entity& entity) {
+        modifications_.notifyCreated(entity);
     }
 
     /// Record entity update for invalidation
-    void onEntityUpdated(std::shared_ptr<const Entity> old_entity,
-                         std::shared_ptr<const Entity> new_entity) {
-        modifications_.notifyUpdated(std::move(old_entity), std::move(new_entity));
+    void onEntityUpdated(const Entity& old_entity, const Entity& new_entity) {
+        modifications_.notifyUpdated(old_entity, new_entity);
     }
 
     /// Record entity deletion for invalidation
-    void onEntityDeleted(std::shared_ptr<const Entity> entity) {
-        modifications_.notifyDeleted(std::move(entity));
+    void onEntityDeleted(const Entity& entity) {
+        modifications_.notifyDeleted(entity);
     }
 
     /// Invalidate a specific query
