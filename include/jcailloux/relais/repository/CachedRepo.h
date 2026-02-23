@@ -424,11 +424,16 @@ private:
         co_return {};
     }
 
+    /// Per-entry memory overhead beyond Entity::memoryUsage().
+    /// CachedWrapper fields + Metadata + padding + ParlayHash bucket (key + pointer).
+    static constexpr size_t kCacheEntryOverhead =
+        sizeof(typename L1Cache::CacheEntry) - sizeof(Entity)
+        + sizeof(Key) + sizeof(void*);
+
     /// Build ValueType from entity (copy path).
     static ValueType buildValue(const Entity& src) {
         if constexpr (HasGDSF) {
-            constexpr size_t kOverhead = sizeof(Key) + sizeof(Metadata);
-            return cache::CachedWrapper<Entity>(Entity(src), kOverhead);
+            return cache::CachedWrapper<Entity>(Entity(src), kCacheEntryOverhead);
         } else {
             return Entity(src);
         }
@@ -437,8 +442,7 @@ private:
     /// Build ValueType from entity (move path — zero copy).
     static ValueType buildValue(Entity&& src) {
         if constexpr (HasGDSF) {
-            constexpr size_t kOverhead = sizeof(Key) + sizeof(Metadata);
-            return cache::CachedWrapper<Entity>(std::move(src), kOverhead);
+            return cache::CachedWrapper<Entity>(std::move(src), kCacheEntryOverhead);
         } else {
             return std::move(src);
         }

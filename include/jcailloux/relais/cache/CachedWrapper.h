@@ -28,7 +28,13 @@ public:
         , extra_overhead_(extra_overhead)
     {
         this->memory_hook_ = &chargeHook;
-        chargeHook(static_cast<int64_t>(this->memoryUsage() + extra_overhead_));
+        chargeHook(static_cast<int64_t>(this->memoryUsage()));
+    }
+
+    /// Full memory cost of this cache entry (entity + overhead).
+    /// Includes: struct + dynamicSize (heap) + lazy BEVE/JSON buffers + cache overhead.
+    [[nodiscard]] size_t memoryUsage() const {
+        return Entity::memoryUsage() + extra_overhead_;
     }
 
     /// Move constructor: transfers memory tracking to the new object.
@@ -44,7 +50,7 @@ public:
 
     ~CachedWrapper() {
         if (this->memory_hook_) {
-            this->memory_hook_(-static_cast<int64_t>(this->memoryUsage() + extra_overhead_));
+            this->memory_hook_(-static_cast<int64_t>(this->memoryUsage()));
         }
     }
 

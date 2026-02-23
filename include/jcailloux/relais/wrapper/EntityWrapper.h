@@ -17,6 +17,14 @@
 
 namespace jcailloux::relais::wrapper {
 
+/// Heap capacity of a std::string, excluding SSO buffer (already in sizeof).
+/// Portable: checks if data() points outside the string object.
+inline size_t heapCapacity(const std::string& s) {
+    const char* p = s.data();
+    const char* obj = reinterpret_cast<const char*>(&s);
+    return (p < obj || p >= obj + sizeof(std::string)) ? s.capacity() : 0;
+}
+
 // =============================================================================
 // EntityWrapper<Struct, Mapping> — API-side wrapper for pure data structs
 //
