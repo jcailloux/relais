@@ -5,7 +5,7 @@
 ### Added
 
 - **Lock-free L1 cache** — ParlayHash-backed `ChunkMap` with epoch-based reclamation; `find`/`insert`/`patch` return lightweight `EntityView` instead of `shared_ptr`
-- **GDSF eviction** — L1 eviction via `RELAIS_L1_MAX_MEMORY` CMake option (0 = disabled); zero overhead when disabled
+- **GDSF eviction** — size-aware L1 eviction via `RELAIS_L1_MAX_MEMORY` CMake option (0 = disabled); score = access_count × avg_cost / memoryUsage; histogram-based threshold with three-zone eviction curve; inline decay during cleanup; access count persistence across upserts; zero overhead when disabled
 - **Zero-copy RowView serialization** — `findJson()`/`findBinary()`/`queryJson()`/`queryBinary()` serialize directly from PgResult rows, skipping entity construction
 - **Configurable L2 format** — `CacheConfig::l2_format`: `Binary` (BEVE, default) or `Json` for non-C++ interop
 - **Composite primary keys** — `std::tuple`-based keys from multiple `@relais primary_key` fields with full CRUD and caching support
@@ -34,6 +34,7 @@
 - **`DbProvider::init()`** now requires an `io` context parameter
 - **Composite keys**: `key()` returns `std::tuple`, SQL uses multi-column WHERE clauses
 - **Partition key concept**: `HasPartitionKey` → `HasPartitionHint`
+- **GDSF internals**: `GDSFScoreData` stores `atomic<uint32_t> access_count` (4 B) instead of `atomic<float> score` + `atomic<uint32_t> last_generation` (8 B); `GDSFConfig::correction_alpha` → `histogram_alpha`; `RepoRegistryEntry::repo_score_fn` removed
 - **List cache keys**: canonical binary buffers replace XXH3 hashes (`query_hash` → `cache_key`)
 - `InvalidationData`: `optional<shared_ptr<const T>>` → `shared_ptr<const T>`
 - `Keyed`/`CreatableEntity` concepts no longer default `Key` to `int64_t`
@@ -44,6 +45,9 @@
 - `EntityWrapper::releaseCaches()`
 - `CacheConfig::l1_cleanup_every_n_gets` / `l1_cleanup_min_interval`
 - `shardmap` dependency (replaced by vendored ParlayHash)
+- `GDSFPolicy::decay()`, `decayFactor()`, `generation()`, `tick()`, `correction()`, `updateCorrection()`, `pressureFactor()`
+- `CachedRepo::repoScore()`, `CachedRepo::postCleanup()`
+- `ListCacheConfig::cleanup_every_n_gets`
 
 ## [0.4.0] - 2026-02-17
 

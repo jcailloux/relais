@@ -1,9 +1,12 @@
 #ifndef JCX_RELAIS_CACHE_GDSF_POLICY_H
 #define JCX_RELAIS_CACHE_GDSF_POLICY_H
 
+#include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <mutex>
 #include <shared_mutex>
 #include <thread>
@@ -32,8 +35,72 @@ namespace jcailloux::relais::cache {
 
 struct GDSFConfig {
     float decay_rate = 0.95f;
-    float correction_alpha = 0.3f;
-    size_t memory_counter_slots = 64;           // must be power of 2, <= 64
+    float histogram_alpha = 0.3f;            // EMA smoothing for histogram merges
+    size_t memory_counter_slots = 64;        // must be power of 2, <= 64
+};
+
+// =========================================================================
+// fast_log2_approx — IEEE 754 bit manipulation (~1-2ns, branchless)
+// =========================================================================
+
+inline float fast_log2_approx(float x) {
+    uint32_t bits;
+    std::memcpy(&bits, &x, 4);
+    return static_cast<float>(bits >> 23) - 127.0f
+         + static_cast<float>(bits & 0x7FFFFF) * (1.0f / 8388608.0f);
+}
+
+// =========================================================================
+// ScoreHistogram — 128 log2 buckets for memory-aware eviction
+// =========================================================================
+//
+// Covers scores from 2^-10 (~0.001) to 2^23.25 (~10M).
+// Each bucket stores cumulative bytes of entries in that score range.
+// O(1) recording via fast_log2_approx, O(N) threshold computation.
+// Size: 128 x 8B = 1KB.
+
+struct ScoreHistogram {
+    static constexpr int N = 128;
+    static constexpr float kLogMin = -10.0f;     // log2(0.001) ~ -10
+    static constexpr float kLogMax = 23.25f;     // log2(10M) ~ 23.25
+    static constexpr float kInvStep = static_cast<float>(N) / (kLogMax - kLogMin);
+
+    uint64_t bytes[N] = {};
+
+    void reset() { std::memset(bytes, 0, sizeof(bytes)); }
+
+    /// Record an entry (score, byte size) into the appropriate bucket.
+    void record(float score, size_t entry_bytes) {
+        int idx = (score <= 0.0f) ? 0
+            : std::clamp(static_cast<int>((fast_log2_approx(score) - kLogMin) * kInvStep),
+                         0, N - 1);
+        bytes[idx] += entry_bytes;
+    }
+
+    /// Find the threshold score such that entries below it total >= target_bytes.
+    /// Walks buckets low-to-high, accumulating bytes.
+    float thresholdForBytes(size_t target_bytes) const {
+        if (target_bytes == 0) return 0.0f;
+        uint64_t cumul = 0;
+        for (int i = 0; i < N; ++i) {
+            cumul += bytes[i];
+            if (cumul >= target_bytes) {
+                float log_val = kLogMin + static_cast<float>(i + 1) / kInvStep;
+                return std::exp2(log_val);
+            }
+        }
+        return std::exp2(kLogMax);
+    }
+
+    /// Exponential moving average merge: this = alpha * newer + (1 - alpha) * this.
+    void mergeEMA(const ScoreHistogram& newer, float alpha) {
+        float one_minus_alpha = 1.0f - alpha;
+        for (int i = 0; i < N; ++i) {
+            bytes[i] = static_cast<uint64_t>(
+                alpha * static_cast<float>(newer.bytes[i])
+              + one_minus_alpha * static_cast<float>(bytes[i]));
+        }
+    }
 };
 
 // =========================================================================
@@ -41,9 +108,8 @@ struct GDSFConfig {
 // =========================================================================
 
 struct RepoRegistryEntry {
-    bool (*sweep_fn)();         // cleanup one chunk, returns true if evicted
+    bool (*sweep_fn)();         // cleanup one chunk, returns true if evicted something
     size_t (*size_fn)();        // current L1 cache size (entry count)
-    float (*repo_score_fn)();   // current repo_score atomic
     const char* name;           // compile-time repo name (for logging)
 };
 
@@ -55,10 +121,16 @@ struct RepoRegistryEntry {
 // issues: CachedWrapper dtors may fire after static singletons are destroyed.
 //
 // Thread-safe: all public methods are safe to call concurrently.
+//
+// Eviction strategy:
+//   1. Compute usage_ratio = totalMemory / kMaxMemory
+//   2. eviction_target_pct(usage_ratio) -> % of memory to free
+//   3. histogram_.thresholdForBytes(pct * budget) -> score threshold
+//   4. Each repo sweeps 1 chunk, evicting entries with score < threshold
+//   5. Building histogram merged into persistent histogram_ via EMA
 
 class GDSFPolicy {
     static constexpr size_t kMaxMemorySlots = 64;
-    static constexpr size_t kDecayTableSize = 65;  // indices 0..64
 
 public:
     /// Compile-time memory budget from CMake define.
@@ -85,16 +157,18 @@ public:
                && "memory_counter_slots exceeds maximum");
         config_ = cfg;
         memory_slot_count_ = cfg.memory_counter_slots;
-        computeDecayTable(cfg.decay_rate);
     }
 
     const GDSFConfig& config() const { return config_; }
+
+    /// Decay rate accessor (used by cleanup predicates for inline decay).
+    float decayRate() const { return config_.decay_rate; }
 
     // =====================================================================
     // Repo Registry
     // =====================================================================
 
-    /// Register a repo for global coordination (threshold, emergency cleanup).
+    /// Register a repo for global coordination (threshold, sweep).
     /// Called once per CachedRepo instantiation via std::call_once.
     void enroll(RepoRegistryEntry entry) {
         std::unique_lock lock(registry_mutex_);
@@ -107,113 +181,31 @@ public:
     }
 
     // =====================================================================
-    // Generation & Decay
+    // Threshold (cached, updated during sweep)
     // =====================================================================
 
-    uint32_t generation() const {
-        return global_generation_.load(std::memory_order_relaxed);
-    }
-
-    /// Called by each repo after a cleanup cycle.
-    /// When all repos have ticked once, global_generation increments.
-    void tick() {
-        uint32_t count = global_counter_.fetch_add(1, std::memory_order_relaxed) + 1;
-        size_t nb;
-        {
-            std::shared_lock lock(registry_mutex_);
-            nb = registry_.size();
-        }
-        if (nb > 0 && count >= nb) {
-            global_counter_.store(0, std::memory_order_relaxed);
-            global_generation_.fetch_add(1, std::memory_order_relaxed);
-        }
-    }
-
-    /// Apply lazy decay to an entry's score based on generation gap.
-    /// Uses CAS loop to avoid losing concurrent fetch_add increments.
-    /// Accepts any GDSF-enabled metadata via GDSFScoreData base reference.
-    void decay(const GDSFScoreData& meta) const {
-        uint32_t current_gen = global_generation_.load(std::memory_order_relaxed);
-        uint32_t last_gen = meta.last_generation.load(std::memory_order_relaxed);
-
-        if (current_gen == last_gen) return;
-
-        uint32_t age = std::min(current_gen - last_gen, uint32_t(64));
-        float factor = decay_table_[age];
-
-        meta.last_generation.store(current_gen, std::memory_order_relaxed);
-
-        float old_score = meta.score.load(std::memory_order_relaxed);
-        float new_score;
-        do {
-            new_score = old_score * factor;
-        } while (!meta.score.compare_exchange_weak(
-            old_score, new_score, std::memory_order_relaxed));
-    }
-
-    /// Pre-computed decay factor for a given age (exposed for testing).
-    float decayFactor(uint32_t age) const {
-        return decay_table_[std::min(age, uint32_t(64))];
-    }
-
-    // =====================================================================
-    // Threshold
-    // =====================================================================
-
-    /// Compute global eviction threshold: weighted average of repo scores
-    /// × correction × pressure_factor.
+    /// Current eviction threshold. Set by sweep(), read by cleanup predicates.
     float threshold() const {
-        std::shared_lock lock(registry_mutex_);
-        if (registry_.empty()) return 0.0f;
-
-        float weighted_sum = 0.0f;
-        size_t total_size = 0;
-
-        for (const auto& entry : registry_) {
-            size_t sz = entry.size_fn();
-            weighted_sum += entry.repo_score_fn() * static_cast<float>(sz);
-            total_size += sz;
-        }
-
-        if (total_size == 0) return 0.0f;
-        return (weighted_sum / static_cast<float>(total_size))
-               * correction_.load(std::memory_order_relaxed)
-               * pressureFactor();
-    }
-
-    /// Update the correction coefficient after a cleanup cycle.
-    /// actual_avg = mean score of survivors after decay.
-    /// estimated_avg = repo_score before cleanup (biased by lazy decay).
-    void updateCorrection(float actual_avg, float estimated_avg) {
-        if (estimated_avg <= 0.0f) return;
-
-        float ratio = actual_avg / estimated_avg;
-        float old_corr = correction_.load(std::memory_order_relaxed);
-        float new_corr = config_.correction_alpha * ratio
-                       + (1.0f - config_.correction_alpha) * old_corr;
-
-        // CAS without retry — EMA converges naturally under contention
-        correction_.compare_exchange_weak(old_corr, new_corr, std::memory_order_relaxed);
-    }
-
-    float correction() const {
-        return correction_.load(std::memory_order_relaxed);
+        return cached_threshold_.load(std::memory_order_relaxed);
     }
 
     // =====================================================================
-    // Pressure Factor
+    // Eviction Target
     // =====================================================================
+    //
+    // Three-zone continuous quadratic curve:
+    //   < 50% usage  ->  0% eviction (no pressure)
+    //   50-80% usage ->  0% to 5% eviction (gentle quadratic)
+    //   80-100% usage -> 5% to 25% eviction (aggressive quadratic)
 
-    /// Memory pressure factor: quadratic scaling from 0 (empty) to 1 (at budget).
-    /// Multiplied to threshold: low usage → lax eviction, high usage → aggressive.
-    float pressureFactor() const {
-        if constexpr (kMaxMemory == 0) return 1.0f;
-        else {
-            float budget = static_cast<float>(kMaxMemory);
-            float usage = static_cast<float>(std::max(int64_t(0), totalMemory()));
-            float ratio = usage / budget;
-            return std::min(1.0f, ratio * ratio);
+    static float eviction_target_pct(float usage) {
+        if (usage < 0.50f) return 0.0f;
+        if (usage < 0.80f) {
+            float t = (usage - 0.50f) / 0.30f;    // 0 -> 1
+            return 0.05f * t * t;                   // 0% -> 5%, convex
         }
+        float t = (usage - 0.80f) / 0.20f;         // 0 -> 1
+        return 0.05f + 0.20f * t * t;              // 5% -> 25%, convex
     }
 
     // =====================================================================
@@ -222,7 +214,8 @@ public:
 
     /// Charge or discharge memory. Positive = allocation, negative = deallocation.
     void charge(int64_t delta) {
-        static thread_local uint32_t tl_idx = static_cast<uint32_t>(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+        static thread_local uint32_t tl_idx = static_cast<uint32_t>(
+            std::hash<std::thread::id>{}(std::this_thread::get_id()));
         size_t slot = tl_idx++ & (memory_slot_count_ - 1);
         memory_slots_[slot].value.fetch_add(delta, std::memory_order_relaxed);
     }
@@ -241,6 +234,17 @@ public:
     }
 
     // =====================================================================
+    // Histogram Recording (during sweep, protected by sweep_flag_)
+    // =====================================================================
+
+    /// Record an entry into the building histogram during sweep.
+    /// Called by cleanup predicates for ALL entries (evicted + kept).
+    /// Only called during sweep which is serialized by sweep_flag_.
+    void recordEntry(float score, size_t entry_bytes) {
+        building_histogram_.record(score, entry_bytes);
+    }
+
+    // =====================================================================
     // Global Sweep
     // =====================================================================
 
@@ -250,25 +254,57 @@ public:
     void sweep() {
         if (sweep_flag_.test_and_set(std::memory_order_acquire)) return;
 
+        // 1. Compute eviction target from current memory usage
+        float usage_ratio = 0.0f;
+        if constexpr (kMaxMemory > 0) {
+            usage_ratio = static_cast<float>(std::max(int64_t(0), totalMemory()))
+                        / static_cast<float>(kMaxMemory);
+        }
+        float pct = eviction_target_pct(usage_ratio);
+        size_t bytes_to_free = (pct > 0.0f)
+            ? static_cast<size_t>(pct * static_cast<float>(kMaxMemory))
+            : 0;
+
+        // 2. Derive threshold from persistent histogram (EMA-smoothed)
+        cached_threshold_.store(
+            (bytes_to_free > 0) ? histogram_.thresholdForBytes(bytes_to_free) : 0.0f,
+            std::memory_order_relaxed);
+
+        // 3. Sweep all repos (each cleans 1 chunk, records into building_histogram_)
+        building_histogram_.reset();
         {
             std::shared_lock rlock(registry_mutex_);
             for (const auto& entry : registry_) {
                 entry.sweep_fn();
             }
         }
-        global_generation_.fetch_add(1, std::memory_order_relaxed);
 
-        // Second pass if over budget (without releasing the flag)
+        // 4. Merge building histogram into persistent (EMA)
+        histogram_.mergeEMA(building_histogram_, config_.histogram_alpha);
+
+        // 5. Second pass if still over budget
         if constexpr (kMaxMemory > 0) {
             if (isOverBudget()) {
                 RELAIS_LOG_WARN << "GDSF: over budget after sweep ("
                                 << totalMemory() << " / " << kMaxMemory
                                 << "), running second pass";
-                std::shared_lock rlock(registry_mutex_);
-                for (const auto& entry : registry_) {
-                    entry.sweep_fn();
+
+                // Recompute threshold with max pressure
+                float new_pct = eviction_target_pct(1.0f);
+                size_t new_bytes = static_cast<size_t>(
+                    new_pct * static_cast<float>(kMaxMemory));
+                cached_threshold_.store(
+                    histogram_.thresholdForBytes(new_bytes),
+                    std::memory_order_relaxed);
+
+                building_histogram_.reset();
+                {
+                    std::shared_lock rlock(registry_mutex_);
+                    for (const auto& entry : registry_) {
+                        entry.sweep_fn();
+                    }
                 }
-                global_generation_.fetch_add(1, std::memory_order_relaxed);
+                histogram_.mergeEMA(building_histogram_, config_.histogram_alpha);
             }
         }
 
@@ -276,23 +312,14 @@ public:
     }
 
 private:
-    GDSFPolicy() {
-        computeDecayTable(config_.decay_rate);
-    }
-
-    void computeDecayTable(float decay_rate) {
-        decay_table_[0] = 1.0f;
-        for (size_t i = 1; i < kDecayTableSize; ++i) {
-            decay_table_[i] = decay_table_[i - 1] * decay_rate;
-        }
-    }
+    GDSFPolicy() = default;
 
     /// Reset all global state for test isolation.
     /// Call AFTER evicting all cache entries (so dtor discharge doesn't go negative).
     void reset() {
-        global_generation_.store(0, std::memory_order_relaxed);
-        global_counter_.store(0, std::memory_order_relaxed);
-        correction_.store(1.0f, std::memory_order_relaxed);
+        cached_threshold_.store(0.0f, std::memory_order_relaxed);
+        histogram_.reset();
+        building_histogram_.reset();
         for (size_t i = 0; i < kMaxMemorySlots; ++i) {
             memory_slots_[i].value.store(0, std::memory_order_relaxed);
         }
@@ -300,7 +327,6 @@ private:
     }
 
     GDSFConfig config_{};
-    float decay_table_[kDecayTableSize]{};
     size_t memory_slot_count_{kMaxMemorySlots};
 
     // Striped memory counter — one slot per cache line to eliminate false sharing.
@@ -314,12 +340,10 @@ private:
     mutable std::shared_mutex registry_mutex_;
     std::vector<RepoRegistryEntry> registry_;
 
-    // Global generation tracking
-    std::atomic<uint32_t> global_generation_{0};
-    std::atomic<uint32_t> global_counter_{0};
-
-    // Correction coefficient (EMA)
-    std::atomic<float> correction_{1.0f};
+    // Histogram-based threshold
+    ScoreHistogram histogram_{};              // persistent, EMA-smoothed
+    ScoreHistogram building_histogram_{};     // temporary, rebuilt each sweep
+    std::atomic<float> cached_threshold_{0.0f};
 
     // Sweep serialization — lock-free, guaranteed on all platforms
     std::atomic_flag sweep_flag_{};
@@ -329,6 +353,11 @@ private:
 public:
     /// Reset all global state for test isolation (test-only).
     void resetForTesting() { reset(); }
+
+    /// Expose histograms for testing.
+    ScoreHistogram& persistentHistogram() { return histogram_; }
+    const ScoreHistogram& persistentHistogram() const { return histogram_; }
+    ScoreHistogram& buildingHistogram() { return building_histogram_; }
 #endif
 };
 

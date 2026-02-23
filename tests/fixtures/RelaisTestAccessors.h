@@ -24,13 +24,12 @@ struct TestInternals {
         cache.full_cleanup([](const auto&, const auto&) { return true; });
     }
 
-    /// Reset list cache state: clear ChunkMap entries, modifications, and counter.
+    /// Reset list cache state: clear ChunkMap entries and modifications.
     template<typename Repo>
     static void resetListCacheState() {
         auto& cache = Repo::listCache();
         cache.cache_.full_cleanup([](const auto&, const auto&) { return true; });
         resetModificationTracker(cache.modifications_);
-        cache.get_counter_ = 0;
     }
 
     /// Get number of pending modifications in the modification tracker.
@@ -114,23 +113,15 @@ struct TestInternals {
         jcailloux::relais::cache::GDSFPolicy::instance().reset();
     }
 
-    /// Reset per-repo GDSF state (avg_construction_time, repo_score).
+    /// Reset per-repo GDSF state (avg_construction_time).
     template<typename Repo>
     static void resetRepoGDSFState() {
         Repo::avg_construction_time_us_.store(0.0f, std::memory_order_relaxed);
-        Repo::repo_score_.store(0.0f, std::memory_order_relaxed);
-    }
-
-    /// Set per-repo GDSF repo_score (for testing threshold-based eviction).
-    template<typename Repo>
-    static void setRepoScore(float score) {
-        Repo::repo_score_.store(score, std::memory_order_relaxed);
     }
 
     /// Type-erased GDSF metadata for test assertions.
     struct GDSFTestMetadata {
-        float score{0.0f};
-        uint32_t last_generation{0};
+        uint32_t access_count{0};
         int64_t ttl_expiration_rep{0};
     };
 
@@ -143,14 +134,31 @@ struct TestInternals {
 
         auto& meta = result.entry->metadata;
         GDSFTestMetadata m;
-        if constexpr (requires { meta.score; }) {
-            m.score = meta.score.load(std::memory_order_relaxed);
-            m.last_generation = meta.last_generation.load(std::memory_order_relaxed);
+        if constexpr (requires { meta.access_count; }) {
+            m.access_count = meta.access_count.load(std::memory_order_relaxed);
         }
         if constexpr (requires { meta.ttl_expiration_rep; }) {
             m.ttl_expiration_rep = meta.ttl_expiration_rep;
         }
         return m;
+    }
+
+    /// Compute the GDSF score for a cached entity (access_count x avg_cost / memoryUsage).
+    /// Returns nullopt if the entity is not in cache.
+    template<typename Repo, typename Key>
+    static std::optional<float> getEntityGDSFScore(const Key& key) {
+        auto result = Repo::cache().find(key);
+        if (!result) return std::nullopt;
+
+        auto& meta = result.entry->metadata;
+        auto& value = result.entry->value;
+        if constexpr (requires { meta.access_count; }) {
+            float avg_cost = Repo::avgConstructionTime();
+            size_t mem = value.memoryUsage();
+            return meta.computeScore(avg_cost, mem);
+        } else {
+            return 0.0f;
+        }
     }
 
     // =========================================================================
