@@ -6,6 +6,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <shared_mutex>
@@ -15,8 +16,8 @@
 #include "jcailloux/relais/cache/GDSFMetadata.h"
 #include "jcailloux/relais/Log.h"
 
-#ifndef RELAIS_L1_MAX_MEMORY
-#define RELAIS_L1_MAX_MEMORY 0
+#ifndef RELAIS_GDSF_ENABLED
+#define RELAIS_GDSF_ENABLED 0
 #endif
 
 #ifndef RELAIS_CLEANUP_FREQUENCY_LOG2
@@ -37,6 +38,7 @@ struct GDSFConfig {
     float decay_rate = 0.95f;
     float histogram_alpha = 0.3f;            // EMA smoothing for histogram merges
     size_t memory_counter_slots = 64;        // must be power of 2, <= 64
+    size_t max_memory = 0;                   // L1 memory budget in bytes (0 = from env / unlimited)
 };
 
 // =========================================================================
@@ -79,6 +81,8 @@ struct ScoreHistogram {
 
     /// Find the threshold score such that entries below it total >= target_bytes.
     /// Walks buckets low-to-high, accumulating bytes.
+    /// Returns 0 when the histogram has no data (cold start: build histogram
+    /// before evicting, rather than nuking everything with exp2(kLogMax)).
     float thresholdForBytes(size_t target_bytes) const {
         if (target_bytes == 0) return 0.0f;
         uint64_t cumul = 0;
@@ -89,7 +93,11 @@ struct ScoreHistogram {
                 return std::exp2(log_val);
             }
         }
-        return std::exp2(kLogMax);
+        // Histogram has less data than target — either cold start (no data)
+        // or target exceeds the histogram's resolution (one chunk).
+        // Return 0 to avoid nuclear eviction; the caller (scaleAndThreshold)
+        // is expected to scale the target to the histogram's resolution.
+        return 0.0f;
     }
 
     /// Exponential moving average merge: this = alpha * newer + (1 - alpha) * this.
@@ -123,7 +131,7 @@ struct RepoRegistryEntry {
 // Thread-safe: all public methods are safe to call concurrently.
 //
 // Eviction strategy:
-//   1. Compute usage_ratio = totalMemory / kMaxMemory
+//   1. Compute usage_ratio = totalMemory / maxMemory()
 //   2. eviction_target_pct(usage_ratio) -> % of memory to free
 //   3. histogram_.thresholdForBytes(pct * budget) -> score threshold
 //   4. Each repo sweeps 1 chunk, evicting entries with score < threshold
@@ -133,9 +141,9 @@ class GDSFPolicy {
     static constexpr size_t kMaxMemorySlots = 64;
 
 public:
-    /// Compile-time memory budget from CMake define.
-    /// 0 = GDSF disabled (default). CachedRepo uses this for if constexpr guards.
-    static constexpr size_t kMaxMemory = RELAIS_L1_MAX_MEMORY;
+    /// Compile-time GDSF toggle. Controls if constexpr guards in CachedRepo/ListMixin.
+    /// When false, all GDSF code paths (metadata, CachedWrapper, scoring) are eliminated.
+    static constexpr bool enabled = RELAIS_GDSF_ENABLED;
 
     /// Compile-time cleanup frequency: sweep every 2^N insertions.
     /// 0 = disabled. Default 9 = every 512 insertions.
@@ -157,9 +165,14 @@ public:
                && "memory_counter_slots exceeds maximum");
         config_ = cfg;
         memory_slot_count_ = cfg.memory_counter_slots;
+        if (cfg.max_memory > 0) max_memory_ = cfg.max_memory;
     }
 
     const GDSFConfig& config() const { return config_; }
+
+    /// Runtime L1 memory budget (bytes). Read once from RELAIS_L1_MAX_MEMORY env
+    /// var at construction, overridable via configure(). Returns 0 if unset (no limit).
+    size_t maxMemory() const { return max_memory_; }
 
     /// Decay rate accessor (used by cleanup predicates for inline decay).
     float decayRate() const { return config_.decay_rate; }
@@ -204,8 +217,8 @@ public:
             float t = (usage - 0.50f) / 0.30f;    // 0 -> 1
             return 0.05f * t * t;                   // 0% -> 5%, convex
         }
-        float t = (usage - 0.80f) / 0.20f;         // 0 -> 1
-        return 0.05f + 0.20f * t * t;              // 5% -> 25%, convex
+        float t = std::min((usage - 0.80f) / 0.20f, 1.0f);  // 0 -> 1, clamped
+        return 0.05f + 0.20f * t * t;                       // 5% -> 25%, convex
     }
 
     // =====================================================================
@@ -230,7 +243,8 @@ public:
     }
 
     bool isOverBudget() const {
-        return totalMemory() > static_cast<int64_t>(kMaxMemory);
+        return max_memory_ > 0
+            && totalMemory() > static_cast<int64_t>(max_memory_);
     }
 
     // =====================================================================
@@ -256,18 +270,24 @@ public:
 
         // 1. Compute eviction target from current memory usage
         float usage_ratio = 0.0f;
-        if constexpr (kMaxMemory > 0) {
-            usage_ratio = static_cast<float>(std::max(int64_t(0), totalMemory()))
-                        / static_cast<float>(kMaxMemory);
+        size_t budget = max_memory_;
+        if constexpr (enabled) {
+            if (budget > 0) {
+                usage_ratio = static_cast<float>(std::max(int64_t(0), totalMemory()))
+                            / static_cast<float>(budget);
+            }
         }
         float pct = eviction_target_pct(usage_ratio);
-        size_t bytes_to_free = (pct > 0.0f)
-            ? static_cast<size_t>(pct * static_cast<float>(kMaxMemory))
+        size_t bytes_to_free = (pct > 0.0f && budget > 0)
+            ? static_cast<size_t>(pct * static_cast<float>(budget))
             : 0;
 
-        // 2. Derive threshold from persistent histogram (EMA-smoothed)
+        // 2. Derive threshold from persistent histogram (EMA-smoothed).
+        //    The histogram represents ~1 chunk (EMA of per-chunk snapshots).
+        //    Scale bytes_to_free to the histogram's resolution to avoid
+        //    nuclear threshold when bytes_to_free > histogram total.
         cached_threshold_.store(
-            (bytes_to_free > 0) ? histogram_.thresholdForBytes(bytes_to_free) : 0.0f,
+            scaleAndThreshold(bytes_to_free),
             std::memory_order_relaxed);
 
         // 3. Sweep all repos (each cleans 1 chunk, records into building_histogram_)
@@ -283,18 +303,18 @@ public:
         histogram_.mergeEMA(building_histogram_, config_.histogram_alpha);
 
         // 5. Second pass if still over budget
-        if constexpr (kMaxMemory > 0) {
+        if constexpr (enabled) {
             if (isOverBudget()) {
                 RELAIS_LOG_WARN << "GDSF: over budget after sweep ("
-                                << totalMemory() << " / " << kMaxMemory
+                                << totalMemory() << " / " << budget
                                 << "), running second pass";
 
                 // Recompute threshold with max pressure
                 float new_pct = eviction_target_pct(1.0f);
                 size_t new_bytes = static_cast<size_t>(
-                    new_pct * static_cast<float>(kMaxMemory));
+                    new_pct * static_cast<float>(budget));
                 cached_threshold_.store(
-                    histogram_.thresholdForBytes(new_bytes),
+                    scaleAndThreshold(new_bytes),
                     std::memory_order_relaxed);
 
                 building_histogram_.reset();
@@ -312,7 +332,36 @@ public:
     }
 
 private:
-    GDSFPolicy() = default;
+    /// Scale bytes_to_free to the histogram's resolution and compute threshold.
+    /// The persistent histogram represents ~1 chunk (EMA of per-chunk snapshots).
+    /// Without scaling, bytes_to_free (a fraction of the global budget) often
+    /// exceeds the histogram's total, causing thresholdForBytes to return
+    /// exp2(kLogMax) — a nuclear threshold that wipes entire chunks.
+    /// Scaling: per_chunk_target = bytes_to_free × (hist_total / totalMemory).
+    float scaleAndThreshold(size_t bytes_to_free) const {
+        if (bytes_to_free == 0) return 0.0f;
+        uint64_t hist_total = 0;
+        for (int i = 0; i < ScoreHistogram::N; ++i)
+            hist_total += histogram_.bytes[i];
+        if (hist_total == 0) return 0.0f;       // cold start: build histogram first
+        auto tmem = std::max(int64_t(1), totalMemory());
+        auto per_chunk = static_cast<size_t>(
+            static_cast<double>(bytes_to_free)
+            * static_cast<double>(hist_total)
+            / static_cast<double>(tmem));
+        return histogram_.thresholdForBytes(std::max(per_chunk, size_t(1)));
+    }
+
+    GDSFPolicy() : max_memory_(readMaxMemoryFromEnv()) {}
+
+    static size_t readMaxMemoryFromEnv() {
+        if (auto* env = std::getenv("RELAIS_L1_MAX_MEMORY")) {
+            char* end = nullptr;
+            auto v = std::strtoull(env, &end, 10);
+            if (end != env && v > 0) return static_cast<size_t>(v);
+        }
+        return 0;
+    }
 
     /// Reset all global state for test isolation.
     /// Call AFTER evicting all cache entries (so dtor discharge doesn't go negative).
@@ -323,11 +372,12 @@ private:
         for (size_t i = 0; i < kMaxMemorySlots; ++i) {
             memory_slots_[i].value.store(0, std::memory_order_relaxed);
         }
-        // Registry intentionally NOT cleared — repos are static objects.
+        // Registry and max_memory_ intentionally NOT cleared.
     }
 
     GDSFConfig config_{};
     size_t memory_slot_count_{kMaxMemorySlots};
+    size_t max_memory_;
 
     // Striped memory counter — one slot per cache line to eliminate false sharing.
     // Each slot is 64-byte aligned (one cache line), costing 4 KB total (negligible).

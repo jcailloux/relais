@@ -36,7 +36,7 @@ namespace jcailloux::relais {
  * Views are thread-agnostic and safe to hold across co_await.
  *
  * Eviction policy depends on compile-time configuration:
- * - GDSF (score = frequency x cost) when RELAIS_L1_MAX_MEMORY > 0
+ * - GDSF (score = frequency x cost) when RELAIS_GDSF_ENABLED
  * - TTL-only when l1_ttl > 0 but no GDSF
  * - No cleanup when neither is configured (default)
  *
@@ -52,7 +52,7 @@ class CachedRepo : public std::conditional_t<
 > {
     static constexpr bool HasRedis = (Cfg.cache_level == config::CacheLevel::L1_L2);
     static constexpr bool HasTTL = (std::chrono::nanoseconds(Cfg.l1_ttl).count() > 0);
-    static constexpr bool HasGDSF = (cache::GDSFPolicy::kMaxMemory > 0);
+    static constexpr bool HasGDSF = cache::GDSFPolicy::enabled;
     static constexpr bool HasCleanup = HasGDSF || HasTTL;
     static constexpr long kChunkCount = 1L << Cfg.l1_chunk_count_log2;
 

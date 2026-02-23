@@ -167,7 +167,7 @@ class ListMixin : public Base {
     // Cache infrastructure
     // =========================================================================
 
-    static constexpr bool HasGDSF = (cache::GDSFPolicy::kMaxMemory > 0);
+    static constexpr bool HasGDSF = cache::GDSFPolicy::enabled;
 
     using ListWrapperType = wrapper::ListWrapper<Entity>;
     using ListCacheType = cache::list::ListCache<Entity, Base::config.l1_chunk_count_log2, Key, Traits, HasGDSF>;

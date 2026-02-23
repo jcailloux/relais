@@ -2,7 +2,7 @@
  * test_gdsf.cpp
  *
  * Tests for the GDSF (Greedy Dual-Size Frequency) cache eviction policy.
- * Compiled with RELAIS_L1_MAX_MEMORY=268435456 (256 MB) to enable GDSF.
+ * Compiled with RELAIS_GDSF_ENABLED=1. Memory budget (256 MB) set via configure().
  *
  * Covers:
  *   1. Access count tracking   — find() bumps access_count by kCountScale
@@ -33,8 +33,15 @@ using GDSFScoreData = jcailloux::relais::cache::GDSFScoreData;
 using ScoreHistogram = jcailloux::relais::cache::ScoreHistogram;
 
 // Compile-time check: this TU must be compiled with GDSF enabled
-static_assert(GDSFPolicy::kMaxMemory > 0,
-    "test_gdsf.cpp must be compiled with RELAIS_L1_MAX_MEMORY > 0");
+static_assert(GDSFPolicy::enabled,
+    "test_gdsf.cpp must be compiled with RELAIS_GDSF_ENABLED=1");
+
+// Configure max_memory for tests (256 MB budget)
+static constexpr size_t kTestMaxMemory = 268435456;
+static const bool gdsf_configured = [] {
+    GDSFPolicy::instance().configure({.max_memory = kTestMaxMemory});
+    return true;
+}();
 
 // =============================================================================
 // Local repos for GDSF testing
@@ -260,7 +267,7 @@ TEST_CASE("GDSF - eviction decisions",
         for (int i = 0; i < 100; ++i) sync(GDSFItemRepo::find(id_high));
 
         // Inflate memory to trigger eviction (>80% budget -> aggressive zone)
-        int64_t budget = static_cast<int64_t>(GDSFPolicy::kMaxMemory);
+        int64_t budget = static_cast<int64_t>(GDSFPolicy::instance().maxMemory());
         GDSFPolicy::instance().charge(budget * 9 / 10);
 
         // Seed the histogram so thresholdForBytes returns meaningful value
@@ -485,7 +492,7 @@ TEST_CASE("GDSF - memory pressure (global sweep)",
         REQUIRE_FALSE(GDSFPolicy::instance().isOverBudget());
 
         // Artificially inflate memory to exceed the compile-time budget
-        int64_t budget = static_cast<int64_t>(GDSFPolicy::kMaxMemory);
+        int64_t budget = static_cast<int64_t>(GDSFPolicy::instance().maxMemory());
         GDSFPolicy::instance().charge(budget + 1);
 
         REQUIRE(GDSFPolicy::instance().isOverBudget());
@@ -506,7 +513,7 @@ TEST_CASE("GDSF - memory pressure (global sweep)",
         REQUIRE(before == 20);
 
         // Inflate memory to exceed budget (triggers second pass in sweep)
-        int64_t budget = static_cast<int64_t>(GDSFPolicy::kMaxMemory);
+        int64_t budget = static_cast<int64_t>(GDSFPolicy::instance().maxMemory());
         GDSFPolicy::instance().charge(budget + 1);
 
         // First sweep: builds histogram, threshold = 0 (empty histogram)

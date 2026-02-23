@@ -11,10 +11,10 @@ target_include_directories(jcailloux-relais INTERFACE
 
 target_compile_features(jcailloux-relais INTERFACE cxx_std_23)
 
-# L1 memory budget for GDSF eviction (0 = disabled, default)
-set(RELAIS_L1_MAX_MEMORY 0 CACHE STRING "L1 max memory budget in bytes for GDSF eviction (0=disabled)")
-if(RELAIS_L1_MAX_MEMORY GREATER 0)
-    target_compile_definitions(jcailloux-relais INTERFACE RELAIS_L1_MAX_MEMORY=${RELAIS_L1_MAX_MEMORY})
+# GDSF eviction: compile-time toggle (memory budget is runtime via RELAIS_L1_MAX_MEMORY env var)
+option(RELAIS_GDSF_ENABLED "Enable GDSF size-aware L1 eviction" OFF)
+if(RELAIS_GDSF_ENABLED)
+    target_compile_definitions(jcailloux-relais INTERFACE RELAIS_GDSF_ENABLED=1)
 endif()
 
 # L1 cleanup frequency: sweep every 2^N insertions (0 = disabled, default 9 = every 512)
@@ -202,8 +202,8 @@ if(RELAIS_BUILD_TESTS)
     relais_add_test(test_relais_concurrency     tests/relais/test_concurrency.cpp          DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;concurrency"      RESOURCE_LOCK)
     relais_add_test(test_relais_dbprovider_log  tests/relais/test_dbprovider_log.cpp       DEFINITIONS RELAIS_BUILDING_TESTS LABELS "integration;relais"                     RESOURCE_LOCK)
     relais_add_test(test_relais_composite_key  tests/relais/test_composite_key.cpp        DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;composite-key"    RESOURCE_LOCK)
-    relais_add_test(test_relais_gdsf          tests/relais/test_gdsf.cpp                DEFINITIONS RELAIS_BUILDING_TESTS "RELAIS_L1_MAX_MEMORY=268435456" LABELS "relais;integration;db;gdsf"             RESOURCE_LOCK)
-    if(RELAIS_L1_MAX_MEMORY EQUAL 0)
+    relais_add_test(test_relais_gdsf          tests/relais/test_gdsf.cpp                DEFINITIONS RELAIS_BUILDING_TESTS "RELAIS_GDSF_ENABLED=1" LABELS "relais;integration;db;gdsf"             RESOURCE_LOCK)
+    if(NOT RELAIS_GDSF_ENABLED)
         relais_add_test(test_relais_gdsf_disabled tests/relais/test_gdsf_disabled.cpp       DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;gdsf")
     endif()
 
@@ -240,7 +240,7 @@ if(RELAIS_BUILD_TESTS)
     )
 
     # Single binary combining all relais tests (excluding GDSF tests which
-    # require RELAIS_L1_MAX_MEMORY and would change behavior of all repos).
+    # require RELAIS_GDSF_ENABLED and would change behavior of all repos).
     # GDSF tests are run via standalone binaries: test_relais_gdsf, test_relais_gdsf_disabled.
     add_executable(test_relais_all
         tests/relais/test_all_runner.cpp
@@ -305,4 +305,11 @@ if(RELAIS_BUILD_BENCHMARKS)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests)
     target_compile_definitions(bench_io_batch PRIVATE RELAIS_BUILDING_TESTS)
     target_link_libraries(bench_io_batch PRIVATE jcailloux::relais Catch2::Catch2WithMain)
+
+    add_executable(bench_gdsf benchmarks/bench_gdsf.cpp)
+    target_include_directories(bench_gdsf PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_compile_definitions(bench_gdsf PRIVATE RELAIS_BUILDING_TESTS RELAIS_GDSF_ENABLED=1)
+    target_link_libraries(bench_gdsf PRIVATE jcailloux::relais Catch2::Catch2WithMain)
 endif()
