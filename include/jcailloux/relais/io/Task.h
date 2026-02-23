@@ -15,6 +15,92 @@ class Task;
 
 namespace detail {
 
+// =============================================================================
+// Thread-local free-list pool for coroutine frames.
+//
+// Each thread keeps a singly-linked free list of recently freed blocks,
+// grouped by size. On alloc: pop from free list (~3-5ns, no lock).
+// On dealloc: push back. Falls through to ::operator new on cold start
+// or when the pool is empty.
+//
+// The pool caps at kMaxCached blocks per size class to bound memory.
+// Blocks larger than kMaxFrameSize bypass the pool entirely.
+// =============================================================================
+
+struct FramePool {
+    static constexpr size_t kMaxFrameSize = 1024;   // frames > 1KB bypass pool
+    static constexpr size_t kMaxCached    = 128;     // max blocks per size class
+
+    struct Block {
+        Block* next;
+    };
+
+    struct SizeClass {
+        Block* head = nullptr;
+        size_t count = 0;
+    };
+
+    // Size classes: 64, 128, 192, 256, 320, 384, 448, 512, 576, 640, 704, 768, 832, 896, 960, 1024
+    static constexpr size_t kGranularity = 64;
+    static constexpr size_t kNumClasses  = kMaxFrameSize / kGranularity;
+
+    SizeClass classes[kNumClasses];
+
+    static size_t classIndex(size_t size) noexcept {
+        return (size + kGranularity - 1) / kGranularity - 1;
+    }
+
+    static size_t classSize(size_t idx) noexcept {
+        return (idx + 1) * kGranularity;
+    }
+
+    static FramePool& instance() noexcept {
+        static thread_local FramePool pool;
+        return pool;
+    }
+
+    void* alloc(size_t size) {
+        if (size > kMaxFrameSize)
+            return ::operator new(size);
+        auto idx = classIndex(size);
+        auto& sc = classes[idx];
+        if (sc.head) {
+            auto* block = sc.head;
+            sc.head = block->next;
+            --sc.count;
+            return block;
+        }
+        return ::operator new(classSize(idx));
+    }
+
+    void dealloc(void* ptr, size_t size) noexcept {
+        if (size > kMaxFrameSize) {
+            ::operator delete(ptr);
+            return;
+        }
+        auto idx = classIndex(size);
+        auto& sc = classes[idx];
+        if (sc.count >= kMaxCached) {
+            ::operator delete(ptr);
+            return;
+        }
+        auto* block = static_cast<Block*>(ptr);
+        block->next = sc.head;
+        sc.head = block;
+        ++sc.count;
+    }
+
+    ~FramePool() {
+        for (auto& sc : classes) {
+            while (sc.head) {
+                auto* next = sc.head->next;
+                ::operator delete(sc.head);
+                sc.head = next;
+            }
+        }
+    }
+};
+
 struct PromiseBase {
     std::coroutine_handle<> continuation_ = std::noop_coroutine();
 
@@ -32,6 +118,15 @@ struct PromiseBase {
 
     [[nodiscard]] std::suspend_always initial_suspend() noexcept { return {}; }
     [[nodiscard]] FinalAwaiter final_suspend() noexcept { return {}; }
+
+    // Coroutine frame allocation: thread-local pool (~3-5ns) with fallback.
+    static void* operator new(size_t size) {
+        return FramePool::instance().alloc(size);
+    }
+
+    static void operator delete(void* ptr, size_t size) noexcept {
+        FramePool::instance().dealloc(ptr, size);
+    }
 };
 
 } // namespace detail
@@ -110,6 +205,53 @@ private:
 
     std::coroutine_handle<promise_type> handle_ = nullptr;
     std::optional<T> ready_value_;
+};
+
+// Immediate<T> — zero-overhead awaitable for sync/async branching
+//
+// Two creation paths:
+// 1. Immediate(T): value ready, no Task allocated, no optional wrapping
+// 2. Immediate(Task<T>): deferred, await delegates to the inner Task
+//
+// On co_await of a ready Immediate: await_ready() = true, no suspend,
+// await_resume() moves T directly out of the variant (single move).
+// sizeof = sizeof(variant<T, Task<T>>), no extra discriminant.
+
+template<typename T>
+class Immediate {
+public:
+    Immediate(T value) noexcept(std::is_nothrow_move_constructible_v<T>)
+        : state_(std::in_place_index<0>, std::move(value)) {}
+
+    Immediate(Task<T> task) noexcept
+        : state_(std::in_place_index<1>, std::move(task)) {}
+
+    Immediate(Immediate&&) = default;
+    Immediate& operator=(Immediate&&) = default;
+    Immediate(const Immediate&) = delete;
+    Immediate& operator=(const Immediate&) = delete;
+
+    [[nodiscard]] bool await_ready() const noexcept {
+        return state_.index() == 0;
+    }
+
+    std::coroutine_handle<> await_suspend(std::coroutine_handle<> caller) noexcept {
+        return std::get<1>(state_).await_suspend(caller);
+    }
+
+    T await_resume() {
+        if (state_.index() == 0)
+            return std::move(std::get<0>(state_));
+        return std::get<1>(state_).await_resume();
+    }
+
+    /// Extract the inner Task (only valid when !await_ready()).
+    Task<T> take_task() noexcept {
+        return std::move(std::get<1>(state_));
+    }
+
+private:
+    std::variant<T, Task<T>> state_;
 };
 
 // Task<void> specialization

@@ -130,6 +130,10 @@ inline constexpr auto WriteThrough = Local
 inline constexpr auto FewChunks = Local
     .with_l1_chunk_count_log2(1);  // 2^1 = 2 chunks
 
+/// Bare L1 for benchmarks — no TTL, no GDSF, zero metadata per entry
+inline constexpr auto BareL1 = Local
+    .with_l1_ttl(Duration{});
+
 /// Read-only presets
 inline constexpr auto ReadOnlyUncached = Uncached.with_read_only();
 inline constexpr auto ReadOnlyL2 = Redis.with_read_only();
