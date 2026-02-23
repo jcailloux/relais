@@ -293,68 +293,36 @@ public:
     // =========================================================================
 
     /// Execute a paginated list query with L1/L2 caching.
-    /// L1 hit returns fromValue (zero-alloc, synchronous). Miss goes through coroutine.
-    static io::Task<ListResult> query(const ListQuery& q) {
+    /// L1 hit: zero overhead (Immediate holds ListResult directly, no Task).
+    static io::Immediate<ListResult> query(const ListQuery& q) {
         if constexpr (kHasL1) {
             if (auto cached = listCache().getByKey(q.cache_key))
-                return io::Task<ListResult>::fromValue(std::move(cached));
+                return std::move(cached);
         }
         return cachedListQuery(q);
     }
 
     /// Execute a paginated list query and return raw JSON string.
-    /// L1 hit: serializes from cached entity (lazy, epoch-guarded).
+    /// L1 hit: zero overhead (Immediate holds JsonView directly, no Task).
     /// L2 hit (BEVE): transcodes via glz::beve_to_json (skips 19-byte ListBoundsHeader).
     /// L2/DB miss: delegates to entity path (cachedListQuery).
-    static io::Task<wrapper::JsonView> queryJson(const ListQuery& q) {
+    static io::Immediate<wrapper::JsonView> queryJson(const ListQuery& q) {
         // L1 check: serialize from cached entities
         if constexpr (kHasL1) {
             if (auto cached = listCache().getByKey(q.cache_key)) {
                 auto json_sp = cached->json();  // lazy serialization, returns shared_ptr
                 auto guard = cached.take_guard();
-                co_return wrapper::JsonView(json_sp.get(), std::move(guard));
+                return wrapper::JsonView(json_sp.get(), std::move(guard));
             }
         }
-
-        // L2 check: BEVE → JSON transcode (skip ListBoundsHeader)
-        if constexpr (kHasL2) {
-            auto pageKey = redisPageKey(q.cache_key);
-
-            std::optional<std::vector<uint8_t>> beve;
-            if constexpr (Base::config.l2_refresh_on_get) {
-                beve = co_await cache::RedisCache::getRawBinaryEx(pageKey, l2Ttl());
-            } else {
-                beve = co_await cache::RedisCache::getRawBinary(pageKey);
-            }
-
-            if (beve) {
-                // Skip ListBoundsHeader (19 bytes, magic 0x53 0x52)
-                size_t off = (beve->size() > 19
-                    && (*beve)[0] == 0x53 && (*beve)[1] == 0x52) ? 19 : 0;
-                std::string json;
-                if (!glz::beve_to_json(
-                        std::span(beve->data() + off, beve->size() - off), json)) {
-                    auto guard = epoch::EpochGuard::acquire();
-                    auto* ptr = jsonPool().New(std::move(json));
-                    jsonPool().Retire(ptr);
-                    co_return wrapper::JsonView(ptr, std::move(guard));
-                }
-            }
-        }
-
-        // Miss: entity path (needed for cursor/bounds/L1 population)
-        auto wrapper = co_await cachedListQuery(q);
-        if (!wrapper) co_return wrapper::JsonView{};
-        auto json_sp = wrapper->json();
-        auto guard = wrapper.take_guard();
-        co_return wrapper::JsonView(json_sp.get(), std::move(guard));
+        return queryJsonSlow(q);
     }
 
     /// Execute a paginated list query and return raw binary (BEVE).
-    /// L1 hit: serializes from cached entity (lazy, epoch-guarded).
+    /// L1 hit: zero overhead (Immediate holds BinaryView directly, no Task).
     /// L2 hit: returns raw binary (skips ListBoundsHeader).
     /// L2/DB miss: delegates to entity path (cachedListQuery).
-    static io::Task<wrapper::BinaryView> queryBinary(const ListQuery& q)
+    static io::Immediate<wrapper::BinaryView> queryBinary(const ListQuery& q)
         requires HasBinarySerialization<Entity>
     {
         // L1 check: serialize from cached entities
@@ -362,39 +330,10 @@ public:
             if (auto cached = listCache().getByKey(q.cache_key)) {
                 auto bin_sp = cached->binary();  // lazy serialization, returns shared_ptr
                 auto guard = cached.take_guard();
-                co_return wrapper::BinaryView(bin_sp.get(), std::move(guard));
+                return wrapper::BinaryView(bin_sp.get(), std::move(guard));
             }
         }
-
-        // L2 check: raw binary from Redis (skip ListBoundsHeader)
-        if constexpr (kHasL2) {
-            auto pageKey = redisPageKey(q.cache_key);
-
-            std::optional<std::vector<uint8_t>> beve;
-            if constexpr (Base::config.l2_refresh_on_get) {
-                beve = co_await cache::RedisCache::getRawBinaryEx(pageKey, l2Ttl());
-            } else {
-                beve = co_await cache::RedisCache::getRawBinary(pageKey);
-            }
-
-            if (beve) {
-                // Skip ListBoundsHeader (19 bytes, magic 0x53 0x52)
-                size_t off = (beve->size() > 19
-                    && (*beve)[0] == 0x53 && (*beve)[1] == 0x52) ? 19 : 0;
-                auto guard = epoch::EpochGuard::acquire();
-                auto* ptr = binaryPool().New(
-                    beve->begin() + static_cast<ptrdiff_t>(off), beve->end());
-                binaryPool().Retire(ptr);
-                co_return wrapper::BinaryView(ptr, std::move(guard));
-            }
-        }
-
-        // Miss: entity path (needed for cursor/bounds/L1 population)
-        auto wrapper = co_await cachedListQuery(q);
-        if (!wrapper) co_return wrapper::BinaryView{};
-        auto bin_sp = wrapper->binary();
-        auto guard = wrapper.take_guard();
-        co_return wrapper::BinaryView(bin_sp.get(), std::move(guard));
+        return queryBinarySlow(q);
     }
 
     /// Get L1 list cache size.
@@ -721,6 +660,81 @@ protected:
                 co_return 0;
             }
         }
+    }
+
+    // =========================================================================
+    // Slow paths for queryJson / queryBinary (L1 miss → L2/DB)
+    // =========================================================================
+
+    /// Slow path for queryJson(): L1 miss → L2 transcode or DB fetch.
+    static io::Task<wrapper::JsonView> queryJsonSlow(const ListQuery& q) {
+        // L2 check: BEVE → JSON transcode (skip ListBoundsHeader)
+        if constexpr (kHasL2) {
+            auto pageKey = redisPageKey(q.cache_key);
+
+            std::optional<std::vector<uint8_t>> beve;
+            if constexpr (Base::config.l2_refresh_on_get) {
+                beve = co_await cache::RedisCache::getRawBinaryEx(pageKey, l2Ttl());
+            } else {
+                beve = co_await cache::RedisCache::getRawBinary(pageKey);
+            }
+
+            if (beve) {
+                // Skip ListBoundsHeader (19 bytes, magic 0x53 0x52)
+                size_t off = (beve->size() > 19
+                    && (*beve)[0] == 0x53 && (*beve)[1] == 0x52) ? 19 : 0;
+                std::string json;
+                if (!glz::beve_to_json(
+                        std::span(beve->data() + off, beve->size() - off), json)) {
+                    auto guard = epoch::EpochGuard::acquire();
+                    auto* ptr = jsonPool().New(std::move(json));
+                    jsonPool().Retire(ptr);
+                    co_return wrapper::JsonView(ptr, std::move(guard));
+                }
+            }
+        }
+
+        // Miss: entity path (needed for cursor/bounds/L1 population)
+        auto wrapper = co_await cachedListQuery(q);
+        if (!wrapper) co_return wrapper::JsonView{};
+        auto json_sp = wrapper->json();
+        auto guard = wrapper.take_guard();
+        co_return wrapper::JsonView(json_sp.get(), std::move(guard));
+    }
+
+    /// Slow path for queryBinary(): L1 miss → L2 or DB fetch.
+    static io::Task<wrapper::BinaryView> queryBinarySlow(const ListQuery& q)
+        requires HasBinarySerialization<Entity>
+    {
+        // L2 check: raw binary from Redis (skip ListBoundsHeader)
+        if constexpr (kHasL2) {
+            auto pageKey = redisPageKey(q.cache_key);
+
+            std::optional<std::vector<uint8_t>> beve;
+            if constexpr (Base::config.l2_refresh_on_get) {
+                beve = co_await cache::RedisCache::getRawBinaryEx(pageKey, l2Ttl());
+            } else {
+                beve = co_await cache::RedisCache::getRawBinary(pageKey);
+            }
+
+            if (beve) {
+                // Skip ListBoundsHeader (19 bytes, magic 0x53 0x52)
+                size_t off = (beve->size() > 19
+                    && (*beve)[0] == 0x53 && (*beve)[1] == 0x52) ? 19 : 0;
+                auto guard = epoch::EpochGuard::acquire();
+                auto* ptr = binaryPool().New(
+                    beve->begin() + static_cast<ptrdiff_t>(off), beve->end());
+                binaryPool().Retire(ptr);
+                co_return wrapper::BinaryView(ptr, std::move(guard));
+            }
+        }
+
+        // Miss: entity path (needed for cursor/bounds/L1 population)
+        auto wrapper = co_await cachedListQuery(q);
+        if (!wrapper) co_return wrapper::BinaryView{};
+        auto bin_sp = wrapper->binary();
+        auto guard = wrapper.take_guard();
+        co_return wrapper::BinaryView(bin_sp.get(), std::move(guard));
     }
 
     // =========================================================================

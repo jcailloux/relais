@@ -82,34 +82,32 @@ public:
 
     /// Find by ID with L1 -> (L2) -> DB fallback.
     /// Returns epoch-guarded EntityView (empty if not found).
-    /// Non-coroutine on L1 hit (zero allocation via Task::fromValue).
-    static io::Task<wrapper::EntityView<Entity>> find(const Key& id) {
+    /// L1 hit: zero overhead (Immediate holds EntityView directly, no Task).
+    static io::Immediate<wrapper::EntityView<Entity>> find(const Key& id) {
         if (auto view = getFromCache(id))
-            return io::Task<wrapper::EntityView<Entity>>::fromValue(std::move(view));
+            return std::move(view);
         return findSlow(id);
     }
 
     /// Find by ID and return JSON buffer view.
     /// Returns epoch-guarded JsonView (empty if not found).
-    /// Non-coroutine on L1 hit.
-    static io::Task<wrapper::JsonView> findJson(const Key& id) {
+    /// L1 hit: zero overhead (Immediate holds JsonView directly, no Task).
+    static io::Immediate<wrapper::JsonView> findJson(const Key& id) {
         auto result = findInCache(id);
         if (result)
-            return io::Task<wrapper::JsonView>::fromValue(
-                wrapper::JsonView(result.entry->value.json(), std::move(result.guard)));
+            return wrapper::JsonView(result.entry->value.json(), std::move(result.guard));
         return findJsonSlow(id);
     }
 
     /// Find by ID and return binary (BEVE) buffer view.
     /// Returns epoch-guarded BinaryView (empty if not found).
-    /// Non-coroutine on L1 hit.
-    static io::Task<wrapper::BinaryView> findBinary(const Key& id)
+    /// L1 hit: zero overhead (Immediate holds BinaryView directly, no Task).
+    static io::Immediate<wrapper::BinaryView> findBinary(const Key& id)
         requires HasBinarySerialization<Entity>
     {
         auto result = findInCache(id);
         if (result)
-            return io::Task<wrapper::BinaryView>::fromValue(
-                wrapper::BinaryView(result.entry->value.binary(), std::move(result.guard)));
+            return wrapper::BinaryView(result.entry->value.binary(), std::move(result.guard));
         return findBinarySlow(id);
     }
 

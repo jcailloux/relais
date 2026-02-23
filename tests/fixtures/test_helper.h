@@ -249,6 +249,13 @@ inline void sync(io::Task<void> task) {
     future.get();
 }
 
+template<typename T>
+T sync(io::Immediate<T> imm) {
+    if (imm.await_ready())
+        return imm.await_resume();
+    return sync(imm.take_task());
+}
+
 /**
  * Execute a query and return the PgResult.
  */

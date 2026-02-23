@@ -40,41 +40,58 @@ using namespace relais_bench;
 //
 // #############################################################################
 
+/// Bare L1 — no TTL, no GDSF, zero metadata per entry
+using BareL1TestItemRepo = Repo<TestItemWrapper, "bench:bare_l1", test_config::BareL1>;
+
 TEST_CASE("Benchmark - L1 cache hit", "[benchmark][l1]")
 {
     TransactionGuard tx;
 
-    static constexpr int NUM_KEYS = 64;
+    static constexpr int NUM_KEYS = 10000;
 
     std::vector<int64_t> ids;
     ids.reserve(NUM_KEYS);
     for (int i = 0; i < NUM_KEYS; ++i) {
         auto kid = insertTestItem("bench_l1_" + std::to_string(i), i);
+        sync(BareL1TestItemRepo::find(kid));
         sync(L1TestItemRepo::find(kid));
         ids.push_back(kid);
     }
 
-    auto single = measureDuration(1, [&](int, std::atomic<bool>& running) -> int64_t {
-        int64_t ops = 0;
-        while (running.load(std::memory_order_relaxed)) {
-            auto task = L1TestItemRepo::find(ids[ops % NUM_KEYS]);
-            doNotOptimize(task.await_resume());
-            ++ops;
-        }
-        return ops;
-    });
-    WARN(formatDurationThroughput("L1 find (1 thread)", 1, single));
+    // Pure L1 lookup via getFromCache — no Immediate, no coroutine, no sync().
+    // Measures: ParlayHash find + epoch guard + TTL check (if enabled).
+    using TI = TestInternals;
 
-    auto json = measureDuration(1, [&](int, std::atomic<bool>& running) -> int64_t {
+    auto bare = measureDuration(1, [&](int, std::atomic<bool>& running) -> int64_t {
         int64_t ops = 0;
         while (running.load(std::memory_order_relaxed)) {
-            auto task = L1TestItemRepo::findJson(ids[ops % NUM_KEYS]);
-            doNotOptimize(task.await_resume());
+            doNotOptimize(TI::getFromCache<BareL1TestItemRepo>(ids[ops % NUM_KEYS]));
             ++ops;
         }
         return ops;
     });
-    WARN(formatDurationThroughput("L1 findJson (1 thread)", 1, json));
+    WARN(formatDurationThroughput("L1 getFromCache bare (1 thread)", 1, bare));
+
+    auto withTtl = measureDuration(1, [&](int, std::atomic<bool>& running) -> int64_t {
+        int64_t ops = 0;
+        while (running.load(std::memory_order_relaxed)) {
+            doNotOptimize(TI::getFromCache<L1TestItemRepo>(ids[ops % NUM_KEYS]));
+            ++ops;
+        }
+        return ops;
+    });
+    WARN(formatDurationThroughput("L1 getFromCache +TTL (1 thread)", 1, withTtl));
+
+    auto viaFind = measureDuration(1, [&](int, std::atomic<bool>& running) -> int64_t {
+        int64_t ops = 0;
+        while (running.load(std::memory_order_relaxed)) {
+            auto imm = BareL1TestItemRepo::find(ids[ops % NUM_KEYS]);
+            doNotOptimize(imm.await_resume());
+            ++ops;
+        }
+        return ops;
+    });
+    WARN(formatDurationThroughput("L1 find() bare (1 thread)", 1, viaFind));
 }
 
 
@@ -300,7 +317,7 @@ TEST_CASE("Benchmark - L1 throughput mixed", "[benchmark][throughput][mixed]") {
     TransactionGuard tx;
 
     static constexpr int THREADS = 6;
-    static constexpr int NUM_KEYS = 64;
+    static constexpr int NUM_KEYS = 10000;
 
     std::vector<int64_t> ids;
     ids.reserve(NUM_KEYS);
@@ -582,7 +599,7 @@ std::string runProductionBench(
 TEST_CASE("Benchmark - production simulation", "[benchmark][production]") {
     TransactionGuard tx;
 
-    static constexpr int NUM_KEYS = 16384;
+    static constexpr int NUM_KEYS = 10000;
     static constexpr int CORO_COUNT = 128;
 
     // Pin event loop thread to a dedicated core.
