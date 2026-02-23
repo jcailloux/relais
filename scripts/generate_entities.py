@@ -992,21 +992,25 @@ class MappingGenerator:
     # =========================================================================
 
     def _generate_dynamic_size(self, entity: ParsedEntity) -> list[str]:
-        """Generate dynamicSize() — heap memory used by dynamic fields (strings, vectors, raw_json)."""
+        """Generate dynamicSize() — heap memory used by dynamic fields (strings, vectors, raw_json).
+
+        Uses heapCapacity() for std::string to exclude SSO buffer (already in sizeof).
+        """
         a = entity.annotation
+        hc = "jcailloux::relais::wrapper::heapCapacity"
         # Collect fields with dynamic heap allocations
         dynamic_fields = []
         for m in entity.members:
             if m.cpp_type == "std::string":
-                dynamic_fields.append(f"s.{m.name}.capacity()")
+                dynamic_fields.append(f"{hc}(s.{m.name})")
             elif m.cpp_type == "std::optional<std::string>":
-                dynamic_fields.append(f"(s.{m.name} ? s.{m.name}->capacity() : 0)")
+                dynamic_fields.append(f"(s.{m.name} ? {hc}(*s.{m.name}) : 0)")
             elif m.cpp_type == "std::vector<char>":
                 dynamic_fields.append(f"s.{m.name}.capacity()")
             elif m.cpp_type == "std::optional<std::vector<char>>":
                 dynamic_fields.append(f"(s.{m.name} ? s.{m.name}->capacity() : 0)")
             elif m.is_raw_json:
-                dynamic_fields.append(f"s.{m.name}.str.capacity()")
+                dynamic_fields.append(f"{hc}(s.{m.name}.str)")
 
         if not dynamic_fields:
             return []
