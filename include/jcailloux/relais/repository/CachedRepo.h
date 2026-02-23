@@ -209,15 +209,10 @@ public:
     // Cleanup
     // =========================================================================
 
-    /// Context passed to cleanup predicates. Accumulates score statistics
-    /// across all entries visited in the chunk (mutable for const& access).
+    /// Context passed to cleanup predicates.
     struct CleanupContext {
         Clock::time_point now;
         float threshold;
-        mutable float score_sum{0.0f};
-        mutable size_t score_count{0};
-        mutable float kept_score_sum{0.0f};
-        mutable size_t kept_count{0};
     };
 
     /// Sweep one chunk (lock-free, always succeeds).
@@ -228,9 +223,8 @@ public:
             CleanupContext ctx{Clock::now(), HasGDSF ? cache::GDSFPolicy::instance().threshold() : 0.0f};
             auto removed = cache().cleanup_next_chunk(kChunkCount,
                 [&ctx](const Key&, auto& entry) {
-                    return cleanupPredicate(entry.metadata, ctx);
+                    return cleanupPredicate(entry.metadata, entry.value, ctx);
                 });
-            if constexpr (HasGDSF) postCleanup(ctx);
             return removed > 0;
         }
     }
@@ -248,9 +242,8 @@ public:
             CleanupContext ctx{Clock::now(), HasGDSF ? cache::GDSFPolicy::instance().threshold() : 0.0f};
             auto removed = cache().full_cleanup(
                 [&ctx](const Key&, auto& entry) {
-                    return cleanupPredicate(entry.metadata, ctx);
+                    return cleanupPredicate(entry.metadata, entry.value, ctx);
                 });
-            if constexpr (HasGDSF) postCleanup(ctx);
             return removed;
         }
     }
@@ -262,11 +255,6 @@ public:
         // Ensure the static ChunkMap instance is constructed + repo registered.
         (void)cache();
         RELAIS_LOG_DEBUG << name() << ": L1 cache primed";
-    }
-
-    /// Current repo score (exposed for testing/debugging).
-    static float repoScore() {
-        return repo_score_.load(std::memory_order_relaxed);
     }
 
     /// Current average construction time in us (exposed for testing/debugging).
@@ -292,9 +280,6 @@ protected:
                 cache::GDSFPolicy::instance().enroll({
                     .sweep_fn = +[]() -> bool { return sweep(); },
                     .size_fn = +[]() -> size_t { return size(); },
-                    .repo_score_fn = +[]() -> float {
-                        return repo_score_.load(std::memory_order_relaxed);
-                    },
                     .name = static_cast<const char*>(Name)
                 });
             });
@@ -465,13 +450,11 @@ private:
     /// Clock::now() calls (e.g., reuse timing from GDSF measurement).
     static Metadata buildMetadata(Clock::time_point now = Clock::now()) {
         if constexpr (HasGDSF) {
-            float cost = avg_construction_time_us_.load(std::memory_order_relaxed);
-            uint32_t gen = cache::GDSFPolicy::instance().generation();
             int64_t ttl_rep = 0;
             if constexpr (HasTTL) {
                 ttl_rep = (now + l1Ttl()).time_since_epoch().count();
             }
-            return Metadata{cost, gen, ttl_rep};
+            return Metadata{cache::GDSFScoreData::kCountScale, ttl_rep};
         } else if constexpr (HasTTL) {
             return Metadata{(now + l1Ttl()).time_since_epoch().count()};
         } else {
@@ -479,22 +462,31 @@ private:
         }
     }
 
-    /// Bump GDSF score: lazy decay then add construction cost.
+    /// Bump GDSF access count (simple fetch_add, no decay on read path).
     static void bumpScore(Metadata& meta) {
-        auto& policy = cache::GDSFPolicy::instance();
-        policy.decay(meta);
-        float cost = avg_construction_time_us_.load(std::memory_order_relaxed);
-        meta.score.fetch_add(cost, std::memory_order_relaxed);
+        meta.access_count.fetch_add(cache::GDSFScoreData::kCountScale,
+                                     std::memory_order_relaxed);
     }
 
-    /// Cleanup predicate: evict based on GDSF score and/or TTL expiration.
-    static bool cleanupPredicate(const Metadata& meta, CleanupContext& ctx) {
+    /// Cleanup predicate: inline decay + compute score on-the-fly + record in histogram.
+    /// Evict based on GDSF score and/or TTL expiration.
+    static bool cleanupPredicate(const Metadata& meta, const ValueType& value,
+                                  CleanupContext& ctx) {
         if constexpr (HasGDSF) {
-            cache::GDSFPolicy::instance().decay(meta);
+            // Inline decay: single writer per chunk during sweep, plain store (no CAS)
+            float dr = cache::GDSFPolicy::instance().decayRate();
+            uint32_t old_count = meta.access_count.load(std::memory_order_relaxed);
+            meta.access_count.store(
+                static_cast<uint32_t>(static_cast<float>(old_count) * dr),
+                std::memory_order_relaxed);
 
-            float score = meta.score.load(std::memory_order_relaxed);
-            ctx.score_sum += score;
-            ctx.score_count++;
+            // Score = access_count x avg_cost / memoryUsage
+            size_t mem = value.memoryUsage();
+            float score = meta.computeScore(
+                avg_construction_time_us_.load(std::memory_order_relaxed), mem);
+
+            // Record in histogram (ALL entries, before eviction decision)
+            cache::GDSFPolicy::instance().recordEntry(score, mem);
 
             // Evict if TTL expired
             if constexpr (HasTTL) {
@@ -504,33 +496,12 @@ private:
             // Evict if score below threshold
             if (score < ctx.threshold) return true;
 
-            // Survivor
-            ctx.kept_score_sum += score;
-            ctx.kept_count++;
             return false;
         } else if constexpr (HasTTL) {
             return meta.isExpired(ctx.now);
         } else {
             return false;  // unreachable — cleanup is disabled
         }
-    }
-
-    /// Post-cleanup: update repo_score, correction coefficient, and tick generation.
-    static void postCleanup(const CleanupContext& ctx) {
-        if (ctx.kept_count > 0) {
-            float avg_kept = ctx.kept_score_sum / static_cast<float>(ctx.kept_count);
-            float old_rs = repo_score_.load(std::memory_order_relaxed);
-            float new_rs = (old_rs * static_cast<float>(kChunkCount - 1) + avg_kept)
-                         / static_cast<float>(kChunkCount);
-
-            // CAS without retry — approximation is fine
-            repo_score_.compare_exchange_weak(old_rs, new_rs, std::memory_order_relaxed);
-
-            // Update correction coefficient
-            cache::GDSFPolicy::instance().updateCorrection(avg_kept, old_rs);
-        }
-
-        cache::GDSFPolicy::instance().tick();
     }
 
     /// EMA update for average construction time (measured on L1 miss).
@@ -548,9 +519,7 @@ private:
     }
 
     // Per-repo GDSF state (one instance per template specialization).
-    // Kept even when !HasGDSF (2 floats per type, negligible) to simplify test accessors.
     static inline std::atomic<float> avg_construction_time_us_{0.0f};
-    static inline std::atomic<float> repo_score_{0.0f};
 
     // =========================================================================
     // Generation counter — stale write prevention (lock-free, cross-thread)

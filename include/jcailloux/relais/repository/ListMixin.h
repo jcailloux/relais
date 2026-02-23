@@ -1,6 +1,8 @@
 #ifndef JCX_RELAIS_LIST_MIXIN_H
 #define JCX_RELAIS_LIST_MIXIN_H
 
+#include <mutex>
+
 #include "jcailloux/relais/io/Task.h"
 #include "jcailloux/relais/io/pg/PgError.h"
 #include "jcailloux/relais/io/pg/PgParams.h"
@@ -179,6 +181,18 @@ class ListMixin : public Base {
 
     static ListCacheType& listCache() {
         static ListCacheType instance(listCacheConfig());
+        if constexpr (HasGDSF) {
+            static std::once_flag gdsf_flag;
+            std::call_once(gdsf_flag, []() {
+                static const std::string list_name =
+                    std::string(Base::name()) + ":list";
+                cache::GDSFPolicy::instance().enroll({
+                    .sweep_fn = +[]() -> bool { return listCache().sweep(); },
+                    .size_fn = +[]() -> size_t { return listCache().size(); },
+                    .name = list_name.c_str()
+                });
+            });
+        }
         return instance;
     }
 

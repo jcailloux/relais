@@ -36,7 +36,6 @@ enum class PaginationMode : uint8_t {
 // =============================================================================
 
 struct ListCacheConfig {
-    size_t cleanup_every_n_gets = 1000;       // Trigger cleanup every N gets
     std::chrono::seconds default_ttl{3600};   // 1 hour
 };
 
@@ -202,7 +201,7 @@ struct ListCacheMetadataImpl {
     int64_t cached_at_rep{0};  // steady_clock rep (immutable after construction)
     SortBounds sort_bounds;
     uint16_t result_count{0};
-    cache::GDSFScoreData gdsf;              // GDSF score tracking (mutable atomics)
+    cache::GDSFScoreData gdsf;              // GDSF access_count tracking (mutable atomic)
     float construction_time_us{0.0f};       // Measured cost for this page
 
     ListCacheMetadataImpl() = default;
@@ -210,14 +209,19 @@ struct ListCacheMetadataImpl {
     ListCacheMetadataImpl(ListQuery<FilterSet, SortFieldEnum> q,
                           Clock::time_point cached_at,
                           SortBounds bounds, uint16_t count,
-                          float cost_us = 0.0f, uint32_t gen = 0)
+                          float cost_us = 0.0f)
         : query(std::move(q))
         , cached_at_rep(cached_at.time_since_epoch().count())
         , sort_bounds(bounds)
         , result_count(count)
-        , gdsf(cost_us, gen)
+        , gdsf(cache::GDSFScoreData::kCountScale)
         , construction_time_us(cost_us)
     {}
+
+    /// Merge access history from old entry on upsert (kUpdatePenalty applied).
+    void mergeFrom(const ListCacheMetadataImpl& old) {
+        gdsf.mergeFrom(old.gdsf);
+    }
 
     // Explicit move (GDSFScoreData has atomics requiring manual move)
     ListCacheMetadataImpl(ListCacheMetadataImpl&& o) noexcept
@@ -290,7 +294,6 @@ private:
     L1Cache cache_;
     ModTracker modifications_;
     ListCacheConfig config_;
-    std::atomic<size_t> get_counter_{0};
     std::atomic<long> cleanup_cursor_{0};  // Own cursor for chunk-based cleanup
 
 public:
@@ -321,11 +324,6 @@ public:
     /// Get cached result by pre-computed cache key (avoids toCacheQuery overhead).
     /// Single-hash: hashes the key once for both lookup and chunk computation.
     ResultView getByKey(const std::string& key) {
-        // Trigger cleanup every N gets
-        if (++get_counter_ % config_.cleanup_every_n_gets == 0) {
-            trySweep();
-        }
-
         auto hk = L1Cache::make_key(key);
         auto result = cache_.find(hk);
         if (!result) return {};
@@ -344,12 +342,10 @@ public:
             return {};
         }
 
-        // GDSF: decay + score bump by construction cost
+        // GDSF: bump access count (simple fetch_add, no decay on read path)
         if constexpr (GDSF) {
-            auto& policy = cache::GDSFPolicy::instance();
-            policy.decay(meta.gdsf);
-            meta.gdsf.score.fetch_add(meta.construction_time_us,
-                                       std::memory_order_relaxed);
+            meta.gdsf.access_count.fetch_add(cache::GDSFScoreData::kCountScale,
+                                              std::memory_order_relaxed);
         }
 
         return ResultView(&value, std::move(result.guard));
@@ -362,17 +358,25 @@ public:
         const auto& key = query.cacheKey();
         const auto now = Clock::now();
 
-        uint32_t gen = 0;
-        if constexpr (GDSF) {
-            gen = cache::GDSFPolicy::instance().generation();
-        }
-
         MetadataImpl meta(
             query, now, bounds,
             static_cast<uint16_t>(result.items.size()),
-            construction_time_us, gen);
+            construction_time_us);
 
-        auto find_result = cache_.upsert(key, std::move(result), std::move(meta));
+        auto hk = L1Cache::make_key(key);
+        auto find_result = cache_.upsert(hk, std::move(result), std::move(meta));
+
+        // Hash-mask cleanup trigger (replaces modulo-based get counter)
+        if constexpr (GDSF) {
+            if ((L1Cache::get_hash(hk) & cache::GDSFPolicy::kCleanupMask) == 0) {
+                cache::GDSFPolicy::instance().sweep();
+            }
+        } else {
+            if ((L1Cache::get_hash(hk) & cache::GDSFPolicy::kCleanupMask) == 0) {
+                trySweep();
+            }
+        }
+
         return ResultView(&find_result.entry->value, std::move(find_result.guard));
     }
 
@@ -536,14 +540,30 @@ private:
         return affected;
     }
 
+    /// Estimate memory usage for a list entry (value + items vector capacity).
+    static size_t estimateMemoryUsage(const Result& result) {
+        return sizeof(Result) + result.items.capacity() * sizeof(Entity);
+    }
+
     /// Cleanup predicate for chunk-based cleanup (with bitmap skip).
     bool cleanupPredicate(const MetadataImpl& meta, const Result& result,
                            TimePoint now, float threshold, long chunk_id) const {
-        // 1. GDSF: decay + threshold check
+        // 1. GDSF: inline decay + compute score on-the-fly + record in histogram
         if constexpr (GDSF) {
-            auto& policy = cache::GDSFPolicy::instance();
-            policy.decay(meta.gdsf);
-            float score = meta.gdsf.score.load(std::memory_order_relaxed);
+            // Decay: single writer per chunk during sweep, plain store (no CAS)
+            float dr = cache::GDSFPolicy::instance().decayRate();
+            uint32_t old_count = meta.gdsf.access_count.load(std::memory_order_relaxed);
+            meta.gdsf.access_count.store(
+                static_cast<uint32_t>(static_cast<float>(old_count) * dr),
+                std::memory_order_relaxed);
+
+            // Score = access_count x avg_cost / memoryUsage
+            size_t mem = estimateMemoryUsage(result);
+            float score = meta.gdsf.computeScore(meta.construction_time_us, mem);
+
+            // Record in histogram (ALL entries, before eviction decision)
+            cache::GDSFPolicy::instance().recordEntry(score, mem);
+
             if (score < threshold) return true;
         }
 
@@ -557,11 +577,19 @@ private:
     /// Cleanup predicate for full cleanup (no bitmap).
     bool cleanupPredicateFull(const MetadataImpl& meta, const Result& result,
                                TimePoint now, float threshold) const {
-        // 1. GDSF: decay + threshold check
+        // 1. GDSF: inline decay + compute score on-the-fly + record in histogram
         if constexpr (GDSF) {
-            auto& policy = cache::GDSFPolicy::instance();
-            policy.decay(meta.gdsf);
-            float score = meta.gdsf.score.load(std::memory_order_relaxed);
+            float dr = cache::GDSFPolicy::instance().decayRate();
+            uint32_t old_count = meta.gdsf.access_count.load(std::memory_order_relaxed);
+            meta.gdsf.access_count.store(
+                static_cast<uint32_t>(static_cast<float>(old_count) * dr),
+                std::memory_order_relaxed);
+
+            size_t mem = estimateMemoryUsage(result);
+            float score = meta.gdsf.computeScore(meta.construction_time_us, mem);
+
+            cache::GDSFPolicy::instance().recordEntry(score, mem);
+
             if (score < threshold) return true;
         }
 

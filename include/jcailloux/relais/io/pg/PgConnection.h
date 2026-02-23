@@ -2,6 +2,7 @@
 #define JCX_RELAIS_IO_PG_CONNECTION_H
 
 #include <cassert>
+#include <chrono>
 #include <coroutine>
 #include <functional>
 #include <memory>
@@ -238,7 +239,7 @@ public:
             auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(now - prev);
             prev = now;
 
-            results.push_back({std::move(query_result), elapsed.count()});
+            results.emplace_back(std::move(query_result), elapsed.count());
 
             // Consume the sync point result (PGRES_PIPELINE_SYNC)
             co_await consumePipelineSync();

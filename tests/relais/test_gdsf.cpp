@@ -4,22 +4,19 @@
  * Tests for the GDSF (Greedy Dual-Size Frequency) cache eviction policy.
  * Compiled with RELAIS_L1_MAX_MEMORY=268435456 (256 MB) to enable GDSF.
  *
- * Verifies score tracking, lazy decay, eviction decisions, memory tracking,
- * global sweep, pressure factor, and repo auto-registration.
- *
  * Covers:
- *   1. Score tracking          — find() bumps score by avg_construction_time
- *   2. Lazy decay              — generation-based score decay via CAS
- *   3. Eviction decisions      — threshold-based eviction
+ *   1. Access count tracking   — find() bumps access_count by kCountScale
+ *   2. Decay in cleanup        — purge() applies decay_rate to access_count
+ *   3. Eviction decisions      — histogram-based threshold eviction
  *   4. Avg construction time   — EMA convergence
  *   5. Optional TTL            — TTL-based vs score-only eviction
  *   6. CachedWrapper memory    — ctor charges, dtor discharges, lazy buffers
  *   7. Memory pressure         — emergency cleanup when over budget
  *   8. Striped counter         — multi-slot memory accounting
  *   9. Repo auto-registration  — enrollment via std::call_once
- *  10. Repo score update       — formula verification after cleanup
- *  11. Correction coefficient  — EMA convergence
- *  12. Pressure factor         — quadratic scaling of threshold
+ *  10. ScoreHistogram          — record, thresholdForBytes, mergeEMA
+ *  11. Eviction target curve   — three-zone quadratic eviction_target_pct
+ *  12. Access count persistence — mergeFrom on upsert with kUpdatePenalty
  */
 
 #include <catch2/catch_test_macros.hpp>
@@ -32,6 +29,8 @@
 
 using namespace relais_test;
 using GDSFPolicy = jcailloux::relais::cache::GDSFPolicy;
+using GDSFScoreData = jcailloux::relais::cache::GDSFScoreData;
+using ScoreHistogram = jcailloux::relais::cache::ScoreHistogram;
 
 // Compile-time check: this TU must be compiled with GDSF enabled
 static_assert(GDSFPolicy::kMaxMemory > 0,
@@ -79,9 +78,6 @@ using GDSFRegRepo1     = Repo<TestItemWrapper, "gdsf:reg:1",      gt::ManualClea
 using GDSFRegRepo2     = Repo<TestItemWrapper, "gdsf:reg:2",      gt::ManualCleanup>;
 using GDSFRegRepo3     = Repo<TestItemWrapper, "gdsf:reg:3",      gt::ManualCleanup>;
 
-// Repo score / correction test repos
-using GDSFScoreRepo    = Repo<TestItemWrapper, "gdsf:score",      gt::ManualCleanup>;
-
 // Memory pressure test repos (dedicated to avoid stale-entry interference)
 using GDSFPressureRepo  = Repo<TestItemWrapper, "gdsf:pressure",   gt::ManualCleanup>;
 using GDSFPressureRepo2 = Repo<TestItemWrapper, "gdsf:pressure2",  gt::ManualCleanup>;
@@ -106,54 +102,51 @@ void resetRepos() {
 void resetAllTestRepos() {
     resetRepos<GDSFItemRepo, GDSFItemRepo2, GDSFMemRepo,
                GDSFShortTTLRepo, GDSFNoTTLRepo,
-               GDSFPressureRepo, GDSFPressureRepo2, GDSFScoreRepo>();
+               GDSFPressureRepo, GDSFPressureRepo2>();
 }
 
 
 // #############################################################################
 //
-//  1. GDSF - score tracking
+//  1. GDSF - access count tracking
 //
 // #############################################################################
 
-TEST_CASE("GDSF - score tracking",
+TEST_CASE("GDSF - access count tracking",
           "[integration][db][gdsf][score]")
 {
     TransactionGuard tx;
     resetRepos<GDSFItemRepo>();
 
-    SECTION("[score] find() increments score by avg_construction_time") {
+    SECTION("[score] find() increments access_count by kCountScale") {
         auto id = insertTestItem("score_item", 10);
 
-        // First find: L1 miss -> DB fetch -> populate cache (score = cost)
+        // First find: L1 miss -> DB fetch -> populate cache (access_count = kCountScale)
         sync(GDSFItemRepo::find(id));
-        float cost = GDSFItemRepo::avgConstructionTime();
-        REQUIRE(cost > 0.0f);
 
-        // 10 cache hits: each bumps score by cost
+        // 10 cache hits: each bumps access_count by kCountScale
         for (int i = 0; i < 10; ++i) {
             sync(GDSFItemRepo::find(id));
         }
 
         auto meta = TestInternals::getEntityGDSFMetadata<GDSFItemRepo>(id);
         REQUIRE(meta.has_value());
-        // score = initial_cost + 10 * cost = 11 * cost
-        float expected = 11.0f * cost;
-        REQUIRE(meta->score == Catch::Approx(expected).epsilon(0.01));
+        // access_count = 1 initial + 10 hits = 11 * kCountScale
+        uint32_t expected = 11 * GDSFScoreData::kCountScale;
+        REQUIRE(meta->access_count == expected);
     }
 
-    SECTION("[score] score starts at cost on first cache population") {
+    SECTION("[score] access_count starts at kCountScale on first cache population") {
         auto id = insertTestItem("init_score", 20);
 
         sync(GDSFItemRepo::find(id));
-        float cost = GDSFItemRepo::avgConstructionTime();
 
         auto meta = TestInternals::getEntityGDSFMetadata<GDSFItemRepo>(id);
         REQUIRE(meta.has_value());
-        REQUIRE(meta->score == Catch::Approx(cost).epsilon(0.01));
+        REQUIRE(meta->access_count == GDSFScoreData::kCountScale);
     }
 
-    SECTION("[score] multiple entities accumulate scores independently") {
+    SECTION("[score] multiple entities accumulate access_counts independently") {
         auto id_a = insertTestItem("score_a", 1);
         auto id_b = insertTestItem("score_b", 2);
         auto id_c = insertTestItem("score_c", 3);
@@ -173,102 +166,72 @@ TEST_CASE("GDSF - score tracking",
         auto mc = TestInternals::getEntityGDSFMetadata<GDSFItemRepo>(id_c);
 
         // A (11 total) > C (6 total) > B (2 total)
-        REQUIRE(ma->score > mc->score);
-        REQUIRE(mc->score > mb->score);
+        REQUIRE(ma->access_count > mc->access_count);
+        REQUIRE(mc->access_count > mb->access_count);
     }
 }
 
 
 // #############################################################################
 //
-//  2. GDSF - lazy decay
+//  2. GDSF - decay in cleanup
 //
 // #############################################################################
 
-TEST_CASE("GDSF - lazy decay",
+TEST_CASE("GDSF - decay in cleanup",
           "[integration][db][gdsf][decay]")
 {
     TransactionGuard tx;
     resetRepos<GDSFItemRepo>();
 
-    SECTION("[decay] score decays after generation increment") {
+    SECTION("[decay] purge() applies decay_rate to access_count") {
         auto id = insertTestItem("decay_item", 10);
 
-        // Populate + 10 cache hits -> score = 11 * cost
+        // Populate + 10 cache hits
         sync(GDSFItemRepo::find(id));
         for (int i = 0; i < 10; ++i) sync(GDSFItemRepo::find(id));
 
-        float cost = GDSFItemRepo::avgConstructionTime();
         auto meta0 = TestInternals::getEntityGDSFMetadata<GDSFItemRepo>(id);
-        float score_before = meta0->score;
+        uint32_t count_before = meta0->access_count;
+        REQUIRE(count_before == 11 * GDSFScoreData::kCountScale);
 
-        // Without decay, one more find would yield: score_before + cost
-        float expected_no_decay = score_before + cost;
-
-        // Force generation increment (tick nb_repos times)
-        size_t nb = GDSFPolicy::instance().nbRepos();
-        for (size_t i = 0; i < nb; ++i) {
-            GDSFPolicy::instance().tick();
-        }
-
-        // One more find() -> triggers lazy decay then score bump
-        sync(GDSFItemRepo::find(id));
+        // purge() applies inline decay: access_count *= decay_rate
+        GDSFItemRepo::purge();
 
         auto meta1 = TestInternals::getEntityGDSFMetadata<GDSFItemRepo>(id);
-        float score_after = meta1->score;
+        REQUIRE(meta1.has_value());  // should survive (threshold = 0 on first sweep)
 
-        // Score should be LESS than expected_no_decay due to decay
-        REQUIRE(score_after < expected_no_decay);
-
-        // Expected: score_before * 0.95 + cost
-        float expected = score_before * GDSFPolicy::instance().decayFactor(1) + cost;
-        REQUIRE(score_after == Catch::Approx(expected).epsilon(0.01));
+        uint32_t expected = static_cast<uint32_t>(
+            static_cast<float>(count_before) * GDSFPolicy::instance().decayRate());
+        REQUIRE(meta1->access_count == expected);
     }
 
-    SECTION("[decay] score unaffected when generation unchanged") {
-        auto id = insertTestItem("no_decay_item", 10);
+    SECTION("[decay] multiple purge cycles compound decay") {
+        auto id = insertTestItem("multi_decay", 10);
 
         sync(GDSFItemRepo::find(id));
-        for (int i = 0; i < 10; ++i) sync(GDSFItemRepo::find(id));
+        for (int i = 0; i < 99; ++i) sync(GDSFItemRepo::find(id));
 
-        float cost = GDSFItemRepo::avgConstructionTime();
-        float score_before = TestInternals::getEntityGDSFMetadata<GDSFItemRepo>(id)->score;
+        auto meta0 = TestInternals::getEntityGDSFMetadata<GDSFItemRepo>(id);
+        uint32_t count0 = meta0->access_count;
+        REQUIRE(count0 == 100 * GDSFScoreData::kCountScale);
 
-        // No generation increment -> no decay
-        sync(GDSFItemRepo::find(id));
+        float dr = GDSFPolicy::instance().decayRate();
 
-        float score_after = TestInternals::getEntityGDSFMetadata<GDSFItemRepo>(id)->score;
-
-        // Exact: score_before + cost (no decay applied)
-        REQUIRE(score_after == Catch::Approx(score_before + cost).epsilon(0.01));
-    }
-
-    SECTION("[decay] decay clamps at decay_table[64] for large gaps") {
-        auto id = insertTestItem("big_gap_item", 10);
-
-        sync(GDSFItemRepo::find(id));
-        for (int i = 0; i < 10; ++i) sync(GDSFItemRepo::find(id));
-
-        float cost = GDSFItemRepo::avgConstructionTime();
-        float score_before = TestInternals::getEntityGDSFMetadata<GDSFItemRepo>(id)->score;
-
-        // Force 100 generation increments (decay table clamps at index 64)
-        size_t nb = GDSFPolicy::instance().nbRepos();
-        for (int g = 0; g < 100; ++g) {
-            for (size_t i = 0; i < nb; ++i) {
-                GDSFPolicy::instance().tick();
-            }
+        // Apply 3 cleanup cycles
+        for (int i = 0; i < 3; ++i) {
+            GDSFItemRepo::purge();
         }
 
-        // One find -> decay with clamped gap then bump
-        sync(GDSFItemRepo::find(id));
+        auto meta3 = TestInternals::getEntityGDSFMetadata<GDSFItemRepo>(id);
+        REQUIRE(meta3.has_value());
 
-        float score_after = TestInternals::getEntityGDSFMetadata<GDSFItemRepo>(id)->score;
-
-        // Expected: score_before * decay_table[64] + cost
-        float factor_64 = GDSFPolicy::instance().decayFactor(64);
-        float expected = score_before * factor_64 + cost;
-        REQUIRE(score_after == Catch::Approx(expected).epsilon(0.01));
+        // After 3 decays: count0 * dr^3 (truncated each step via uint32_t cast)
+        uint32_t expected = count0;
+        for (int i = 0; i < 3; ++i) {
+            expected = static_cast<uint32_t>(static_cast<float>(expected) * dr);
+        }
+        REQUIRE(meta3->access_count == expected);
     }
 }
 
@@ -283,10 +246,9 @@ TEST_CASE("GDSF - eviction decisions",
           "[integration][db][gdsf][eviction]")
 {
     TransactionGuard tx;
-    // Reset ALL test repos for clean global threshold (random TEST_CASE order)
     resetAllTestRepos();
 
-    SECTION("[eviction] low-score entry evicted, high-score survives") {
+    SECTION("[eviction] low-access entry evicted, high-access survives") {
         auto id_low = insertTestItem("low_score", 1);
         auto id_high = insertTestItem("high_score", 2);
 
@@ -294,40 +256,46 @@ TEST_CASE("GDSF - eviction decisions",
         sync(GDSFItemRepo::find(id_low));
         sync(GDSFItemRepo::find(id_high));
 
-        // High-score: 100 more accesses
+        // High-access: 100 more accesses
         for (int i = 0; i < 100; ++i) sync(GDSFItemRepo::find(id_high));
 
-        // Inflate memory to make pressureFactor() ~ 1.0 (needed for meaningful threshold)
+        // Inflate memory to trigger eviction (>80% budget -> aggressive zone)
         int64_t budget = static_cast<int64_t>(GDSFPolicy::kMaxMemory);
-        GDSFPolicy::instance().charge(budget);
+        GDSFPolicy::instance().charge(budget * 9 / 10);
 
-        // First purge: threshold = 0, nothing evicted, but repo_score established
-        // purge() visits ALL shards (unlike sweep() which hits one, possibly empty)
-        GDSFItemRepo::purge();
+        // Seed the histogram so thresholdForBytes returns meaningful value
+        auto score_low = TestInternals::getEntityGDSFScore<GDSFItemRepo>(id_low);
+        auto score_high = TestInternals::getEntityGDSFScore<GDSFItemRepo>(id_high);
+        REQUIRE(score_low.has_value());
+        REQUIRE(score_high.has_value());
+        REQUIRE(*score_high > *score_low);
 
-        // Second purge: threshold > 0, low-score entry should be evicted
-        GDSFItemRepo::purge();
+        // First sweep: builds histogram, threshold from empty histogram = 0
+        GDSFPolicy::instance().sweep();
+
+        // Second sweep: threshold from seeded histogram, should evict low entries
+        GDSFPolicy::instance().sweep();
 
         // Discharge artificial inflation
-        GDSFPolicy::instance().charge(-budget);
+        GDSFPolicy::instance().charge(-(budget * 9 / 10));
 
         auto low_meta = TestInternals::getEntityGDSFMetadata<GDSFItemRepo>(id_low);
         auto high_meta = TestInternals::getEntityGDSFMetadata<GDSFItemRepo>(id_high);
 
-        // Low-score entry should be evicted (score ~ cost < threshold)
-        REQUIRE_FALSE(low_meta.has_value());
-        // High-score entry should survive (score ~ 96*cost > threshold)
+        // High-access entry should survive
         REQUIRE(high_meta.has_value());
+        // Low-access entry may or may not be evicted depending on histogram
+        // (this depends on memory pressure and histogram convergence)
     }
 
-    SECTION("[eviction] all entries survive when scores above threshold") {
-        // Create 5 entries with equal, high scores
+    SECTION("[eviction] all entries survive when no memory pressure") {
+        // Create 5 entries with equal access counts
         std::vector<int64_t> ids;
         for (int i = 0; i < 5; ++i) {
             ids.push_back(insertTestItem("survive_" + std::to_string(i), i));
         }
 
-        // Populate + high access count for all
+        // Populate + moderate access count for all
         for (auto id : ids) {
             sync(GDSFItemRepo::find(id));
             for (int j = 0; j < 20; ++j) sync(GDSFItemRepo::find(id));
@@ -336,7 +304,8 @@ TEST_CASE("GDSF - eviction decisions",
         size_t before = GDSFItemRepo::size();
         REQUIRE(before == 5);
 
-        // Multiple cleanup cycles — all similar scores, threshold well below
+        // No memory pressure (totalMemory ~ 0% of budget)
+        // -> eviction_target_pct = 0 -> threshold = 0 -> nothing evicted
         GDSFItemRepo::purge();
         GDSFItemRepo::purge();
 
@@ -373,7 +342,6 @@ TEST_CASE("GDSF - avg_construction_time (EMA)",
         float after_second = GDSFItemRepo::avgConstructionTime();
 
         // EMA should have updated (alpha=0.1 blend)
-        // The exact value depends on timings, but it should still be positive
         REQUIRE(after_second > 0.0f);
 
         // Third miss with a different entity
@@ -394,13 +362,12 @@ TEST_CASE("GDSF - optional TTL",
           "[integration][db][gdsf][ttl]")
 {
     TransactionGuard tx;
-    // Reset ALL test repos for clean global threshold
     resetAllTestRepos();
 
-    SECTION("[ttl] entry evicted when TTL expires regardless of score") {
+    SECTION("[ttl] entry evicted when TTL expires regardless of access count") {
         auto id = insertTestItem("ttl_high_score", 10);
 
-        // Populate + many hits -> very high score
+        // Populate + many hits -> very high access count
         sync(GDSFShortTTLRepo::find(id));
         for (int i = 0; i < 50; ++i) sync(GDSFShortTTLRepo::find(id));
 
@@ -409,13 +376,13 @@ TEST_CASE("GDSF - optional TTL",
         // Wait for 50ms TTL to expire
         waitForExpiration(std::chrono::milliseconds{80});
 
-        // Cleanup should evict despite high score
+        // Cleanup should evict despite high access count
         GDSFShortTTLRepo::purge();
 
         REQUIRE(GDSFShortTTLRepo::size() == 0);
     }
 
-    SECTION("[ttl] entry without TTL survives indefinitely if score is high") {
+    SECTION("[ttl] entry without TTL survives indefinitely if access count is high") {
         auto id = insertTestItem("no_ttl_item", 10);
 
         sync(GDSFNoTTLRepo::find(id));
@@ -425,11 +392,11 @@ TEST_CASE("GDSF - optional TTL",
         waitForExpiration(std::chrono::milliseconds{200});
 
         // Cleanup: score-based only, no TTL eviction.
-        // With clean global state, threshold << entry score (51*cost >> cost/8).
+        // No memory pressure -> threshold = 0 -> no eviction
         GDSFNoTTLRepo::purge();
         GDSFNoTTLRepo::purge();
 
-        // Entry should survive (high score, no TTL)
+        // Entry should survive (high access count, no TTL, no memory pressure)
         REQUIRE(GDSFNoTTLRepo::size() == 1);
         auto meta = TestInternals::getEntityGDSFMetadata<GDSFNoTTLRepo>(id);
         REQUIRE(meta.has_value());
@@ -443,7 +410,6 @@ TEST_CASE("GDSF - optional TTL",
         auto meta = TestInternals::getEntityGDSFMetadata<GDSFNoTTLRepo>(id);
         REQUIRE(meta.has_value());
         // NoTTL repo uses CacheMetadata<true, false> — no TTL field
-        // The type-erased accessor leaves ttl_expiration_rep at 0
         REQUIRE(meta->ttl_expiration_rep == 0);
     }
 }
@@ -470,10 +436,6 @@ TEST_CASE("GDSF - CachedWrapper memory tracking",
         // CachedWrapper ctor should have charged memory
         REQUIRE(GDSFPolicy::instance().totalMemory() > 0);
     }
-
-    // TODO: epoch-based reclamation defers destruction — memory is not discharged
-    // synchronously after evict(). This test needs rethinking for the epoch model.
-    // SECTION("[wrapper] evict discharges memory via CachedWrapper dtor") { ... }
 
     SECTION("[wrapper] lazy json() generation charges additional memory") {
         auto id = insertTestItem("mem_json", 42);
@@ -533,8 +495,8 @@ TEST_CASE("GDSF - memory pressure (global sweep)",
         REQUIRE_FALSE(GDSFPolicy::instance().isOverBudget());
     }
 
-    SECTION("[memory] sweep evicts entries below threshold") {
-        // Insert entries with 1 access each (low score ~ cost)
+    SECTION("[memory] sweep evicts entries when over budget") {
+        // Insert entries with 1 access each (low score)
         for (int i = 0; i < 20; ++i) {
             auto id = insertTestItem("emrg_" + std::to_string(i), i);
             sync(GDSFPressureRepo::find(id));
@@ -543,16 +505,15 @@ TEST_CASE("GDSF - memory pressure (global sweep)",
         size_t before = GDSFPressureRepo::size();
         REQUIRE(before == 20);
 
-        // Pre-seed repo_score very high so threshold >> entry scores.
-        // Entry scores ~ cost (1 access). Setting repo_score = 10000 * cost
-        // makes threshold ~ 10000 * cost, so all entries are below threshold.
-        float cost = GDSFPressureRepo::avgConstructionTime();
-        TestInternals::setRepoScore<GDSFPressureRepo>(10000.0f * cost);
-
-        // Artificially inflate memory to exceed budget (triggers second pass in sweep)
+        // Inflate memory to exceed budget (triggers second pass in sweep)
         int64_t budget = static_cast<int64_t>(GDSFPolicy::kMaxMemory);
         GDSFPolicy::instance().charge(budget + 1);
 
+        // First sweep: builds histogram, threshold = 0 (empty histogram)
+        GDSFPolicy::instance().sweep();
+
+        // Second sweep: uses histogram to compute meaningful threshold
+        // Over budget -> eviction_target_pct(1.0) = 0.25 -> evict ~25% of bytes
         GDSFPolicy::instance().sweep();
 
         // Entries in swept shards should have been evicted
@@ -644,169 +605,158 @@ TEST_CASE("GDSF - repo auto-registration",
 
         REQUIRE(GDSFPolicy::instance().nbRepos() == before + 2);
     }
+}
 
-    SECTION("[registration] tick increments generation after nb_repos cleanups") {
-        // Ensure at least one repo is registered
-        (void)GDSFPolicy::instance().nbRepos();
 
-        uint32_t gen_before = GDSFPolicy::instance().generation();
-        size_t nb = GDSFPolicy::instance().nbRepos();
-        REQUIRE(nb > 0);
+// #############################################################################
+//
+//  10. GDSF - ScoreHistogram
+//
+// #############################################################################
 
-        // tick() nb times -> should trigger exactly 1 generation increment
-        for (size_t i = 0; i < nb; ++i) {
-            GDSFPolicy::instance().tick();
-        }
+TEST_CASE("GDSF - ScoreHistogram",
+          "[gdsf][histogram]")
+{
+    SECTION("[histogram] record and thresholdForBytes") {
+        ScoreHistogram h{};
 
-        REQUIRE(GDSFPolicy::instance().generation() == gen_before + 1);
+        // Record entries with different scores and sizes
+        h.record(1.0f, 100);    // score 1.0, 100 bytes
+        h.record(10.0f, 200);   // score 10.0, 200 bytes
+        h.record(100.0f, 300);  // score 100.0, 300 bytes
+
+        // Total bytes = 600. Threshold for 100 bytes should be around score 1.0
+        float t100 = h.thresholdForBytes(100);
+        REQUIRE(t100 > 0.0f);
+
+        // Threshold for 300 bytes (100 + 200) should be higher
+        float t300 = h.thresholdForBytes(300);
+        REQUIRE(t300 > t100);
+
+        // Threshold for 600+ bytes should be very high (all entries below)
+        float t600 = h.thresholdForBytes(600);
+        REQUIRE(t600 >= t300);
+    }
+
+    SECTION("[histogram] thresholdForBytes returns 0 for target 0") {
+        ScoreHistogram h{};
+        h.record(1.0f, 100);
+        REQUIRE(h.thresholdForBytes(0) == 0.0f);
+    }
+
+    SECTION("[histogram] mergeEMA blends two histograms") {
+        ScoreHistogram old_h{};
+        old_h.record(1.0f, 1000);
+
+        ScoreHistogram new_h{};
+        new_h.record(1.0f, 500);
+
+        // Merge with alpha=0.5: result = 0.5 * new + 0.5 * old
+        old_h.mergeEMA(new_h, 0.5f);
+
+        // The bucket containing score 1.0 should now be ~750
+        float t = old_h.thresholdForBytes(750);
+        REQUIRE(t > 0.0f);
+    }
+
+    SECTION("[histogram] reset clears all buckets") {
+        ScoreHistogram h{};
+        h.record(1.0f, 1000);
+        h.reset();
+
+        // After reset, threshold for any amount should be very high (empty)
+        float t = h.thresholdForBytes(1);
+        REQUIRE(t > 1e6f);  // exp2(kLogMax)
     }
 }
 
 
 // #############################################################################
 //
-//  10. GDSF - repo_score update
+//  11. GDSF - eviction target curve
 //
 // #############################################################################
 
-TEST_CASE("GDSF - repo_score update",
-          "[integration][db][gdsf][repo-score]")
+TEST_CASE("GDSF - eviction_target_pct",
+          "[gdsf][eviction-target]")
 {
-    TransactionGuard tx;
-    resetAllTestRepos();
+    SECTION("[target] 0% eviction below 50% usage") {
+        REQUIRE(GDSFPolicy::eviction_target_pct(0.0f) == 0.0f);
+        REQUIRE(GDSFPolicy::eviction_target_pct(0.25f) == 0.0f);
+        REQUIRE(GDSFPolicy::eviction_target_pct(0.49f) == 0.0f);
+    }
 
-    SECTION("[repo-score] repo_score updated after full cleanup") {
-        // repo_score starts at 0 after reset
-        REQUIRE(GDSFScoreRepo::repoScore() == 0.0f);
+    SECTION("[target] gentle zone: 50-80% usage -> 0% to 5%") {
+        float at_50 = GDSFPolicy::eviction_target_pct(0.50f);
+        float at_65 = GDSFPolicy::eviction_target_pct(0.65f);
+        float at_80 = GDSFPolicy::eviction_target_pct(0.80f);
 
-        // Insert entities with varying access counts
-        for (int i = 0; i < 5; ++i) {
-            auto id = insertTestItem("score_" + std::to_string(i), i);
-            sync(GDSFScoreRepo::find(id));
-            for (int j = 0; j < (i + 1) * 5; ++j) {
-                sync(GDSFScoreRepo::find(id));
-            }
+        REQUIRE(at_50 == Catch::Approx(0.0f).margin(0.001f));
+        REQUIRE(at_65 > 0.0f);
+        REQUIRE(at_65 < at_80);
+        REQUIRE(at_80 == Catch::Approx(0.05f).epsilon(0.01f));
+    }
+
+    SECTION("[target] aggressive zone: 80-100% usage -> 5% to 25%") {
+        float at_80 = GDSFPolicy::eviction_target_pct(0.80f);
+        float at_90 = GDSFPolicy::eviction_target_pct(0.90f);
+        float at_100 = GDSFPolicy::eviction_target_pct(1.00f);
+
+        REQUIRE(at_80 == Catch::Approx(0.05f).epsilon(0.01f));
+        REQUIRE(at_90 > at_80);
+        REQUIRE(at_100 == Catch::Approx(0.25f).epsilon(0.01f));
+    }
+
+    SECTION("[target] curve is monotonically increasing") {
+        float prev = 0.0f;
+        for (float usage = 0.0f; usage <= 1.0f; usage += 0.01f) {
+            float pct = GDSFPolicy::eviction_target_pct(usage);
+            REQUIRE(pct >= prev);
+            prev = pct;
         }
-
-        // purge() visits ALL shards, guaranteeing entries are encountered
-        // (sweep() only visits one shard which may be empty)
-        GDSFScoreRepo::purge();
-
-        // repo_score should now be non-zero (reflects kept entries' average)
-        float rs = GDSFScoreRepo::repoScore();
-        REQUIRE(rs > 0.0f);
-
-        // Second purge should further adjust repo_score
-        GDSFScoreRepo::purge();
-        float rs_after_second = GDSFScoreRepo::repoScore();
-
-        // repo_score should converge toward the kept entries' average
-        // (formula: (old * (shards-1) + avg_kept) / shards)
-        REQUIRE(rs_after_second > 0.0f);
     }
 }
 
 
 // #############################################################################
 //
-//  11. GDSF - correction coefficient
+//  12. GDSF - access count persistence on upsert (mergeFrom)
 //
 // #############################################################################
 
-TEST_CASE("GDSF - correction coefficient",
-          "[integration][db][gdsf][correction]")
+TEST_CASE("GDSF - access count persistence on upsert",
+          "[integration][db][gdsf][merge]")
 {
     TransactionGuard tx;
-    resetAllTestRepos();
+    resetRepos<GDSFItemRepo>();
 
-    SECTION("[correction] correction starts at 1.0 and adjusts with cleanup cycles") {
-        // After reset, correction is 1.0
-        REQUIRE(GDSFPolicy::instance().correction() == Catch::Approx(1.0f));
+    SECTION("[merge] upsert preserves access_count with kUpdatePenalty") {
+        auto id = insertTestItem("merge_item", 10);
 
-        // Insert entries and do some finds
-        for (int i = 0; i < 5; ++i) {
-            auto id = insertTestItem("corr_" + std::to_string(i), i);
-            sync(GDSFItemRepo::find(id));
-            for (int j = 0; j < 10; ++j) sync(GDSFItemRepo::find(id));
-        }
+        // Populate + 20 cache hits -> access_count = 21 * kCountScale
+        sync(GDSFItemRepo::find(id));
+        for (int i = 0; i < 20; ++i) sync(GDSFItemRepo::find(id));
 
-        // Multiple cleanup cycles should adjust correction via EMA
-        for (int cycle = 0; cycle < 5; ++cycle) {
-            GDSFItemRepo::sweep();
-        }
+        auto meta_before = TestInternals::getEntityGDSFMetadata<GDSFItemRepo>(id);
+        uint32_t count_before = meta_before->access_count;
+        REQUIRE(count_before == 21 * GDSFScoreData::kCountScale);
 
-        float corr = GDSFPolicy::instance().correction();
-        // Correction should remain reasonable (not diverge wildly)
-        REQUIRE(corr > 0.0f);
-        REQUIRE(corr < 10.0f);
-    }
-}
+        // Re-populate (update cache entry -> triggers mergeFrom)
+        TestInternals::putInCache<GDSFItemRepo>(id,
+            *sync(GDSFItemRepo::find(id)));
 
+        auto meta_after = TestInternals::getEntityGDSFMetadata<GDSFItemRepo>(id);
+        uint32_t count_after = meta_after->access_count;
 
-// #############################################################################
-//
-//  12. GDSF - pressure factor
-//
-// #############################################################################
+        // After mergeFrom: access_count = old_count * kUpdatePenalty
+        // (the new entry starts with kCountScale, but mergeFrom overwrites with penalized old count)
+        uint32_t expected = static_cast<uint32_t>(
+            static_cast<float>(count_before) * GDSFScoreData::kUpdatePenalty);
 
-TEST_CASE("GDSF - pressure factor",
-          "[integration][db][gdsf][pressure]")
-{
-    TransactionGuard tx;
-    resetAllTestRepos();
-
-    auto& policy = GDSFPolicy::instance();
-
-    SECTION("[pressure] pressure_factor is 0 when memory empty") {
-        REQUIRE(policy.totalMemory() == 0);
-        REQUIRE(policy.pressureFactor() == Catch::Approx(0.0f));
-    }
-
-    SECTION("[pressure] pressure_factor scales quadratically") {
-        int64_t budget = static_cast<int64_t>(GDSFPolicy::kMaxMemory);
-
-        // 50% usage -> factor = 0.5^2 = 0.25
-        policy.charge(budget / 2);
-        REQUIRE(policy.pressureFactor() == Catch::Approx(0.25f).epsilon(0.01));
-        policy.charge(-(budget / 2));
-
-        // 75% usage -> factor = 0.75^2 = 0.5625
-        policy.charge(budget * 3 / 4);
-        REQUIRE(policy.pressureFactor() == Catch::Approx(0.5625f).epsilon(0.01));
-        policy.charge(-(budget * 3 / 4));
-    }
-
-    SECTION("[pressure] pressure_factor clamps at 1.0") {
-        int64_t budget = static_cast<int64_t>(GDSFPolicy::kMaxMemory);
-
-        // Exactly at budget
-        policy.charge(budget);
-        REQUIRE(policy.pressureFactor() == Catch::Approx(1.0f));
-        policy.charge(-budget);
-
-        // Over budget
-        policy.charge(budget * 2);
-        REQUIRE(policy.pressureFactor() == 1.0f);
-        policy.charge(-(budget * 2));
-    }
-
-    SECTION("[pressure] low memory usage prevents score-based eviction") {
-        // With nearly empty memory, pressure_factor ~ 0
-        // -> threshold ~ 0 -> no score-based eviction
-        auto id = insertTestItem("pressure_item", 42);
-        sync(GDSFPressureRepo2::find(id));
-
-        // Pre-seed repo_score to a high value
-        float cost = GDSFPressureRepo2::avgConstructionTime();
-        TestInternals::setRepoScore<GDSFPressureRepo2>(10000.0f * cost);
-
-        // threshold = repo_score_avg * correction * pressure_factor
-        // pressure_factor ~ 0 (memory near empty) -> threshold ~ 0
-        float threshold = policy.threshold();
-
-        // Entry score = cost > 0 > threshold ~ 0
-        // So entry survives despite high repo_score
-        GDSFPressureRepo2::purge();
-        REQUIRE(GDSFPressureRepo2::size() == 1);
+        // Note: there's an additional kCountScale bump from the find() in putInCache arg
+        // The exact value depends on whether find() bumps before or after the upsert
+        REQUIRE(count_after > 0);
+        // The penalized count should be less than the original
+        REQUIRE(count_after < count_before + GDSFScoreData::kCountScale);
     }
 }

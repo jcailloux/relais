@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <concepts>
 #include <tuple>
 #include <variant>
 #include <vector>
@@ -12,6 +13,13 @@
 #include <utils/epoch.h>
 
 namespace jcailloux::relais::cache {
+
+// =============================================================================
+// Mergeable concept — metadata that preserves access history across upserts
+// =============================================================================
+
+template<typename T>
+concept Mergeable = requires(T& a, const T& b) { a.mergeFrom(b); };
 
 // =============================================================================
 // Hash support for std::tuple (needed for composite primary keys)
@@ -123,7 +131,10 @@ public:
     FindResult upsert(const K& key, V value, Metadata meta = {}) {
         auto guard = epoch::EpochGuard::acquire();
         auto* new_entry = pool_.New(std::move(value), std::move(meta));
-        auto old = map_.Upsert_in_epoch(key, [&](std::optional<CacheEntry*>) -> CacheEntry* {
+        auto old = map_.Upsert_in_epoch(key, [&](std::optional<CacheEntry*> opt) -> CacheEntry* {
+            if constexpr (Mergeable<Metadata>) {
+                if (opt && *opt) new_entry->metadata.mergeFrom((*opt)->metadata);
+            }
             return new_entry;
         });
         bool inserted = !old.has_value();
@@ -137,7 +148,10 @@ public:
     FindResult upsert(const hashed_key& hk, V value, Metadata meta = {}) {
         auto guard = epoch::EpochGuard::acquire();
         auto* new_entry = pool_.New(std::move(value), std::move(meta));
-        auto old = map_.Upsert_in_epoch(hk, [&](std::optional<CacheEntry*>) -> CacheEntry* {
+        auto old = map_.Upsert_in_epoch(hk, [&](std::optional<CacheEntry*> opt) -> CacheEntry* {
+            if constexpr (Mergeable<Metadata>) {
+                if (opt && *opt) new_entry->metadata.mergeFrom((*opt)->metadata);
+            }
             return new_entry;
         });
         bool inserted = !old.has_value();
