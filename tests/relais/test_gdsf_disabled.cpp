@@ -1,14 +1,14 @@
 /**
  * test_gdsf_disabled.cpp
  *
- * Tests that GDSF is fully disabled (zero overhead) when RELAIS_L1_MAX_MEMORY == 0.
- * This file is compiled WITHOUT RELAIS_L1_MAX_MEMORY to verify the default path.
+ * Tests that GDSF is fully disabled (zero overhead) when RELAIS_GDSF_ENABLED == 0.
+ * This file is compiled WITHOUT RELAIS_GDSF_ENABLED to verify the default path.
  *
- * In the combined binary (test_relais_all), RELAIS_L1_MAX_MEMORY is set to 268435456,
+ * In the combined binary (test_relais_all), RELAIS_GDSF_ENABLED=1,
  * so these tests are skipped via preprocessor guard.
  *
  * Covers:
- *   1. HasGDSF is false when kMaxMemory == 0
+ *   1. HasGDSF is false when GDSF disabled
  *   2. Monostate metadata (0 bytes) when no TTL and no GDSF
  *   3. TTL-only metadata (8 bytes) when TTL but no GDSF
  *   4. No GDSFPolicy registration from disabled repos
@@ -17,9 +17,9 @@
 #include "jcailloux/relais/cache/GDSFPolicy.h"
 #include "jcailloux/relais/cache/GDSFMetadata.h"
 
-// These tests only compile when GDSF is disabled (kMaxMemory == 0).
-// In the combined binary (test_relais_all), RELAIS_L1_MAX_MEMORY=268435456 -> skip.
-#if RELAIS_L1_MAX_MEMORY == 0
+// These tests only compile when GDSF is disabled.
+// In the combined binary (test_relais_all), RELAIS_GDSF_ENABLED=1 -> skip.
+#if !RELAIS_GDSF_ENABLED
 
 #include <catch2/catch_test_macros.hpp>
 #include <type_traits>
@@ -29,8 +29,8 @@
 using GDSFPolicy = jcailloux::relais::cache::GDSFPolicy;
 
 // Compile-time check: GDSF must be disabled in this TU
-static_assert(GDSFPolicy::kMaxMemory == 0,
-    "test_gdsf_disabled.cpp must be compiled WITHOUT RELAIS_L1_MAX_MEMORY");
+static_assert(!GDSFPolicy::enabled,
+    "test_gdsf_disabled.cpp must be compiled without RELAIS_GDSF_ENABLED");
 
 namespace relais_test::gdsf_disabled {
 
@@ -56,14 +56,14 @@ using NoCleanupRepo = relais_test::Repo<TestItemWrapper, "gdsf_dis:noclean", NoC
 using namespace relais_test::gdsf_disabled;
 
 // =============================================================================
-// GDSF disabled - zero overhead when kMaxMemory == 0
+// GDSF disabled - zero overhead when not enabled
 // =============================================================================
 
-TEST_CASE("GDSF disabled - zero overhead when kMaxMemory == 0",
+TEST_CASE("GDSF disabled - zero overhead when not enabled",
           "[gdsf][disabled]")
 {
-    SECTION("HasGDSF is false when kMaxMemory == 0") {
-        static_assert(GDSFPolicy::kMaxMemory == 0);
+    SECTION("HasGDSF is false when GDSF disabled") {
+        static_assert(!GDSFPolicy::enabled);
         SUCCEED();
     }
 
@@ -109,4 +109,4 @@ TEST_CASE("GDSF disabled - zero overhead when kMaxMemory == 0",
     }
 }
 
-#endif // RELAIS_L1_MAX_MEMORY == 0
+#endif // !RELAIS_GDSF_ENABLED
