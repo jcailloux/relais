@@ -5,7 +5,7 @@
 ### Added
 
 - **Lock-free L1 cache** — ParlayHash-backed `ChunkMap` with epoch-based reclamation; `find`/`insert`/`patch` return lightweight `EntityView` instead of `shared_ptr`
-- **GDSF eviction** — size-aware L1 eviction via `RELAIS_GDSF_ENABLED` CMake option + runtime `RELAIS_L1_MAX_MEMORY` env var; score = access_count × avg_cost / memoryUsage; histogram-based threshold with three-zone eviction curve; inline decay during cleanup; access count persistence across upserts; zero overhead when disabled
+- **GDSF eviction** — size-aware L1 eviction via `RELAIS_GDSF_ENABLED` CMake option + runtime `RELAIS_L1_MAX_MEMORY` env var; score = access_count × avg_cost / memoryUsage; histogram-based threshold with three-zone eviction curve; inline decay during cleanup; access count persistence across upserts; ghost admission control under memory pressure (≥ 50%); cross-repo sweep coordination; zero overhead when disabled
 - **Zero-copy RowView serialization** — `findJson()`/`findBinary()`/`queryJson()`/`queryBinary()` serialize directly from PgResult rows, skipping entity construction
 - **Configurable L2 format** — `CacheConfig::l2_format`: `Binary` (BEVE, default) or `Json` for non-C++ interop
 - **Composite primary keys** — `std::tuple`-based keys from multiple `@relais primary_key` fields with full CRUD and caching support

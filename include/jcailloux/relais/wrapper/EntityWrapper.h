@@ -117,7 +117,7 @@ public:
     // Memory tracking hook (set by CachedWrapper, nullptr for non-cached)
     // =========================================================================
 
-    using MemoryHook = void(*)(int64_t);
+    using MemoryHook = void(*)(void* ctx, int64_t delta);
 
     /// Approximate heap memory used by this entity (struct + dynamic fields + buffers).
     [[nodiscard]] size_t memoryUsage() const {
@@ -144,7 +144,7 @@ public:
         const std::vector<uint8_t>* expected = nullptr;
         if (beve_cache_.compare_exchange_strong(expected, buf,
                 std::memory_order_release, std::memory_order_acquire)) {
-            if (memory_hook_) memory_hook_(static_cast<int64_t>(buf->capacity()));
+            if (memory_hook_) memory_hook_(memory_hook_ctx_, static_cast<int64_t>(buf->capacity()));
             return buf;
         }
         delete buf;
@@ -173,7 +173,7 @@ public:
         const std::string* expected = nullptr;
         if (json_cache_.compare_exchange_strong(expected, buf,
                 std::memory_order_release, std::memory_order_acquire)) {
-            if (memory_hook_) memory_hook_(static_cast<int64_t>(buf->capacity()));
+            if (memory_hook_) memory_hook_(memory_hook_ctx_, static_cast<int64_t>(buf->capacity()));
             return buf;
         }
         delete buf;
@@ -187,8 +187,16 @@ public:
         return entity;
     }
 
+    /// Introspection: has the lazy binary cache been materialized?
+    bool hasBinaryCache() const { return beve_cache_.load(std::memory_order_relaxed) != nullptr; }
+    /// Introspection: has the lazy JSON cache been materialized?
+    bool hasJsonCache() const { return json_cache_.load(std::memory_order_relaxed) != nullptr; }
+    /// Set memory tracking hook with context pointer.
+    void setMemoryHook(MemoryHook hook, void* ctx) { memory_hook_ = hook; memory_hook_ctx_ = ctx; }
+
 protected:
     mutable MemoryHook memory_hook_ = nullptr;
+    mutable void* memory_hook_ctx_ = nullptr;
 
 private:
     mutable std::atomic<const std::vector<uint8_t>*> beve_cache_{nullptr};

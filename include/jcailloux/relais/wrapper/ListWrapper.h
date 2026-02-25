@@ -31,7 +31,7 @@ class ListWrapper {
 public:
     using Format = jcailloux::relais::StructFormat;
     using ItemType = Item;
-    using MemoryHook = void(*)(int64_t);
+    using MemoryHook = void(*)(void* ctx, int64_t delta);
     static constexpr bool read_only = true;
 
     std::vector<Item> items;
@@ -92,7 +92,7 @@ public:
                 buf->clear();
             beve_cache_ = std::move(buf);
             if (memory_hook_) {
-                memory_hook_(static_cast<int64_t>(beve_cache_->capacity()));
+                memory_hook_(memory_hook_ctx_, static_cast<int64_t>(beve_cache_->capacity()));
             }
         });
         return beve_cache_;
@@ -120,7 +120,7 @@ public:
             else
                 json_cache_ = std::move(json);
             if (memory_hook_) {
-                memory_hook_(static_cast<int64_t>(json_cache_->capacity()));
+                memory_hook_(memory_hook_ctx_, static_cast<int64_t>(json_cache_->capacity()));
             }
         });
         return json_cache_;
@@ -194,6 +194,7 @@ public:
     }
 
     mutable MemoryHook memory_hook_ = nullptr;
+    mutable void* memory_hook_ctx_ = nullptr;
 
 private:
     mutable std::once_flag beve_flag_;

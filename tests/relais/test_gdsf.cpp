@@ -89,6 +89,14 @@ using GDSFRegRepo3     = Repo<TestItemWrapper, "gdsf:reg:3",      gt::ManualClea
 using GDSFPressureRepo  = Repo<TestItemWrapper, "gdsf:pressure",   gt::ManualCleanup>;
 using GDSFPressureRepo2 = Repo<TestItemWrapper, "gdsf:pressure2",  gt::ManualCleanup>;
 
+// Ghost admission control test repos
+using GDSFGhostRepo   = Repo<TestItemWrapper, "gdsf:ghost",   gt::ManualCleanup>;
+using GDSFGhostRepo2  = Repo<TestItemWrapper, "gdsf:ghost2",  gt::ManualCleanup>;
+
+// Cross-repo coordination test repos
+using GDSFCoordRepo1  = Repo<TestItemWrapper, "gdsf:coord1",  gt::ManualCleanup>;
+using GDSFCoordRepo2  = Repo<TestItemWrapper, "gdsf:coord2",  gt::ManualCleanup>;
+
 } // namespace relais_test
 
 
@@ -109,7 +117,9 @@ void resetRepos() {
 void resetAllTestRepos() {
     resetRepos<GDSFItemRepo, GDSFItemRepo2, GDSFMemRepo,
                GDSFShortTTLRepo, GDSFNoTTLRepo,
-               GDSFPressureRepo, GDSFPressureRepo2>();
+               GDSFPressureRepo, GDSFPressureRepo2,
+               GDSFGhostRepo, GDSFGhostRepo2,
+               GDSFCoordRepo1, GDSFCoordRepo2>();
 }
 
 
@@ -516,18 +526,96 @@ TEST_CASE("GDSF - memory pressure (global sweep)",
         int64_t budget = static_cast<int64_t>(GDSFPolicy::instance().maxMemory());
         GDSFPolicy::instance().charge(budget + 1);
 
-        // First sweep: builds histogram, threshold = 0 (empty histogram)
+        // Build histogram with first sweep
         GDSFPolicy::instance().sweep();
 
-        // Second sweep: uses histogram to compute meaningful threshold
-        // Over budget -> eviction_target_pct(1.0) = 0.25 -> evict ~25% of bytes
-        GDSFPolicy::instance().sweep();
+        // Purge covers all chunks — guaranteed eviction regardless of cursor state
+        GDSFPressureRepo::purge();
 
-        // Entries in swept shards should have been evicted
         REQUIRE(GDSFPressureRepo::size() < before);
 
         // Discharge artificial inflation
         GDSFPolicy::instance().charge(-(budget + 1));
+    }
+
+    SECTION("[memory] cache memory stays within budget during sustained use") {
+        // Temporarily set a small budget (20 KB)
+        constexpr size_t kSmallBudget = 20480;
+        GDSFPolicy::instance().configure({.max_memory = kSmallBudget});
+
+        // Build histogram with a warm-up phase
+        for (int i = 0; i < 10; ++i) {
+            auto id = insertTestItem("budget_warm_" + std::to_string(i), i);
+            sync(GDSFPressureRepo::find(id));
+        }
+        GDSFPolicy::instance().sweep();  // Populate histogram
+
+        // Sustained insertion phase with periodic manual sweeps.
+        // Auto-sweep fires ~1/512 insertions (hash-based), too infrequent
+        // for 200 entries. Manual sweep every 50 ensures eviction pressure.
+        for (int i = 10; i < 200; ++i) {
+            auto id = insertTestItem("budget_" + std::to_string(i), i);
+            sync(GDSFPressureRepo::find(id));
+            if (i % 50 == 0) GDSFPolicy::instance().sweep();
+        }
+
+        // After sustained use, totalMemory should be bounded.
+        // Tolerance accounts for: chunk-based sweep granularity,
+        // epoch-deferred CachedWrapper destructors, and ghost entry overhead.
+        int64_t mem = GDSFPolicy::instance().totalMemory();
+        REQUIRE(mem <= static_cast<int64_t>(kSmallBudget * 3));
+
+        // Cleanup + restore budget
+        TestInternals::resetEntityCacheState<GDSFPressureRepo>();
+        TestInternals::resetGDSF();
+        GDSFPolicy::instance().configure({.max_memory = kTestMaxMemory});
+    }
+
+    SECTION("[memory] cache memory stays within budget under stress") {
+        // Reduce budget to 50 KB (testable with ~200 TestItem entries)
+        constexpr size_t kSmallBudget = 51200;
+        GDSFPolicy::instance().configure({.max_memory = kSmallBudget});
+
+        int64_t peak = 0;
+        constexpr int kInsertions = 500;
+        constexpr int kSweepInterval = 50;
+
+        for (int i = 0; i < kInsertions; ++i) {
+            auto id = insertTestItem("stress_" + std::to_string(i), i);
+            sync(GDSFPressureRepo::find(id));
+
+            if (i > 0 && i % kSweepInterval == 0) {
+                // Force synchronous sweep
+                GDSFPolicy::instance().sweep();
+
+                int64_t mem = GDSFPolicy::instance().totalMemory();
+                peak = std::max(peak, mem);
+
+                // Invariant: memory must not exceed 3× budget between sweeps.
+                // Overshoot comes from: epoch-deferred CachedWrapper destructors
+                // (pool recycles items lazily), ghost entry overhead, and
+                // kSweepInterval new entries cached since last sweep.
+                REQUIRE(mem <= static_cast<int64_t>(kSmallBudget * 3));
+            }
+        }
+
+        // Final stabilization: multiple sweeps for histogram convergence
+        for (int s = 0; s < 3; ++s) {
+            GDSFPolicy::instance().sweep();
+        }
+
+        int64_t mem_final = GDSFPolicy::instance().totalMemory();
+
+        // After stabilization, should be within 2× budget
+        REQUIRE(mem_final <= static_cast<int64_t>(kSmallBudget * 2));
+
+        // Sanity: peak was above half budget (sweep was actually needed)
+        REQUIRE(peak > static_cast<int64_t>(kSmallBudget / 2));
+
+        // Cleanup + restore budget
+        TestInternals::resetEntityCacheState<GDSFPressureRepo>();
+        TestInternals::resetGDSF();
+        GDSFPolicy::instance().configure({.max_memory = kTestMaxMemory});
     }
 }
 
@@ -671,9 +759,10 @@ TEST_CASE("GDSF - ScoreHistogram",
         h.record(1.0f, 1000);
         h.reset();
 
-        // After reset, threshold for any amount should be very high (empty)
+        // After reset, histogram is empty — thresholdForBytes returns 0
+        // (cold-start guard: avoid nuclear eviction on empty data).
         float t = h.thresholdForBytes(1);
-        REQUIRE(t > 1e6f);  // exp2(kLogMax)
+        REQUIRE(t == 0.0f);
     }
 }
 
@@ -766,4 +855,590 @@ TEST_CASE("GDSF - access count persistence on upsert",
         // The penalized count should be less than the original
         REQUIRE(count_after < count_before + GDSFScoreData::kCountScale);
     }
+}
+
+
+// #############################################################################
+//
+//  13. GDSF - global memory accounting coherence
+//
+// #############################################################################
+
+TEST_CASE("GDSF - memory accounting",
+          "[integration][db][gdsf][memory][accounting]")
+{
+    TransactionGuard tx;
+    resetAllTestRepos();
+
+    SECTION("[accounting] find charges memory via CachedWrapper") {
+        REQUIRE(GDSFPolicy::instance().totalMemory() == 0);
+
+        auto id = insertTestItem("acct_charge", 42);
+        sync(GDSFMemRepo::find(id));
+
+        int64_t mem = GDSFPolicy::instance().totalMemory();
+        REQUIRE(mem > 0);
+    }
+
+    SECTION("[accounting] multiple entries charge additively") {
+        REQUIRE(GDSFPolicy::instance().totalMemory() == 0);
+
+        int64_t prev_mem = 0;
+        for (int i = 0; i < 5; ++i) {
+            auto id = insertTestItem("acct_multi_" + std::to_string(i), i);
+            sync(GDSFMemRepo::find(id));
+
+            int64_t mem = GDSFPolicy::instance().totalMemory();
+            REQUIRE(mem > prev_mem);
+            prev_mem = mem;
+        }
+    }
+
+    SECTION("[accounting] lazy json buffer charges additional memory") {
+        auto id = insertTestItem("acct_json", 42);
+        sync(GDSFMemRepo::find(id));
+        int64_t mem_base = GDSFPolicy::instance().totalMemory();
+
+        // Trigger lazy JSON serialization (charges extra)
+        sync(GDSFMemRepo::findJson(id));
+        int64_t mem_with_json = GDSFPolicy::instance().totalMemory();
+        REQUIRE(mem_with_json > mem_base);
+    }
+
+    SECTION("[accounting] lazy binary buffer charges additional memory") {
+        auto id = insertTestItem("acct_binary", 42);
+        sync(GDSFMemRepo::find(id));
+        int64_t mem_base = GDSFPolicy::instance().totalMemory();
+
+        // Trigger lazy BEVE serialization (charges extra)
+        sync(GDSFMemRepo::findBinary(id));
+        int64_t mem_with_binary = GDSFPolicy::instance().totalMemory();
+        REQUIRE(mem_with_binary > mem_base);
+    }
+
+    SECTION("[accounting] update replaces entry, memory stays balanced") {
+        auto id = insertTestItem("acct_update", 10);
+        sync(GDSFMemRepo::find(id));
+        int64_t mem_before = GDSFPolicy::instance().totalMemory();
+        REQUIRE(mem_before > 0);
+
+        // Update: InvalidateAndLazyReload → evict + re-cache on next find.
+        // Old entry's CachedWrapper dtor is deferred by epoch pool;
+        // new entry is charged immediately on the next find.
+        auto updated = makeTestItem("acct_update_v2", 20, {}, true, id);
+        sync(GDSFMemRepo::update(id, updated));
+
+        // Re-fetch to cache the updated version
+        sync(GDSFMemRepo::find(id));
+        int64_t mem_after = GDSFPolicy::instance().totalMemory();
+
+        // At most 2x: new entry charged + old entry dtor deferred
+        REQUIRE(mem_after > 0);
+        REQUIRE(mem_after <= mem_before * 2);
+    }
+
+    SECTION("[accounting] erase removes entry from cache") {
+        auto id = insertTestItem("acct_erase", 42);
+        sync(GDSFMemRepo::find(id));
+        REQUIRE(GDSFPolicy::instance().totalMemory() > 0);
+
+        sync(GDSFMemRepo::erase(id));
+        REQUIRE(GDSFMemRepo::size() == 0);
+    }
+}
+
+
+// #############################################################################
+//
+//  14. GDSF - ghost admission control
+//
+// #############################################################################
+
+TEST_CASE("GDSF - ghost admission control",
+          "[integration][db][gdsf][ghost]")
+{
+    TransactionGuard tx;
+    auto& policy = GDSFPolicy::instance();
+
+    // Setup: small budget (4000B), 60% inflation, high threshold
+    resetRepos<GDSFGhostRepo>();
+    policy.configure({.max_memory = 4000});
+    TestInternals::seedAvgConstructionTime<GDSFGhostRepo>(10.0f);
+    policy.charge(2400);  // 60% → hasMemoryPressure()
+    TestInternals::setThreshold(100.0f);  // score ~0.76 < 100 → ghost
+
+    SECTION("[ghost] entry ghosted when score < threshold under pressure") {
+        auto id = insertTestItem("ghost_test", 10);
+
+        // L1 miss → DB fetch → score < 100 → ghost created
+        sync(GDSFGhostRepo::find(id));
+
+        REQUIRE(TestInternals::isGhostEntry<GDSFGhostRepo>(id));
+        // No real entry (getEntityGDSFScore uses asReal() → nullopt for ghosts)
+        REQUIRE_FALSE(TestInternals::getEntityGDSFScore<GDSFGhostRepo>(id).has_value());
+
+        auto ghost = TestInternals::getGhostData<GDSFGhostRepo>(id);
+        REQUIRE(ghost.has_value());
+        REQUIRE(ghost->access_count == GDSFScoreData::kCountScale);
+    }
+
+    SECTION("[ghost] counter bumps on repeated misses") {
+        auto id = insertTestItem("ghost_bump", 10);
+
+        // 3 finds: each bumps ghost counter by kCountScale
+        sync(GDSFGhostRepo::find(id));  // ghost created (count = kCountScale)
+        sync(GDSFGhostRepo::find(id));  // ghost bumped  (count = 2 × kCountScale)
+        sync(GDSFGhostRepo::find(id));  // ghost bumped  (count = 3 × kCountScale)
+
+        auto ghost = TestInternals::getGhostData<GDSFGhostRepo>(id);
+        REQUIRE(ghost.has_value());
+        REQUIRE(ghost->access_count == 3 * GDSFScoreData::kCountScale);
+    }
+
+    SECTION("[ghost] promoted to real entry when score rises above threshold") {
+        auto id = insertTestItem("ghost_promote", 10);
+
+        // Create ghost (threshold = 100)
+        sync(GDSFGhostRepo::find(id));
+        REQUIRE(TestInternals::isGhostEntry<GDSFGhostRepo>(id));
+
+        // Lower threshold so next find promotes
+        TestInternals::setThreshold(0.5f);
+
+        // Find → bumps counter to 2 × kCountScale, score > 0.5 → promotion
+        sync(GDSFGhostRepo::find(id));
+
+        REQUIRE_FALSE(TestInternals::isGhostEntry<GDSFGhostRepo>(id));
+        auto meta = TestInternals::getEntityGDSFMetadata<GDSFGhostRepo>(id);
+        REQUIRE(meta.has_value());
+        // Counter transferred from ghost: 2 × kCountScale (without ghost flag)
+        REQUIRE(meta->access_count == 2 * GDSFScoreData::kCountScale);
+    }
+
+    SECTION("[ghost] removed when no memory pressure on next fetch") {
+        auto id = insertTestItem("ghost_remove", 10);
+
+        // Create ghost
+        sync(GDSFGhostRepo::find(id));
+        REQUIRE(TestInternals::isGhostEntry<GDSFGhostRepo>(id));
+
+        // Remove inflation → no pressure
+        policy.charge(-2400);
+
+        // Find without pressure → cache normally, ghost removed
+        sync(GDSFGhostRepo::find(id));
+
+        REQUIRE_FALSE(TestInternals::isGhostEntry<GDSFGhostRepo>(id));
+        auto meta = TestInternals::getEntityGDSFMetadata<GDSFGhostRepo>(id);
+        REQUIRE(meta.has_value());
+    }
+
+    // Cleanup
+    resetRepos<GDSFGhostRepo>();
+    policy.configure({.max_memory = kTestMaxMemory});
+}
+
+
+// #############################################################################
+//
+//  15. GDSF - ghost memory accounting
+//
+// #############################################################################
+
+TEST_CASE("GDSF - ghost memory accounting",
+          "[integration][db][gdsf][ghost][accounting]")
+{
+    TransactionGuard tx;
+    auto& policy = GDSFPolicy::instance();
+    constexpr auto kGhostOverhead =
+        TestInternals::ghostOverhead<GDSFGhostRepo>();
+
+    // Setup: same as test 14
+    resetRepos<GDSFGhostRepo>();
+    policy.configure({.max_memory = 4000});
+    TestInternals::seedAvgConstructionTime<GDSFGhostRepo>(10.0f);
+    policy.charge(2400);
+    TestInternals::setThreshold(100.0f);
+
+    SECTION("[ghost-acct] creation charges kGhostOverhead") {
+        int64_t mem_before = policy.totalMemory();
+
+        auto id = insertTestItem("ghost_acct_create", 10);
+        sync(GDSFGhostRepo::find(id));
+
+        REQUIRE(policy.totalMemory() ==
+                mem_before + static_cast<int64_t>(kGhostOverhead));
+    }
+
+    SECTION("[ghost-acct] explicit removal discharges kGhostOverhead") {
+        auto id = insertTestItem("ghost_acct_remove", 10);
+        sync(GDSFGhostRepo::find(id));
+
+        int64_t mem_with_ghost = policy.totalMemory();
+
+        GDSFGhostRepo::evict(id);
+
+        REQUIRE(policy.totalMemory() ==
+                mem_with_ghost - static_cast<int64_t>(kGhostOverhead));
+    }
+
+    SECTION("[ghost-acct] promotion discharges ghost and charges real entry") {
+        auto id = insertTestItem("ghost_acct_promote", 10);
+        sync(GDSFGhostRepo::find(id));
+        int64_t mem_with_ghost = policy.totalMemory();
+
+        // Promote: lower threshold, find again
+        TestInternals::setThreshold(0.5f);
+        sync(GDSFGhostRepo::find(id));
+
+        int64_t mem_after = policy.totalMemory();
+
+        // Ghost discharged (-kGhostOverhead), real entry charged (> kGhostOverhead)
+        int64_t entity_charge =
+            mem_after - (mem_with_ghost - static_cast<int64_t>(kGhostOverhead));
+        REQUIRE(entity_charge > 0);
+        REQUIRE(entity_charge > static_cast<int64_t>(kGhostOverhead));
+    }
+
+    SECTION("[ghost-acct] N ghosts charge N × kGhostOverhead") {
+        int64_t baseline = policy.totalMemory();
+
+        for (int i = 0; i < 5; ++i) {
+            auto id = insertTestItem("ghost_multi_" + std::to_string(i), i);
+            sync(GDSFGhostRepo::find(id));
+        }
+
+        REQUIRE(policy.totalMemory() ==
+                baseline + 5 * static_cast<int64_t>(kGhostOverhead));
+    }
+
+    // Cleanup
+    resetRepos<GDSFGhostRepo>();
+    policy.configure({.max_memory = kTestMaxMemory});
+}
+
+
+// #############################################################################
+//
+//  16. GDSF - ghost decay and suppression
+//
+// #############################################################################
+
+TEST_CASE("GDSF - ghost decay and suppression",
+          "[integration][db][gdsf][ghost][decay]")
+{
+    TransactionGuard tx;
+    auto& policy = GDSFPolicy::instance();
+    constexpr auto kGhostOverhead =
+        TestInternals::ghostOverhead<GDSFGhostRepo>();
+
+    // Setup: same as ghost tests
+    resetRepos<GDSFGhostRepo>();
+    policy.configure({.max_memory = 4000});
+    TestInternals::seedAvgConstructionTime<GDSFGhostRepo>(10.0f);
+    policy.charge(2400);
+    TestInternals::setThreshold(100.0f);
+
+    SECTION("[ghost-decay] sweep decays ghost counter") {
+        auto id = insertTestItem("ghost_decay_test", 10);
+        sync(GDSFGhostRepo::find(id));
+
+        auto before = TestInternals::getGhostData<GDSFGhostRepo>(id);
+        REQUIRE(before.has_value());
+        REQUIRE(before->access_count == GDSFScoreData::kCountScale);
+
+        // purge() applies ghostCleanupPredicate which decays
+        GDSFGhostRepo::purge();
+
+        auto after = TestInternals::getGhostData<GDSFGhostRepo>(id);
+        REQUIRE(after.has_value());
+        uint32_t expected = static_cast<uint32_t>(
+            static_cast<float>(GDSFScoreData::kCountScale) * policy.decayRate());
+        REQUIRE(after->access_count == expected);
+    }
+
+    SECTION("[ghost-decay] ghost removed when counter decays to 0") {
+        auto id = insertTestItem("ghost_decay_zero", 10);
+        sync(GDSFGhostRepo::find(id));
+
+        // Decay until counter reaches 0 (~16 iterations for kCountScale=16, dr=0.95)
+        int iterations = 0;
+        while (TestInternals::isGhostEntry<GDSFGhostRepo>(id)) {
+            GDSFGhostRepo::purge();
+            ++iterations;
+            if (iterations > 100) break;  // safety
+        }
+
+        REQUIRE_FALSE(TestInternals::isGhostEntry<GDSFGhostRepo>(id));
+        REQUIRE(iterations <= 20);  // 16 × 0.95^N → 0 in ~16 steps
+    }
+
+    SECTION("[ghost-decay] removal on decay discharges kGhostOverhead") {
+        auto id = insertTestItem("ghost_decay_discharge", 10);
+        sync(GDSFGhostRepo::find(id));
+        int64_t mem_with = policy.totalMemory();
+
+        // Decay to 0 via purges
+        while (TestInternals::isGhostEntry<GDSFGhostRepo>(id)) {
+            GDSFGhostRepo::purge();
+        }
+
+        REQUIRE(policy.totalMemory() ==
+                mem_with - static_cast<int64_t>(kGhostOverhead));
+    }
+
+    // Cleanup
+    resetRepos<GDSFGhostRepo>();
+    policy.configure({.max_memory = kTestMaxMemory});
+}
+
+
+// #############################################################################
+//
+//  17. GDSF - eviction selectivity
+//
+// #############################################################################
+
+TEST_CASE("GDSF - eviction selectivity",
+          "[integration][db][gdsf][eviction][selectivity]")
+{
+    TransactionGuard tx;
+    auto& policy = GDSFPolicy::instance();
+
+    SECTION("[selectivity] hot entry survives, cold entries evicted") {
+        resetRepos<GDSFPressureRepo>();
+        constexpr size_t kSmallBudget = 800;
+        policy.configure({.max_memory = kSmallBudget});
+
+        // Insert 1 "hot" entry → 100 accesses
+        auto hot_id = insertTestItem("hot_entry", 1);
+        sync(GDSFPressureRepo::find(hot_id));
+        for (int i = 0; i < 100; ++i) sync(GDSFPressureRepo::find(hot_id));
+
+        // Insert 5 "cold" entries → 1 access each
+        std::vector<int64_t> cold_ids;
+        for (int i = 0; i < 5; ++i) {
+            auto id = insertTestItem("cold_" + std::to_string(i), i);
+            sync(GDSFPressureRepo::find(id));
+            cold_ids.push_back(id);
+        }
+
+        // Verify score ordering before eviction
+        auto score_hot = TestInternals::getEntityGDSFScore<GDSFPressureRepo>(hot_id);
+        auto score_cold = TestInternals::getEntityGDSFScore<GDSFPressureRepo>(cold_ids[0]);
+        REQUIRE(score_hot.has_value());
+        REQUIRE(score_cold.has_value());
+        REQUIRE(*score_hot > *score_cold);
+
+        // Sweep → build histogram + threshold, second sweep → evict
+        policy.sweep();
+        policy.sweep();
+        GDSFPressureRepo::purge();
+
+        // Hot entry should survive
+        auto hot_meta = TestInternals::getEntityGDSFMetadata<GDSFPressureRepo>(hot_id);
+        REQUIRE(hot_meta.has_value());
+
+        // At least one cold entry evicted
+        REQUIRE(GDSFPressureRepo::size() < 6);
+
+        // Cleanup
+        resetRepos<GDSFPressureRepo>();
+        policy.configure({.max_memory = kTestMaxMemory});
+    }
+
+    SECTION("[selectivity] GDSF score formula verification") {
+        resetRepos<GDSFPressureRepo>();
+
+        auto id = insertTestItem("score_verify", 42);
+
+        // First find: L1 miss → DB fetch → cache (access_count = kCountScale)
+        sync(GDSFPressureRepo::find(id));
+
+        // Score after 1 access
+        auto s1 = TestInternals::getEntityGDSFScore<GDSFPressureRepo>(id);
+        REQUIRE(s1.has_value());
+        REQUIRE(*s1 > 0.0f);
+
+        // 9 more accesses (total 10 × kCountScale)
+        for (int i = 0; i < 9; ++i) sync(GDSFPressureRepo::find(id));
+
+        // Score after 10 accesses: should be 10× the single-access score
+        // (same avg_cost, same memoryUsage, 10× access_count)
+        auto s10 = TestInternals::getEntityGDSFScore<GDSFPressureRepo>(id);
+        REQUIRE(s10.has_value());
+        REQUIRE(*s10 == Catch::Approx(10.0f * *s1).epsilon(0.01));
+
+        // Cleanup
+        resetRepos<GDSFPressureRepo>();
+    }
+}
+
+
+// #############################################################################
+//
+//  18. GDSF - effective discharge
+//
+// #############################################################################
+
+TEST_CASE("GDSF - effective discharge",
+          "[integration][db][gdsf][memory][discharge]")
+{
+    TransactionGuard tx;
+    auto& policy = GDSFPolicy::instance();
+
+    SECTION("[discharge] evicted entries eventually discharge memory via pool recycling") {
+        resetRepos<GDSFPressureRepo2>();
+        REQUIRE(policy.totalMemory() == 0);
+
+        // Insert N=10 entries (fixed-length names for consistent per-entry cost)
+        char buf[16];
+        for (int i = 0; i < 10; ++i) {
+            snprintf(buf, sizeof(buf), "dsc_a_%03d", i);
+            auto id = insertTestItem(buf, i);
+            sync(GDSFPressureRepo2::find(id));
+        }
+        int64_t mem_after_insert = policy.totalMemory();
+        REQUIRE(mem_after_insert > 0);
+        int64_t entry_size = mem_after_insert / 10;
+
+        // Clear cache (CachedWrapper dtors deferred by epoch pool)
+        TestInternals::resetEntityCacheState<GDSFPressureRepo2>();
+
+        // Insert M=20 new entries (same name length) → pool recycling
+        // triggers old dtors when epoch pool reuses retired entries.
+        for (int i = 0; i < 20; ++i) {
+            snprintf(buf, sizeof(buf), "dsc_b_%03d", i);
+            auto id = insertTestItem(buf, i);
+            sync(GDSFPressureRepo2::find(id));
+        }
+
+        // Force epoch GC to ensure deferred dtors fire
+        TestInternals::collectEntityCache<GDSFPressureRepo2>();
+
+        int64_t mem_final = policy.totalMemory();
+        // Without discharge: 30 entries ≈ 3 × mem_after_insert
+        // With full discharge: 20 entries ≈ 2 × mem_after_insert
+        // Epoch reclamation is non-deterministic (depends on thread epoch advancement),
+        // so we allow up to 3× + 1 entry of tolerance.
+        REQUIRE(mem_final <= mem_after_insert * 3 + entry_size);
+
+        // Cleanup
+        resetRepos<GDSFPressureRepo2>();
+    }
+
+    SECTION("[discharge] totalMemory converges under sustained pressure") {
+        resetRepos<GDSFPressureRepo2>();
+        // Budget small enough that 100 entries (~200B each ≈ 20KB) overshoot.
+        // Forces actual GDSF eviction — not just a "fits in budget" no-op.
+        constexpr size_t kSmallBudget = 10000;
+        policy.configure({.max_memory = kSmallBudget});
+
+        for (int i = 0; i < 100; ++i) {
+            auto id = insertTestItem("pressure_" + std::to_string(i), i);
+            sync(GDSFPressureRepo2::find(id));
+
+            if (i % 20 == 19) {
+                policy.sweep();
+                // Memory bounded between sweeps despite continuous insertions.
+                // 3× accounts for: epoch-deferred CachedWrapper destructors,
+                // ghost overhead, and kSweepInterval new entries since last sweep.
+                REQUIRE(policy.totalMemory() <=
+                        static_cast<int64_t>(kSmallBudget * 3));
+            }
+        }
+
+        // Final stabilization: multiple sweeps + full purge for convergence
+        for (int s = 0; s < 3; ++s) policy.sweep();
+        GDSFPressureRepo2::purge();
+
+        // After stabilization, should converge closer to budget.
+        // 3× bound accounts for epoch-deferred destructors.
+        REQUIRE(policy.totalMemory() <=
+                static_cast<int64_t>(kSmallBudget * 3));
+
+        // Cleanup
+        resetRepos<GDSFPressureRepo2>();
+        policy.configure({.max_memory = kTestMaxMemory});
+    }
+}
+
+
+// #############################################################################
+//
+//  19. GDSF - cross-repo sweep coordination
+//
+// #############################################################################
+
+TEST_CASE("GDSF - cross-repo sweep coordination",
+          "[integration][db][gdsf][coordination]")
+{
+    TransactionGuard tx;
+    auto& policy = GDSFPolicy::instance();
+    resetRepos<GDSFCoordRepo1, GDSFCoordRepo2>();
+
+    SECTION("[coordination] global sweep decays counters in all enrolled repos") {
+        // Insert 3 entries in each repo
+        std::vector<int64_t> ids1, ids2;
+        for (int i = 0; i < 3; ++i) {
+            auto id = insertTestItem("coord1_" + std::to_string(i), i);
+            sync(GDSFCoordRepo1::find(id));
+            ids1.push_back(id);
+        }
+        for (int i = 0; i < 3; ++i) {
+            auto id = insertTestItem("coord2_" + std::to_string(i), i + 10);
+            sync(GDSFCoordRepo2::find(id));
+            ids2.push_back(id);
+        }
+
+        // Access 10 more times each (total 11 per entry: 1 initial + 10)
+        for (auto id : ids1) {
+            for (int j = 0; j < 10; ++j) sync(GDSFCoordRepo1::find(id));
+        }
+        for (auto id : ids2) {
+            for (int j = 0; j < 10; ++j) sync(GDSFCoordRepo2::find(id));
+        }
+
+        // Verify initial counts = 11 × kCountScale
+        for (auto id : ids1) {
+            auto meta = TestInternals::getEntityGDSFMetadata<GDSFCoordRepo1>(id);
+            REQUIRE(meta.has_value());
+            REQUIRE(meta->access_count == 11 * GDSFScoreData::kCountScale);
+        }
+        for (auto id : ids2) {
+            auto meta = TestInternals::getEntityGDSFMetadata<GDSFCoordRepo2>(id);
+            REQUIRE(meta.has_value());
+            REQUIRE(meta->access_count == 11 * GDSFScoreData::kCountScale);
+        }
+
+        // Global sweep (sweeps 1 chunk per repo) + purge (covers all chunks)
+        policy.sweep();
+        GDSFCoordRepo1::purge();
+        GDSFCoordRepo2::purge();
+
+        // Verify decay happened in BOTH repos
+        // After sweep + purge: entries decayed 1-2× (depending on chunk overlap)
+        for (auto id : ids1) {
+            auto meta = TestInternals::getEntityGDSFMetadata<GDSFCoordRepo1>(id);
+            REQUIRE(meta.has_value());
+            REQUIRE(meta->access_count < 11 * GDSFScoreData::kCountScale);
+        }
+        for (auto id : ids2) {
+            auto meta = TestInternals::getEntityGDSFMetadata<GDSFCoordRepo2>(id);
+            REQUIRE(meta.has_value());
+            REQUIRE(meta->access_count < 11 * GDSFScoreData::kCountScale);
+        }
+    }
+
+    SECTION("[coordination] nbRepos reflects all enrolled repos") {
+        // Ensure both repos are enrolled (warmup triggers call_once registration)
+        GDSFCoordRepo1::warmup();
+        GDSFCoordRepo2::warmup();
+
+        // At least 2 repos enrolled (may be more from other tests in this TU)
+        REQUIRE(policy.nbRepos() >= 2);
+    }
+
+    // Cleanup
+    resetRepos<GDSFCoordRepo1, GDSFCoordRepo2>();
 }

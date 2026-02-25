@@ -247,6 +247,15 @@ public:
             && totalMemory() > static_cast<int64_t>(max_memory_);
     }
 
+    /// Memory pressure >= 50% — ghost admission control activates above this.
+    bool hasMemoryPressure() const {
+        size_t budget = max_memory_;
+        if (budget == 0) return false;
+        float usage = static_cast<float>(std::max(int64_t(0), totalMemory()))
+                    / static_cast<float>(budget);
+        return usage >= 0.50f;
+    }
+
     // =====================================================================
     // Histogram Recording (during sweep, protected by sweep_flag_)
     // =====================================================================

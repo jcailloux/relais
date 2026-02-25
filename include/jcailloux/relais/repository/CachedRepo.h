@@ -13,6 +13,7 @@
 #include "jcailloux/relais/cache/ChunkMap.h"
 #include "jcailloux/relais/cache/GDSFMetadata.h"
 #include "jcailloux/relais/cache/GDSFPolicy.h"
+#include "jcailloux/relais/cache/GhostEntry.h"
 #include "jcailloux/relais/wrapper/EntityView.h"
 #include "jcailloux/relais/wrapper/BufferView.h"
 #include "jcailloux/relais/config/repo_config.h"
@@ -39,6 +40,11 @@ namespace jcailloux::relais {
  * - GDSF (score = frequency x cost) when RELAIS_GDSF_ENABLED
  * - TTL-only when l1_ttl > 0 but no GDSF
  * - No cleanup when neither is configured (default)
+ *
+ * When GDSF is enabled, ghost entries provide admission control under memory
+ * pressure (>= 50%). Evicted/rejected data is tracked as lightweight ghosts
+ * (~20B) that accumulate access frequency. Only data that proves popular
+ * enough is (re-)admitted to the cache.
  *
  * Note: L1RepoConfig constraint is verified in Repo.h to avoid
  * eager evaluation issues with std::conditional_t.
@@ -94,8 +100,10 @@ public:
     /// L1 hit: zero overhead (Immediate holds JsonView directly, no Task).
     static io::Immediate<wrapper::JsonView> findJson(const Key& id) {
         auto result = findInCache(id);
-        if (result)
-            return wrapper::JsonView(result.entry->value.json(), std::move(result.guard));
+        if (result) {
+            auto* ce = result.asReal();
+            return wrapper::JsonView(ce->value.json(), std::move(result.guard));
+        }
         return findJsonSlow(id);
     }
 
@@ -106,8 +114,10 @@ public:
         requires HasBinarySerialization<Entity>
     {
         auto result = findInCache(id);
-        if (result)
-            return wrapper::BinaryView(result.entry->value.binary(), std::move(result.guard));
+        if (result) {
+            auto* ce = result.asReal();
+            return wrapper::BinaryView(ce->value.binary(), std::move(result.guard));
+        }
         return findBinarySlow(id);
     }
 
@@ -140,6 +150,10 @@ public:
             if constexpr (Cfg.update_strategy == InvalidateAndLazyReload) {
                 evict(id);  // evict() calls bumpGeneration internally
             } else {
+                // Apply ghost penalty if a ghost exists for this key
+                if constexpr (HasGDSF) {
+                    applyGhostUpdatePenalty(id);
+                }
                 bumpGeneration(id);
                 putInCache(id, entity);
             }
@@ -153,6 +167,9 @@ public:
     static io::Task<wrapper::EntityView<Entity>> patch(const Key& id, Updates&&... updates)
         requires HasFieldUpdate<Entity> && (!Cfg.read_only)
     {
+        if constexpr (HasGDSF) {
+            applyGhostUpdatePenalty(id);
+        }
         bumpGeneration(id);
         evict(id);
         auto entity = co_await Base::patchRaw(id, std::forward<Updates>(updates)...);
@@ -192,9 +209,12 @@ public:
     }
 
     /// Invalidate L1 cache only. Non-coroutine since there is no async work.
-    /// Note: the retired entry is destroyed asynchronously via epoch-based reclamation.
+    /// Removes both real entries and ghosts.
     /// Increments the generation counter to prevent stale fetches from caching.
     static void evict(const Key& id) {
+        if constexpr (HasGDSF) {
+            removeGhost(id);
+        }
         bumpGeneration(id);
         cache().invalidate(id);
     }
@@ -211,6 +231,8 @@ public:
     struct CleanupContext {
         Clock::time_point now;
         float threshold;
+        struct GhostCandidate { Key key; uint32_t count; uint32_t bytes; uint8_t flags; };
+        std::vector<GhostCandidate>* ghost_candidates = nullptr;
     };
 
     /// Sweep one chunk (lock-free, always succeeds).
@@ -218,11 +240,41 @@ public:
         if constexpr (!HasCleanup) {
             return false;
         } else {
-            CleanupContext ctx{Clock::now(), HasGDSF ? cache::GDSFPolicy::instance().threshold() : 0.0f};
+            auto& policy = cache::GDSFPolicy::instance();
+            CleanupContext ctx{Clock::now(), HasGDSF ? policy.threshold() : 0.0f};
+
+            // Ghost candidates collected during sweep (inserted after).
+            // Only collect when under moderate pressure (50-100%), not during
+            // emergency sweeps (>100%) — those need to free memory, not add ghosts.
+            std::vector<typename CleanupContext::GhostCandidate> candidates;
+            if constexpr (HasGDSF) {
+                if (policy.hasMemoryPressure() && !policy.isOverBudget()) {
+                    ctx.ghost_candidates = &candidates;
+                }
+            }
+
             auto removed = cache().cleanup_next_chunk(kChunkCount,
-                [&ctx](const Key&, auto& entry) {
-                    return cleanupPredicate(entry.metadata, entry.value, ctx);
+                [&ctx](const Key& key, auto& header) {
+                    if constexpr (HasGDSF) {
+                        if (header.metadata.isGhost()) {
+                            return ghostCleanupPredicate(header.metadata);
+                        }
+                    }
+                    auto& ce = static_cast<typename L1Cache::CacheEntry&>(header);
+                    return cleanupPredicate(key, ce.metadata, ce.value, ctx);
                 });
+
+            // Insert ghosts for evicted entries (post-sweep)
+            if constexpr (HasGDSF) {
+                for (auto& gc : candidates) {
+                    Metadata meta(gc.count | cache::GDSFScoreData::kGhostFlag, 0);
+                    if (cache().insert_ghost(gc.key,
+                            cache::GhostData{gc.bytes, gc.flags}, meta)) {
+                        policy.charge(static_cast<int64_t>(kGhostOverhead));
+                    }
+                }
+            }
+
             return removed > 0;
         }
     }
@@ -237,11 +289,37 @@ public:
         if constexpr (!HasCleanup) {
             return 0;
         } else {
-            CleanupContext ctx{Clock::now(), HasGDSF ? cache::GDSFPolicy::instance().threshold() : 0.0f};
+            auto& policy = cache::GDSFPolicy::instance();
+            CleanupContext ctx{Clock::now(), HasGDSF ? policy.threshold() : 0.0f};
+
+            std::vector<typename CleanupContext::GhostCandidate> candidates;
+            if constexpr (HasGDSF) {
+                if (policy.hasMemoryPressure() && !policy.isOverBudget()) {
+                    ctx.ghost_candidates = &candidates;
+                }
+            }
+
             auto removed = cache().full_cleanup(
-                [&ctx](const Key&, auto& entry) {
-                    return cleanupPredicate(entry.metadata, entry.value, ctx);
+                [&ctx](const Key& key, auto& header) {
+                    if constexpr (HasGDSF) {
+                        if (header.metadata.isGhost()) {
+                            return ghostCleanupPredicate(header.metadata);
+                        }
+                    }
+                    auto& ce = static_cast<typename L1Cache::CacheEntry&>(header);
+                    return cleanupPredicate(key, ce.metadata, ce.value, ctx);
                 });
+
+            if constexpr (HasGDSF) {
+                for (auto& gc : candidates) {
+                    Metadata meta(gc.count | cache::GDSFScoreData::kGhostFlag, 0);
+                    if (cache().insert_ghost(gc.key,
+                            cache::GhostData{gc.bytes, gc.flags}, meta)) {
+                        policy.charge(static_cast<int64_t>(kGhostOverhead));
+                    }
+                }
+            }
+
             return removed;
         }
     }
@@ -261,7 +339,8 @@ public:
     }
 
 protected:
-    using L1Cache = cache::ChunkMap<Key, ValueType, Metadata>;
+    using L1Cache = cache::ChunkMap<Key, ValueType, Metadata,
+        std::conditional_t<HasGDSF, cache::GhostData, void>>;
 
     /// Returns the static ChunkMap instance.
     /// On first call, auto-registers this repo with GDSFPolicy for global coordination
@@ -287,9 +366,15 @@ protected:
 
     /// L1 cache lookup with TTL check and GDSF score bump.
     /// Returns raw FindResult for flexible use by find/findJson/findBinary.
+    /// Ghosts are treated as L1 miss (the slow path handles admission).
     static typename L1Cache::FindResult findInCache(const Key& key) {
         auto result = cache().find(key);
         if (!result) return {};
+
+        // Ghost: treated as L1 miss (slow path will handle admission)
+        if constexpr (HasGDSF) {
+            if (result.entry->metadata.isGhost()) return {};
+        }
 
         auto* entry = result.entry;
 
@@ -311,7 +396,9 @@ protected:
     static wrapper::EntityView<Entity> getFromCache(const Key& key) {
         auto result = findInCache(key);
         if (!result) return {};
-        return wrapper::EntityView<Entity>(&result.entry->value, std::move(result.guard));
+        auto* ce = result.asReal();
+        return wrapper::EntityView<Entity>(
+            static_cast<const Entity*>(&ce->value), std::move(result.guard));
     }
 
     /// Put entity in cache (copy). Returns FindResult for flexible use.
@@ -348,13 +435,17 @@ protected:
     /// Put entity in cache and return EntityView (copy path).
     static wrapper::EntityView<Entity> putInCacheAndView(const Key& key, const Entity& src) {
         auto result = putInCache(key, src);
-        return wrapper::EntityView<Entity>(&result.entry->value, std::move(result.guard));
+        auto* ce = result.asReal();
+        return wrapper::EntityView<Entity>(
+            static_cast<const Entity*>(&ce->value), std::move(result.guard));
     }
 
     /// Put entity in cache and return EntityView (move path — zero copy).
     static wrapper::EntityView<Entity> putInCacheAndView(const Key& key, Entity&& src) {
         auto result = putInCache(key, std::move(src));
-        return wrapper::EntityView<Entity>(&result.entry->value, std::move(result.guard));
+        auto* ce = result.asReal();
+        return wrapper::EntityView<Entity>(
+            static_cast<const Entity*>(&ce->value), std::move(result.guard));
     }
 
     /// Fire a global sweep as a detached coroutine (fire-and-forget).
@@ -366,18 +457,15 @@ protected:
 private:
     /// Slow path for find(): L1 miss → (L2) → DB → cache.
     static io::Task<wrapper::EntityView<Entity>> findSlow(const Key& id) {
-        auto result = co_await fetchAndCache(id);
-        if (result) {
-            co_return wrapper::EntityView<Entity>(&result.entry->value, std::move(result.guard));
-        }
-        co_return {};
+        co_return co_await fetchAndCache(id);
     }
 
     /// Slow path for findJson(): L1 miss → (L2) → DB → cache → JSON.
     static io::Task<wrapper::JsonView> findJsonSlow(const Key& id) {
-        auto result = co_await fetchAndCache(id);
-        if (result) {
-            co_return wrapper::JsonView(result.entry->value.json(), std::move(result.guard));
+        auto view = co_await fetchAndCache(id);
+        if (view) {
+            auto* p = view->json();  // evaluate before take_guard() nulls ptr_
+            co_return wrapper::JsonView(p, view.take_guard());
         }
         co_return {};
     }
@@ -386,42 +474,132 @@ private:
     static io::Task<wrapper::BinaryView> findBinarySlow(const Key& id)
         requires HasBinarySerialization<Entity>
     {
-        auto result = co_await fetchAndCache(id);
-        if (result) {
-            co_return wrapper::BinaryView(result.entry->value.binary(), std::move(result.guard));
+        auto view = co_await fetchAndCache(id);
+        if (view) {
+            auto* p = view->binary();  // evaluate before take_guard() nulls ptr_
+            co_return wrapper::BinaryView(p, view.take_guard());
         }
         co_return {};
     }
 
-    /// Fetch from Base via findRaw (entity by value), measure construction
-    /// time (GDSF), move into cache. Reuses Clock::now() for both GDSF
-    /// timing and TTL metadata (saves one vDSO call ~25ns).
+    /// Fetch from Base via findRaw and decide: cache, ghost, or reject.
     ///
-    /// Generation counter: reads the generation before fetching. If a write
-    /// (update/evict/invalidate) happened during the fetch, the generation
-    /// will have changed. Currently we cache anyway since the fetch window
-    /// is very short without batching. When BatchScheduler is wired in
-    /// (wider fetch windows), this will be upgraded to skip caching and
-    /// return the entity via an alternate path (requires EntityView changes).
-    static io::Task<typename L1Cache::FindResult> fetchAndCache(const Key& id) {
+    /// Under GDSF with memory pressure (>= 50%), the entity is scored against
+    /// the eviction threshold. If the score is too low, a lightweight ghost
+    /// (~20B) is created instead of caching the full entity. Ghosts track
+    /// access frequency so that popular data is admitted on subsequent fetches.
+    ///
+    /// Without pressure or without GDSF, every fetch is cached (existing behavior).
+    static io::Task<wrapper::EntityView<Entity>> fetchAndCache(const Key& id) {
         if constexpr (HasGDSF) {
             auto start = Clock::now();
             auto entity = co_await Base::findRaw(id);
-            if (entity) {
-                auto now = Clock::now();
-                auto elapsed_us = static_cast<float>(
-                    std::chrono::duration_cast<std::chrono::microseconds>(
-                        now - start).count());
-                updateAvgConstructionTime(elapsed_us);
-                co_return putInCache(id, std::move(*entity), now);
+            if (!entity) co_return {};
+
+            auto now = Clock::now();
+            auto elapsed_us = static_cast<float>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    now - start).count());
+            updateAvgConstructionTime(elapsed_us);
+
+            auto& policy = cache::GDSFPolicy::instance();
+
+            if (policy.hasMemoryPressure()) {
+                // --- Lookup existing ghost ---
+                auto ghost_result = cache().find(id);
+                auto* ge = ghost_result ? ghost_result.asGhost() : nullptr;
+
+                // --- Compute score ---
+                uint32_t est_bytes = static_cast<uint32_t>(
+                    entity->memoryUsage() + kCacheEntryOverhead);
+                uint8_t est_flags = static_cast<uint8_t>(
+                    (entity->hasBinaryCache() ? 0x01 : 0) |
+                    (entity->hasJsonCache()   ? 0x02 : 0));
+
+                uint32_t count;
+                if (ge) {
+                    // Ghost exists: bump counter, update estimated_bytes
+                    uint32_t raw = ge->metadata.access_count.load(std::memory_order_relaxed);
+                    uint32_t old_count = raw & cache::GDSFScoreData::kCountMask;
+                    count = old_count + cache::GDSFScoreData::kCountScale;
+                    ge->metadata.access_count.store(
+                        count | cache::GDSFScoreData::kGhostFlag,
+                        std::memory_order_relaxed);
+                    ge->value.estimated_bytes.store(est_bytes, std::memory_order_relaxed);
+                    ge->value.flags.store(est_flags, std::memory_order_relaxed);
+                } else {
+                    // No ghost: initial score
+                    count = cache::GDSFScoreData::kCountScale;
+                }
+
+                float avg_cost = avg_construction_time_us_.load(std::memory_order_relaxed);
+                float decayed = static_cast<float>(count) * policy.decayRate();
+                float score = decayed * avg_cost
+                    / static_cast<float>(std::max(est_bytes, uint32_t{1}));
+
+                if (score >= policy.threshold()) {
+                    // === CACHE (or PROMOTION if ghost existed) ===
+                    if (ge) {
+                        policy.charge(-static_cast<int64_t>(kGhostOverhead));
+                        // upsert real → retire ghost automatically via retire()
+                    }
+                    auto r = putInCache(id, std::move(*entity), now);
+                    if (ge) {
+                        // Transfer counter (without ghost flag)
+                        r.entry->metadata.access_count.store(count,
+                            std::memory_order_relaxed);
+                    }
+                    auto* ce = r.asReal();
+                    co_return wrapper::EntityView<Entity>(
+                        static_cast<const Entity*>(&ce->value), std::move(r.guard));
+                } else {
+                    // === GHOST (create or keep existing) ===
+                    if (!ge) {
+                        // Create new ghost (insert_ghost: never replaces a real entry)
+                        if (cache().insert_ghost(id,
+                                cache::GhostData{est_bytes, est_flags},
+                                Metadata(cache::GDSFScoreData::kCountScale
+                                    | cache::GDSFScoreData::kGhostFlag, 0))) {
+                            policy.charge(static_cast<int64_t>(kGhostOverhead));
+                        }
+                        // If insert fails → a real entry was inserted concurrently.
+                        // We continue: the entity is returned as transient anyway.
+                    }
+                    // Return entity without caching (transient pool)
+                    auto guard = epoch::EpochGuard::acquire();
+                    auto* ptr = transientPool().New(std::move(*entity));
+                    // Install ghost hook if ghost exists (re-lookup)
+                    auto gr = cache().find(id);
+                    auto* ghost = gr ? gr.asGhost() : nullptr;
+                    if (ghost) ptr->setMemoryHook(&cache::ghostMemoryHook, &ghost->value);
+                    transientPool().Retire(ptr);
+                    co_return wrapper::EntityView<Entity>(
+                        static_cast<const Entity*>(ptr), std::move(guard));
+                }
             }
+
+            // --- No pressure: cache normally ---
+            // Remove ghost if one exists (no longer relevant without pressure)
+            auto ghost_result = cache().find(id);
+            if (ghost_result && ghost_result.entry->metadata.isGhost()) {
+                policy.charge(-static_cast<int64_t>(kGhostOverhead));
+                cache().remove(id);
+            }
+            auto r = putInCache(id, std::move(*entity), now);
+            auto* ce = r.asReal();
+            co_return wrapper::EntityView<Entity>(
+                static_cast<const Entity*>(&ce->value), std::move(r.guard));
         } else {
+            // Non-GDSF path (unchanged)
             auto entity = co_await Base::findRaw(id);
             if (entity) {
-                co_return putInCache(id, std::move(*entity));
+                auto r = putInCache(id, std::move(*entity));
+                auto* ce = r.asReal();
+                co_return wrapper::EntityView<Entity>(
+                    static_cast<const Entity*>(&ce->value), std::move(r.guard));
             }
+            co_return {};
         }
-        co_return {};
     }
 
     /// Per-entry memory overhead beyond Entity::memoryUsage().
@@ -429,6 +607,23 @@ private:
     static constexpr size_t kCacheEntryOverhead =
         sizeof(typename L1Cache::CacheEntry) - sizeof(Entity)
         + sizeof(Key) + sizeof(void*);
+
+    /// Per-ghost memory overhead (EntryHeader + GhostData + key + pointer in map).
+    static constexpr size_t kGhostOverhead = [] {
+        if constexpr (HasGDSF) {
+            return sizeof(typename L1Cache::GhostCacheEntry)
+                 + sizeof(Key) + sizeof(void*);
+        } else {
+            return size_t{0};
+        }
+    }();
+
+    /// Transient pool for entities returned without caching (ghost REJECT path).
+    /// Epoch-based reclamation ensures the entity lives until the EpochGuard drops.
+    static epoch::memory_pool<Entity>& transientPool() {
+        static auto* p = new epoch::memory_pool<Entity>();
+        return *p;
+    }
 
     /// Build ValueType from entity (copy path).
     static ValueType buildValue(const Entity& src) {
@@ -470,14 +665,14 @@ private:
                                      std::memory_order_relaxed);
     }
 
-    /// Cleanup predicate: inline decay + compute score on-the-fly + record in histogram.
-    /// Evict based on GDSF score and/or TTL expiration.
-    static bool cleanupPredicate(const Metadata& meta, const ValueType& value,
-                                  CleanupContext& ctx) {
+    /// Cleanup predicate for real entries: inline decay + score + histogram.
+    /// When evicting, accumulates ghost candidates for post-sweep insertion.
+    static bool cleanupPredicate(const Key& key, const Metadata& meta,
+                                  const ValueType& value, CleanupContext& ctx) {
         if constexpr (HasGDSF) {
             // Inline decay: single writer per chunk during sweep, plain store (no CAS)
             float dr = cache::GDSFPolicy::instance().decayRate();
-            uint32_t old_count = meta.access_count.load(std::memory_order_relaxed);
+            uint32_t old_count = meta.rawCount();
             meta.access_count.store(
                 static_cast<uint32_t>(static_cast<float>(old_count) * dr),
                 std::memory_order_relaxed);
@@ -496,13 +691,59 @@ private:
             }
 
             // Evict if score below threshold
-            if (score < ctx.threshold) return true;
+            if (score < ctx.threshold) {
+                if (ctx.ghost_candidates) {
+                    ctx.ghost_candidates->push_back({key, old_count,
+                        static_cast<uint32_t>(mem),
+                        static_cast<uint8_t>(
+                            (value.hasBinaryCache() ? 0x01 : 0) |
+                            (value.hasJsonCache()   ? 0x02 : 0))});
+                }
+                return true;
+            }
 
             return false;
         } else if constexpr (HasTTL) {
             return meta.isExpired(ctx.now);
         } else {
             return false;  // unreachable — cleanup is disabled
+        }
+    }
+
+    /// Ghost cleanup predicate: decay counter, remove if counter reaches 0.
+    static bool ghostCleanupPredicate(const Metadata& meta) {
+        float dr = cache::GDSFPolicy::instance().decayRate();
+        uint32_t count = meta.rawCount();
+        uint32_t decayed = static_cast<uint32_t>(static_cast<float>(count) * dr);
+        meta.access_count.store(decayed | cache::GDSFScoreData::kGhostFlag,
+            std::memory_order_relaxed);
+        if (decayed == 0) {
+            cache::GDSFPolicy::instance().charge(-static_cast<int64_t>(kGhostOverhead));
+            return true;
+        }
+        return false;
+    }
+
+    /// Remove a ghost entry for the given key (if it exists).
+    /// Used by evict/invalidate to clean up ghosts on write paths.
+    static void removeGhost(const Key& id) {
+        auto r = cache().find(id);
+        if (r && r.entry->metadata.isGhost()) {
+            cache::GDSFPolicy::instance().charge(-static_cast<int64_t>(kGhostOverhead));
+            cache().remove(id);
+        }
+    }
+
+    /// Apply update penalty to a ghost's access count (if ghost exists).
+    /// Called by update/patch to erode scores of frequently-mutated data.
+    static void applyGhostUpdatePenalty(const Key& id) {
+        auto r = cache().find(id);
+        if (r && r.entry->metadata.isGhost()) {
+            uint32_t raw = r.entry->metadata.access_count.load(std::memory_order_relaxed);
+            uint32_t count = raw & cache::GDSFScoreData::kCountMask;
+            r.entry->metadata.access_count.store(
+                static_cast<uint32_t>(static_cast<float>(count) * cache::GDSFScoreData::kUpdatePenalty)
+                | cache::GDSFScoreData::kGhostFlag, std::memory_order_relaxed);
         }
     }
 

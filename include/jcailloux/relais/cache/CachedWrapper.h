@@ -28,7 +28,8 @@ public:
         , extra_overhead_(extra_overhead)
     {
         this->memory_hook_ = &chargeHook;
-        chargeHook(static_cast<int64_t>(this->memoryUsage()));
+        this->memory_hook_ctx_ = nullptr;
+        chargeHook(nullptr, static_cast<int64_t>(this->memoryUsage()));
     }
 
     /// Full memory cost of this cache entry (entity + overhead).
@@ -44,13 +45,15 @@ public:
         , extra_overhead_(o.extra_overhead_)
     {
         this->memory_hook_ = o.memory_hook_;
+        this->memory_hook_ctx_ = o.memory_hook_ctx_;
         o.memory_hook_ = nullptr;
+        o.memory_hook_ctx_ = nullptr;
         o.extra_overhead_ = 0;
     }
 
     ~CachedWrapper() {
         if (this->memory_hook_) {
-            this->memory_hook_(-static_cast<int64_t>(this->memoryUsage()));
+            this->memory_hook_(this->memory_hook_ctx_, -static_cast<int64_t>(this->memoryUsage()));
         }
     }
 
@@ -61,7 +64,7 @@ public:
 private:
     size_t extra_overhead_;
 
-    static void chargeHook(int64_t delta) {
+    static void chargeHook(void* /*ctx*/, int64_t delta) {
         GDSFPolicy::instance().charge(delta);
     }
 };
