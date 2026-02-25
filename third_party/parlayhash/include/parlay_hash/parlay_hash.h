@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstring>
 #include <functional>
 #include <iterator>
 #include <optional>
@@ -84,9 +85,21 @@ struct parlay_hash {
   // for delayed reclamation of links using an epoch-based collector
   epoch::memory_pool<link>* link_pool;
 
+  // Memory accounting hook — called with +delta on allocation, -delta on deallocation.
+  // Allows the embedding application to track ParlayHash's internal memory usage
+  // (overflow links, bucket arrays) independently of user-managed entry lifetimes.
+  using MemoryHook = void(*)(int64_t);
+  MemoryHook memory_hook_ = nullptr;
+
   link* new_link(const Entry& entry, link* l) {
-    return link_pool->New(entry, l); }
-  void retire_link(link* l) { link_pool->Retire(l);}
+    auto* node = link_pool->New(entry, l);
+    if (memory_hook_) memory_hook_(static_cast<int64_t>(sizeof(link)));
+    return node;
+  }
+  void retire_link(link* l) {
+    if (memory_hook_) memory_hook_(-static_cast<int64_t>(sizeof(link)));
+    link_pool->Retire(l);
+  }
 
   // Each bucket contains a "state", which consists of a fixed size
   // buffer of entries (buffer_size) and an overflow list.  The first
@@ -210,11 +223,11 @@ struct parlay_hash {
     if (nxt == nullptr) 
       return std::tuple(0, nullptr, nullptr);
     else if (nxt->entry.equal(k))
-      return std::tuple(1, link_pool->New(constr(std::optional(nxt->entry)), nxt->next), nxt);
+      return std::tuple(1, new_link(constr(std::optional(nxt->entry)), nxt->next), nxt);
     else {
       auto [len, ptr, updated] = update_list(nxt->next, k, constr);
       if (ptr == nullptr) return std::tuple(len + 1, nullptr, nullptr);
-      return std::tuple(len + 1, link_pool->New(nxt->entry, ptr), updated);
+      return std::tuple(len + 1, new_link(nxt->entry, ptr), updated);
     }
   }
 
@@ -334,6 +347,8 @@ struct parlay_hash {
     bucket* buckets; // sequence of buckets
     //sequence<bucket> buckets; // sequence of buckets
     std::atomic<status>* block_status; // status of each block while copying
+    MemoryHook memory_hook_ = nullptr;
+    int64_t charged_bytes_ = 0;
 
     // The index of a key is the highest num_bits of the lowest
     // 48-bits of the hash value.  Using the highest num_bits ensures
@@ -347,18 +362,22 @@ struct parlay_hash {
       return &buckets[get_index(k)].v; }
 
     // initial table version, n indicating size
-    table_version(long n) 
+    table_version(long n, MemoryHook hook = nullptr)
       : next(nullptr),
 	finished_block_count(0),
 	num_bits(std::max<long>((long) std::ceil(std::log2(min_block_size-1)),
 				(long) std::ceil(std::log2(1.5*n)) - log_bucket_size)),
 	size(1ul << num_bits),
 	block_size(num_bits < 10 ? min_block_size : get_block_size(num_bits)),
-	overflow_size(get_overflow_size(num_bits))
+	overflow_size(get_overflow_size(num_bits)),
+	memory_hook_(hook)
     {
       //if (PrintGrow) std::cout << "initial size: " << size << std::endl;
       buckets = (bucket*) malloc(sizeof(bucket)*size);
       block_status = (std::atomic<status>*) malloc(sizeof(std::atomic<status>) * size/block_size);
+      charged_bytes_ = static_cast<int64_t>(sizeof(bucket)*size
+          + sizeof(std::atomic<status>) * size/block_size);
+      if (memory_hook_) memory_hook_(charged_bytes_);
       parallel_for(size, [&] (long i) { initialize(buckets[i]);});
       parallel_for(size/block_size, [&] (long i) { block_status[i] = Empty;});
     }
@@ -370,13 +389,21 @@ struct parlay_hash {
 	num_bits(t->num_bits + log_grow_factor),
 	size(t->size * grow_factor),
 	block_size(get_block_size(num_bits)),
-	overflow_size(get_overflow_size(num_bits))
+	overflow_size(get_overflow_size(num_bits)),
+	memory_hook_(t->memory_hook_)
     {
       buckets = (bucket*) malloc(sizeof(bucket)*size);
+      std::memset(buckets, 0, sizeof(bucket)*size);
       block_status = (std::atomic<status>*) malloc(sizeof(std::atomic<status>) * size/min_block_size);
+      charged_bytes_ = static_cast<int64_t>(sizeof(bucket)*size
+          + sizeof(std::atomic<status>) * size/min_block_size);
+      if (memory_hook_) memory_hook_(charged_bytes_);
+      for (long i = 0; i < size/min_block_size; i++)
+        block_status[i] = Empty;
     }
 
     ~table_version() {
+      if (memory_hook_) memory_hook_(-charged_bytes_);
       free(buckets);
       free(block_status);
     }
@@ -536,6 +563,7 @@ struct parlay_hash {
       clear_bucket(b);
     else {
       table_version* next = t->next.load();
+      if (next == nullptr) return;  // expansion in progress; clear() will free table chain
       for (int j = 0; j < grow_factor; j++)
 	clear_bucket_rec(next, grow_factor * i + j);
     }
@@ -562,7 +590,7 @@ struct parlay_hash {
     }
     // reinitialize
     if (reinitialize) {
-      current_table_version = new table_version(1);
+      current_table_version = new table_version(1, memory_hook_);
       initial_table_version = current_table_version;
     }
   }
@@ -572,8 +600,11 @@ struct parlay_hash {
   // Creates initial table version for the given size.  The
   // clear_at_end allows to free up the epoch-based collector's
   // memory, and the scheduler.
-  parlay_hash(long n, Entries* entries, bool clear_at_end = default_clear_at_end)
+  // memory_hook: optional callback for tracking internal allocations.
+  parlay_hash(long n, Entries* entries, bool clear_at_end = default_clear_at_end,
+              MemoryHook memory_hook = nullptr)
     : entries_(entries),
+      memory_hook_(memory_hook),
       clear_memory_and_scheduler_at_end(clear_at_end),
       sched_ref(clear_at_end ?
 		new parlay::scheduler_type(std::thread::hardware_concurrency()) :
@@ -581,7 +612,7 @@ struct parlay_hash {
       link_pool(clear_at_end ?
 		new epoch::memory_pool<link>() :
 		&epoch::get_default_pool<link>()),
-      current_table_version(new table_version(n)),
+      current_table_version(new table_version(n, memory_hook)),
       initial_table_version(current_table_version.load())
   { }
 
@@ -605,6 +636,7 @@ struct parlay_hash {
 			      big_atomic<state>*& b, state& s, tag_type& tag, long& idx) {
     if (s.is_forwarded()) {
       table_version* nxt = t->next.load();
+      if (nxt == nullptr) return;  // defensive: should not happen after copy_if_needed
       idx = nxt->get_index(k);
       b = &(nxt->buckets[idx].v);
       std::tie(s, tag) = b->ll();
@@ -623,6 +655,7 @@ struct parlay_hash {
     //if bucket is forwarded, go to next version
     if (x.is_forwarded()) {
       table_version* nxt = t->next.load();
+      if (nxt == nullptr) return std::nullopt;  // defensive: should not happen
       return find_in_bucket_rec(nxt, nxt->get_bucket(k), k, f);
     }
     return find_in_state(x, k, f);
@@ -1026,8 +1059,9 @@ struct parlay_hash {
     if (!head.is_forwarded())
       return  head.size();
     else {
-      long sum = 0;
       table_version* next = t->next.load();
+      if (next == nullptr) return 0;  // expansion in progress; bucket not yet reachable
+      long sum = 0;
       for (int j = 0; j < grow_factor; j++)
 	sum += bucket_size_rec(next, grow_factor * i + j);
       return sum;
@@ -1048,6 +1082,7 @@ struct parlay_hash {
       for_each_in_state(s, f);
     else {
       table_version* next = t->next.load();
+      if (next == nullptr) return;  // expansion in progress; skip bucket for this sweep
       for (int j = 0; j < grow_factor; j++)
 	for_each_bucket_rec(next, grow_factor * i + j, f);
     }

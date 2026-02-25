@@ -13,6 +13,12 @@
 #include <parlay_hash/unordered_map.h>
 #include <utils/epoch.h>
 
+#include "jcailloux/relais/cache/GDSFPolicy.h"
+
+#ifdef RELAIS_BUILDING_TESTS
+namespace relais_test { struct TestInternals; }
+#endif
+
 namespace jcailloux::relais::cache {
 
 // =============================================================================
@@ -119,8 +125,15 @@ public:
     static hashed_key make_key(const K& key) { return MapType::make_key(key); }
     static size_t get_hash(const hashed_key& k) { return MapType::get_hash(k); }
 
+    static void memoryHook(int64_t delta) {
+        if constexpr (GDSFPolicy::enabled) {
+            GDSFPolicy::instance().charge(delta);
+        }
+    }
+
     explicit ChunkMap(long initial_size = 128)
-        : map_(*new MapType(initial_size, false)) {}
+        : map_(*new MapType(initial_size, false,
+                GDSFPolicy::enabled ? &memoryHook : nullptr)) {}
 
     // ChunkMap instances are static singletons (CachedRepo::cache(),
     // ListCache::cache_). Their destruction happens during static cleanup
@@ -413,6 +426,10 @@ private:
     MapType& map_;
     epoch::memory_pool<CacheEntry>& pool_ = shared_pool();
     std::atomic<long> cleanup_cursor_{0};
+
+#ifdef RELAIS_BUILDING_TESTS
+    friend struct ::relais_test::TestInternals;
+#endif
 };
 
 }  // namespace jcailloux::relais::cache

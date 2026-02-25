@@ -98,6 +98,18 @@ struct TestInternals {
         Repo::cache().collect();
     }
 
+    /// Destroy all deferred entries in the epoch pool(s).
+    /// Flushes CachedWrapper destructors that would otherwise fire lazily
+    /// (reserve FIFO > 500) and corrupt totalMemory after resetGDSF.
+    /// Only safe after resetEntityCacheState (map is empty).
+    template<typename Repo>
+    static void clearEntityCachePools() {
+        using Cache = std::remove_reference_t<decltype(Repo::cache())>;
+        auto& cache = Repo::cache();
+        cache.pool_.clear();
+        if constexpr (Cache::HasGhost) cache.shared_ghost_pool().clear();
+    }
+
     /// Read the chunk_id for a cached list entry (for bitmap skip testing).
     /// Computed by ChunkMap from the key (deterministic). Returns nullopt if not in cache.
     template<typename Repo>
@@ -197,8 +209,8 @@ struct TestInternals {
         if (!ge) return std::nullopt;
         GhostTestData d;
         d.access_count = ge->metadata.rawCount();
-        d.estimated_bytes = ge->value.estimated_bytes.load(std::memory_order_relaxed);
-        d.flags = ge->value.flags.load(std::memory_order_relaxed);
+        d.estimated_bytes = ge->value.estimated_bytes();
+        d.flags = ge->value.flags();
         return d;
     }
 

@@ -23,6 +23,12 @@
 - `ConcurrencyGate` coroutine semaphore for shared PG+Redis I/O budget
 - `DetachedTask` coroutine type for fire-and-forget async work
 - `Task::fromValue(T)` / `Task<void>::ready()` for pre-resolved coroutines
+- `Immediate<T>` coroutine type — zero-allocation synchronous fast path for L1 cache hits; thread-local coroutine frame pool for the async path
+
+### Fixed
+
+- Use-after-free in async I/O callbacks: coroutine handle saved before `removeCurrentWatch()` destroys the enclosing lambda (PgConnection, RedisConnection)
+- Inaccurate L1 memory accounting: ParlayHash internal allocations now charged to GDSF budget
 
 ### Changed (Breaking)
 

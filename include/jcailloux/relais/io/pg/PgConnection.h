@@ -259,8 +259,10 @@ private:
         void await_suspend(std::coroutine_handle<> h) {
             continuation = h;
             self->registerWatch(IoEvent::Write, [this](IoEvent) {
+                // Save before removeCurrentWatch destroys this lambda (and its captures)
+                auto coro = continuation;
                 self->removeCurrentWatch();
-                continuation.resume();
+                coro.resume();
             });
         }
 
@@ -343,8 +345,10 @@ private:
         void await_suspend(std::coroutine_handle<> h) {
             continuation = h;
             self->registerWatch(IoEvent::Read, [this](IoEvent) {
+                // Save before removeCurrentWatch destroys this lambda (and its captures)
+                auto coro = continuation;
                 self->removeCurrentWatch();
-                continuation.resume();
+                coro.resume();
             });
         }
 
@@ -403,14 +407,19 @@ private:
                     self->updateWatchEvents(IoEvent::Write);
                     break;
                 case PGRES_POLLING_OK:
-                case PGRES_POLLING_FAILED:
+                case PGRES_POLLING_FAILED: {
+                    // Save before removeCurrentWatch destroys this lambda (and its captures)
+                    auto coro = continuation;
                     self->removeCurrentWatch();
-                    continuation.resume();
+                    coro.resume();
                     break;
-                default:
+                }
+                default: {
+                    auto coro = continuation;
                     self->removeCurrentWatch();
-                    continuation.resume();
+                    coro.resume();
                     break;
+                }
             }
         }
     };
@@ -459,9 +468,12 @@ private:
     private:
         void consumeInput() {
             if (!PQconsumeInput(self->conn_)) {
+                // Save before removeCurrentWatch destroys this lambda (and its captures)
+                auto coro = continuation;
                 self->removeCurrentWatch();
+                // result is on the awaiter (stack-allocated), safe to access after removeWatch
                 result = PgResult{};
-                continuation.resume();
+                coro.resume();
                 return;
             }
 
@@ -474,9 +486,11 @@ private:
                 last = r;
             }
 
+            // Save before removeCurrentWatch destroys this lambda (and its captures)
+            auto coro = continuation;
             self->removeCurrentWatch();
             result = PgResult(last);
-            continuation.resume();
+            coro.resume();
         }
     };
 
