@@ -259,8 +259,10 @@ private:
         void await_suspend(std::coroutine_handle<> h) {
             continuation = h;
             self->registerWatch(events, [this](IoEvent) {
+                // Save before removeCurrentWatch destroys this lambda (and its captures)
+                auto coro = continuation;
                 self->removeCurrentWatch();
-                continuation.resume();
+                coro.resume();
             });
         }
 

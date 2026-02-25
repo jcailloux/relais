@@ -43,7 +43,7 @@ namespace jcailloux::relais {
  *
  * When GDSF is enabled, ghost entries provide admission control under memory
  * pressure (>= 50%). Evicted/rejected data is tracked as lightweight ghosts
- * (~20B) that accumulate access frequency. Only data that proves popular
+ * that accumulate access frequency. Only data that proves popular
  * enough is (re-)admitted to the cache.
  *
  * Note: L1RepoConfig constraint is verified in Repo.h to avoid
@@ -402,15 +402,15 @@ protected:
     }
 
     /// Put entity in cache (copy). Returns FindResult for flexible use.
-    /// Triggers a global sweep on insertion when the hash check passes.
+    /// Triggers a global sweep probabilistically (~1/512) or unconditionally when over budget.
     static typename L1Cache::FindResult putInCache(const Key& key, const Entity& src,
         Clock::time_point now = Clock::now())
     {
         auto hk = L1Cache::make_key(key);
         auto result = cache().upsert(hk, buildValue(src), buildMetadata(now));
         if constexpr (HasCleanup) {
-            if (result.was_insert
-                && (L1Cache::get_hash(hk) & cache::GDSFPolicy::kCleanupMask) == 0) {
+            if ((L1Cache::get_hash(hk) & cache::GDSFPolicy::kCleanupMask) == 0
+                    || cache::GDSFPolicy::instance().isOverBudget()) {
                 fireCleanup();
             }
         }
@@ -424,8 +424,8 @@ protected:
         auto hk = L1Cache::make_key(key);
         auto result = cache().upsert(hk, buildValue(std::move(src)), buildMetadata(now));
         if constexpr (HasCleanup) {
-            if (result.was_insert
-                && (L1Cache::get_hash(hk) & cache::GDSFPolicy::kCleanupMask) == 0) {
+            if ((L1Cache::get_hash(hk) & cache::GDSFPolicy::kCleanupMask) == 0
+                    || cache::GDSFPolicy::instance().isOverBudget()) {
                 fireCleanup();
             }
         }
@@ -486,7 +486,7 @@ private:
     ///
     /// Under GDSF with memory pressure (>= 50%), the entity is scored against
     /// the eviction threshold. If the score is too low, a lightweight ghost
-    /// (~20B) is created instead of caching the full entity. Ghosts track
+    /// is created instead of caching the full entity. Ghosts track
     /// access frequency so that popular data is admitted on subsequent fetches.
     ///
     /// Without pressure or without GDSF, every fetch is cached (existing behavior).
@@ -525,8 +525,7 @@ private:
                     ge->metadata.access_count.store(
                         count | cache::GDSFScoreData::kGhostFlag,
                         std::memory_order_relaxed);
-                    ge->value.estimated_bytes.store(est_bytes, std::memory_order_relaxed);
-                    ge->value.flags.store(est_flags, std::memory_order_relaxed);
+                    ge->value.store(est_bytes, est_flags);
                 } else {
                     // No ghost: initial score
                     count = cache::GDSFScoreData::kCountScale;
@@ -561,6 +560,14 @@ private:
                                 Metadata(cache::GDSFScoreData::kCountScale
                                     | cache::GDSFScoreData::kGhostFlag, 0))) {
                             policy.charge(static_cast<int64_t>(kGhostOverhead));
+                            // New ghost created — trigger sweep on mutation only.
+                            if constexpr (HasCleanup) {
+                                auto hk = L1Cache::make_key(id);
+                                if ((L1Cache::get_hash(hk) & cache::GDSFPolicy::kCleanupMask) == 0
+                                        || policy.isOverBudget()) {
+                                    fireCleanup();
+                                }
+                            }
                         }
                         // If insert fails → a real entry was inserted concurrently.
                         // We continue: the entity is returned as transient anyway.
@@ -711,14 +718,19 @@ private:
     }
 
     /// Ghost cleanup predicate: decay counter, remove if counter reaches 0.
+    /// Evicted ghosts (count=0) are recorded in the histogram so that
+    /// scaleAndThreshold's hist_total/totalMemory ratio stays accurate
+    /// when ghost memory is a significant fraction of totalMemory.
     static bool ghostCleanupPredicate(const Metadata& meta) {
-        float dr = cache::GDSFPolicy::instance().decayRate();
+        auto& policy = cache::GDSFPolicy::instance();
+        float dr = policy.decayRate();
         uint32_t count = meta.rawCount();
         uint32_t decayed = static_cast<uint32_t>(static_cast<float>(count) * dr);
         meta.access_count.store(decayed | cache::GDSFScoreData::kGhostFlag,
             std::memory_order_relaxed);
         if (decayed == 0) {
-            cache::GDSFPolicy::instance().charge(-static_cast<int64_t>(kGhostOverhead));
+            policy.recordEntry(0.0f, kGhostOverhead);
+            policy.charge(-static_cast<int64_t>(kGhostOverhead));
             return true;
         }
         return false;
