@@ -92,6 +92,12 @@ struct TestInternals {
         Repo::evict(key);
     }
 
+    /// Force epoch GC on entity cache pools (flushes deferred destructors).
+    template<typename Repo>
+    static void collectEntityCache() {
+        Repo::cache().collect();
+    }
+
     /// Read the chunk_id for a cached list entry (for bitmap skip testing).
     /// Computed by ChunkMap from the key (deterministic). Returns nullopt if not in cache.
     template<typename Repo>
@@ -150,8 +156,11 @@ struct TestInternals {
         auto result = Repo::cache().find(key);
         if (!result) return std::nullopt;
 
-        auto& meta = result.entry->metadata;
-        auto& value = result.entry->value;
+        auto* ce = result.asReal();
+        if (!ce) return std::nullopt;
+
+        auto& meta = ce->metadata;
+        auto& value = ce->value;
         if constexpr (requires { meta.access_count; }) {
             float avg_cost = Repo::avgConstructionTime();
             size_t mem = value.memoryUsage();
@@ -159,6 +168,56 @@ struct TestInternals {
         } else {
             return 0.0f;
         }
+    }
+
+    // =========================================================================
+    // Ghost entry access (GDSF admission control testing)
+    // =========================================================================
+
+    struct GhostTestData {
+        uint32_t access_count{0};
+        uint32_t estimated_bytes{0};
+        uint8_t flags{0};
+    };
+
+    /// Check if an entry is a ghost (admission-control placeholder).
+    template<typename Repo, typename Key>
+    static bool isGhostEntry(const Key& key) {
+        auto result = Repo::cache().find(key);
+        if (!result) return false;
+        return result.entry->metadata.isGhost();
+    }
+
+    /// Get ghost data for a cached ghost entry.
+    template<typename Repo, typename Key>
+    static std::optional<GhostTestData> getGhostData(const Key& key) {
+        auto result = Repo::cache().find(key);
+        if (!result) return std::nullopt;
+        auto* ge = result.asGhost();
+        if (!ge) return std::nullopt;
+        GhostTestData d;
+        d.access_count = ge->metadata.rawCount();
+        d.estimated_bytes = ge->value.estimated_bytes.load(std::memory_order_relaxed);
+        d.flags = ge->value.flags.load(std::memory_order_relaxed);
+        return d;
+    }
+
+    /// Set the GDSF eviction threshold directly (test-only).
+    static void setThreshold(float t) {
+        jcailloux::relais::cache::GDSFPolicy::instance().cached_threshold_.store(
+            t, std::memory_order_relaxed);
+    }
+
+    /// Seed the average construction time for a repo (test-only).
+    template<typename Repo>
+    static void seedAvgConstructionTime(float us) {
+        Repo::avg_construction_time_us_.store(us, std::memory_order_relaxed);
+    }
+
+    /// Ghost overhead in bytes for a specific repo.
+    template<typename Repo>
+    static constexpr size_t ghostOverhead() {
+        return Repo::kGhostOverhead;
     }
 
     // =========================================================================

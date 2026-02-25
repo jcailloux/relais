@@ -328,9 +328,10 @@ public:
         auto result = cache_.find(hk);
         if (!result) return {};
 
-        auto* entry = result.entry;
-        auto& meta = entry->metadata;
-        auto& value = entry->value;
+        auto* ce = result.asReal();
+        if (!ce) return {};
+        auto& meta = ce->metadata;
+        auto& value = ce->value;
 
         // Single-hash chunk computation: extract hash from pre-computed hashed_key
         size_t hash = L1Cache::get_hash(hk);
@@ -338,7 +339,7 @@ public:
 
         if (isAffectedByModificationsForChunk(meta, value, config::CachedClock::now(), chunk_id)) {
             // Two-phase eviction: remove only if same entry (guards against concurrent Upsert)
-            cache_.remove_if(key, [entry](auto* e) { return e == entry; });
+            cache_.remove_if(key, [ce](auto* e) { return e == static_cast<typename L1Cache::EntryHeader*>(ce); });
             return {};
         }
 
@@ -377,7 +378,7 @@ public:
             }
         }
 
-        return ResultView(&find_result.entry->value, std::move(find_result.guard));
+        return ResultView(&find_result.asReal()->value, std::move(find_result.guard));
     }
 
     /// Helper to extract sort bounds from a result
@@ -436,7 +437,8 @@ public:
         }
 
         auto removed = cache_.cleanup_chunk(chunk, static_cast<long>(ChunkCount),
-            [this, now, threshold, chunk](const CacheKey&, auto& entry) {
+            [this, now, threshold, chunk](const CacheKey&, auto& header) {
+                auto& entry = static_cast<typename L1Cache::CacheEntry&>(header);
                 return cleanupPredicate(entry.metadata, entry.value, now, threshold, chunk);
             });
 
@@ -460,7 +462,8 @@ public:
         }
 
         size_t erased = cache_.full_cleanup(
-            [this, now, threshold](const CacheKey&, auto& entry) {
+            [this, now, threshold](const CacheKey&, auto& header) {
+                auto& entry = static_cast<typename L1Cache::CacheEntry&>(header);
                 return cleanupPredicateFull(entry.metadata, entry.value, now, threshold);
             });
 
