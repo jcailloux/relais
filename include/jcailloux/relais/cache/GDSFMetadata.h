@@ -25,22 +25,15 @@ namespace jcailloux::relais::cache {
 struct GDSFScoreData {
     static constexpr uint32_t kCountScale = 16;
     static constexpr float kUpdatePenalty = 0.95f;
-    static constexpr uint32_t kGhostFlag = 0x80000000u;
-    static constexpr uint32_t kCountMask = ~kGhostFlag;
 
     mutable std::atomic<uint32_t> access_count{0};
 
     GDSFScoreData() = default;
     explicit GDSFScoreData(uint32_t count) : access_count(count) {}
 
-    /// Is this entry a ghost (admission-control placeholder)?
-    bool isGhost() const {
-        return (access_count.load(std::memory_order_relaxed) & kGhostFlag) != 0;
-    }
-
-    /// Access count with ghost flag masked out (31 useful bits).
+    /// Raw access count (full 32 bits, no masking).
     uint32_t rawCount() const {
-        return access_count.load(std::memory_order_relaxed) & kCountMask;
+        return access_count.load(std::memory_order_relaxed);
     }
 
     /// Compute GDSF score on-the-fly: access_count × avg_cost / memoryUsage.
@@ -53,12 +46,10 @@ struct GDSFScoreData {
 
     /// Merge access history from old entry on upsert.
     /// Applies kUpdatePenalty so frequently-updated entities see score erode.
-    /// Preserves ghost flag of the NEW entry (this), not the old one.
     void mergeFrom(const GDSFScoreData& old) {
-        uint32_t c = old.rawCount();
-        uint32_t my_flag = access_count.load(std::memory_order_relaxed) & kGhostFlag;
+        uint32_t c = old.access_count.load(std::memory_order_relaxed);
         access_count.store(
-            static_cast<uint32_t>(static_cast<float>(c) * kUpdatePenalty) | my_flag,
+            static_cast<uint32_t>(static_cast<float>(c) * kUpdatePenalty),
             std::memory_order_relaxed);
     }
 

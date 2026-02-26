@@ -14,6 +14,7 @@
 #include "jcailloux/relais/wrapper/BufferView.h"
 #include "jcailloux/relais/cache/GDSFMetadata.h"
 #include "jcailloux/relais/cache/GDSFPolicy.h"
+#include "jcailloux/relais/cache/TaggedEntry.h"
 #include "jcailloux/relais/config/CachedClock.h"
 
 #ifdef RELAIS_BUILDING_TESTS
@@ -291,6 +292,28 @@ private:
     using MetadataImpl = ListCacheMetadataImpl<FilterSet, SortFieldEnum>;
     using L1Cache = cache::ChunkMap<CacheKey, Result, MetadataImpl>;
 
+    // --- GDSF memory tracking constants ---
+
+    template<typename T>
+    struct EpochWrapperMirror { void* next; T value; };
+
+    static constexpr size_t kEpochWrapperOverhead =
+        sizeof(EpochWrapperMirror<typename L1Cache::CacheEntry>)
+        - sizeof(typename L1Cache::CacheEntry);
+
+    /// Overhead charged per list entry (excludes bucket slot — tracked by hook).
+    static constexpr size_t kListChargeOverhead =
+        sizeof(typename L1Cache::CacheEntry) - sizeof(Result)
+        + kEpochWrapperOverhead;
+
+    /// Bucket slot size (score computation only).
+    static constexpr size_t kListBucketSlotSize =
+        sizeof(CacheKey) + sizeof(cache::TaggedEntry);
+
+    static void chargeHook(void* /*ctx*/, int64_t delta) {
+        cache::GDSFPolicy::instance().charge(delta);
+    }
+
     L1Cache cache_;
     ModTracker modifications_;
     ListCacheConfig config_;
@@ -364,19 +387,25 @@ public:
             static_cast<uint16_t>(result.items.size()),
             construction_time_us);
 
+        if constexpr (GDSF && cache::GDSFPolicy::enabled) {
+            size_t key_heap = (key.size() >= sizeof(CacheKey)) ? key.capacity() : 0;
+            size_t cursor_heap = query.cursor.data.capacity();
+            result.cache_overhead_ = kListChargeOverhead + 2 * key_heap + cursor_heap;
+            result.memory_hook_ = &chargeHook;
+            result.memory_hook_ctx_ = nullptr;
+        }
+
         auto hk = L1Cache::make_key(key);
         auto find_result = cache_.upsert(hk, std::move(result), std::move(meta));
 
-        // Hash-mask cleanup trigger (replaces modulo-based get counter)
-        if constexpr (GDSF) {
-            if ((L1Cache::get_hash(hk) & cache::GDSFPolicy::kCleanupMask) == 0) {
-                cache::GDSFPolicy::instance().sweep();
-            }
-        } else {
-            if ((L1Cache::get_hash(hk) & cache::GDSFPolicy::kCleanupMask) == 0) {
-                trySweep();
-            }
+        if constexpr (GDSF && cache::GDSFPolicy::enabled) {
+            auto* ce = find_result.asReal();
+            chargeHook(nullptr, static_cast<int64_t>(
+                ce->value.memoryUsage() + ce->value.cache_overhead_));
         }
+
+        // Deterministic cleanup trigger via global insertion counter
+        cache::GDSFPolicy::instance().tickInsertion();
 
         return ResultView(&find_result.asReal()->value, std::move(find_result.guard));
     }
@@ -437,9 +466,10 @@ public:
         }
 
         auto removed = cache_.cleanup_chunk(chunk, static_cast<long>(ChunkCount),
-            [this, now, threshold, chunk](const CacheKey&, auto& header) {
-                auto& entry = static_cast<typename L1Cache::CacheEntry&>(header);
-                return cleanupPredicate(entry.metadata, entry.value, now, threshold, chunk);
+            [this, now, threshold, chunk](const CacheKey&, auto te) {
+                auto* entry = static_cast<typename L1Cache::CacheEntry*>(
+                    te.template asReal<typename L1Cache::EntryHeader>());
+                return cleanupPredicate(entry->metadata, entry->value, now, threshold, chunk);
             });
 
         modifications_.drainChunk(now, static_cast<uint8_t>(chunk));
@@ -462,9 +492,10 @@ public:
         }
 
         size_t erased = cache_.full_cleanup(
-            [this, now, threshold](const CacheKey&, auto& header) {
-                auto& entry = static_cast<typename L1Cache::CacheEntry&>(header);
-                return cleanupPredicateFull(entry.metadata, entry.value, now, threshold);
+            [this, now, threshold](const CacheKey&, auto te) {
+                auto* entry = static_cast<typename L1Cache::CacheEntry*>(
+                    te.template asReal<typename L1Cache::EntryHeader>());
+                return cleanupPredicateFull(entry->metadata, entry->value, now, threshold);
             });
 
         // All chunks processed — drain modifications that existed before cleanup
@@ -543,9 +574,9 @@ private:
         return affected;
     }
 
-    /// Estimate memory usage for a list entry (value + items vector capacity).
+    /// Estimate memory usage for a list entry (memoryUsage + cache overhead).
     static size_t estimateMemoryUsage(const Result& result) {
-        return sizeof(Result) + result.items.capacity() * sizeof(Entity);
+        return result.memoryUsage() + result.cache_overhead_;
     }
 
     /// Cleanup predicate for chunk-based cleanup (with bitmap skip).
@@ -560,11 +591,11 @@ private:
                 static_cast<uint32_t>(static_cast<float>(old_count) * dr),
                 std::memory_order_relaxed);
 
-            // Score = access_count x avg_cost / memoryUsage
+            // Score = access_count x avg_cost / memoryUsage (includes bucket slot)
             size_t mem = estimateMemoryUsage(result);
-            float score = meta.gdsf.computeScore(meta.construction_time_us, mem);
+            float score = meta.gdsf.computeScore(meta.construction_time_us, mem + kListBucketSlotSize);
 
-            // Record in histogram (ALL entries, before eviction decision)
+            // Record in histogram (no ghosts in ListCache → no adjustment)
             cache::GDSFPolicy::instance().recordEntry(score, mem);
 
             if (score < threshold) return true;
@@ -588,9 +619,11 @@ private:
                 static_cast<uint32_t>(static_cast<float>(old_count) * dr),
                 std::memory_order_relaxed);
 
+            // Score = access_count x avg_cost / memoryUsage (includes bucket slot)
             size_t mem = estimateMemoryUsage(result);
-            float score = meta.gdsf.computeScore(meta.construction_time_us, mem);
+            float score = meta.gdsf.computeScore(meta.construction_time_us, mem + kListBucketSlotSize);
 
+            // Record in histogram (no ghosts in ListCache → no adjustment)
             cache::GDSFPolicy::instance().recordEntry(score, mem);
 
             if (score < threshold) return true;

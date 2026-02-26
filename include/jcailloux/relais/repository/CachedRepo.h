@@ -13,7 +13,7 @@
 #include "jcailloux/relais/cache/ChunkMap.h"
 #include "jcailloux/relais/cache/GDSFMetadata.h"
 #include "jcailloux/relais/cache/GDSFPolicy.h"
-#include "jcailloux/relais/cache/GhostEntry.h"
+#include "jcailloux/relais/cache/TaggedEntry.h"
 #include "jcailloux/relais/wrapper/EntityView.h"
 #include "jcailloux/relais/wrapper/BufferView.h"
 #include "jcailloux/relais/config/repo_config.h"
@@ -42,9 +42,9 @@ namespace jcailloux::relais {
  * - No cleanup when neither is configured (default)
  *
  * When GDSF is enabled, ghost entries provide admission control under memory
- * pressure (>= 50%). Evicted/rejected data is tracked as lightweight ghosts
- * that accumulate access frequency. Only data that proves popular
- * enough is (re-)admitted to the cache.
+ * pressure (>= 50%). Ghosts are zero-allocation: 8B of data (access count,
+ * estimated bytes, flags) encoded inline in a tagged pointer stored directly
+ * in the ParlayHash bucket. Only data that proves popular enough is admitted.
  *
  * Note: L1RepoConfig constraint is verified in Repo.h to avoid
  * eager evaluation issues with std::conditional_t.
@@ -233,6 +233,8 @@ public:
         float threshold;
         struct GhostCandidate { Key key; uint32_t count; uint32_t bytes; uint8_t flags; };
         std::vector<GhostCandidate>* ghost_candidates = nullptr;
+        struct GhostDecay { Key key; uint32_t decayed_count; };
+        std::vector<GhostDecay>* ghost_decays = nullptr;
     };
 
     /// Sweep one chunk (lock-free, always succeeds).
@@ -247,31 +249,37 @@ public:
             // Only collect when under moderate pressure (50-100%), not during
             // emergency sweeps (>100%) — those need to free memory, not add ghosts.
             std::vector<typename CleanupContext::GhostCandidate> candidates;
+            std::vector<typename CleanupContext::GhostDecay> ghost_decays;
             if constexpr (HasGDSF) {
                 if (policy.hasMemoryPressure() && !policy.isOverBudget()) {
                     ctx.ghost_candidates = &candidates;
                 }
+                ctx.ghost_decays = &ghost_decays;
             }
 
             auto removed = cache().cleanup_next_chunk(kChunkCount,
-                [&ctx](const Key& key, auto& header) {
+                [&ctx](const Key& key, auto te) {
                     if constexpr (HasGDSF) {
-                        if (header.metadata.isGhost()) {
-                            return ghostCleanupPredicate(header.metadata);
+                        if (te.isGhost()) {
+                            return ghostCleanupPredicate(key, te, ctx);
                         }
                     }
-                    auto& ce = static_cast<typename L1Cache::CacheEntry&>(header);
-                    return cleanupPredicate(key, ce.metadata, ce.value, ctx);
+                    auto* ce = static_cast<typename L1Cache::CacheEntry*>(
+                        te.template asReal<typename L1Cache::EntryHeader>());
+                    return cleanupPredicate(key, ce->metadata, ce->value, ctx);
                 });
 
-            // Insert ghosts for evicted entries (post-sweep)
+            // Post-sweep: apply ghost decays via read-modify-write
             if constexpr (HasGDSF) {
+                for (auto& gd : ghost_decays) {
+                    cache().update_ghost(gd.key, [&gd](cache::TaggedEntry te) {
+                        return te.withGhostCount(gd.decayed_count);
+                    });
+                }
+
+                // Insert ghosts for evicted entries (no charge — bucket slot tracked by hook)
                 for (auto& gc : candidates) {
-                    Metadata meta(gc.count | cache::GDSFScoreData::kGhostFlag, 0);
-                    if (cache().insert_ghost(gc.key,
-                            cache::GhostData{gc.bytes, gc.flags}, meta)) {
-                        policy.charge(static_cast<int64_t>(kGhostOverhead));
-                    }
+                    cache().insert_ghost(gc.key, gc.count, gc.bytes, gc.flags);
                 }
             }
 
@@ -293,30 +301,37 @@ public:
             CleanupContext ctx{Clock::now(), HasGDSF ? policy.threshold() : 0.0f};
 
             std::vector<typename CleanupContext::GhostCandidate> candidates;
+            std::vector<typename CleanupContext::GhostDecay> ghost_decays;
             if constexpr (HasGDSF) {
                 if (policy.hasMemoryPressure() && !policy.isOverBudget()) {
                     ctx.ghost_candidates = &candidates;
                 }
+                ctx.ghost_decays = &ghost_decays;
             }
 
             auto removed = cache().full_cleanup(
-                [&ctx](const Key& key, auto& header) {
+                [&ctx](const Key& key, auto te) {
                     if constexpr (HasGDSF) {
-                        if (header.metadata.isGhost()) {
-                            return ghostCleanupPredicate(header.metadata);
+                        if (te.isGhost()) {
+                            return ghostCleanupPredicate(key, te, ctx);
                         }
                     }
-                    auto& ce = static_cast<typename L1Cache::CacheEntry&>(header);
-                    return cleanupPredicate(key, ce.metadata, ce.value, ctx);
+                    auto* ce = static_cast<typename L1Cache::CacheEntry*>(
+                        te.template asReal<typename L1Cache::EntryHeader>());
+                    return cleanupPredicate(key, ce->metadata, ce->value, ctx);
                 });
 
+            // Post-sweep: apply ghost decays via read-modify-write
             if constexpr (HasGDSF) {
+                for (auto& gd : ghost_decays) {
+                    cache().update_ghost(gd.key, [&gd](cache::TaggedEntry te) {
+                        return te.withGhostCount(gd.decayed_count);
+                    });
+                }
+
+                // Insert ghosts for evicted entries (no charge — bucket slot tracked by hook)
                 for (auto& gc : candidates) {
-                    Metadata meta(gc.count | cache::GDSFScoreData::kGhostFlag, 0);
-                    if (cache().insert_ghost(gc.key,
-                            cache::GhostData{gc.bytes, gc.flags}, meta)) {
-                        policy.charge(static_cast<int64_t>(kGhostOverhead));
-                    }
+                    cache().insert_ghost(gc.key, gc.count, gc.bytes, gc.flags);
                 }
             }
 
@@ -339,8 +354,7 @@ public:
     }
 
 protected:
-    using L1Cache = cache::ChunkMap<Key, ValueType, Metadata,
-        std::conditional_t<HasGDSF, cache::GhostData, void>>;
+    using L1Cache = cache::ChunkMap<Key, ValueType, Metadata, HasGDSF>;
 
     /// Returns the static ChunkMap instance.
     /// On first call, auto-registers this repo with GDSFPolicy for global coordination
@@ -373,10 +387,10 @@ protected:
 
         // Ghost: treated as L1 miss (slow path will handle admission)
         if constexpr (HasGDSF) {
-            if (result.entry->metadata.isGhost()) return {};
+            if (result.isGhost()) return {};
         }
 
-        auto* entry = result.entry;
+        auto* entry = result.entry();
 
         // TTL expiration check: two-phase eviction (find → check → evict)
         if constexpr (HasTTL) {
@@ -402,17 +416,13 @@ protected:
     }
 
     /// Put entity in cache (copy). Returns FindResult for flexible use.
-    /// Triggers a global sweep probabilistically (~1/512) or unconditionally when over budget.
+    /// Triggers a global sweep every kCleanupMask+1 insertions or when over budget.
     static typename L1Cache::FindResult putInCache(const Key& key, const Entity& src,
         Clock::time_point now = Clock::now())
     {
-        auto hk = L1Cache::make_key(key);
-        auto result = cache().upsert(hk, buildValue(src), buildMetadata(now));
+        auto result = cache().upsert(L1Cache::make_key(key), buildValue(src), buildMetadata(now));
         if constexpr (HasCleanup) {
-            if ((L1Cache::get_hash(hk) & cache::GDSFPolicy::kCleanupMask) == 0
-                    || cache::GDSFPolicy::instance().isOverBudget()) {
-                fireCleanup();
-            }
+            cache::GDSFPolicy::instance().tickInsertion();
         }
         return result;
     }
@@ -421,13 +431,9 @@ protected:
     static typename L1Cache::FindResult putInCache(const Key& key, Entity&& src,
         Clock::time_point now = Clock::now())
     {
-        auto hk = L1Cache::make_key(key);
-        auto result = cache().upsert(hk, buildValue(std::move(src)), buildMetadata(now));
+        auto result = cache().upsert(L1Cache::make_key(key), buildValue(std::move(src)), buildMetadata(now));
         if constexpr (HasCleanup) {
-            if ((L1Cache::get_hash(hk) & cache::GDSFPolicy::kCleanupMask) == 0
-                    || cache::GDSFPolicy::instance().isOverBudget()) {
-                fireCleanup();
-            }
+            cache::GDSFPolicy::instance().tickInsertion();
         }
         return result;
     }
@@ -446,12 +452,6 @@ protected:
         auto* ce = result.asReal();
         return wrapper::EntityView<Entity>(
             static_cast<const Entity*>(&ce->value), std::move(result.guard));
-    }
-
-    /// Fire a global sweep as a detached coroutine (fire-and-forget).
-    static io::DetachedTask fireCleanup() {
-        cache::GDSFPolicy::instance().sweep();
-        co_return;
     }
 
 private:
@@ -486,8 +486,9 @@ private:
     ///
     /// Under GDSF with memory pressure (>= 50%), the entity is scored against
     /// the eviction threshold. If the score is too low, a lightweight ghost
-    /// is created instead of caching the full entity. Ghosts track
-    /// access frequency so that popular data is admitted on subsequent fetches.
+    /// is created instead of caching the full entity. Ghosts are zero-allocation
+    /// (data encoded inline in TaggedEntry) and track access frequency so that
+    /// popular data is admitted on subsequent fetches.
     ///
     /// Without pressure or without GDSF, every fetch is cached (existing behavior).
     static io::Task<wrapper::EntityView<Entity>> fetchAndCache(const Key& id) {
@@ -507,25 +508,23 @@ private:
             if (policy.hasMemoryPressure()) {
                 // --- Lookup existing ghost ---
                 auto ghost_result = cache().find(id);
-                auto* ge = ghost_result ? ghost_result.asGhost() : nullptr;
+                bool has_ghost = ghost_result && ghost_result.isGhost();
 
                 // --- Compute score ---
                 uint32_t est_bytes = static_cast<uint32_t>(
-                    entity->memoryUsage() + kCacheEntryOverhead);
+                    entity->memoryUsage() + kChargeOverhead + kBucketSlotSize);
                 uint8_t est_flags = static_cast<uint8_t>(
                     (entity->hasBinaryCache() ? 0x01 : 0) |
                     (entity->hasJsonCache()   ? 0x02 : 0));
 
                 uint32_t count;
-                if (ge) {
+                if (has_ghost) {
                     // Ghost exists: bump counter, update estimated_bytes
-                    uint32_t raw = ge->metadata.access_count.load(std::memory_order_relaxed);
-                    uint32_t old_count = raw & cache::GDSFScoreData::kCountMask;
+                    uint32_t old_count = ghost_result.ghostCount();
                     count = old_count + cache::GDSFScoreData::kCountScale;
-                    ge->metadata.access_count.store(
-                        count | cache::GDSFScoreData::kGhostFlag,
-                        std::memory_order_relaxed);
-                    ge->value.store(est_bytes, est_flags);
+                    cache().update_ghost(id, [count, est_bytes, est_flags](cache::TaggedEntry te) {
+                        return te.withGhostCount(count).withGhostBytes(est_bytes, est_flags);
+                    });
                 } else {
                     // No ghost: initial score
                     count = cache::GDSFScoreData::kCountScale;
@@ -538,14 +537,11 @@ private:
 
                 if (score >= policy.threshold()) {
                     // === CACHE (or PROMOTION if ghost existed) ===
-                    if (ge) {
-                        policy.charge(-static_cast<int64_t>(kGhostOverhead));
-                        // upsert real → retire ghost automatically via retire()
-                    }
+                    // No ghost discharge — bucket slot is tracked by the hook.
                     auto r = putInCache(id, std::move(*entity), now);
-                    if (ge) {
-                        // Transfer counter (without ghost flag)
-                        r.entry->metadata.access_count.store(count,
+                    if (has_ghost) {
+                        // Transfer counter from ghost to real entry
+                        r.entry()->metadata.access_count.store(count,
                             std::memory_order_relaxed);
                     }
                     auto* ce = r.asReal();
@@ -553,21 +549,14 @@ private:
                         static_cast<const Entity*>(&ce->value), std::move(r.guard));
                 } else {
                     // === GHOST (create or keep existing) ===
-                    if (!ge) {
+                    if (!has_ghost) {
                         // Create new ghost (insert_ghost: never replaces a real entry)
+                        // No ghost charge — bucket slot is tracked by the hook.
                         if (cache().insert_ghost(id,
-                                cache::GhostData{est_bytes, est_flags},
-                                Metadata(cache::GDSFScoreData::kCountScale
-                                    | cache::GDSFScoreData::kGhostFlag, 0))) {
-                            policy.charge(static_cast<int64_t>(kGhostOverhead));
-                            // New ghost created — trigger sweep on mutation only.
-                            if constexpr (HasCleanup) {
-                                auto hk = L1Cache::make_key(id);
-                                if ((L1Cache::get_hash(hk) & cache::GDSFPolicy::kCleanupMask) == 0
-                                        || policy.isOverBudget()) {
-                                    fireCleanup();
-                                }
-                            }
+                                cache::GDSFScoreData::kCountScale,
+                                est_bytes, est_flags)) {
+                            // New ghost created — tick global insertion counter.
+                            policy.tickInsertion();
                         }
                         // If insert fails → a real entry was inserted concurrently.
                         // We continue: the entity is returned as transient anyway.
@@ -575,10 +564,6 @@ private:
                     // Return entity without caching (transient pool)
                     auto guard = epoch::EpochGuard::acquire();
                     auto* ptr = transientPool().New(std::move(*entity));
-                    // Install ghost hook if ghost exists (re-lookup)
-                    auto gr = cache().find(id);
-                    auto* ghost = gr ? gr.asGhost() : nullptr;
-                    if (ghost) ptr->setMemoryHook(&cache::ghostMemoryHook, &ghost->value);
                     transientPool().Retire(ptr);
                     co_return wrapper::EntityView<Entity>(
                         static_cast<const Entity*>(ptr), std::move(guard));
@@ -587,9 +572,9 @@ private:
 
             // --- No pressure: cache normally ---
             // Remove ghost if one exists (no longer relevant without pressure)
+            // No ghost discharge — bucket slot is tracked by the hook.
             auto ghost_result = cache().find(id);
-            if (ghost_result && ghost_result.entry->metadata.isGhost()) {
-                policy.charge(-static_cast<int64_t>(kGhostOverhead));
+            if (ghost_result && ghost_result.isGhost()) {
                 cache().remove(id);
             }
             auto r = putInCache(id, std::move(*entity), now);
@@ -609,21 +594,26 @@ private:
         }
     }
 
-    /// Per-entry memory overhead beyond Entity::memoryUsage().
-    /// CachedWrapper fields + Metadata + padding + ParlayHash bucket (key + pointer).
-    static constexpr size_t kCacheEntryOverhead =
-        sizeof(typename L1Cache::CacheEntry) - sizeof(Entity)
-        + sizeof(Key) + sizeof(void*);
+    /// Epoch wrapper: memory_pool wraps each CacheEntry in a node with a next pointer.
+    template<typename T>
+    struct EpochWrapperMirror { void* next; T value; };
 
-    /// Per-ghost memory overhead (EntryHeader + GhostData + key + pointer in map).
-    static constexpr size_t kGhostOverhead = [] {
-        if constexpr (HasGDSF) {
-            return sizeof(typename L1Cache::GhostCacheEntry)
-                 + sizeof(Key) + sizeof(void*);
-        } else {
-            return size_t{0};
-        }
-    }();
+    static constexpr size_t kEpochWrapperOverhead =
+        sizeof(EpochWrapperMirror<typename L1Cache::CacheEntry>)
+        - sizeof(typename L1Cache::CacheEntry);
+
+    /// Overhead charged per live entry (excludes bucket slot — tracked by hook).
+    static constexpr size_t kChargeOverhead =
+        sizeof(typename L1Cache::CacheEntry) - sizeof(Entity)
+        + kEpochWrapperOverhead;
+
+    /// ParlayHash bucket slot. Used for:
+    /// - Score denominator (full incompressible cost of keeping an entry)
+    /// - Histogram ghost adjustment (net gain live → ghost)
+    /// - Ghost admission estimation in fetchAndCache
+    /// NOT charged to GDSFPolicy (already in hook's bucket array charge).
+    static constexpr size_t kBucketSlotSize =
+        sizeof(Key) + sizeof(cache::TaggedEntry);
 
     /// Transient pool for entities returned without caching (ghost REJECT path).
     /// Epoch-based reclamation ensures the entity lives until the EpochGuard drops.
@@ -635,7 +625,7 @@ private:
     /// Build ValueType from entity (copy path).
     static ValueType buildValue(const Entity& src) {
         if constexpr (HasGDSF) {
-            return cache::CachedWrapper<Entity>(Entity(src), kCacheEntryOverhead);
+            return cache::CachedWrapper<Entity>(Entity(src), kChargeOverhead);
         } else {
             return Entity(src);
         }
@@ -644,7 +634,7 @@ private:
     /// Build ValueType from entity (move path — zero copy).
     static ValueType buildValue(Entity&& src) {
         if constexpr (HasGDSF) {
-            return cache::CachedWrapper<Entity>(std::move(src), kCacheEntryOverhead);
+            return cache::CachedWrapper<Entity>(std::move(src), kChargeOverhead);
         } else {
             return std::move(src);
         }
@@ -684,13 +674,18 @@ private:
                 static_cast<uint32_t>(static_cast<float>(old_count) * dr),
                 std::memory_order_relaxed);
 
-            // Score = access_count x avg_cost / memoryUsage
+            // Score = access_count x avg_cost / memoryUsage (includes bucket slot)
             size_t mem = value.memoryUsage();
-            float score = meta.computeScore(
-                avg_construction_time_us_.load(std::memory_order_relaxed), mem);
+            float avg_cost = avg_construction_time_us_.load(std::memory_order_relaxed);
+            float score = meta.computeScore(avg_cost, mem + kBucketSlotSize);
 
-            // Record in histogram (ALL entries, before eviction decision)
-            cache::GDSFPolicy::instance().recordEntry(score, mem);
+            // Histogram: net freeable bytes. When ghost candidates are active,
+            // evicting a live entry only frees (mem - kBucketSlotSize) since
+            // a ghost occupies the bucket slot.
+            size_t freeable = ctx.ghost_candidates
+                ? (mem - std::min(mem, kBucketSlotSize))
+                : mem;
+            cache::GDSFPolicy::instance().recordEntry(score, freeable);
 
             // Evict if TTL expired
             if constexpr (HasTTL) {
@@ -717,21 +712,22 @@ private:
         }
     }
 
-    /// Ghost cleanup predicate: decay counter, remove if counter reaches 0.
-    /// Evicted ghosts (count=0) are recorded in the histogram so that
-    /// scaleAndThreshold's hist_total/totalMemory ratio stays accurate
-    /// when ghost memory is a significant fraction of totalMemory.
-    static bool ghostCleanupPredicate(const Metadata& meta) {
-        auto& policy = cache::GDSFPolicy::instance();
-        float dr = policy.decayRate();
-        uint32_t count = meta.rawCount();
+    /// Ghost cleanup predicate (two-phase): read ghost data inline, decide
+    /// remove or decay. Ghosts that survive are collected for post-sweep update.
+    static bool ghostCleanupPredicate(const Key& key, cache::TaggedEntry te,
+                                       CleanupContext& ctx) {
+        float dr = cache::GDSFPolicy::instance().decayRate();
+        uint32_t count = te.ghostCount();
         uint32_t decayed = static_cast<uint32_t>(static_cast<float>(count) * dr);
-        meta.access_count.store(decayed | cache::GDSFScoreData::kGhostFlag,
-            std::memory_order_relaxed);
         if (decayed == 0) {
-            policy.recordEntry(0.0f, kGhostOverhead);
-            policy.charge(-static_cast<int64_t>(kGhostOverhead));
+            // Ghost eviction frees the bucket slot (modeled in histogram,
+            // not in charge — bucket array is tracked by the hook).
+            cache::GDSFPolicy::instance().recordEntry(0.0f, kBucketSlotSize);
             return true;
+        }
+        // Collect for post-sweep batch update
+        if (ctx.ghost_decays) {
+            ctx.ghost_decays->push_back({key, decayed});
         }
         return false;
     }
@@ -740,8 +736,8 @@ private:
     /// Used by evict/invalidate to clean up ghosts on write paths.
     static void removeGhost(const Key& id) {
         auto r = cache().find(id);
-        if (r && r.entry->metadata.isGhost()) {
-            cache::GDSFPolicy::instance().charge(-static_cast<int64_t>(kGhostOverhead));
+        if (r && r.isGhost()) {
+            // No ghost discharge — bucket slot is tracked by the hook.
             cache().remove(id);
         }
     }
@@ -750,12 +746,13 @@ private:
     /// Called by update/patch to erode scores of frequently-mutated data.
     static void applyGhostUpdatePenalty(const Key& id) {
         auto r = cache().find(id);
-        if (r && r.entry->metadata.isGhost()) {
-            uint32_t raw = r.entry->metadata.access_count.load(std::memory_order_relaxed);
-            uint32_t count = raw & cache::GDSFScoreData::kCountMask;
-            r.entry->metadata.access_count.store(
-                static_cast<uint32_t>(static_cast<float>(count) * cache::GDSFScoreData::kUpdatePenalty)
-                | cache::GDSFScoreData::kGhostFlag, std::memory_order_relaxed);
+        if (r && r.isGhost()) {
+            uint32_t count = r.ghostCount();
+            uint32_t penalized = static_cast<uint32_t>(
+                static_cast<float>(count) * cache::GDSFScoreData::kUpdatePenalty);
+            cache().update_ghost(id, [penalized](cache::TaggedEntry te) {
+                return te.withGhostCount(penalized);
+            });
         }
     }
 

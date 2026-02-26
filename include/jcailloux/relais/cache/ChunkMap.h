@@ -15,6 +15,7 @@
 #include <utils/epoch.h>
 
 #include "jcailloux/relais/cache/GDSFPolicy.h"
+#include "jcailloux/relais/cache/TaggedEntry.h"
 
 #ifdef RELAIS_BUILDING_TESTS
 namespace relais_test { struct TestInternals; }
@@ -118,29 +119,27 @@ struct AutoHash<std::tuple<Ts...>> {
 }  // namespace detail
 
 // =============================================================================
-// ChunkMap<K, V, Metadata, GhostV> — lock-free hash map with epoch-based reclamation
+// ChunkMap<K, V, Metadata, HasGhost> — lock-free hash map with epoch-based reclamation
 //
 // Wraps ParlayHash (lock-free concurrent hash map) with:
 // - epoch::memory_pool<CacheEntry> for safe deferred destruction
 // - epoch::EpochGuard (ticket-based) for thread-agnostic read protection
 // - Chunk-based partial cleanup for incremental eviction
-// - Optional ghost entries (GhostV != void) for admission control
+// - Optional ghost entries (HasGhost = true) via tagged pointers (zero allocation)
 //
-// ParlayHash stores pair<K, EntryHeader*> directly in bucket buffers (trivially
-// copyable). Our memory_pool manages entry lifetime independently.
+// ParlayHash stores pair<K, TaggedEntry> directly in bucket buffers (trivially
+// copyable). TaggedEntry is 8 bytes: either a real pointer to a CacheEntry, or
+// ghost data encoded inline (bit 0 = ghost flag).
 //
-// When GhostV = void (default), all ghost code is eliminated at compile time.
+// When HasGhost = false (default), all ghost code is eliminated at compile time.
 //
 // Thread-safe: all public methods are safe to call concurrently.
 // =============================================================================
 
 template<typename K, typename V, typename Metadata = std::monostate,
-         typename GhostV = void,
+         bool HasGhost = false,
          typename Hash = detail::AutoHash<K>>
 class ChunkMap {
-    static constexpr bool HasGhost = !std::is_void_v<GhostV>;
-    using GhostValueType = std::conditional_t<HasGhost, GhostV, char>;
-
 public:
     // Base: metadata accessible without downcast
     struct EntryHeader {
@@ -154,35 +153,31 @@ public:
             : EntryHeader{std::move(m)}, value(std::move(v)) {}
     };
 
-    // Ghost entry: inherits EntryHeader, adds compact ghost data.
-    // When HasGhost = false, GhostValueType = char (never instantiated).
-    struct GhostCacheEntry : EntryHeader {
-        GhostValueType value;
-        GhostCacheEntry(GhostValueType v, Metadata m)
-            : EntryHeader{std::move(m)}, value(std::move(v)) {}
-    };
-
     struct FindResult {
-        EntryHeader* entry = nullptr;
+        TaggedEntry tagged{};
         epoch::EpochGuard guard;
         bool was_insert = false;
-        explicit operator bool() const { return entry != nullptr; }
+
+        explicit operator bool() const { return !tagged.empty(); }
+
+        bool isGhost() const { return tagged.isGhost(); }
 
         CacheEntry* asReal() const {
-            if (!entry) return nullptr;
-            if constexpr (HasGhost) {
-                if (entry->metadata.isGhost()) return nullptr;
-            }
-            return static_cast<CacheEntry*>(entry);
+            auto* h = tagged.asReal<EntryHeader>();
+            if (!h) return nullptr;
+            return static_cast<CacheEntry*>(h);
         }
 
-        GhostCacheEntry* asGhost() const requires (HasGhost) {
-            return (entry && entry->metadata.isGhost())
-                ? static_cast<GhostCacheEntry*>(entry) : nullptr;
+        EntryHeader* entry() const {
+            return tagged.asReal<EntryHeader>();
         }
+
+        uint32_t ghostCount() const { return tagged.ghostCount(); }
+        uint32_t ghostBytes() const { return tagged.ghostBytes(); }
+        uint8_t ghostFlags() const { return tagged.ghostFlags(); }
     };
 
-    using MapType = parlay::parlay_unordered_map<K, EntryHeader*, Hash>;
+    using MapType = parlay::parlay_unordered_map<K, TaggedEntry, Hash>;
     using hashed_key = typename MapType::hashed_key;
 
     static hashed_key make_key(const K& key) { return MapType::make_key(key); }
@@ -215,8 +210,8 @@ public:
     // =========================================================================
 
     /// Find entry by key. Returns epoch-guarded result.
-    /// The returned EntryHeader* is valid as long as FindResult lives.
-    /// Use asReal()/asGhost() to downcast.
+    /// The returned TaggedEntry is valid as long as FindResult lives.
+    /// Use asReal()/isGhost() to discriminate.
     FindResult find(const K& key) {
         auto hk = make_key(key);
         map_.prefetch_for(hk);
@@ -242,27 +237,32 @@ public:
     /// Insert or replace entry. Returns epoch-guarded result pointing to the
     /// NEW entry. EpochGuard is acquired BEFORE the Upsert to protect the new
     /// entry from concurrent Upsert + Retire by another thread.
-    /// Old entry (real or ghost) is retired via dispatch.
+    /// Old real entry is retired via pool. Old ghost is a no-op (inline data).
     FindResult upsert(const K& key, V value, Metadata meta = {}) {
         auto hk = make_key(key);
         map_.prefetch_for(hk);
         auto guard = epoch::EpochGuard::acquire();
         auto* new_entry = pool_.New(std::move(value), std::move(meta));
+        auto new_te = TaggedEntry::fromReal(static_cast<EntryHeader*>(new_entry));
         auto old = map_.Upsert_in_epoch(hk,
-            [&](std::optional<EntryHeader*> opt) -> EntryHeader* {
+            [&](std::optional<TaggedEntry> opt) -> TaggedEntry {
                 if constexpr (Mergeable<Metadata>) {
-                    if (opt && *opt) new_entry->metadata.mergeFrom((*opt)->metadata);
+                    if (opt && opt->isReal()) {
+                        new_entry->metadata.mergeFrom(opt->template asReal<EntryHeader>()->metadata);
+                    }
                 }
-                return new_entry;
+                return new_te;
             });
         bool inserted = !old.has_value();
         if constexpr (HasGhost) {
             // new entry is always real: +1 if insert or replacing ghost
-            if (inserted || (*old)->metadata.isGhost())
+            if (inserted || old->isGhost())
                 live_count_.fetch_add(1, std::memory_order_relaxed);
         }
-        if (!inserted) retire(*old);
-        return {new_entry, std::move(guard), inserted};
+        if (!inserted && old->isReal()) {
+            pool_.Retire(static_cast<CacheEntry*>(old->template asReal<EntryHeader>()));
+        }
+        return {new_te, std::move(guard), inserted};
     }
 
     /// Insert or replace entry using a pre-computed hashed key (avoids re-hashing).
@@ -270,57 +270,51 @@ public:
         map_.prefetch_for(hk);
         auto guard = epoch::EpochGuard::acquire();
         auto* new_entry = pool_.New(std::move(value), std::move(meta));
+        auto new_te = TaggedEntry::fromReal(static_cast<EntryHeader*>(new_entry));
         auto old = map_.Upsert_in_epoch(hk,
-            [&](std::optional<EntryHeader*> opt) -> EntryHeader* {
+            [&](std::optional<TaggedEntry> opt) -> TaggedEntry {
                 if constexpr (Mergeable<Metadata>) {
-                    if (opt && *opt) new_entry->metadata.mergeFrom((*opt)->metadata);
+                    if (opt && opt->isReal()) {
+                        new_entry->metadata.mergeFrom(opt->template asReal<EntryHeader>()->metadata);
+                    }
                 }
-                return new_entry;
+                return new_te;
             });
         bool inserted = !old.has_value();
         if constexpr (HasGhost) {
-            if (inserted || (*old)->metadata.isGhost())
+            if (inserted || old->isGhost())
                 live_count_.fetch_add(1, std::memory_order_relaxed);
         }
-        if (!inserted) retire(*old);
-        return {new_entry, std::move(guard), inserted};
+        if (!inserted && old->isReal()) {
+            pool_.Retire(static_cast<CacheEntry*>(old->template asReal<EntryHeader>()));
+        }
+        return {new_te, std::move(guard), inserted};
     }
 
-    /// Insert or replace ghost entry.
-    FindResult upsert_ghost(const K& key, GhostValueType gv, Metadata meta)
+    /// Insert ghost entry (zero allocation — data encoded inline in TaggedEntry).
+    /// Only if key doesn't exist (never replaces a real entry).
+    /// Returns true if inserted, false if key already existed.
+    bool insert_ghost(const K& key, uint32_t count, uint32_t bytes, uint8_t flags)
         requires (HasGhost)
     {
+        auto te = TaggedEntry::fromGhost(count, bytes, flags);
+        auto existing = map_.Insert(key, te);
+        return !existing.has_value();
+    }
+
+    /// Update a ghost entry via read-modify-write (Upsert).
+    /// No-op if the entry is not a ghost or doesn't exist.
+    template<typename Mutator>
+    void update_ghost(const K& key, Mutator&& mutator) requires (HasGhost) {
         auto hk = make_key(key);
         map_.prefetch_for(hk);
-        auto guard = epoch::EpochGuard::acquire();
-        auto* new_entry = shared_ghost_pool().New(std::move(gv), std::move(meta));
         auto old = map_.Upsert_in_epoch(hk,
-            [&](std::optional<EntryHeader*> opt) -> EntryHeader* {
-                if constexpr (Mergeable<Metadata>) {
-                    if (opt && *opt) new_entry->metadata.mergeFrom((*opt)->metadata);
-                }
-                return new_entry;
+            [&](std::optional<TaggedEntry> opt) -> TaggedEntry {
+                if (opt && opt->isGhost()) return mutator(*opt);
+                return opt.value_or(TaggedEntry{});
             });
-        bool inserted = !old.has_value();
-        // new entry is ghost: -1 only if replacing a real entry
-        if (!inserted && !(*old)->metadata.isGhost())
-            live_count_.fetch_sub(1, std::memory_order_relaxed);
-        if (!inserted) retire(*old);
-        return {new_entry, std::move(guard), inserted};
-    }
-
-    /// Insert ghost only if key doesn't exist (never replaces a real entry).
-    /// Returns true if inserted, false if key already existed.
-    bool insert_ghost(const K& key, GhostValueType gv, Metadata meta)
-        requires (HasGhost)
-    {
-        auto* new_entry = shared_ghost_pool().New(std::move(gv), std::move(meta));
-        auto existing = map_.Insert(key, static_cast<EntryHeader*>(new_entry));
-        if (existing.has_value()) {
-            shared_ghost_pool().Delete(new_entry);
-            return false;
-        }
-        return true;
+        // If key didn't exist, we inserted an empty TaggedEntry — remove it
+        if (!old.has_value()) map_.Remove(key);
     }
 
     /// Insert entry only if key doesn't exist.
@@ -328,7 +322,8 @@ public:
     /// On failure, the new entry is destroyed immediately (never visible).
     bool insert(const K& key, V value, Metadata meta = {}) {
         auto* new_entry = pool_.New(std::move(value), std::move(meta));
-        auto existing = map_.Insert(key, static_cast<EntryHeader*>(new_entry));
+        auto te = TaggedEntry::fromReal(static_cast<EntryHeader*>(new_entry));
+        auto existing = map_.Insert(key, te);
         if (existing.has_value()) {
             pool_.Delete(new_entry);
             return false;
@@ -337,15 +332,19 @@ public:
         return true;
     }
 
-    /// Remove entry by key. Dispatches to correct pool. Returns true if removed.
+    /// Remove entry by key. Retires real entries via pool; ghost removal is a no-op.
+    /// Returns true if removed.
     bool remove(const K& key) {
         auto old = map_.Remove(key);
         if (!old.has_value()) return false;
+        auto te = *old;
         if constexpr (HasGhost) {
-            if (!(*old)->metadata.isGhost())
+            if (!te.isGhost())
                 live_count_.fetch_sub(1, std::memory_order_relaxed);
         }
-        retire(*old);
+        if (te.isReal()) {
+            pool_.Retire(static_cast<CacheEntry*>(te.template asReal<EntryHeader>()));
+        }
         return true;
     }
 
@@ -355,28 +354,34 @@ public:
     ///
     /// Implementation: atomic Remove then check pred. If pred fails,
     /// re-Insert the entry (brief cache-miss window, acceptable for a cache).
+    /// Predicate receives EntryHeader* (only called for real entries).
     template<typename Pred>
     bool remove_if(const K& key, Pred&& pred) {
         auto old = map_.Remove(key);
         if (!old.has_value()) return false;
-        EntryHeader* entry = *old;
-        if (pred(entry)) {
-            if constexpr (HasGhost) {
-                if (!entry->metadata.isGhost())
+        auto te = *old;
+
+        if (te.isReal()) {
+            auto* entry = te.template asReal<EntryHeader>();
+            if (pred(entry)) {
+                if constexpr (HasGhost) {
                     live_count_.fetch_sub(1, std::memory_order_relaxed);
+                }
+                pool_.Retire(static_cast<CacheEntry*>(entry));
+                return true;
             }
-            retire(entry);
-            return true;
         }
-        // Predicate failed — re-insert (best-effort)
-        auto existing = map_.Insert(key, entry);
+
+        // Predicate failed or ghost entry — re-insert (best-effort)
+        auto existing = map_.Insert(key, te);
         if (existing.has_value()) {
             // Race: another thread inserted between our Remove and Insert
-            if constexpr (HasGhost) {
-                if (!entry->metadata.isGhost())
+            if (te.isReal()) {
+                if constexpr (HasGhost) {
                     live_count_.fetch_sub(1, std::memory_order_relaxed);
+                }
+                pool_.Retire(static_cast<CacheEntry*>(te.template asReal<EntryHeader>()));
             }
-            retire(entry);
         }
         return false;
     }
@@ -425,7 +430,7 @@ public:
     // Chunk-based cleanup
     // =========================================================================
 
-    /// Cleanup a specific chunk of buckets. Pred: bool(const K&, EntryHeader&).
+    /// Cleanup a specific chunk of buckets. Pred: bool(const K&, TaggedEntry).
     /// Returns number of entries removed.
     template<typename Pred>
     size_t cleanup_chunk(long chunk, long n_chunks, Pred&& pred) {
@@ -439,8 +444,8 @@ public:
             auto guard = epoch::EpochGuard::acquire();
             for (long i = start; i < end; ++i) {
                 map_.prefetch_bucket(i + 1);
-                map_.for_each_bucket(i, [&](const K& key, EntryHeader* entry) {
-                    if (pred(key, *entry)) to_remove.push_back(key);
+                map_.for_each_bucket(i, [&](const K& key, TaggedEntry te) {
+                    if (pred(key, te)) to_remove.push_back(key);
                 });
             }
         }
@@ -468,8 +473,8 @@ public:
             auto guard = epoch::EpochGuard::acquire();
             for (long i = 0; i < nb; ++i) {
                 map_.prefetch_bucket(i + 1);
-                map_.for_each_bucket(i, [&](const K& key, EntryHeader* entry) {
-                    if (pred(key, *entry)) to_remove.push_back(key);
+                map_.for_each_bucket(i, [&](const K& key, TaggedEntry te) {
+                    if (pred(key, te)) to_remove.push_back(key);
                 });
             }
         }
@@ -480,10 +485,9 @@ public:
         return removed;
     }
 
-    /// Force a GC cycle on the epoch pool(s).
+    /// Force a GC cycle on the epoch pool.
     void collect() {
         pool_.collect();
-        if constexpr (HasGhost) shared_ghost_pool().collect();
     }
 
     /// Find which chunk a key belongs to (test-only, O(num_buckets)).
@@ -494,7 +498,7 @@ public:
         long chunk_size = (nb + n_chunks - 1) / n_chunks;
         for (long i = 0; i < nb; ++i) {
             bool found = false;
-            map_.for_each_bucket(i, [&](const K& k, EntryHeader*) {
+            map_.for_each_bucket(i, [&](const K& k, TaggedEntry) {
                 if (k == key) found = true;
             });
             if (found) return i / chunk_size;
@@ -503,30 +507,12 @@ public:
     }
 
 private:
-    /// Dispatch retire to the correct pool based on ghost flag.
-    void retire(EntryHeader* entry) {
-        if constexpr (HasGhost) {
-            if (entry->metadata.isGhost()) {
-                shared_ghost_pool().Retire(static_cast<GhostCacheEntry*>(entry));
-                return;
-            }
-        }
-        pool_.Retire(static_cast<CacheEntry*>(entry));
-    }
-
     // memory_pool allocated on the heap and intentionally never freed.
     // ChunkMap instances are static singletons; during static destruction
     // the epoch singleton may already be destroyed, and ~memory_pool calls
     // get_epoch().update_epoch() which would crash.
     static epoch::memory_pool<CacheEntry>& shared_pool() {
         static auto* p = new epoch::memory_pool<CacheEntry>();
-        return *p;
-    }
-
-    static epoch::memory_pool<GhostCacheEntry>& shared_ghost_pool()
-        requires (HasGhost)
-    {
-        static auto* p = new epoch::memory_pool<GhostCacheEntry>();
         return *p;
     }
 

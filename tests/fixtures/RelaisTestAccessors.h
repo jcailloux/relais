@@ -104,16 +104,14 @@ struct TestInternals {
         return Repo::cache().totalEntries();
     }
 
-    /// Destroy all deferred entries in the epoch pool(s).
+    /// Destroy all deferred entries in the epoch pool.
     /// Flushes CachedWrapper destructors that would otherwise fire lazily
     /// (reserve FIFO > 500) and corrupt totalMemory after resetGDSF.
     /// Only safe after resetEntityCacheState (map is empty).
     template<typename Repo>
     static void clearEntityCachePools() {
-        using Cache = std::remove_reference_t<decltype(Repo::cache())>;
         auto& cache = Repo::cache();
         cache.pool_.clear();
-        if constexpr (Cache::HasGhost) cache.shared_ghost_pool().clear();
     }
 
     /// Read the chunk_id for a cached list entry (for bitmap skip testing).
@@ -151,12 +149,14 @@ struct TestInternals {
 
     /// Get GDSF metadata for a cached entity (read-only, no score bump).
     /// Returns type-erased metadata compatible with all CacheMetadata variants.
+    /// Returns nullopt for ghosts and missing entries.
     template<typename Repo, typename Key>
     static std::optional<GDSFTestMetadata> getEntityGDSFMetadata(const Key& key) {
         auto result = Repo::cache().find(key);
-        if (!result) return std::nullopt;
+        if (!result || result.isGhost()) return std::nullopt;
 
-        auto& meta = result.entry->metadata;
+        auto* header = result.entry();
+        auto& meta = header->metadata;
         GDSFTestMetadata m;
         if constexpr (requires { meta.access_count; }) {
             m.access_count = meta.access_count.load(std::memory_order_relaxed);
@@ -203,20 +203,19 @@ struct TestInternals {
     static bool isGhostEntry(const Key& key) {
         auto result = Repo::cache().find(key);
         if (!result) return false;
-        return result.entry->metadata.isGhost();
+        return result.isGhost();
     }
 
     /// Get ghost data for a cached ghost entry.
+    /// Ghost data is read inline from the TaggedEntry (zero pointer dereference).
     template<typename Repo, typename Key>
     static std::optional<GhostTestData> getGhostData(const Key& key) {
         auto result = Repo::cache().find(key);
-        if (!result) return std::nullopt;
-        auto* ge = result.asGhost();
-        if (!ge) return std::nullopt;
+        if (!result || !result.isGhost()) return std::nullopt;
         GhostTestData d;
-        d.access_count = ge->metadata.rawCount();
-        d.estimated_bytes = ge->value.estimated_bytes();
-        d.flags = ge->value.flags();
+        d.access_count = result.ghostCount();
+        d.estimated_bytes = result.ghostBytes();
+        d.flags = result.ghostFlags();
         return d;
     }
 
@@ -232,10 +231,13 @@ struct TestInternals {
         Repo::avg_construction_time_us_.store(us, std::memory_order_relaxed);
     }
 
-    /// Ghost overhead in bytes for a specific repo.
+    /// Bucket slot size in bytes for a specific repo.
+    /// Ghost entries no longer carry a charge — the bucket slot is tracked
+    /// by the ParlayHash memory hook. This constant is exposed for test
+    /// assertions on histogram entries and score denominators.
     template<typename Repo>
-    static constexpr size_t ghostOverhead() {
-        return Repo::kGhostOverhead;
+    static constexpr size_t bucketSlotSize() {
+        return Repo::kBucketSlotSize;
     }
 
     // =========================================================================
