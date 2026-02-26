@@ -41,10 +41,11 @@ namespace jcailloux::relais {
  * - TTL-only when l1_ttl > 0 but no GDSF
  * - No cleanup when neither is configured (default)
  *
- * When GDSF is enabled, ghost entries provide admission control under memory
- * pressure (>= 50%). Ghosts are zero-allocation: 8B of data (access count,
- * estimated bytes, flags) encoded inline in a tagged pointer stored directly
- * in the ParlayHash bucket. Only data that proves popular enough is admitted.
+ * When GDSF is enabled, ghost entries provide admission control under high
+ * memory pressure (>= admission_pressure, default 90%). Below that threshold,
+ * all fetches are cached directly and the sweep handles eviction. Ghosts are
+ * zero-allocation: 8B of data (access count, estimated bytes, flags) encoded
+ * inline in a tagged pointer stored directly in the ParlayHash bucket.
  *
  * Note: L1RepoConfig constraint is verified in Repo.h to avoid
  * eager evaluation issues with std::conditional_t.
@@ -251,7 +252,7 @@ public:
             std::vector<typename CleanupContext::GhostCandidate> candidates;
             std::vector<typename CleanupContext::GhostDecay> ghost_decays;
             if constexpr (HasGDSF) {
-                if (policy.hasMemoryPressure() && !policy.isOverBudget()) {
+                if (policy.hasAdmissionPressure() && !policy.isOverBudget()) {
                     ctx.ghost_candidates = &candidates;
                 }
                 ctx.ghost_decays = &ghost_decays;
@@ -303,7 +304,7 @@ public:
             std::vector<typename CleanupContext::GhostCandidate> candidates;
             std::vector<typename CleanupContext::GhostDecay> ghost_decays;
             if constexpr (HasGDSF) {
-                if (policy.hasMemoryPressure() && !policy.isOverBudget()) {
+                if (policy.hasAdmissionPressure() && !policy.isOverBudget()) {
                     ctx.ghost_candidates = &candidates;
                 }
                 ctx.ghost_decays = &ghost_decays;
@@ -505,7 +506,7 @@ private:
 
             auto& policy = cache::GDSFPolicy::instance();
 
-            if (policy.hasMemoryPressure()) {
+            if (policy.hasAdmissionPressure() && cache().size() > kChunkCount) {
                 // --- Lookup existing ghost ---
                 auto ghost_result = cache().find(id);
                 bool has_ghost = ghost_result && ghost_result.isGhost();

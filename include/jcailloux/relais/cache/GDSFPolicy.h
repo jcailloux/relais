@@ -37,6 +37,7 @@ namespace jcailloux::relais::cache {
 struct GDSFConfig {
     float decay_rate = 0.95f;
     float histogram_alpha = 0.3f;            // EMA smoothing for histogram merges
+    float admission_pressure = 0.95f;        // ghost gate activates at this pressure (0.0–1.0)
     size_t memory_counter_slots = 64;        // must be power of 2, <= 64
     size_t max_memory = 0;                   // L1 memory budget in bytes (0 = from env / unlimited)
 };
@@ -280,13 +281,24 @@ public:
             && totalMemory() > static_cast<int64_t>(max_memory_);
     }
 
-    /// Memory pressure >= 50% — ghost admission control activates above this.
+    /// Memory pressure >= 50% — eviction curve reference point.
     bool hasMemoryPressure() const {
         size_t budget = max_memory_;
         if (budget == 0) return false;
         float usage = static_cast<float>(std::max(int64_t(0), totalMemory()))
                     / static_cast<float>(budget);
         return usage >= 0.50f;
+    }
+
+    /// Admission pressure — ghost gate activates above this threshold.
+    /// Below this, all fetches are cached directly and the sweep handles eviction.
+    /// Default: 0.95 (95% memory usage).
+    bool hasAdmissionPressure() const {
+        size_t budget = max_memory_;
+        if (budget == 0) return false;
+        float usage = static_cast<float>(std::max(int64_t(0), totalMemory()))
+                    / static_cast<float>(budget);
+        return usage >= config_.admission_pressure;
     }
 
     // =====================================================================

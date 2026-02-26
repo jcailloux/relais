@@ -219,6 +219,70 @@ AccessStats runWorkload(const std::vector<int64_t>& ids, KeyGen&& gen) {
     return stats;
 }
 
+/// Fixed-ops workload: deterministic hit rate measurement.
+/// Runs exactly num_ops operations, eliminating timing noise.
+template<typename KeyGen>
+AccessStats runWorkloadFixed(const std::vector<int64_t>& ids, KeyGen&& gen,
+                             size_t num_ops) {
+    AccessStats stats;
+    auto start = Clock::now();
+
+    for (size_t i = 0; i < num_ops; ++i) {
+        size_t idx = gen();
+        auto task = GDSFBenchRepo::find(ids[idx]);
+        if (task.await_ready()) {
+            doNotOptimize(task.await_resume());
+            ++stats.hits;
+        } else {
+            ++stats.misses;
+        }
+    }
+
+    stats.cache_size = static_cast<int64_t>(GDSFBenchRepo::size());
+    stats.elapsed = Clock::now() - start;
+    return stats;
+}
+
+/// Run N trials of a hit-rate scenario, report mean ± stddev.
+/// TrialSetup: void(uint64_t seed) — called before each trial to reset state.
+/// TrialRun: AccessStats(uint64_t seed) — runs the workload with a given seed.
+template<typename TrialSetup, typename TrialRun>
+std::string runTrials(const std::string& label, int n_trials,
+                      TrialSetup&& setup, TrialRun&& run) {
+    std::vector<double> hit_rates;
+    hit_rates.reserve(n_trials);
+
+    for (int t = 0; t < n_trials; ++t) {
+        uint64_t seed = static_cast<uint64_t>(t * 997 + 31);
+        setup(seed);
+        auto stats = run(seed);
+        hit_rates.push_back(stats.hitRate());
+    }
+
+    double mean = std::accumulate(hit_rates.begin(), hit_rates.end(), 0.0)
+                / static_cast<double>(n_trials);
+    double sq_sum = 0.0;
+    for (double r : hit_rates) sq_sum += (r - mean) * (r - mean);
+    double stddev = n_trials > 1
+        ? std::sqrt(sq_sum / static_cast<double>(n_trials - 1)) : 0.0;
+
+    auto bar = std::string(55, '-');
+    std::ostringstream out;
+    out << "\n  " << bar
+        << "\n  " << label
+        << "\n  " << bar
+        << "\n  trials:       " << n_trials
+        << "\n  hit rate:     " << std::fixed << std::setprecision(1)
+        << mean << "% ± " << std::setprecision(2) << stddev << "%"
+        << "\n  per trial:    ";
+    for (size_t i = 0; i < hit_rates.size(); ++i) {
+        if (i > 0) out << ", ";
+        out << std::fixed << std::setprecision(1) << hit_rates[i] << "%";
+    }
+    out << "\n  " << bar;
+    return out.str();
+}
+
 std::string formatAccessStats(const std::string& label, const AccessStats& s) {
     auto bar = std::string(55, '-');
     std::ostringstream out;
@@ -407,3 +471,5 @@ TEST_CASE("Benchmark - GDSF multi-thread zipfian", "[benchmark][gdsf][zipfian][t
         WARN(msg + extra.str());
     }
 }
+
+
