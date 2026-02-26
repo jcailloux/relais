@@ -196,6 +196,20 @@ namespace parlay {
         return m.current_table()->get_index(Entry::make_key(key));
     }
 
+    // Prefetch bucket for a pre-computed hashed key (read, high temporal locality).
+    // Issue before EpochGuard::acquire() to overlap cache miss with epoch overhead.
+    void prefetch_for(const hashed_key& k) {
+        auto* t = m.current_table();
+        __builtin_prefetch(&t->buckets[t->get_index(k)].v, 0, 3);
+    }
+
+    // Prefetch by raw bucket index (for sequential iteration / cleanup loops).
+    void prefetch_bucket(long i) {
+        auto* t = m.current_table();
+        if (i < t->size)
+            __builtin_prefetch(&t->buckets[i].v, 0, 3);
+    }
+
     // Iterate all entries with unpacked (K&, V&). Runs inside with_epoch.
     template<typename F>
     void for_each_entry(F&& f) {
