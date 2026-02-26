@@ -174,8 +174,41 @@ public:
     /// var at construction, overridable via configure(). Returns 0 if unset (no limit).
     size_t maxMemory() const { return max_memory_; }
 
-    /// Decay rate accessor (used by cleanup predicates for inline decay).
-    float decayRate() const { return config_.decay_rate; }
+    /// Memory pressure ratio: totalMemory / maxMemory, clamped to [0, ∞).
+    /// Returns 0 when no budget is configured.
+    float memoryPressure() const {
+        size_t budget = max_memory_;
+        if (budget == 0) return 0.0f;
+        return static_cast<float>(std::max(int64_t(0), totalMemory()))
+             / static_cast<float>(budget);
+    }
+
+    /// Pressure-adaptive decay rate: 0.95 − 0.7 × pressure³.
+    /// At zero pressure: 0.95 (gentle decay, entries retained longer).
+    /// At full pressure: 0.25 (aggressive decay, faster eviction).
+    /// Clamped to [0.01, 0.95] to avoid zero/negative values.
+    float decayRate() const {
+        float p = memoryPressure();
+        float rate = 0.95f - 0.7f * p * p * p;
+        return std::clamp(rate, 0.01f, 0.95f);
+    }
+
+    // =====================================================================
+    // Deterministic Cleanup Trigger
+    // =====================================================================
+
+    /// Tick the global insertion counter. Fires a global sweep every
+    /// kCleanupMask+1 insertions, or immediately when over budget.
+    /// Called from every L1 cache insertion (putInCache, ghost creation, list put).
+    void tickInsertion() {
+        if (kCleanupFrequencyLog2 > 0
+                && (insertion_counter_.fetch_add(1, std::memory_order_relaxed)
+                    & kCleanupMask) == kCleanupMask) {
+            sweep();
+        } else if (isOverBudget()) {
+            sweep();
+        }
+    }
 
     // =====================================================================
     // Repo Registry
@@ -381,6 +414,7 @@ private:
         for (size_t i = 0; i < kMaxMemorySlots; ++i) {
             memory_slots_[i].value.store(0, std::memory_order_relaxed);
         }
+        insertion_counter_.store(0, std::memory_order_relaxed);
         // Registry and max_memory_ intentionally NOT cleared.
     }
 
@@ -403,6 +437,9 @@ private:
     ScoreHistogram histogram_{};              // persistent, EMA-smoothed
     ScoreHistogram building_histogram_{};     // temporary, rebuilt each sweep
     std::atomic<float> cached_threshold_{0.0f};
+
+    // Deterministic insertion counter (replaces probabilistic hash-based trigger)
+    std::atomic<uint32_t> insertion_counter_{0};
 
     // Sweep serialization — lock-free, guaranteed on all platforms
     std::atomic_flag sweep_flag_{};

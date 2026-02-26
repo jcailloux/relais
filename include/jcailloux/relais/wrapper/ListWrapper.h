@@ -40,13 +40,30 @@ public:
 
     ListWrapper() = default;
 
+    ~ListWrapper() {
+        if (memory_hook_) {
+            memory_hook_(memory_hook_ctx_,
+                -static_cast<int64_t>(memoryUsage() + cache_overhead_));
+        }
+    }
+
     // std::once_flag is non-copyable/non-movable — caches are transient
     // and will be lazily recomputed after copy/move.
+    // Copy ctor/assignment do NOT transfer the hook (copies are independent).
     ListWrapper(const ListWrapper& o)
         : items(o.items), total_count(o.total_count), next_cursor(o.next_cursor) {}
+
     ListWrapper(ListWrapper&& o) noexcept
         : items(std::move(o.items)), total_count(o.total_count),
-          next_cursor(std::move(o.next_cursor)) {}
+          next_cursor(std::move(o.next_cursor)),
+          memory_hook_(o.memory_hook_), memory_hook_ctx_(o.memory_hook_ctx_),
+          cache_overhead_(o.cache_overhead_)
+    {
+        o.memory_hook_ = nullptr;
+        o.memory_hook_ctx_ = nullptr;
+        o.cache_overhead_ = 0;
+    }
+
     ListWrapper& operator=(const ListWrapper& o) {
         if (this != &o) {
             items = o.items;
@@ -55,11 +72,22 @@ public:
         }
         return *this;
     }
+
     ListWrapper& operator=(ListWrapper&& o) noexcept {
         if (this != &o) {
+            if (memory_hook_) {
+                memory_hook_(memory_hook_ctx_,
+                    -static_cast<int64_t>(memoryUsage() + cache_overhead_));
+            }
             items = std::move(o.items);
             total_count = o.total_count;
             next_cursor = std::move(o.next_cursor);
+            memory_hook_ = o.memory_hook_;
+            memory_hook_ctx_ = o.memory_hook_ctx_;
+            cache_overhead_ = o.cache_overhead_;
+            o.memory_hook_ = nullptr;
+            o.memory_hook_ctx_ = nullptr;
+            o.cache_overhead_ = 0;
         }
         return *this;
     }
@@ -195,6 +223,7 @@ public:
 
     mutable MemoryHook memory_hook_ = nullptr;
     mutable void* memory_hook_ctx_ = nullptr;
+    size_t cache_overhead_{0};
 
 private:
     mutable std::once_flag beve_flag_;
