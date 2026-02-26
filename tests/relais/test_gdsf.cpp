@@ -1208,6 +1208,107 @@ TEST_CASE("GDSF - ghost decay and suppression",
 
 // #############################################################################
 //
+//  16b. size() live count excludes ghosts
+//
+// #############################################################################
+
+TEST_CASE("GDSF - size() live count excludes ghosts",
+          "[integration][db][gdsf][ghost][size]")
+{
+    TransactionGuard tx;
+    auto& policy = GDSFPolicy::instance();
+
+    // Setup: small budget, high threshold → ghosts created
+    resetRepos<GDSFGhostRepo>();
+    policy.configure({.max_memory = 4000});
+    TestInternals::seedAvgConstructionTime<GDSFGhostRepo>(10.0f);
+    policy.charge(2400);  // 60% → hasMemoryPressure()
+    TestInternals::setThreshold(100.0f);  // score < 100 → ghost
+
+    SECTION("[size] ghosts excluded from size(), included in totalEntries()") {
+        // Insert 3 ghosts
+        std::vector<int64_t> ids;
+        for (int i = 0; i < 3; ++i) {
+            auto id = insertTestItem("size_ghost_" + std::to_string(i), i);
+            sync(GDSFGhostRepo::find(id));
+            REQUIRE(TestInternals::isGhostEntry<GDSFGhostRepo>(id));
+            ids.push_back(id);
+        }
+
+        REQUIRE(GDSFGhostRepo::size() == 0);
+        REQUIRE(TestInternals::totalEntityCacheEntries<GDSFGhostRepo>() == 3);
+    }
+
+    SECTION("[size] promotion increases size()") {
+        auto id = insertTestItem("size_promote", 10);
+        sync(GDSFGhostRepo::find(id));  // ghost
+        REQUIRE(GDSFGhostRepo::size() == 0);
+        REQUIRE(TestInternals::totalEntityCacheEntries<GDSFGhostRepo>() == 1);
+
+        // Lower threshold → next find promotes ghost to real
+        TestInternals::setThreshold(0.5f);
+        sync(GDSFGhostRepo::find(id));
+
+        REQUIRE_FALSE(TestInternals::isGhostEntry<GDSFGhostRepo>(id));
+        REQUIRE(GDSFGhostRepo::size() == 1);
+        REQUIRE(TestInternals::totalEntityCacheEntries<GDSFGhostRepo>() == 1);
+    }
+
+    SECTION("[size] evict decreases size() for real, not for ghost") {
+        // Insert a real entry (no pressure first)
+        policy.charge(-2400);  // remove pressure
+        auto real_id = insertTestItem("size_real", 10);
+        sync(GDSFGhostRepo::find(real_id));
+        REQUIRE_FALSE(TestInternals::isGhostEntry<GDSFGhostRepo>(real_id));
+        REQUIRE(GDSFGhostRepo::size() == 1);
+
+        // Re-apply pressure, create a ghost
+        policy.charge(2400);
+        auto ghost_id = insertTestItem("size_ghost", 20);
+        sync(GDSFGhostRepo::find(ghost_id));
+        REQUIRE(TestInternals::isGhostEntry<GDSFGhostRepo>(ghost_id));
+        REQUIRE(GDSFGhostRepo::size() == 1);  // ghost doesn't count
+        REQUIRE(TestInternals::totalEntityCacheEntries<GDSFGhostRepo>() == 2);
+
+        // Evict ghost → size unchanged
+        GDSFGhostRepo::evict(ghost_id);
+        REQUIRE(GDSFGhostRepo::size() == 1);
+        REQUIRE(TestInternals::totalEntityCacheEntries<GDSFGhostRepo>() == 1);
+
+        // Evict real → size decreases
+        GDSFGhostRepo::evict(real_id);
+        REQUIRE(GDSFGhostRepo::size() == 0);
+        REQUIRE(TestInternals::totalEntityCacheEntries<GDSFGhostRepo>() == 0);
+    }
+
+    SECTION("[size] mixed real + ghost consistency") {
+        // Start without pressure → insert 2 real entries
+        policy.charge(-2400);
+        auto id1 = insertTestItem("size_mix_1", 1);
+        auto id2 = insertTestItem("size_mix_2", 2);
+        sync(GDSFGhostRepo::find(id1));
+        sync(GDSFGhostRepo::find(id2));
+        REQUIRE(GDSFGhostRepo::size() == 2);
+
+        // Re-apply pressure → insert 3 ghosts
+        policy.charge(2400);
+        for (int i = 0; i < 3; ++i) {
+            auto id = insertTestItem("size_mix_g_" + std::to_string(i), i + 10);
+            sync(GDSFGhostRepo::find(id));
+        }
+
+        REQUIRE(GDSFGhostRepo::size() == 2);  // only reals
+        REQUIRE(TestInternals::totalEntityCacheEntries<GDSFGhostRepo>() == 5);
+    }
+
+    // Cleanup
+    resetRepos<GDSFGhostRepo>();
+    policy.configure({.max_memory = kTestMaxMemory});
+}
+
+
+// #############################################################################
+//
 //  17. GDSF - eviction selectivity
 //
 // #############################################################################

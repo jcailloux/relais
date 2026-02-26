@@ -98,6 +98,12 @@ struct TestInternals {
         Repo::cache().collect();
     }
 
+    /// Total entries in the cache (live + ghost). For size() vs ghost testing.
+    template<typename Repo>
+    static long totalEntityCacheEntries() {
+        return Repo::cache().totalEntries();
+    }
+
     /// Destroy all deferred entries in the epoch pool(s).
     /// Flushes CachedWrapper destructors that would otherwise fire lazily
     /// (reserve FIFO > 500) and corrupt totalMemory after resetGDSF.
