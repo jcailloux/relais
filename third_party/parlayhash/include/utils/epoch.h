@@ -363,12 +363,10 @@ private:
   struct alignas(256) old_current {
     ilist old;      // retired items from previous epoch
     ilist current;  // retired items from current epoch
-    ilist reserve;  // items past safety window, reusable
     long epoch; // epoch on last retire, updated on a retire
     long retire_count; // number of retires so far, reset on updating the epoch
-    long alloc_count;
     epoch_s::state e_state;
-    old_current() : e_state(0), epoch(0), retire_count(0), alloc_count(0) {}
+    old_current() : epoch(0), retire_count(0), e_state(0) {}
   };
 
   std::vector<old_current> pools;
@@ -403,7 +401,7 @@ private:
 #endif
     long current = get_epoch().get_current();
     if (pid.epoch + delay < current) {
-      pid.reserve.splice_back(pid.old);
+      clear_list(pid.old);
       pid.old = std::move(pid.current);
       pid.epoch = current;
     }
@@ -456,20 +454,6 @@ private:
   }
   
   wrapper* allocate_wrapper() {
-    auto &pid = pools[worker_id()];
-    if (!pid.reserve.empty()) {
-      wrapper* w = pid.reserve.pop_front();
-#ifdef USE_UNDO
-      if (!w->keep_) {
-#endif
-	w->value.~T();
-	check_wrapper_on_destruct(w);
-	set_wrapper_on_construct(w);
-	return w;
-#ifdef USE_UNDO
-      }
-#endif
-    }
 #ifdef USE_PARLAY_ALLOC
     wrapper* w = Allocator::alloc();
 #else
@@ -518,17 +502,6 @@ private:
 #endif
     auto i = worker_id();
     auto &pid = pools[i];
-    if (pid.reserve.size() > 500) {
-      wrapper* rw = pid.reserve.pop_front();
-#ifdef USE_UNDO
-      if (!rw->keep_) {
-#endif
-	rw->value.~T();
-	free_wrapper(rw);
-#ifdef USE_UNDO
-      }
-#endif
-    }
     advance_epoch(i, pid);
     wrapper* w = wrapper_from_value(p);
     pid.current.push_back(w);
@@ -561,15 +534,10 @@ private:
   // Clears all the lists, to be used on termination, or could be use
   // at a quiescent point when noone is reading any retired items.
   void clear() {
-    // for (int i=0; i < num_workers(); i++)
-    //   std::cout << i << ": " << pools[1].old.size() << ", "
-    // 		<< pools[i].current.size() << ", "
-    // 		<< pools[i].reserve.size() << std::endl;
     get_epoch().update_epoch();
     for (int i=0; i < num_workers(); i++) {
       clear_list(pools[i].old);
       clear_list(pools[i].current);
-      clear_list(pools[i].reserve);
     }
     //Allocator::print_stats();
   }
@@ -580,6 +548,19 @@ private:
     get_epoch().update_epoch();
     auto i = worker_id();
     advance_epoch(i, pools[i]);
+  }
+
+  // Immediately reclaim all retired entries that are safe to free.
+  // Performs two epoch advancements to complete the full retirement cycle
+  // (current→old, then clear old). Entries guarded by active EpochGuards
+  // remain in the pool and will be reclaimed on subsequent calls.
+  void reclaim() {
+    auto& ep = get_epoch();
+    auto i = worker_id();
+    for (int round = 0; round < 2; ++round) {
+      ep.update_epoch();
+      advance_epoch(i, pools[i]);
+    }
   }
 
   void stats() {}
@@ -600,7 +581,7 @@ private:
     long epoch; // epoch on last retire, updated on a retire
     long retire_count; // number of retires so far, reset on updating the epoch
     epoch_s::state e_state;
-    old_current() : e_state(0), epoch(0), retire_count(0) {}
+    old_current() : epoch(0), retire_count(0), e_state(0) {}
   };
 
   std::vector<old_current> pools;

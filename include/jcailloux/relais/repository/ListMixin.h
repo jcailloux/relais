@@ -20,6 +20,7 @@
 #include "jcailloux/relais/list/decl/HttpQueryParser.h"
 #include "jcailloux/relais/wrapper/EntityConcepts.h"
 #include "jcailloux/relais/wrapper/ListWrapper.h"
+#include "jcailloux/relais/cache/Metrics.h"
 
 #ifdef RELAIS_BUILDING_TESTS
 namespace relais_test { struct TestInternals; }
@@ -269,6 +270,11 @@ class ListMixin : public Base {
     }
 
 public:
+#if RELAIS_ENABLE_METRICS
+    static inline cache::L1Counters list_l1_counters_{};
+    static inline cache::L2Counters list_l2_counters_{};
+#endif
+
     using typename Base::EntityType;
     using typename Base::KeyType;
     using typename Base::WrapperType;
@@ -296,8 +302,11 @@ public:
     /// L1 hit: zero overhead (Immediate holds ListResult directly, no Task).
     static io::Immediate<ListResult> query(const ListQuery& q) {
         if constexpr (kHasL1) {
-            if (auto cached = listCache().getByKey(q.cache_key))
+            if (auto cached = listCache().getByKey(q.cache_key)) {
+                RELAIS_METRICS_INC(list_l1_counters_.hits);
                 return std::move(cached);
+            }
+            RELAIS_METRICS_INC(list_l1_counters_.misses);
         }
         return cachedListQuery(q);
     }
@@ -310,10 +319,12 @@ public:
         // L1 check: serialize from cached entities
         if constexpr (kHasL1) {
             if (auto cached = listCache().getByKey(q.cache_key)) {
+                RELAIS_METRICS_INC(list_l1_counters_.hits);
                 auto json_sp = cached->json();  // lazy serialization, returns shared_ptr
                 auto guard = cached.take_guard();
                 return wrapper::JsonView(json_sp.get(), std::move(guard));
             }
+            RELAIS_METRICS_INC(list_l1_counters_.misses);
         }
         return queryJsonSlow(q);
     }
@@ -328,10 +339,12 @@ public:
         // L1 check: serialize from cached entities
         if constexpr (kHasL1) {
             if (auto cached = listCache().getByKey(q.cache_key)) {
+                RELAIS_METRICS_INC(list_l1_counters_.hits);
                 auto bin_sp = cached->binary();  // lazy serialization, returns shared_ptr
                 auto guard = cached.take_guard();
                 return wrapper::BinaryView(bin_sp.get(), std::move(guard));
             }
+            RELAIS_METRICS_INC(list_l1_counters_.misses);
         }
         return queryBinarySlow(q);
     }
@@ -765,6 +778,7 @@ protected:
             }
 
             if (cached) {
+                RELAIS_METRICS_INC(list_l2_counters_.hits);
                 if constexpr (kHasL1) {
                     // Move into L1 cache, return epoch-guarded view
                     auto elapsed_us = static_cast<float>(
@@ -786,6 +800,7 @@ protected:
                     co_return makeListView(std::move(*cached));
                 }
             }
+            RELAIS_METRICS_INC(list_l2_counters_.misses);
         }
 
         // 3. Cache miss — query database

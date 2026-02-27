@@ -18,6 +18,7 @@
 #include "jcailloux/relais/wrapper/BufferView.h"
 #include "jcailloux/relais/config/repo_config.h"
 #include "jcailloux/relais/config/CachedClock.h"
+#include "jcailloux/relais/cache/Metrics.h"
 #include <array>
 
 #ifdef RELAIS_BUILDING_TESTS
@@ -61,7 +62,6 @@ class CachedRepo : public std::conditional_t<
     static constexpr bool HasTTL = (std::chrono::nanoseconds(Cfg.l1_ttl).count() > 0);
     static constexpr bool HasGDSF = cache::GDSFPolicy::enabled;
     static constexpr bool HasCleanup = HasGDSF || HasTTL;
-    static constexpr long kChunkCount = 1L << Cfg.l1_chunk_count_log2;
 
     using Base = std::conditional_t<
         HasRedis,
@@ -83,6 +83,10 @@ public:
 
     static constexpr auto l1Ttl() { return std::chrono::nanoseconds(Cfg.l1_ttl); }
 
+#if RELAIS_ENABLE_METRICS
+    static inline cache::L1Counters l1_counters_{};
+#endif
+
     // =========================================================================
     // Queries
     // =========================================================================
@@ -91,8 +95,11 @@ public:
     /// Returns epoch-guarded EntityView (empty if not found).
     /// L1 hit: zero overhead (Immediate holds EntityView directly, no Task).
     static io::Immediate<wrapper::EntityView<Entity>> find(const Key& id) {
-        if (auto view = getFromCache(id))
+        if (auto view = getFromCache(id)) {
+            RELAIS_METRICS_INC(l1_counters_.hits);
             return std::move(view);
+        }
+        RELAIS_METRICS_INC(l1_counters_.misses);
         return findSlow(id);
     }
 
@@ -102,9 +109,11 @@ public:
     static io::Immediate<wrapper::JsonView> findJson(const Key& id) {
         auto result = findInCache(id);
         if (result) {
+            RELAIS_METRICS_INC(l1_counters_.hits);
             auto* ce = result.asReal();
             return wrapper::JsonView(ce->value.json(), std::move(result.guard));
         }
+        RELAIS_METRICS_INC(l1_counters_.misses);
         return findJsonSlow(id);
     }
 
@@ -116,9 +125,11 @@ public:
     {
         auto result = findInCache(id);
         if (result) {
+            RELAIS_METRICS_INC(l1_counters_.hits);
             auto* ce = result.asReal();
             return wrapper::BinaryView(ce->value.binary(), std::move(result.guard));
         }
+        RELAIS_METRICS_INC(l1_counters_.misses);
         return findBinarySlow(id);
     }
 
@@ -258,7 +269,7 @@ public:
                 ctx.ghost_decays = &ghost_decays;
             }
 
-            auto removed = cache().cleanup_next_chunk(kChunkCount,
+            auto removed = cache().cleanup_next_chunk(cache::GDSFPolicy::instance().chunkCount(),
                 [&ctx](const Key& key, auto te) {
                     if constexpr (HasGDSF) {
                         if (te.isGhost()) {
@@ -269,6 +280,11 @@ public:
                         te.template asReal<typename L1Cache::EntryHeader>());
                     return cleanupPredicate(key, ce->metadata, ce->value, ctx);
                 });
+
+            // Reclaim evicted entries immediately when safe (no active EpochGuard).
+            // Without this, totalMemory() stays inflated (charges are immediate
+            // but discharges are epoch-deferred), causing cascading eviction.
+            if (removed > 0) cache().reclaim();
 
             // Post-sweep: apply ghost decays via read-modify-write
             if constexpr (HasGDSF) {
@@ -321,6 +337,9 @@ public:
                         te.template asReal<typename L1Cache::EntryHeader>());
                     return cleanupPredicate(key, ce->metadata, ce->value, ctx);
                 });
+
+            // Drain epoch pool (see trySweep comment).
+            if (removed > 0) cache().collect();
 
             // Post-sweep: apply ghost decays via read-modify-write
             if constexpr (HasGDSF) {
@@ -417,26 +436,19 @@ protected:
     }
 
     /// Put entity in cache (copy). Returns FindResult for flexible use.
-    /// Triggers a global sweep every kCleanupMask+1 insertions or when over budget.
+    /// No tick here — the sweep counter is driven by fetchAndCache (DB fetches),
+    /// not by local cache mutations (update, insert via API).
     static typename L1Cache::FindResult putInCache(const Key& key, const Entity& src,
         Clock::time_point now = Clock::now())
     {
-        auto result = cache().upsert(L1Cache::make_key(key), buildValue(src), buildMetadata(now));
-        if constexpr (HasCleanup) {
-            cache::GDSFPolicy::instance().tickInsertion();
-        }
-        return result;
+        return cache().upsert(L1Cache::make_key(key), buildValue(src), buildMetadata(now));
     }
 
     /// Put entity in cache (move — zero copy). Returns FindResult.
     static typename L1Cache::FindResult putInCache(const Key& key, Entity&& src,
         Clock::time_point now = Clock::now())
     {
-        auto result = cache().upsert(L1Cache::make_key(key), buildValue(std::move(src)), buildMetadata(now));
-        if constexpr (HasCleanup) {
-            cache::GDSFPolicy::instance().tickInsertion();
-        }
-        return result;
+        return cache().upsert(L1Cache::make_key(key), buildValue(std::move(src)), buildMetadata(now));
     }
 
     /// Put entity in cache and return EntityView (copy path).
@@ -506,7 +518,13 @@ private:
 
             auto& policy = cache::GDSFPolicy::instance();
 
-            if (policy.hasAdmissionPressure() && cache().size() > kChunkCount) {
+            // Tick on every DB fetch (not just insertions). This ensures
+            // periodic sweeps fire even when ghosts prevent putInCache,
+            // breaking the deadlock: ghosts block insertion → no ticks →
+            // no sweeps → threshold stale → ghosts never promoted.
+            policy.tickInsertion();
+
+            if (policy.hasAdmissionPressure() && cache().size() > cache::GDSFPolicy::instance().chunkCount()) {
                 // --- Lookup existing ghost ---
                 auto ghost_result = cache().find(id);
                 bool has_ghost = ghost_result && ghost_result.isGhost();
@@ -553,12 +571,9 @@ private:
                     if (!has_ghost) {
                         // Create new ghost (insert_ghost: never replaces a real entry)
                         // No ghost charge — bucket slot is tracked by the hook.
-                        if (cache().insert_ghost(id,
+                        cache().insert_ghost(id,
                                 cache::GDSFScoreData::kCountScale,
-                                est_bytes, est_flags)) {
-                            // New ghost created — tick global insertion counter.
-                            policy.tickInsertion();
-                        }
+                                est_bytes, est_flags);
                         // If insert fails → a real entry was inserted concurrently.
                         // We continue: the entity is returned as transient anyway.
                     }

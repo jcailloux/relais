@@ -10,6 +10,7 @@
 #include "jcailloux/relais/repository/ListMixin.h"
 #include "jcailloux/relais/config/FixedString.h"
 #include "jcailloux/relais/wrapper/EntityConcepts.h"
+#include "jcailloux/relais/cache/Metrics.h"
 
 namespace jcailloux::relais {
 
@@ -122,6 +123,69 @@ public:
     using Base::name;
     using Base::find;
     using Base::config;
+
+#if RELAIS_ENABLE_METRICS
+    // =======================================================================
+    // Metrics — aggregated from all active cache layers
+    // =======================================================================
+
+    [[nodiscard]] static cache::MetricsSnapshot metrics() {
+        cache::MetricsSnapshot snap{};
+
+        // L1 entity counters
+        if constexpr (Cfg.cache_level == config::CacheLevel::L1
+                    || Cfg.cache_level == config::CacheLevel::L1_L2) {
+            using CachedLayer = CachedRepo<Entity, Name, Cfg, Key>;
+            snap.l1_hits   = CachedLayer::l1_counters_.hits.load();
+            snap.l1_misses = CachedLayer::l1_counters_.misses.load();
+        }
+
+        // L2 entity counters
+        if constexpr (Cfg.cache_level == config::CacheLevel::L2
+                    || Cfg.cache_level == config::CacheLevel::L1_L2) {
+            using RedisLayer = RedisRepo<Entity, Name, Cfg, Key>;
+            snap.l2_hits   = RedisLayer::l2_counters_.hits.load();
+            snap.l2_misses = RedisLayer::l2_counters_.misses.load();
+        }
+
+        // List counters
+        if constexpr (HasListDescriptor<Entity>) {
+            using CacheLayer = typename detail::CacheLayerSelector<Entity, Name, Cfg, Key>::type;
+            using ListLayer = ListMixin<CacheLayer>;
+            snap.list_l1_hits   = ListLayer::list_l1_counters_.hits.load();
+            snap.list_l1_misses = ListLayer::list_l1_counters_.misses.load();
+            snap.list_l2_hits   = ListLayer::list_l2_counters_.hits.load();
+            snap.list_l2_misses = ListLayer::list_l2_counters_.misses.load();
+        }
+
+        return snap;
+    }
+
+    static void resetMetrics() {
+        if constexpr (Cfg.cache_level == config::CacheLevel::L1
+                    || Cfg.cache_level == config::CacheLevel::L1_L2) {
+            using CachedLayer = CachedRepo<Entity, Name, Cfg, Key>;
+            CachedLayer::l1_counters_.hits.reset();
+            CachedLayer::l1_counters_.misses.reset();
+        }
+
+        if constexpr (Cfg.cache_level == config::CacheLevel::L2
+                    || Cfg.cache_level == config::CacheLevel::L1_L2) {
+            using RedisLayer = RedisRepo<Entity, Name, Cfg, Key>;
+            RedisLayer::l2_counters_.hits.reset();
+            RedisLayer::l2_counters_.misses.reset();
+        }
+
+        if constexpr (HasListDescriptor<Entity>) {
+            using CacheLayer = typename detail::CacheLayerSelector<Entity, Name, Cfg, Key>::type;
+            using ListLayer = ListMixin<CacheLayer>;
+            ListLayer::list_l1_counters_.hits.reset();
+            ListLayer::list_l1_counters_.misses.reset();
+            ListLayer::list_l2_counters_.hits.reset();
+            ListLayer::list_l2_counters_.misses.reset();
+        }
+    }
+#endif
 
     // =======================================================================
     // Convenience methods (need correct dispatch through method hiding)

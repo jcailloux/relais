@@ -378,9 +378,10 @@ TEST_CASE("Benchmark - L1 throughput mixed", "[benchmark][throughput][mixed]") {
         // lazily via coroutine suspension (non-blocking). Reads that miss go to
         // DB but in production this suspends the coroutine, not the thread.
         // Here we skip DB misses to measure pure L1 read + evict throughput.
-        struct MixedOps { int64_t reads = 0; int64_t evicts = 0; int64_t misses = 0; };
+        struct MixedOps { int64_t reads = 0; int64_t evicts = 0; };
         std::vector<MixedOps> thread_ops(THREADS);
 
+        L1TestItemRepo::resetMetrics();
         auto result = measureDuration(THREADS, [&](int tid, std::atomic<bool>& running) -> int64_t {
             std::mt19937 rng(tid * 42 + 7);
             MixedOps local;
@@ -393,7 +394,6 @@ TEST_CASE("Benchmark - L1 throughput mixed", "[benchmark][throughput][mixed]") {
                     } else {
                         // Key evicted by another thread — in production this
                         // suspends the coroutine (non-blocking). Skip here.
-                        ++local.misses;
                     }
                     ++local.reads;
                 } else {  // 5% evictions (non-blocking, ~20ns)
@@ -405,18 +405,18 @@ TEST_CASE("Benchmark - L1 throughput mixed", "[benchmark][throughput][mixed]") {
             return local.reads + local.evicts;
         });
 
-        int64_t total_reads = 0, total_evicts = 0, total_misses = 0;
+        int64_t total_reads = 0, total_evicts = 0;
         for (auto& t : thread_ops) {
             total_reads += t.reads;
             total_evicts += t.evicts;
-            total_misses += t.misses;
         }
-        double miss_rate = (total_reads > 0) ? 100.0 * total_misses / total_reads : 0.0;
+        auto m = L1TestItemRepo::metrics();
+        double miss_rate = (1.0 - m.l1HitRatio()) * 100.0;
         auto msg = formatMixedThroughput("L1 mixed read/evict (95R/5W)",
                                          THREADS, result, total_reads, total_evicts);
         std::ostringstream extra;
         extra << "\n  L1 miss rate:    " << std::fixed << std::setprecision(1)
-              << miss_rate << "% (" << total_misses << " misses)";
+              << miss_rate << "% (" << m.l1_misses << " misses)";
         WARN(msg + extra.str());
     }
 
@@ -429,11 +429,12 @@ TEST_CASE("Benchmark - L1 throughput mixed", "[benchmark][throughput][mixed]") {
 
         static constexpr int CORO_COUNT = 64;
 
-        struct CoroStats { int64_t reads = 0; int64_t evicts = 0; int64_t db_fetches = 0; };
+        struct CoroStats { int64_t reads = 0; int64_t evicts = 0; };
         std::vector<CoroStats> coro_stats(CORO_COUNT);
         std::atomic<bool> coro_running{true};
         std::latch done{CORO_COUNT};
 
+        L1TestItemRepo::resetMetrics();
         auto t0 = Clock::now();
 
         for (int cid = 0; cid < CORO_COUNT; ++cid) {
@@ -445,12 +446,9 @@ TEST_CASE("Benchmark - L1 throughput mixed", "[benchmark][throughput][mixed]") {
                     while (running.load(std::memory_order_relaxed)) {
                         auto kid = ids[(cid * 11 + stats.reads + stats.evicts) % num_keys];
                         if (rng() % 20 != 0) {  // 95% reads
-                            auto task = L1TestItemRepo::find(kid);
-                            bool was_l1 = task.await_ready();
-                            auto result = co_await std::move(task);
+                            auto result = co_await L1TestItemRepo::find(kid);
                             doNotOptimize(result);
                             ++stats.reads;
-                            if (!was_l1) ++stats.db_fetches;
                         } else {  // 5% evictions
                             L1TestItemRepo::evict(kid);
                             ++stats.evicts;
@@ -466,19 +464,19 @@ TEST_CASE("Benchmark - L1 throughput mixed", "[benchmark][throughput][mixed]") {
         done.wait();
         auto elapsed = Clock::now() - t0;
 
-        int64_t total_reads = 0, total_evicts = 0, total_db = 0;
+        int64_t total_reads = 0, total_evicts = 0;
         for (auto& s : coro_stats) {
             total_reads += s.reads;
             total_evicts += s.evicts;
-            total_db += s.db_fetches;
         }
 
+        auto m = L1TestItemRepo::metrics();
         DurationResult result{elapsed, total_reads + total_evicts};
         auto msg = formatMixedThroughput("L1 mixed read/evict coroutine (95R/5W)",
                                          1, result, total_reads, total_evicts);
-        double db_pct = (total_reads > 0) ? 100.0 * total_db / total_reads : 0.0;
+        double db_pct = (1.0 - m.l1HitRatio()) * 100.0;
         std::ostringstream extra;
-        extra << "\n  DB fetches:      " << total_db
+        extra << "\n  DB fetches:      " << m.l1_misses
               << " (" << std::fixed << std::setprecision(1) << db_pct << "% of reads)"
               << "\n  coroutines:      " << CORO_COUNT;
         WARN(msg + extra.str());
@@ -510,7 +508,6 @@ struct ProdStats {
     int64_t reads = 0;
     int64_t l1_evicts = 0;
     int64_t invalidates = 0;
-    int64_t l1_hits = 0;
 };
 
 template<typename Repo>
@@ -524,12 +521,9 @@ DetachedHandle prodWorker(
                         + stats.invalidates) % num_keys];
         auto roll = rng() % 100;
         if (roll >= 2) {  // 98% reads
-            auto task = Repo::find(kid);
-            bool was_l1 = task.await_ready();
-            auto result = co_await std::move(task);
+            auto result = co_await Repo::find(kid);
             doNotOptimize(result);
             ++stats.reads;
-            if (was_l1) ++stats.l1_hits;
         } else if (roll == 1) {  // 1% L1 evictions (next read → L2 or DB)
             Repo::evict(kid);
             ++stats.l1_evicts;
@@ -550,6 +544,7 @@ std::string runProductionBench(
     std::atomic<bool> running{true};
     std::latch done{coro_count};
 
+    Repo::resetMetrics();
     auto t0 = Clock::now();
 
     for (int cid = 0; cid < coro_count; ++cid) {
@@ -571,7 +566,6 @@ std::string runProductionBench(
         total.reads += s.reads;
         total.l1_evicts += s.l1_evicts;
         total.invalidates += s.invalidates;
-        total.l1_hits += s.l1_hits;
     }
 
     int64_t total_ops = total.reads + total.l1_evicts + total.invalidates;
@@ -580,8 +574,9 @@ std::string runProductionBench(
 
     auto msg = formatMixedThroughput(label, 1, result, total.reads, total_writes);
 
-    double l1_pct = (total.reads > 0) ? 100.0 * total.l1_hits / total.reads : 0.0;
-    int64_t l1_misses = total.reads - total.l1_hits;
+    auto m = Repo::metrics();
+    double l1_pct = m.l1HitRatio() * 100.0;
+    int64_t l1_misses = static_cast<int64_t>(m.l1_misses);
 
     std::ostringstream extra;
     extra << "\n  L1 hit rate:     " << std::fixed << std::setprecision(1) << l1_pct << "%"
@@ -677,6 +672,7 @@ TEST_CASE("Benchmark - production simulation", "[benchmark][production]") {
         std::atomic<bool> running{true};
         std::latch done{CORO_COUNT};
 
+        L1TestItemRepo::resetMetrics();
         auto t0 = Clock::now();
 
         for (int cid = 0; cid < CORO_COUNT; ++cid) {
@@ -691,12 +687,9 @@ TEST_CASE("Benchmark - production simulation", "[benchmark][production]") {
                                             + stats.invalidates) % num_keys];
                             auto roll = rng() % 4;
                             if (roll < 2) {  // 50% reads
-                                auto task = L1TestItemRepo::find(kid);
-                                bool was_l1 = task.await_ready();
-                                auto result = co_await std::move(task);
+                                auto result = co_await L1TestItemRepo::find(kid);
                                 doNotOptimize(result);
                                 ++stats.reads;
-                                if (was_l1) ++stats.l1_hits;
                             } else if (roll == 2) {  // 25% L1 evictions
                                 L1TestItemRepo::evict(kid);
                                 ++stats.l1_evicts;
@@ -720,7 +713,6 @@ TEST_CASE("Benchmark - production simulation", "[benchmark][production]") {
             total.reads += s.reads;
             total.l1_evicts += s.l1_evicts;
             total.invalidates += s.invalidates;
-            total.l1_hits += s.l1_hits;
         }
 
         int64_t total_ops = total.reads + total.l1_evicts + total.invalidates;
@@ -730,8 +722,9 @@ TEST_CASE("Benchmark - production simulation", "[benchmark][production]") {
         auto msg = formatMixedThroughput("L1+DB high-miss (50R/25E/25I)",
                                          1, result, total.reads, total_writes);
 
-        double l1_pct = (total.reads > 0) ? 100.0 * total.l1_hits / total.reads : 0.0;
-        int64_t l1_misses = total.reads - total.l1_hits;
+        auto m = L1TestItemRepo::metrics();
+        double l1_pct = m.l1HitRatio() * 100.0;
+        int64_t l1_misses = static_cast<int64_t>(m.l1_misses);
 
         std::ostringstream extra;
         extra << "\n  L1 hit rate:     " << std::fixed << std::setprecision(1) << l1_pct << "%"

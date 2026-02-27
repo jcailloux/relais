@@ -17,6 +17,12 @@ if(RELAIS_GDSF_ENABLED)
     target_compile_definitions(jcailloux-relais INTERFACE RELAIS_GDSF_ENABLED=1)
 endif()
 
+# Cache hit/miss metrics: zero-cost when disabled (OFF by default, always ON for benchmarks)
+option(RELAIS_ENABLE_METRICS "Enable per-repo cache hit/miss metrics" OFF)
+if(RELAIS_ENABLE_METRICS)
+    target_compile_definitions(jcailloux-relais INTERFACE RELAIS_ENABLE_METRICS=1)
+endif()
+
 # L1 cleanup frequency: sweep every 2^N insertions (0 = disabled, default 9 = every 512)
 set(RELAIS_CLEANUP_FREQUENCY_LOG2 9 CACHE STRING "L1 cleanup frequency as log2 (0=disabled, 9=every 512 insertions)")
 if(NOT RELAIS_CLEANUP_FREQUENCY_LOG2 EQUAL 9)
@@ -284,32 +290,34 @@ if(RELAIS_BUILD_BENCHMARKS)
     target_include_directories(bench_relais_cache PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks
         ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-    target_compile_definitions(bench_relais_cache PRIVATE RELAIS_BUILDING_TESTS)
+    target_compile_definitions(bench_relais_cache PRIVATE RELAIS_BUILDING_TESTS RELAIS_ENABLE_METRICS=1)
     target_link_libraries(bench_relais_cache PRIVATE jcailloux::relais Catch2::Catch2WithMain)
 
     add_executable(bench_io_redis benchmarks/bench_io_redis.cpp)
     target_include_directories(bench_io_redis PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks
         ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_compile_definitions(bench_io_redis PRIVATE RELAIS_ENABLE_METRICS=1)
     target_link_libraries(bench_io_redis PRIVATE jcailloux::relais Catch2::Catch2WithMain)
 
     add_executable(bench_io_pg benchmarks/bench_io_pg.cpp)
     target_include_directories(bench_io_pg PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks
         ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_compile_definitions(bench_io_pg PRIVATE RELAIS_ENABLE_METRICS=1)
     target_link_libraries(bench_io_pg PRIVATE jcailloux::relais Catch2::Catch2WithMain)
 
     add_executable(bench_io_batch benchmarks/bench_io_batch.cpp)
     target_include_directories(bench_io_batch PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks
         ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-    target_compile_definitions(bench_io_batch PRIVATE RELAIS_BUILDING_TESTS)
+    target_compile_definitions(bench_io_batch PRIVATE RELAIS_BUILDING_TESTS RELAIS_ENABLE_METRICS=1)
     target_link_libraries(bench_io_batch PRIVATE jcailloux::relais Catch2::Catch2WithMain)
 
     add_executable(bench_gdsf benchmarks/bench_gdsf.cpp)
     target_include_directories(bench_gdsf PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks
         ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-    target_compile_definitions(bench_gdsf PRIVATE RELAIS_BUILDING_TESTS RELAIS_GDSF_ENABLED=1)
+    target_compile_definitions(bench_gdsf PRIVATE RELAIS_BUILDING_TESTS RELAIS_GDSF_ENABLED=1 RELAIS_ENABLE_METRICS=1)
     target_link_libraries(bench_gdsf PRIVATE jcailloux::relais Catch2::Catch2WithMain)
 endif()
