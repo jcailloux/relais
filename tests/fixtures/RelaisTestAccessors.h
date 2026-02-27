@@ -126,6 +126,16 @@ struct TestInternals {
         return static_cast<uint8_t>(chunk);
     }
 
+    /// Full GDSF-safe cache reset: remove all entries, drain epoch pool,
+    /// then reset all GDSF state (including memory counters).
+    template<typename Repo>
+    static void resetCacheForGDSF() {
+        resetEntityCacheState<Repo>();              // remove all entries
+        clearEntityCachePools<Repo>();              // drain epoch → CachedWrapper dtors fire
+        resetRepoGDSFState<Repo>();                 // reset avg_construction_time
+        resetGDSF();                                // reset everything (histograms + memory)
+    }
+
     // =========================================================================
     // GDSF state access
     // =========================================================================

@@ -457,15 +457,18 @@ public:
         // Snapshot time BEFORE chunk cleanup so that modifications added
         // during cleanup are not counted (they weren't fully considered).
         const auto now = Clock::now();
+        long n_chunks = GDSF
+            ? cache::GDSFPolicy::instance().chunkCount()
+            : static_cast<long>(ChunkCount);
         long chunk = cleanup_cursor_.fetch_add(1, std::memory_order_relaxed)
-                   % static_cast<long>(ChunkCount);
+                   % n_chunks;
 
         float threshold = 0.0f;
         if constexpr (GDSF) {
             threshold = cache::GDSFPolicy::instance().threshold();
         }
 
-        auto removed = cache_.cleanup_chunk(chunk, static_cast<long>(ChunkCount),
+        auto removed = cache_.cleanup_chunk(chunk, n_chunks,
             [this, now, threshold, chunk](const CacheKey&, auto te) {
                 auto* entry = static_cast<typename L1Cache::CacheEntry*>(
                     te.template asReal<typename L1Cache::EntryHeader>());

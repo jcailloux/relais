@@ -469,13 +469,13 @@ TEST_CASE("GDSF - CachedWrapper memory tracking",
         auto id = insertTestItem("mem_json", 42);
         sync(GDSFMemRepo::find(id));
 
-        int64_t mem_after_find = GDSFPolicy::instance().totalMemory();
+        size_t mem_after_find = GDSFPolicy::instance().totalMemory();
         REQUIRE(mem_after_find > 0);
 
         // Trigger JSON buffer generation via findJson
         sync(GDSFMemRepo::findJson(id));
 
-        int64_t mem_after_json = GDSFPolicy::instance().totalMemory();
+        size_t mem_after_json = GDSFPolicy::instance().totalMemory();
         // JSON buffer should have added memory
         REQUIRE(mem_after_json > mem_after_find);
     }
@@ -484,13 +484,13 @@ TEST_CASE("GDSF - CachedWrapper memory tracking",
         auto id = insertTestItem("mem_binary", 42);
         sync(GDSFMemRepo::find(id));
 
-        int64_t mem_after_find = GDSFPolicy::instance().totalMemory();
+        size_t mem_after_find = GDSFPolicy::instance().totalMemory();
         REQUIRE(mem_after_find > 0);
 
         // Trigger BEVE buffer generation via findBinary
         sync(GDSFMemRepo::findBinary(id));
 
-        int64_t mem_after_binary = GDSFPolicy::instance().totalMemory();
+        size_t mem_after_binary = GDSFPolicy::instance().totalMemory();
         // BEVE buffer should have added memory
         REQUIRE(mem_after_binary > mem_after_find);
     }
@@ -573,8 +573,8 @@ TEST_CASE("GDSF - memory pressure (global sweep)",
         // After sustained use, totalMemory should be bounded.
         // Tolerance accounts for: chunk-based sweep granularity,
         // epoch-deferred CachedWrapper destructors, and ghost entry overhead.
-        int64_t mem = GDSFPolicy::instance().totalMemory();
-        REQUIRE(mem <= static_cast<int64_t>(kSmallBudget * 3));
+         size_t mem = GDSFPolicy::instance().totalMemory();
+        REQUIRE(mem <= kSmallBudget * 3);
 
         // Cleanup + restore budget
         TestInternals::resetEntityCacheState<GDSFPressureRepo>();
@@ -587,7 +587,7 @@ TEST_CASE("GDSF - memory pressure (global sweep)",
         constexpr size_t kSmallBudget = 51200;
         GDSFPolicy::instance().configure({.max_memory = kSmallBudget});
 
-        int64_t peak = 0;
+        size_t peak = 0;
         constexpr int kInsertions = 500;
         constexpr int kSweepInterval = 50;
 
@@ -599,14 +599,14 @@ TEST_CASE("GDSF - memory pressure (global sweep)",
                 // Force synchronous sweep
                 GDSFPolicy::instance().sweep();
 
-                int64_t mem = GDSFPolicy::instance().totalMemory();
+                size_t mem = GDSFPolicy::instance().totalMemory();
                 peak = std::max(peak, mem);
 
                 // Invariant: memory must not exceed 3× budget between sweeps.
                 // Overshoot comes from: epoch-deferred CachedWrapper destructors
                 // (pool recycles items lazily), ghost entry overhead, and
                 // kSweepInterval new entries cached since last sweep.
-                REQUIRE(mem <= static_cast<int64_t>(kSmallBudget * 3));
+                REQUIRE(mem <= kSmallBudget * 3);
             }
         }
 
@@ -616,11 +616,11 @@ TEST_CASE("GDSF - memory pressure (global sweep)",
         }
         GDSFPressureRepo::purge();
 
-        int64_t mem_final = GDSFPolicy::instance().totalMemory();
+        size_t mem_final = GDSFPolicy::instance().totalMemory();
 
         // After stabilization, should be within 3× budget (accounts for
         // epoch-deferred CachedWrapper destructors and ParlayHash overhead)
-        REQUIRE(mem_final <= static_cast<int64_t>(kSmallBudget * 3));
+        REQUIRE(mem_final <= kSmallBudget * 3);
 
         // Sanity: peak was above half budget (sweep was actually needed)
         REQUIRE(peak > static_cast<int64_t>(kSmallBudget / 2));
@@ -889,19 +889,19 @@ TEST_CASE("GDSF - memory accounting",
         auto id = insertTestItem("acct_charge", 42);
         sync(GDSFMemRepo::find(id));
 
-        int64_t mem = GDSFPolicy::instance().totalMemory();
+        size_t mem = GDSFPolicy::instance().totalMemory();
         REQUIRE(mem > 0);
     }
 
     SECTION("[accounting] multiple entries charge additively") {
         REQUIRE(GDSFPolicy::instance().totalMemory() == 0);
 
-        int64_t prev_mem = 0;
+        size_t prev_mem = 0;
         for (int i = 0; i < 5; ++i) {
             auto id = insertTestItem("acct_multi_" + std::to_string(i), i);
             sync(GDSFMemRepo::find(id));
 
-            int64_t mem = GDSFPolicy::instance().totalMemory();
+            size_t mem = GDSFPolicy::instance().totalMemory();
             REQUIRE(mem > prev_mem);
             prev_mem = mem;
         }
@@ -910,29 +910,29 @@ TEST_CASE("GDSF - memory accounting",
     SECTION("[accounting] lazy json buffer charges additional memory") {
         auto id = insertTestItem("acct_json", 42);
         sync(GDSFMemRepo::find(id));
-        int64_t mem_base = GDSFPolicy::instance().totalMemory();
+        size_t mem_base = GDSFPolicy::instance().totalMemory();
 
         // Trigger lazy JSON serialization (charges extra)
         sync(GDSFMemRepo::findJson(id));
-        int64_t mem_with_json = GDSFPolicy::instance().totalMemory();
+        size_t mem_with_json = GDSFPolicy::instance().totalMemory();
         REQUIRE(mem_with_json > mem_base);
     }
 
     SECTION("[accounting] lazy binary buffer charges additional memory") {
         auto id = insertTestItem("acct_binary", 42);
         sync(GDSFMemRepo::find(id));
-        int64_t mem_base = GDSFPolicy::instance().totalMemory();
+        size_t mem_base = GDSFPolicy::instance().totalMemory();
 
         // Trigger lazy BEVE serialization (charges extra)
         sync(GDSFMemRepo::findBinary(id));
-        int64_t mem_with_binary = GDSFPolicy::instance().totalMemory();
+        size_t mem_with_binary = GDSFPolicy::instance().totalMemory();
         REQUIRE(mem_with_binary > mem_base);
     }
 
     SECTION("[accounting] update replaces entry, memory stays balanced") {
         auto id = insertTestItem("acct_update", 10);
         sync(GDSFMemRepo::find(id));
-        int64_t mem_before = GDSFPolicy::instance().totalMemory();
+        size_t mem_before = GDSFPolicy::instance().totalMemory();
         REQUIRE(mem_before > 0);
 
         // Update: InvalidateAndLazyReload → evict + re-cache on next find.
@@ -943,7 +943,7 @@ TEST_CASE("GDSF - memory accounting",
 
         // Re-fetch to cache the updated version
         sync(GDSFMemRepo::find(id));
-        int64_t mem_after = GDSFPolicy::instance().totalMemory();
+        size_t mem_after = GDSFPolicy::instance().totalMemory();
 
         // At most 2x: new entry charged + old entry dtor deferred
         REQUIRE(mem_after > 0);
@@ -1072,7 +1072,7 @@ TEST_CASE("GDSF - ghost memory accounting",
     TestInternals::setThreshold(100.0f);
 
     SECTION("[ghost-acct] ghost creation does not charge (bucket slot tracked by hook)") {
-        int64_t mem_before = policy.totalMemory();
+        size_t mem_before = policy.totalMemory();
 
         auto id = insertTestItem("ghost_acct_create", 10);
         sync(GDSFGhostRepo::find(id));
@@ -1089,7 +1089,7 @@ TEST_CASE("GDSF - ghost memory accounting",
         sync(GDSFGhostRepo::find(id));
         REQUIRE(TestInternals::isGhostEntry<GDSFGhostRepo>(id));
 
-        int64_t mem_with_ghost = policy.totalMemory();
+        size_t mem_with_ghost = policy.totalMemory();
 
         GDSFGhostRepo::evict(id);
 
@@ -1101,22 +1101,22 @@ TEST_CASE("GDSF - ghost memory accounting",
         auto id = insertTestItem("ghost_acct_promote", 10);
         sync(GDSFGhostRepo::find(id));
         REQUIRE(TestInternals::isGhostEntry<GDSFGhostRepo>(id));
-        int64_t mem_with_ghost = policy.totalMemory();
+        size_t mem_with_ghost = policy.totalMemory();
 
         // Promote: lower threshold, find again
         TestInternals::setThreshold(0.5f);
         sync(GDSFGhostRepo::find(id));
 
-        int64_t mem_after = policy.totalMemory();
+        size_t mem_after = policy.totalMemory();
 
         // Real entry charged — no ghost discharge offset.
-        int64_t entity_charge = mem_after - mem_with_ghost;
+        size_t entity_charge = mem_after - mem_with_ghost;
         REQUIRE(entity_charge > 0);
         REQUIRE(!TestInternals::isGhostEntry<GDSFGhostRepo>(id));
     }
 
     SECTION("[ghost-acct] N ghosts do not charge N * kGhostOverhead") {
-        int64_t baseline = policy.totalMemory();
+        size_t baseline = policy.totalMemory();
 
         for (int i = 0; i < 5; ++i) {
             auto id = insertTestItem("ghost_multi_" + std::to_string(i), i);
@@ -1352,8 +1352,8 @@ TEST_CASE("GDSF - eviction selectivity",
         // Inflate to just above budget to trigger isOverBudget() and the
         // second pass in sweep (eviction_target_pct(1.0) = 25%).
         // Pressure ≈ 1.01 → decay ≈ 0.23, hot/cold ratio stays 100:1.
-        int64_t current_mem = std::max(int64_t(0), policy.totalMemory());
-        int64_t inflation = static_cast<int64_t>(kSmallBudget) - current_mem + 100;
+        size_t current_mem = policy.totalMemory();
+        int64_t inflation = static_cast<int64_t>(kSmallBudget) - static_cast<int64_t>(current_mem) + 100;
         if (inflation > 0) policy.charge(inflation);
 
         // Sweep → build histogram + threshold, second sweep → evict
@@ -1427,9 +1427,9 @@ TEST_CASE("GDSF - effective discharge",
             auto id = insertTestItem(buf, i);
             sync(GDSFPressureRepo2::find(id));
         }
-        int64_t mem_after_insert = policy.totalMemory();
+        size_t mem_after_insert = policy.totalMemory();
         REQUIRE(mem_after_insert > 0);
-        int64_t entry_size = mem_after_insert / 10;
+        size_t entry_size = mem_after_insert / 10;
 
         // Clear cache (CachedWrapper dtors deferred by epoch pool)
         TestInternals::resetEntityCacheState<GDSFPressureRepo2>();
@@ -1445,7 +1445,7 @@ TEST_CASE("GDSF - effective discharge",
         // Force epoch GC to ensure deferred dtors fire
         TestInternals::collectEntityCache<GDSFPressureRepo2>();
 
-        int64_t mem_final = policy.totalMemory();
+        size_t mem_final = policy.totalMemory();
         // Without discharge: 30 entries ≈ 3 × mem_after_insert
         // With full discharge: 20 entries ≈ 2 × mem_after_insert
         // Epoch reclamation is non-deterministic (depends on thread epoch advancement),
@@ -1472,8 +1472,7 @@ TEST_CASE("GDSF - effective discharge",
                 // Memory bounded between sweeps despite continuous insertions.
                 // 3× accounts for: epoch-deferred CachedWrapper destructors,
                 // ghost overhead, and kSweepInterval new entries since last sweep.
-                REQUIRE(policy.totalMemory() <=
-                        static_cast<int64_t>(kSmallBudget * 3));
+                REQUIRE(policy.totalMemory() <= kSmallBudget * 3);
             }
         }
 
@@ -1483,8 +1482,7 @@ TEST_CASE("GDSF - effective discharge",
 
         // After stabilization, should converge closer to budget.
         // 3× bound accounts for epoch-deferred destructors.
-        REQUIRE(policy.totalMemory() <=
-                static_cast<int64_t>(kSmallBudget * 3));
+        REQUIRE(policy.totalMemory() <= kSmallBudget * 3);
 
         // Cleanup
         resetRepos<GDSFPressureRepo2>();
@@ -1609,10 +1607,10 @@ TEST_CASE("GDSF - memory bound under Zipfian load",
 
     // 3. Empirical per-item memory: find one item, measure totalMemory delta
     std::fprintf(stderr, "  [stress] step 3: measuring per_item...\n");
-    int64_t mem_before = policy.totalMemory();
+    size_t mem_before = policy.totalMemory();
     sync(GDSFStressRepo::find(ids[0]));
-    int64_t mem_after = policy.totalMemory();
-    size_t per_item = static_cast<size_t>(std::max(int64_t(1), mem_after - mem_before));
+    size_t mem_after = policy.totalMemory();
+    size_t per_item = std::max(size_t{1}, mem_after - mem_before);
     std::fprintf(stderr, "  [stress] per_item=%zu\n", per_item);
 
     // Pre-warm histogram (16 sweeps with no pressure) so eviction uses
@@ -1645,16 +1643,16 @@ TEST_CASE("GDSF - memory bound under Zipfian load",
     };
 
     // 6. Run FINDS find() calls, track peak memory
-    int64_t max_memory = 0;
+    size_t max_memory = 0;
     for (int i = 0; i < FINDS; ++i) {
         size_t rank = zipf_sample();
         if (rank >= static_cast<size_t>(N)) rank = N - 1;
         sync(GDSFStressRepo::find(ids[rank]));
-        int64_t mem = policy.totalMemory();
+        size_t mem = policy.totalMemory();
         if (mem > max_memory) max_memory = mem;
         if ((i + 1) % 1'000 == 0)
-            std::fprintf(stderr, "  [stress] %d/%d finds, mem=%ld, peak=%ld\n",
-                         i + 1, FINDS, (long)mem, (long)max_memory);
+            std::fprintf(stderr, "  [stress] %d/%d finds, mem=%zu, peak=%zu\n",
+                         i + 1, FINDS, mem, max_memory);
     }
 
     // 7. Assert: peak memory never exceeded LIMIT_ITEMS × per_item

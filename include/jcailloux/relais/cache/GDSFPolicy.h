@@ -40,6 +40,7 @@ struct GDSFConfig {
     float admission_pressure = 0.95f;        // ghost gate activates at this pressure (0.0–1.0)
     size_t memory_counter_slots = 64;        // must be power of 2, <= 64
     size_t max_memory = 0;                   // L1 memory budget in bytes (0 = from env / unlimited)
+    long chunk_count = 8;                    // number of chunks for all ChunkMaps (uniform)
 };
 
 // =========================================================================
@@ -82,8 +83,10 @@ struct ScoreHistogram {
 
     /// Find the threshold score such that entries below it total >= target_bytes.
     /// Walks buckets low-to-high, accumulating bytes.
-    /// Returns 0 when the histogram has no data (cold start: build histogram
-    /// before evicting, rather than nuking everything with exp2(kLogMax)).
+    /// Returns 0 on cold start (empty histogram) to avoid nuclear eviction.
+    /// Returns exp2(kLogMax) when the histogram is populated but the target
+    /// exceeds its total — evict everything in this chunk; the while(isOverBudget)
+    /// loop will sweep more chunks as needed.
     float thresholdForBytes(size_t target_bytes) const {
         if (target_bytes == 0) return 0.0f;
         uint64_t cumul = 0;
@@ -94,11 +97,10 @@ struct ScoreHistogram {
                 return std::exp2(log_val);
             }
         }
-        // Histogram has less data than target — either cold start (no data)
-        // or target exceeds the histogram's resolution (one chunk).
-        // Return 0 to avoid nuclear eviction; the caller (scaleAndThreshold)
-        // is expected to scale the target to the histogram's resolution.
-        return 0.0f;
+        // Cold start (empty histogram): return 0 to avoid nuclear eviction.
+        // Populated but insufficient: return max threshold to evict all
+        // entries in this chunk — the caller's loop handles multi-chunk convergence.
+        return (cumul > 0) ? std::exp2(kLogMax) : 0.0f;
     }
 
     /// Exponential moving average merge: this = alpha * newer + (1 - alpha) * this.
@@ -175,23 +177,32 @@ public:
     /// var at construction, overridable via configure(). Returns 0 if unset (no limit).
     size_t maxMemory() const { return max_memory_; }
 
+    /// Number of chunks (uniform across all ChunkMaps).
+    long chunkCount() const { return config_.chunk_count; }
+
     /// Memory pressure ratio: totalMemory / maxMemory, clamped to [0, ∞).
     /// Returns 0 when no budget is configured.
     float memoryPressure() const {
         size_t budget = max_memory_;
         if (budget == 0) return 0.0f;
-        return static_cast<float>(std::max(int64_t(0), totalMemory()))
+        return static_cast<float>(totalMemory())
              / static_cast<float>(budget);
     }
 
-    /// Pressure-adaptive decay rate: 0.95 − 0.7 × pressure³.
-    /// At zero pressure: 0.95 (gentle decay, entries retained longer).
-    /// At full pressure: 0.25 (aggressive decay, faster eviction).
-    /// Clamped to [0.01, 0.95] to avoid zero/negative values.
+    /// Constant decay rate for temporal aging of access counts.
+    /// Applied to every entry during each sweep pass.
+    ///
+    /// Decay controls score aging (how fast old access patterns fade),
+    /// NOT pressure response. Pressure is handled orthogonally by:
+    ///   - isOverBudget() → immediate sweep trigger (frequency)
+    ///   - eviction_target_pct() → quadratic curve up to 25% (volume)
+    ///
+    /// A constant rate preserves relative score differentiation across
+    /// sweeps: after N sweeps at rate r, ratio A/B is unchanged.
+    /// Pressure-adaptive decay destroyed differentiation under load
+    /// (0.25^3 ≈ 0.016 — all scores converge to zero in 3 sweeps).
     float decayRate() const {
-        float p = memoryPressure();
-        float rate = 0.95f - 0.7f * p * p * p;
-        return std::clamp(rate, 0.01f, 0.95f);
+        return config_.decay_rate;
     }
 
     // =====================================================================
@@ -240,19 +251,21 @@ public:
     // Eviction Target
     // =====================================================================
     //
-    // Three-zone continuous quadratic curve:
-    //   < 50% usage  ->  0% eviction (no pressure)
-    //   50-80% usage ->  0% to 5% eviction (gentle quadratic)
-    //   80-100% usage -> 5% to 25% eviction (aggressive quadratic)
+    // Two zones:
+    //   <= 95% usage -> 0% score-based eviction (ghost/TTL cleanup only)
+    //   > 95% usage  -> free (usage − 95%) to return to 95%
+    //
+    // At threshold = 0 (target 0%), sweeps still run ghost decay (count→0
+    // removal) and TTL expiration — these are handled by dedicated cleanup
+    // predicates, not the score threshold.
+    //
+    // At 100% usage: target 5%.  At 110%: target 15%.
+    // Combined with isOverBudget() reactive trigger, this keeps memory
+    // near 95% without the ×100 overshoot of the previous 25% curve.
 
     static float eviction_target_pct(float usage) {
-        if (usage < 0.50f) return 0.0f;
-        if (usage < 0.80f) {
-            float t = (usage - 0.50f) / 0.30f;    // 0 -> 1
-            return 0.05f * t * t;                   // 0% -> 5%, convex
-        }
-        float t = std::min((usage - 0.80f) / 0.20f, 1.0f);  // 0 -> 1, clamped
-        return 0.05f + 0.20f * t * t;                       // 5% -> 25%, convex
+        if (usage <= 0.95f) return 0.0f;
+        return usage - 0.95f;
     }
 
     // =====================================================================
@@ -268,24 +281,27 @@ public:
     }
 
     /// Sum of all memory counter slots (approximate under contention).
-    int64_t totalMemory() const {
+    /// Returns size_t clamped to 0: memory is inherently non-negative.
+    /// Individual slots may be negative (striped counter design), but the
+    /// aggregate should never be negative in a well-behaved system.
+    size_t totalMemory() const {
         int64_t total = 0;
         for (size_t i = 0; i < memory_slot_count_; ++i) {
             total += memory_slots_[i].value.load(std::memory_order_relaxed);
         }
-        return total;
+        return static_cast<size_t>(std::max(int64_t{0}, total));
     }
 
     bool isOverBudget() const {
         return max_memory_ > 0
-            && totalMemory() > static_cast<int64_t>(max_memory_);
+            && totalMemory() > max_memory_;
     }
 
     /// Memory pressure >= 50% — eviction curve reference point.
     bool hasMemoryPressure() const {
         size_t budget = max_memory_;
         if (budget == 0) return false;
-        float usage = static_cast<float>(std::max(int64_t(0), totalMemory()))
+        float usage = static_cast<float>(totalMemory())
                     / static_cast<float>(budget);
         return usage >= 0.50f;
     }
@@ -296,7 +312,7 @@ public:
     bool hasAdmissionPressure() const {
         size_t budget = max_memory_;
         if (budget == 0) return false;
-        float usage = static_cast<float>(std::max(int64_t(0), totalMemory()))
+        float usage = static_cast<float>(totalMemory())
                     / static_cast<float>(budget);
         return usage >= config_.admission_pressure;
     }
@@ -327,7 +343,7 @@ public:
         size_t budget = max_memory_;
         if constexpr (enabled) {
             if (budget > 0) {
-                usage_ratio = static_cast<float>(std::max(int64_t(0), totalMemory()))
+                usage_ratio = static_cast<float>(totalMemory())
                             / static_cast<float>(budget);
             }
         }
@@ -356,29 +372,32 @@ public:
         // 4. Merge building histogram into persistent (EMA)
         histogram_.mergeEMA(building_histogram_, config_.histogram_alpha);
 
-        // 5. Second pass if still over budget
+        // 5. Extra passes: keep sweeping chunks until memory drops below
+        //    budget. Each pass recomputes usage and targets 95% occupancy.
+        //    Stops when: (a) under budget, or (b) a pass evicts nothing
+        //    (remaining memory is non-evictable structural overhead).
         if constexpr (enabled) {
-            if (isOverBudget()) {
-                RELAIS_LOG_WARN << "GDSF: over budget after sweep ("
-                                << totalMemory() << " / " << budget
-                                << "), running second pass";
-
-                // Recompute threshold with max pressure
-                float new_pct = eviction_target_pct(1.0f);
-                size_t new_bytes = static_cast<size_t>(
-                    new_pct * static_cast<float>(budget));
+            while (isOverBudget()) {
+                float cur_usage = static_cast<float>(totalMemory())
+                    / static_cast<float>(budget);
+                float new_pct = eviction_target_pct(cur_usage);
+                size_t new_bytes = (new_pct > 0.0f)
+                    ? static_cast<size_t>(new_pct * static_cast<float>(budget))
+                    : 0;
                 cached_threshold_.store(
                     scaleAndThreshold(new_bytes),
                     std::memory_order_relaxed);
 
                 building_histogram_.reset();
+                bool any_evicted = false;
                 {
                     std::shared_lock rlock(registry_mutex_);
                     for (const auto& entry : registry_) {
-                        entry.sweep_fn();
+                        any_evicted |= entry.sweep_fn();
                     }
                 }
                 histogram_.mergeEMA(building_histogram_, config_.histogram_alpha);
+                if (!any_evicted) break;
             }
         }
 
@@ -386,23 +405,14 @@ public:
     }
 
 private:
-    /// Scale bytes_to_free to the histogram's resolution and compute threshold.
+    /// Scale global bytes_to_free to per-chunk target and compute threshold.
     /// The persistent histogram represents ~1 chunk (EMA of per-chunk snapshots).
-    /// Without scaling, bytes_to_free (a fraction of the global budget) often
-    /// exceeds the histogram's total, causing thresholdForBytes to return
-    /// exp2(kLogMax) — a nuclear threshold that wipes entire chunks.
-    /// Scaling: per_chunk_target = bytes_to_free × (hist_total / totalMemory).
+    /// Each sweep processes one chunk per repo, so the per-chunk target is
+    /// simply bytes_to_free / chunk_count.
     float scaleAndThreshold(size_t bytes_to_free) const {
         if (bytes_to_free == 0) return 0.0f;
-        uint64_t hist_total = 0;
-        for (int i = 0; i < ScoreHistogram::N; ++i)
-            hist_total += histogram_.bytes[i];
-        if (hist_total == 0) return 0.0f;       // cold start: build histogram first
-        auto tmem = std::max(int64_t(1), totalMemory());
-        auto per_chunk = static_cast<size_t>(
-            static_cast<double>(bytes_to_free)
-            * static_cast<double>(hist_total)
-            / static_cast<double>(tmem));
+        auto per_chunk = static_cast<size_t>(bytes_to_free)
+            / static_cast<size_t>(config_.chunk_count);
         return histogram_.thresholdForBytes(std::max(per_chunk, size_t(1)));
     }
 

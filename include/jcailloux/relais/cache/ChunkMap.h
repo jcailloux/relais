@@ -490,6 +490,11 @@ public:
         pool_.collect();
     }
 
+    /// Immediately reclaim all retired entries safe to free.
+    void reclaim() {
+        pool_.reclaim();
+    }
+
     /// Find which chunk a key belongs to (test-only, O(num_buckets)).
     /// Returns -1 if key is not found.
     long key_chunk(const K& key, long n_chunks) {

@@ -3,6 +3,7 @@
 
 #include "jcailloux/relais/repository/BaseRepo.h"
 #include "jcailloux/relais/cache/RedisCache.h"
+#include "jcailloux/relais/cache/Metrics.h"
 #include "jcailloux/relais/config/repo_config.h"
 
 namespace jcailloux::relais {
@@ -32,6 +33,10 @@ class RedisRepo : public BaseRepo<Entity, Name, Cfg, Key> {
         (Cfg.l2_format == config::L2Format::Binary) && HasBinarySerialization<Entity>;
 
     public:
+#if RELAIS_ENABLE_METRICS
+        static inline cache::L2Counters l2_counters_{};
+#endif
+
         using typename Base::EntityType;
         using typename Base::KeyType;
         using typename Base::WrapperType;
@@ -316,8 +321,12 @@ class RedisRepo : public BaseRepo<Entity, Name, Cfg, Key> {
         static io::Task<std::optional<Entity>> findRaw(const Key& id) {
             auto redisKey = makeRedisKey(id);
             auto cached = co_await getFromCache(redisKey);
-            if (cached) co_return cached;
+            if (cached) {
+                RELAIS_METRICS_INC(l2_counters_.hits);
+                co_return cached;
+            }
 
+            RELAIS_METRICS_INC(l2_counters_.misses);
             auto entity = co_await Base::findRaw(id);
             if (entity) {
                 co_await setInCache(redisKey, *entity);
