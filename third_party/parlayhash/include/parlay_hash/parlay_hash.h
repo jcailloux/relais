@@ -93,11 +93,11 @@ struct parlay_hash {
 
   link* new_link(const Entry& entry, link* l) {
     auto* node = link_pool->New(entry, l);
-    if (memory_hook_) memory_hook_(static_cast<int64_t>(sizeof(link) + sizeof(void*)));
+    if (memory_hook_) memory_hook_(static_cast<int64_t>(sizeof(link)));
     return node;
   }
   void retire_link(link* l) {
-    if (memory_hook_) memory_hook_(-static_cast<int64_t>(sizeof(link) + sizeof(void*)));
+    if (memory_hook_) memory_hook_(-static_cast<int64_t>(sizeof(link)));
     link_pool->Retire(l);
   }
 

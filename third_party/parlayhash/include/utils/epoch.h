@@ -23,15 +23,6 @@
 // will check that an object allocated using epoch::New(..) has not
 // been corrupted.
 //
-// Supports undoing retires.  This can be useful in transactional
-// system in which an operation aborts, and any retires done during
-// the operations have to be undone.  In particular Retire returns a
-// pointer to a boolean.  Running
-//    epoch::undo_retire(bool* x)
-// will undo the retire.  Must be run in same with_epoch as the retire
-// was run, otherwise it is too late to undo.  If you don't want
-// to undo retires, you can ignore this feature.
-//
 // New<T>, Retire and Delete use a shared pool for the retired lists,
 // which, although not very large, is not cleared until program
 // termination.  A private pool can be created with
@@ -54,7 +45,6 @@
 #include <atomic>
 #include <cstdlib>
 #include <functional>
-#include <list>
 #include <ostream>
 #include <vector>
 #include <type_traits>
@@ -71,13 +61,6 @@
 #define EpochMemCheck 1
 #endif
 //#define EpochMemCheck 1
-
-#define USE_STEPPING 1
-//#define USE_UNDO 1
-
-#ifdef USE_PARLAY_ALLOC
-#include "parlay/alloc.h"
-#endif
 
 #ifdef __linux__
 #include <linux/membarrier.h>
@@ -321,13 +304,7 @@ struct alignas(64) memory_pool {
 private:
 
   // wrapper used so can pad for the memory checked version.
-  // Also serves as intrusive list node (ilist_next) to avoid
-  // std::list node allocations in the memory pool.
   struct wrapper {
-    wrapper* ilist_next = nullptr;
-#ifdef USE_UNDO
-    bool keep_ = false;
-#endif
 #ifdef EpochMemCheck
     long pad;
     std::atomic<long> head;
@@ -338,61 +315,10 @@ private:
 #endif
   };
 
-  // Intrusive singly-linked list of wrappers.
-  // Replaces std::list<list_entry> — zero allocations for push/pop/splice.
-  struct ilist {
-    wrapper* head_ = nullptr;
-    wrapper* tail_ = nullptr;
-    long count_ = 0;
-
-    bool empty() const { return head_ == nullptr; }
-    long size() const { return count_; }
-
-    void push_back(wrapper* w) {
-      w->ilist_next = nullptr;
-      if (tail_) tail_->ilist_next = w;
-      else head_ = w;
-      tail_ = w;
-      ++count_;
-    }
-
-    wrapper* pop_front() {
-      wrapper* w = head_;
-      head_ = w->ilist_next;
-      if (!head_) tail_ = nullptr;
-      --count_;
-      return w;
-    }
-
-    void splice_back(ilist& other) {
-      if (other.empty()) return;
-      if (tail_) tail_->ilist_next = other.head_;
-      else head_ = other.head_;
-      tail_ = other.tail_;
-      count_ += other.count_;
-      other.head_ = other.tail_ = nullptr;
-      other.count_ = 0;
-    }
-
-    void clear() { head_ = tail_ = nullptr; count_ = 0; }
-
-    ilist() = default;
-    ilist(ilist&& o) noexcept : head_(o.head_), tail_(o.tail_), count_(o.count_) {
-      o.head_ = o.tail_ = nullptr; o.count_ = 0;
-    }
-    ilist& operator=(ilist&& o) noexcept {
-      head_ = o.head_; tail_ = o.tail_; count_ = o.count_;
-      o.head_ = o.tail_ = nullptr; o.count_ = 0;
-      return *this;
-    }
-    ilist(const ilist&) = delete;
-    ilist& operator=(const ilist&) = delete;
-  };
-
   // each thread keeps one of these
   struct alignas(256) old_current {
-    ilist old;      // retired items from previous epoch
-    ilist current;  // retired items from current epoch
+    std::vector<wrapper*> old;      // retired items from previous epoch
+    std::vector<wrapper*> current;  // retired items from current epoch
     long epoch; // epoch on last retire, updated on a retire
     long retire_count; // number of retires so far, reset on updating the epoch
     epoch_s::state e_state;
@@ -412,48 +338,29 @@ private:
   }
 
   // destructs entries on a list
-  void clear_list(ilist& lst) {
-    while (!lst.empty()) {
-      wrapper* w = lst.pop_front();
-#ifdef USE_UNDO
-      if (w->keep_) continue;
-#endif
+  void clear_list(std::vector<wrapper*>& lst) {
+    for (wrapper* w : lst) {
       w->value.~T();
       free_wrapper(w);
     }
+    lst.clear();
   }
 
   void advance_epoch(int i, old_current& pid) {
-#ifndef USE_UNDO
-    int delay = 1;
-#else
-    int delay = 2;
-#endif
+    int delay = 0;
     long current = get_epoch().get_current();
     if (pid.epoch + delay < current) {
       clear_list(pid.old);
-      pid.old = std::move(pid.current);
+      std::swap(pid.old, pid.current);
       pid.epoch = current;
     }
     // a heuristic
-#ifdef USE_STEPPING
     long update_threshold = 10;
-#else
-    long update_threshold = 10 * num_workers();
-#endif
     if (++pid.retire_count == update_threshold) {
       pid.retire_count = 0;
-#ifdef USE_STEPPING
       pid.e_state = get_epoch().update_epoch_steps(pid.e_state, 8);
-#else
-      get_epoch().update_epoch();
-#endif
     }
   }
-
-#ifdef USE_PARLAY_ALLOC
-  using Allocator = parlay::type_allocator<wrapper>;
-#endif
 
   void check_wrapper_on_destruct(wrapper* x) {
 #ifdef EpochMemCheck
@@ -476,19 +383,11 @@ private:
 
   void free_wrapper(wrapper* x) {
     check_wrapper_on_destruct(x);
-#ifdef USE_PARLAY_ALLOC
-    return Allocator::free(x);
-#else
-    return std::free(x);
-#endif
+    std::free(x);
   }
-  
+
   wrapper* allocate_wrapper() {
-#ifdef USE_PARLAY_ALLOC
-    wrapper* w = Allocator::alloc();
-#else
     wrapper* w = (wrapper*) std::malloc(sizeof(wrapper));
-#endif
     set_wrapper_on_construct(w);
     return w;
   }
@@ -524,21 +423,12 @@ private:
     return x;
   }
 
-  // retire and return a pointer if want to undo the retire
-#ifdef USE_UNDO
-  bool* Retire(T* p) {
-#else
   void Retire(T* p) {
-#endif
     auto i = worker_id();
     auto &pid = pools[i];
     advance_epoch(i, pid);
     wrapper* w = wrapper_from_value(p);
     pid.current.push_back(w);
-#ifdef USE_UNDO
-    w->keep_ = false;
-    return &w->keep_;
-#endif
   }
 
   // destructs and frees the object immediately
@@ -569,7 +459,6 @@ private:
       clear_list(pools[i].old);
       clear_list(pools[i].current);
     }
-    //Allocator::print_stats();
   }
 
   // Force a GC cycle for this worker's pool.
@@ -596,96 +485,11 @@ private:
   void stats() {}
 };
 
-template <typename T>
-struct alignas(64) retire_pool {
-private:
-
-  struct list_entry {
-    char data[sizeof(T)];
-  };
-
-  // each thread keeps one of these
-  struct alignas(256) old_current {
-    std::list<list_entry> old;  // linked list of retired items from previous epoch
-    std::list<list_entry> current; // linked list of retired items from current epoch
-    long epoch; // epoch on last retire, updated on a retire
-    long retire_count; // number of retires so far, reset on updating the epoch
-    epoch_s::state e_state;
-    old_current() : epoch(0), retire_count(0), e_state(0) {}
-  };
-
-  std::vector<old_current> pools;
-
-  // destructs entries on a list
-  void clear_list(std::list<list_entry>& lst) {
-    for (list_entry& x : lst)
-      ((T*) (&(x.data)))->~T();
-    lst.clear();
-  }
-
-  void advance_epoch(int i, old_current& pid) {
-    long current = get_epoch().get_current();
-    if (pid.epoch + 1 < current) {
-      clear_list(pid.old);
-      pid.old = std::move(pid.current);
-      pid.epoch = current;
-    }
-#ifdef USE_STEPPING
-    long update_threshold = 10;
-#else
-    long update_threshold = 10 * num_workers();
-#endif
-    if (++pid.retire_count == update_threshold) {
-      pid.retire_count = 0;
-#ifdef USE_STEPPING
-      pid.e_state = get_epoch().update_epoch_steps(pid.e_state, 8);
-#else
-      get_epoch().update_epoch();
-#endif
-    }
-  }
-
- public:
-  retire_pool() {
-    long workers = max_num_workers;
-    pools = std::vector<old_current>(workers);
-    for (int i = 0; i < workers; i++) 
-      pools[i].retire_count = 0;
-  }
-
-  retire_pool(const retire_pool&) = delete;
-  ~retire_pool() { clear(); }
-
-  void Retire(T* p) {
-    auto i = worker_id();
-    auto &pid = pools[i];
-    advance_epoch(i, pid);
-    list_entry x;
-    strncpy(x.data, (char*) p, sizeof(T));
-    pid.current.push_back(x);
-  }
-
-  // Clears all the lists, to be used on termination, or could be use
-  // at a quiescent point when noone is reading any retired items.
-  void clear() {
-    get_epoch().update_epoch();
-    for (int i=0; i < num_workers(); i++) {
-      clear_list(pools[i].old);
-      clear_list(pools[i].current);
-    }
-  }
-
-  void stats() {}
-};
-
 } // namespace internal
 
 // ***************************
 // The public interface
 // ***************************
-  
-  // x should point to the skip field of a link
-  inline void undo_retire(bool* x) { *x = true;}
   
   template <typename T>
   using memory_pool = internal::memory_pool<T>;
@@ -693,15 +497,6 @@ private:
   template <typename T>
   extern inline memory_pool<T>& get_default_pool() {
     static memory_pool<T> pool;
-    return pool;
-  }
-
-  template <typename T>
-  using retire_pool = internal::retire_pool<T>;
-
-  template <typename T>
-  extern inline retire_pool<T>& get_default_retire_pool() {
-    static retire_pool<T> pool;
     return pool;
   }
 
@@ -713,11 +508,7 @@ private:
   static void Delete(T* p) {get_default_pool<T>().Delete(p);}
 
   template <typename T>
-#ifdef USE_UNDO
-  static bool* Retire(T* p) {return get_default_pool<T>().Retire(p);}
-#else
-  void Retire(T* p) {return get_default_pool<T>().Retire(p);}
-#endif
+  void Retire(T* p) {get_default_pool<T>().Retire(p);}
     
   template <typename T>
   static bool check_ptr(T* p, bool silent=false) {
