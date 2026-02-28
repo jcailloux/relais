@@ -612,7 +612,7 @@ private:
 
     /// Epoch wrapper: memory_pool wraps each CacheEntry in a node with a next pointer.
     template<typename T>
-    struct EpochWrapperMirror { void* next; T value; };
+    struct EpochWrapperMirror { T value; };
 
     static constexpr size_t kEpochWrapperOverhead =
         sizeof(EpochWrapperMirror<typename L1Cache::CacheEntry>)

@@ -295,7 +295,7 @@ private:
     // --- GDSF memory tracking constants ---
 
     template<typename T>
-    struct EpochWrapperMirror { void* next; T value; };
+    struct EpochWrapperMirror { T value; };
 
     static constexpr size_t kEpochWrapperOverhead =
         sizeof(EpochWrapperMirror<typename L1Cache::CacheEntry>)
