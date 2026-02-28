@@ -79,6 +79,12 @@
 #include "parlay/alloc.h"
 #endif
 
+#ifdef __linux__
+#include <linux/membarrier.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
+
 // ***************************
 // epoch structure
 // ***************************
@@ -90,6 +96,20 @@ namespace epoch {
   inline int worker_id() {return parlay::my_thread_id(); }
   inline int num_workers() {return parlay::num_thread_ids();}
   constexpr int max_num_workers = 1024;
+
+    inline void epoch_barrier() {
+    #ifdef __linux__
+          syscall(__NR_membarrier, MEMBARRIER_CMD_PRIVATE_EXPEDITED, 0, 0);
+    #else
+          std::atomic_thread_fence(std::memory_order_seq_cst);
+    #endif
+        }
+
+        inline void init_membarrier() {
+    #ifdef __linux__
+          syscall(__NR_membarrier, MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED, 0, 0);
+    #endif
+    }
 
 struct alignas(64) epoch_s {
 
@@ -123,10 +143,11 @@ struct alignas(64) epoch_s {
     epoch_state(0) {
     for (int i = 0; i < max_tickets - 1; i++) ticket_next[i] = i + 1;
     ticket_next[max_tickets - 1] = -1;
+    init_membarrier();
   }
 
   long get_current() {
-    return current_epoch.load();
+    return current_epoch.load(std::memory_order_relaxed);
   }
 
   long get_my_epoch() {
@@ -142,9 +163,12 @@ struct alignas(64) epoch_s {
     assert(id < max_num_workers);
     while (true) {
       long current_e = get_current();
+#ifdef __linux__
+      announcements[id].last.store(current_e, std::memory_order_relaxed);
+#else
       long tmp = current_e;
-      // apparently an exchange is faster than a store (write and fence)
       announcements[id].last.exchange(tmp, std::memory_order_seq_cst);
+#endif
       if (get_current() == current_e) return id;
     }
   }
@@ -191,8 +215,12 @@ struct alignas(64) epoch_s {
     }
     while (true) {
       long current_e = get_current();
+#ifdef __linux__
+      tickets[t].epoch.store(current_e, std::memory_order_relaxed);
+#else
       long tmp = current_e;
       tickets[t].epoch.exchange(tmp, std::memory_order_seq_cst);
+#endif
       if (get_current() == current_e) return t;
     }
   }
@@ -214,6 +242,7 @@ struct alignas(64) epoch_s {
     if (prev_state != current_state)
       return current_state;
     size_t i = current_state >> 48;
+    if (i == 0) epoch_barrier();
     size_t current_e = ((1ul << 48) - 1) & current_state;
     size_t workers = num_workers();
     if (i == workers) {
@@ -246,6 +275,7 @@ struct alignas(64) epoch_s {
   // this version does the full sweep
   void update_epoch() {
     long current_e = get_current();
+    epoch_barrier();
 
     // check if everyone is done with earlier epochs
     int workers;
