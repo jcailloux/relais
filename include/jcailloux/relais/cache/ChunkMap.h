@@ -457,10 +457,17 @@ public:
         return removed;
     }
 
+    /// Advance the round-robin cursor and return the chunk index.
+    /// Use with cleanup_chunk() when work must be inserted between
+    /// cursor advance and cleanup (e.g., flushing thread-local counters).
+    long advance_cleanup_cursor(long n_chunks) {
+        return cleanup_cursor_.fetch_add(1, std::memory_order_relaxed) % n_chunks;
+    }
+
     /// Cleanup the next chunk (round-robin cursor). Returns entries removed.
     template<typename Pred>
     size_t cleanup_next_chunk(long n_chunks, Pred&& pred) {
-        long chunk = cleanup_cursor_.fetch_add(1, std::memory_order_relaxed) % n_chunks;
+        long chunk = advance_cleanup_cursor(n_chunks);
         return cleanup_chunk(chunk, n_chunks, std::forward<Pred>(pred));
     }
 

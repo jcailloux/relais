@@ -188,24 +188,29 @@ struct alignas(64) epoch_s {
     // Update high-water mark BEFORE publishing the epoch (seq_cst ordering
     // ensures the scanner sees the high-water update before the epoch store).
     // Safe even if scanner reads high-water before the epoch is set: the
-    // ticket has epoch=-1 (inactive), so the scanner skips it. The retry
-    // loop below self-corrects to the current epoch.
+    // ticket has epoch=-1 (inactive), so the scanner skips it.
     int hw = ticket_high_water.load(std::memory_order_relaxed);
     while (t >= hw) {
       if (ticket_high_water.compare_exchange_weak(hw, t + 1,
               std::memory_order_seq_cst, std::memory_order_relaxed))
         break;
     }
+#ifdef __linux__
+    // On Linux, epoch_barrier() (MEMBARRIER_CMD_PRIVATE_EXPEDITED) guarantees
+    // that when the scanner reads this ticket, it sees our store. A stale
+    // epoch value is safe: it's conservative (prevents the scanner from
+    // advancing), and we don't hold pointers to data from before our announce.
+    // This eliminates the verification re-read of current_epoch.
+    tickets[t].epoch.store(get_current(), std::memory_order_relaxed);
+    return t;
+#else
     while (true) {
       long current_e = get_current();
-#ifdef __linux__
-      tickets[t].epoch.store(current_e, std::memory_order_relaxed);
-#else
       long tmp = current_e;
       tickets[t].epoch.exchange(tmp, std::memory_order_seq_cst);
-#endif
       if (get_current() == current_e) return t;
     }
+#endif
   }
 
   void unannounce_ticket(int t) { release_ticket(t); }
@@ -289,10 +294,21 @@ struct alignas(64) epoch_s {
   }
 };
 
+  // Cached pointer for fast hot-path access (single relaxed load + branch).
+  // C++17 inline variable: single instance across all translation units.
+  inline std::atomic<epoch_s*> epoch_ptr_{nullptr};
+
+  [[gnu::noinline]] inline epoch_s& get_epoch_slow() {
+    static epoch_s epoch;
+    epoch_ptr_.store(&epoch, std::memory_order_relaxed);
+    return epoch;
+  }
+
   // Juat one epoch structure shared by all
   extern inline epoch_s& get_epoch() {
-    static epoch_s epoch;
-    return epoch;
+    auto* p = epoch_ptr_.load(std::memory_order_relaxed);
+    if (p) [[likely]] return *p;
+    return get_epoch_slow();
   }
 
 // ***************************

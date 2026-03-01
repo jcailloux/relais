@@ -126,10 +126,17 @@ struct TestInternals {
         return static_cast<uint8_t>(chunk);
     }
 
-    /// Full GDSF-safe cache reset: remove all entries, drain epoch pool,
-    /// then reset all GDSF state (including memory counters).
+    /// Flush thread-local access counters for a repo (entity cache).
+    template<typename Repo>
+    static void flushAccessCounters() {
+        Repo::flushAccessCounters();
+    }
+
+    /// Full GDSF-safe cache reset: flush TL counters, remove all entries,
+    /// drain epoch pool, then reset all GDSF state (including memory counters).
     template<typename Repo>
     static void resetCacheForGDSF() {
+        Repo::flushAccessCounters();                // drain TL counters before reset
         resetEntityCacheState<Repo>();              // remove all entries
         clearEntityCachePools<Repo>();              // drain epoch → CachedWrapper dtors fire
         resetRepoGDSFState<Repo>();                 // reset avg_construction_time
@@ -160,8 +167,10 @@ struct TestInternals {
     /// Get GDSF metadata for a cached entity (read-only, no score bump).
     /// Returns type-erased metadata compatible with all CacheMetadata variants.
     /// Returns nullopt for ghosts and missing entries.
+    /// Flushes thread-local access counters first for accurate reads.
     template<typename Repo, typename Key>
     static std::optional<GDSFTestMetadata> getEntityGDSFMetadata(const Key& key) {
+        Repo::flushAccessCounters();
         auto result = Repo::cache().find(key);
         if (!result || result.isGhost()) return std::nullopt;
 
@@ -179,8 +188,10 @@ struct TestInternals {
 
     /// Compute the GDSF score for a cached entity (access_count x avg_cost / memoryUsage).
     /// Returns nullopt if the entity is not in cache.
+    /// Flushes thread-local access counters first for accurate reads.
     template<typename Repo, typename Key>
     static std::optional<float> getEntityGDSFScore(const Key& key) {
+        Repo::flushAccessCounters();
         auto result = Repo::cache().find(key);
         if (!result) return std::nullopt;
 
