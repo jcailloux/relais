@@ -4,7 +4,6 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
-#include <mutex>
 #include <type_traits>
 #include "jcailloux/relais/io/Task.h"
 #include "jcailloux/relais/repository/RedisRepo.h"
@@ -379,23 +378,26 @@ protected:
     /// Returns the static ChunkMap instance.
     /// On first call, auto-registers this repo with GDSFPolicy for global coordination
     /// (when cleanup is enabled: GDSF or TTL > 0).
+    ///
+    /// All initialization is folded into a single static local (Holder) so that
+    /// the hot path is a single guard-variable check (~1ns) instead of multiple
+    /// std::call_once / pthread_once calls through PLT (~5-8ns each).
     static L1Cache& cache() {
-        static L1Cache instance;
-        static std::once_flag init_flag;
-        std::call_once(init_flag, []() {
-            config::CachedClock::ensureStarted();
-        });
-        if constexpr (HasCleanup) {
-            static std::once_flag registry_flag;
-            std::call_once(registry_flag, []() {
-                cache::GDSFPolicy::instance().enroll({
-                    .sweep_fn = +[]() -> bool { return sweep(); },
-                    .size_fn = +[]() -> size_t { return size(); },
-                    .name = static_cast<const char*>(Name)
-                });
-            });
-        }
-        return instance;
+        struct Holder {
+            L1Cache instance;
+            Holder() {
+                config::CachedClock::ensureStarted();
+                if constexpr (HasCleanup) {
+                    cache::GDSFPolicy::instance().enroll({
+                        .sweep_fn = +[]() -> bool { return sweep(); },
+                        .size_fn = +[]() -> size_t { return size(); },
+                        .name = static_cast<const char*>(Name)
+                    });
+                }
+            }
+        };
+        static Holder h;
+        return h.instance;
     }
 
     /// L1 cache lookup with TTL check and GDSF score bump.
@@ -670,12 +672,13 @@ private:
         } else {
             return Metadata{};
         }
+        
     }
 
     /// Bump GDSF access count (simple fetch_add, no decay on read path).
     static void bumpScore(Metadata& meta) {
-        meta.access_count.fetch_add(cache::GDSFScoreData::kCountScale,
-                                     std::memory_order_relaxed);
+        auto val = meta.access_count.load(std::memory_order_relaxed);
+        meta.access_count.store(val + cache::GDSFScoreData::kCountScale, std::memory_order_relaxed);
     }
 
     /// Cleanup predicate for real entries: inline decay + score + histogram.

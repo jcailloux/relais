@@ -2,6 +2,7 @@
 #define JCX_RELAIS_CACHE_METRICS_H
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <thread>
 
@@ -43,6 +44,31 @@ struct StripedCounter {
     }
 };
 
+/// Sweep duration counters — simple atomics (sweeps are serialized by sweep_flag_).
+struct SweepCounters {
+    std::atomic<uint64_t> count{0};
+    std::atomic<uint64_t> total_ns{0};
+    std::atomic<uint64_t> last_ns{0};
+    std::atomic<uint64_t> max_ns{0};
+
+    void record(uint64_t duration_ns) noexcept {
+        count.fetch_add(1, std::memory_order_relaxed);
+        total_ns.fetch_add(duration_ns, std::memory_order_relaxed);
+        last_ns.store(duration_ns, std::memory_order_relaxed);
+        auto prev = max_ns.load(std::memory_order_relaxed);
+        while (duration_ns > prev
+               && !max_ns.compare_exchange_weak(prev, duration_ns,
+                       std::memory_order_relaxed)) {}
+    }
+
+    void reset() noexcept {
+        count.store(0, std::memory_order_relaxed);
+        total_ns.store(0, std::memory_order_relaxed);
+        last_ns.store(0, std::memory_order_relaxed);
+        max_ns.store(0, std::memory_order_relaxed);
+    }
+};
+
 /// L1 cache hit/miss counter pair.
 struct L1Counters {
     StripedCounter hits;
@@ -65,6 +91,10 @@ struct MetricsSnapshot {
     uint64_t list_l1_misses = 0;
     uint64_t list_l2_hits = 0;
     uint64_t list_l2_misses = 0;
+    uint64_t sweep_count = 0;
+    uint64_t sweep_total_ns = 0;
+    uint64_t sweep_last_ns = 0;
+    uint64_t sweep_max_ns = 0;
 
     [[nodiscard]] double l1HitRatio() const noexcept {
         auto total = l1_hits + l1_misses;
@@ -84,6 +114,13 @@ struct MetricsSnapshot {
     [[nodiscard]] double listL2HitRatio() const noexcept {
         auto total = list_l2_hits + list_l2_misses;
         return total ? static_cast<double>(list_l2_hits) / static_cast<double>(total) : 0.0;
+    }
+
+    /// Average sweep duration in microseconds (0 if no sweeps).
+    [[nodiscard]] double sweepAvgUs() const noexcept {
+        return sweep_count > 0
+            ? static_cast<double>(sweep_total_ns) / static_cast<double>(sweep_count) / 1000.0
+            : 0.0;
     }
 };
 

@@ -286,6 +286,9 @@ std::string formatAccessStats(const std::string& label, const AccessStats& s) {
         << "\n  cache size:   " << s.cache_size << " entries"
         << "\n  L1 memory:    " << GDSFPolicy::instance().totalMemory() << " B"
         << "\n  throughput:   " << fmtOps(s.opsPerSec())
+#if RELAIS_ENABLE_METRICS
+        << formatSweepMetrics()
+#endif
         << "\n  " << bar;
     return out.str();
 }

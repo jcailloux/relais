@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "jcailloux/relais/cache/GDSFMetadata.h"
+#include "jcailloux/relais/cache/Metrics.h"
 #include "jcailloux/relais/Log.h"
 
 #ifndef RELAIS_GDSF_ENABLED
@@ -338,6 +339,10 @@ public:
     void sweep() {
         if (sweep_flag_.test_and_set(std::memory_order_acquire)) return;
 
+#if RELAIS_ENABLE_METRICS
+        auto sweep_t0 = std::chrono::steady_clock::now();
+#endif
+
         // 1. Compute eviction target from current memory usage
         float usage_ratio = 0.0f;
         size_t budget = max_memory_;
@@ -401,8 +406,20 @@ public:
             }
         }
 
+#if RELAIS_ENABLE_METRICS
+        auto sweep_ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - sweep_t0).count());
+        sweep_counters_.record(sweep_ns);
+#endif
+
         sweep_flag_.clear(std::memory_order_release);
     }
+
+#if RELAIS_ENABLE_METRICS
+    const SweepCounters& sweepCounters() const noexcept { return sweep_counters_; }
+    SweepCounters& sweepCounters() noexcept { return sweep_counters_; }
+#endif
 
 private:
     /// Scale global bytes_to_free to per-chunk target and compute threshold.
@@ -437,6 +454,9 @@ private:
             memory_slots_[i].value.store(0, std::memory_order_relaxed);
         }
         insertion_counter_.store(0, std::memory_order_relaxed);
+#if RELAIS_ENABLE_METRICS
+        sweep_counters_.reset();
+#endif
         // Registry and max_memory_ intentionally NOT cleared.
     }
 
@@ -465,6 +485,10 @@ private:
 
     // Sweep serialization — lock-free, guaranteed on all platforms
     std::atomic_flag sweep_flag_{};
+
+#if RELAIS_ENABLE_METRICS
+    SweepCounters sweep_counters_;
+#endif
 
 #ifdef RELAIS_BUILDING_TESTS
     friend struct ::relais_test::TestInternals;

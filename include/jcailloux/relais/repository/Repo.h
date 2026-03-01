@@ -11,6 +11,7 @@
 #include "jcailloux/relais/config/FixedString.h"
 #include "jcailloux/relais/wrapper/EntityConcepts.h"
 #include "jcailloux/relais/cache/Metrics.h"
+#include "jcailloux/relais/cache/GDSFPolicy.h"
 
 namespace jcailloux::relais {
 
@@ -158,6 +159,13 @@ public:
             snap.list_l2_misses = ListLayer::list_l2_counters_.misses.load();
         }
 
+        // Sweep counters (global, shared across all repos)
+        auto& sc = cache::GDSFPolicy::instance().sweepCounters();
+        snap.sweep_count    = sc.count.load(std::memory_order_relaxed);
+        snap.sweep_total_ns = sc.total_ns.load(std::memory_order_relaxed);
+        snap.sweep_last_ns  = sc.last_ns.load(std::memory_order_relaxed);
+        snap.sweep_max_ns   = sc.max_ns.load(std::memory_order_relaxed);
+
         return snap;
     }
 
@@ -184,6 +192,9 @@ public:
             ListLayer::list_l2_counters_.hits.reset();
             ListLayer::list_l2_counters_.misses.reset();
         }
+
+        // Sweep counters (global)
+        cache::GDSFPolicy::instance().sweepCounters().reset();
     }
 #endif
 

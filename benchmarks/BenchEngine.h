@@ -13,6 +13,7 @@
  */
 
 #include "jcailloux/relais/io/Task.h"
+#include "jcailloux/relais/cache/GDSFPolicy.h"
 
 #include <algorithm>
 #include <atomic>
@@ -429,5 +430,22 @@ inline std::string formatMixedThroughput(
     out << "  " << bar;
     return out.str();
 }
+
+#if RELAIS_ENABLE_METRICS
+inline std::string formatSweepMetrics() {
+    auto& sc = jcailloux::relais::cache::GDSFPolicy::instance().sweepCounters();
+    auto count = sc.count.load(std::memory_order_relaxed);
+    if (count == 0) return "\n  sweeps:          0";
+    auto total_ns = sc.total_ns.load(std::memory_order_relaxed);
+    double avg_us = static_cast<double>(total_ns) / static_cast<double>(count) / 1000.0;
+    auto max_ns = sc.max_ns.load(std::memory_order_relaxed);
+    double max_us = static_cast<double>(max_ns) / 1000.0;
+    std::ostringstream out;
+    out << "\n  sweeps:          " << count
+        << " (avg " << fmtDuration(avg_us)
+        << ", max " << fmtDuration(max_us) << ")";
+    return out.str();
+}
+#endif
 
 } // namespace relais_bench

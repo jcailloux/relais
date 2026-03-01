@@ -43,11 +43,26 @@ using namespace relais_bench;
 /// Bare L1 — no TTL, no GDSF, zero metadata per entry
 using BareL1TestItemRepo = Repo<TestItemWrapper, "bench:bare_l1", test_config::BareL1>;
 
+namespace {
+inline std::string gdsf_banner() {
+    using GDSFPolicy = jcailloux::relais::cache::GDSFPolicy;
+    std::ostringstream out;
+    out << "\n  [config] GDSF: " << (GDSFPolicy::enabled ? "ON" : "OFF")
+        << "  |  cleanup every " << (GDSFPolicy::kCleanupMask + 1) << " insertions";
+    if (GDSFPolicy::enabled && GDSFPolicy::instance().maxMemory() > 0)
+        out << "  |  budget " << GDSFPolicy::instance().maxMemory() << " B";
+    return out.str();
+}
+} // anonymous namespace
+
 TEST_CASE("Benchmark - L1 cache hit", "[benchmark][l1]")
 {
     TransactionGuard tx;
 
     static constexpr int NUM_KEYS = 10000;
+    static constexpr int THREADS = 6;
+
+    WARN(gdsf_banner());
 
     std::vector<int64_t> ids;
     ids.reserve(NUM_KEYS);
@@ -59,10 +74,18 @@ TEST_CASE("Benchmark - L1 cache hit", "[benchmark][l1]")
     }
 
     // Pure L1 lookup via getFromCache — no Immediate, no coroutine, no sync().
-    // Measures: ParlayHash find + epoch guard + TTL check (if enabled).
+    // Measures: ParlayHash find + epoch guard + TTL check (if enabled)
+    // + GDSF ghost check + bumpScore (if GDSF enabled).
+    //
+    // Each variant runs single-thread then multi-thread (6T, distributed keys)
+    // to isolate contention cost of bumpScore's fetch_add on metadata cache lines.
     using TI = TestInternals;
 
-    auto bare = measureDuration(1, [&](int, std::atomic<bool>& running) -> int64_t {
+    L1TestItemRepo::resetMetrics();
+
+    // --- getFromCache bare ---
+
+    auto bare_1t = measureDuration(1, [&](int, std::atomic<bool>& running) -> int64_t {
         int64_t ops = 0;
         while (running.load(std::memory_order_relaxed)) {
             doNotOptimize(TI::getFromCache<BareL1TestItemRepo>(ids[ops % NUM_KEYS]));
@@ -70,9 +93,22 @@ TEST_CASE("Benchmark - L1 cache hit", "[benchmark][l1]")
         }
         return ops;
     });
-    WARN(formatDurationThroughput("L1 getFromCache bare (1 thread)", 1, bare));
+    WARN(formatDurationThroughput("L1 getFromCache bare (1T)", 1, bare_1t));
 
-    auto withTtl = measureDuration(1, [&](int, std::atomic<bool>& running) -> int64_t {
+    auto bare_mt = measureDuration(THREADS, [&](int tid, std::atomic<bool>& running) -> int64_t {
+        int64_t ops = 0;
+        while (running.load(std::memory_order_relaxed)) {
+            doNotOptimize(TI::getFromCache<BareL1TestItemRepo>(
+                ids[(tid * 11 + ops) % NUM_KEYS]));
+            ++ops;
+        }
+        return ops;
+    });
+    WARN(formatDurationThroughput("L1 getFromCache bare (6T)", THREADS, bare_mt));
+
+    // --- getFromCache +TTL ---
+
+    auto ttl_1t = measureDuration(1, [&](int, std::atomic<bool>& running) -> int64_t {
         int64_t ops = 0;
         while (running.load(std::memory_order_relaxed)) {
             doNotOptimize(TI::getFromCache<L1TestItemRepo>(ids[ops % NUM_KEYS]));
@@ -80,9 +116,22 @@ TEST_CASE("Benchmark - L1 cache hit", "[benchmark][l1]")
         }
         return ops;
     });
-    WARN(formatDurationThroughput("L1 getFromCache +TTL (1 thread)", 1, withTtl));
+    WARN(formatDurationThroughput("L1 getFromCache +TTL (1T)", 1, ttl_1t));
 
-    auto viaFind = measureDuration(1, [&](int, std::atomic<bool>& running) -> int64_t {
+    auto ttl_mt = measureDuration(THREADS, [&](int tid, std::atomic<bool>& running) -> int64_t {
+        int64_t ops = 0;
+        while (running.load(std::memory_order_relaxed)) {
+            doNotOptimize(TI::getFromCache<L1TestItemRepo>(
+                ids[(tid * 11 + ops) % NUM_KEYS]));
+            ++ops;
+        }
+        return ops;
+    });
+    WARN(formatDurationThroughput("L1 getFromCache +TTL (6T)", THREADS, ttl_mt));
+
+    // --- find() bare (includes Immediate wrapper overhead) ---
+
+    auto find_1t = measureDuration(1, [&](int, std::atomic<bool>& running) -> int64_t {
         int64_t ops = 0;
         while (running.load(std::memory_order_relaxed)) {
             auto imm = BareL1TestItemRepo::find(ids[ops % NUM_KEYS]);
@@ -91,7 +140,58 @@ TEST_CASE("Benchmark - L1 cache hit", "[benchmark][l1]")
         }
         return ops;
     });
-    WARN(formatDurationThroughput("L1 find() bare (1 thread)", 1, viaFind));
+    WARN(formatDurationThroughput("L1 find() bare (1T)", 1, find_1t));
+
+    auto find_mt = measureDuration(THREADS, [&](int tid, std::atomic<bool>& running) -> int64_t {
+        int64_t ops = 0;
+        while (running.load(std::memory_order_relaxed)) {
+            auto imm = BareL1TestItemRepo::find(
+                ids[(tid * 11 + ops) % NUM_KEYS]);
+            doNotOptimize(imm.await_resume());
+            ++ops;
+        }
+        return ops;
+    });
+    WARN(formatDurationThroughput("L1 find() bare (6T)", THREADS, find_mt));
+
+    // --- Single-key contention: all threads hit the same cache line ---
+    // Isolates the cost of bumpScore's fetch_add under maximum contention.
+    // Compare with distributed variants above to measure cache-line bouncing.
+
+    auto id0 = ids[0];
+
+    auto contention_bare = measureDuration(THREADS, [&](int, std::atomic<bool>& running) -> int64_t {
+        int64_t ops = 0;
+        while (running.load(std::memory_order_relaxed)) {
+            doNotOptimize(TI::getFromCache<BareL1TestItemRepo>(id0));
+            ++ops;
+        }
+        return ops;
+    });
+    WARN(formatDurationThroughput("L1 getFromCache bare (6T, 1 key)", THREADS, contention_bare));
+
+    auto contention_ttl = measureDuration(THREADS, [&](int, std::atomic<bool>& running) -> int64_t {
+        int64_t ops = 0;
+        while (running.load(std::memory_order_relaxed)) {
+            doNotOptimize(TI::getFromCache<L1TestItemRepo>(id0));
+            ++ops;
+        }
+        return ops;
+    });
+    WARN(formatDurationThroughput("L1 getFromCache +TTL (6T, 1 key)", THREADS, contention_ttl));
+
+    auto contention_find = measureDuration(THREADS, [&](int, std::atomic<bool>& running) -> int64_t {
+        int64_t ops = 0;
+        while (running.load(std::memory_order_relaxed)) {
+            auto imm = BareL1TestItemRepo::find(id0);
+            doNotOptimize(imm.await_resume());
+            ++ops;
+        }
+        return ops;
+    });
+    WARN(formatDurationThroughput("L1 find() bare (6T, 1 key)", THREADS, contention_find));
+
+    WARN(formatSweepMetrics());
 }
 
 
@@ -258,6 +358,7 @@ TEST_CASE("Benchmark - list query", "[benchmark][list]")
 TEST_CASE("Benchmark - L1 throughput", "[benchmark][throughput]")
 {
     TransactionGuard tx;
+    WARN(gdsf_banner());
 
     static constexpr int THREADS = 6;
     static constexpr int NUM_KEYS = 10000;
@@ -315,6 +416,7 @@ TEST_CASE("Benchmark - L1 throughput", "[benchmark][throughput]")
 
 TEST_CASE("Benchmark - L1 throughput mixed", "[benchmark][throughput][mixed]") {
     TransactionGuard tx;
+    WARN(gdsf_banner());
 
     static constexpr int THREADS = 6;
     static constexpr int NUM_KEYS = 10000;
@@ -416,7 +518,8 @@ TEST_CASE("Benchmark - L1 throughput mixed", "[benchmark][throughput][mixed]") {
                                          THREADS, result, total_reads, total_evicts);
         std::ostringstream extra;
         extra << "\n  L1 miss rate:    " << std::fixed << std::setprecision(1)
-              << miss_rate << "% (" << m.l1_misses << " misses)";
+              << miss_rate << "% (" << m.l1_misses << " misses)"
+              << formatSweepMetrics();
         WARN(msg + extra.str());
     }
 
@@ -478,7 +581,8 @@ TEST_CASE("Benchmark - L1 throughput mixed", "[benchmark][throughput][mixed]") {
         std::ostringstream extra;
         extra << "\n  DB fetches:      " << m.l1_misses
               << " (" << std::fixed << std::setprecision(1) << db_pct << "% of reads)"
-              << "\n  coroutines:      " << CORO_COUNT;
+              << "\n  coroutines:      " << CORO_COUNT
+              << formatSweepMetrics();
         WARN(msg + extra.str());
     }
 }
@@ -584,7 +688,8 @@ std::string runProductionBench(
           << "\n  L1 evictions:    " << total.l1_evicts << " (next read \u2192 L2 or DB)"
           << "\n  invalidations:   " << total.invalidates << " (next read \u2192 DB)"
           << "\n  coroutines:      " << coro_count
-          << "\n  IO pinned:       core " << io_core;
+          << "\n  IO pinned:       core " << io_core
+          << formatSweepMetrics();
     return msg + extra.str();
 }
 
@@ -593,6 +698,7 @@ std::string runProductionBench(
 
 TEST_CASE("Benchmark - production simulation", "[benchmark][production]") {
     TransactionGuard tx;
+    WARN(gdsf_banner());
 
     static constexpr int NUM_KEYS = 10000;
     static constexpr int CORO_COUNT = 128;
@@ -732,7 +838,8 @@ TEST_CASE("Benchmark - production simulation", "[benchmark][production]") {
               << "\n  L1 evictions:    " << total.l1_evicts
               << "\n  invalidations:   " << total.invalidates
               << "\n  coroutines:      " << CORO_COUNT
-              << "\n  IO pinned:       core " << io_core;
+              << "\n  IO pinned:       core " << io_core
+              << formatSweepMetrics();
         WARN(msg + extra.str());
     }
 
