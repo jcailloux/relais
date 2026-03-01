@@ -585,7 +585,15 @@ private:
         if (!map) [[unlikely]]
             map = access_chunks_[chunk_id].acquire();
         if (map->record(static_cast<void*>(sd), hash)) [[unlikely]] {
-            map->flush(kFlushFn);
+            uint8_t cur = map->capLog2();
+            uint8_t new_log2{0};
+            if (cur < 14) {
+                size_t max_mem = cache::GDSFPolicy::instance().maxMemory();
+                if (max_mem == 0
+                    || cache::AccessCounterMap::totalBytes() < max_mem / 100)
+                    new_log2 = cur + 1;
+            }
+            map->try_flush(kFlushFn, new_log2);
         }
     }
 
