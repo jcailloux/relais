@@ -58,19 +58,11 @@ public:
 
 class AccessCounterMap {
     std::atomic<uintptr_t>* slots_;
-    // size_ and cap_log2_ are read by flush_all (via size()/capLog2()/capacity())
-    // while the owning thread modifies them in record()/flush().
-    // Relaxed atomics (plain mov on x86) — zero overhead.
-    std::atomic<uint16_t> size_{0};
-    std::atomic<uint8_t> cap_log2_{4};  // start at 16 slots
-    std::atomic<bool> flush_active_{false};  // try-lock: owner flush vs flush_all
-    std::atomic<uint8_t> pending_resize_{0};  // shrink suggestion from flush_all (0 = none)
+    uint16_t size_{0};
+    uint8_t cap_log2_{4};  // start at 16 slots
 
     static constexpr int kCountShift = 56;
     static constexpr uintptr_t kPtrMask = (uintptr_t{1} << kCountShift) - 1;
-
-    /// Global memory accounting for all AccessCounterMap slot arrays.
-    static inline std::atomic<size_t> total_bytes_{0};
 
 public:
     // Intrusive pointers for pool (Treiber stack) and registry (lock-free list)
@@ -78,19 +70,17 @@ public:
     std::atomic<AccessCounterMap*> reg_next_{nullptr};
 
     AccessCounterMap() {
-        allocSlots(cap_log2_.load(std::memory_order_relaxed));
+        allocSlots(cap_log2_);
     }
 
     ~AccessCounterMap() {
-        total_bytes_.fetch_sub(capacity() * sizeof(std::atomic<uintptr_t>),
-                               std::memory_order_relaxed);
         delete[] slots_;
     }
 
     AccessCounterMap(const AccessCounterMap&) = delete;
     AccessCounterMap& operator=(const AccessCounterMap&) = delete;
 
-    /// Hot path: record an access to entry_ptr. Returns true if 75%-full (flush needed).
+    /// Hot path: record an access to entry_ptr. Returns true if half-full (flush needed).
     /// Single atomic load per probe, single store on match — minimal cache footprint.
     bool record(void* entry_ptr, size_t hash) {
         uint16_t cap = capacity();
@@ -103,6 +93,7 @@ public:
             uintptr_t ptr_bits = tagged & kPtrMask;
 
             if (ptr_bits == target) {
+                // Found: increment local counter (count in bits 56-63)
                 uint8_t c = static_cast<uint8_t>(tagged >> kCountShift);
                 if (c == 255) [[unlikely]] return true;
                 slots_[slot].store(
@@ -111,52 +102,23 @@ public:
                 return false;
             }
             if (tagged == 0) {
+                // Empty slot: insert with count=1
                 slots_[slot].store(
                     target | (uintptr_t{1} << kCountShift),
                     std::memory_order_relaxed);
-                size_.store(size_.load(std::memory_order_relaxed) + 1,
-                            std::memory_order_relaxed);
-                uint16_t sz = size_.load(std::memory_order_relaxed);
-                return sz >= (cap - (cap >> 2));  // 75%
+                ++size_;
+                return size_ >= (cap >> 1);
             }
             slot = (slot + 1) & mask;
         }
+        // Table full (shouldn't happen if we flush at half-full)
         return true;
     }
 
-    /// Try to flush this map. Returns false if another flush is in progress.
-    /// Resize (new_cap_log2 != 0) is only safe from the owning thread;
-    /// flush_all must always pass 0.
+    /// Flush: iterate all slots, call fn(void*, uint8_t) for non-empty entries, then clear.
+    /// Optionally resize to new_cap_log2 (0 = keep current, or grow/shrink).
     template<typename Fn>
-    bool try_flush(Fn&& fn, uint8_t new_cap_log2 = 0) {
-        bool expected = false;
-        if (!flush_active_.compare_exchange_strong(expected, true,
-                std::memory_order_acquire, std::memory_order_relaxed))
-            return false;
-        flush(std::forward<Fn>(fn), new_cap_log2);
-        flush_active_.store(false, std::memory_order_release);
-        return true;
-    }
-
-    uint16_t size() const { return size_.load(std::memory_order_relaxed); }
-    uint8_t capLog2() const { return cap_log2_.load(std::memory_order_relaxed); }
-    uint16_t capacity() const { return uint16_t{1} << cap_log2_.load(std::memory_order_relaxed); }
-
-    /// Total bytes allocated by all AccessCounterMap slot arrays globally.
-    static size_t totalBytes() {
-        return total_bytes_.load(std::memory_order_relaxed);
-    }
-
-    /// Suggest a resize target (applied at next flush by the owning thread).
-    void suggestResize(uint8_t target_log2) {
-        pending_resize_.store(target_log2, std::memory_order_relaxed);
-    }
-
-private:
-    /// Drain all slots, call fn(void*, uint8_t), clear. Optionally resize.
-    /// Must be called under try-lock (flush_active_).
-    template<typename Fn>
-    void flush(Fn&& fn, uint8_t new_cap_log2) {
+    void flush(Fn&& fn, uint8_t new_cap_log2 = 0) {
         uint16_t cap = capacity();
         for (uint16_t i = 0; i < cap; ++i) {
             uintptr_t tagged = slots_[i].load(std::memory_order_relaxed);
@@ -167,31 +129,25 @@ private:
                 slots_[i].store(0, std::memory_order_relaxed);
             }
         }
-        size_.store(0, std::memory_order_relaxed);
+        size_ = 0;
 
-        // Apply pending_resize_ (shrink suggestion from flush_all) with priority
-        uint8_t pr = pending_resize_.load(std::memory_order_relaxed);
-        if (pr != 0) {
-            pending_resize_.store(0, std::memory_order_relaxed);
-            new_cap_log2 = pr;
-        }
-
-        if (new_cap_log2 != 0 && new_cap_log2 != cap_log2_.load(std::memory_order_relaxed)) {
-            total_bytes_.fetch_sub(cap * sizeof(std::atomic<uintptr_t>),
-                                   std::memory_order_relaxed);
+        if (new_cap_log2 != 0 && new_cap_log2 != cap_log2_) {
             delete[] slots_;
             allocSlots(new_cap_log2);
-            cap_log2_.store(new_cap_log2, std::memory_order_relaxed);
+            cap_log2_ = new_cap_log2;
         }
     }
 
+    uint16_t size() const { return size_; }
+    uint8_t capLog2() const { return cap_log2_; }
+    uint16_t capacity() const { return uint16_t{1} << cap_log2_; }
+
+private:
     void allocSlots(uint8_t log2) {
         uint16_t cap = uint16_t{1} << log2;
         slots_ = new std::atomic<uintptr_t>[cap];
         for (uint16_t i = 0; i < cap; ++i)
             slots_[i].store(0, std::memory_order_relaxed);
-        total_bytes_.fetch_add(cap * sizeof(std::atomic<uintptr_t>),
-                               std::memory_order_relaxed);
     }
 };
 
@@ -231,20 +187,21 @@ public:
     }
 
     /// Flush all registered maps: iterate the intrusive registry, flush each.
-    /// Never resizes — resize is only safe from the owning thread.
-    /// Suggests shrink when a map is under 25% utilization (applied at next owner flush).
-    /// Skips maps whose owner is concurrently flushing (counts are being
-    /// drained anyway, so no data is lost).
     template<typename Fn>
     void flush_all(Fn&& fn) {
         auto* m = registry_.load(std::memory_order_acquire);
         while (m) {
+            // Compute optimal capacity for next period:
+            // grow x2 if half-full, shrink if <1/8 used (min 16 slots)
+            uint8_t new_log2 = 0;
             uint16_t sz = m->size();
             uint8_t cur_log2 = m->capLog2();
-            m->try_flush(fn);
-            if (sz < (m->capacity() >> 2) && cur_log2 > 4) {
-                m->suggestResize(cur_log2 - 1);
+            if (sz >= (m->capacity() >> 1) && cur_log2 < 12) {
+                new_log2 = cur_log2 + 1;  // grow
+            } else if (sz < (m->capacity() >> 3) && cur_log2 > 4) {
+                new_log2 = cur_log2 - 1;  // shrink
             }
+            m->flush(fn, new_log2);
             m = m->reg_next_.load(std::memory_order_acquire);
         }
     }
