@@ -16,6 +16,10 @@ namespace jcailloux::relais::cache {
 
 /// Striped atomic counter — 8 cache-line-aligned slots to minimize contention.
 /// Total footprint: ~512 bytes per counter.
+///
+/// Slot selection uses a sequential TLS index (0,1,2,...) instead of
+/// hash(thread_id) & 7 — on glibc, pthread_t addresses are 8MB-aligned so
+/// the low 3 bits are always 0, mapping all threads to the same slot.
 struct StripedCounter {
     static constexpr unsigned kSlots = 8;
     static constexpr unsigned kMask = kSlots - 1;
@@ -27,8 +31,15 @@ struct StripedCounter {
     Slot slots[kSlots];
 
     void increment() noexcept {
-        auto idx = std::hash<std::thread::id>{}(std::this_thread::get_id()) & kMask;
-        slots[idx].value.fetch_add(1, std::memory_order_relaxed);
+        static std::atomic<unsigned> next_idx{0};
+        static thread_local unsigned my_idx =
+            next_idx.fetch_add(1, std::memory_order_relaxed) & kMask;
+        // Relaxed load+store instead of fetch_add: compiles to plain mov+inc+mov
+        // on x86 (no lock prefix). Safe because each thread has its own slot
+        // (≤8 threads); with >8 threads some increments may be lost — acceptable
+        // for metrics counters.
+        auto& s = slots[my_idx].value;
+        s.store(s.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
     }
 
     [[nodiscard]] uint64_t load() const noexcept {

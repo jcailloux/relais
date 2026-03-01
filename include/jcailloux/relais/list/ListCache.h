@@ -16,6 +16,7 @@
 #include "jcailloux/relais/cache/GDSFPolicy.h"
 #include "jcailloux/relais/cache/TaggedEntry.h"
 #include "jcailloux/relais/config/CachedClock.h"
+#include "jcailloux/relais/cache/AccessCounter.h"
 
 #ifdef RELAIS_BUILDING_TESTS
 namespace relais_test { struct TestInternals; }
@@ -358,7 +359,10 @@ public:
 
         // Single-hash chunk computation: extract hash from pre-computed hashed_key
         size_t hash = L1Cache::get_hash(hk);
-        long chunk_id = cache_.chunk_for_hash(hash, static_cast<long>(ChunkCount));
+        constexpr uint8_t kChunkBits = ChunkCountLog2;
+        constexpr size_t kChunkMask = ChunkCount - 1;
+        long chunk_id = static_cast<long>(
+            (hash >> (48 - kChunkBits)) & kChunkMask);
 
         if (isAffectedByModificationsForChunk(meta, value, config::CachedClock::now(), chunk_id)) {
             // Two-phase eviction: remove only if same entry (guards against concurrent Upsert)
@@ -366,10 +370,10 @@ public:
             return {};
         }
 
-        // GDSF: bump access count (simple fetch_add, no decay on read path)
+        // GDSF: thread-local access counting (unconditional — no skip check to
+        // keep the function body small enough for the compiler to inline).
         if constexpr (GDSF) {
-            meta.gdsf.access_count.fetch_add(cache::GDSFScoreData::kCountScale,
-                                              std::memory_order_relaxed);
+            recordAccess(&meta.gdsf, hash, chunk_id);
         }
 
         return ResultView(&value, std::move(result.guard));
@@ -453,6 +457,8 @@ public:
     // =========================================================================
 
     /// Sweep one chunk (lock-free, always succeeds).
+    /// Double-flush pattern: flush TL counters before sweep (precise scores)
+    /// and after sweep (drain pointers to retired entries before reclaim).
     bool trySweep() {
         // Snapshot time BEFORE chunk cleanup so that modifications added
         // during cleanup are not counted (they weren't fully considered).
@@ -466,6 +472,8 @@ public:
         float threshold = 0.0f;
         if constexpr (GDSF) {
             threshold = cache::GDSFPolicy::instance().threshold();
+            // FLUSH #1: drain TL counters for precise scores
+            access_chunks_[chunk].flush_all(kFlushFn);
         }
 
         auto removed = cache_.cleanup_chunk(chunk, n_chunks,
@@ -474,6 +482,14 @@ public:
                     te.template asReal<typename L1Cache::EntryHeader>());
                 return cleanupPredicate(entry->metadata, entry->value, now, threshold, chunk);
             });
+
+        if constexpr (GDSF) {
+            // FLUSH #2: drain counters accumulated during sweep (retired entries still valid)
+            access_chunks_[chunk].flush_all(kFlushFn);
+        }
+
+        // RECLAIM retired entries (now safe — no dangling pointers in TL maps)
+        if (removed > 0) cache_.reclaim();
 
         modifications_.drainChunk(now, static_cast<uint8_t>(chunk));
 
@@ -486,12 +502,15 @@ public:
     }
 
     /// Sweep all chunks.
+    /// Double-flush pattern: flush all TL counters before + after full cleanup.
     size_t purge() {
         const auto now = Clock::now();
 
         float threshold = 0.0f;
         if constexpr (GDSF) {
             threshold = cache::GDSFPolicy::instance().threshold();
+            // FLUSH #1: drain all TL counters for precise scores
+            flushAccessCounters();
         }
 
         size_t erased = cache_.full_cleanup(
@@ -500,6 +519,14 @@ public:
                     te.template asReal<typename L1Cache::EntryHeader>());
                 return cleanupPredicateFull(entry->metadata, entry->value, now, threshold);
             });
+
+        if constexpr (GDSF) {
+            // FLUSH #2: drain counters accumulated during cleanup
+            flushAccessCounters();
+        }
+
+        // RECLAIM retired entries (now safe)
+        if (erased > 0) cache_.collect();
 
         // All chunks processed — drain modifications that existed before cleanup
         modifications_.drain(now);
@@ -520,6 +547,55 @@ public:
 #endif
 
 private:
+    // =========================================================================
+    // Thread-local access counting (GDSF hot path optimization)
+    // =========================================================================
+
+    static constexpr long kMaxChunks = 64;
+
+    /// Per-chunk access counter pools + registries.
+    static inline cache::ChunkAccessCounter access_chunks_[kMaxChunks]{};
+
+    /// Flush lambda: transfer TL counts to shared GDSFScoreData atomics.
+    static constexpr auto kFlushFn = [](void* ptr, uint8_t count) {
+        static_cast<cache::GDSFScoreData*>(ptr)->access_count.fetch_add(
+            static_cast<uint32_t>(count) * cache::GDSFScoreData::kCountScale,
+            std::memory_order_relaxed);
+    };
+
+    /// Per-thread map pointers for each chunk.
+    struct ThreadMaps {
+        cache::AccessCounterMap* maps[kMaxChunks]{};
+        ~ThreadMaps() {
+            long nc = cache::GDSFPolicy::instance().chunkCount();
+            for (long i = 0; i < nc; ++i) {
+                if (maps[i]) access_chunks_[i].release(maps[i]);
+            }
+        }
+    };
+
+    static ThreadMaps& threadMaps() {
+        static thread_local ThreadMaps tm;
+        return tm;
+    }
+
+    static void recordAccess(cache::GDSFScoreData* sd, size_t hash, long chunk_id) {
+        auto& tm = threadMaps();
+        auto*& map = tm.maps[chunk_id];
+        if (!map) [[unlikely]]
+            map = access_chunks_[chunk_id].acquire();
+        if (map->record(static_cast<void*>(sd), hash)) [[unlikely]] {
+            map->flush(kFlushFn);
+        }
+    }
+
+    void flushAccessCounters() {
+        long nc = cache::GDSFPolicy::instance().chunkCount();
+        for (long i = 0; i < nc; ++i) {
+            access_chunks_[i].flush_all(kFlushFn);
+        }
+    }
+
     // =========================================================================
     // Validation logic
     // =========================================================================

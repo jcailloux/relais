@@ -29,6 +29,32 @@ if(NOT RELAIS_CLEANUP_FREQUENCY_LOG2 EQUAL 9)
     target_compile_definitions(jcailloux-relais INTERFACE RELAIS_CLEANUP_FREQUENCY_LOG2=${RELAIS_CLEANUP_FREQUENCY_LOG2})
 endif()
 
+# Profile-Guided Optimization: propagated via INTERFACE to all consumers
+# Usage (same build directory for both phases):
+#   1. cmake -B build -DRELAIS_ENABLE_PGO=generate -DCMAKE_BUILD_TYPE=Release
+#      cmake --build build -j$(nproc) && ./build/my_app   # training workload
+#   2. cmake -B build -DRELAIS_ENABLE_PGO=use
+#      cmake --build build -j$(nproc)                     # optimized binary
+set(RELAIS_ENABLE_PGO "OFF" CACHE STRING "Profile-Guided Optimization (OFF, generate, use)")
+set_property(CACHE RELAIS_ENABLE_PGO PROPERTY STRINGS OFF generate use)
+
+if(NOT RELAIS_ENABLE_PGO STREQUAL "OFF")
+    set(RELAIS_PGO_DIR "${CMAKE_BINARY_DIR}/pgo-data")
+    if(RELAIS_ENABLE_PGO STREQUAL "generate")
+        target_compile_options(jcailloux-relais INTERFACE
+            -fprofile-generate=${RELAIS_PGO_DIR} -fprofile-update=atomic)
+        target_link_options(jcailloux-relais INTERFACE
+            -fprofile-generate=${RELAIS_PGO_DIR})
+    elseif(RELAIS_ENABLE_PGO STREQUAL "use")
+        target_compile_options(jcailloux-relais INTERFACE
+            -fprofile-use=${RELAIS_PGO_DIR}
+            -fprofile-correction
+            -Wno-missing-profile)
+        target_link_options(jcailloux-relais INTERFACE
+            -fprofile-use=${RELAIS_PGO_DIR})
+    endif()
+endif()
+
 # CMake modules (available to consumers via FetchContent)
 list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
 
