@@ -18,9 +18,7 @@
 #include "jcailloux/relais/config/repo_config.h"
 #include "jcailloux/relais/config/CachedClock.h"
 #include "jcailloux/relais/cache/Metrics.h"
-#include "jcailloux/relais/cache/AccessCounter.h"
 #include <array>
-#include <bit>
 
 #ifdef RELAIS_BUILDING_TESTS
 namespace relais_test { struct TestInternals; }
@@ -251,8 +249,6 @@ public:
     };
 
     /// Sweep one chunk (lock-free, always succeeds).
-    /// Double-flush pattern: flush TL counters before sweep (precise scores)
-    /// and after sweep (drain pointers to retired entries before reclaim).
     static bool trySweep() {
         if constexpr (!HasCleanup) {
             return false;
@@ -272,17 +268,7 @@ public:
                 ctx.ghost_decays = &ghost_decays;
             }
 
-            long n_chunks = policy.chunkCount();
-            long chunk_id = cache().advance_cleanup_cursor(n_chunks);
-
-            // 1. FLUSH #1: drain TL counters → access_count reflects true frequency.
-            //    Allows cleanupPredicate to compute precise scores.
-            if constexpr (HasGDSF) {
-                access_chunks_[chunk_id].flush_all(kFlushFn);
-            }
-
-            // 2. SWEEP: cleanup_chunk reads precise scores, retires evicted entries.
-            auto removed = cache().cleanup_chunk(chunk_id, n_chunks,
+            auto removed = cache().cleanup_next_chunk(cache::GDSFPolicy::instance().chunkCount(),
                 [&ctx](const Key& key, auto te) {
                     if constexpr (HasGDSF) {
                         if (te.isGhost()) {
@@ -294,13 +280,9 @@ public:
                     return cleanupPredicate(key, ce->metadata, ce->value, ctx);
                 });
 
-            // 3. FLUSH #2: drain counters accumulated by concurrent threads during
-            //    the sweep. Retired entries are still valid (epoch-deferred).
-            if constexpr (HasGDSF) {
-                access_chunks_[chunk_id].flush_all(kFlushFn);
-            }
-
-            // 4. RECLAIM: safe — no dangling pointers in TL maps for this chunk.
+            // Reclaim evicted entries immediately when safe (no active EpochGuard).
+            // Without this, totalMemory() stays inflated (charges are immediate
+            // but discharges are epoch-deferred), causing cascading eviction.
             if (removed > 0) cache().reclaim();
 
             // Post-sweep: apply ghost decays via read-modify-write
@@ -327,7 +309,6 @@ public:
     }
 
     /// Sweep all chunks.
-    /// Double-flush pattern: flush all TL counters before + after full cleanup.
     static size_t purge() {
         if constexpr (!HasCleanup) {
             return 0;
@@ -344,11 +325,6 @@ public:
                 ctx.ghost_decays = &ghost_decays;
             }
 
-            // FLUSH #1: drain all TL counters for precise scores.
-            if constexpr (HasGDSF) {
-                flushAccessCounters();
-            }
-
             auto removed = cache().full_cleanup(
                 [&ctx](const Key& key, auto te) {
                     if constexpr (HasGDSF) {
@@ -360,11 +336,6 @@ public:
                         te.template asReal<typename L1Cache::EntryHeader>());
                     return cleanupPredicate(key, ce->metadata, ce->value, ctx);
                 });
-
-            // FLUSH #2: drain counters accumulated during cleanup (retired entries still valid).
-            if constexpr (HasGDSF) {
-                flushAccessCounters();
-            }
 
             // Drain epoch pool (see trySweep comment).
             if (removed > 0) cache().collect();
@@ -405,16 +376,13 @@ protected:
     using L1Cache = cache::ChunkMap<Key, ValueType, Metadata, HasGDSF>;
 
     /// Returns the static ChunkMap instance.
-    /// Hot path: single pointer check (no guard variable, no function call).
-    /// First call delegates to cache_init_slow() which constructs and registers.
+    /// On first call, auto-registers this repo with GDSFPolicy for global coordination
+    /// (when cleanup is enabled: GDSF or TTL > 0).
+    ///
+    /// All initialization is folded into a single static local (Holder) so that
+    /// the hot path is a single guard-variable check (~1ns) instead of multiple
+    /// std::call_once / pthread_once calls through PLT (~5-8ns each).
     static L1Cache& cache() {
-        auto* p = cache_ptr_;
-        if (p) [[likely]] return *p;
-        return cache_init_slow();
-    }
-
-    /// Cold path: construct the ChunkMap, register with GDSFPolicy, cache the pointer.
-    [[gnu::noinline]] static L1Cache& cache_init_slow() {
         struct Holder {
             L1Cache instance;
             Holder() {
@@ -426,30 +394,17 @@ protected:
                         .name = static_cast<const char*>(Name)
                     });
                 }
-                if constexpr (HasGDSF) {
-                    long nc = cache::GDSFPolicy::instance().chunkCount();
-                    chunk_bits_ = static_cast<uint8_t>(
-                        std::countr_zero(static_cast<unsigned long>(nc)));
-                    chunk_mask_ = static_cast<size_t>(nc - 1);
-                }
-                cache_ptr_ = &instance;
             }
         };
         static Holder h;
-        cache_ptr_ = &h.instance;  // also set here for safety (after static init)
         return h.instance;
     }
 
-    /// L1 cache lookup with TTL check and thread-local access counting.
+    /// L1 cache lookup with TTL check and GDSF score bump.
     /// Returns raw FindResult for flexible use by find/findJson/findBinary.
     /// Ghosts are treated as L1 miss (the slow path handles admission).
-    ///
-    /// GDSF hot path: instead of a shared atomic fetch_add (MESI bouncing),
-    /// accesses are recorded in per-thread maps and flushed in batch during sweep.
-    /// Kept minimal (~4 lines) so the compiler inlines into getFromCache/find.
     static typename L1Cache::FindResult findInCache(const Key& key) {
-        auto hk = L1Cache::make_key(key);
-        auto result = cache().find(hk);
+        auto result = cache().find(key);
         if (!result) return {};
 
         // Ghost: treated as L1 miss (slow path will handle admission)
@@ -468,21 +423,11 @@ protected:
             }
         }
 
-        if constexpr (HasGDSF) {
-            // Thread-local access counting: record unconditionally.
-            // chunk_bits_ / chunk_mask_ are pre-computed static constants.
-            size_t hash = L1Cache::get_hash(hk);
-            long chunk_id = static_cast<long>(
-                (hash >> (48 - chunk_bits_)) & chunk_mask_);
-            recordAccess(
-                static_cast<cache::GDSFScoreData*>(&entry->metadata),
-                hash, chunk_id);
-        }
+        if constexpr (HasGDSF) bumpScore(entry->metadata);
 
         return result;
     }
 
-    /// Get from cache as EntityView (convenience wrapper around findInCache).
     /// Get from cache as EntityView (convenience wrapper around findInCache).
     static wrapper::EntityView<Entity> getFromCache(const Key& key) {
         auto result = findInCache(key);
@@ -730,79 +675,10 @@ private:
         
     }
 
-    // =========================================================================
-    // Thread-local access counting (GDSF hot path optimization)
-    // =========================================================================
-    //
-    // Instead of a shared atomic fetch_add on every L1 hit (MESI bouncing,
-    // ~40-80ns under 6T contention), accesses are recorded in per-thread maps
-    // and batch-flushed during sweep. This reduces the hot path to ~2-3ns.
-    //
-    // One ChunkAccessCounter per chunk, one TLS map per (repo, thread, chunk).
-    // The template parameters make CachedRepo<E,N,C,K> a distinct type, so
-    // `static thread_local` gives automatic per-(repo, thread) isolation.
-
-    static constexpr long kMaxChunks = 64;
-
-    /// Per-chunk access counter pools + registries (one per repo instantiation).
-    static inline cache::ChunkAccessCounter access_chunks_[kMaxChunks]{};
-
-    /// Cached pointer to the L1Cache instance (set once in cache_init_slow).
-    /// Avoids the guard-variable function call on every findInCache.
-    static inline L1Cache* cache_ptr_{nullptr};
-
-    /// Pre-computed chunk constants (set once in Holder, never modified).
-    /// Avoids loading chunkCount() on every findInCache call.
-    static inline uint8_t chunk_bits_{0};   // = countr_zero(chunkCount())
-    static inline size_t chunk_mask_{0};    // = chunkCount() - 1
-
-    /// Flush lambda: transfer TL counts to the shared GDSFScoreData atomics.
-    static constexpr auto kFlushFn = [](void* ptr, uint8_t count) {
-        static_cast<cache::GDSFScoreData*>(ptr)->access_count.fetch_add(
-            static_cast<uint32_t>(count) * cache::GDSFScoreData::kCountScale,
-            std::memory_order_relaxed);
-    };
-
-    /// Per-thread map pointers for each chunk. Acquired lazily on first access
-    /// to a chunk, released back to pool on thread exit.
-    struct ThreadMaps {
-        cache::AccessCounterMap* maps[kMaxChunks]{};
-        ~ThreadMaps() {
-            long nc = cache::GDSFPolicy::instance().chunkCount();
-            for (long i = 0; i < nc; ++i) {
-                if (maps[i]) access_chunks_[i].release(maps[i]);
-            }
-        }
-    };
-
-    static ThreadMaps& threadMaps() {
-        static thread_local ThreadMaps tm;
-        return tm;
-    }
-
-    /// Record an access in the thread-local map for the given chunk.
-    /// Hot path: ~4-5ns (TLS lookup + open-addressing insert/increment).
-    /// On half-full, flush and grow the map to reduce future flush frequency.
-    /// After warmup (~6 growths), the map accommodates the working set and
-    /// inline flushes stop entirely — only sweep flushes remain.
-    static void recordAccess(cache::GDSFScoreData* sd, size_t hash, long chunk_id) {
-        auto& tm = threadMaps();
-        auto*& map = tm.maps[chunk_id];
-        if (!map) [[unlikely]]
-            map = access_chunks_[chunk_id].acquire();
-        if (map->record(static_cast<void*>(sd), hash)) [[unlikely]] {
-            uint8_t cur = map->capLog2();
-            uint8_t new_log2 = cur < 14 ? static_cast<uint8_t>(cur + 1) : uint8_t{0};
-            map->flush(kFlushFn, new_log2);
-        }
-    }
-
-    /// Flush all TL counters for all chunks (used by purge and test accessors).
-    static void flushAccessCounters() {
-        long nc = cache::GDSFPolicy::instance().chunkCount();
-        for (long i = 0; i < nc; ++i) {
-            access_chunks_[i].flush_all(kFlushFn);
-        }
+    /// Bump GDSF access count (simple fetch_add, no decay on read path).
+    static void bumpScore(Metadata& meta) {
+        auto val = meta.access_count.load(std::memory_order_relaxed);
+        meta.access_count.store(val + cache::GDSFScoreData::kCountScale, std::memory_order_relaxed);
     }
 
     /// Cleanup predicate for real entries: inline decay + score + histogram.
