@@ -782,7 +782,7 @@ private:
 
     /// Record an access in the thread-local map for the given chunk.
     /// Hot path: ~4-5ns (TLS lookup + open-addressing insert/increment).
-    /// On half-full, flush and grow the map to reduce future flush frequency.
+    /// On 75%-full, flush and grow the map (if under memory budget).
     /// After warmup (~6 growths), the map accommodates the working set and
     /// inline flushes stop entirely — only sweep flushes remain.
     static void recordAccess(cache::GDSFScoreData* sd, size_t hash, long chunk_id) {
@@ -792,8 +792,14 @@ private:
             map = access_chunks_[chunk_id].acquire();
         if (map->record(static_cast<void*>(sd), hash)) [[unlikely]] {
             uint8_t cur = map->capLog2();
-            uint8_t new_log2 = cur < 14 ? static_cast<uint8_t>(cur + 1) : uint8_t{0};
-            map->flush(kFlushFn, new_log2);
+            uint8_t new_log2{0};
+            if (cur < 14) {
+                size_t max_mem = cache::GDSFPolicy::instance().maxMemory();
+                if (max_mem == 0
+                    || cache::AccessCounterMap::totalBytes() < max_mem / 100)
+                    new_log2 = cur + 1;
+            }
+            map->try_flush(kFlushFn, new_log2);
         }
     }
 
