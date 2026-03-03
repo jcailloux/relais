@@ -512,6 +512,13 @@ private:
 
   template <typename T>
   extern inline memory_pool<T>& get_default_pool() {
+    // Force epoch_s and ThreadIdPool initialization before memory_pool.
+    // ~memory_pool() → clear() → get_epoch().update_epoch() → num_workers().
+    // Both must outlive memory_pool, so they must be constructed first
+    // (statics are destroyed in reverse construction order).
+    // Uses static init — runs once, not on every call.
+    static const int deps_ [[maybe_unused]] =
+        (internal::get_epoch(), parlay::num_thread_ids(), 0);
     static memory_pool<T> pool;
     return pool;
   }

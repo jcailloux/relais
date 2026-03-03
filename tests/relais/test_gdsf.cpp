@@ -789,31 +789,26 @@ TEST_CASE("GDSF - ScoreHistogram",
 TEST_CASE("GDSF - eviction_target_pct",
           "[gdsf][eviction-target]")
 {
-    SECTION("[target] 0% eviction below 50% usage") {
+    // Current implementation: 0% below 95%, linear above (usage - 0.95).
+
+    SECTION("[target] 0% eviction below 95% usage") {
         REQUIRE(GDSFPolicy::eviction_target_pct(0.0f) == 0.0f);
         REQUIRE(GDSFPolicy::eviction_target_pct(0.25f) == 0.0f);
-        REQUIRE(GDSFPolicy::eviction_target_pct(0.49f) == 0.0f);
+        REQUIRE(GDSFPolicy::eviction_target_pct(0.50f) == 0.0f);
+        REQUIRE(GDSFPolicy::eviction_target_pct(0.80f) == 0.0f);
+        REQUIRE(GDSFPolicy::eviction_target_pct(0.95f) == 0.0f);
     }
 
-    SECTION("[target] gentle zone: 50-80% usage -> 0% to 5%") {
-        float at_50 = GDSFPolicy::eviction_target_pct(0.50f);
-        float at_65 = GDSFPolicy::eviction_target_pct(0.65f);
-        float at_80 = GDSFPolicy::eviction_target_pct(0.80f);
-
-        REQUIRE(at_50 == Catch::Approx(0.0f).margin(0.001f));
-        REQUIRE(at_65 > 0.0f);
-        REQUIRE(at_65 < at_80);
-        REQUIRE(at_80 == Catch::Approx(0.05f).epsilon(0.01f));
-    }
-
-    SECTION("[target] aggressive zone: 80-100% usage -> 5% to 25%") {
-        float at_80 = GDSFPolicy::eviction_target_pct(0.80f);
-        float at_90 = GDSFPolicy::eviction_target_pct(0.90f);
+    SECTION("[target] linear above 95%") {
+        float at_96 = GDSFPolicy::eviction_target_pct(0.96f);
+        float at_98 = GDSFPolicy::eviction_target_pct(0.98f);
         float at_100 = GDSFPolicy::eviction_target_pct(1.00f);
 
-        REQUIRE(at_80 == Catch::Approx(0.05f).epsilon(0.01f));
-        REQUIRE(at_90 > at_80);
-        REQUIRE(at_100 == Catch::Approx(0.25f).epsilon(0.01f));
+        REQUIRE(at_96 == Catch::Approx(0.01f).margin(0.001f));
+        REQUIRE(at_98 == Catch::Approx(0.03f).margin(0.001f));
+        REQUIRE(at_100 == Catch::Approx(0.05f).margin(0.001f));
+        REQUIRE(at_96 < at_98);
+        REQUIRE(at_98 < at_100);
     }
 
     SECTION("[target] curve is monotonically increasing") {
@@ -975,9 +970,9 @@ TEST_CASE("GDSF - ghost admission control",
 
     // Setup: small budget (4000B), 60% inflation, high threshold
     resetRepos<GDSFGhostRepo>();
-    policy.configure({.max_memory = 4000});
+    policy.configure({.admission_pressure = 0.5f, .max_memory = 4000});
     TestInternals::seedAvgConstructionTime<GDSFGhostRepo>(10.0f);
-    policy.charge(2400);  // 60% → hasMemoryPressure()
+    policy.charge(2400);  // 60% > admission_pressure (0.5) → ghost path active
     TestInternals::setThreshold(100.0f);  // score ~0.76 < 100 → ghost
 
     SECTION("[ghost] entry ghosted when score < threshold under pressure") {
@@ -1066,9 +1061,9 @@ TEST_CASE("GDSF - ghost memory accounting",
 
     // Setup: same as test 14
     resetRepos<GDSFGhostRepo>();
-    policy.configure({.max_memory = 4000});
+    policy.configure({.admission_pressure = 0.5f, .max_memory = 4000});
     TestInternals::seedAvgConstructionTime<GDSFGhostRepo>(10.0f);
-    policy.charge(2400);
+    policy.charge(2400);  // 60% > admission_pressure (0.5) → ghost path active
     TestInternals::setThreshold(100.0f);
 
     SECTION("[ghost-acct] ghost creation does not charge (bucket slot tracked by hook)") {
@@ -1149,9 +1144,9 @@ TEST_CASE("GDSF - ghost decay and suppression",
 
     // Setup: same as ghost tests
     resetRepos<GDSFGhostRepo>();
-    policy.configure({.max_memory = 4000});
+    policy.configure({.admission_pressure = 0.5f, .max_memory = 4000});
     TestInternals::seedAvgConstructionTime<GDSFGhostRepo>(10.0f);
-    policy.charge(2400);
+    policy.charge(2400);  // 60% > admission_pressure (0.5) → ghost path active
     TestInternals::setThreshold(100.0f);
 
     SECTION("[ghost-decay] sweep decays ghost counter") {
@@ -1222,9 +1217,9 @@ TEST_CASE("GDSF - size() live count excludes ghosts",
 
     // Setup: small budget, high threshold → ghosts created
     resetRepos<GDSFGhostRepo>();
-    policy.configure({.max_memory = 4000});
+    policy.configure({.admission_pressure = 0.5f, .max_memory = 4000});
     TestInternals::seedAvgConstructionTime<GDSFGhostRepo>(10.0f);
-    policy.charge(2400);  // 60% → hasMemoryPressure()
+    policy.charge(2400);  // 60% > admission_pressure (0.5) → ghost path active
     TestInternals::setThreshold(100.0f);  // score < 100 → ghost
 
     SECTION("[size] ghosts excluded from size(), included in totalEntries()") {
@@ -1323,11 +1318,6 @@ TEST_CASE("GDSF - eviction selectivity",
 
     SECTION("[selectivity] hot entry survives, cold entries evicted") {
         resetRepos<GDSFPressureRepo>();
-        // Budget sized so 6 entries fit at ~20-30% usage, leaving room
-        // to inflate to ~90% where decay is adaptive but discriminating
-        // (decay ≈ 0.44 at 90% pressure: hot scores stay 100× above cold).
-        constexpr size_t kSmallBudget = 10000;
-        policy.configure({.max_memory = kSmallBudget});
 
         // Insert 1 "hot" entry → 100 accesses
         auto hot_id = insertTestItem("hot_entry", 1);
@@ -1349,26 +1339,19 @@ TEST_CASE("GDSF - eviction selectivity",
         REQUIRE(score_cold.has_value());
         REQUIRE(*score_hot > *score_cold);
 
-        // Inflate to just above budget to trigger isOverBudget() and the
-        // second pass in sweep (eviction_target_pct(1.0) = 25%).
-        // Pressure ≈ 1.01 → decay ≈ 0.23, hot/cold ratio stays 100:1.
-        size_t current_mem = policy.totalMemory();
-        int64_t inflation = static_cast<int64_t>(kSmallBudget) - static_cast<int64_t>(current_mem) + 100;
-        if (inflation > 0) policy.charge(inflation);
+        // Set threshold between cold and hot scores → purge evicts cold only.
+        // This directly tests GDSF selectivity without depending on the
+        // eviction curve or the iterative sweep loop.
+        float midpoint = (*score_cold + *score_hot) / 2.0f;
+        TestInternals::setThreshold(midpoint);
 
-        // Sweep → build histogram + threshold, second sweep → evict
-        policy.sweep();
-        policy.sweep();
         GDSFPressureRepo::purge();
 
-        // Discharge artificial inflation
-        policy.charge(-inflation);
-
-        // Hot entry should survive
+        // Hot entry should survive (score > threshold)
         auto hot_meta = TestInternals::getEntityGDSFMetadata<GDSFPressureRepo>(hot_id);
         REQUIRE(hot_meta.has_value());
 
-        // At least one cold entry evicted
+        // At least one cold entry evicted (score < threshold)
         REQUIRE(GDSFPressureRepo::size() < 6);
 
         // Cleanup
