@@ -8,6 +8,7 @@
 #include <memory>
 #include <mutex>
 #include <type_traits>
+#include <unordered_map>
 #include "jcailloux/relais/io/Task.h"
 #include "jcailloux/relais/repository/RedisRepo.h"
 #include "jcailloux/relais/Log.h"
@@ -21,6 +22,8 @@
 #include "jcailloux/relais/config/repo_config.h"
 #include "jcailloux/relais/config/CachedClock.h"
 #include "jcailloux/relais/cache/Metrics.h"
+#include "jcailloux/relais/cache/AccessCounter.h"
+#include "jcailloux/relais/cache/AccessTargets.h"
 #include <array>
 #include <bit>
 
@@ -226,11 +229,33 @@ public:
     /// Invalidate L1 cache only. Non-coroutine since there is no async work.
     /// Removes both real entries and ghosts.
     /// Increments the generation counter to prevent stale fetches from caching.
+    /// With GDSF: captures hash+ptr BEFORE invalidate, then unregisters the
+    /// target AFTER (entry removed from map → no reader can re-write the slot).
     static void evict(const Key& id) {
         if constexpr (HasGDSF) {
             removeGhost(id);
+
+            // Pre-read: capture hash + metadata ptr for unregisterTarget
+            auto hk = L1Cache::make_key(id);
+            size_t hash = L1Cache::get_hash(hk);
+            long cid = static_cast<long>((hash >> (48 - chunk_bits_)) & chunk_mask_);
+            void* meta_ptr = nullptr;
+            {
+                auto r = cache().find(hk);
+                if (r && !r.isGhost()) {
+                    auto* ce = r.entry();
+                    meta_ptr = static_cast<void*>(
+                        const_cast<cache::GDSFScoreData*>(
+                            static_cast<const cache::GDSFScoreData*>(&ce->metadata)));
+                }
+            }
+
             bumpGeneration(id);
             cache().invalidate(id);
+
+            if (meta_ptr) {
+                access_targets_[cid].unregisterTarget(hash, meta_ptr);
+            }
         } else {
             bumpGeneration(id);
             cache().invalidate(id);
@@ -256,6 +281,8 @@ public:
     };
 
     /// Sweep one chunk (lock-free, always succeeds).
+    /// Target-indirected flush: TL maps point to access target slots, not to
+    /// entries directly. Flush reads slot atomically under EpochGuard.
     static bool trySweep() {
         if constexpr (!HasCleanup) {
             return false;
@@ -276,14 +303,64 @@ public:
             size_t removed = 0;
 
             if constexpr (HasGDSF) {
+                auto guard = epoch::EpochGuard::acquire();
+
+                // FLUSH: accumulate TL counts per slot (no slot target dereference).
+                // Safety: slot targets may point to entries freed in a previous
+                // epoch — guard at E does NOT protect entries retired at E-1.
+                // Resolution happens during cleanup_chunk on live entries only.
+                std::unordered_map<void*, uint32_t> acc;
+                access_chunks_[chunk_id].flush_all(
+                    [&acc](void* slot_ptr, uint8_t count) {
+                        acc[slot_ptr] += static_cast<uint32_t>(count) *
+                            cache::GDSFScoreData::kCountScale;
+                    });
+
+                // SWEEP: cleanup_chunk iterates live entries → resolve TL counts
+                // + eviction predicate. Collect (hash, ptr) for deferred
+                // unregisterTarget AFTER remove().
+                struct UnregInfo { size_t hash; void* ptr; };
+                std::vector<UnregInfo> to_unreg;
+
                 removed = cache().cleanup_chunk(chunk_id, n_chunks,
-                    [&ctx](const Key& key, auto te) {
+                    [&ctx, &to_unreg, &acc, chunk_id](const Key& key, auto te) {
                         if (te.isGhost())
                             return ghostCleanupPredicate(key, te, ctx);
                         auto* ce = static_cast<typename L1Cache::CacheEntry*>(
                             te.template asReal<typename L1Cache::EntryHeader>());
-                        return cleanupPredicate(key, ce->metadata, ce->value, ctx);
+
+                        // Resolve accumulated TL counts for this live entry
+                        if (!acc.empty()) {
+                            auto hk = L1Cache::make_key(key);
+                            size_t h = L1Cache::get_hash(hk);
+                            auto* slot = access_targets_[chunk_id].slot(h);
+                            if (slot) {
+                                auto it = acc.find(static_cast<void*>(slot));
+                                if (it != acc.end() && it->second > 0) {
+                                    ce->metadata.access_count.fetch_add(
+                                        it->second, std::memory_order_relaxed);
+                                    it->second = 0;
+                                }
+                            }
+                        }
+
+                        bool evict = cleanupPredicate(key, ce->metadata, ce->value, ctx);
+                        if (evict) {
+                            auto hk = L1Cache::make_key(key);
+                            to_unreg.push_back({L1Cache::get_hash(hk),
+                                static_cast<void*>(
+                                    const_cast<cache::GDSFScoreData*>(
+                                        static_cast<const cache::GDSFScoreData*>(
+                                            &ce->metadata)))});
+                        }
+                        return evict;
                     });
+
+                // UNREGISTER: after remove() (entries no longer findable in map),
+                // still under guard (entries not freed yet). Safe timing.
+                for (auto& u : to_unreg) {
+                    access_targets_[chunk_id].unregisterTarget(u.hash, u.ptr);
+                }
             } else {
                 removed = cache().cleanup_chunk(chunk_id, n_chunks,
                     [&ctx](const Key& key, auto te) {
@@ -293,7 +370,9 @@ public:
                     });
             }
 
-            // 4. RECLAIM: epoch-based reclamation for deferred destructors.
+            // 4. RECLAIM: epoch-based reclamation is global. Stale pointers in
+            //    TL maps point to access target SLOTS (not to entries directly),
+            //    so a freed entry's slot reads nullptr → flush skips safely.
             if (removed > 0) cache().reclaim();
 
             // Post-sweep: apply ghost decays + insertions
@@ -318,6 +397,7 @@ public:
     }
 
     /// Sweep all chunks.
+    /// Target-indirected: single EpochGuard per chunk for flush + cleanup + unregister.
     static size_t purge() {
         if constexpr (!HasCleanup) {
             return 0;
@@ -338,15 +418,58 @@ public:
 
             if constexpr (HasGDSF) {
                 long n_chunks = policy.chunkCount();
+                struct UnregInfo { size_t hash; void* ptr; };
+                std::vector<UnregInfo> to_unreg;
+
                 for (long chunk_id = 0; chunk_id < n_chunks; ++chunk_id) {
+                    auto guard = epoch::EpochGuard::acquire();
+
+                    // FLUSH: accumulate TL counts (no slot target dereference)
+                    std::unordered_map<void*, uint32_t> acc;
+                    access_chunks_[chunk_id].flush_all(
+                        [&acc](void* slot_ptr, uint8_t count) {
+                            acc[slot_ptr] += static_cast<uint32_t>(count) *
+                                cache::GDSFScoreData::kCountScale;
+                        });
+
+                    to_unreg.clear();
                     removed += cache().cleanup_chunk(chunk_id, n_chunks,
-                        [&ctx](const Key& key, auto te) {
+                        [&ctx, &to_unreg, &acc, chunk_id](const Key& key, auto te) {
                             if (te.isGhost())
                                 return ghostCleanupPredicate(key, te, ctx);
                             auto* ce = static_cast<typename L1Cache::CacheEntry*>(
                                 te.template asReal<typename L1Cache::EntryHeader>());
-                            return cleanupPredicate(key, ce->metadata, ce->value, ctx);
+
+                            // Resolve accumulated TL counts
+                            if (!acc.empty()) {
+                                auto hk = L1Cache::make_key(key);
+                                size_t h = L1Cache::get_hash(hk);
+                                auto* slot = access_targets_[chunk_id].slot(h);
+                                if (slot) {
+                                    auto it = acc.find(static_cast<void*>(slot));
+                                    if (it != acc.end() && it->second > 0) {
+                                        ce->metadata.access_count.fetch_add(
+                                            it->second, std::memory_order_relaxed);
+                                        it->second = 0;
+                                    }
+                                }
+                            }
+
+                            bool evict_it = cleanupPredicate(key, ce->metadata, ce->value, ctx);
+                            if (evict_it) {
+                                auto hk = L1Cache::make_key(key);
+                                to_unreg.push_back({L1Cache::get_hash(hk),
+                                    static_cast<void*>(
+                                        const_cast<cache::GDSFScoreData*>(
+                                            static_cast<const cache::GDSFScoreData*>(
+                                                &ce->metadata)))});
+                            }
+                            return evict_it;
                         });
+
+                    for (auto& u : to_unreg) {
+                        access_targets_[chunk_id].unregisterTarget(u.hash, u.ptr);
+                    }
                 }
             } else {
                 removed = cache().full_cleanup(
@@ -428,9 +551,13 @@ protected:
         return h.instance;
     }
 
-    /// L1 cache lookup with TTL check and direct access counting.
+    /// L1 cache lookup with TTL check and thread-local access counting.
     /// Returns raw FindResult for flexible use by find/findJson/findBinary.
     /// Ghosts are treated as L1 miss (the slow path handles admission).
+    ///
+    /// GDSF hot path: instead of a shared atomic fetch_add (MESI bouncing),
+    /// accesses are recorded in per-thread maps and flushed in batch during sweep.
+    /// Kept minimal (~4 lines) so the compiler inlines into getFromCache/find.
     static typename L1Cache::FindResult findInCache(const Key& key) {
         auto hk = L1Cache::make_key(key);
         auto result = cache().find(hk);
@@ -446,18 +573,32 @@ protected:
         // TTL expiration check: two-phase eviction (find → check → evict)
         if constexpr (HasTTL) {
             if (entry->metadata.isExpired(config::CachedClock::now())) {
+                // Remove only if pointer identity matches (guards against concurrent Upsert)
                 cache().remove_if(key, [entry](auto* e) { return e == entry; });
+                // Unregister target after remove (entry not freed yet — result holds guard)
+                if constexpr (HasGDSF) {
+                    size_t hash = L1Cache::get_hash(hk);
+                    long cid = static_cast<long>(
+                        (hash >> (48 - chunk_bits_)) & chunk_mask_);
+                    access_targets_[cid].unregisterTarget(hash,
+                        static_cast<void*>(
+                            const_cast<cache::GDSFScoreData*>(
+                                static_cast<const cache::GDSFScoreData*>(
+                                    &entry->metadata))));
+                }
                 return {};
             }
         }
 
-        // Direct access counting: fetch_add(relaxed) on the entry's metadata.
-        // Safe: entry is alive under the EpochGuard held by FindResult.
-        // Cost: ~0ns uncontended (cache line already in L1d from find()).
         if constexpr (HasGDSF) {
-            entry->metadata.access_count.fetch_add(
-                cache::GDSFScoreData::kCountScale,
-                std::memory_order_relaxed);
+            // Thread-local access counting via target-indirected slots.
+            // chunk_bits_ / chunk_mask_ are pre-computed static constants.
+            size_t hash = L1Cache::get_hash(hk);
+            long chunk_id = static_cast<long>(
+                (hash >> (48 - chunk_bits_)) & chunk_mask_);
+            recordAccess(
+                static_cast<cache::GDSFScoreData*>(&entry->metadata),
+                hash, chunk_id);
         }
 
         return result;
@@ -476,17 +617,76 @@ protected:
     /// Put entity in cache (copy). Returns FindResult for flexible use.
     /// No tick here — the sweep counter is driven by fetchAndCache (DB fetches),
     /// not by local cache mutations (update, insert via API).
+    /// With GDSF: flush TL counters for the target slot before upsert so that
+    /// mergeFrom reads the correct access_count from the old entry.
+    ///
+    /// Safety: find-based flush — find() the live entry under its own guard,
+    /// then transfer counts directly to its metadata. Never dereference slot
+    /// targets (guard at epoch E does NOT protect entries retired at E-1).
     static typename L1Cache::FindResult putInCache(const Key& key, const Entity& src,
         Clock::time_point now = Clock::now())
     {
-        return cache().upsert(L1Cache::make_key(key), buildValue(src), buildMetadata(now));
+        if constexpr (HasGDSF) {
+            auto hk = L1Cache::make_key(key);
+            size_t hash = L1Cache::get_hash(hk);
+            long cid = static_cast<long>((hash >> (48 - chunk_bits_)) & chunk_mask_);
+            auto* slot = access_targets_[cid].slot(hash);
+            if (slot) {
+                auto existing = cache().find(hk);
+                if (existing) {
+                    auto* md = static_cast<cache::GDSFScoreData*>(
+                        &existing.asReal()->metadata);
+                    access_chunks_[cid].flush_one_all(slot, hash,
+                        [md](void*, uint8_t count) {
+                            md->access_count.fetch_add(
+                                static_cast<uint32_t>(count) *
+                                    cache::GDSFScoreData::kCountScale,
+                                std::memory_order_relaxed);
+                        });
+                }
+            }
+            auto result = cache().upsert(hk, buildValue(src), buildMetadata(now));
+            // Register the NEW entry so the slot never holds a dangling ptr.
+            access_targets_[cid].registerAndSlot(hash,
+                static_cast<void*>(
+                    static_cast<cache::GDSFScoreData*>(&result.asReal()->metadata)));
+            return result;
+        } else {
+            return cache().upsert(L1Cache::make_key(key), buildValue(src), buildMetadata(now));
+        }
     }
 
     /// Put entity in cache (move — zero copy). Returns FindResult.
     static typename L1Cache::FindResult putInCache(const Key& key, Entity&& src,
         Clock::time_point now = Clock::now())
     {
-        return cache().upsert(L1Cache::make_key(key), buildValue(std::move(src)), buildMetadata(now));
+        if constexpr (HasGDSF) {
+            auto hk = L1Cache::make_key(key);
+            size_t hash = L1Cache::get_hash(hk);
+            long cid = static_cast<long>((hash >> (48 - chunk_bits_)) & chunk_mask_);
+            auto* slot = access_targets_[cid].slot(hash);
+            if (slot) {
+                auto existing = cache().find(hk);
+                if (existing) {
+                    auto* md = static_cast<cache::GDSFScoreData*>(
+                        &existing.asReal()->metadata);
+                    access_chunks_[cid].flush_one_all(slot, hash,
+                        [md](void*, uint8_t count) {
+                            md->access_count.fetch_add(
+                                static_cast<uint32_t>(count) *
+                                    cache::GDSFScoreData::kCountScale,
+                                std::memory_order_relaxed);
+                        });
+                }
+            }
+            auto result = cache().upsert(hk, buildValue(std::move(src)), buildMetadata(now));
+            access_targets_[cid].registerAndSlot(hash,
+                static_cast<void*>(
+                    static_cast<cache::GDSFScoreData*>(&result.asReal()->metadata)));
+            return result;
+        } else {
+            return cache().upsert(L1Cache::make_key(key), buildValue(std::move(src)), buildMetadata(now));
+        }
     }
 
     /// Put entity in cache and return EntityView (copy path).
@@ -850,6 +1050,28 @@ private:
         
     }
 
+    // =========================================================================
+    // Thread-local access counting (GDSF hot path optimization)
+    // =========================================================================
+    //
+    // Instead of a shared atomic fetch_add on every L1 hit (MESI bouncing,
+    // ~40-80ns under 6T contention), accesses are recorded in per-thread maps
+    // and batch-flushed during sweep. This reduces the hot path to ~2-3ns.
+    //
+    // One ChunkAccessCounter per chunk, one TLS map per (repo, thread, chunk).
+    // The template parameters make CachedRepo<E,N,C,K> a distinct type, so
+    // `static thread_local` gives automatic per-(repo, thread) isolation.
+
+    static constexpr long kMaxChunks = 64;
+
+    /// Per-chunk access counter pools + registries (one per repo instantiation).
+    static inline cache::ChunkAccessCounter access_chunks_[kMaxChunks]{};
+
+    /// Per-chunk access targets for safe TL counter indirection.
+    /// TL maps store pointers to slots in these arrays (not to entries directly).
+    /// Each slot is atomic<void*>: non-null = live entry, nullptr = evicted.
+    static inline cache::AccessTargets access_targets_[kMaxChunks]{};
+
     /// Cached pointer to the L1Cache instance (set once in cache_init_slow).
     /// Avoids the guard-variable function call on every findInCache.
     static inline L1Cache* cache_ptr_{nullptr};
@@ -858,6 +1080,91 @@ private:
     /// Avoids loading chunkCount() on every findInCache call.
     static inline uint8_t chunk_bits_{0};   // = countr_zero(chunkCount())
     static inline size_t chunk_mask_{0};    // = chunkCount() - 1
+
+    /// No-op flush lambda: drains map without dereferencing slot targets.
+    /// Used for anti-overflow flush (kMapFull) and flushAccessCounters.
+    /// Why no-op: slot targets may point to entries freed in a previous epoch
+    /// (guard at epoch E does NOT protect entries retired at E-1), so any
+    /// slot->load() → dereference is unsafe even under EpochGuard.
+    /// Safe flush patterns: captured-sd (count=255), find-based (putInCache),
+    /// accumulate+resolve (sweep).
+    static constexpr auto kNoopFn = [](void*, uint8_t) {};
+
+    /// Per-thread map pointers for each chunk. Acquired lazily on first access
+    /// to a chunk, released back to pool on thread exit.
+    /// cached_data[] caches AccessTargets::data_ to avoid load(acquire) on ARM.
+    /// data_ never changes after allocation → cached pointer is valid for life.
+    struct ThreadMaps {
+        cache::AccessCounterMap* maps[kMaxChunks]{};
+        std::atomic<void*>* cached_data[kMaxChunks]{};
+        ~ThreadMaps() {
+            long nc = cache::GDSFPolicy::instance().chunkCount();
+            for (long i = 0; i < nc; ++i) {
+                if (maps[i]) access_chunks_[i].release(maps[i]);
+            }
+        }
+    };
+
+    static ThreadMaps& threadMaps() {
+        static thread_local ThreadMaps tm;
+        return tm;
+    }
+
+    /// Record an access in the thread-local map for the given chunk.
+    /// Hot path: 0 load(acquire) (data_ TLS-cached), 1 store(relaxed) to slot.
+    /// Overflow: count=255 → surgical flush_one (~10ns); kMapFull → noop flush
+    /// (anti-overflow, counts lost but re-accumulated in ~1 sweep).
+    static void recordAccess(cache::GDSFScoreData* sd, size_t hash, long chunk_id) {
+        auto& tm = threadMaps();
+
+        // TLS-cached data_ — data_ never changes after ensureAllocated(),
+        // so cached pointer is valid for the lifetime of the AccessTargets.
+        auto*& d = tm.cached_data[chunk_id];
+        if (!d) [[unlikely]] {
+            access_targets_[chunk_id].ensureAllocated();
+            d = access_targets_[chunk_id].data_.load(std::memory_order_acquire);
+        }
+
+        // Register target + get slot ptr (single array deref, no load(acquire))
+        auto& cell = d[(hash >> 16) & cache::AccessTargets::kMask];
+        cell.store(static_cast<void*>(sd), std::memory_order_relaxed);
+        auto* slot = &cell;
+
+        auto*& map = tm.maps[chunk_id];
+        if (!map) [[unlikely]]
+            map = access_chunks_[chunk_id].acquire();
+        auto rr = map->record(static_cast<void*>(slot), hash);
+        if (rr != cache::RecordResult::kOk) [[unlikely]] {
+            if (rr == cache::RecordResult::kCountFull) {
+                // count=255 overflow: surgical flush for this entry only.
+                // Direct write to sd (captured, protected by findInCache's
+                // caller guard). Never dereference slot targets.
+                map->flush_one(static_cast<void*>(slot), hash,
+                    [sd](void*, uint8_t count) {
+                        sd->access_count.fetch_add(
+                            static_cast<uint32_t>(count) *
+                                cache::GDSFScoreData::kCountScale,
+                            std::memory_order_relaxed);
+                    });
+            } else {
+                // kMapFull: >= 75% full or probe failure.
+                // Anti-overflow: drain the map. Counts lost (no safe dereference
+                // without EpochGuard). Re-accumulated in ~1 sweep cycle.
+                // Frequency: ~1x per 3072 unique accesses (75% of 4096).
+                map->try_flush(kNoopFn);
+            }
+        }
+    }
+
+    /// Flush all TL counters for all chunks (drains maps without dereferencing).
+    /// Counts are lost (not transferred to entries) — use before trySweep if
+    /// precise counts are needed (trySweep resolves via accumulate+iterate).
+    static void flushAccessCounters() {
+        long nc = cache::GDSFPolicy::instance().chunkCount();
+        for (long i = 0; i < nc; ++i) {
+            access_chunks_[i].flush_all(kNoopFn);
+        }
+    }
 
     /// Cleanup predicate for real entries: inline decay + score + histogram.
     /// When evicting, accumulates ghost candidates for post-sweep insertion.
