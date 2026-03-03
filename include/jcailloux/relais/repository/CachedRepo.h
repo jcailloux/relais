@@ -3,8 +3,12 @@
 
 #include <atomic>
 #include <chrono>
+#include <coroutine>
+#include <exception>
 #include <memory>
+#include <mutex>
 #include <type_traits>
+#include <unordered_map>
 #include "jcailloux/relais/io/Task.h"
 #include "jcailloux/relais/repository/RedisRepo.h"
 #include "jcailloux/relais/Log.h"
@@ -300,7 +304,11 @@ public:
                 access_chunks_[chunk_id].flush_all(kFlushFn);
             }
 
-            // 4. RECLAIM: safe — no dangling pointers in TL maps for this chunk.
+            // 4. RECLAIM: epoch-based reclamation is global (frees entries from
+            //    all chunks, not just the current one). Stale pointers in TL maps
+            //    for OTHER chunks are safe because the CacheEntry pool uses
+            //    recycling mode: freed memory stays mapped, so a spurious
+            //    fetch_add on a recycled entry's access_count is harmless.
             if (removed > 0) cache().reclaim();
 
             // Post-sweep: apply ghost decays via read-modify-write
@@ -525,9 +533,148 @@ protected:
     }
 
 private:
-    /// Slow path for find(): L1 miss → (L2) → DB → cache.
+    // =========================================================================
+    // Inflight dedup — coalesce concurrent misses on the same key
+    // =========================================================================
+
+    struct InflightEntry {
+        std::mutex mu;
+        std::atomic<bool> done{false};
+        std::vector<std::coroutine_handle<>> waiters;
+
+        enum class Outcome : uint8_t { pending, found, not_found, error };
+        Outcome outcome = Outcome::pending;
+        std::exception_ptr error;  // set if outcome == error
+    };
+
+    struct ShardedInflightMap {
+        static constexpr int kShards = 16;
+        struct Shard {
+            std::mutex mu;
+            std::unordered_map<Key, std::shared_ptr<InflightEntry>,
+                               cache::detail::AutoHash<Key>> map;
+        };
+        std::array<Shard, kShards> shards;
+
+        Shard& shard_for(const Key& k) {
+            return shards[cache::detail::AutoHash<Key>{}(k)
+                          & static_cast<size_t>(kShards - 1)];
+        }
+
+        struct AcquireResult {
+            std::shared_ptr<InflightEntry> entry;
+            bool is_leader;
+        };
+
+        AcquireResult acquire(const Key& k) {
+            auto& s = shard_for(k);
+            std::lock_guard lk(s.mu);
+            auto& slot = s.map[k];
+            if (!slot) {
+                slot = std::make_shared<InflightEntry>();
+                return {slot, true};
+            }
+            return {slot, false};
+        }
+
+        void erase(const Key& k) {
+            auto& s = shard_for(k);
+            std::lock_guard lk(s.mu);
+            s.map.erase(k);
+        }
+    };
+
+    /// Coroutine awaiter for dedup followers.
+    /// await_suspend returns bool: false if already done (no suspend needed).
+    struct DedupAwaiter {
+        std::shared_ptr<InflightEntry> entry;
+
+        bool await_ready() const noexcept {
+            return entry->done.load(std::memory_order_acquire);
+        }
+
+        bool await_suspend(std::coroutine_handle<> h) {
+            std::lock_guard lk(entry->mu);
+            // Re-check under lock to avoid race between await_ready and suspend
+            if (entry->done.load(std::memory_order_relaxed)) {
+                return false;  // don't suspend, resume immediately
+            }
+            entry->waiters.push_back(h);
+            return true;  // suspend
+        }
+
+        void await_resume() noexcept {}
+    };
+
+    static ShardedInflightMap& inflightMap() {
+        static ShardedInflightMap map;
+        return map;
+    }
+
+    /// Slow path for find(): L1 miss → dedup → (L2) → DB → cache.
     static io::Task<wrapper::EntityView<Entity>> findSlow(const Key& id) {
-        co_return co_await fetchAndCache(id);
+        auto [entry, is_leader] = inflightMap().acquire(id);
+
+        if (is_leader) {
+            // Leader: execute the actual fetch
+            wrapper::EntityView<Entity> result;
+            try {
+                result = co_await fetchAndCache(id);
+                // Determine outcome
+                {
+                    std::lock_guard lk(entry->mu);
+                    entry->outcome = result
+                        ? InflightEntry::Outcome::found
+                        : InflightEntry::Outcome::not_found;
+                    entry->done.store(true, std::memory_order_release);
+                }
+            } catch (...) {
+                // Propagate error to followers
+                {
+                    std::lock_guard lk(entry->mu);
+                    entry->outcome = InflightEntry::Outcome::error;
+                    entry->error = std::current_exception();
+                    entry->done.store(true, std::memory_order_release);
+                }
+                // Resume followers, erase, then rethrow
+                for (auto h : entry->waiters) h.resume();
+                inflightMap().erase(id);
+                throw;
+            }
+
+            // Resume all waiting followers
+            // Copy waiters under lock then resume outside lock
+            std::vector<std::coroutine_handle<>> to_resume;
+            {
+                std::lock_guard lk(entry->mu);
+                to_resume = std::move(entry->waiters);
+            }
+            for (auto h : to_resume) h.resume();
+
+            // Remove from map
+            inflightMap().erase(id);
+
+            co_return result;
+        }
+
+        // Follower: wait for leader to complete
+        co_await DedupAwaiter{entry};
+
+        switch (entry->outcome) {
+        case InflightEntry::Outcome::found: {
+            // Entity should be in L1 cache now
+            auto view = getFromCache(id);
+            if (view) co_return view;
+            // Evicted between leader store and follower read — fallback
+            co_return co_await fetchAndCache(id);
+        }
+        case InflightEntry::Outcome::not_found:
+            co_return {};
+        case InflightEntry::Outcome::error:
+            std::rethrow_exception(entry->error);
+        default:
+            co_return {};
+        }
     }
 
     /// Slow path for findJson(): L1 miss → (L2) → DB → cache → JSON.

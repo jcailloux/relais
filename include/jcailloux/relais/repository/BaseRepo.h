@@ -299,10 +299,12 @@ protected:
     // =====================================================================
 
     /// Find by ID, returning entity by value (no pool/view allocation).
+    /// Routes through submitEntityRead for ANY-array batching.
     static io::Task<std::optional<Entity>> findRaw(const Key& id) {
         try {
             auto params = io::PgParams::fromKey(id);
-            auto result = co_await DbProvider::queryParams(
+            auto result = co_await DbProvider::entityQueryParams(
+                Mapping::SQL::select_by_pk_batch,
                 Mapping::SQL::select_by_pk, params);
             if (result.empty()) co_return std::nullopt;
             co_return Entity::fromRow(result[0]);

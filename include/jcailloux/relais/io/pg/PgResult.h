@@ -75,7 +75,9 @@ public:
     // Dimensions
 
     [[nodiscard]] int rows() const noexcept {
-        return result_ ? PQntuples(result_.get()) : 0;
+        if (!result_) return 0;
+        if (is_slice_) return 1;
+        return PQntuples(result_.get());
     }
 
     // Status
@@ -103,7 +105,7 @@ public:
     // Row access
 
     [[nodiscard]] Row operator[](int row) const noexcept {
-        return Row(*this, row);
+        return Row(*this, is_slice_ ? row_offset_ : row);
     }
 
     // Raw access (used internally by Row)
@@ -115,8 +117,27 @@ public:
         return result_;
     }
 
+    /// Number of columns in the result.
+    [[nodiscard]] int cols() const noexcept {
+        return result_ ? PQnfields(result_.get()) : 0;
+    }
+
+    /// Create a single-row view sharing the same PGresult.
+    /// The returned PgResult shares ownership of the underlying PGresult
+    /// but presents a view offset to the given row index.
+    /// This enables zero-copy distribution of ANY-batch results.
+    static PgResult sliceRow(const PgResult& batch, int row_index) {
+        PgResult r;
+        r.result_ = batch.result_;
+        r.row_offset_ = row_index;
+        r.is_slice_ = true;
+        return r;
+    }
+
 private:
     std::shared_ptr<PGresult> result_{nullptr, &PQclear};
+    int row_offset_ = 0;   // for sliceRow views
+    bool is_slice_ = false;
 };
 
 // Type specializations for Row::get<T>
