@@ -68,6 +68,17 @@ public:
         return pg_query_params_(sql, params);
     }
 
+    /// Execute an entity read query — routed through submitEntityRead for
+    /// ANY-array batching. batch_sql is the ANY variant (may be null).
+    /// @note sql pointers and params must remain valid until co_await completes.
+    static io::Task<io::PgResult> entityQueryParams(
+        const char* batch_sql, const char* single_sql,
+        const io::PgParams& params)
+    {
+        assert(pg_entity_query_ && "DbProvider::entityQueryParams() called before init()");
+        return pg_entity_query_(batch_sql, single_sql, params);
+    }
+
     /// Execute a command (INSERT/UPDATE/DELETE), returning {affected_rows, coalesced}.
     /// coalesced=true means an identical write was already batched and this
     /// caller received the leader's result without a DB round-trip.
@@ -174,6 +185,13 @@ public:
         {
             co_return co_await batcher->submitQueryRead(sql, io::PgParams{params});
         };
+        pg_entity_query_ = [batcher](const char* batch_sql, const char* single_sql,
+                                      const io::PgParams& params)
+            -> io::Task<io::PgResult>
+        {
+            co_return co_await batcher->submitEntityRead(
+                batch_sql, single_sql, io::PgParams{params});
+        };
         pg_execute_ = [batcher](const char* sql, const io::PgParams& params)
             -> io::Task<std::pair<int, bool>>
         {
@@ -197,6 +215,7 @@ public:
     static void reset() noexcept {
         pg_query_ = nullptr;
         pg_query_params_ = nullptr;
+        pg_entity_query_ = nullptr;
         pg_execute_ = nullptr;
         redis_exec_ = nullptr;
     }
@@ -208,6 +227,8 @@ public:
     using PgQueryFn = std::function<io::Task<io::PgResult>(const char*)>;
     using PgQueryParamsFn = std::function<io::Task<io::PgResult>(
         const char*, const io::PgParams&)>;
+    using PgEntityQueryFn = std::function<io::Task<io::PgResult>(
+        const char*, const char*, const io::PgParams&)>;
     using PgExecuteFn = std::function<io::Task<std::pair<int, bool>>(
         const char*, const io::PgParams&)>;
     using RedisExecFn = std::function<io::Task<io::RedisResult>(
@@ -215,6 +236,7 @@ public:
 
     static inline PgQueryFn pg_query_;
     static inline PgQueryParamsFn pg_query_params_;
+    static inline PgEntityQueryFn pg_entity_query_;
     static inline PgExecuteFn pg_execute_;
     static inline RedisExecFn redis_exec_;
 

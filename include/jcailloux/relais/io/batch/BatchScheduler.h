@@ -172,6 +172,9 @@ private:
         std::coroutine_handle<> continuation{};
         PgResult result;
         int64_t processing_time_us = 0;
+
+        // Key values for ANY-batch result matching (populated before ANY send)
+        std::vector<std::string> key_values;
     };
 
     struct PgWriteEntry {
@@ -587,16 +590,30 @@ private:
 
             // Build ANY segments from entity groups
             for (auto& [sql, group] : entity_groups) {
-                // Build the ANY array as a PG array literal: {val1,val2,...}
-                // For simple keys: single param as PG array text format
-                // For now: send each entity as individual pipelined queries
-                // (ANY batching requires generated batch SQL — Phase 5)
-                for (auto* e : group) {
+                if (group.size() == 1) {
+                    // Single entity: no batching overhead
+                    auto* e = group[0];
                     Segment seg;
                     seg.sql = e->single_sql;
                     seg.params = std::move(e->params);
                     seg.waiters.push_back(e);
                     seg.is_any = false;
+                    segments.push_back(std::move(seg));
+                } else {
+                    // Multiple entities: build ANY($1) array literal
+                    // Save key_values on each entry for result matching
+                    std::vector<PgParams> keys;
+                    keys.reserve(group.size());
+                    for (auto* e : group) {
+                        e->key_values = e->params.keyValues();
+                        keys.push_back(std::move(e->params));
+                    }
+
+                    Segment seg;
+                    seg.sql = sql;  // batch_sql: SELECT ... WHERE pk = ANY($1)
+                    seg.params = PgParams::buildArrayLiteral(keys);
+                    seg.waiters = group;
+                    seg.is_any = true;
                     segments.push_back(std::move(seg));
                 }
             }
@@ -630,18 +647,27 @@ private:
                 auto& seg = segments[i];
                 auto& pr = results[i];
 
-                for (auto* waiter : seg.waiters) {
-                    waiter->result = std::move(pr.result);
-                    waiter->processing_time_us = pr.processing_time_us;
-                }
+                if (!seg.is_any) {
+                    // Non-ANY segment: single waiter gets full result
+                    for (auto* waiter : seg.waiters) {
+                        waiter->result = std::move(pr.result);
+                        waiter->processing_time_us = pr.processing_time_us;
+                    }
+                } else {
+                    // ANY segment: match result rows to waiters by PK values
+                    distributeAnyResults(seg.waiters, pr.result,
+                                         pr.processing_time_us);
 
-                // Update timing estimator
-                if (seg.is_any && !seg.waiters.empty()) {
-                    auto* first_waiter = seg.waiters[0];
-                    estimator_.updateSqlTimingPerKey(
-                        first_waiter->batch_sql ? first_waiter->batch_sql : first_waiter->single_sql,
-                        static_cast<int>(seg.waiters.size()),
-                        static_cast<double>(pr.processing_time_us) * 1000.0);
+                    // Update timing estimator for per-key cost
+                    if (!seg.waiters.empty()) {
+                        auto* first_waiter = seg.waiters[0];
+                        estimator_.updateSqlTimingPerKey(
+                            first_waiter->batch_sql
+                                ? first_waiter->batch_sql
+                                : first_waiter->single_sql,
+                            static_cast<int>(seg.waiters.size()),
+                            static_cast<double>(pr.processing_time_us) * 1000.0);
+                    }
                 }
             }
 
@@ -934,6 +960,45 @@ private:
     // =========================================================================
     // Helpers
     // =========================================================================
+
+    /// Distribute an ANY-batch PgResult to individual waiters by matching
+    /// PK column values. Each waiter gets a zero-copy sliceRow view.
+    /// Waiters without a match receive an empty PgResult.
+    void distributeAnyResults(std::vector<PgReadEntry*>& waiters,
+                               PgResult& batch_result,
+                               int64_t processing_time_us) {
+        int n_rows = batch_result.valid()
+            ? PQntuples(batch_result.raw()) : 0;
+        int n_pk_cols = waiters.empty() ? 0
+            : static_cast<int>(waiters[0]->key_values.size());
+
+        // Build lookup: for each row, extract PK columns as strings
+        // and match against each waiter's key_values.
+        // O(rows * waiters * pk_cols) — typically small (< 100 total).
+        for (auto* waiter : waiters) {
+            waiter->processing_time_us = processing_time_us;
+            bool matched = false;
+
+            for (int r = 0; r < n_rows && !matched; ++r) {
+                bool row_match = true;
+                for (int c = 0; c < n_pk_cols; ++c) {
+                    auto rv = batch_result[r].rawValue(c);
+                    if (rv != std::string_view(waiter->key_values[c])) {
+                        row_match = false;
+                        break;
+                    }
+                }
+                if (row_match) {
+                    waiter->result = PgResult::sliceRow(batch_result, r);
+                    matched = true;
+                }
+            }
+
+            if (!matched) {
+                waiter->result = PgResult{};  // not found
+            }
+        }
+    }
 
     Task<void> readAndDiscardPipelineResult(PgConnection<Io>& conn) {
         // Read and discard a single pipeline result (prepare result)

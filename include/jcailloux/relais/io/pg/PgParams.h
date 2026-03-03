@@ -174,6 +174,76 @@ struct PgParams {
         }
     }
 
+    /// Build PG array literals from a vector of PgParams (one per key).
+    /// Returns N PgParams objects, one per key column, each containing the
+    /// PG array literal: {val1,val2,...}
+    ///
+    /// For simple keys (1 param each): returns a single PgParams with one array.
+    /// For composite keys (N params each): returns a single PgParams with N arrays.
+    ///
+    /// Example: keys [PgParams({1}), PgParams({2}), PgParams({3})]
+    ///   → PgParams with one param: "{1,2,3}"
+    ///
+    /// Example: composite keys [PgParams({1,"a"}), PgParams({2,"b"})]
+    ///   → PgParams with two params: "{1,2}" and "{a,b}"
+    static PgParams buildArrayLiteral(const std::vector<PgParams>& keys) {
+        if (keys.empty()) return {};
+
+        size_t n_cols = keys[0].params.size();
+        PgParams result;
+        result.params.reserve(n_cols);
+
+        for (size_t col = 0; col < n_cols; ++col) {
+            std::string arr = "{";
+            for (size_t i = 0; i < keys.size(); ++i) {
+                if (i > 0) arr += ',';
+                const auto& p = keys[i].params[col];
+                if (p.isNull()) {
+                    arr += "NULL";
+                } else {
+                    // Escape values: quote if they contain special chars
+                    std::string_view val(p.data(),
+                        static_cast<size_t>(p.length()));
+                    bool needs_quoting = val.empty();
+                    if (!needs_quoting) {
+                        for (char c : val) {
+                            if (c == ',' || c == '{' || c == '}' || c == '"'
+                                || c == '\\' || c == ' ') {
+                                needs_quoting = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (needs_quoting) {
+                        arr += '"';
+                        for (char c : val) {
+                            if (c == '"' || c == '\\') arr += '\\';
+                            arr += c;
+                        }
+                        arr += '"';
+                    } else {
+                        arr += val;
+                    }
+                }
+            }
+            arr += '}';
+            result.params.push_back(PgParam(std::move(arr)));
+        }
+
+        return result;
+    }
+
+    /// Extract key column values as strings from a PgParams (for result matching).
+    [[nodiscard]] std::vector<std::string> keyValues() const {
+        std::vector<std::string> vals;
+        vals.reserve(params.size());
+        for (const auto& p : params) {
+            vals.emplace_back(p.isNull() ? "" : std::string(p.data(),
+                static_cast<size_t>(p.length())));
+        }
+        return vals;
+    }
+
 private:
     static PgParam toParam(PgParam p) { return p; }
     static PgParam toParam(int32_t v) { return PgParam::integer(v); }

@@ -184,6 +184,21 @@ public:
             co_return co_await workers_[0].batcher->submitQueryRead(sql, PgParams{params});
         };
 
+        // PG entityQueryParams (entity reads routed to submitEntityRead)
+        DbProvider::pg_entity_query_ = [this](const char* batch_sql,
+                                               const char* single_sql,
+                                               const PgParams& params)
+            -> Task<PgResult>
+        {
+            auto* batcher = getBatcher();
+            if (batcher) {
+                co_return co_await batcher->submitEntityRead(
+                    batch_sql, single_sql, PgParams{params});
+            }
+            co_return co_await workers_[0].batcher->submitEntityRead(
+                batch_sql, single_sql, PgParams{params});
+        };
+
         // PG execute
         DbProvider::pg_execute_ = [this](const char* sql,
                                           const PgParams& params)
