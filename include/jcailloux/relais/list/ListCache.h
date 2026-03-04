@@ -407,11 +407,9 @@ public:
 
         auto hk = L1Cache::make_key(key);
 
-        // Flush TL counters for the target slot before upsert so that
-        // mergeFrom reads the correct access_count from the old entry.
-        // Safety: find() first to get the live entry under guard, then flush
-        // directly to its metadata (no slot->load dereference — see CachedRepo
-        // putInCache comment for full epoch-safety rationale).
+        // Unresolved TL counts stay in TL maps → resolved at next sweep
+        // via the stable slot (registerAndSlot updates slot to new entry).
+        // mergeFrom transfers resolved access_count from old entry.
         size_t put_hash{};
         long put_cid{};
         if constexpr (GDSF && cache::GDSFPolicy::enabled) {
@@ -419,29 +417,12 @@ public:
             constexpr uint8_t kChunkBits = ChunkCountLog2;
             constexpr size_t kChunkMask = ChunkCount - 1;
             put_cid = static_cast<long>((put_hash >> (48 - kChunkBits)) & kChunkMask);
-            auto* slot = access_targets_[put_cid].slot(put_hash);
-            if (slot) {
-                auto existing = cache_.find(hk);
-                if (existing) {
-                    auto* md = const_cast<cache::GDSFScoreData*>(
-                        static_cast<const cache::GDSFScoreData*>(
-                            &existing.asReal()->metadata.gdsf));
-                    access_chunks_[put_cid].flush_one_all(slot, put_hash,
-                        [md](void*, uint8_t count) {
-                            md->access_count.fetch_add(
-                                static_cast<uint32_t>(count) *
-                                    cache::GDSFScoreData::kCountScale,
-                                std::memory_order_relaxed);
-                        });
-                }
-            }
         }
 
         auto find_result = cache_.upsert(hk, std::move(result), std::move(meta));
 
         if constexpr (GDSF && cache::GDSFPolicy::enabled) {
             auto* ce = find_result.asReal();
-            // Register the NEW entry in the slot (replaces stale old-entry ptr).
             access_targets_[put_cid].registerAndSlot(put_hash,
                 static_cast<void*>(
                     const_cast<cache::GDSFScoreData*>(
@@ -536,44 +517,51 @@ public:
             float threshold = cache::GDSFPolicy::instance().threshold();
             auto guard = epoch::EpochGuard::acquire();
 
-            // FLUSH: accumulate TL counts per slot (no slot target dereference).
-            // Resolution happens during cleanup_chunk on live entries only.
-            std::unordered_map<void*, uint32_t> acc;
-            access_chunks_[chunk].flush_all(
-                [&acc](void* slot_ptr, uint8_t count) {
-                    acc[slot_ptr] += static_cast<uint32_t>(count) *
-                        cache::GDSFScoreData::kCountScale;
-                });
+            // FLUSH: accumulate TL counts into flat array indexed by slot offset.
+            static thread_local uint32_t tl_acc[cache::AccessTargets::kCapacity];
+            bool has_counts = false;
+            auto* at_base = access_targets_[chunk].data_.load(
+                std::memory_order_relaxed);
+            if (at_base) {
+                std::memset(tl_acc, 0, sizeof(tl_acc));
+                access_chunks_[chunk].flush_all(
+                    [&has_counts, at_base](void* slot_ptr, uint8_t count) {
+                        auto idx = static_cast<uint32_t>(
+                            static_cast<std::atomic<void*>*>(slot_ptr) - at_base);
+                        if (idx < cache::AccessTargets::kCapacity) {
+                            tl_acc[idx] += static_cast<uint32_t>(count) *
+                                cache::GDSFScoreData::kCountScale;
+                            has_counts = true;
+                        }
+                    });
+            }
 
-            // Collect (hash, ptr) for deferred unregisterTarget after remove()
             struct UnregInfo { size_t hash; void* ptr; };
             std::vector<UnregInfo> to_unreg;
 
             removed = cache_.cleanup_chunk(chunk, n_chunks,
-                [this, now, threshold, chunk, &to_unreg, &acc](const CacheKey& key, auto te) {
+                [this, now, threshold, has_counts, chunk, &to_unreg](const CacheKey& key, auto te) {
                     auto* entry = static_cast<typename L1Cache::CacheEntry*>(
                         te.template asReal<typename L1Cache::EntryHeader>());
 
-                    // Resolve accumulated TL counts for this live entry
-                    if (!acc.empty()) {
-                        auto hk = L1Cache::make_key(key);
-                        size_t h = L1Cache::get_hash(hk);
-                        auto* slot = access_targets_[chunk].slot(h);
-                        if (slot) {
-                            auto it = acc.find(static_cast<void*>(slot));
-                            if (it != acc.end() && it->second > 0) {
-                                entry->metadata.gdsf.access_count.fetch_add(
-                                    it->second, std::memory_order_relaxed);
-                                it->second = 0;
-                            }
+                    auto hk = L1Cache::make_key(key);
+                    size_t h = L1Cache::get_hash(hk);
+
+                    // Resolve accumulated TL counts via flat array (O(1) lookup)
+                    if (has_counts) {
+                        uint32_t si = static_cast<uint32_t>(
+                            (h >> 16) & cache::AccessTargets::kMask);
+                        if (tl_acc[si] > 0) {
+                            entry->metadata.gdsf.access_count.fetch_add(
+                                tl_acc[si], std::memory_order_relaxed);
+                            tl_acc[si] = 0;
                         }
                     }
 
                     bool evict_it = cleanupPredicate(
                         entry->metadata, entry->value, now, threshold, chunk);
                     if (evict_it) {
-                        auto hk = L1Cache::make_key(key);
-                        to_unreg.push_back({L1Cache::get_hash(hk),
+                        to_unreg.push_back({h,
                             static_cast<void*>(&entry->metadata.gdsf)});
                     }
                     return evict_it;
@@ -619,40 +607,49 @@ public:
             for (long chunk = 0; chunk < n_chunks; ++chunk) {
                 auto guard = epoch::EpochGuard::acquire();
 
-                // FLUSH: accumulate TL counts (no slot target dereference)
-                std::unordered_map<void*, uint32_t> acc;
-                access_chunks_[chunk].flush_all(
-                    [&acc](void* slot_ptr, uint8_t count) {
-                        acc[slot_ptr] += static_cast<uint32_t>(count) *
-                            cache::GDSFScoreData::kCountScale;
-                    });
+                // FLUSH: accumulate TL counts into flat array
+                static thread_local uint32_t tl_acc[cache::AccessTargets::kCapacity];
+                bool has_counts = false;
+                auto* at_base = access_targets_[chunk].data_.load(
+                    std::memory_order_relaxed);
+                if (at_base) {
+                    std::memset(tl_acc, 0, sizeof(tl_acc));
+                    access_chunks_[chunk].flush_all(
+                        [&has_counts, at_base](void* slot_ptr, uint8_t count) {
+                            auto idx = static_cast<uint32_t>(
+                                static_cast<std::atomic<void*>*>(slot_ptr) - at_base);
+                            if (idx < cache::AccessTargets::kCapacity) {
+                                tl_acc[idx] += static_cast<uint32_t>(count) *
+                                    cache::GDSFScoreData::kCountScale;
+                                has_counts = true;
+                            }
+                        });
+                }
 
                 to_unreg.clear();
                 erased += cache_.cleanup_chunk(chunk, n_chunks,
-                    [this, now, threshold, &to_unreg, &acc, chunk](const CacheKey& key, auto te) {
+                    [this, now, threshold, has_counts, &to_unreg](const CacheKey& key, auto te) {
                         auto* entry = static_cast<typename L1Cache::CacheEntry*>(
                             te.template asReal<typename L1Cache::EntryHeader>());
 
-                        // Resolve accumulated TL counts
-                        if (!acc.empty()) {
-                            auto hk = L1Cache::make_key(key);
-                            size_t h = L1Cache::get_hash(hk);
-                            auto* slot = access_targets_[chunk].slot(h);
-                            if (slot) {
-                                auto it = acc.find(static_cast<void*>(slot));
-                                if (it != acc.end() && it->second > 0) {
-                                    entry->metadata.gdsf.access_count.fetch_add(
-                                        it->second, std::memory_order_relaxed);
-                                    it->second = 0;
-                                }
+                        auto hk = L1Cache::make_key(key);
+                        size_t h = L1Cache::get_hash(hk);
+
+                        // Resolve accumulated TL counts via flat array
+                        if (has_counts) {
+                            uint32_t si = static_cast<uint32_t>(
+                                (h >> 16) & cache::AccessTargets::kMask);
+                            if (tl_acc[si] > 0) {
+                                entry->metadata.gdsf.access_count.fetch_add(
+                                    tl_acc[si], std::memory_order_relaxed);
+                                tl_acc[si] = 0;
                             }
                         }
 
                         bool evict_it = cleanupPredicateFull(
                             entry->metadata, entry->value, now, threshold);
                         if (evict_it) {
-                            auto hk = L1Cache::make_key(key);
-                            to_unreg.push_back({L1Cache::get_hash(hk),
+                            to_unreg.push_back({h,
                                 static_cast<void*>(&entry->metadata.gdsf)});
                         }
                         return evict_it;
