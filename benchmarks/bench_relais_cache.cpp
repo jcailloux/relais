@@ -48,6 +48,7 @@ inline std::string gdsf_banner() {
     using GDSFPolicy = jcailloux::relais::cache::GDSFPolicy;
     std::ostringstream out;
     out << "\n  [config] GDSF: " << (GDSFPolicy::enabled ? "ON" : "OFF")
+        << "  |  access: direct fetch_add"
         << "  |  cleanup every " << (GDSFPolicy::kCleanupMask + 1) << " insertions";
     if (GDSFPolicy::enabled && GDSFPolicy::instance().maxMemory() > 0)
         out << "  |  budget " << GDSFPolicy::instance().maxMemory() << " B";
@@ -605,6 +606,31 @@ TEST_CASE("Benchmark - L1 throughput mixed", "[benchmark][throughput][mixed]") {
 
 namespace {
 
+/// Zipf CDF table — shared, immutable after construction.
+/// Separate from RNG so multiple coroutines can sample without copying the CDF.
+class ZipfCDF {
+    std::vector<double> cdf_;
+public:
+    explicit ZipfCDF(size_t n, double s) {
+        cdf_.resize(n);
+        double sum = 0.0;
+        for (size_t i = 0; i < n; ++i)
+            sum += 1.0 / std::pow(static_cast<double>(i + 1), s);
+        double cumul = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            cumul += (1.0 / std::pow(static_cast<double>(i + 1), s)) / sum;
+            cdf_[i] = cumul;
+        }
+    }
+    [[nodiscard]] size_t sample(std::mt19937_64& rng) const {
+        double u = std::uniform_real_distribution<double>(0.0, 1.0)(rng);
+        auto it = std::lower_bound(cdf_.begin(), cdf_.end(), u);
+        return (it == cdf_.end()) ? cdf_.size() - 1
+             : static_cast<size_t>(std::distance(cdf_.begin(), it));
+    }
+    [[nodiscard]] size_t size() const noexcept { return cdf_.size(); }
+};
+
 // Coroutine worker for production benchmark.
 // Templated on Repo to compare L1-only vs L1+L2 with identical logic.
 template<typename Repo>
@@ -632,6 +658,36 @@ DetachedHandle prodWorker(
             Repo::evict(kid);
             ++stats.l1_evicts;
         } else {  // 1% full invalidations (next read → DB)
+            co_await Repo::invalidate(kid);
+            ++stats.invalidates;
+        }
+    }
+    done.count_down();
+}
+
+/// Zipf-driven coroutine worker for realism benchmarks.
+/// Each coroutine samples on-the-fly from the shared CDF with its own RNG.
+template<typename Repo>
+DetachedHandle zipfWorker(
+        const std::vector<int64_t>& ids,
+        const ZipfCDF& cdf,
+        int cid,
+        std::atomic<bool>& running, ProdStats<Repo>& stats,
+        std::latch& done) {
+    std::mt19937_64 rng(static_cast<uint64_t>(cid) * 2654435761ULL + 42);
+    std::mt19937 op_rng(cid * 42 + 7);
+    while (running.load(std::memory_order_relaxed)) {
+        auto idx = cdf.sample(rng);
+        auto kid = ids[idx];
+        auto roll = op_rng() % 100;
+        if (roll >= 2) {  // 98% reads
+            auto result = co_await Repo::find(kid);
+            doNotOptimize(result);
+            ++stats.reads;
+        } else if (roll == 1) {  // 1% L1 evictions
+            Repo::evict(kid);
+            ++stats.l1_evicts;
+        } else {  // 1% full invalidations
             co_await Repo::invalidate(kid);
             ++stats.invalidates;
         }
@@ -880,4 +936,381 @@ TEST_CASE("Benchmark - production simulation", "[benchmark][production]") {
             ids, NUM_KEYS, CORO_COUNT, io_core);
         WARN(msg);
     }
+}
+
+
+// #############################################################################
+//
+//  9. Pure L1 throughput at scale — TLS vs direct fetch_add A/B
+//
+//  Fills the cache to capacity with variable-size entities, then measures
+//  pure L1 read throughput (100% hits, no DB) across N threads.
+//  No sync() overhead — uses task.await_resume() directly.
+//
+// #############################################################################
+
+TEST_CASE("Benchmark - L1 throughput at scale", "[benchmark][throughput-scale]") {
+    using GDSFPolicy = jcailloux::relais::cache::GDSFPolicy;
+    using TI = relais_test::TestInternals;
+
+    auto& policy = GDSFPolicy::instance();
+    size_t max_mem = policy.maxMemory();
+    if (max_mem == 0) {
+        WARN("SKIP: Set RELAIS_L1_MAX_MEMORY (e.g. 1073741824 for 1GB)");
+        return;
+    }
+
+    TransactionGuard tx;
+    WARN(gdsf_banner());
+
+    static constexpr size_t DESC_MIN = 64;
+    static constexpr size_t DESC_MAX = 8192;
+    static constexpr size_t EST_CACHED_BYTES = 512 + 256;
+
+    int threads = 6;
+    if (auto* env = std::getenv("BENCH_THREADS"))
+        if (int v = std::atoi(env); v > 0) threads = v;
+
+    // Fill cache to ~80% capacity (all hits, no eviction pressure)
+    size_t est_capacity = max_mem / EST_CACHED_BYTES;
+    size_t num_keys = static_cast<size_t>(est_capacity * 0.8);
+    if (num_keys < 100) num_keys = 100;
+
+    WARN("\n  Cache budget: " << max_mem / 1024 / 1024 << " MB  |  "
+         << num_keys << " entities  |  " << threads << " threads");
+
+    // Bulk insert
+    auto t_insert = Clock::now();
+    auto bulk = execQueryArgs(
+        "INSERT INTO relais_test_items (name, value, description, is_active) "
+        "SELECT 'scale_' || i, i::int4, "
+        "  repeat('x', $1::int + abs(hashint4(i::int4)) % ($2::int - $1::int + 1)), "
+        "  true "
+        "FROM generate_series(0, $3::int) AS i "
+        "RETURNING id",
+        static_cast<int>(DESC_MIN), static_cast<int>(DESC_MAX),
+        static_cast<int>(num_keys - 1));
+    auto insert_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        Clock::now() - t_insert).count();
+
+    std::vector<int64_t> ids;
+    ids.reserve(num_keys);
+    for (int r = 0; r < bulk.rows(); ++r)
+        ids.push_back(bulk[r].get<int64_t>(0));
+
+    WARN("  Inserted " << ids.size() << " entities in " << insert_ms << " ms");
+
+    // Warm both caches: fetch every entity once (sync, sequential)
+    auto t_warm = Clock::now();
+    for (auto id : ids) {
+        sync(L1TestItemRepo::find(id));
+        sync(BareL1TestItemRepo::find(id));
+    }
+    auto warm_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        Clock::now() - t_warm).count();
+    WARN("  Warmup in " << warm_ms << " ms  (100% L1 hit expected)\n");
+
+    auto m0 = L1TestItemRepo::metrics();
+    WARN("  L1 hits: " << m0.l1_hits << "  misses: " << m0.l1_misses);
+
+    // Reset metrics for the actual benchmark
+    L1TestItemRepo::resetMetrics();
+#if RELAIS_ENABLE_METRICS
+    policy.sweepCounters().reset();
+#endif
+
+    int nkeys = static_cast<int>(ids.size());
+
+    ZipfCDF cdf(nkeys, 0.99);
+
+    // Bare (no GDSF metadata) vs GDSF (direct fetch_add on access_count)
+    {
+        auto bare = measureDuration(threads, [&](int tid, std::atomic<bool>& running) -> int64_t {
+            int64_t ops = 0;
+            while (running.load(std::memory_order_relaxed)) {
+                doNotOptimize(TI::getFromCache<BareL1TestItemRepo>(
+                    ids[(tid * 11 + ops) % nkeys]));
+                ++ops;
+            }
+            return ops;
+        });
+        WARN(formatDurationThroughput("Bare   distrib", threads, bare));
+
+        auto gdsf = measureDuration(threads, [&](int tid, std::atomic<bool>& running) -> int64_t {
+            int64_t ops = 0;
+            while (running.load(std::memory_order_relaxed)) {
+                doNotOptimize(TI::getFromCache<L1TestItemRepo>(
+                    ids[(tid * 11 + ops) % nkeys]));
+                ++ops;
+            }
+            return ops;
+        });
+        WARN(formatDurationThroughput("GDSF   distrib", threads, gdsf));
+    }
+}
+
+
+// #############################################################################
+//
+//  10. Pure L1 find() throughput — 100% hit ratio at scale
+//
+//  Pre-warms the full cache, then measures pure find() (coroutine path)
+//  throughput on 6 threads with distributed keys. No DB access, no eviction.
+//
+//  Run with:
+//    RELAIS_L1_MAX_MEMORY=$((2*1024*1024*1024)) ./bench_relais_cache "[find-scale]"
+//
+// #############################################################################
+
+TEST_CASE("Benchmark - L1 find at scale", "[benchmark][find-scale]") {
+    using GDSFPolicy = jcailloux::relais::cache::GDSFPolicy;
+
+    auto& policy = GDSFPolicy::instance();
+    size_t max_mem = policy.maxMemory();
+    if (max_mem == 0) {
+        WARN("SKIP: Set RELAIS_L1_MAX_MEMORY (e.g. 2147483648 for 2GB)");
+        return;
+    }
+
+    TransactionGuard tx;
+    WARN(gdsf_banner());
+
+    static constexpr size_t DESC_MIN = 64;
+    static constexpr size_t DESC_MAX = 8192;
+    static constexpr size_t EST_CACHED_BYTES = 512 + 256;
+
+    int threads = 6;
+    if (auto* env = std::getenv("BENCH_THREADS"))
+        if (int v = std::atoi(env); v > 0) threads = v;
+
+    // Fill cache to ~80% capacity
+    size_t est_capacity = max_mem / EST_CACHED_BYTES;
+    size_t num_keys = static_cast<size_t>(est_capacity * 0.8);
+    if (num_keys < 100) num_keys = 100;
+
+    WARN("\n  Cache budget: " << max_mem / 1024 / 1024 << " MB  |  "
+         << num_keys << " entities  |  " << threads << " threads");
+
+    // Bulk insert
+    auto t_insert = Clock::now();
+    auto bulk = execQueryArgs(
+        "INSERT INTO relais_test_items (name, value, description, is_active) "
+        "SELECT 'findscale_' || i, i::int4, "
+        "  repeat('x', $1::int + abs(hashint4(i::int4)) % ($2::int - $1::int + 1)), "
+        "  true "
+        "FROM generate_series(0, $3::int) AS i "
+        "RETURNING id",
+        static_cast<int>(DESC_MIN), static_cast<int>(DESC_MAX),
+        static_cast<int>(num_keys - 1));
+    auto insert_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        Clock::now() - t_insert).count();
+
+    std::vector<int64_t> ids;
+    ids.reserve(num_keys);
+    for (int r = 0; r < bulk.rows(); ++r)
+        ids.push_back(bulk[r].get<int64_t>(0));
+
+    WARN("  Inserted " << ids.size() << " entities in " << insert_ms << " ms");
+
+    // Pre-warm: fetch every entity once → 100% L1 hit after this
+    auto t_warm = Clock::now();
+    for (auto id : ids)
+        sync(L1TestItemRepo::find(id));
+    auto warm_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        Clock::now() - t_warm).count();
+    WARN("  Warmup in " << warm_ms << " ms\n");
+
+    L1TestItemRepo::resetMetrics();
+
+    int nkeys = static_cast<int>(ids.size());
+
+    // Pure find() — coroutine path, 100% L1 hit, distributed keys
+    auto result = measureDuration(threads, [&](int tid, std::atomic<bool>& running) -> int64_t {
+        int64_t ops = 0;
+        while (running.load(std::memory_order_relaxed)) {
+            auto task = L1TestItemRepo::find(ids[(tid * 11 + ops) % nkeys]);
+            doNotOptimize(task.await_resume());
+            ++ops;
+        }
+        return ops;
+    });
+    WARN(formatDurationThroughput("find() 100% L1 hit", threads, result));
+
+    auto m = L1TestItemRepo::metrics();
+    WARN("  L1 hits: " << m.l1_hits << "  misses: " << m.l1_misses
+         << "  hit ratio: " << (m.l1_hits * 100.0 / (m.l1_hits + m.l1_misses + 1)) << "%");
+}
+
+
+// #############################################################################
+//
+//  11. Production Realism — scaling test
+//
+//  Progressive keyspace growth to identify throughput cliffs.
+//  Entities have variable-size descriptions (64-8KB).
+//  Each L1 miss hits the real PostgreSQL backend.
+//
+//  Run with:
+//    RELAIS_L1_MAX_MEMORY=$((64*1024*1024)) ./bench_relais_cache "[realism]"
+//    RELAIS_L1_MAX_MEMORY=$((1024*1024*1024)) BENCH_DURATION_S=10 ./bench_relais_cache "[realism]"
+//
+// #############################################################################
+
+TEST_CASE("Benchmark - production realism scaling", "[benchmark][realism]") {
+    using GDSFPolicy = jcailloux::relais::cache::GDSFPolicy;
+    using TI = relais_test::TestInternals;
+
+    auto& policy = GDSFPolicy::instance();
+    size_t max_mem = policy.maxMemory();
+    if (max_mem == 0) {
+        WARN("SKIP: Set RELAIS_L1_MAX_MEMORY (e.g. 67108864 for 64MB)");
+        return;
+    }
+
+    TransactionGuard tx;
+    WARN(gdsf_banner());
+
+    // --- Config ---
+    // Variable-size descriptions: log-normal distribution centered around 512 bytes.
+    // min ~64B, median ~512B, max ~8KB.  Exercises GDSF size-aware scoring.
+    static constexpr size_t DESC_MEDIAN = 512;
+    static constexpr size_t DESC_MIN = 64;
+    static constexpr size_t DESC_MAX = 8192;
+    static constexpr size_t EST_CACHED_BYTES = DESC_MEDIAN + 256;  // median entity + wrapper overhead
+
+    int threads = 6;
+    if (auto* env = std::getenv("BENCH_THREADS"))
+        if (int v = std::atoi(env); v > 0) threads = v;
+
+    size_t est_capacity = max_mem / EST_CACHED_BYTES;
+
+    // Ratios: keyspace as fraction of estimated cache capacity.
+    // ratio < 1.0 → everything fits (100% hit). ratio > 1.0 → eviction pressure.
+    // Fine-grained sweep: few MB in cache → cache full → beyond (miss pressure).
+    std::vector<double> ratios = {
+        0.001, 0.005, 0.01, 0.05, 0.10, 0.25, 0.50, 0.75,
+        1.0, 1.25, 1.5, 2.0
+    };
+    size_t max_keys = static_cast<size_t>(est_capacity * ratios.back());
+    if (max_keys < 100) max_keys = 100;
+
+    WARN("\n  Cache budget: " << max_mem / 1024 / 1024 << " MB  |  "
+         << "est. capacity: " << est_capacity << " entities  |  "
+         << "max keyspace: " << max_keys << "  |  "
+         << threads << " threads");
+
+    // --- Bulk insert with variable-size descriptions ---
+    // Size per row: 64 + (hash(i) % (8192-64)).  Pseudo-random, deterministic.
+    auto t_insert = Clock::now();
+    auto bulk = execQueryArgs(
+        "INSERT INTO relais_test_items (name, value, description, is_active) "
+        "SELECT 'realism_' || i, i::int4, "
+        "  repeat('x', $1::int + abs(hashint4(i::int4)) % ($2::int - $1::int + 1)), "
+        "  true "
+        "FROM generate_series(0, $3::int) AS i "
+        "RETURNING id",
+        static_cast<int>(DESC_MIN), static_cast<int>(DESC_MAX),
+        static_cast<int>(max_keys - 1));
+    auto insert_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        Clock::now() - t_insert).count();
+
+    std::vector<int64_t> ids;
+    ids.reserve(max_keys);
+    for (int r = 0; r < bulk.rows(); ++r)
+        ids.push_back(bulk[r].get<int64_t>(0));
+
+    WARN("  Inserted " << ids.size() << " entities in " << insert_ms << " ms\n");
+
+    // --- Header ---
+    WARN(std::string(74, '='));
+    WARN("  ratio   | keys      | hit ratio | throughput     | sweeps");
+    WARN(std::string(74, '-'));
+
+    static constexpr double ZIPF_ALPHA = 0.80;
+
+    for (double ratio : ratios) {
+        int num_keys = static_cast<int>(est_capacity * ratio);
+        if (num_keys < 10) continue;
+        if (num_keys > static_cast<int>(ids.size())) num_keys = static_cast<int>(ids.size());
+
+        // Build shared Zipf CDF (read-only, ~num_keys * 8 bytes)
+        ZipfCDF cdf(num_keys, ZIPF_ALPHA);
+
+        // Reset cache + GDSF state
+        TI::resetCacheForGDSF<L1TestItemRepo>();
+        L1TestItemRepo::resetMetrics();
+#if RELAIS_ENABLE_METRICS
+        policy.sweepCounters().reset();
+#endif
+
+        // Warm up: Zipf-weighted, enough to fill cache with realistic working set.
+        // num_keys * 3 samples exercises the full Zipf tail.
+        {
+            std::mt19937_64 warmup_rng(42);
+            size_t warmup_count = std::min(static_cast<size_t>(num_keys) * 3,
+                                           static_cast<size_t>(2'000'000));
+            for (size_t i = 0; i < warmup_count; ++i)
+                sync(L1TestItemRepo::find(ids[cdf.sample(warmup_rng)]));
+        }
+
+        // Production workload — N real threads, each with Zipf sampling.
+        // sync(Repo::find()) dispatches to the IO event loop; L1 hits resolve
+        // immediately (no suspension), misses go to DB asynchronously.
+        L1TestItemRepo::resetMetrics();
+#if RELAIS_ENABLE_METRICS
+        policy.sweepCounters().reset();
+#endif
+
+        auto result = measureDuration(threads, [&](int tid, std::atomic<bool>& running) -> int64_t {
+            std::mt19937_64 rng(static_cast<uint64_t>(tid) * 2654435761ULL + 42);
+            std::mt19937 op_rng(tid * 42 + 7);
+            int64_t ops = 0;
+            while (running.load(std::memory_order_relaxed)) {
+                auto idx = cdf.sample(rng);
+                auto kid = ids[idx];
+                auto roll = op_rng() % 100;
+                if (roll >= 2) {  // 98% reads
+                    doNotOptimize(sync(L1TestItemRepo::find(kid)));
+                } else if (roll == 1) {  // 1% L1 evictions
+                    L1TestItemRepo::evict(kid);
+                } else {  // 1% full invalidations
+                    sync(L1TestItemRepo::invalidate(kid));
+                }
+                ++ops;
+            }
+            return ops;
+        });
+
+        auto m = L1TestItemRepo::metrics();
+        double hr = m.l1HitRatio() * 100.0;
+        double ops_s = (result.total_ops > 0)
+            ? result.total_ops * 1'000'000.0
+              / std::chrono::duration_cast<std::chrono::microseconds>(result.elapsed).count()
+            : 0.0;
+
+        // Sweep info
+        std::string sweep_info = "-";
+#if RELAIS_ENABLE_METRICS
+        auto& sc = policy.sweepCounters();
+        auto sweep_count = sc.count.load(std::memory_order_relaxed);
+        if (sweep_count > 0) {
+            auto total_ns = sc.total_ns.load(std::memory_order_relaxed);
+            double avg_us = static_cast<double>(total_ns) / sweep_count / 1000.0;
+            std::ostringstream ss;
+            ss << sweep_count << " (avg " << std::fixed << std::setprecision(0) << avg_us << "us)";
+            sweep_info = ss.str();
+        }
+#endif
+
+        // Format ratio
+        std::ostringstream line;
+        line << "  " << std::fixed << std::setprecision(2) << ratio
+             << "    | " << std::setw(9) << num_keys
+             << " | " << std::setw(7) << std::setprecision(1) << hr << "%"
+             << "  | " << std::setw(14) << fmtOps(ops_s)
+             << " | " << sweep_info;
+        WARN(line.str());
+    }
+
+    WARN(std::string(74, '='));
 }
