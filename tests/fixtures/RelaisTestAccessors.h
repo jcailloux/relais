@@ -126,65 +126,10 @@ struct TestInternals {
         return static_cast<uint8_t>(chunk);
     }
 
-    /// Flush thread-local access counters for a repo (entity cache).
-    /// Production version drains without transfer (kNoopFn).
-    template<typename Repo>
-    static void flushAccessCounters() {
-        Repo::flushAccessCounters();
-    }
-
-    /// Resolve TL access counters for ALL entries (test-only).
-    /// For each chunk: accumulates TL counts, then iterates entries via
-    /// cleanup_chunk (with a never-evict predicate) to resolve counts.
-    /// Uses accumulate+resolve pattern (safe: no slot target dereference).
-    template<typename Repo>
-    static void resolveAllAccessCounters() {
-        using L1Cache = typename Repo::L1Cache;
-        using GDSFScoreData = jcailloux::relais::cache::GDSFScoreData;
-
-        auto& policy = jcailloux::relais::cache::GDSFPolicy::instance();
-        long nc = policy.chunkCount();
-
-        for (long c = 0; c < nc; ++c) {
-            // Accumulate TL counts for this chunk
-            std::unordered_map<void*, uint32_t> acc;
-            Repo::access_chunks_[c].flush_all(
-                [&acc](void* slot_ptr, uint8_t count) {
-                    acc[slot_ptr] += static_cast<uint32_t>(count) *
-                        GDSFScoreData::kCountScale;
-                });
-
-            if (acc.empty()) continue;
-
-            // Resolve via cleanup_chunk with a never-evict predicate.
-            // cleanup_chunk iterates all live entries in the chunk — we
-            // apply accumulated counts and always return false (no eviction).
-            Repo::cache().cleanup_chunk(c, nc,
-                [&acc, c](const auto& key, auto te) {
-                    if (te.isGhost()) return false;
-                    auto* ce = static_cast<typename L1Cache::CacheEntry*>(
-                        te.template asReal<typename L1Cache::EntryHeader>());
-                    auto hk = L1Cache::make_key(key);
-                    size_t h = L1Cache::get_hash(hk);
-                    auto* slot = Repo::access_targets_[c].slot(h);
-                    if (slot) {
-                        auto it = acc.find(static_cast<void*>(slot));
-                        if (it != acc.end() && it->second > 0) {
-                            ce->metadata.access_count.fetch_add(
-                                it->second, std::memory_order_relaxed);
-                            it->second = 0;
-                        }
-                    }
-                    return false;  // never evict
-                });
-        }
-    }
-
-    /// Full GDSF-safe cache reset: flush TL counters, remove all entries,
+    /// Full GDSF-safe cache reset: remove all entries,
     /// drain epoch pool, then reset all GDSF state (including memory counters).
     template<typename Repo>
     static void resetCacheForGDSF() {
-        Repo::flushAccessCounters();                // drain TL counters before reset
         resetEntityCacheState<Repo>();              // remove all entries
         clearEntityCachePools<Repo>();              // drain epoch → CachedWrapper dtors fire
         resetRepoGDSFState<Repo>();                 // reset avg_construction_time
@@ -215,10 +160,8 @@ struct TestInternals {
     /// Get GDSF metadata for a cached entity (read-only, no score bump).
     /// Returns type-erased metadata compatible with all CacheMetadata variants.
     /// Returns nullopt for ghosts and missing entries.
-    /// Resolves TL access counters for all entries first (accumulate+resolve).
     template<typename Repo, typename Key>
     static std::optional<GDSFTestMetadata> getEntityGDSFMetadata(const Key& key) {
-        resolveAllAccessCounters<Repo>();
         auto result = Repo::cache().find(key);
         if (!result || result.isGhost()) return std::nullopt;
 
@@ -236,10 +179,8 @@ struct TestInternals {
 
     /// Compute the GDSF score for a cached entity (access_count x avg_cost / memoryUsage).
     /// Returns nullopt if the entity is not in cache.
-    /// Resolves TL access counters for all entries first (accumulate+resolve).
     template<typename Repo, typename Key>
     static std::optional<float> getEntityGDSFScore(const Key& key) {
-        resolveAllAccessCounters<Repo>();
         auto result = Repo::cache().find(key);
         if (!result) return std::nullopt;
 
