@@ -21,11 +21,6 @@ namespace jcailloux::relais::cache::parse {
     return result;
 }
 
-/// Clamp limit to [1, 100]
-[[nodiscard]] inline int clampLimit(int value) noexcept {
-    return value < 1 ? 1 : (value > 100 ? 100 : value);
-}
-
 /// Maximum allowed string length for filter values (security)
 inline constexpr size_t MAX_STRING_LEN = 256;
 

@@ -42,9 +42,6 @@ struct CachedClock {
         });
     }
 
-    /// Stop the background thread (for clean shutdown).
-    static void stop() { thread_ = {}; }
-
     /// Ensure the background thread is running (call from init paths).
     static void ensureStarted() { start(); }
 
