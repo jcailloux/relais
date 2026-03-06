@@ -269,7 +269,7 @@ TEST_CASE("L1 Config - read_only",
         auto id = insertTestItem("ro_json_item", 10);
 
         auto json = sync(ReadOnlyCfgRepo::findJson(id));
-        REQUIRE(json != nullptr);
-        REQUIRE(json->find("\"ro_json_item\"") != std::string::npos);
+        REQUIRE(!json.empty());
+        REQUIRE(json.find("\"ro_json_item\"") != std::string::npos);
     }
 }

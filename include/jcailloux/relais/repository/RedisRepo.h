@@ -18,7 +18,7 @@ namespace jcailloux::relais {
  * When l2_format is Binary but the entity lacks HasBinarySerialization,
  * JSON is used as an automatic fallback.
  *
- * All find methods return epoch-guarded views (EntityView / JsonView / BinaryView).
+ * find() returns epoch-guarded EntityView. findJson()/findBinary() return by value.
  * Views are thread-agnostic and safe to hold across co_await.
  *
  * Cross-invalidation is not handled here; it belongs in InvalidationMixin.
@@ -53,15 +53,14 @@ class RedisRepo : public BaseRepo<Entity, Name, Cfg, Key> {
             co_return Base::makeView(std::move(*entity));
         }
 
-        /// Find by ID and return raw JSON string view.
+        /// Find by ID and return JSON string.
         /// L2 hit (BEVE): transcodes via glz::beve_to_json (no entity construction).
         /// L2 hit (JSON): returns raw string directly.
-        /// L2 miss: delegates to find() then accesses entity json().
-        static io::Task<wrapper::JsonView> findJson(const Key& id) {
+        /// L2 miss: delegates to find() then serializes.
+        static io::Task<std::string> findJson(const Key& id) {
             auto redisKey = makeRedisKey(id);
 
             if constexpr (useL2Binary) {
-                // L2 hit path: BEVE → JSON transcode
                 std::optional<std::vector<uint8_t>> beve;
                 if constexpr (Cfg.l2_refresh_on_get) {
                     beve = co_await cache::RedisCache::getRawBinaryEx(redisKey, l2Ttl());
@@ -71,59 +70,42 @@ class RedisRepo : public BaseRepo<Entity, Name, Cfg, Key> {
                 if (beve) {
                     std::string json;
                     if (!glz::beve_to_json(*beve, json)) {
-                        auto guard = epoch::EpochGuard::acquire();
-                        auto* ptr = json_pool().New(std::move(json));
-                        json_pool().Retire(ptr);
-                        co_return wrapper::JsonView(ptr, std::move(guard));
+                        co_return json;
                     }
                 }
             } else {
-                // L2 hit path: raw JSON
                 std::optional<std::string> cached;
                 if constexpr (Cfg.l2_refresh_on_get) {
                     cached = co_await cache::RedisCache::getRawEx(redisKey, l2Ttl());
                 } else {
                     cached = co_await cache::RedisCache::getRaw(redisKey);
                 }
-                if (cached) {
-                    auto guard = epoch::EpochGuard::acquire();
-                    auto* ptr = json_pool().New(std::move(*cached));
-                    json_pool().Retire(ptr);
-                    co_return wrapper::JsonView(ptr, std::move(guard));
-                }
+                if (cached) co_return std::move(*cached);
             }
 
-            // L2 miss: entity path (find() populates L2)
+            // L2 miss
             auto view = co_await find(id);
             if (!view) co_return {};
-            const auto* buf = view->json();
-            co_return wrapper::JsonView(buf, view.take_guard());
+            co_return view->json();
         }
 
-        /// Find by ID and return raw binary (BEVE) view.
+        /// Find by ID and return binary (BEVE) vector.
         /// L2 hit (Binary): returns raw bytes directly from Redis.
-        /// L2 miss: delegates to find() then accesses entity binary().
-        static io::Task<wrapper::BinaryView> findBinary(const Key& id)
+        /// L2 miss: delegates to find() then serializes.
+        static io::Task<std::vector<uint8_t>> findBinary(const Key& id)
             requires HasBinarySerialization<Entity>
         {
             auto redisKey = makeRedisKey(id);
 
             if constexpr (useL2Binary) {
-                // L2 hit path: raw binary from Redis
                 std::optional<std::vector<uint8_t>> cached;
                 if constexpr (Cfg.l2_refresh_on_get) {
                     cached = co_await cache::RedisCache::getRawBinaryEx(redisKey, l2Ttl());
                 } else {
                     cached = co_await cache::RedisCache::getRawBinary(redisKey);
                 }
-                if (cached) {
-                    auto guard = epoch::EpochGuard::acquire();
-                    auto* ptr = binary_pool().New(std::move(*cached));
-                    binary_pool().Retire(ptr);
-                    co_return wrapper::BinaryView(ptr, std::move(guard));
-                }
+                if (cached) co_return std::move(*cached);
             } else {
-                // L2 JSON format: check cache, parse entity → binary
                 std::optional<std::string> cached;
                 if constexpr (Cfg.l2_refresh_on_get) {
                     cached = co_await cache::RedisCache::getRawEx(redisKey, l2Ttl());
@@ -132,20 +114,14 @@ class RedisRepo : public BaseRepo<Entity, Name, Cfg, Key> {
                 }
                 if (cached) {
                     auto entity_opt = Entity::fromJson(*cached);
-                    if (entity_opt) {
-                        auto guard = epoch::EpochGuard::acquire();
-                        auto* entity_ptr = Base::pool().New(std::move(*entity_opt));
-                        Base::pool().Retire(entity_ptr);
-                        co_return wrapper::BinaryView(entity_ptr->binary(), std::move(guard));
-                    }
+                    if (entity_opt) co_return entity_opt->binary();
                 }
             }
 
-            // L2 miss: entity path (find() populates L2)
+            // L2 miss
             auto view = co_await find(id);
             if (!view) co_return {};
-            const auto* buf = view->binary();
-            co_return wrapper::BinaryView(buf, view.take_guard());
+            co_return view->binary();
         }
 
         /// Insert entity in database with L2 cache population.
@@ -277,18 +253,6 @@ class RedisRepo : public BaseRepo<Entity, Name, Cfg, Key> {
             }
         }
 
-        /// Epoch memory pool for JSON strings (L2 hit paths).
-        static epoch::memory_pool<std::string>& json_pool() {
-            static epoch::memory_pool<std::string> p;
-            return p;
-        }
-
-        /// Epoch memory pool for binary vectors (L2 hit paths).
-        static epoch::memory_pool<std::vector<uint8_t>>& binary_pool() {
-            static epoch::memory_pool<std::vector<uint8_t>> p;
-            return p;
-        }
-
     public:
 
         /// Build a group key from key parts.
@@ -384,7 +348,7 @@ class RedisRepo : public BaseRepo<Entity, Name, Cfg, Key> {
         /// Set entity in cache using the configured serialization format.
         static io::Task<bool> setInCache(const std::string& key, const Entity& entity) {
             if constexpr (useL2Binary) {
-                co_return co_await cache::RedisCache::setRawBinary(key, *entity.binary(), l2Ttl());
+                co_return co_await cache::RedisCache::setRawBinary(key, entity.binary(), l2Ttl());
             } else {
                 co_return co_await cache::RedisCache::set(key, entity, l2Ttl());
             }

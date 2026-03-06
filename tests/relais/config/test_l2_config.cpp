@@ -256,7 +256,7 @@ TEST_CASE("L2 Config - read_only",
         auto id = insertTestItem("l2_ro_json", 10);
 
         auto json = sync(L2ReadOnlyCfgRepo::findJson(id));
-        REQUIRE(json != nullptr);
-        REQUIRE(json->find("\"l2_ro_json\"") != std::string::npos);
+        REQUIRE(!json.empty());
+        REQUIRE(json.find("\"l2_ro_json\"") != std::string::npos);
     }
 }

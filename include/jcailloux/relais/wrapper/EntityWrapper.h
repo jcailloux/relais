@@ -1,7 +1,6 @@
 #ifndef JCX_RELAIS_WRAPPER_ENTITY_WRAPPER_H
 #define JCX_RELAIS_WRAPPER_ENTITY_WRAPPER_H
 
-#include <atomic>
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -29,7 +28,7 @@ inline size_t heapCapacity(const std::string& s) {
 // EntityWrapper<Struct, Mapping> — API-side wrapper for pure data structs
 //
 // Inherits from Struct (pure declarative data) and adds:
-// - Thread-safe lazy BEVE/JSON serialization via atomic CAS
+// - On-demand BEVE/JSON serialization via Glaze (no caching)
 // - SQL row mapping (fromRow/toInsertParams) delegated to Mapping
 // - Primary key access delegated to Mapping
 //
@@ -51,33 +50,19 @@ public:
     explicit EntityWrapper(const Struct& s) : Struct(s) {}
     explicit EntityWrapper(Struct&& s) noexcept : Struct(std::move(s)) {}
 
-    ~EntityWrapper() {
-        delete beve_cache_.load(std::memory_order_relaxed);
-        delete json_cache_.load(std::memory_order_relaxed);
-    }
+    ~EntityWrapper() = default;
 
-    // Serialization caches are not copied — lazy recompute on demand.
+    // No serialization caches — copies/moves are trivial (Struct-only).
+    // memory_hook_ is intentionally NOT copied/moved: it belongs to the
+    // CachedWrapper that installed it, not to the EntityWrapper.
     EntityWrapper(const EntityWrapper& o) : Struct(static_cast<const Struct&>(o)) {}
-    EntityWrapper(EntityWrapper&& o) noexcept : Struct(static_cast<Struct&&>(std::move(o))) {
-        beve_cache_.store(o.beve_cache_.exchange(nullptr, std::memory_order_relaxed), std::memory_order_relaxed);
-        json_cache_.store(o.json_cache_.exchange(nullptr, std::memory_order_relaxed), std::memory_order_relaxed);
-    }
+    EntityWrapper(EntityWrapper&& o) noexcept : Struct(static_cast<Struct&&>(std::move(o))) {}
     EntityWrapper& operator=(const EntityWrapper& o) {
-        if (this != &o) {
-            delete beve_cache_.exchange(nullptr, std::memory_order_relaxed);
-            delete json_cache_.exchange(nullptr, std::memory_order_relaxed);
-            Struct::operator=(static_cast<const Struct&>(o));
-        }
+        if (this != &o) Struct::operator=(static_cast<const Struct&>(o));
         return *this;
     }
     EntityWrapper& operator=(EntityWrapper&& o) noexcept {
-        if (this != &o) {
-            delete beve_cache_.exchange(nullptr, std::memory_order_relaxed);
-            delete json_cache_.exchange(nullptr, std::memory_order_relaxed);
-            Struct::operator=(static_cast<Struct&&>(std::move(o)));
-            beve_cache_.store(o.beve_cache_.exchange(nullptr, std::memory_order_relaxed), std::memory_order_relaxed);
-            json_cache_.store(o.json_cache_.exchange(nullptr, std::memory_order_relaxed), std::memory_order_relaxed);
-        }
+        if (this != &o) Struct::operator=(static_cast<Struct&&>(std::move(o)));
         return *this;
     }
 
@@ -119,36 +104,23 @@ public:
 
     using MemoryHook = void(*)(void* ctx, int64_t delta);
 
-    /// Approximate heap memory used by this entity (struct + dynamic fields + buffers).
+    /// Approximate heap memory used by this entity (struct + dynamic fields).
     [[nodiscard]] size_t memoryUsage() const {
         size_t size = sizeof(*this);
         if constexpr (requires(const Struct& s) { Mapping::dynamicSize(s); }) {
             size += Mapping::dynamicSize(static_cast<const Struct&>(*this));
         }
-        auto* beve = beve_cache_.load(std::memory_order_relaxed);
-        if (beve) size += beve->capacity();
-        auto* json = json_cache_.load(std::memory_order_relaxed);
-        if (json) size += json->capacity();
         return size;
     }
 
     // =========================================================================
-    // Binary serialization (Glaze BEVE, thread-safe lazy)
+    // Binary serialization (Glaze BEVE, on-demand)
     // =========================================================================
 
-    [[nodiscard]] const std::vector<uint8_t>* binary() const {
-        auto* cached = beve_cache_.load(std::memory_order_acquire);
-        if (cached) return cached;
-        auto* buf = new std::vector<uint8_t>();
-        if (glz::write_beve(*this, *buf)) buf->clear();
-        const std::vector<uint8_t>* expected = nullptr;
-        if (beve_cache_.compare_exchange_strong(expected, buf,
-                std::memory_order_release, std::memory_order_acquire)) {
-            if (memory_hook_) memory_hook_(memory_hook_ctx_, static_cast<int64_t>(buf->capacity()));
-            return buf;
-        }
-        delete buf;
-        return expected;
+    [[nodiscard]] std::vector<uint8_t> binary() const {
+        std::vector<uint8_t> buf;
+        if (glz::write_beve(*this, buf)) buf.clear();
+        return buf;
     }
 
     static std::optional<EntityWrapper> fromBinary(std::span<const uint8_t> data) {
@@ -161,23 +133,14 @@ public:
     }
 
     // =========================================================================
-    // JSON serialization (Glaze JSON, thread-safe lazy)
+    // JSON serialization (Glaze JSON, on-demand)
     // =========================================================================
 
-    [[nodiscard]] const std::string* json() const {
-        auto* cached = json_cache_.load(std::memory_order_acquire);
-        if (cached) return cached;
-        auto* buf = new std::string();
-        buf->reserve(256);
-        if (glz::write_json(*this, *buf)) *buf = "{}";
-        const std::string* expected = nullptr;
-        if (json_cache_.compare_exchange_strong(expected, buf,
-                std::memory_order_release, std::memory_order_acquire)) {
-            if (memory_hook_) memory_hook_(memory_hook_ctx_, static_cast<int64_t>(buf->capacity()));
-            return buf;
-        }
-        delete buf;
-        return expected;
+    [[nodiscard]] std::string json() const {
+        std::string buf;
+        buf.reserve(256);
+        if (glz::write_json(*this, buf)) buf = "{}";
+        return buf;
     }
 
     static std::optional<EntityWrapper> fromJson(std::string_view json) {
@@ -187,20 +150,12 @@ public:
         return entity;
     }
 
-    /// Introspection: has the lazy binary cache been materialized?
-    bool hasBinaryCache() const { return beve_cache_.load(std::memory_order_relaxed) != nullptr; }
-    /// Introspection: has the lazy JSON cache been materialized?
-    bool hasJsonCache() const { return json_cache_.load(std::memory_order_relaxed) != nullptr; }
     /// Set memory tracking hook with context pointer.
     void setMemoryHook(MemoryHook hook, void* ctx) { memory_hook_ = hook; memory_hook_ctx_ = ctx; }
 
 protected:
     mutable MemoryHook memory_hook_ = nullptr;
     mutable void* memory_hook_ctx_ = nullptr;
-
-private:
-    mutable std::atomic<const std::vector<uint8_t>*> beve_cache_{nullptr};
-    mutable std::atomic<const std::string*> json_cache_{nullptr};
 };
 
 }  // namespace jcailloux::relais::wrapper

@@ -248,11 +248,10 @@ TEST_CASE("BaseRepo<TestItem> - JSON serialization", "[integration][db][base][it
         REQUIRE(original != nullptr);
 
         auto json = original->json();
-        REQUIRE(json != nullptr);
-        REQUIRE(!json->empty());
-        REQUIRE(json->find("Serialization Test") != std::string::npos);
-        REQUIRE(json->find("42") != std::string::npos);
-        REQUIRE(json->find("desc") != std::string::npos);
+        REQUIRE(!json.empty());
+        REQUIRE(json.find("Serialization Test") != std::string::npos);
+        REQUIRE(json.find("42") != std::string::npos);
+        REQUIRE(json.find("desc") != std::string::npos);
     }
 
     SECTION("[json] json with null description") {
@@ -262,9 +261,8 @@ TEST_CASE("BaseRepo<TestItem> - JSON serialization", "[integration][db][base][it
         REQUIRE(entity != nullptr);
 
         auto json = entity->json();
-        REQUIRE(json != nullptr);
-        REQUIRE(!json->empty());
-        REQUIRE(json->find("No Desc") != std::string::npos);
+        REQUIRE(!json.empty());
+        REQUIRE(json.find("No Desc") != std::string::npos);
     }
 }
 
@@ -797,10 +795,9 @@ TEST_CASE("BaseRepo<TestArticle> - JSON serialization", "[integration][db][base]
         REQUIRE(original != nullptr);
 
         auto json = original->json();
-        REQUIRE(json != nullptr);
-        REQUIRE(!json->empty());
-        REQUIRE(json->find("tech") != std::string::npos);
-        REQUIRE(json->find("JSON Test") != std::string::npos);
+        REQUIRE(!json.empty());
+        REQUIRE(json.find("tech") != std::string::npos);
+        REQUIRE(json.find("JSON Test") != std::string::npos);
     }
 }
 
@@ -1302,13 +1299,12 @@ TEST_CASE("BaseRepo - RowView byte-identity (TestUser)", "[integration][db][base
         auto entity = sync(UncachedTestUserRepo::find(id));
         REQUIRE(entity != nullptr);
         auto entityJson = entity->json();
-        REQUIRE(entityJson != nullptr);
 
         // RowView-path: findJson (uses Mapping::rowToJson under the hood)
         auto rowJson = sync(UncachedTestUserRepo::findJson(id));
-        REQUIRE(rowJson != nullptr);
+        REQUIRE(!rowJson.empty());
 
-        REQUIRE(*rowJson == *entityJson);
+        REQUIRE(rowJson == entityJson);
     }
 
     SECTION("[rowview] rowToBeve matches entity->binary()") {
@@ -1317,12 +1313,11 @@ TEST_CASE("BaseRepo - RowView byte-identity (TestUser)", "[integration][db][base
         auto entity = sync(UncachedTestUserRepo::find(id));
         REQUIRE(entity != nullptr);
         auto entityBeve = entity->binary();
-        REQUIRE(entityBeve != nullptr);
 
         auto rowBeve = sync(UncachedTestUserRepo::findBinary(id));
-        REQUIRE(rowBeve != nullptr);
+        REQUIRE(!rowBeve.empty());
 
-        REQUIRE(*rowBeve == *entityBeve);
+        REQUIRE(rowBeve == entityBeve);
     }
 }
 
@@ -1337,9 +1332,9 @@ TEST_CASE("BaseRepo - RowView byte-identity (TestItem)", "[integration][db][base
         auto entityJson = entity->json();
 
         auto rowJson = sync(UncachedTestItemRepo::findJson(id));
-        REQUIRE(rowJson != nullptr);
+        REQUIRE(!rowJson.empty());
 
-        REQUIRE(*rowJson == *entityJson);
+        REQUIRE(rowJson == entityJson);
     }
 
     SECTION("[rowview] rowToJson matches entity->json() with empty description") {
@@ -1349,7 +1344,7 @@ TEST_CASE("BaseRepo - RowView byte-identity (TestItem)", "[integration][db][base
         auto entityJson = entity->json();
 
         auto rowJson = sync(UncachedTestItemRepo::findJson(id));
-        REQUIRE(*rowJson == *entityJson);
+        REQUIRE(rowJson == entityJson);
     }
 
     SECTION("[rowview] rowToBeve matches entity->binary()") {
@@ -1359,7 +1354,7 @@ TEST_CASE("BaseRepo - RowView byte-identity (TestItem)", "[integration][db][base
         auto entityBeve = entity->binary();
 
         auto rowBeve = sync(UncachedTestItemRepo::findBinary(id));
-        REQUIRE(*rowBeve == *entityBeve);
+        REQUIRE(rowBeve == entityBeve);
     }
 }
 
@@ -1374,9 +1369,9 @@ TEST_CASE("BaseRepo - RowView byte-identity (TestProduct with column= mapping)",
         auto entityJson = entity->json();
 
         auto rowJson = sync(UncachedTestProductRepo::findJson(id));
-        REQUIRE(rowJson != nullptr);
+        REQUIRE(!rowJson.empty());
 
-        REQUIRE(*rowJson == *entityJson);
+        REQUIRE(rowJson == entityJson);
     }
 
     SECTION("[rowview] rowToJson with null optional") {
@@ -1386,7 +1381,7 @@ TEST_CASE("BaseRepo - RowView byte-identity (TestProduct with column= mapping)",
         auto entityJson = entity->json();
 
         auto rowJson = sync(UncachedTestProductRepo::findJson(id));
-        REQUIRE(*rowJson == *entityJson);
+        REQUIRE(rowJson == entityJson);
     }
 
     SECTION("[rowview] rowToBeve matches entity->binary()") {
@@ -1396,7 +1391,7 @@ TEST_CASE("BaseRepo - RowView byte-identity (TestProduct with column= mapping)",
         auto entityBeve = entity->binary();
 
         auto rowBeve = sync(UncachedTestProductRepo::findBinary(id));
-        REQUIRE(*rowBeve == *entityBeve);
+        REQUIRE(rowBeve == entityBeve);
     }
 }
 
@@ -1414,29 +1409,29 @@ TEST_CASE("BaseRepo - findJson (Uncached)", "[integration][db][base][findJson]")
 
         auto json = sync(UncachedTestUserRepo::findJson(id));
 
-        REQUIRE(json != nullptr);
-        REQUIRE(json->find("\"fj_user\"") != std::string::npos);
-        REQUIRE(json->find("100") != std::string::npos);
+        REQUIRE(!json.empty());
+        REQUIRE(json.find("\"fj_user\"") != std::string::npos);
+        REQUIRE(json.find("100") != std::string::npos);
     }
 
-    SECTION("[findJson] returns nullptr for non-existent id") {
+    SECTION("[findJson] returns empty for non-existent id") {
         auto json = sync(UncachedTestUserRepo::findJson(999999999));
-        REQUIRE(json == nullptr);
+        REQUIRE(json.empty());
     }
 
     SECTION("[findJson] returns fresh data (no caching)") {
         auto id = insertTestUser("fj_nocache", "fj_nc@test.com", 50);
 
         auto json1 = sync(UncachedTestUserRepo::findJson(id));
-        REQUIRE(json1 != nullptr);
+        REQUIRE(!json1.empty());
 
         // Modify DB directly
         updateTestUserBalance(id, 999);
 
         // Second call should see new data (no cache)
         auto json2 = sync(UncachedTestUserRepo::findJson(id));
-        REQUIRE(json2 != nullptr);
-        REQUIRE(json2->find("999") != std::string::npos);
+        REQUIRE(!json2.empty());
+        REQUIRE(json2.find("999") != std::string::npos);
     }
 }
 
@@ -1448,19 +1443,18 @@ TEST_CASE("BaseRepo - findBinary (Uncached)", "[integration][db][base][findBinar
 
         auto beve = sync(UncachedTestUserRepo::findBinary(id));
 
-        REQUIRE(beve != nullptr);
-        REQUIRE(!beve->empty());
+        REQUIRE(!beve.empty());
 
         // Roundtrip: BEVE → entity
-        auto entity = TestUserWrapper::fromBinary(*beve);
+        auto entity = TestUserWrapper::fromBinary(beve);
         REQUIRE(entity.has_value());
         REQUIRE(entity->username == "fb_user");
         REQUIRE(entity->balance == 200);
     }
 
-    SECTION("[findBinary] returns nullptr for non-existent id") {
+    SECTION("[findBinary] returns empty for non-existent id") {
         auto beve = sync(UncachedTestUserRepo::findBinary(999999999));
-        REQUIRE(beve == nullptr);
+        REQUIRE(beve.empty());
     }
 
     SECTION("[findBinary] returns fresh data (no caching)") {
@@ -1471,8 +1465,8 @@ TEST_CASE("BaseRepo - findBinary (Uncached)", "[integration][db][base][findBinar
         updateTestUserBalance(id, 777);
 
         auto beve2 = sync(UncachedTestUserRepo::findBinary(id));
-        REQUIRE(beve2 != nullptr);
-        auto entity = TestUserWrapper::fromBinary(*beve2);
+        REQUIRE(!beve2.empty());
+        auto entity = TestUserWrapper::fromBinary(beve2);
         REQUIRE(entity.has_value());
         REQUIRE(entity->balance == 777);
     }

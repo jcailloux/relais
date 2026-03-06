@@ -562,13 +562,13 @@ TEST_CASE("FullCache - findJson at L1+L2",
         auto id = insertTestItem("json_item", 42);
 
         auto json1 = sync(FullCacheTestItemRepo::findJson(id));
-        REQUIRE(json1 != nullptr);
-        REQUIRE(json1->find("\"json_item\"") != std::string::npos);
+        REQUIRE(!json1.empty());
+        REQUIRE(json1.find("\"json_item\"") != std::string::npos);
 
-        // Second call returns same cached pointer
+        // Second call returns same cached value
         auto json2 = sync(FullCacheTestItemRepo::findJson(id));
-        REQUIRE(json2 != nullptr);
-        REQUIRE(*json1 == *json2);
+        REQUIRE(!json2.empty());
+        REQUIRE(json1 == json2);
     }
 
     SECTION("[json] L1 miss falls back to L2 JSON") {
@@ -582,8 +582,8 @@ TEST_CASE("FullCache - findJson at L1+L2",
 
         // Should fall back to L2
         auto json = sync(FullCacheTestItemRepo::findJson(id));
-        REQUIRE(json != nullptr);
-        REQUIRE(json->find("\"json_l2_item\"") != std::string::npos);
+        REQUIRE(!json.empty());
+        REQUIRE(json.find("\"json_l2_item\"") != std::string::npos);
     }
 }
 

@@ -15,6 +15,7 @@
 
 #include <glaze/glaze.hpp>
 #include <jcailloux/relais/list/ListCache.h>
+#include "jcailloux/relais/wrapper/SerializationTraits.h"
 
 namespace jcailloux::relais::cache {
 
@@ -63,9 +64,8 @@ namespace jcailloux::relais::cache {
 
                 try {
                     auto ttl_seconds = std::chrono::duration_cast<std::chrono::seconds>(ttl).count();
-                    auto json = entity.json();
                     co_await DbProvider::redis("SETEX", key,
-                        ttl_seconds, *json);
+                        ttl_seconds, entity.json());
                     co_return true;
                 } catch (const std::exception& e) {
                     RELAIS_LOG_WARN << "RedisCache SET error: " << e.what();
@@ -368,19 +368,17 @@ namespace jcailloux::relais::cache {
                 const ListEntity& listEntity,
                 std::chrono::duration<Rep, Period> ttl,
                 std::optional<list::ListBoundsHeader> header = std::nullopt)
-                requires requires(const ListEntity& l) {
-                    { l.binary() } -> std::convertible_to<std::shared_ptr<const std::vector<uint8_t>>>;
-                }
+                requires HasBinarySerialization<ListEntity>
             {
                 auto binary = listEntity.binary();
                 if (header) {
-                    std::vector<uint8_t> prefixed(list::kListBoundsHeaderSize + binary->size());
+                    std::vector<uint8_t> prefixed(list::kListBoundsHeaderSize + binary.size());
                     header->writeTo(prefixed.data());
                     std::memcpy(prefixed.data() + list::kListBoundsHeaderSize,
-                                binary->data(), binary->size());
+                                binary.data(), binary.size());
                     co_return co_await setRawBinary(key, prefixed, ttl);
                 }
-                co_return co_await setRawBinary(key, *binary, ttl);
+                co_return co_await setRawBinary(key, binary, ttl);
             }
 
             /// Refresh TTL without modifying the value.

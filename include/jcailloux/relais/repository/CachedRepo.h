@@ -17,7 +17,6 @@
 #include "jcailloux/relais/cache/GDSFPolicy.h"
 #include "jcailloux/relais/cache/TaggedEntry.h"
 #include "jcailloux/relais/wrapper/EntityView.h"
-#include "jcailloux/relais/wrapper/BufferView.h"
 #include "jcailloux/relais/config/repo_config.h"
 #include "jcailloux/relais/config/CachedClock.h"
 #include "jcailloux/relais/cache/Metrics.h"
@@ -37,7 +36,7 @@ namespace jcailloux::relais {
  * - CacheLevel::L1:    RAM -> Database (Redis bypassed)
  * - CacheLevel::L1_L2: RAM -> Redis -> Database (full hierarchy)
  *
- * All find methods return epoch-guarded views (EntityView / JsonView / BinaryView).
+ * find() returns EntityView. findJson()/findBinary() return by value.
  * Views are thread-agnostic and safe to hold across co_await.
  *
  * Eviction policy depends on compile-time configuration:
@@ -106,31 +105,29 @@ public:
         return findSlow(id);
     }
 
-    /// Find by ID and return JSON buffer view.
-    /// Returns epoch-guarded JsonView (empty if not found).
-    /// L1 hit: zero overhead (Immediate holds JsonView directly, no Task).
-    static io::Immediate<wrapper::JsonView> findJson(const Key& id) {
+    /// Find by ID and return JSON string (empty if not found).
+    /// L1 hit: serializes from cached entity (Immediate, no Task).
+    static io::Immediate<std::string> findJson(const Key& id) {
         auto result = findInCache(id);
         if (result) {
             RELAIS_METRICS_INC(l1_counters_.hits);
             auto* ce = result.asReal();
-            return wrapper::JsonView(ce->value.json(), std::move(result.guard));
+            return ce->value.json();
         }
         RELAIS_METRICS_INC(l1_counters_.misses);
         return findJsonSlow(id);
     }
 
-    /// Find by ID and return binary (BEVE) buffer view.
-    /// Returns epoch-guarded BinaryView (empty if not found).
-    /// L1 hit: zero overhead (Immediate holds BinaryView directly, no Task).
-    static io::Immediate<wrapper::BinaryView> findBinary(const Key& id)
+    /// Find by ID and return binary (BEVE) vector (empty if not found).
+    /// L1 hit: serializes from cached entity (Immediate, no Task).
+    static io::Immediate<std::vector<uint8_t>> findBinary(const Key& id)
         requires HasBinarySerialization<Entity>
     {
         auto result = findInCache(id);
         if (result) {
             RELAIS_METRICS_INC(l1_counters_.hits);
             auto* ce = result.asReal();
-            return wrapper::BinaryView(ce->value.binary(), std::move(result.guard));
+            return ce->value.binary();
         }
         RELAIS_METRICS_INC(l1_counters_.misses);
         return findBinarySlow(id);
@@ -651,24 +648,18 @@ private:
     }
 
     /// Slow path for findJson(): L1 miss → (L2) → DB → cache → JSON.
-    static io::Task<wrapper::JsonView> findJsonSlow(const Key& id) {
+    static io::Task<std::string> findJsonSlow(const Key& id) {
         auto view = co_await fetchAndCache(id);
-        if (view) {
-            auto* p = view->json();  // evaluate before take_guard() nulls ptr_
-            co_return wrapper::JsonView(p, view.take_guard());
-        }
+        if (view) co_return view->json();
         co_return {};
     }
 
     /// Slow path for findBinary(): L1 miss → (L2) → DB → cache → binary.
-    static io::Task<wrapper::BinaryView> findBinarySlow(const Key& id)
+    static io::Task<std::vector<uint8_t>> findBinarySlow(const Key& id)
         requires HasBinarySerialization<Entity>
     {
         auto view = co_await fetchAndCache(id);
-        if (view) {
-            auto* p = view->binary();  // evaluate before take_guard() nulls ptr_
-            co_return wrapper::BinaryView(p, view.take_guard());
-        }
+        if (view) co_return view->binary();
         co_return {};
     }
 
@@ -709,9 +700,7 @@ private:
                 // --- Compute score ---
                 uint32_t est_bytes = static_cast<uint32_t>(
                     entity->memoryUsage() + kChargeOverhead + kBucketSlotSize);
-                uint8_t est_flags = static_cast<uint8_t>(
-                    (entity->hasBinaryCache() ? 0x01 : 0) |
-                    (entity->hasJsonCache()   ? 0x02 : 0));
+                uint8_t est_flags = 0;  // No cached buffers (serialize on demand)
 
                 uint32_t count;
                 if (has_ghost) {
@@ -893,10 +882,7 @@ private:
             if (score < ctx.threshold) {
                 if (ctx.ghost_candidates) {
                     ctx.ghost_candidates->push_back({key, old_count,
-                        static_cast<uint32_t>(mem),
-                        static_cast<uint8_t>(
-                            (value.hasBinaryCache() ? 0x01 : 0) |
-                            (value.hasJsonCache()   ? 0x02 : 0))});
+                        static_cast<uint32_t>(mem), 0});
                 }
                 return true;
             }

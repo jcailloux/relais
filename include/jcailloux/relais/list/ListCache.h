@@ -10,7 +10,7 @@
 #include "ListCacheTraits.h"
 #include "ModificationTracker.h"
 #include "jcailloux/relais/wrapper/ListWrapper.h"
-#include "jcailloux/relais/wrapper/BufferView.h"
+#include "jcailloux/relais/wrapper/EntityView.h"
 #include "jcailloux/relais/cache/GDSFMetadata.h"
 #include "jcailloux/relais/cache/GDSFPolicy.h"
 #include "jcailloux/relais/cache/TaggedEntry.h"
@@ -277,7 +277,7 @@ public:
     using SortFieldEnum = typename Traits::SortField;
     using Query = ListQuery<FilterSet, SortFieldEnum>;
     using Result = jcailloux::relais::wrapper::ListWrapper<Entity>;
-    using ResultView = jcailloux::relais::wrapper::BufferView<Result>;
+    using ResultView = jcailloux::relais::wrapper::EntityView<Result>;
     using Modification = EntityModification<Entity>;
     using Clock = std::chrono::steady_clock;
     using TimePoint = Clock::time_point;

@@ -468,15 +468,14 @@ TEST_CASE("PartitionKey - serialization",
         REQUIRE(original != nullptr);
 
         auto json = original->json();
-        REQUIRE(json != nullptr);
+        REQUIRE(!json.empty());
 
         // Verify region is in the JSON
-        auto jsonStr = *json;
-        CHECK(jsonStr.find("\"region\"") != std::string::npos);
-        CHECK(jsonStr.find("\"eu\"") != std::string::npos);
+        CHECK(json.find("\"region\"") != std::string::npos);
+        CHECK(json.find("\"eu\"") != std::string::npos);
 
         // Round-trip
-        auto restored = TestEventWrapper::fromJson(jsonStr);
+        auto restored = TestEventWrapper::fromJson(json);
         REQUIRE(restored.has_value());
         CHECK(restored->region == "eu");
         CHECK(restored->title == "JSON Test");
@@ -490,10 +489,9 @@ TEST_CASE("PartitionKey - serialization",
         REQUIRE(original != nullptr);
 
         auto binary = original->binary();
-        REQUIRE(binary != nullptr);
-        REQUIRE(!binary->empty());
+        REQUIRE(!binary.empty());
 
-        auto restored = TestEventWrapper::fromBinary(*binary);
+        auto restored = TestEventWrapper::fromBinary(binary);
         REQUIRE(restored.has_value());
         CHECK(restored->region == "us");
         CHECK(restored->title == "BEVE Test");

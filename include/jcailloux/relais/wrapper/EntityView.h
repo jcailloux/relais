@@ -39,8 +39,7 @@ public:
     friend bool operator==(const EntityView& v, std::nullptr_t) { return v.ptr_ == nullptr; }
     friend bool operator!=(const EntityView& v, std::nullptr_t) { return v.ptr_ != nullptr; }
 
-    /// Transfer guard ownership (e.g., EntityView → JsonView/BinaryView).
-    /// Leaves this view empty (ptr_ = nullptr, guard moved out).
+    /// Transfer guard ownership. Leaves this view empty (ptr_ = nullptr, guard moved out).
     epoch::EpochGuard take_guard() {
         auto g = std::move(guard_);
         ptr_ = nullptr;

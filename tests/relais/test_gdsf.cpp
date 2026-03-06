@@ -465,35 +465,7 @@ TEST_CASE("GDSF - CachedWrapper memory tracking",
         REQUIRE(GDSFPolicy::instance().totalMemory() > 0);
     }
 
-    SECTION("[wrapper] lazy json() generation charges additional memory") {
-        auto id = insertTestItem("mem_json", 42);
-        sync(GDSFMemRepo::find(id));
-
-        size_t mem_after_find = GDSFPolicy::instance().totalMemory();
-        REQUIRE(mem_after_find > 0);
-
-        // Trigger JSON buffer generation via findJson
-        sync(GDSFMemRepo::findJson(id));
-
-        size_t mem_after_json = GDSFPolicy::instance().totalMemory();
-        // JSON buffer should have added memory
-        REQUIRE(mem_after_json > mem_after_find);
-    }
-
-    SECTION("[wrapper] lazy binary() generation charges additional memory") {
-        auto id = insertTestItem("mem_binary", 42);
-        sync(GDSFMemRepo::find(id));
-
-        size_t mem_after_find = GDSFPolicy::instance().totalMemory();
-        REQUIRE(mem_after_find > 0);
-
-        // Trigger BEVE buffer generation via findBinary
-        sync(GDSFMemRepo::findBinary(id));
-
-        size_t mem_after_binary = GDSFPolicy::instance().totalMemory();
-        // BEVE buffer should have added memory
-        REQUIRE(mem_after_binary > mem_after_find);
-    }
+    // (Removed: lazy json/binary buffer charge tests — buffers no longer cached in entity)
 }
 
 
@@ -902,27 +874,7 @@ TEST_CASE("GDSF - memory accounting",
         }
     }
 
-    SECTION("[accounting] lazy json buffer charges additional memory") {
-        auto id = insertTestItem("acct_json", 42);
-        sync(GDSFMemRepo::find(id));
-        size_t mem_base = GDSFPolicy::instance().totalMemory();
-
-        // Trigger lazy JSON serialization (charges extra)
-        sync(GDSFMemRepo::findJson(id));
-        size_t mem_with_json = GDSFPolicy::instance().totalMemory();
-        REQUIRE(mem_with_json > mem_base);
-    }
-
-    SECTION("[accounting] lazy binary buffer charges additional memory") {
-        auto id = insertTestItem("acct_binary", 42);
-        sync(GDSFMemRepo::find(id));
-        size_t mem_base = GDSFPolicy::instance().totalMemory();
-
-        // Trigger lazy BEVE serialization (charges extra)
-        sync(GDSFMemRepo::findBinary(id));
-        size_t mem_with_binary = GDSFPolicy::instance().totalMemory();
-        REQUIRE(mem_with_binary > mem_base);
-    }
+    // (Removed: lazy json/binary buffer charge accounting tests — buffers no longer cached)
 
     SECTION("[accounting] update replaces entry, memory stays balanced") {
         auto id = insertTestItem("acct_update", 10);

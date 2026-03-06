@@ -1055,14 +1055,14 @@ TEST_CASE("CachedRepo - findJson",
 
         auto result = sync(L1TestUserRepo::findJson(id));
 
-        REQUIRE(result != nullptr);
-        REQUIRE(result->find("json_user") != std::string::npos);
+        REQUIRE(!result.empty());
+        REQUIRE(result.find("json_user") != std::string::npos);
     }
 
-    SECTION("[json] returns nullptr for non-existent id") {
+    SECTION("[json] returns empty for non-existent id") {
         auto result = sync(L1TestUserRepo::findJson(999999999));
 
-        REQUIRE(result == nullptr);
+        REQUIRE(result.empty());
     }
 
     SECTION("[json] second call returns cached JSON") {
@@ -1070,17 +1070,17 @@ TEST_CASE("CachedRepo - findJson",
 
         // First call — DB fetch, cache entity in L1
         auto result1 = sync(L1TestUserRepo::findJson(id));
-        REQUIRE(result1 != nullptr);
+        REQUIRE(!result1.empty());
 
         // Modify DB directly
         updateTestUserBalance(id, 999);
 
         // Second call — L1 cached entity converted to JSON
         auto result2 = sync(L1TestUserRepo::findJson(id));
-        REQUIRE(result2 != nullptr);
-        REQUIRE(result2->find("cache_json") != std::string::npos);
+        REQUIRE(!result2.empty());
+        REQUIRE(result2.find("cache_json") != std::string::npos);
         // Balance should still be 10 (stale from L1 cache)
-        REQUIRE(result2->find("999") == std::string::npos);
+        REQUIRE(result2.find("999") == std::string::npos);
     }
 }
 

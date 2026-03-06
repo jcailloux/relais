@@ -3,7 +3,6 @@
 
 #include <cstdint>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
@@ -20,8 +19,8 @@ namespace jcailloux::relais::wrapper {
 // =============================================================================
 // ListWrapper<Item> — Generic list wrapper for any entity type
 //
-// Provides thread-safe lazy-cached serialization, factory methods, and
-// accessors. Uses std::call_once for lock-free fast path.
+// Provides on-demand serialization (no caching), factory methods, and
+// accessors.
 //
 // Satisfies: HasBinarySerialization, HasJsonSerialization, HasFormat
 // =============================================================================
@@ -47,8 +46,6 @@ public:
         }
     }
 
-    // std::once_flag is non-copyable/non-movable — caches are transient
-    // and will be lazily recomputed after copy/move.
     // Copy ctor/assignment do NOT transfer the hook (copies are independent).
     ListWrapper(const ListWrapper& o)
         : items(o.items), total_count(o.total_count), next_cursor(o.next_cursor) {}
@@ -110,20 +107,13 @@ public:
     }
 
     // =========================================================================
-    // Binary serialization (Glaze BEVE)
+    // Binary serialization (Glaze BEVE, on-demand)
     // =========================================================================
 
-    [[nodiscard]] std::shared_ptr<const std::vector<uint8_t>> binary() const {
-        std::call_once(beve_flag_, [this] {
-            auto buf = std::make_shared<std::vector<uint8_t>>();
-            if (glz::write_beve(*this, *buf))
-                buf->clear();
-            beve_cache_ = std::move(buf);
-            if (memory_hook_) {
-                memory_hook_(memory_hook_ctx_, static_cast<int64_t>(beve_cache_->capacity()));
-            }
-        });
-        return beve_cache_;
+    [[nodiscard]] std::vector<uint8_t> binary() const {
+        std::vector<uint8_t> buf;
+        if (glz::write_beve(*this, buf)) buf.clear();
+        return buf;
     }
 
     static std::optional<ListWrapper> fromBinary(std::span<const uint8_t> data) {
@@ -136,22 +126,14 @@ public:
     }
 
     // =========================================================================
-    // JSON serialization (Glaze JSON)
+    // JSON serialization (Glaze JSON, on-demand)
     // =========================================================================
 
-    [[nodiscard]] std::shared_ptr<const std::string> json() const {
-        std::call_once(json_flag_, [this] {
-            auto json = std::make_shared<std::string>();
-            json->reserve(items.size() * 200 + 64);
-            if (glz::write_json(*this, *json))
-                json_cache_ = std::make_shared<std::string>(R"({"items":[]})");
-            else
-                json_cache_ = std::move(json);
-            if (memory_hook_) {
-                memory_hook_(memory_hook_ctx_, static_cast<int64_t>(json_cache_->capacity()));
-            }
-        });
-        return json_cache_;
+    [[nodiscard]] std::string json() const {
+        std::string buf;
+        buf.reserve(items.size() * 200 + 64);
+        if (glz::write_json(*this, buf)) buf = R"({"items":[]})";
+        return buf;
     }
 
     static std::optional<ListWrapper> fromJson(std::string_view json) {
@@ -165,7 +147,7 @@ public:
     // Memory tracking
     // =========================================================================
 
-    /// Approximate heap memory used by this list (items + cursors + buffers).
+    /// Approximate heap memory used by this list (items + cursors).
     [[nodiscard]] size_t memoryUsage() const {
         size_t size = sizeof(*this);
         size += items.capacity() * sizeof(Item);
@@ -175,21 +157,7 @@ public:
             }
         }
         size += next_cursor.capacity();
-        if (beve_cache_) size += beve_cache_->capacity();
-        if (json_cache_) size += json_cache_->capacity();
         return size;
-    }
-
-    // =========================================================================
-    // Cache management
-    // =========================================================================
-
-    /// Release serialization caches. After this call, binary()/json()
-    /// return nullptr. Callers who previously obtained shared_ptrs from
-    /// binary()/json() retain valid data through reference counting.
-    void releaseCaches() const noexcept {
-        beve_cache_.reset();
-        json_cache_.reset();
     }
 
     // =========================================================================
@@ -224,12 +192,6 @@ public:
     mutable MemoryHook memory_hook_ = nullptr;
     mutable void* memory_hook_ctx_ = nullptr;
     size_t cache_overhead_{0};
-
-private:
-    mutable std::once_flag beve_flag_;
-    mutable std::once_flag json_flag_;
-    mutable std::shared_ptr<const std::vector<uint8_t>> beve_cache_;
-    mutable std::shared_ptr<const std::string> json_cache_;
 };
 
 }  // namespace jcailloux::relais::wrapper

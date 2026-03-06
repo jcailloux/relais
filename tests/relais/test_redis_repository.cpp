@@ -605,14 +605,14 @@ TEST_CASE("RedisRepo - findJson", "[integration][db][redis][json]") {
 
         auto result = sync(L2TestItemRepo::findJson(id));
 
-        REQUIRE(result != nullptr);
-        REQUIRE(result->find("\"JSON Item\"") != std::string::npos);
+        REQUIRE(!result.empty());
+        REQUIRE(result.find("\"JSON Item\"") != std::string::npos);
     }
 
-    SECTION("[json] returns nullptr for non-existent id") {
+    SECTION("[json] returns empty string for non-existent id") {
         auto result = sync(L2TestItemRepo::findJson(999999999));
 
-        REQUIRE(result == nullptr);
+        REQUIRE(result.empty());
     }
 
     SECTION("[json] second call returns cached JSON") {
@@ -620,15 +620,15 @@ TEST_CASE("RedisRepo - findJson", "[integration][db][redis][json]") {
 
         // First call — DB fetch, cache as JSON
         auto result1 = sync(L2TestItemRepo::findJson(id));
-        REQUIRE(result1 != nullptr);
+        REQUIRE(!result1.empty());
 
         // Modify DB directly
         updateTestItem(id, "Modified", 999);
 
         // Second call — cached JSON
         auto result2 = sync(L2TestItemRepo::findJson(id));
-        REQUIRE(result2 != nullptr);
-        REQUIRE(result2->find("\"Cache JSON\"") != std::string::npos);
+        REQUIRE(!result2.empty());
+        REQUIRE(result2.find("\"Cache JSON\"") != std::string::npos);
     }
 }
 
@@ -646,23 +646,23 @@ TEST_CASE("RedisRepo - findJson on BEVE entity", "[integration][db][redis][json]
 
         // First call — DB fetch, stored as BEVE in Redis, JSON returned via entity
         auto result1 = sync(L2TestUserRepo::findJson(id));
-        REQUIRE(result1 != nullptr);
-        REQUIRE(result1->find("\"beve_json\"") != std::string::npos);
-        REQUIRE(result1->find("750") != std::string::npos);
+        REQUIRE(!result1.empty());
+        REQUIRE(result1.find("\"beve_json\"") != std::string::npos);
+        REQUIRE(result1.find("750") != std::string::npos);
 
         // Modify DB directly
         updateTestUserBalance(id, 999);
 
         // Second call — BEVE in Redis transcoded directly to JSON (no entity construction)
         auto result2 = sync(L2TestUserRepo::findJson(id));
-        REQUIRE(result2 != nullptr);
-        REQUIRE(result2->find("\"beve_json\"") != std::string::npos);
-        REQUIRE(result2->find("750") != std::string::npos);  // Still cached
+        REQUIRE(!result2.empty());
+        REQUIRE(result2.find("\"beve_json\"") != std::string::npos);
+        REQUIRE(result2.find("750") != std::string::npos);  // Still cached
     }
 
-    SECTION("[json] returns nullptr for non-existent id") {
+    SECTION("[json] returns empty string for non-existent id") {
         auto result = sync(L2TestUserRepo::findJson(999999999));
-        REQUIRE(result == nullptr);
+        REQUIRE(result.empty());
     }
 }
 
@@ -680,19 +680,18 @@ TEST_CASE("RedisRepo - findBinary", "[integration][db][redis][binary]") {
 
         auto result = sync(L2TestUserRepo::findBinary(id));
 
-        REQUIRE(result != nullptr);
-        REQUIRE(!result->empty());
+        REQUIRE(!result.empty());
         // Verify roundtrip: deserialize BEVE back to entity
-        auto entity = entity::generated::TestUserWrapper::fromBinary(*result);
+        auto entity = entity::generated::TestUserWrapper::fromBinary(result);
         REQUIRE(entity.has_value());
         REQUIRE(entity->username == "binary_user");
         REQUIRE(entity->balance == 100);
     }
 
-    SECTION("[binary] returns nullptr for non-existent id") {
+    SECTION("[binary] returns empty vector for non-existent id") {
         auto result = sync(L2TestUserRepo::findBinary(999999999));
 
-        REQUIRE(result == nullptr);
+        REQUIRE(result.empty());
     }
 
     SECTION("[binary] second call served from Redis cache") {
@@ -700,15 +699,15 @@ TEST_CASE("RedisRepo - findBinary", "[integration][db][redis][binary]") {
 
         // First call — DB fetch, store binary in Redis
         auto result1 = sync(L2TestUserRepo::findBinary(id));
-        REQUIRE(result1 != nullptr);
+        REQUIRE(!result1.empty());
 
         // Modify DB directly (bypass cache)
         updateTestUserBalance(id, 999);
 
         // Second call — cached binary (still has old balance)
         auto result2 = sync(L2TestUserRepo::findBinary(id));
-        REQUIRE(result2 != nullptr);
-        auto entity = entity::generated::TestUserWrapper::fromBinary(*result2);
+        REQUIRE(!result2.empty());
+        auto entity = entity::generated::TestUserWrapper::fromBinary(result2);
         REQUIRE(entity.has_value());
         REQUIRE(entity->balance == 200);
     }
@@ -727,8 +726,8 @@ TEST_CASE("RedisRepo - findBinary", "[integration][db][redis][binary]") {
 
         // Should fetch fresh data from DB
         auto result = sync(L2TestUserRepo::findBinary(id));
-        REQUIRE(result != nullptr);
-        auto entity = entity::generated::TestUserWrapper::fromBinary(*result);
+        REQUIRE(!result.empty());
+        auto entity = entity::generated::TestUserWrapper::fromBinary(result);
         REQUIRE(entity.has_value());
         REQUIRE(entity->balance == 0);
     }
@@ -2364,8 +2363,8 @@ TEST_CASE("RedisRepo - l2_format Json", "[integration][db][redis][l2-format]") {
 
         // Verify Redis contains JSON (not binary) by reading raw string
         auto rawJson = sync(L2JsonTestUserRepo::findJson(id));
-        REQUIRE(rawJson != nullptr);
-        REQUIRE(rawJson->find("\"json_format\"") != std::string::npos);
+        REQUIRE(!rawJson.empty());
+        REQUIRE(rawJson.find("\"json_format\"") != std::string::npos);
 
         // Modify DB directly
         updateTestUserBalance(id, 999);
@@ -2381,11 +2380,10 @@ TEST_CASE("RedisRepo - l2_format Json", "[integration][db][redis][l2-format]") {
 
         // findBinary on a Json-format repo: fetches entity (from JSON cache), returns binary
         auto bin = sync(L2JsonTestUserRepo::findBinary(id));
-        REQUIRE(bin != nullptr);
-        REQUIRE(!bin->empty());
+        REQUIRE(!bin.empty());
 
         // Roundtrip: deserialize BEVE back to entity
-        auto entity = TestUserWrapper::fromBinary(*bin);
+        auto entity = TestUserWrapper::fromBinary(bin);
         REQUIRE(entity.has_value());
         REQUIRE(entity->username == "json_to_bin");
         REQUIRE(entity->balance == 300);
@@ -2397,8 +2395,8 @@ TEST_CASE("RedisRepo - l2_format Json", "[integration][db][redis][l2-format]") {
 
         // Verify cache is JSON
         auto rawJson = sync(L2JsonTestUserRepo::findJson(created->id));
-        REQUIRE(rawJson != nullptr);
-        REQUIRE(rawJson->find("\"json_insert\"") != std::string::npos);
+        REQUIRE(!rawJson.empty());
+        REQUIRE(rawJson.find("\"json_insert\"") != std::string::npos);
     }
 
     SECTION("[update] invalidates JSON cache") {
@@ -2466,9 +2464,9 @@ TEST_CASE("RedisRepo - RowView byte-identity (TestUser BEVE)", "[integration][db
 
         // RowView path: L2 miss → DB → rowToJson
         auto rowJson = sync(L2TestUserRepo::findJson(id));
-        REQUIRE(rowJson != nullptr);
+        REQUIRE(!rowJson.empty());
 
-        REQUIRE(*rowJson == *entityJson);
+        REQUIRE(rowJson == entityJson);
     }
 
     SECTION("[rowview] findBinary on L2 miss produces byte-identical BEVE to entity path") {
@@ -2481,9 +2479,9 @@ TEST_CASE("RedisRepo - RowView byte-identity (TestUser BEVE)", "[integration][db
         sync(L2TestUserRepo::evictRedis(id));
 
         auto rowBeve = sync(L2TestUserRepo::findBinary(id));
-        REQUIRE(rowBeve != nullptr);
+        REQUIRE(!rowBeve.empty());
 
-        REQUIRE(*rowBeve == *entityBeve);
+        REQUIRE(rowBeve == entityBeve);
     }
 }
 
@@ -2500,9 +2498,9 @@ TEST_CASE("RedisRepo - RowView byte-identity (TestItem JSON format)", "[integrat
         sync(L2TestItemRepo::evictRedis(id));
 
         auto rowJson = sync(L2TestItemRepo::findJson(id));
-        REQUIRE(rowJson != nullptr);
+        REQUIRE(!rowJson.empty());
 
-        REQUIRE(*rowJson == *entityJson);
+        REQUIRE(rowJson == entityJson);
     }
 }
 
@@ -2520,8 +2518,8 @@ TEST_CASE("RedisRepo - RowView fire-and-forget L2 population (BEVE)", "[integrat
 
         // L2 miss → RowView JSON returned + fire-and-forget BEVE stored in L2
         auto json = sync(L2TestUserRepo::findJson(id));
-        REQUIRE(json != nullptr);
-        REQUIRE(json->find("\"ff_user\"") != std::string::npos);
+        REQUIRE(!json.empty());
+        REQUIRE(json.find("\"ff_user\"") != std::string::npos);
 
         // Brief wait for fire-and-forget to complete
         waitForExpiration(std::chrono::milliseconds{50});
@@ -2540,7 +2538,7 @@ TEST_CASE("RedisRepo - RowView fire-and-forget L2 population (BEVE)", "[integrat
 
         // L2 miss → RowView BEVE returned + fire-and-forget BEVE stored in L2
         auto beve = sync(L2TestUserRepo::findBinary(id));
-        REQUIRE(beve != nullptr);
+        REQUIRE(!beve.empty());
 
         waitForExpiration(std::chrono::milliseconds{50});
 
@@ -2561,7 +2559,7 @@ TEST_CASE("RedisRepo - RowView fire-and-forget L2 population (JSON format)", "[i
 
         // L2 miss → RowView JSON returned + fire-and-forget JSON stored in L2
         auto json = sync(L2TestItemRepo::findJson(id));
-        REQUIRE(json != nullptr);
+        REQUIRE(!json.empty());
 
         waitForExpiration(std::chrono::milliseconds{50});
 
@@ -2595,9 +2593,9 @@ TEST_CASE("RedisRepo - findJson L2 hit uses cache (not RowView)", "[integration]
 
         // findJson should transcode BEVE from L2 (not hit DB)
         auto json = sync(L2TestUserRepo::findJson(id));
-        REQUIRE(json != nullptr);
-        REQUIRE(json->find("400") != std::string::npos);  // Cached value
-        REQUIRE(json->find("999") == std::string::npos);   // Not DB value
+        REQUIRE(!json.empty());
+        REQUIRE(json.find("400") != std::string::npos);  // Cached value
+        REQUIRE(json.find("999") == std::string::npos);   // Not DB value
     }
 
     SECTION("[l2-hit] findJson returns cached JSON on L2 hit (JSON format)") {
@@ -2608,8 +2606,8 @@ TEST_CASE("RedisRepo - findJson L2 hit uses cache (not RowView)", "[integration]
         updateTestItem(id, "Modified", 0);
 
         auto json = sync(L2TestItemRepo::findJson(id));
-        REQUIRE(json != nullptr);
-        REQUIRE(json->find("\"l2hit_item\"") != std::string::npos);
+        REQUIRE(!json.empty());
+        REQUIRE(json.find("\"l2hit_item\"") != std::string::npos);
     }
 
     SECTION("[l2-hit] findBinary returns cached BEVE on L2 hit") {
@@ -2620,8 +2618,8 @@ TEST_CASE("RedisRepo - findJson L2 hit uses cache (not RowView)", "[integration]
         updateTestUserBalance(id, 888);
 
         auto beve = sync(L2TestUserRepo::findBinary(id));
-        REQUIRE(beve != nullptr);
-        auto entity = TestUserWrapper::fromBinary(*beve);
+        REQUIRE(!beve.empty());
+        auto entity = TestUserWrapper::fromBinary(beve);
         REQUIRE(entity.has_value());
         REQUIRE(entity->balance == 300);
     }
@@ -2641,8 +2639,8 @@ TEST_CASE("RedisRepo - RowView with L2 JSON format", "[integration][db][redis][r
 
         // L2 miss → RowView JSON + fire-and-forget L2 JSON
         auto json = sync(L2JsonTestUserRepo::findJson(id));
-        REQUIRE(json != nullptr);
-        REQUIRE(json->find("\"rv_json_user\"") != std::string::npos);
+        REQUIRE(!json.empty());
+        REQUIRE(json.find("\"rv_json_user\"") != std::string::npos);
 
         waitForExpiration(std::chrono::milliseconds{50});
 
@@ -2650,8 +2648,8 @@ TEST_CASE("RedisRepo - RowView with L2 JSON format", "[integration][db][redis][r
 
         // L2 hit: raw JSON from Redis
         auto json2 = sync(L2JsonTestUserRepo::findJson(id));
-        REQUIRE(json2 != nullptr);
-        REQUIRE(json2->find("600") != std::string::npos);  // Cached
+        REQUIRE(!json2.empty());
+        REQUIRE(json2.find("600") != std::string::npos);  // Cached
     }
 
     SECTION("[l2-json] findBinary on L2 miss uses RowView + fire-and-forget JSON") {
@@ -2659,8 +2657,8 @@ TEST_CASE("RedisRepo - RowView with L2 JSON format", "[integration][db][redis][r
 
         // L2 miss → RowView BEVE returned + fire-and-forget JSON stored in L2
         auto beve = sync(L2JsonTestUserRepo::findBinary(id));
-        REQUIRE(beve != nullptr);
-        auto entity = TestUserWrapper::fromBinary(*beve);
+        REQUIRE(!beve.empty());
+        auto entity = TestUserWrapper::fromBinary(beve);
         REQUIRE(entity.has_value());
         REQUIRE(entity->balance == 350);
 

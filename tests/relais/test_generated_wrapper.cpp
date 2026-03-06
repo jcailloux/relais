@@ -91,7 +91,7 @@ TEST_CASE("TestUser - binary (BEVE) round-trip", "[wrapper][binary][user]") {
     user.created_at = "2025-01-01T00:00:00Z";
 
     SECTION("[Binary] round-trip preserves all fields") {
-        auto restored = TestUser::fromBinary(*user.binary());
+        auto restored = TestUser::fromBinary(user.binary());
         REQUIRE(restored.has_value());
         REQUIRE(restored->id == 42);
         REQUIRE(restored->username == "alice");
@@ -112,22 +112,16 @@ TEST_CASE("TestUser - JSON round-trip", "[wrapper][json][user]") {
 
     SECTION("[JSON] json produces valid output") {
         auto json = user.json();
-        REQUIRE(json);
-        REQUIRE(json->find("\"id\":42") != std::string::npos);
-        REQUIRE(json->find("\"username\":\"alice\"") != std::string::npos);
-        REQUIRE(json->find("\"email\":\"alice@example.com\"") != std::string::npos);
-        REQUIRE(json->find("\"balance\":1000") != std::string::npos);
-    }
-
-    SECTION("[JSON] result is cached (same pointer)") {
-        auto p1 = user.json();
-        auto p2 = user.json();
-        REQUIRE(p1 == p2);
+        REQUIRE(!json.empty());
+        REQUIRE(json.find("\"id\":42") != std::string::npos);
+        REQUIRE(json.find("\"username\":\"alice\"") != std::string::npos);
+        REQUIRE(json.find("\"email\":\"alice@example.com\"") != std::string::npos);
+        REQUIRE(json.find("\"balance\":1000") != std::string::npos);
     }
 
     SECTION("[JSON] round-trip via fromJson") {
         auto json = user.json();
-        auto restored = TestUser::fromJson(*json);
+        auto restored = TestUser::fromJson(json);
         REQUIRE(restored.has_value());
         REQUIRE(restored->id == 42);
         REQUIRE(restored->username == "alice");
@@ -142,7 +136,7 @@ TEST_CASE("TestUser - JSON round-trip", "[wrapper][json][user]") {
         u.email = "bob@example.com";
         u.balance = 500;
         u.created_at = "2025-06-15T10:30:00Z";
-        auto restored = TestUser::fromBinary(*u.binary());
+        auto restored = TestUser::fromBinary(u.binary());
         REQUIRE(restored.has_value());
         REQUIRE(restored->id == 99);
         REQUIRE(restored->username == "bob");
@@ -208,7 +202,7 @@ TEST_CASE("TestArticle - nullable fields", "[wrapper][struct][article][nullable]
 
     SECTION("[JSON] absent optional is handled") {
         auto json = article.json();
-        REQUIRE(json);
+        REQUIRE(!json.empty());
         // Glaze serializes std::optional as null or omits it depending on config
     }
 
@@ -224,14 +218,14 @@ TEST_CASE("TestArticle - nullable fields", "[wrapper][struct][article][nullable]
     }
 
     SECTION("[Binary] round-trip preserves absent optional") {
-        auto restored = TestArticle::fromBinary(*article.binary());
+        auto restored = TestArticle::fromBinary(article.binary());
         REQUIRE(restored.has_value());
         REQUIRE_FALSE(restored->view_count.has_value());
     }
 
     SECTION("[Binary] round-trip preserves present optional") {
         article.view_count = 42;
-        auto restored = TestArticle::fromBinary(*article.binary());
+        auto restored = TestArticle::fromBinary(article.binary());
         REQUIRE(restored.has_value());
         REQUIRE(restored->view_count.has_value());
         REQUIRE(*restored->view_count == 42);
@@ -264,13 +258,13 @@ TEST_CASE("TestPurchase - struct / json / binary", "[wrapper][struct][purchase]"
 
     SECTION("[JSON] contains all fields") {
         auto json = purchase.json();
-        REQUIRE(json->find("\"user_id\":42") != std::string::npos);
-        REQUIRE(json->find("\"product_name\":\"Widget\"") != std::string::npos);
-        REQUIRE(json->find("\"amount\":999") != std::string::npos);
+        REQUIRE(json.find("\"user_id\":42") != std::string::npos);
+        REQUIRE(json.find("\"product_name\":\"Widget\"") != std::string::npos);
+        REQUIRE(json.find("\"amount\":999") != std::string::npos);
     }
 
     SECTION("[Binary] round-trip preserves data") {
-        auto restored = TestPurchase::fromBinary(*purchase.binary());
+        auto restored = TestPurchase::fromBinary(purchase.binary());
         REQUIRE(restored.has_value());
         REQUIRE(restored->id == 1);
         REQUIRE(restored->user_id == 42);
@@ -390,7 +384,7 @@ TEST_CASE("TestOrder - direct construction reads all fields", "[wrapper][struct]
 TEST_CASE("TestOrder - binary (BEVE) round-trip", "[wrapper][binary][order]") {
 
     auto order = buildFullTestOrder();
-    auto restored = TestOrder::fromBinary(*order.binary());
+    auto restored = TestOrder::fromBinary(order.binary());
     REQUIRE(restored.has_value());
 
     SECTION("[Binary] preserves scalar fields") {
@@ -449,7 +443,7 @@ TEST_CASE("TestOrder - EnumField (priority)", "[wrapper][struct][order][enum]") 
     }
 
     SECTION("[JSON] outputs quoted lowercase string") {
-        REQUIRE(order.json()->find("\"priority\":\"high\"") != std::string::npos);
+        REQUIRE(order.json().find("\"priority\":\"high\"") != std::string::npos);
     }
 }
 
@@ -462,11 +456,11 @@ TEST_CASE("TestOrder - EnumField (status — developer-defined glz::meta)", "[wr
     }
 
     SECTION("[JSON] outputs quoted lowercase string") {
-        REQUIRE(order.json()->find("\"status\":\"shipped\"") != std::string::npos);
+        REQUIRE(order.json().find("\"status\":\"shipped\"") != std::string::npos);
     }
 
     SECTION("[Binary] round-trips through BEVE") {
-        auto restored = TestOrder::fromBinary(*order.binary());
+        auto restored = TestOrder::fromBinary(order.binary());
         REQUIRE(restored.has_value());
         REQUIRE(restored->status == Status::Shipped);
     }
@@ -476,7 +470,7 @@ TEST_CASE("TestOrder - RawJson (metadata)", "[wrapper][struct][order][rawjson]")
 
     SECTION("[JSON] injects raw JSON correctly") {
         auto order = buildFullTestOrder();
-        REQUIRE(order.json()->find("\"metadata\":{\"x\":1}") != std::string::npos);
+        REQUIRE(order.json().find("\"metadata\":{\"x\":1}") != std::string::npos);
     }
 
     SECTION("[JSON] raw string preserved via JSON round-trip") {
@@ -491,7 +485,7 @@ TEST_CASE("TestOrder - RawJson (metadata)", "[wrapper][struct][order][rawjson]")
         order.created_at = "2025-01-01T00:00:00Z";
         order.metadata.str = R"({"key":"value"})";
         auto json = order.json();
-        auto restored = TestOrder::fromJson(*json);
+        auto restored = TestOrder::fromJson(json);
         REQUIRE(restored.has_value());
         REQUIRE(restored->metadata.str == R"({"key":"value"})");
     }
@@ -501,7 +495,7 @@ TEST_CASE("TestOrder - nested struct (address)", "[wrapper][struct][order][objec
 
     SECTION("[JSON] outputs nested object with 4-level nesting") {
         auto order = buildFullTestOrder();
-        auto json = *order.json();
+        auto json = order.json();
         REQUIRE(json.find("\"street\":\"123 Main St\"") != std::string::npos);
         REQUIRE(json.find("\"latitude\":") != std::string::npos);
         REQUIRE(json.find("\"source\":\"gps\"") != std::string::npos);
@@ -526,8 +520,8 @@ TEST_CASE("TestOrder - ObjectVectorField (history)", "[wrapper][struct][order][o
     SECTION("[JSON] outputs array of objects") {
         auto order = buildFullTestOrder();
         auto json = order.json();
-        REQUIRE(json->find("\"street\":\"10 Rue A\"") != std::string::npos);
-        REQUIRE(json->find("\"street\":\"20 Rue B\"") != std::string::npos);
+        REQUIRE(json.find("\"street\":\"10 Rue A\"") != std::string::npos);
+        REQUIRE(json.find("\"street\":\"20 Rue B\"") != std::string::npos);
     }
 }
 
@@ -535,7 +529,7 @@ TEST_CASE("TestOrder - ScalarVectorField (quantities)", "[wrapper][struct][order
 
     SECTION("[JSON] outputs array of numbers") {
         auto order = buildFullTestOrder();
-        REQUIRE(order.json()->find("\"quantities\":[10,20,30]") != std::string::npos);
+        REQUIRE(order.json().find("\"quantities\":[10,20,30]") != std::string::npos);
     }
 }
 
@@ -543,7 +537,7 @@ TEST_CASE("TestOrder - StringVectorField (tags)", "[wrapper][struct][order][stri
 
     SECTION("[JSON] outputs array of strings") {
         auto order = buildFullTestOrder();
-        REQUIRE(order.json()->find("\"tags\":[\"urgent\",\"fragile\"]") != std::string::npos);
+        REQUIRE(order.json().find("\"tags\":[\"urgent\",\"fragile\"]") != std::string::npos);
     }
 }
 
@@ -569,14 +563,14 @@ TEST_CASE("TestOrder - nullable discount", "[wrapper][struct][order][nullable]")
 
     SECTION("[Binary] round-trip preserves absent") {
         auto order = buildMinimalTestOrder();
-        auto restored = TestOrder::fromBinary(*order.binary());
+        auto restored = TestOrder::fromBinary(order.binary());
         REQUIRE(restored.has_value());
         REQUIRE_FALSE(restored->discount.has_value());
     }
 
     SECTION("[Binary] round-trip preserves present value") {
         auto order = buildFullTestOrder();
-        auto restored = TestOrder::fromBinary(*order.binary());
+        auto restored = TestOrder::fromBinary(order.binary());
         REQUIRE(restored.has_value());
         REQUIRE(restored->discount.has_value());
         REQUIRE(*restored->discount == 50);
@@ -587,7 +581,7 @@ TEST_CASE("TestOrder - JSON round-trip preserves all field types", "[wrapper][js
 
     auto order = buildFullTestOrder();
     auto json = order.json();
-    auto restored = TestOrder::fromJson(*json);
+    auto restored = TestOrder::fromJson(json);
     REQUIRE(restored.has_value());
 
     SECTION("[JSON] preserves scalar/string/enum fields") {
@@ -644,7 +638,7 @@ TEST_CASE("TestOrder - deep nesting round-trip (4 levels)", "[wrapper][struct][o
         order.address.geo.metadata.accuracy = 0.5f;
         order.address.geo.metadata.source = "satellite";
 
-        auto json = *order.json();
+        auto json = order.json();
         REQUIRE(json.find("\"street\":\"1 Rue X\"") != std::string::npos);
         REQUIRE(json.find("\"latitude\":") != std::string::npos);
         REQUIRE(json.find("\"source\":\"satellite\"") != std::string::npos);
@@ -652,7 +646,7 @@ TEST_CASE("TestOrder - deep nesting round-trip (4 levels)", "[wrapper][struct][o
 
     SECTION("[Binary] full composite round-trip") {
         auto order = buildFullTestOrder();
-        auto restored = TestOrder::fromBinary(*order.binary());
+        auto restored = TestOrder::fromBinary(order.binary());
         REQUIRE(restored.has_value());
 
         REQUIRE(restored->address.street == "123 Main St");
@@ -741,7 +735,7 @@ TEST_CASE("ListWrapper<TestArticle> - construction and accessors", "[wrapper][li
     }
 
     SECTION("[List] binary round-trip preserves list") {
-        auto restored = ListWrapperArticle::fromBinary(*list.binary());
+        auto restored = ListWrapperArticle::fromBinary(list.binary());
         REQUIRE(restored.has_value());
         REQUIRE(restored->size() == 2);
     }
@@ -789,8 +783,8 @@ TEST_CASE("ListWrapper<TestArticle> - json", "[wrapper][list][article][json]") {
     SECTION("[List->JSON] empty list") {
         ListWrapperArticle list;
         auto json = list.json();
-        REQUIRE(json);
-        REQUIRE(json->find("\"items\":[]") != std::string::npos);
+        REQUIRE(!json.empty());
+        REQUIRE(json.find("\"items\":[]") != std::string::npos);
     }
 
     TestArticle a;
@@ -808,15 +802,9 @@ TEST_CASE("ListWrapper<TestArticle> - json", "[wrapper][list][article][json]") {
 
     SECTION("[List->JSON] items are serialized") {
         auto json = list.json();
-        REQUIRE(json->find("\"items\":[{") != std::string::npos);
-        REQUIRE(json->find("\"view_count\":42") != std::string::npos);
-        REQUIRE(json->find("\"category\":\"tech\"") != std::string::npos);
-    }
-
-    SECTION("[List->JSON] result is cached (same pointer)") {
-        auto p1 = list.json();
-        auto p2 = list.json();
-        REQUIRE(p1 == p2);
+        REQUIRE(json.find("\"items\":[{") != std::string::npos);
+        REQUIRE(json.find("\"view_count\":42") != std::string::npos);
+        REQUIRE(json.find("\"category\":\"tech\"") != std::string::npos);
     }
 }
 
@@ -837,7 +825,7 @@ TEST_CASE("ListWrapper<TestArticle> - JSON round-trip", "[wrapper][list][article
     auto json = list.json();
 
     SECTION("[List] fromJson round-trip") {
-        auto restored = ListWrapperArticle::fromJson(*json);
+        auto restored = ListWrapperArticle::fromJson(json);
         REQUIRE(restored.has_value());
         REQUIRE(restored->size() == 1);
         auto* first = restored->front();
@@ -1090,18 +1078,18 @@ TEST_CASE("Custom JSON field names via glz::meta<Struct>", "[wrapper][json][cust
 
     SECTION("[JSON] uses camelCase names from glz::meta<Product>") {
         auto json = product.json();
-        REQUIRE(json);
+        REQUIRE(!json.empty());
         // Must use camelCase from glz::meta<Product>
-        REQUIRE(json->find("\"productName\":\"Widget\"") != std::string::npos);
-        REQUIRE(json->find("\"unitPrice\":999") != std::string::npos);
+        REQUIRE(json.find("\"productName\":\"Widget\"") != std::string::npos);
+        REQUIRE(json.find("\"unitPrice\":999") != std::string::npos);
         // Must NOT contain snake_case from Mapping::glaze_value
-        REQUIRE(json->find("\"product_name\"") == std::string::npos);
-        REQUIRE(json->find("\"unit_price\"") == std::string::npos);
+        REQUIRE(json.find("\"product_name\"") == std::string::npos);
+        REQUIRE(json.find("\"unit_price\"") == std::string::npos);
     }
 
     SECTION("[JSON] round-trip preserves all fields") {
         auto json = product.json();
-        auto restored = custom_json_test::ProductWrapper::fromJson(*json);
+        auto restored = custom_json_test::ProductWrapper::fromJson(json);
         REQUIRE(restored.has_value());
         REQUIRE(restored->id == 42);
         REQUIRE(restored->product_name == "Widget");
@@ -1109,7 +1097,7 @@ TEST_CASE("Custom JSON field names via glz::meta<Struct>", "[wrapper][json][cust
     }
 
     SECTION("[Binary] BEVE round-trip preserves all fields") {
-        auto restored = custom_json_test::ProductWrapper::fromBinary(*product.binary());
+        auto restored = custom_json_test::ProductWrapper::fromBinary(product.binary());
         REQUIRE(restored.has_value());
         REQUIRE(restored->id == 42);
         REQUIRE(restored->product_name == "Widget");
@@ -1141,43 +1129,19 @@ TEST_CASE("ListWrapper items use custom JSON field names", "[wrapper][list][cust
 
     SECTION("[List->JSON] items serialized with camelCase names") {
         auto json = list.json();
-        REQUIRE(json);
-        REQUIRE(json->find("\"productName\":\"Widget\"") != std::string::npos);
-        REQUIRE(json->find("\"productName\":\"Gadget\"") != std::string::npos);
-        REQUIRE(json->find("\"unitPrice\":100") != std::string::npos);
-        REQUIRE(json->find("\"product_name\"") == std::string::npos);
+        REQUIRE(!json.empty());
+        REQUIRE(json.find("\"productName\":\"Widget\"") != std::string::npos);
+        REQUIRE(json.find("\"productName\":\"Gadget\"") != std::string::npos);
+        REQUIRE(json.find("\"unitPrice\":100") != std::string::npos);
+        REQUIRE(json.find("\"product_name\"") == std::string::npos);
     }
 
     SECTION("[List] BEVE round-trip preserves items") {
-        auto restored = ProductList::fromBinary(*list.binary());
+        auto restored = ProductList::fromBinary(list.binary());
         REQUIRE(restored.has_value());
         REQUIRE(restored->size() == 2);
         REQUIRE(restored->items[0].product_name == "Widget");
         REQUIRE(restored->items[1].unit_price == 200);
-    }
-}
-
-TEST_CASE("releaseCaches() frees serialization data while callers retain copies", "[wrapper][cache]") {
-
-    TestUser user;
-    user.id = 42;
-    user.username = "alice";
-    user.email = "alice@example.com";
-    user.balance = 1000;
-    user.created_at = "2025-01-01T00:00:00Z";
-
-    SECTION("[Entity] atomic cache pointers are stable across calls") {
-        auto binary1 = user.binary();
-        auto binary2 = user.binary();
-        REQUIRE(binary1);
-        REQUIRE(binary1 == binary2);  // Same pointer (CAS-based lazy init)
-    }
-
-    SECTION("[Entity] JSON atomic cache is stable across calls") {
-        auto json1 = user.json();
-        auto json2 = user.json();
-        REQUIRE(json1);
-        REQUIRE(json1 == json2);  // Same pointer (CAS-based lazy init)
     }
 }
 
@@ -1193,7 +1157,7 @@ TEST_CASE("Entities without glz::meta<Struct> still use Mapping::glaze_value", "
     user.created_at = "2025-01-01T00:00:00Z";
 
     auto json = user.json();
-    REQUIRE(json);
-    REQUIRE(json->find("\"username\":\"alice\"") != std::string::npos);
-    REQUIRE(json->find("\"balance\":100") != std::string::npos);
+    REQUIRE(!json.empty());
+    REQUIRE(json.find("\"username\":\"alice\"") != std::string::npos);
+    REQUIRE(json.find("\"balance\":100") != std::string::npos);
 }

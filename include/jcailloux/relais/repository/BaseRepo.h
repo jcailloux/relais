@@ -17,7 +17,6 @@
 #include "jcailloux/relais/config/TypeTraits.h"
 #include "jcailloux/relais/wrapper/EntityConcepts.h"
 #include "jcailloux/relais/wrapper/EntityView.h"
-#include "jcailloux/relais/wrapper/BufferView.h"
 #include "jcailloux/relais/wrapper/FieldUpdate.h"
 
 namespace jcailloux::relais {
@@ -110,9 +109,8 @@ inline std::string buildUpdateReturning(
 // BaseRepo - CRUD operations with L3 (database) access only
 // =========================================================================
 //
-// All methods return epoch-guarded views (EntityView / JsonView / BinaryView).
-// Entities are allocated in a static memory_pool and immediately retired.
-// The EpochGuard prevents reclamation until the view is destroyed.
+// find() returns epoch-guarded EntityView. findJson()/findBinary() return
+// serialized data by value (std::string / std::vector<uint8_t>).
 
 template<typename Entity, config::FixedString Name, config::CacheConfig Cfg, typename Key>
 requires ReadableEntity<Entity>
@@ -143,8 +141,8 @@ public:
     // Find by ID — JSON serialization (L3: database only)
     // =====================================================================
 
-    /// Find by ID and return JSON buffer view (empty if not found).
-    static io::Task<wrapper::JsonView> findJson(const Key& id) {
+    /// Find by ID and return JSON string (empty if not found).
+    static io::Task<std::string> findJson(const Key& id) {
         try {
             auto params = io::PgParams::fromKey(id);
             auto result = co_await DbProvider::queryParams(
@@ -152,10 +150,7 @@ public:
             if (result.empty()) co_return {};
             auto entity = Entity::fromRow(result[0]);
             if (!entity) co_return {};
-            auto guard = epoch::EpochGuard::acquire();
-            auto* ptr = pool().New(std::move(*entity));
-            pool().Retire(ptr);
-            co_return wrapper::JsonView(ptr->json(), std::move(guard));
+            co_return entity->json();
         } catch (const io::PgError& e) {
             RELAIS_LOG_ERROR << name() << ": findJson DB error - " << e.what();
             co_return {};
@@ -166,8 +161,8 @@ public:
     // Find by ID — binary serialization (L3: database only)
     // =====================================================================
 
-    /// Find by ID and return binary (BEVE) buffer view (empty if not found).
-    static io::Task<wrapper::BinaryView> findBinary(const Key& id)
+    /// Find by ID and return binary (BEVE) vector (empty if not found).
+    static io::Task<std::vector<uint8_t>> findBinary(const Key& id)
         requires HasBinarySerialization<Entity>
     {
         try {
@@ -177,10 +172,7 @@ public:
             if (result.empty()) co_return {};
             auto entity = Entity::fromRow(result[0]);
             if (!entity) co_return {};
-            auto guard = epoch::EpochGuard::acquire();
-            auto* ptr = pool().New(std::move(*entity));
-            pool().Retire(ptr);
-            co_return wrapper::BinaryView(ptr->binary(), std::move(guard));
+            co_return entity->binary();
         } catch (const io::PgError& e) {
             RELAIS_LOG_ERROR << name() << ": findBinary DB error - " << e.what();
             co_return {};
