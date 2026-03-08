@@ -53,8 +53,6 @@ public:
     ~EntityWrapper() = default;
 
     // No serialization caches — copies/moves are trivial (Struct-only).
-    // memory_hook_ is intentionally NOT copied/moved: it belongs to the
-    // CachedWrapper that installed it, not to the EntityWrapper.
     EntityWrapper(const EntityWrapper& o) : Struct(static_cast<const Struct&>(o)) {}
     EntityWrapper(EntityWrapper&& o) noexcept : Struct(static_cast<Struct&&>(std::move(o))) {}
     EntityWrapper& operator=(const EntityWrapper& o) {
@@ -97,12 +95,6 @@ public:
     // =========================================================================
 
     using MappingType = Mapping;
-
-    // =========================================================================
-    // Memory tracking hook (set by CachedWrapper, nullptr for non-cached)
-    // =========================================================================
-
-    using MemoryHook = void(*)(void* ctx, int64_t delta);
 
     /// Approximate heap memory used by this entity (struct + dynamic fields).
     [[nodiscard]] size_t memoryUsage() const {
@@ -150,12 +142,6 @@ public:
         return entity;
     }
 
-    /// Set memory tracking hook with context pointer.
-    void setMemoryHook(MemoryHook hook, void* ctx) { memory_hook_ = hook; memory_hook_ctx_ = ctx; }
-
-protected:
-    mutable MemoryHook memory_hook_ = nullptr;
-    mutable void* memory_hook_ctx_ = nullptr;
 };
 
 }  // namespace jcailloux::relais::wrapper

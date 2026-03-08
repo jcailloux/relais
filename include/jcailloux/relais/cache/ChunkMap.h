@@ -94,6 +94,16 @@ inline uint64_t wyhash(const void* data, size_t len, uint64_t seed = 0) {
 template<typename T>
 struct AutoHash : std::hash<T> {};
 
+// Integers — ParlayHash's own rehash with is_avalanching (applied once, not twice)
+template<std::integral T>
+struct AutoHash<T> {
+    using is_avalanching = void;
+    size_t operator()(T x) const {
+        size_t h = static_cast<size_t>(x) * UINT64_C(0xbf58476d1ce4e5b9);
+        return h ^ (h >> 31);
+    }
+};
+
 // std::string — wyhash on raw bytes, skip ParlayHash rehash
 template<>
 struct AutoHash<std::string> {

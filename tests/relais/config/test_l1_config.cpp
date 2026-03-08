@@ -30,11 +30,12 @@ namespace relais_test::config_test {
 using namespace jcailloux::relais::config;
 
 // --- l1_ttl ---
-inline constexpr auto TTL50ms = Local
-    .with_l1_ttl(std::chrono::milliseconds{50});
+// CachedClock uses uint32_t seconds → minimum useful TTL is 1 second.
+inline constexpr auto TTL1s = Local
+    .with_l1_ttl(std::chrono::seconds{1});
 
-inline constexpr auto TTL500ms = Local
-    .with_l1_ttl(std::chrono::milliseconds{500});
+inline constexpr auto TTL3s = Local
+    .with_l1_ttl(std::chrono::seconds{3});
 
 // --- l1_chunk_count_log2 ---
 inline constexpr auto Seg2 = Local.with_l1_chunk_count_log2(1);    // 2^1 = 2 chunks
@@ -57,8 +58,8 @@ namespace relais_test {
 namespace ct = config_test;
 
 // TTL repos
-using TTL50msRepo   = Repo<TestItemWrapper, "cfg:l1:ttl50",   ct::TTL50ms>;
-using TTL500msRepo  = Repo<TestItemWrapper, "cfg:l1:ttl500",  ct::TTL500ms>;
+using TTL1sRepo   = Repo<TestItemWrapper, "cfg:l1:ttl1s",   ct::TTL1s>;
+using TTL3sRepo   = Repo<TestItemWrapper, "cfg:l1:ttl3s",   ct::TTL3s>;
 
 // Segment repos
 using Seg2Repo  = Repo<TestItemWrapper, "cfg:l1:seg2",  ct::Seg2>;
@@ -85,49 +86,51 @@ TEST_CASE("L1 Config - l1_ttl",
 {
     TransactionGuard tx;
 
-    SECTION("[ttl] 50ms TTL expires quickly") {
-        auto id = insertTestItem("ttl50_item", 10);
+    SECTION("[ttl] 1s TTL expires after wait") {
+        auto id = insertTestItem("ttl1s_item", 10);
 
-        sync(TTL50msRepo::find(id));
-        REQUIRE(getCacheSize<TTL50msRepo>() > 0);
+        sync(TTL1sRepo::find(id));
+        REQUIRE(getCacheSize<TTL1sRepo>() > 0);
 
-        waitForExpiration(std::chrono::milliseconds{80});
-        forcePurge<TTL50msRepo>();
+        // CachedClock uses uint32_t seconds: worst-case quantization adds ~1s
+        waitForExpiration(std::chrono::milliseconds{2200});
+        forcePurge<TTL1sRepo>();
 
         // Cache should be empty after cleanup
-        REQUIRE(getCacheSize<TTL50msRepo>() == 0);
+        REQUIRE(getCacheSize<TTL1sRepo>() == 0);
     }
 
-    SECTION("[ttl] 500ms TTL survives 200ms wait") {
-        auto id = insertTestItem("ttl500_item", 20);
+    SECTION("[ttl] 3s TTL survives 1s wait") {
+        auto id = insertTestItem("ttl3s_item", 20);
 
-        sync(TTL500msRepo::find(id));
+        sync(TTL3sRepo::find(id));
 
-        waitForExpiration(std::chrono::milliseconds{200});
+        waitForExpiration(std::chrono::seconds{1});
 
         // Modify DB — cached value should still be served
         updateTestItem(id, "modified", 99);
 
-        auto item = sync(TTL500msRepo::find(id));
-        REQUIRE(item->name == "ttl500_item");
+        auto item = sync(TTL3sRepo::find(id));
+        REQUIRE(item->name == "ttl3s_item");
         REQUIRE(item->value == 20);
     }
 
     SECTION("[ttl] expired entry triggers DB re-fetch after cleanup") {
         auto id = insertTestItem("ttl_refetch", 10);
 
-        sync(TTL50msRepo::find(id));
+        sync(TTL1sRepo::find(id));
 
         // Update DB
         updateTestItem(id, "ttl_refetched", 99);
 
-        waitForExpiration(std::chrono::milliseconds{80});
+        // CachedClock uses uint32_t seconds: worst-case quantization adds ~1s
+        waitForExpiration(std::chrono::milliseconds{2200});
 
         // GDSF: cleanup evicts TTL-expired entries
-        forcePurge<TTL50msRepo>();
+        forcePurge<TTL1sRepo>();
 
         // Expired entry evicted → DB fetch
-        auto item = sync(TTL50msRepo::find(id));
+        auto item = sync(TTL1sRepo::find(id));
         REQUIRE(item->name == "ttl_refetched");
         REQUIRE(item->value == 99);
     }

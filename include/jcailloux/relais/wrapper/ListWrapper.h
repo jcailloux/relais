@@ -30,7 +30,6 @@ class ListWrapper {
 public:
     using Format = jcailloux::relais::StructFormat;
     using ItemType = Item;
-    using MemoryHook = void(*)(void* ctx, int64_t delta);
     static constexpr bool read_only = true;
 
     std::vector<Item> items;
@@ -38,28 +37,15 @@ public:
     std::string next_cursor;
 
     ListWrapper() = default;
+    ~ListWrapper() = default;
 
-    ~ListWrapper() {
-        if (memory_hook_) {
-            memory_hook_(memory_hook_ctx_,
-                -static_cast<int64_t>(memoryUsage() + cache_overhead_));
-        }
-    }
-
-    // Copy ctor/assignment do NOT transfer the hook (copies are independent).
     ListWrapper(const ListWrapper& o)
         : items(o.items), total_count(o.total_count), next_cursor(o.next_cursor) {}
 
     ListWrapper(ListWrapper&& o) noexcept
         : items(std::move(o.items)), total_count(o.total_count),
-          next_cursor(std::move(o.next_cursor)),
-          memory_hook_(o.memory_hook_), memory_hook_ctx_(o.memory_hook_ctx_),
-          cache_overhead_(o.cache_overhead_)
-    {
-        o.memory_hook_ = nullptr;
-        o.memory_hook_ctx_ = nullptr;
-        o.cache_overhead_ = 0;
-    }
+          next_cursor(std::move(o.next_cursor))
+    {}
 
     ListWrapper& operator=(const ListWrapper& o) {
         if (this != &o) {
@@ -72,19 +58,9 @@ public:
 
     ListWrapper& operator=(ListWrapper&& o) noexcept {
         if (this != &o) {
-            if (memory_hook_) {
-                memory_hook_(memory_hook_ctx_,
-                    -static_cast<int64_t>(memoryUsage() + cache_overhead_));
-            }
             items = std::move(o.items);
             total_count = o.total_count;
             next_cursor = std::move(o.next_cursor);
-            memory_hook_ = o.memory_hook_;
-            memory_hook_ctx_ = o.memory_hook_ctx_;
-            cache_overhead_ = o.cache_overhead_;
-            o.memory_hook_ = nullptr;
-            o.memory_hook_ctx_ = nullptr;
-            o.cache_overhead_ = 0;
         }
         return *this;
     }
@@ -188,10 +164,6 @@ public:
         list.next_cursor = std::string(cursor);
         return list;
     }
-
-    mutable MemoryHook memory_hook_ = nullptr;
-    mutable void* memory_hook_ctx_ = nullptr;
-    size_t cache_overhead_{0};
 };
 
 }  // namespace jcailloux::relais::wrapper

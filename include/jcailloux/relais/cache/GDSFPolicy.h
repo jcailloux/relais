@@ -130,7 +130,7 @@ struct RepoRegistryEntry {
 // =========================================================================
 //
 // Leaking singleton (never destroyed) to avoid static destruction order
-// issues: CachedWrapper dtors may fire after static singletons are destroyed.
+// issues: cache entry dtors may fire after static singletons are destroyed.
 //
 // Thread-safe: all public methods are safe to call concurrently.
 //
@@ -146,7 +146,7 @@ class GDSFPolicy {
 
 public:
     /// Compile-time GDSF toggle. Controls if constexpr guards in CachedRepo/ListMixin.
-    /// When false, all GDSF code paths (metadata, CachedWrapper, scoring) are eliminated.
+    /// When false, all GDSF code paths (metadata, scoring, ghosts) are eliminated.
     static constexpr bool enabled = RELAIS_GDSF_ENABLED;
 
     /// Compile-time cleanup frequency: sweep every 2^N insertions.

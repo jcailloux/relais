@@ -487,14 +487,14 @@ TEST_CASE("CachedRepo - ShortTTL config",
     SECTION("[ttl] expired entry evicted by GDSF cleanup, re-fetched from DB") {
         auto id = insertTestItem("Short TTL", 42);
 
-        // Populate cache (TTL = 100ms)
+        // Populate cache (TTL = 1s)
         auto r1 = sync(ShortTTLTestItemRepo::find(id));
         REQUIRE(r1 != nullptr);
 
         updateTestItem(id, "After Expiry", 99);
 
-        // Wait for TTL expiration (100ms TTL + 150ms margin for CachedClock refresh)
-        waitForExpiration(std::chrono::milliseconds{250});
+        // Wait for TTL expiration (1s TTL + worst-case quantization adds ~1s)
+        waitForExpiration(std::chrono::milliseconds{2200});
 
         // GDSF: TTL-expired entry is evicted on get (Invalidate action)
         // → re-fetches fresh from DB

@@ -175,8 +175,9 @@ class ListMixin : public Base {
 
     static cache::list::ListCacheConfig listCacheConfig() {
         return {
-            .default_ttl = std::chrono::duration_cast<std::chrono::seconds>(
-                std::chrono::nanoseconds(Base::config.l1_ttl)),
+            .default_ttl_sec = static_cast<uint32_t>(
+                std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::nanoseconds(Base::config.l1_ttl)).count()),
         };
     }
 
@@ -187,7 +188,7 @@ class ListMixin : public Base {
             std::call_once(gdsf_flag, []() {
                 static const std::string list_name =
                     std::string(Base::name()) + ":list";
-                cache::GDSFPolicy::instance().enroll({
+                instance.tier().enroll({
                     .sweep_fn = +[]() -> bool { return listCache().sweep(); },
                     .size_fn = +[]() -> size_t { return listCache().size(); },
                     .name = list_name.c_str()

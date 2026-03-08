@@ -1,27 +1,21 @@
 #ifndef JCX_RELAIS_CACHEDREPO_H
 #define JCX_RELAIS_CACHEDREPO_H
 
+#include <array>
 #include <atomic>
 #include <chrono>
-#include <coroutine>
-#include <exception>
 #include <memory>
-#include <mutex>
 #include <type_traits>
+
 #include "jcailloux/relais/io/Task.h"
 #include "jcailloux/relais/repository/RedisRepo.h"
 #include "jcailloux/relais/Log.h"
-#include "jcailloux/relais/cache/CachedWrapper.h"
-#include "jcailloux/relais/cache/ChunkMap.h"
+#include "jcailloux/relais/cache/CacheTier.h"
 #include "jcailloux/relais/cache/GDSFMetadata.h"
-#include "jcailloux/relais/cache/GDSFPolicy.h"
-#include "jcailloux/relais/cache/TaggedEntry.h"
 #include "jcailloux/relais/wrapper/EntityView.h"
 #include "jcailloux/relais/config/repo_config.h"
 #include "jcailloux/relais/config/CachedClock.h"
 #include "jcailloux/relais/cache/Metrics.h"
-#include <array>
-#include <bit>
 
 #ifdef RELAIS_BUILDING_TESTS
 namespace relais_test { struct TestInternals; }
@@ -30,25 +24,19 @@ namespace relais_test { struct TestInternals; }
 namespace jcailloux::relais {
 
 /**
- * Repo with L1 RAM cache backed by lock-free ChunkMap (ParlayHash).
+ * Repo with L1 RAM cache backed by CacheTier (ChunkMap + GDSF + ghosts).
+ *
+ * Thin wrapper: all L1 mechanics (find, store, evict, cleanup, inflight dedup,
+ * GDSF admission, ghost lifecycle) are delegated to CacheTier<Key, Entity, Metadata>.
+ *
+ * CachedRepo adds only domain-specific concerns:
+ * - Generation counter for stale write prevention
+ * - EntityView wrapping for find() results
+ * - Mixin chain delegation (Base = RedisRepo or BaseRepo)
  *
  * Supports two modes based on Cfg.cache_level:
  * - CacheLevel::L1:    RAM -> Database (Redis bypassed)
  * - CacheLevel::L1_L2: RAM -> Redis -> Database (full hierarchy)
- *
- * find() returns EntityView. findJson()/findBinary() return by value.
- * Views are thread-agnostic and safe to hold across co_await.
- *
- * Eviction policy depends on compile-time configuration:
- * - GDSF (score = frequency x cost) when RELAIS_GDSF_ENABLED
- * - TTL-only when l1_ttl > 0 but no GDSF
- * - No cleanup when neither is configured (default)
- *
- * When GDSF is enabled, ghost entries provide admission control under high
- * memory pressure (>= admission_pressure, default 90%). Below that threshold,
- * all fetches are cached directly and the sweep handles eviction. Ghosts are
- * zero-allocation: 8B of data (access count, estimated bytes, flags) encoded
- * inline in a tagged pointer stored directly in the ParlayHash bucket.
  *
  * Note: L1RepoConfig constraint is verified in Repo.h to avoid
  * eager evaluation issues with std::conditional_t.
@@ -71,10 +59,13 @@ class CachedRepo : public std::conditional_t<
         BaseRepo<Entity, Name, Cfg, Key>
     >;
 
-    using Mapping = typename Entity::MappingType;
-    using Clock = std::chrono::steady_clock;
     using Metadata = cache::CacheMetadata<HasGDSF, HasTTL>;
-    using ValueType = std::conditional_t<HasGDSF, cache::CachedWrapper<Entity>, Entity>;
+    using Tier = cache::CacheTier<Key, Entity, Metadata>;
+
+    /// TTL in seconds (compile-time, for metadata construction).
+    static constexpr uint32_t kTtlSec = static_cast<uint32_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::nanoseconds(Cfg.l1_ttl)).count());
 
 public:
     using typename Base::EntityType;
@@ -94,40 +85,37 @@ public:
     // =========================================================================
 
     /// Find by ID with L1 -> (L2) -> DB fallback.
-    /// Returns epoch-guarded EntityView (empty if not found).
     /// L1 hit: zero overhead (Immediate holds EntityView directly, no Task).
     static io::Immediate<wrapper::EntityView<Entity>> find(const Key& id) {
-        if (auto view = getFromCache(id)) {
+        auto hit = tier().find(id);
+        if (hit) {
             RELAIS_METRICS_INC(l1_counters_.hits);
-            return std::move(view);
+            return wrapper::EntityView<Entity>(
+                static_cast<const Entity*>(hit.value), std::move(hit.guard));
         }
         RELAIS_METRICS_INC(l1_counters_.misses);
         return findSlow(id);
     }
 
     /// Find by ID and return JSON string (empty if not found).
-    /// L1 hit: serializes from cached entity (Immediate, no Task).
     static io::Immediate<std::string> findJson(const Key& id) {
-        auto result = findInCache(id);
-        if (result) {
+        auto hit = tier().find(id);
+        if (hit) {
             RELAIS_METRICS_INC(l1_counters_.hits);
-            auto* ce = result.asReal();
-            return ce->value.json();
+            return hit.value->json();
         }
         RELAIS_METRICS_INC(l1_counters_.misses);
         return findJsonSlow(id);
     }
 
     /// Find by ID and return binary (BEVE) vector (empty if not found).
-    /// L1 hit: serializes from cached entity (Immediate, no Task).
     static io::Immediate<std::vector<uint8_t>> findBinary(const Key& id)
         requires HasBinarySerialization<Entity>
     {
-        auto result = findInCache(id);
-        if (result) {
+        auto hit = tier().find(id);
+        if (hit) {
             RELAIS_METRICS_INC(l1_counters_.hits);
-            auto* ce = result.asReal();
-            return ce->value.binary();
+            return hit.value->binary();
         }
         RELAIS_METRICS_INC(l1_counters_.misses);
         return findBinarySlow(id);
@@ -144,14 +132,12 @@ public:
         auto result = co_await Base::insertRaw(entity);
         if (result) {
             bumpGeneration(result->key());
-            co_return putInCacheAndView(result->key(), std::move(*result));
+            co_return storeAndView(result->key(), std::move(*result));
         }
         co_return {};
     }
 
     /// Update entity in database with L1 cache handling.
-    /// Returns true on success, false on error.
-    /// Skips L1 cache operations when the write was coalesced (follower).
     static io::Task<bool> update(const Key& id, const Entity& entity)
         requires MutableEntity<Entity> && (!Cfg.read_only)
     {
@@ -160,14 +146,11 @@ public:
         auto outcome = co_await Base::updateOutcome(id, entity);
         if (outcome.success && !outcome.coalesced) {
             if constexpr (Cfg.update_strategy == InvalidateAndLazyReload) {
-                evict(id);  // evict() calls bumpGeneration internally
+                evict(id);
             } else {
-                // Apply ghost penalty if a ghost exists for this key
-                if constexpr (HasGDSF) {
-                    applyGhostUpdatePenalty(id);
-                }
+                tier().onMutation(id);
                 bumpGeneration(id);
-                putInCache(id, entity);
+                tier().store(id, Entity(entity), buildMetadata());
             }
         }
         co_return outcome.success;
@@ -179,21 +162,17 @@ public:
     static io::Task<wrapper::EntityView<Entity>> patch(const Key& id, Updates&&... updates)
         requires HasFieldUpdate<Entity> && (!Cfg.read_only)
     {
-        if constexpr (HasGDSF) {
-            applyGhostUpdatePenalty(id);
-        }
+        tier().onMutation(id);
         bumpGeneration(id);
-        evict(id);
+        tier().evict(id);
         auto entity = co_await Base::patchRaw(id, std::forward<Updates>(updates)...);
         if (entity) {
-            co_return putInCacheAndView(id, std::move(*entity));
+            co_return storeAndView(id, std::move(*entity));
         }
         co_return {};
     }
 
     /// Erase entity by ID.
-    /// Returns: rows deleted (0 if not found), or nullopt on DB error.
-    /// Invalidates L1 cache unless DB error occurred or write was coalesced.
     static io::Task<std::optional<size_t>> erase(const Key& id)
         requires (!Cfg.read_only)
     {
@@ -201,8 +180,8 @@ public:
         const Entity* hint = nullptr;
         std::optional<Entity> local_hint;
         if constexpr (HasPartitionHint<Entity>) {
-            auto view = getFromCache(id);
-            if (view) { local_hint.emplace(*view); hint = &*local_hint; }
+            auto hit = tier().find(id);
+            if (hit) { local_hint.emplace(*hit.value); hint = &*local_hint; }
         }
 
         auto outcome = co_await Base::eraseOutcome(id, hint);
@@ -224,89 +203,21 @@ public:
     /// Removes both real entries and ghosts.
     /// Increments the generation counter to prevent stale fetches from caching.
     static void evict(const Key& id) {
-        if constexpr (HasGDSF) {
-            removeGhost(id);
-            bumpGeneration(id);
-            cache().invalidate(id);
-        } else {
-            bumpGeneration(id);
-            cache().invalidate(id);
-        }
+        bumpGeneration(id);
+        tier().evict(id);
     }
 
     [[nodiscard]] static size_t size() {
-        return static_cast<size_t>(cache().size());
+        return tier().size();
     }
 
     // =========================================================================
     // Cleanup
     // =========================================================================
 
-    /// Context passed to cleanup predicates.
-    struct CleanupContext {
-        Clock::time_point now;
-        float threshold;
-        struct GhostCandidate { Key key; uint32_t count; uint32_t bytes; uint8_t flags; };
-        std::vector<GhostCandidate>* ghost_candidates = nullptr;
-        struct GhostDecay { Key key; uint32_t decayed_count; };
-        std::vector<GhostDecay>* ghost_decays = nullptr;
-    };
-
     /// Sweep one chunk (lock-free, always succeeds).
     static bool trySweep() {
-        if constexpr (!HasCleanup) {
-            return false;
-        } else {
-            auto& policy = cache::GDSFPolicy::instance();
-            CleanupContext ctx{Clock::now(), HasGDSF ? policy.threshold() : 0.0f};
-
-            std::vector<typename CleanupContext::GhostCandidate> candidates;
-            std::vector<typename CleanupContext::GhostDecay> ghost_decays;
-            if constexpr (HasGDSF) {
-                if (policy.hasAdmissionPressure() && !policy.isOverBudget())
-                    ctx.ghost_candidates = &candidates;
-                ctx.ghost_decays = &ghost_decays;
-            }
-
-            long n_chunks = policy.chunkCount();
-            long chunk_id = cache().advance_cleanup_cursor(n_chunks);
-            size_t removed = 0;
-
-            if constexpr (HasGDSF) {
-                removed = cache().cleanup_chunk(chunk_id, n_chunks,
-                    [&ctx](const Key& key, auto te) {
-                        if (te.isGhost())
-                            return ghostCleanupPredicate(key, te, ctx);
-                        auto* ce = static_cast<typename L1Cache::CacheEntry*>(
-                            te.template asReal<typename L1Cache::EntryHeader>());
-                        return cleanupPredicate(key, ce->metadata, ce->value, ctx);
-                    });
-            } else {
-                removed = cache().cleanup_chunk(chunk_id, n_chunks,
-                    [&ctx](const Key& key, auto te) {
-                        auto* ce = static_cast<typename L1Cache::CacheEntry*>(
-                            te.template asReal<typename L1Cache::EntryHeader>());
-                        return cleanupPredicate(key, ce->metadata, ce->value, ctx);
-                    });
-            }
-
-            // 4. RECLAIM: epoch-based reclamation for deferred destructors.
-            if (removed > 0) cache().reclaim();
-
-            // Post-sweep: apply ghost decays + insertions
-            if constexpr (HasGDSF) {
-                for (auto& gd : ghost_decays) {
-                    cache().update_ghost(gd.key, [&gd](cache::TaggedEntry te) {
-                        return te.withGhostCount(gd.decayed_count);
-                    });
-                }
-                for (auto& gc : candidates) {
-                    cache().insert_ghost(gc.key, gc.count, gc.bytes, gc.flags);
-                }
-            }
-
-            return removed > 0;
-        }
+        return tier().sweepChunk(noExtraPred).removed_any;
     }
 
     /// Sweep one chunk (identical to trySweep in lock-free design).
@@ -316,653 +227,175 @@ public:
 
     /// Sweep all chunks.
     static size_t purge() {
-        if constexpr (!HasCleanup) {
-            return 0;
-        } else {
-            auto& policy = cache::GDSFPolicy::instance();
-            CleanupContext ctx{Clock::now(), HasGDSF ? policy.threshold() : 0.0f};
-
-            std::vector<typename CleanupContext::GhostCandidate> candidates;
-            std::vector<typename CleanupContext::GhostDecay> ghost_decays;
-            if constexpr (HasGDSF) {
-                if (policy.hasAdmissionPressure() && !policy.isOverBudget()) {
-                    ctx.ghost_candidates = &candidates;
-                }
-                ctx.ghost_decays = &ghost_decays;
-            }
-
-            size_t removed = 0;
-
-            if constexpr (HasGDSF) {
-                long n_chunks = policy.chunkCount();
-                for (long chunk_id = 0; chunk_id < n_chunks; ++chunk_id) {
-                    removed += cache().cleanup_chunk(chunk_id, n_chunks,
-                        [&ctx](const Key& key, auto te) {
-                            if (te.isGhost())
-                                return ghostCleanupPredicate(key, te, ctx);
-                            auto* ce = static_cast<typename L1Cache::CacheEntry*>(
-                                te.template asReal<typename L1Cache::EntryHeader>());
-                            return cleanupPredicate(key, ce->metadata, ce->value, ctx);
-                        });
-                }
-            } else {
-                removed = cache().full_cleanup(
-                    [&ctx](const Key& key, auto te) {
-                        auto* ce = static_cast<typename L1Cache::CacheEntry*>(
-                            te.template asReal<typename L1Cache::EntryHeader>());
-                        return cleanupPredicate(key, ce->metadata, ce->value, ctx);
-                    });
-            }
-
-            if (removed > 0) cache().collect();
-
-            // Post-sweep: apply ghost decays + insertions
-            if constexpr (HasGDSF) {
-                for (auto& gd : ghost_decays) {
-                    cache().update_ghost(gd.key, [&gd](cache::TaggedEntry te) {
-                        return te.withGhostCount(gd.decayed_count);
-                    });
-                }
-                for (auto& gc : candidates) {
-                    cache().insert_ghost(gc.key, gc.count, gc.bytes, gc.flags);
-                }
-            }
-
-            return removed;
-        }
+        return tier().purgeAll(noExtraPred);
     }
 
     /// Prime L1 cache at startup.
     /// ListMixin overrides this via method hiding to also warm up the list cache.
     static void warmup() {
         RELAIS_LOG_DEBUG << name() << ": warming up L1 cache...";
-        // Ensure the static ChunkMap instance is constructed + repo registered.
-        (void)cache();
+        (void)tier();
         RELAIS_LOG_DEBUG << name() << ": L1 cache primed";
     }
 
     /// Current average construction time in us (exposed for testing/debugging).
     static float avgConstructionTime() {
-        return avg_construction_time_us_.load(std::memory_order_relaxed);
+        return tier().avgCost();
     }
 
 protected:
-    using L1Cache = cache::ChunkMap<Key, ValueType, Metadata, HasGDSF>;
+    /// Backward-compat alias for test accessors.
+    using L1Cache = typename Tier::Map;
 
-    /// Returns the static ChunkMap instance.
-    /// Hot path: single pointer check (no guard variable, no function call).
-    /// First call delegates to cache_init_slow() which constructs and registers.
-    static L1Cache& cache() {
-        auto* p = cache_ptr_;
-        if (p) [[likely]] return *p;
-        return cache_init_slow();
-    }
+    /// Returns the underlying ChunkMap (via CacheTier).
+    static L1Cache& cache() { return tier().map(); }
 
-    /// Cold path: construct the ChunkMap, register with GDSFPolicy, cache the pointer.
-    [[gnu::noinline]] static L1Cache& cache_init_slow() {
-        struct Holder {
-            L1Cache instance;
-            Holder() {
-                config::CachedClock::ensureStarted();
-                if constexpr (HasCleanup) {
-                    cache::GDSFPolicy::instance().enroll({
-                        .sweep_fn = +[]() -> bool { return sweep(); },
-                        .size_fn = +[]() -> size_t { return size(); },
-                        .name = static_cast<const char*>(Name)
-                    });
-                }
-                if constexpr (HasGDSF) {
-                    long nc = cache::GDSFPolicy::instance().chunkCount();
-                    chunk_bits_ = static_cast<uint8_t>(
-                        std::countr_zero(static_cast<unsigned long>(nc)));
-                    chunk_mask_ = static_cast<size_t>(nc - 1);
-                }
-                cache_ptr_ = &instance;
-            }
-        };
-        static Holder h;
-        cache_ptr_ = &h.instance;  // also set here for safety (after static init)
-        return h.instance;
-    }
-
-    /// L1 cache lookup with TTL check and direct access counting.
-    /// Returns raw FindResult for flexible use by find/findJson/findBinary.
-    /// Ghosts are treated as L1 miss (the slow path handles admission).
-    static typename L1Cache::FindResult findInCache(const Key& key) {
-        auto hk = L1Cache::make_key(key);
-        auto result = cache().find(hk);
-        if (!result) return {};
-
-        // Ghost: treated as L1 miss (slow path will handle admission)
-        if constexpr (HasGDSF) {
-            if (result.isGhost()) return {};
-        }
-
-        auto* entry = result.entry();
-
-        // TTL expiration check: two-phase eviction (find → check → evict)
-        if constexpr (HasTTL) {
-            if (entry->metadata.isExpired(config::CachedClock::now())) {
-                cache().remove_if(key, [entry](auto* e) { return e == entry; });
-                return {};
-            }
-        }
-
-        // Direct access counting: fetch_add(relaxed) on the entry's metadata.
-        // Safe: entry is alive under the EpochGuard held by FindResult.
-        // Cost: ~0ns uncontended (cache line already in L1d from find()).
-        if constexpr (HasGDSF) {
-            entry->metadata.access_count.fetch_add(
-                cache::GDSFScoreData::kCountScale,
-                std::memory_order_relaxed);
-        }
-
-        return result;
-    }
-
-    /// Get from cache as EntityView (convenience wrapper around findInCache).
-    /// Get from cache as EntityView (convenience wrapper around findInCache).
+    /// Get from cache as EntityView.
     static wrapper::EntityView<Entity> getFromCache(const Key& key) {
-        auto result = findInCache(key);
-        if (!result) return {};
-        auto* ce = result.asReal();
+        auto hit = tier().find(key);
+        if (!hit) return {};
         return wrapper::EntityView<Entity>(
-            static_cast<const Entity*>(&ce->value), std::move(result.guard));
+            static_cast<const Entity*>(hit.value), std::move(hit.guard));
     }
 
-    /// Put entity in cache (copy). Returns FindResult for flexible use.
-    /// No tick here — the sweep counter is driven by fetchAndCache (DB fetches),
+    /// Put entity in cache (copy). Returns Hit for flexible use.
+    /// No tick — the sweep counter is driven by fetch paths (DB misses),
     /// not by local cache mutations (update, insert via API).
-    static typename L1Cache::FindResult putInCache(const Key& key, const Entity& src,
-        Clock::time_point now = Clock::now())
+    static typename Tier::Hit putInCache(const Key& key, const Entity& src,
+        uint32_t now_sec = config::CachedClock::now())
     {
-        return cache().upsert(L1Cache::make_key(key), buildValue(src), buildMetadata(now));
+        return tier().store(key, Entity(src), buildMetadata(now_sec));
     }
 
-    /// Put entity in cache (move — zero copy). Returns FindResult.
-    static typename L1Cache::FindResult putInCache(const Key& key, Entity&& src,
-        Clock::time_point now = Clock::now())
+    /// Put entity in cache (move). Returns Hit.
+    static typename Tier::Hit putInCache(const Key& key, Entity&& src,
+        uint32_t now_sec = config::CachedClock::now())
     {
-        return cache().upsert(L1Cache::make_key(key), buildValue(std::move(src)), buildMetadata(now));
+        return tier().store(key, std::move(src), buildMetadata(now_sec));
     }
 
-    /// Put entity in cache and return EntityView (copy path).
-    static wrapper::EntityView<Entity> putInCacheAndView(const Key& key, const Entity& src) {
-        auto result = putInCache(key, src);
-        auto* ce = result.asReal();
-        return wrapper::EntityView<Entity>(
-            static_cast<const Entity*>(&ce->value), std::move(result.guard));
+    /// Build metadata. Accepts pre-computed now_sec to avoid redundant
+    /// CachedClock::now() calls.
+    static Metadata buildMetadata(uint32_t now_sec = config::CachedClock::now()) {
+        if constexpr (HasGDSF) {
+            uint32_t ttl_sec = 0;
+            if constexpr (HasTTL) {
+                ttl_sec = now_sec + kTtlSec;
+            }
+            return Metadata{cache::GDSFScoreData::kCountScale, ttl_sec};
+        } else if constexpr (HasTTL) {
+            return Metadata{now_sec + kTtlSec};
+        } else {
+            return Metadata{};
+        }
     }
 
-    /// Put entity in cache and return EntityView (move path — zero copy).
-    static wrapper::EntityView<Entity> putInCacheAndView(const Key& key, Entity&& src) {
-        auto result = putInCache(key, std::move(src));
-        auto* ce = result.asReal();
-        return wrapper::EntityView<Entity>(
-            static_cast<const Entity*>(&ce->value), std::move(result.guard));
+    /// Returns the CacheTier singleton.
+    /// Hot path: single pointer check (no guard variable, no function call).
+    /// First call delegates to tier_init_slow() which constructs and registers.
+    static Tier& tier() {
+        auto* p = tier_ptr_;
+        if (p) [[likely]] return *p;
+        return tier_init_slow();
     }
 
 private:
     // =========================================================================
-    // Inflight dedup — coalesce concurrent misses on the same key
+    // CacheTier singleton
     // =========================================================================
 
-    struct InflightEntry {
-        std::mutex mu;
-        std::atomic<bool> done{false};
-        std::vector<std::coroutine_handle<>> waiters;
+    static inline Tier* tier_ptr_{nullptr};
 
-        enum class Outcome : uint8_t { pending, found, not_found, error };
-        Outcome outcome = Outcome::pending;
-        std::exception_ptr error;  // set if outcome == error
-    };
-
-    struct ShardedInflightMap {
-        static constexpr int kShards = 16;
-        struct Shard {
-            std::mutex mu;
-            std::unordered_map<Key, std::shared_ptr<InflightEntry>,
-                               cache::detail::AutoHash<Key>> map;
-        };
-        std::array<Shard, kShards> shards;
-
-        Shard& shard_for(const Key& k) {
-            return shards[cache::detail::AutoHash<Key>{}(k)
-                          & static_cast<size_t>(kShards - 1)];
-        }
-
-        struct AcquireResult {
-            std::shared_ptr<InflightEntry> entry;
-            bool is_leader;
-        };
-
-        AcquireResult acquire(const Key& k) {
-            auto& s = shard_for(k);
-            std::lock_guard lk(s.mu);
-            auto& slot = s.map[k];
-            if (!slot) {
-                slot = std::make_shared<InflightEntry>();
-                return {slot, true};
+    /// Cold path: construct CacheTier, register with GDSFPolicy, cache pointer.
+    [[gnu::noinline]] static Tier& tier_init_slow() {
+        struct Holder {
+            Tier instance;
+            Holder() {
+                instance.enroll({
+                    .sweep_fn = +[]() -> bool { return sweep(); },
+                    .size_fn = +[]() -> size_t { return size(); },
+                    .name = static_cast<const char*>(Name)
+                });
+                tier_ptr_ = &instance;
             }
-            return {slot, false};
-        }
-
-        void erase(const Key& k) {
-            auto& s = shard_for(k);
-            std::lock_guard lk(s.mu);
-            s.map.erase(k);
-        }
-    };
-
-    /// Coroutine awaiter for dedup followers.
-    /// await_suspend returns bool: false if already done (no suspend needed).
-    struct DedupAwaiter {
-        std::shared_ptr<InflightEntry> entry;
-
-        bool await_ready() const noexcept {
-            return entry->done.load(std::memory_order_acquire);
-        }
-
-        bool await_suspend(std::coroutine_handle<> h) {
-            std::lock_guard lk(entry->mu);
-            // Re-check under lock to avoid race between await_ready and suspend
-            if (entry->done.load(std::memory_order_relaxed)) {
-                return false;  // don't suspend, resume immediately
-            }
-            entry->waiters.push_back(h);
-            return true;  // suspend
-        }
-
-        void await_resume() noexcept {}
-    };
-
-    static ShardedInflightMap& inflightMap() {
-        static ShardedInflightMap map;
-        return map;
+        };
+        static Holder h;
+        tier_ptr_ = &h.instance;  // also set here for safety (after static init)
+        return h.instance;
     }
 
-    /// Slow path for find(): L1 miss → dedup → (L2) → DB → cache.
+    // =========================================================================
+    // Store + view helper
+    // =========================================================================
+
+    /// Store entity in cache and return EntityView.
+    static wrapper::EntityView<Entity> storeAndView(const Key& key, Entity&& src) {
+        auto hit = tier().store(key, std::move(src), buildMetadata());
+        return wrapper::EntityView<Entity>(
+            static_cast<const Entity*>(hit.value), std::move(hit.guard));
+    }
+
+    // =========================================================================
+    // Slow paths (delegated to CacheTier::findOrFetch with inflight dedup)
+    // =========================================================================
+
+    /// Slow path for find(): L1 miss -> dedup -> (L2) -> DB -> cache.
     static io::Task<wrapper::EntityView<Entity>> findSlow(const Key& id) {
-        auto [entry, is_leader] = inflightMap().acquire(id);
-
-        if (is_leader) {
-            // Leader: execute the actual fetch
-            wrapper::EntityView<Entity> result;
-            try {
-                result = co_await fetchAndCache(id);
-                // Determine outcome
-                {
-                    std::lock_guard lk(entry->mu);
-                    entry->outcome = result
-                        ? InflightEntry::Outcome::found
-                        : InflightEntry::Outcome::not_found;
-                    entry->done.store(true, std::memory_order_release);
-                }
-            } catch (...) {
-                // Propagate error to followers
-                {
-                    std::lock_guard lk(entry->mu);
-                    entry->outcome = InflightEntry::Outcome::error;
-                    entry->error = std::current_exception();
-                    entry->done.store(true, std::memory_order_release);
-                }
-                // Resume followers, erase, then rethrow
-                for (auto h : entry->waiters) h.resume();
-                inflightMap().erase(id);
-                throw;
-            }
-
-            // Resume all waiting followers
-            // Copy waiters under lock then resume outside lock
-            std::vector<std::coroutine_handle<>> to_resume;
-            {
-                std::lock_guard lk(entry->mu);
-                to_resume = std::move(entry->waiters);
-            }
-            for (auto h : to_resume) h.resume();
-
-            // Remove from map
-            inflightMap().erase(id);
-
-            co_return result;
+        auto hit = co_await tier().findOrFetch(
+            id,
+            [&id]() -> io::Task<std::optional<Entity>> {
+                co_return co_await Base::findRaw(id);
+            },
+            [](const Entity&, float) -> Metadata { return buildMetadata(); }
+        );
+        if (hit) {
+            co_return wrapper::EntityView<Entity>(
+                static_cast<const Entity*>(hit.value), std::move(hit.guard));
         }
-
-        // Follower: wait for leader to complete
-        co_await DedupAwaiter{entry};
-
-        switch (entry->outcome) {
-        case InflightEntry::Outcome::found: {
-            // Entity should be in L1 cache now
-            auto view = getFromCache(id);
-            if (view) co_return view;
-            // Evicted between leader store and follower read — fallback
-            co_return co_await fetchAndCache(id);
-        }
-        case InflightEntry::Outcome::not_found:
-            co_return {};
-        case InflightEntry::Outcome::error:
-            std::rethrow_exception(entry->error);
-        default:
-            co_return {};
-        }
-    }
-
-    /// Slow path for findJson(): L1 miss → (L2) → DB → cache → JSON.
-    static io::Task<std::string> findJsonSlow(const Key& id) {
-        auto view = co_await fetchAndCache(id);
-        if (view) co_return view->json();
         co_return {};
     }
 
-    /// Slow path for findBinary(): L1 miss → (L2) → DB → cache → binary.
+    /// Slow path for findJson(): L1 miss -> dedup -> (L2) -> DB -> cache -> JSON.
+    static io::Task<std::string> findJsonSlow(const Key& id) {
+        auto hit = co_await tier().findOrFetch(
+            id,
+            [&id]() -> io::Task<std::optional<Entity>> {
+                co_return co_await Base::findRaw(id);
+            },
+            [](const Entity&, float) -> Metadata { return buildMetadata(); }
+        );
+        if (hit) co_return hit.value->json();
+        co_return std::string{};
+    }
+
+    /// Slow path for findBinary(): L1 miss -> dedup -> (L2) -> DB -> cache -> binary.
     static io::Task<std::vector<uint8_t>> findBinarySlow(const Key& id)
         requires HasBinarySerialization<Entity>
     {
-        auto view = co_await fetchAndCache(id);
-        if (view) co_return view->binary();
-        co_return {};
+        auto hit = co_await tier().findOrFetch(
+            id,
+            [&id]() -> io::Task<std::optional<Entity>> {
+                co_return co_await Base::findRaw(id);
+            },
+            [](const Entity&, float) -> Metadata { return buildMetadata(); }
+        );
+        if (hit) co_return hit.value->binary();
+        co_return std::vector<uint8_t>{};
     }
 
-    /// Fetch from Base via findRaw and decide: cache, ghost, or reject.
-    ///
-    /// Under GDSF with memory pressure (>= 50%), the entity is scored against
-    /// the eviction threshold. If the score is too low, a lightweight ghost
-    /// is created instead of caching the full entity. Ghosts are zero-allocation
-    /// (data encoded inline in TaggedEntry) and track access frequency so that
-    /// popular data is admitted on subsequent fetches.
-    ///
-    /// Without pressure or without GDSF, every fetch is cached (existing behavior).
-    static io::Task<wrapper::EntityView<Entity>> fetchAndCache(const Key& id) {
-        if constexpr (HasGDSF) {
-            auto start = Clock::now();
-            auto entity = co_await Base::findRaw(id);
-            if (!entity) co_return {};
+    // =========================================================================
+    // Cleanup predicate (no domain-specific eviction for entities)
+    // =========================================================================
 
-            auto now = Clock::now();
-            auto elapsed_us = static_cast<float>(
-                std::chrono::duration_cast<std::chrono::microseconds>(
-                    now - start).count());
-            updateAvgConstructionTime(elapsed_us);
-
-            auto& policy = cache::GDSFPolicy::instance();
-
-            // Tick on every DB fetch (not just insertions). This ensures
-            // periodic sweeps fire even when ghosts prevent putInCache,
-            // breaking the deadlock: ghosts block insertion → no ticks →
-            // no sweeps → threshold stale → ghosts never promoted.
-            policy.tickInsertion();
-
-            if (policy.hasAdmissionPressure()) {
-                // --- Lookup existing ghost ---
-                auto ghost_result = cache().find(id);
-                bool has_ghost = ghost_result && ghost_result.isGhost();
-
-                // --- Compute score ---
-                uint32_t est_bytes = static_cast<uint32_t>(
-                    entity->memoryUsage() + kChargeOverhead + kBucketSlotSize);
-                uint8_t est_flags = 0;  // No cached buffers (serialize on demand)
-
-                uint32_t count;
-                if (has_ghost) {
-                    // Ghost exists: bump counter, update estimated_bytes
-                    uint32_t old_count = ghost_result.ghostCount();
-                    count = old_count + cache::GDSFScoreData::kCountScale;
-                    cache().update_ghost(id, [count, est_bytes, est_flags](cache::TaggedEntry te) {
-                        return te.withGhostCount(count).withGhostBytes(est_bytes, est_flags);
-                    });
-                } else {
-                    // No ghost: initial score
-                    count = cache::GDSFScoreData::kCountScale;
-                }
-
-                float avg_cost = avg_construction_time_us_.load(std::memory_order_relaxed);
-                float decayed = static_cast<float>(count) * policy.decayRate();
-                float score = decayed * avg_cost
-                    / static_cast<float>(std::max(est_bytes, uint32_t{1}));
-
-                if (score >= policy.threshold()) {
-                    // === CACHE (or PROMOTION if ghost existed) ===
-                    // No ghost discharge — bucket slot is tracked by the hook.
-                    auto r = putInCache(id, std::move(*entity), now);
-                    if (has_ghost) {
-                        // Transfer counter from ghost to real entry
-                        r.entry()->metadata.access_count.store(count,
-                            std::memory_order_relaxed);
-                    }
-                    auto* ce = r.asReal();
-                    co_return wrapper::EntityView<Entity>(
-                        static_cast<const Entity*>(&ce->value), std::move(r.guard));
-                } else {
-                    // === GHOST (create or keep existing) ===
-                    if (!has_ghost) {
-                        // Create new ghost (insert_ghost: never replaces a real entry)
-                        // No ghost charge — bucket slot is tracked by the hook.
-                        cache().insert_ghost(id,
-                                cache::GDSFScoreData::kCountScale,
-                                est_bytes, est_flags);
-                        // If insert fails → a real entry was inserted concurrently.
-                        // We continue: the entity is returned as transient anyway.
-                    }
-                    // Return entity without caching (transient pool)
-                    auto guard = epoch::EpochGuard::acquire();
-                    auto* ptr = transientPool().New(std::move(*entity));
-                    transientPool().Retire(ptr);
-                    co_return wrapper::EntityView<Entity>(
-                        static_cast<const Entity*>(ptr), std::move(guard));
-                }
-            }
-
-            // --- No pressure: cache normally ---
-            // Remove ghost if one exists (no longer relevant without pressure)
-            // No ghost discharge — bucket slot is tracked by the hook.
-            auto ghost_result = cache().find(id);
-            if (ghost_result && ghost_result.isGhost()) {
-                cache().remove(id);
-            }
-            auto r = putInCache(id, std::move(*entity), now);
-            auto* ce = r.asReal();
-            co_return wrapper::EntityView<Entity>(
-                static_cast<const Entity*>(&ce->value), std::move(r.guard));
-        } else {
-            // Non-GDSF path (unchanged)
-            auto entity = co_await Base::findRaw(id);
-            if (entity) {
-                auto r = putInCache(id, std::move(*entity));
-                auto* ce = r.asReal();
-                co_return wrapper::EntityView<Entity>(
-                    static_cast<const Entity*>(&ce->value), std::move(r.guard));
-            }
-            co_return {};
-        }
-    }
-
-    /// Epoch wrapper: memory_pool wraps each CacheEntry in a node with a next pointer.
-    template<typename T>
-    struct EpochWrapperMirror { T value; };
-
-    static constexpr size_t kEpochWrapperOverhead =
-        sizeof(EpochWrapperMirror<typename L1Cache::CacheEntry>)
-        - sizeof(typename L1Cache::CacheEntry);
-
-    /// Overhead charged per live entry (excludes bucket slot — tracked by hook).
-    static constexpr size_t kChargeOverhead =
-        sizeof(typename L1Cache::CacheEntry) - sizeof(Entity)
-        + kEpochWrapperOverhead;
-
-    /// ParlayHash bucket slot. Used for:
-    /// - Score denominator (full incompressible cost of keeping an entry)
-    /// - Histogram ghost adjustment (net gain live → ghost)
-    /// - Ghost admission estimation in fetchAndCache
-    /// NOT charged to GDSFPolicy (already in hook's bucket array charge).
-    static constexpr size_t kBucketSlotSize =
-        sizeof(Key) + sizeof(cache::TaggedEntry);
-
-    /// Transient pool for entities returned without caching (ghost REJECT path).
-    /// Epoch-based reclamation ensures the entity lives until the EpochGuard drops.
-    static epoch::memory_pool<Entity>& transientPool() {
-        static auto* p = new epoch::memory_pool<Entity>();
-        return *p;
-    }
-
-    /// Build ValueType from entity (copy path).
-    static ValueType buildValue(const Entity& src) {
-        if constexpr (HasGDSF) {
-            return cache::CachedWrapper<Entity>(Entity(src), kChargeOverhead);
-        } else {
-            return Entity(src);
-        }
-    }
-
-    /// Build ValueType from entity (move path — zero copy).
-    static ValueType buildValue(Entity&& src) {
-        if constexpr (HasGDSF) {
-            return cache::CachedWrapper<Entity>(std::move(src), kChargeOverhead);
-        } else {
-            return std::move(src);
-        }
-    }
-
-    /// Build metadata. Accepts a pre-computed timestamp to avoid redundant
-    /// Clock::now() calls (e.g., reuse timing from GDSF measurement).
-    static Metadata buildMetadata(Clock::time_point now = Clock::now()) {
-        if constexpr (HasGDSF) {
-            int64_t ttl_rep = 0;
-            if constexpr (HasTTL) {
-                ttl_rep = (now + l1Ttl()).time_since_epoch().count();
-            }
-            return Metadata{cache::GDSFScoreData::kCountScale, ttl_rep};
-        } else if constexpr (HasTTL) {
-            return Metadata{(now + l1Ttl()).time_since_epoch().count()};
-        } else {
-            return Metadata{};
-        }
-        
-    }
-
-    /// Cached pointer to the L1Cache instance (set once in cache_init_slow).
-    /// Avoids the guard-variable function call on every findInCache.
-    static inline L1Cache* cache_ptr_{nullptr};
-
-    /// Pre-computed chunk constants (set once in Holder, never modified).
-    /// Avoids loading chunkCount() on every findInCache call.
-    static inline uint8_t chunk_bits_{0};   // = countr_zero(chunkCount())
-    static inline size_t chunk_mask_{0};    // = chunkCount() - 1
-
-    /// Cleanup predicate for real entries: inline decay + score + histogram.
-    /// When evicting, accumulates ghost candidates for post-sweep insertion.
-    static bool cleanupPredicate(const Key& key, const Metadata& meta,
-                                  const ValueType& value, CleanupContext& ctx) {
-        if constexpr (HasGDSF) {
-            // Inline decay: single writer per chunk during sweep, plain store (no CAS)
-            float dr = cache::GDSFPolicy::instance().decayRate();
-            uint32_t old_count = meta.rawCount();
-            meta.access_count.store(
-                static_cast<uint32_t>(static_cast<float>(old_count) * dr),
-                std::memory_order_relaxed);
-
-            // Score = access_count x avg_cost / memoryUsage (includes bucket slot)
-            size_t mem = value.memoryUsage();
-            float avg_cost = avg_construction_time_us_.load(std::memory_order_relaxed);
-            float score = meta.computeScore(avg_cost, mem + kBucketSlotSize);
-
-            // Histogram: net freeable bytes. When ghost candidates are active,
-            // evicting a live entry only frees (mem - kBucketSlotSize) since
-            // a ghost occupies the bucket slot.
-            size_t freeable = ctx.ghost_candidates
-                ? (mem - std::min(mem, kBucketSlotSize))
-                : mem;
-            cache::GDSFPolicy::instance().recordEntry(score, freeable);
-
-            // Evict if TTL expired
-            if constexpr (HasTTL) {
-                if (meta.isExpired(ctx.now)) return true;
-            }
-
-            // Evict if score below threshold
-            if (score < ctx.threshold) {
-                if (ctx.ghost_candidates) {
-                    ctx.ghost_candidates->push_back({key, old_count,
-                        static_cast<uint32_t>(mem), 0});
-                }
-                return true;
-            }
-
-            return false;
-        } else if constexpr (HasTTL) {
-            return meta.isExpired(ctx.now);
-        } else {
-            return false;  // unreachable — cleanup is disabled
-        }
-    }
-
-    /// Ghost cleanup predicate (two-phase): read ghost data inline, decide
-    /// remove or decay. Ghosts that survive are collected for post-sweep update.
-    static bool ghostCleanupPredicate(const Key& key, cache::TaggedEntry te,
-                                       CleanupContext& ctx) {
-        float dr = cache::GDSFPolicy::instance().decayRate();
-        uint32_t count = te.ghostCount();
-        uint32_t decayed = static_cast<uint32_t>(static_cast<float>(count) * dr);
-        if (decayed == 0) {
-            // Ghost eviction frees the bucket slot (modeled in histogram,
-            // not in charge — bucket array is tracked by the hook).
-            cache::GDSFPolicy::instance().recordEntry(0.0f, kBucketSlotSize);
-            return true;
-        }
-        // Collect for post-sweep batch update
-        if (ctx.ghost_decays) {
-            ctx.ghost_decays->push_back({key, decayed});
-        }
-        return false;
-    }
-
-    /// Remove a ghost entry for the given key (if it exists).
-    /// Used by evict/invalidate to clean up ghosts on write paths.
-    static void removeGhost(const Key& id) {
-        auto r = cache().find(id);
-        if (r && r.isGhost()) {
-            // No ghost discharge — bucket slot is tracked by the hook.
-            cache().remove(id);
-        }
-    }
-
-    /// Apply update penalty to a ghost's access count (if ghost exists).
-    /// Called by update/patch to erode scores of frequently-mutated data.
-    static void applyGhostUpdatePenalty(const Key& id) {
-        auto r = cache().find(id);
-        if (r && r.isGhost()) {
-            uint32_t count = r.ghostCount();
-            uint32_t penalized = static_cast<uint32_t>(
-                static_cast<float>(count) * cache::GDSFScoreData::kUpdatePenalty);
-            cache().update_ghost(id, [penalized](cache::TaggedEntry te) {
-                return te.withGhostCount(penalized);
-            });
-        }
-    }
-
-    /// EMA update for average construction time (measured on L1 miss).
-    /// CAS without retry: if contention causes a lost update, the EMA converges naturally.
-    static void updateAvgConstructionTime(float elapsed_us) {
-        constexpr float kAlpha = 0.1f;
-        float old_avg = avg_construction_time_us_.load(std::memory_order_relaxed);
-        float new_avg;
-        if (old_avg == 0.0f) {
-            new_avg = elapsed_us;  // First measurement: seed the EMA
-        } else {
-            new_avg = kAlpha * elapsed_us + (1.0f - kAlpha) * old_avg;
-        }
-        avg_construction_time_us_.compare_exchange_weak(old_avg, new_avg, std::memory_order_relaxed);
-    }
-
-    // Per-repo GDSF state (one instance per template specialization).
-    static inline std::atomic<float> avg_construction_time_us_{0.0f};
+    static constexpr auto noExtraPred =
+        [](const Key&, const Metadata&, const Entity&, long) { return false; };
 
     // =========================================================================
     // Generation counter — stale write prevention (lock-free, cross-thread)
     // =========================================================================
     //
     // Flat array of atomic counters indexed by hash(key) % kGenSlots.
-    // Zero allocation, zero epoch overhead (unlike ParlayHash Upsert which
-    // allocates + retires a node on every update).
+    // Zero allocation, zero epoch overhead.
     //
     // Hash collisions are safe: two keys sharing a slot may cause an
     // unnecessary cache miss (pessimistic), never stale data.

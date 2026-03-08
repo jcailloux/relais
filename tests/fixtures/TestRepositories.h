@@ -119,8 +119,9 @@ namespace test_config {
 using namespace jcailloux::relais::config;
 
 /// Short TTL for expiration tests — L1 expires quickly, GDSF evicts on cleanup
+/// CachedClock uses uint32_t seconds → minimum useful TTL is 1 second.
 inline constexpr auto ShortTTL = Local
-    .with_l1_ttl(std::chrono::milliseconds{100});
+    .with_l1_ttl(std::chrono::seconds{1});
 
 /// Write-through strategy — PopulateImmediately on update
 inline constexpr auto WriteThrough = Local

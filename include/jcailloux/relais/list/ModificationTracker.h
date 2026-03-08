@@ -2,7 +2,6 @@
 #define JCAILLOUX_RELAIS_LIST_MODIFICATIONTRACKER_H
 
 #include <atomic>
-#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <shared_mutex>
@@ -22,8 +21,6 @@ namespace jcailloux::relais::cache::list {
 template<typename Entity>
 struct EntityModification {
     using EntityPtr = std::unique_ptr<const Entity>;
-    using Clock = std::chrono::steady_clock;
-    using TimePoint = Clock::time_point;
 
     enum class Type : uint8_t {
         Created,
@@ -34,33 +31,33 @@ struct EntityModification {
     Type type;
     EntityPtr old_entity;   // nullptr for Created
     EntityPtr new_entity;   // nullptr for Deleted
-    TimePoint modified_at;
+    uint32_t generation;    // monotonic generation number from the owning ListCache
 
-    // Factory methods
-    static EntityModification created(const Entity& entity) {
+    // Factory methods — caller provides the generation number
+    static EntityModification created(const Entity& entity, uint32_t gen) {
         return EntityModification{
             .type = Type::Created,
             .old_entity = nullptr,
             .new_entity = std::make_unique<const Entity>(entity),
-            .modified_at = Clock::now()
+            .generation = gen
         };
     }
 
-    static EntityModification updated(const Entity& old_entity, const Entity& new_entity) {
+    static EntityModification updated(const Entity& old_entity, const Entity& new_entity, uint32_t gen) {
         return EntityModification{
             .type = Type::Updated,
             .old_entity = std::make_unique<const Entity>(old_entity),
             .new_entity = std::make_unique<const Entity>(new_entity),
-            .modified_at = Clock::now()
+            .generation = gen
         };
     }
 
-    static EntityModification deleted(const Entity& entity) {
+    static EntityModification deleted(const Entity& entity, uint32_t gen) {
         return EntityModification{
             .type = Type::Deleted,
             .old_entity = std::make_unique<const Entity>(entity),
             .new_entity = nullptr,
-            .modified_at = Clock::now()
+            .generation = gen
         };
     }
 };
@@ -84,6 +81,9 @@ namespace detail {
 // When a chunk is cleaned, its bit is cleared. When all bits are 0,
 // all chunks have seen this modification and it can be erased.
 //
+// Uses monotonic generation numbers instead of timestamps.
+// Generation numbers come from the owning ListCache's atomic counter.
+//
 // TotalSegments = number of chunks, known at compile time (from ChunkMap config).
 //
 
@@ -94,8 +94,6 @@ public:
                   "TotalSegments must be between 2 and 64");
 
     using Modification = EntityModification<Entity>;
-    using Clock = std::chrono::steady_clock;
-    using TimePoint = Clock::time_point;
     using BitmapType = detail::SmallestUintFor<TotalSegments>;
 
     static constexpr BitmapType initial_bitmap_ =
@@ -113,7 +111,7 @@ public:
 private:
     std::vector<TrackedModification> modifications_;
     mutable std::shared_mutex mutex_;
-    std::atomic<TimePoint> latest_modification_time_{TimePoint::min()};
+    std::atomic<uint32_t> latest_generation_{0};
 
 public:
     explicit ModificationTracker() {
@@ -132,25 +130,25 @@ public:
     // Track modifications
     // =========================================================================
 
-    void notifyCreated(const Entity& entity) {
-        track(Modification::created(entity));
+    void notifyCreated(const Entity& entity, uint32_t gen) {
+        track(Modification::created(entity, gen));
     }
 
-    void notifyUpdated(const Entity& old_entity, const Entity& new_entity) {
-        track(Modification::updated(old_entity, new_entity));
+    void notifyUpdated(const Entity& old_entity, const Entity& new_entity, uint32_t gen) {
+        track(Modification::updated(old_entity, new_entity, gen));
     }
 
-    void notifyDeleted(const Entity& entity) {
-        track(Modification::deleted(entity));
+    void notifyDeleted(const Entity& entity, uint32_t gen) {
+        track(Modification::deleted(entity, gen));
     }
 
 private:
     void track(Modification mod) {
-        // Update latest modification time (atomic max)
-        TimePoint current_latest = latest_modification_time_.load(std::memory_order_relaxed);
-        while (mod.modified_at > current_latest &&
-               !latest_modification_time_.compare_exchange_weak(
-                   current_latest, mod.modified_at,
+        // Update latest generation (atomic max)
+        uint32_t current_latest = latest_generation_.load(std::memory_order_relaxed);
+        while (mod.generation > current_latest &&
+               !latest_generation_.compare_exchange_weak(
+                   current_latest, mod.generation,
                    std::memory_order_release, std::memory_order_relaxed)) {
         }
 
@@ -172,7 +170,7 @@ public:
     /// Clears the bit for chunk_id in each modification's bitmap.
     /// Erases modifications whose bitmap becomes 0 (all chunks processed).
     ///
-    /// Only modifications with modified_at <= cutoff are processed. The cutoff
+    /// Only modifications with generation <= cutoff_gen are processed. The cutoff
     /// must be captured BEFORE the chunk cleanup, so that modifications added
     /// during cleanup are excluded and not prematurely drained.
     ///
@@ -182,14 +180,14 @@ public:
     ///   forEachModificationWithBitmap reads via atomic_ref too.
     /// - Phase 2 (unique_lock): erase expired entries via swap-with-last.
     ///   Only taken when there are actual removals.
-    void drainChunk(TimePoint cutoff, uint8_t chunk_id) {
+    void drainChunk(uint32_t cutoff_gen, uint8_t chunk_id) {
         std::vector<size_t> to_erase;
         const BitmapType chunk_bit = BitmapType{1} << chunk_id;
 
         {
             std::shared_lock lock(mutex_);
             for (size_t i = 0; i < modifications_.size(); ++i) {
-                if (modifications_[i].modification.modified_at > cutoff) continue;
+                if (modifications_[i].modification.generation > cutoff_gen) continue;
 
                 std::atomic_ref<BitmapType> bitmap(modifications_[i].pending_segments);
                 BitmapType remaining = bitmap.fetch_and(
@@ -216,12 +214,12 @@ public:
         }
     }
 
-    /// Erase all modifications with modified_at <= cutoff in one pass.
+    /// Erase all modifications with generation <= cutoff_gen in one pass.
     /// Used by purge() after processing all chunks at once.
-    void drain(TimePoint cutoff) {
+    void drain(uint32_t cutoff_gen) {
         std::unique_lock lock(mutex_);
-        std::erase_if(modifications_, [cutoff](const TrackedModification& t) {
-            return t.modification.modified_at <= cutoff;
+        std::erase_if(modifications_, [cutoff_gen](const TrackedModification& t) {
+            return t.modification.generation <= cutoff_gen;
         });
     }
 
@@ -250,10 +248,10 @@ public:
         }
     }
 
-    /// Check if there are modifications since the given time.
+    /// Check if there are modifications since the given generation.
     /// Use this for short-circuit optimization before iterating.
-    [[nodiscard]] bool hasModificationsSince(TimePoint since) const {
-        return latest_modification_time_.load(std::memory_order_acquire) > since;
+    [[nodiscard]] bool hasModificationsSince(uint32_t since_gen) const {
+        return latest_generation_.load(std::memory_order_acquire) > since_gen;
     }
 
     // =========================================================================
@@ -270,8 +268,8 @@ public:
         return modifications_.size();
     }
 
-    [[nodiscard]] TimePoint latestModificationTime() const {
-        return latest_modification_time_.load(std::memory_order_acquire);
+    [[nodiscard]] uint32_t latestGeneration() const {
+        return latest_generation_.load(std::memory_order_acquire);
     }
 
     [[nodiscard]] static constexpr BitmapType initialBitmap() { return initial_bitmap_; }

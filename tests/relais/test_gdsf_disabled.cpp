@@ -76,20 +76,15 @@ TEST_CASE("GDSF disabled - zero overhead when not enabled",
 
     SECTION("TTL-only metadata when TTL configured but no GDSF") {
         using Metadata = jcailloux::relais::cache::CacheMetadata<false, true>;
-        static_assert(sizeof(Metadata) == sizeof(int64_t),
-            "CacheMetadata<false, true> should be 8 bytes (TTL only)");
+        static_assert(sizeof(Metadata) == sizeof(uint32_t),
+            "CacheMetadata<false, true> should be 4 bytes (TTL only)");
 
         // Verify TTL functionality
         Metadata meta{};
-        meta.ttl_expiration_rep = 1000;
+        meta.ttl_expiration_sec = 1000;
 
-        auto expired_tp = std::chrono::steady_clock::time_point{
-            std::chrono::steady_clock::duration{2000}};
-        REQUIRE(meta.isExpired(expired_tp));
-
-        auto not_expired_tp = std::chrono::steady_clock::time_point{
-            std::chrono::steady_clock::duration{500}};
-        REQUIRE_FALSE(meta.isExpired(not_expired_tp));
+        REQUIRE(meta.isExpired(2000));          // now > expiration → expired
+        REQUIRE_FALSE(meta.isExpired(500));     // now < expiration → not expired
     }
 
     SECTION("TTL repos register for global sweep, no-cleanup repos do not") {

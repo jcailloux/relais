@@ -3,7 +3,6 @@
 
 #include <algorithm>
 #include <atomic>
-#include <chrono>
 #include <cstdint>
 
 namespace jcailloux::relais::cache {
@@ -53,6 +52,10 @@ struct GDSFScoreData {
             std::memory_order_relaxed);
     }
 
+    /// Self-reference for concept detection (GDSFAware).
+    GDSFScoreData& gdsfData() { return *this; }
+    const GDSFScoreData& gdsfData() const { return *this; }
+
     // --- Manual copy/move (std::atomic is non-copyable) ---
 
     GDSFScoreData(const GDSFScoreData& o)
@@ -81,11 +84,11 @@ struct GDSFScoreData {
 // Selected at compile time in CachedRepo via:
 //   using Metadata = cache::CacheMetadata<HasGDSF, HasTTL>;
 //
-// Sizes:
+// Sizes (TTL compressed to uint32_t seconds):
 //   <false, false>  0 bytes (EBO via [[no_unique_address]] in ChunkMap)
-//   <false, true>   8 bytes (TTL only)
+//   <false, true>   4 bytes (TTL only)
 //   <true,  false>  4 bytes (GDSF only, inherits GDSFScoreData)
-//   <true,  true>  16 bytes (GDSF 4B + TTL 8B, padded to 16B)
+//   <true,  true>   8 bytes (GDSF 4B + TTL 4B, no padding)
 
 template<bool WithGDSF, bool WithTTL>
 struct CacheMetadata;
@@ -99,15 +102,14 @@ struct CacheMetadata<false, false> {
 };
 
 // ---------------------------------------------------------------------------
-// (false, true) — TTL only (8 bytes)
+// (false, true) — TTL only (4 bytes)
 // ---------------------------------------------------------------------------
 template<>
 struct CacheMetadata<false, true> {
-    int64_t ttl_expiration_rep{0};  // steady_clock rep; 0 = no TTL
+    uint32_t ttl_expiration_sec{0};  // seconds since steady_clock epoch; 0 = no TTL
 
-    bool isExpired(std::chrono::steady_clock::time_point now) const {
-        return ttl_expiration_rep != 0
-            && now.time_since_epoch().count() > ttl_expiration_rep;
+    bool isExpired(uint32_t now_sec) const {
+        return ttl_expiration_sec != 0 && now_sec > ttl_expiration_sec;
     }
 
     void mergeFrom(const CacheMetadata&) {}
@@ -119,23 +121,22 @@ struct CacheMetadata<false, true> {
 template<>
 struct CacheMetadata<true, false> : GDSFScoreData {
     CacheMetadata() = default;
-    CacheMetadata(uint32_t count, int64_t = 0) : GDSFScoreData(count) {}
+    CacheMetadata(uint32_t count, uint32_t = 0) : GDSFScoreData(count) {}
 };
 
 // ---------------------------------------------------------------------------
-// (true, true) — GDSF + TTL (4B + 8B = 12B, padded to 16B)
+// (true, true) — GDSF + TTL (4B + 4B = 8B, no padding)
 // ---------------------------------------------------------------------------
 template<>
 struct CacheMetadata<true, true> : GDSFScoreData {
-    int64_t ttl_expiration_rep{0};  // steady_clock rep; 0 = no TTL
+    uint32_t ttl_expiration_sec{0};  // seconds since steady_clock epoch; 0 = no TTL
 
     CacheMetadata() = default;
-    CacheMetadata(uint32_t count, int64_t ttl_rep)
-        : GDSFScoreData(count), ttl_expiration_rep(ttl_rep) {}
+    CacheMetadata(uint32_t count, uint32_t ttl_sec)
+        : GDSFScoreData(count), ttl_expiration_sec(ttl_sec) {}
 
-    bool isExpired(std::chrono::steady_clock::time_point now) const {
-        return ttl_expiration_rep != 0
-            && now.time_since_epoch().count() > ttl_expiration_rep;
+    bool isExpired(uint32_t now_sec) const {
+        return ttl_expiration_sec != 0 && now_sec > ttl_expiration_sec;
     }
 
     void mergeFrom(const CacheMetadata& old) {
@@ -145,20 +146,20 @@ struct CacheMetadata<true, true> : GDSFScoreData {
     // --- Copy/move: base + ttl field ---
 
     CacheMetadata(const CacheMetadata& o)
-        : GDSFScoreData(o), ttl_expiration_rep(o.ttl_expiration_rep) {}
+        : GDSFScoreData(o), ttl_expiration_sec(o.ttl_expiration_sec) {}
 
     CacheMetadata& operator=(const CacheMetadata& o) {
         GDSFScoreData::operator=(o);
-        ttl_expiration_rep = o.ttl_expiration_rep;
+        ttl_expiration_sec = o.ttl_expiration_sec;
         return *this;
     }
 
     CacheMetadata(CacheMetadata&& o) noexcept
-        : GDSFScoreData(std::move(o)), ttl_expiration_rep(o.ttl_expiration_rep) {}
+        : GDSFScoreData(std::move(o)), ttl_expiration_sec(o.ttl_expiration_sec) {}
 
     CacheMetadata& operator=(CacheMetadata&& o) noexcept {
         GDSFScoreData::operator=(std::move(o));
-        ttl_expiration_rep = o.ttl_expiration_rep;
+        ttl_expiration_sec = o.ttl_expiration_sec;
         return *this;
     }
 };
