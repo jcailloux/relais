@@ -1,5 +1,5 @@
-#ifndef CODIBOT_LISTCACHE_H
-#define CODIBOT_LISTCACHE_H
+#ifndef JCX_RELAIS_LIST_LISTCACHE_H
+#define JCX_RELAIS_LIST_LISTCACHE_H
 
 #include <atomic>
 #include <chrono>
@@ -8,19 +8,19 @@
 #include "ListQuery.h"
 #include "ListCacheTraits.h"
 #include "ModificationTracker.h"
-#include "jcailloux/relais/wrapper/ListWrapper.h"
-#include "jcailloux/relais/wrapper/EntityView.h"
+#include "jcailloux/relais/list/ListWrapper.h"
+#include "jcailloux/relais/cache/CacheView.h"
 #include "jcailloux/relais/cache/CacheTier.h"
-#include "jcailloux/relais/cache/GDSFMetadata.h"
+#include "jcailloux/relais/cache/CacheMetadata.h"
 #include "jcailloux/relais/cache/GDSFPolicy.h"
 #include "jcailloux/relais/cache/TaggedEntry.h"
-#include "jcailloux/relais/config/CachedClock.h"
+#include "jcailloux/relais/runtime/CachedClock.h"
 
 #ifdef RELAIS_BUILDING_TESTS
 namespace relais_test { struct TestInternals; }
 #endif
 
-namespace jcailloux::relais::cache::list {
+namespace jcailloux::relais::list {
 
 // =============================================================================
 // PaginationMode - Distinguishes offset-based and cursor-based pagination
@@ -281,8 +281,8 @@ public:
     using FilterSet = typename Traits::Filters;
     using SortFieldEnum = typename Traits::SortField;
     using Query = ListQuery<FilterSet, SortFieldEnum>;
-    using Result = jcailloux::relais::wrapper::ListWrapper<Entity>;
-    using ResultView = jcailloux::relais::wrapper::EntityView<Result>;
+    using Result = jcailloux::relais::list::ListWrapper<Entity>;
+    using ResultView = jcailloux::relais::cache::CacheView<Result>;
     using Modification = EntityModification<Entity>;
 
     using ModTracker = ModificationTracker<Entity, ChunkCount>;
@@ -348,7 +348,7 @@ public:
     ResultView put(const Query& query, Result result, SortBounds bounds = {},
                    float construction_time_us = 0.0f) {
         const auto& key = query.cacheKey();
-        uint32_t now_sec = config::CachedClock::now();
+        uint32_t now_sec = runtime::CachedClock::now();
         uint32_t gen = generation_.load(std::memory_order_relaxed);
 
         MetadataImpl meta(
@@ -605,6 +605,6 @@ private:
     }
 };
 
-}  // namespace jcailloux::relais::cache::list
+}  // namespace jcailloux::relais::list
 
-#endif  // CODIBOT_LISTCACHE_H
+#endif  // JCX_RELAIS_LIST_LISTCACHE_H

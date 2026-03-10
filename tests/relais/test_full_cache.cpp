@@ -27,7 +27,7 @@
 
 using namespace relais_test;
 
-namespace decl = jcailloux::relais::cache::list::decl;
+namespace decl = jcailloux::relais::list::spec;
 
 // #############################################################################
 //
@@ -66,9 +66,9 @@ using FullCacheInvUserRepo = Repo<TestUserWrapper, "test:user:both:inv", cfg::Bo
 // L1+L2 purchase repo with cross-invalidation → user
 using FullCachePurchaseRepo = Repo<TestPurchaseWrapper, "test:purchase:both",
     cfg::Both,
-    cache::Invalidate<FullCacheInvUserRepo, purchaseUserId>>;
+    Invalidate<FullCacheInvUserRepo, purchaseUserId>>;
 
-using jcailloux::relais::wrapper::set;
+using jcailloux::relais::entity::set;
 using F = TestUserWrapper::Field;
 
 // L1+L2 article repo for InvalidateVia target
@@ -77,7 +77,7 @@ using FullCacheInvArticleRepo = Repo<TestArticleWrapper, "test:article:both:inv"
 // Resolver: Purchase user_id → Article IDs by same author
 struct BothUserArticleResolver {
     static io::Task<std::vector<int64_t>> resolve(int64_t user_id) {
-        auto result = co_await jcailloux::relais::DbProvider::queryArgs(
+        auto result = co_await jcailloux::relais::PgProvider::queryArgs(
             "SELECT id FROM relais_test_articles WHERE author_id = $1", user_id);
         std::vector<int64_t> ids;
         for (size_t i = 0; i < result.rows(); ++i)
@@ -89,8 +89,8 @@ struct BothUserArticleResolver {
 // Purchase repo with Invalidate<User> + InvalidateVia<Article> at cfg::Both
 using FullCacheCustomPurchaseRepo = Repo<TestPurchaseWrapper, "test:purchase:both:custom",
     cfg::Both,
-    cache::Invalidate<FullCacheInvUserRepo, purchaseUserId>,
-    cache::InvalidateVia<FullCacheInvArticleRepo, purchaseUserId, &BothUserArticleResolver::resolve>>;
+    Invalidate<FullCacheInvUserRepo, purchaseUserId>,
+    InvalidateVia<FullCacheInvArticleRepo, purchaseUserId, &BothUserArticleResolver::resolve>>;
 
 // L1+L2 purchase list repo (target of InvalidateList cross-invalidation)
 using BothPurchaseListRepo = Repo<TestPurchaseWrapper, "test:purchase:list:both:forinv", cfg::Both>;
@@ -110,7 +110,7 @@ public:
 // Purchase repo with InvalidateList at cfg::Both
 using FullCacheListInvPurchaseRepo = Repo<TestPurchaseWrapper, "test:purchase:both:listinv",
     cfg::Both,
-    cache::InvalidateList<BothPurchaseListInvalidator>>;
+    InvalidateList<BothPurchaseListInvalidator>>;
 
 } // namespace relais_test
 

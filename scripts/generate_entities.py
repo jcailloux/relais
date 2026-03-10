@@ -501,14 +501,14 @@ class MappingGenerator:
         lines.append(f"// {wrapper_name} — public API type")
         lines.append("// ============================================================================")
         lines.append("")
-        lines.append(f"using {wrapper_name} = jcailloux::relais::wrapper::EntityWrapper<")
+        lines.append(f"using {wrapper_name} = jcailloux::relais::entity::EntityWrapper<")
         lines.append(f"    {struct_fqn}, {mapping_name}>;")
 
         # === List wrapper (if list annotations present) ===
         if a.has_list:
             list_wrapper_name = f"{entity.class_name}ListWrapper"
             lines.append("")
-            lines.append(f"using {list_wrapper_name} = jcailloux::relais::wrapper::ListWrapper<{wrapper_name}>;")
+            lines.append(f"using {list_wrapper_name} = jcailloux::relais::list::ListWrapper<{wrapper_name}>;")
 
         lines.append("")
         lines.append("}  // namespace entity::generated")
@@ -562,7 +562,7 @@ class MappingGenerator:
             lines.append("#include <vector>")
 
         # EntityWrapper (always needed)
-        lines.append("#include <jcailloux/relais/wrapper/EntityWrapper.h>")
+        lines.append("#include <jcailloux/relais/entity/EntityWrapper.h>")
 
         # Struct header (relative path from generated file to source)
         struct_include = self._find_struct_include(entity, output_file)
@@ -570,9 +570,9 @@ class MappingGenerator:
 
         # List includes
         if a.has_list:
-            lines.append("#include <jcailloux/relais/wrapper/ListWrapper.h>")
-            lines.append("#include <jcailloux/relais/list/decl/FilterDescriptor.h>")
-            lines.append("#include <jcailloux/relais/list/decl/SortDescriptor.h>")
+            lines.append("#include <jcailloux/relais/list/ListWrapper.h>")
+            lines.append("#include <jcailloux/relais/list/spec/FilterDescriptor.h>")
+            lines.append("#include <jcailloux/relais/list/spec/SortDescriptor.h>")
 
         return lines
 
@@ -919,7 +919,7 @@ class MappingGenerator:
         """Generate toUpdateParams for composite key entities.
 
         Unlike toInsertParams (which includes PK fields), this returns only
-        the SET fields used in UPDATE statements. The caller (BaseRepo) prepends
+        the SET fields used in UPDATE statements. The caller (PgRepo) prepends
         the key params separately.
         """
         a = entity.annotation
@@ -997,7 +997,7 @@ class MappingGenerator:
         Uses heapCapacity() for std::string to exclude SSO buffer (already in sizeof).
         """
         a = entity.annotation
-        hc = "jcailloux::relais::wrapper::heapCapacity"
+        hc = "jcailloux::relais::entity::heapCapacity"
         # Collect fields with dynamic heap allocations
         dynamic_fields = []
         for m in entity.members:
@@ -1229,7 +1229,7 @@ class MappingGenerator:
         a = entity.annotation
         struct_fqn = (f"{entity.namespace}::{entity.class_name}"
                       if entity.namespace else entity.class_name)
-        decl_ns = "jcailloux::relais::cache::list::decl"
+        decl_ns = "jcailloux::relais::list::spec"
 
         limits = a.limits if a.limits else [10, 25, 50]
         default_limit = limits[0]

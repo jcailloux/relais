@@ -28,7 +28,7 @@
 #include "fixtures/generated/TestArticleWrapper.h"
 #include "fixtures/generated/TestPurchaseWrapper.h"
 #include "fixtures/generated/TestOrderWrapper.h"
-#include <jcailloux/relais/wrapper/ListWrapper.h>
+#include <jcailloux/relais/list/ListWrapper.h>
 
 // Shadow raw struct names with EntityWrapper types for testing
 using TestItem = entity::generated::TestItemWrapper;
@@ -41,8 +41,8 @@ using relais_test::TestGeoLocation;
 using relais_test::TestCoordinateMetadata;
 using relais_test::Priority;
 using relais_test::Status;
-using ListWrapperArticle = jcailloux::relais::wrapper::ListWrapper<TestArticle>;
-using ListWrapperItem = jcailloux::relais::wrapper::ListWrapper<TestItem>;
+using ListWrapperArticle = jcailloux::relais::list::ListWrapper<TestArticle>;
+using ListWrapperItem = jcailloux::relais::list::ListWrapper<TestItem>;
 
 // #############################################################################
 //
@@ -1065,7 +1065,7 @@ struct ProductMapping {
     );
 };
 
-using ProductWrapper = jcailloux::relais::wrapper::EntityWrapper<Product, ProductMapping>;
+using ProductWrapper = jcailloux::relais::entity::EntityWrapper<Product, ProductMapping>;
 
 } // namespace custom_json_test
 
@@ -1111,7 +1111,7 @@ TEST_CASE("Custom JSON field names via glz::meta<Struct>", "[wrapper][json][cust
 
 TEST_CASE("ListWrapper items use custom JSON field names", "[wrapper][list][custom-names]") {
 
-    using ProductList = jcailloux::relais::wrapper::ListWrapper<custom_json_test::ProductWrapper>;
+    using ProductList = jcailloux::relais::list::ListWrapper<custom_json_test::ProductWrapper>;
 
     custom_json_test::ProductWrapper p1;
     p1.id = 1;

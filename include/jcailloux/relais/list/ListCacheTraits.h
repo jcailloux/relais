@@ -1,11 +1,11 @@
-#ifndef CODIBOT_LISTCACHETRAITS_H
-#define CODIBOT_LISTCACHETRAITS_H
+#ifndef JCX_RELAIS_LIST_LISTCACHETRAITS_H
+#define JCX_RELAIS_LIST_LISTCACHETRAITS_H
 
 #include <concepts>
 
 #include "ListQuery.h"
 
-namespace jcailloux::relais::cache::list {
+namespace jcailloux::relais::list {
 
 // =============================================================================
 // Concepts for ListCacheTraits requirements
@@ -217,6 +217,6 @@ struct ListCacheTraits<entity::MyEntity> {
 };
 */
 
-}  // namespace jcailloux::relais::cache::list
+}  // namespace jcailloux::relais::list
 
-#endif  // CODIBOT_LISTCACHETRAITS_H
+#endif  // JCX_RELAIS_LIST_LISTCACHETRAITS_H

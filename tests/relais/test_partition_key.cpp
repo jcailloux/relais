@@ -26,7 +26,7 @@ using L1EventTargetUserRepo = Repo<TestUserWrapper, "test:user:l1:event">;
 // L1 event repo as cross-invalidation SOURCE (Event → User)
 using L1EventSourceRepo = Repo<TestEventWrapper, "test:event:l1:crossinv",
     cfg::Local,
-    cache::Invalidate<L1EventTargetUserRepo, eventUserId>>;
+    Invalidate<L1EventTargetUserRepo, eventUserId>>;
 
 // L1 event repo as cross-invalidation TARGET
 using L1EventAsTargetRepo = Repo<TestEventWrapper, "test:event:l1:target">;
@@ -34,7 +34,7 @@ using L1EventAsTargetRepo = Repo<TestEventWrapper, "test:event:l1:target">;
 // Async resolver: given a user_id, find event IDs for that user
 struct PurchaseToEventResolver {
     static io::Task<std::vector<int64_t>> resolve(int64_t user_id) {
-        auto result = co_await jcailloux::relais::DbProvider::queryArgs(
+        auto result = co_await jcailloux::relais::PgProvider::queryArgs(
             "SELECT id FROM relais_test_events WHERE user_id = $1", user_id);
         std::vector<int64_t> ids;
         for (size_t i = 0; i < result.rows(); ++i) {
@@ -47,13 +47,13 @@ struct PurchaseToEventResolver {
 // L1 purchase repo that invalidates event cache via resolver
 using L1PurchaseInvEventRepo = Repo<TestPurchaseWrapper, "test:purchase:l1:event:target",
     cfg::Local,
-    cache::InvalidateVia<L1EventAsTargetRepo, purchaseUserId, &PurchaseToEventResolver::resolve>>;
+    InvalidateVia<L1EventAsTargetRepo, purchaseUserId, &PurchaseToEventResolver::resolve>>;
 
 } // anonymous namespace
 
 // #############################################################################
 //
-//  1. PartitionKey CRUD (Uncached / BaseRepo)
+//  1. PartitionKey CRUD (Uncached / PgRepo)
 //
 // #############################################################################
 
@@ -505,7 +505,7 @@ TEST_CASE("PartitionKey - serialization",
 //
 // #############################################################################
 
-using jcailloux::relais::wrapper::set;
+using jcailloux::relais::entity::set;
 using EF = TestEventWrapper::Field;
 
 TEST_CASE("PartitionKey<TestEvent> - patch (Uncached)",

@@ -39,7 +39,7 @@ using FullPurchaseListQuery = FullCachePurchaseListRepo::ListQuery;
 // L1+L2 query helpers
 // =============================================================================
 
-namespace decl = jcailloux::relais::cache::list::decl;
+namespace decl = jcailloux::relais::list::spec;
 
 static FullArticleListQuery makeFullArticleQuery(
     std::optional<std::string> category = std::nullopt,
@@ -470,7 +470,7 @@ TEST_CASE("[DeclList L1+L2] L2 hit repopulates L1",
 // #############################################################################
 
 namespace {
-namespace list_ns = jcailloux::relais::cache::list;
+namespace list_ns = jcailloux::relais::list;
 
 using FullArticleDecl = FullCacheArticleListRepo::ListDescriptorType;
 using FullArticleDescQuery = decl::ListDescriptorQuery<FullArticleDecl>;

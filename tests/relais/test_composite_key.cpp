@@ -11,7 +11,7 @@
 #include "fixtures/RelaisTestAccessors.h"
 
 using namespace relais_test;
-using jcailloux::relais::wrapper::set;
+using jcailloux::relais::entity::set;
 
 // #############################################################################
 //
@@ -68,7 +68,7 @@ TEST_CASE("CompositeKey<TestMembership> - SQL strings",
 
 // #############################################################################
 //
-//  2. Composite Key CRUD (Uncached / BaseRepo)
+//  2. Composite Key CRUD (Uncached / PgRepo)
 //
 // #############################################################################
 

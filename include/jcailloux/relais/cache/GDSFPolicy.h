@@ -13,7 +13,7 @@
 #include <thread>
 #include <vector>
 
-#include "jcailloux/relais/cache/GDSFMetadata.h"
+#include "jcailloux/relais/cache/CacheMetadata.h"
 #include "jcailloux/relais/cache/Metrics.h"
 #include "jcailloux/relais/Log.h"
 
@@ -145,7 +145,7 @@ class GDSFPolicy {
     static constexpr size_t kMaxMemorySlots = 64;
 
 public:
-    /// Compile-time GDSF toggle. Controls if constexpr guards in CachedRepo/ListMixin.
+    /// Compile-time GDSF toggle. Controls if constexpr guards in LocalRepo/ListMixin.
     /// When false, all GDSF code paths (metadata, scoring, ghosts) are eliminated.
     static constexpr bool enabled = RELAIS_GDSF_ENABLED;
 
@@ -228,7 +228,7 @@ public:
     // =====================================================================
 
     /// Register a repo for global coordination (threshold, sweep).
-    /// Called once per CachedRepo instantiation via std::call_once.
+    /// Called once per LocalRepo instantiation via std::call_once.
     void enroll(RepoRegistryEntry entry) {
         std::unique_lock lock(registry_mutex_);
         registry_.push_back(std::move(entry));

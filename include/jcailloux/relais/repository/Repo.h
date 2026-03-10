@@ -5,11 +5,11 @@
 #include <type_traits>
 #include "jcailloux/relais/io/Task.h"
 #include "jcailloux/relais/Log.h"
-#include "jcailloux/relais/repository/CachedRepo.h"
+#include "jcailloux/relais/repository/LocalRepo.h"
 #include "jcailloux/relais/repository/InvalidationMixin.h"
 #include "jcailloux/relais/repository/ListMixin.h"
 #include "jcailloux/relais/config/FixedString.h"
-#include "jcailloux/relais/wrapper/EntityConcepts.h"
+#include "jcailloux/relais/entity/EntityConcepts.h"
 #include "jcailloux/relais/cache/Metrics.h"
 #include "jcailloux/relais/cache/GDSFPolicy.h"
 
@@ -20,11 +20,11 @@ namespace jcailloux::relais {
 // =============================================================================
 //
 // Chain (bottom to top):
-//   BaseRepos
+//   PgRepo
 //     ↑ (if L2 or L1_L2)
 //   RedisRepo
 //     ↑ (if L1 or L1_L2)
-//   CachedRepo
+//   LocalRepo
 //     ↑ (if Entity has ListDescriptor)
 //   ListMixin
 //     ↑ (if Invalidations... non-empty)
@@ -40,11 +40,11 @@ template<typename Entity, config::FixedString Name, config::CacheConfig Cfg, typ
 struct CacheLayerSelector {
     using type = std::conditional_t<
         Cfg.cache_level == config::CacheLevel::L1 || Cfg.cache_level == config::CacheLevel::L1_L2,
-        CachedRepo<Entity, Name, Cfg, Key>,
+        LocalRepo<Entity, Name, Cfg, Key>,
         std::conditional_t<
             Cfg.cache_level == config::CacheLevel::L2,
             RedisRepo<Entity, Name, Cfg, Key>,
-            BaseRepo<Entity, Name, Cfg, Key>
+            PgRepo<Entity, Name, Cfg, Key>
         >
     >;
 };
@@ -136,7 +136,7 @@ public:
         // L1 entity counters
         if constexpr (Cfg.cache_level == config::CacheLevel::L1
                     || Cfg.cache_level == config::CacheLevel::L1_L2) {
-            using CachedLayer = CachedRepo<Entity, Name, Cfg, Key>;
+            using CachedLayer = LocalRepo<Entity, Name, Cfg, Key>;
             snap.l1_hits   = CachedLayer::l1_counters_.hits.load();
             snap.l1_misses = CachedLayer::l1_counters_.misses.load();
         }
@@ -172,7 +172,7 @@ public:
     static void resetMetrics() {
         if constexpr (Cfg.cache_level == config::CacheLevel::L1
                     || Cfg.cache_level == config::CacheLevel::L1_L2) {
-            using CachedLayer = CachedRepo<Entity, Name, Cfg, Key>;
+            using CachedLayer = LocalRepo<Entity, Name, Cfg, Key>;
             CachedLayer::l1_counters_.hits.reset();
             CachedLayer::l1_counters_.misses.reset();
         }

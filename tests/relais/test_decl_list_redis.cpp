@@ -20,7 +20,7 @@
 #include "fixtures/RelaisTestAccessors.h"
 using namespace relais_test;
 
-namespace decl = jcailloux::relais::cache::list::decl;
+namespace decl = jcailloux::relais::list::spec;
 
 // #############################################################################
 //
@@ -98,7 +98,7 @@ static L2ArticleDescQuery makeL2ViewCountQuery(std::string_view category, uint16
     L2ArticleDescQuery q;
     q.limit = limit;
     q.filters.get<1>() = category;
-    q.sort = jcailloux::relais::cache::list::SortSpec<size_t>{1, jcailloux::relais::cache::list::SortDirection::Desc};
+    q.sort = jcailloux::relais::list::SortSpec<size_t>{1, jcailloux::relais::list::SortDirection::Desc};
 
     q.group_key = decl::groupCacheKey<L2ArticleDecl>(q);
     q.cache_key = decl::cacheKey<L2ArticleDecl>(q);
@@ -739,7 +739,7 @@ TEST_CASE("[DeclList L2] Lua SortBounds — per-page precision",
 
         // Page 2: [60, 40] via cursor (fp=false, cursor mode, complete)
         auto q2 = makeL2ViewCountQuery("tech", 2);
-        q2.cursor = jcailloux::relais::cache::list::Cursor::decode(
+        q2.cursor = jcailloux::relais::list::Cursor::decode(
             std::string(p1->cursor())).value();
         q2.cache_key = decl::cacheKey<L2ArticleDecl>(q2);
         auto p2 = sync(L2DeclArticleListRepo::query(q2));
@@ -780,7 +780,7 @@ TEST_CASE("[DeclList L2] Lua SortBounds — per-page precision",
 
         // Page 2: [60, 40] via cursor
         auto q2 = makeL2ViewCountQuery("tech", 2);
-        q2.cursor = jcailloux::relais::cache::list::Cursor::decode(
+        q2.cursor = jcailloux::relais::list::Cursor::decode(
             std::string(p1->cursor())).value();
         q2.cache_key = decl::cacheKey<L2ArticleDecl>(q2);
         auto p2 = sync(L2DeclArticleListRepo::query(q2));
@@ -953,7 +953,7 @@ TEST_CASE("[DeclList L2] Lua all-in-one — multi-group correctness",
 // #############################################################################
 
 namespace {
-namespace list_ns = jcailloux::relais::cache::list;
+namespace list_ns = jcailloux::relais::list;
 
 /// Build the Redis page key for a declarative list query (reproduces ListMixin::redisPageKey).
 template<typename RepoT>
@@ -1085,8 +1085,8 @@ static L2ArticleDescQuery makeL2ViewCountQueryOffset(
     q.limit = limit;
     q.offset = offset;
     q.filters.get<1>() = category;
-    q.sort = jcailloux::relais::cache::list::SortSpec<size_t>{
-        1, jcailloux::relais::cache::list::SortDirection::Desc};
+    q.sort = jcailloux::relais::list::SortSpec<size_t>{
+        1, jcailloux::relais::list::SortDirection::Desc};
     q.group_key = decl::groupCacheKey<L2ArticleDecl>(q);
     q.cache_key = decl::cacheKey<L2ArticleDecl>(q);
     return q;

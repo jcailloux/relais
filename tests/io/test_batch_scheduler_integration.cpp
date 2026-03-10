@@ -8,7 +8,7 @@
 #include <jcailloux/relais/io/batch/BatchScheduler.h>
 #include <jcailloux/relais/io/batch/TimingEstimator.h>
 #include <jcailloux/relais/io/Task.h>
-#include <jcailloux/relais/DbProvider.h>
+#include <jcailloux/relais/PgProvider.h>
 
 #include <atomic>
 #include <chrono>
@@ -669,13 +669,13 @@ TEST_CASE("BatchScheduler: Redis pipelineExec returns correct results",
 }
 
 // =============================================================================
-// DbProvider: redis routes through BatchScheduler
+// PgProvider: redis routes through BatchScheduler
 // =============================================================================
 
-TEST_CASE("BatchScheduler: DbProvider redis routes through batcher",
+TEST_CASE("BatchScheduler: PgProvider redis routes through batcher",
           "[io][batch][integration][redis]")
 {
-    using jcailloux::relais::DbProvider;
+    using jcailloux::relais::PgProvider;
 
     Io io;
     bool done = false;
@@ -685,21 +685,21 @@ TEST_CASE("BatchScheduler: DbProvider redis routes through batcher",
         auto pool = co_await PgPool<Io>::create(io, CONNINFO, 1, 1);
         auto redis = co_await RedisClient<Io>::connect(io);
 
-        DbProvider::init(io, pool, redis);
-        REQUIRE(DbProvider::initialized());
-        REQUIRE(DbProvider::hasRedis());
+        PgProvider::init(io, pool, redis);
+        REQUIRE(PgProvider::initialized());
+        REQUIRE(PgProvider::hasRedis());
 
-        // SET via DbProvider::redis (goes through batcher->submitRedis)
-        co_await DbProvider::redis("SET", "dbp_batch_test", "routed");
+        // SET via PgProvider::redis (goes through batcher->submitRedis)
+        co_await PgProvider::redis("SET", "dbp_batch_test", "routed");
 
-        auto reply = co_await DbProvider::redis("GET", "dbp_batch_test");
+        auto reply = co_await PgProvider::redis("GET", "dbp_batch_test");
         REQUIRE(reply.isString());
         REQUIRE(reply.asString() == "routed");
 
         // Cleanup
-        co_await DbProvider::redis("DEL", "dbp_batch_test");
+        co_await PgProvider::redis("DEL", "dbp_batch_test");
 
-        DbProvider::reset();
+        PgProvider::reset();
         done = true;
     };
     task();

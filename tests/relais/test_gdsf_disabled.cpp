@@ -15,7 +15,7 @@
  */
 
 #include "jcailloux/relais/cache/GDSFPolicy.h"
-#include "jcailloux/relais/cache/GDSFMetadata.h"
+#include "jcailloux/relais/cache/CacheMetadata.h"
 
 // These tests only compile when GDSF is disabled.
 // In the combined binary (test_relais_all), RELAIS_GDSF_ENABLED=1 -> skip.

@@ -1,10 +1,10 @@
 #ifndef JCX_RELAIS_REDISREPO_H
 #define JCX_RELAIS_REDISREPO_H
 
-#include "jcailloux/relais/repository/BaseRepo.h"
+#include "jcailloux/relais/repository/PgRepo.h"
 #include "jcailloux/relais/cache/RedisCache.h"
 #include "jcailloux/relais/cache/Metrics.h"
-#include "jcailloux/relais/config/repo_config.h"
+#include "jcailloux/relais/config/CacheConfig.h"
 
 namespace jcailloux::relais {
 
@@ -18,15 +18,15 @@ namespace jcailloux::relais {
  * When l2_format is Binary but the entity lacks HasBinarySerialization,
  * JSON is used as an automatic fallback.
  *
- * find() returns epoch-guarded EntityView. findJson()/findBinary() return by value.
+ * find() returns epoch-guarded CacheView. findJson()/findBinary() return by value.
  * Views are thread-agnostic and safe to hold across co_await.
  *
  * Cross-invalidation is not handled here; it belongs in InvalidationMixin.
  */
 template<typename Entity, config::FixedString Name, config::CacheConfig Cfg, typename Key>
 requires CacheableEntity<Entity>
-class RedisRepo : public BaseRepo<Entity, Name, Cfg, Key> {
-    using Base = BaseRepo<Entity, Name, Cfg, Key>;
+class RedisRepo : public PgRepo<Entity, Name, Cfg, Key> {
+    using Base = PgRepo<Entity, Name, Cfg, Key>;
     using Mapping = typename Entity::MappingType;
 
     static constexpr bool useL2Binary =
@@ -46,8 +46,8 @@ class RedisRepo : public BaseRepo<Entity, Name, Cfg, Key> {
         static constexpr auto l2Ttl() { return std::chrono::nanoseconds(Cfg.l2_ttl); }
 
         /// Find by ID with L2 (Redis) -> L3 (DB) fallback.
-        /// Returns epoch-guarded EntityView (empty if not found).
-        static io::Task<wrapper::EntityView<Entity>> find(const Key& id) {
+        /// Returns epoch-guarded CacheView (empty if not found).
+        static io::Task<cache::CacheView<Entity>> find(const Key& id) {
             auto entity = co_await findRaw(id);
             if (!entity) co_return {};
             co_return Base::makeView(std::move(*entity));
@@ -125,8 +125,8 @@ class RedisRepo : public BaseRepo<Entity, Name, Cfg, Key> {
         }
 
         /// Insert entity in database with L2 cache population.
-        /// Returns epoch-guarded EntityView (empty on error).
-        static io::Task<wrapper::EntityView<Entity>> insert(const Entity& entity)
+        /// Returns epoch-guarded CacheView (empty on error).
+        static io::Task<cache::CacheView<Entity>> insert(const Entity& entity)
             requires CreatableEntity<Entity, Key> && (!Cfg.read_only)
         {
             auto result = co_await insertRaw(entity);
@@ -146,7 +146,7 @@ class RedisRepo : public BaseRepo<Entity, Name, Cfg, Key> {
         /// Partial update: invalidates Redis then delegates to Base::patchRaw.
         /// Returns the re-fetched entity as epoch-guarded view.
         template<typename... Updates>
-        static io::Task<wrapper::EntityView<Entity>> patch(const Key& id, Updates&&... updates)
+        static io::Task<cache::CacheView<Entity>> patch(const Key& id, Updates&&... updates)
             requires HasFieldUpdate<Entity> && (!Cfg.read_only)
         {
             auto entity = co_await patchRaw(id, std::forward<Updates>(updates)...);
@@ -230,7 +230,7 @@ class RedisRepo : public BaseRepo<Entity, Name, Cfg, Key> {
         }
 
         static std::string makeRedisKey(const Key& id) {
-            if constexpr (config::is_tuple_v<Key>) {
+            if constexpr (is_tuple_v<Key>) {
                 std::string key = std::string(name());
                 std::apply([&](const auto&... parts) {
                     ((key += ":" + keyPartToString(parts)), ...);
@@ -278,7 +278,7 @@ class RedisRepo : public BaseRepo<Entity, Name, Cfg, Key> {
 
     protected:
         // =====================================================================
-        // Raw methods returning entity by value (for CachedRepo move path)
+        // Raw methods returning entity by value (for LocalRepo move path)
         // =====================================================================
 
         /// Find with L2 -> L3 fallback, returning entity by value.
@@ -376,7 +376,7 @@ class RedisRepo : public BaseRepo<Entity, Name, Cfg, Key> {
         static io::Task<bool> setListInRedis(const std::string& key,
                                                   const std::vector<E>& entities,
                                                   std::chrono::duration<Rep, Period> ttl,
-                                                  std::optional<cache::list::ListBoundsHeader> header = std::nullopt)
+                                                  std::optional<list::ListBoundsHeader> header = std::nullopt)
         {
             if constexpr (useL2Binary) {
                 co_return co_await cache::RedisCache::setListBeve(key, entities, ttl, header);
@@ -465,7 +465,7 @@ class RedisRepo : public BaseRepo<Entity, Name, Cfg, Key> {
 
             auto results = co_await query();
 
-            std::optional<cache::list::ListBoundsHeader> header;
+            std::optional<list::ListBoundsHeader> header;
             if constexpr (!std::is_null_pointer_v<std::decay_t<HeaderBuilder>>) {
                 header = headerBuilder(results, limit, offset);
             }
@@ -579,7 +579,7 @@ class RedisRepo : public BaseRepo<Entity, Name, Cfg, Key> {
             auto listEntity = co_await query();
 
             // Build header if headerBuilder is provided
-            std::optional<cache::list::ListBoundsHeader> header;
+            std::optional<list::ListBoundsHeader> header;
             if constexpr (!std::is_null_pointer_v<std::decay_t<HeaderBuilder>>) {
                 header = headerBuilder(listEntity, limit, offset);
             }

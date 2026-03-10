@@ -31,7 +31,7 @@ namespace jcailloux::relais::io::batch {
 // BatchScheduler — single-threaded adaptive batching for PG and Redis.
 //
 // This scheduler is mono-thread: one instance per event loop worker.
-// No internal mutexes — the DbProvider thread_local dispatch guarantees
+// No internal mutexes — the PgProvider thread_local dispatch guarantees
 // that all calls come from the same event loop.
 //
 // Batching strategy:

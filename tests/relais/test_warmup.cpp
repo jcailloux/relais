@@ -4,7 +4,7 @@
  * Tests for warmup() — priming cache infrastructure at startup.
  *
  * Covers:
- *   1. CachedRepo::warmup() — L1 entity cache priming
+ *   1. LocalRepo::warmup() — L1 entity cache priming
  *   2. ListMixin::warmup() — entity + list cache priming
  */
 
@@ -20,11 +20,11 @@ using namespace relais_test;
 
 // #############################################################################
 //
-//  1. CachedRepo::warmup — L1 entity cache
+//  1. LocalRepo::warmup — L1 entity cache
 //
 // #############################################################################
 
-TEST_CASE("CachedRepo::warmup - L1 entity cache",
+TEST_CASE("LocalRepo::warmup - L1 entity cache",
           "[integration][db][warmup][l1]")
 {
     TransactionGuard tx;

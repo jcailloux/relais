@@ -11,8 +11,8 @@
 #pragma once
 
 #include <jcailloux/relais/repository/Repo.h>
-#include <jcailloux/relais/config/repo_config.h>
-#include <jcailloux/relais/cache/InvalidateOn.h>
+#include <jcailloux/relais/config/CacheConfig.h>
+#include <jcailloux/relais/repository/InvalidateOn.h>
 #include "generated/TestItemWrapper.h"
 #include "generated/TestUserWrapper.h"
 #include "generated/TestArticleWrapper.h"
@@ -25,6 +25,11 @@ namespace relais_test {
 
 // Convenience aliases
 using jcailloux::relais::Repo;
+using jcailloux::relais::Invalidate;
+using jcailloux::relais::InvalidateOn;
+using jcailloux::relais::InvalidateList;
+using jcailloux::relais::InvalidateVia;
+using jcailloux::relais::InvalidateListVia;
 namespace cache = jcailloux::relais::cache;
 namespace cfg = jcailloux::relais::config;
 
@@ -145,10 +150,10 @@ inline constexpr auto ReadOnlyL2 = Redis.with_read_only();
 // Test Repositories - TestItem (no ListDescriptor)
 // =============================================================================
 
-/// No caching — tests BaseRepo directly
+/// No caching — tests PgRepo directly
 using UncachedTestItemRepo = Repo<TestItemWrapper, "test:uncached", cfg::Uncached>;
 
-/// L1 only — tests CachedRepo without Redis
+/// L1 only — tests LocalRepo without Redis
 using L1TestItemRepo = Repo<TestItemWrapper, "test:l1">;
 
 /// L2 only — tests RedisRepo
@@ -180,7 +185,7 @@ using UncachedTestPurchaseRepo = Repo<TestPurchaseWrapper, "test:purchase:uncach
 
 /// Purchase L1 with cross-invalidation → User
 using L1TestPurchaseRepo = Repo<TestPurchaseWrapper, "test:purchase:l1", cfg::Local,
-    cache::Invalidate<L1TestUserRepo, purchaseUserId>>;
+    Invalidate<L1TestUserRepo, purchaseUserId>>;
 
 // =============================================================================
 // Article Repositories (has ListDescriptor → ListMixin auto-detected)

@@ -13,10 +13,10 @@
 #include <vector>
 
 #include "jcailloux/relais/cache/ChunkMap.h"
-#include "jcailloux/relais/cache/GDSFMetadata.h"
+#include "jcailloux/relais/cache/CacheMetadata.h"
 #include "jcailloux/relais/cache/GDSFPolicy.h"
 #include "jcailloux/relais/cache/TaggedEntry.h"
-#include "jcailloux/relais/config/CachedClock.h"
+#include "jcailloux/relais/runtime/CachedClock.h"
 #include "jcailloux/relais/io/Task.h"
 
 #include <utils/epoch.h>
@@ -56,7 +56,7 @@ concept MemoryTrackable = requires(const V& v) {
 // Encapsulates the full L1 cache mechanics: ChunkMap storage, GDSF scoring,
 // ghost admission control, TTL expiration, inflight dedup, and cleanup.
 //
-// CachedRepo and ListCache become thin domain wrappers around this.
+// LocalRepo and ListCache become thin domain wrappers around this.
 //
 // Template parameters:
 //   Key      — lookup key (int64_t, tuple, std::string, ...)
@@ -114,7 +114,7 @@ public:
     // =========================================================================
 
     CacheTier() {
-        config::CachedClock::ensureStarted();
+        runtime::CachedClock::ensureStarted();
     }
 
     ~CacheTier() = default;
@@ -144,7 +144,7 @@ public:
 
         // TTL check
         if constexpr (kHasTTL) {
-            if (ce->metadata.isExpired(config::CachedClock::now())) {
+            if (ce->metadata.isExpired(runtime::CachedClock::now())) {
                 map_.remove_if(key, [ce](auto* e) { return e == ce; });
                 return {};
             }
@@ -294,7 +294,7 @@ public:
             return {};
         } else {
             auto& policy = GDSFPolicy::instance();
-            CleanupContext ctx{config::CachedClock::now(),
+            CleanupContext ctx{runtime::CachedClock::now(),
                                kHasGDSF ? policy.threshold() : 0.0f};
 
             std::vector<typename CleanupContext::GhostCandidate> candidates;
@@ -355,7 +355,7 @@ public:
             return 0;
         } else {
             auto& policy = GDSFPolicy::instance();
-            CleanupContext ctx{config::CachedClock::now(),
+            CleanupContext ctx{runtime::CachedClock::now(),
                                kHasGDSF ? policy.threshold() : 0.0f};
 
             std::vector<typename CleanupContext::GhostCandidate> candidates;

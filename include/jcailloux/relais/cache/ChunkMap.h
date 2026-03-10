@@ -203,7 +203,7 @@ public:
         : map_(*new MapType(initial_size, false,
                 GDSFPolicy::enabled ? &memoryHook : nullptr)) {}
 
-    // ChunkMap instances are static singletons (CachedRepo::cache(),
+    // ChunkMap instances are static singletons (LocalRepo::cache(),
     // ListCache::cache_). Their destruction happens during static cleanup
     // when dependent singletons (epoch, GDSFPolicy) may already be destroyed.
     // Both the ParlayHash map and the memory_pool are heap-allocated and

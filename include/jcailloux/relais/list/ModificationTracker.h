@@ -1,5 +1,5 @@
-#ifndef JCAILLOUX_RELAIS_LIST_MODIFICATIONTRACKER_H
-#define JCAILLOUX_RELAIS_LIST_MODIFICATIONTRACKER_H
+#ifndef JCX_RELAIS_LIST_MODIFICATIONTRACKER_H
+#define JCX_RELAIS_LIST_MODIFICATIONTRACKER_H
 
 #include <atomic>
 #include <cstdint>
@@ -12,7 +12,7 @@
 namespace relais_test { struct TestInternals; }
 #endif
 
-namespace jcailloux::relais::cache::list {
+namespace jcailloux::relais::list {
 
 // =============================================================================
 // EntityModification - Represents a modification to an entity
@@ -279,6 +279,6 @@ public:
 #endif
 };
 
-}  // namespace jcailloux::relais::cache::list
+}  // namespace jcailloux::relais::list
 
-#endif  // JCAILLOUX_RELAIS_LIST_MODIFICATIONTRACKER_H
+#endif  // JCX_RELAIS_LIST_MODIFICATIONTRACKER_H

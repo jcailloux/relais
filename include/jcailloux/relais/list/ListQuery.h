@@ -1,5 +1,5 @@
-#ifndef CODIBOT_LISTQUERY_H
-#define CODIBOT_LISTQUERY_H
+#ifndef JCX_RELAIS_LIST_LISTQUERY_H
+#define JCX_RELAIS_LIST_LISTQUERY_H
 
 #include <chrono>
 #include <cstdint>
@@ -10,7 +10,7 @@
 #include <vector>
 #include <glaze/glaze.hpp>
 
-namespace jcailloux::relais::cache::list {
+namespace jcailloux::relais::list {
 
 // =============================================================================
 // SortDirection - Ascending or Descending
@@ -188,20 +188,20 @@ struct CachedListResult {
     [[nodiscard]] size_t size() const noexcept { return items.size(); }
 };
 
-}  // namespace jcailloux::relais::cache::list
+}  // namespace jcailloux::relais::list
 
 // =============================================================================
 // Glaze metadata for serialization
 // =============================================================================
 
 template<>
-struct glz::meta<jcailloux::relais::cache::list::SortDirection> {
-    using enum jcailloux::relais::cache::list::SortDirection;
+struct glz::meta<jcailloux::relais::list::SortDirection> {
+    using enum jcailloux::relais::list::SortDirection;
     static constexpr auto value = enumerate(Asc, Desc);
 };
 
 template<>
-struct glz::meta<jcailloux::relais::cache::list::Cursor> {
+struct glz::meta<jcailloux::relais::list::Cursor> {
     static constexpr auto value = object(
         "data", [](auto& self) -> auto& {
             // Serialize as base64 string
@@ -212,4 +212,4 @@ struct glz::meta<jcailloux::relais::cache::list::Cursor> {
     );
 };
 
-#endif  // CODIBOT_LISTQUERY_H
+#endif  // JCX_RELAIS_LIST_LISTQUERY_H

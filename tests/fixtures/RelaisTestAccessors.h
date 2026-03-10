@@ -6,7 +6,7 @@
  * Test-only accessor for relais internal state.
  * Compiled only when RELAIS_BUILDING_TESTS is defined.
  * Provides cache reset, modification count inspection, forced cleanup,
- * and GDSF policy access via friend access to CachedRepo, ListMixin,
+ * and GDSF policy access via friend access to LocalRepo, ListMixin,
  * ListCache, ModificationTracker, and GDSFPolicy.
  */
 

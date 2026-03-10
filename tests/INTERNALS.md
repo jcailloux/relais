@@ -7,10 +7,10 @@ Technical details about the relais test infrastructure.
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │                         Test Files (.cpp)                           │
-│  test_base_repository.cpp      BaseRepo (no cache) + patch │
-│  test_redis_repository.cpp     RedisRepo (L2 cache)           │
+│  test_pg_repo.cpp              PgRepo (no cache) + patch │
+│  test_redis_repo.cpp           RedisRepo (L2 cache)           │
 │  test_decl_list_cache.cpp      ListMixin (L1 lists)                  │
-│  test_cached_repository.cpp    CachedRepo (L1 cache)          │
+│  test_local_repo.cpp           LocalRepo (L1 cache)          │
 │  test_partition_key.cpp         PartitionKey (composite PK, partitions) │
 │  test_generated_wrapper.cpp    Struct + EntityWrapper + ListWrapper  │
 └─────────────────────────────────────────────────────────────────────┘
@@ -37,7 +37,7 @@ Technical details about the relais test infrastructure.
                               ▼
 ┌─────────────────────────────────────────────────────────────────────┐
 │                        test_helper.h                                │
-│  - initTest(): DbProvider + PostgreSQL + Redis initialization       │
+│  - initTest(): PgProvider + PostgreSQL + Redis initialization       │
 │  - TransactionGuard: RAII test isolation (BEGIN/ROLLBACK + flush)   │
 │  - sync(): Coroutine synchronous execution                          │
 │  - insertTestItem/User/Purchase/Article: Direct DB helpers          │
@@ -55,7 +55,7 @@ Initializes the I/O layer for testing:
 1. Creates `IoContext` and starts the event loop in a background thread
 2. Creates `PgPool` with hardcoded config (localhost:5432, relais_test)
 3. Creates `RedisClient` (127.0.0.1:6379)
-4. Calls `DbProvider::init(pool, redis)` to register providers
+4. Calls `PgProvider::init(pool, redis)` to register providers
 
 **Important**: Called once per test run (guarded by atomic flag).
 
@@ -127,16 +127,16 @@ sync(Repo::update(id, makeEntity(updated)));
 Four repository classes with different cache configurations:
 
 ```cpp
-// No caching - tests BaseRepo
+// No caching - tests PgRepo
 class UncachedTestItemRepo : public Repo<..., config::Uncached> {};
 
-// L1 only - tests CachedRepo without Redis
+// L1 only - tests LocalRepo without Redis
 class L1TestItemRepo : public Repo<..., config::L1Only> {};
 
 // L2 only - tests RedisRepo
 class L2TestItemRepo : public Repo<..., config::L2Only> {};
 
-// Full hierarchy - tests CachedRepo with Redis
+// Full hierarchy - tests LocalRepo with Redis
 class FullCacheTestItemRepo : public Repo<..., config::Both> {};
 ```
 
@@ -231,7 +231,7 @@ L1Repo::clearCache();
 
 ### Test Single Case
 ```bash
-./test_relais_base "[BaseRepo] CRUD Operations" -s
+./test_relais_base "[PgRepo] CRUD Operations" -s
 ```
 
 ## Redis Repo Tests (`test_redis_repository.cpp`)
@@ -350,7 +350,7 @@ Defined in the concrete list repository. Translates the typed `GroupKey` + optio
 ### `invalidateAllListGroups()`
 
 Defined in the CRTP hierarchy:
-- **BaseRepo**: no-op (no cache to invalidate)
+- **PgRepo**: no-op (no cache to invalidate)
 - **RedisRepo**: `SCAN` with pattern `name() + ":list:*"` and `DEL` each match
 
 Called when the resolver returns `std::nullopt` (full pattern invalidation).
@@ -392,13 +392,13 @@ Helpers in `FieldUpdate.h`: `fieldColumnName<Traits>(update)` extracts the quote
 For partition pruning, `DELETE WHERE id=$1 AND region=$2` scans 1 partition vs `DELETE WHERE id=$1` scans N. The optimization uses cached entities as hints:
 
 ```
-CachedRepo::erase(id)
+LocalRepo::erase(id)
   → hint = getFromCache(id)        // Free L1 check
   → RedisRepo::eraseImpl(id, hint)
     → if (!hint && HasPartitionKey) {
         hint = getFromRedis(id)    // ~0.1ms L2 check
       }
-    → BaseRepo::eraseImpl(id, hint)
+    → PgRepo::eraseImpl(id, hint)
       → if (hint) deleteByPrimaryKey(fullPK)  // Pruned: 1 partition
       → else      deleteByKey(id)              // Scan: N partitions
 ```

@@ -21,7 +21,7 @@
 #include "fixtures/RelaisTestAccessors.h"
 using namespace relais_test;
 
-namespace decl = jcailloux::relais::cache::list::decl;
+namespace decl = jcailloux::relais::list::spec;
 
 // =============================================================================
 // Helper: build a TestArticleWrapper from raw values (no DB round-trip)
@@ -53,7 +53,7 @@ TestListQuery makeViewCountQuery(std::string_view category, uint16_t limit) {
     q.filters.get<1>() = category;
 
     // Sort index 1 = view_count, DESC
-    q.sort = jcailloux::relais::cache::list::SortSpec<size_t>{1, jcailloux::relais::cache::list::SortDirection::Desc};
+    q.sort = jcailloux::relais::list::SortSpec<size_t>{1, jcailloux::relais::list::SortDirection::Desc};
 
     // Canonical cache keys
     q.group_key = decl::groupCacheKey<TestDecl>(q);

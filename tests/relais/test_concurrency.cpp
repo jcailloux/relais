@@ -510,7 +510,7 @@ TEST_CASE("Concurrency - concurrent patch",
 {
     TransactionGuard tx;
 
-    using jcailloux::relais::wrapper::set;
+    using jcailloux::relais::entity::set;
     using F = TestUserWrapper::Field;
 
     SECTION("[L1] concurrent patch on same user") {
