@@ -37,19 +37,19 @@ namespace relais_test::gdsf_disabled {
 using namespace jcailloux::relais::config;
 
 // Default Local config (has default TTL of 1h, no GDSF)
-using DefaultTTLRepo = relais_test::Repo<TestItemWrapper, "gdsf_dis:item", Local>;
+using DefaultTTLRepo = relais_test::Repo<TestItemEntity, "gdsf_dis:item", Local>;
 
 // TTL-only (no GDSF, but explicit TTL active)
 inline constexpr auto WithTTL = Local
     .with_l1_ttl(std::chrono::seconds{60});
 
-using TTLOnlyRepo = relais_test::Repo<TestItemWrapper, "gdsf_dis:ttl", WithTTL>;
+using TTLOnlyRepo = relais_test::Repo<TestItemEntity, "gdsf_dis:ttl", WithTTL>;
 
 // No TTL, no GDSF — truly no cleanup
 inline constexpr auto NoCleanup = Local
     .with_l1_ttl(std::chrono::nanoseconds{0});
 
-using NoCleanupRepo = relais_test::Repo<TestItemWrapper, "gdsf_dis:noclean", NoCleanup>;
+using NoCleanupRepo = relais_test::Repo<TestItemEntity, "gdsf_dis:noclean", NoCleanup>;
 
 } // namespace relais_test::gdsf_disabled
 

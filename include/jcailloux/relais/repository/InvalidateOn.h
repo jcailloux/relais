@@ -12,23 +12,23 @@ namespace jcailloux::relais {
 // =============================================================================
 
 /// Invalidation data for cross-repository notifications.
-/// Raw pointers to data owned by the caller's coroutine frame (const Entity&
-/// parameter or local optional<Entity>). Safe because the fold expression
+/// Raw pointers to data owned by the caller's coroutine frame (const E&
+/// parameter or local optional<E>). Safe because the fold expression
 /// `(co_await Dependencies::invalidateWithData(data), ...)` is sequential.
-template<typename Entity>
+template<typename E>
 struct InvalidationData {
-    const Entity* old_entity = nullptr;  // null for insert
-    const Entity* new_entity = nullptr;  // null for delete
+    const E* old_entity = nullptr;  // null for insert
+    const E* new_entity = nullptr;  // null for delete
 
-    static InvalidationData forCreate(const Entity& e) {
+    static InvalidationData forCreate(const E& e) {
         return {nullptr, &e};
     }
 
-    static InvalidationData forUpdate(const Entity* old_e, const Entity& new_e) {
+    static InvalidationData forUpdate(const E* old_e, const E& new_e) {
         return {old_e, &new_e};
     }
 
-    static InvalidationData forDelete(const Entity& e) {
+    static InvalidationData forDelete(const E& e) {
         return {&e, nullptr};
     }
 
@@ -45,8 +45,8 @@ template<typename Cache, auto KeyExtractor>
 struct Invalidate {
     using CacheType = Cache;
 
-    template<typename Entity>
-    static io::Task<void> invalidate(const Entity& entity) {
+    template<typename E>
+    static io::Task<void> invalidate(const E& entity) {
         if constexpr (requires { KeyExtractor(entity); }) {
             co_await Cache::invalidate(KeyExtractor(entity));
         } else if constexpr (requires { (entity.*KeyExtractor); }) {
@@ -54,9 +54,9 @@ struct Invalidate {
         }
     }
 
-    template<typename Entity>
-    static io::Task<void> invalidateWithData(const InvalidationData<Entity>& data) {
-        using KeyT = decltype(extractKey(std::declval<Entity>()));
+    template<typename E>
+    static io::Task<void> invalidateWithData(const InvalidationData<E>& data) {
+        using KeyT = decltype(extractKey(std::declval<E>()));
         std::optional<KeyT> old_key;
         std::optional<KeyT> new_key;
 
@@ -77,8 +77,8 @@ struct Invalidate {
     }
 
 private:
-    template<typename Entity>
-    static auto extractKey(const Entity& entity) {
+    template<typename E>
+    static auto extractKey(const E& entity) {
         if constexpr (requires { KeyExtractor(entity); }) {
             return KeyExtractor(entity);
         } else if constexpr (requires { (entity.*KeyExtractor); }) {
@@ -95,8 +95,8 @@ template<typename ListCache>
 struct InvalidateList {
     using CacheType = ListCache;
 
-    template<typename Entity>
-    static io::Task<void> invalidate(const Entity& entity) {
+    template<typename E>
+    static io::Task<void> invalidate(const E& entity) {
         if constexpr (requires { ListCache::onEntityModified(entity); }) {
             co_await ListCache::onEntityModified(entity);
         } else if constexpr (requires { ListCache::onEntityCreated(entity); }) {
@@ -107,21 +107,21 @@ struct InvalidateList {
         }
     }
 
-    template<typename Entity>
-    static io::Task<void> invalidateWithData(const InvalidationData<Entity>& data) {
+    template<typename E>
+    static io::Task<void> invalidateWithData(const InvalidationData<E>& data) {
         if constexpr (requires { ListCache::onEntityModified(data); }) {
             co_await ListCache::onEntityModified(data);
         }
         else if constexpr (requires { ListCache::onEntityUpdated(
-            std::declval<const Entity&>(),
-            std::declval<const Entity&>()); }) {
+            std::declval<const E&>(),
+            std::declval<const E&>()); }) {
 
             if (data.isCreate() && data.new_entity) {
-                if constexpr (requires { ListCache::onEntityCreated(std::declval<const Entity&>()); }) {
+                if constexpr (requires { ListCache::onEntityCreated(std::declval<const E&>()); }) {
                     co_await ListCache::onEntityCreated(*data.new_entity);
                 }
             } else if (data.isDelete() && data.old_entity) {
-                if constexpr (requires { ListCache::onEntityDeleted(std::declval<const Entity&>()); }) {
+                if constexpr (requires { ListCache::onEntityDeleted(std::declval<const E&>()); }) {
                     co_await ListCache::onEntityDeleted(*data.old_entity);
                 }
             } else if (data.isUpdate()) {
@@ -129,8 +129,8 @@ struct InvalidateList {
             }
         }
         else if constexpr (requires { ListCache::notifyUpdated(
-            std::declval<const Entity&>(),
-            std::declval<const Entity&>()); }) {
+            std::declval<const E&>(),
+            std::declval<const E&>()); }) {
 
             if (data.isCreate() && data.new_entity) {
                 ListCache::notifyCreated(*data.new_entity);
@@ -142,7 +142,7 @@ struct InvalidateList {
             co_return;
         }
         else if constexpr (requires { ListCache::onEntityModified(
-            std::declval<const Entity&>()); }) {
+            std::declval<const E&>()); }) {
 
             if (data.new_entity) {
                 co_await ListCache::onEntityModified(*data.new_entity);
@@ -162,16 +162,16 @@ template<typename TargetCache, auto SourceKeyExtractor, auto Resolver>
 struct InvalidateVia {
     using CacheType = TargetCache;
 
-    template<typename Entity>
-    static io::Task<void> invalidate(const Entity& entity) {
+    template<typename E>
+    static io::Task<void> invalidate(const E& entity) {
         auto target_keys = co_await Resolver(extractKey(entity));
         for (const auto& tk : target_keys)
             co_await TargetCache::invalidate(tk);
     }
 
-    template<typename Entity>
-    static io::Task<void> invalidateWithData(const InvalidationData<Entity>& data) {
-        using KeyT = decltype(extractKey(std::declval<Entity>()));
+    template<typename E>
+    static io::Task<void> invalidateWithData(const InvalidationData<E>& data) {
+        using KeyT = decltype(extractKey(std::declval<E>()));
         std::optional<KeyT> old_key, new_key;
 
         if (data.old_entity)
@@ -193,8 +193,8 @@ struct InvalidateVia {
     }
 
 private:
-    template<typename Entity>
-    static auto extractKey(const Entity& entity) {
+    template<typename E>
+    static auto extractKey(const E& entity) {
         if constexpr (requires { SourceKeyExtractor(entity); })
             return SourceKeyExtractor(entity);
         else if constexpr (requires { (entity.*SourceKeyExtractor); })
@@ -223,14 +223,14 @@ struct InvalidateListVia {
     using GroupKey = typename ListRepo::GroupKey;
     using Target = ListInvalidationTarget<GroupKey>;
 
-    template<typename Entity>
-    static io::Task<void> invalidate(const Entity& entity) {
+    template<typename E>
+    static io::Task<void> invalidate(const E& entity) {
         co_await resolveAndInvalidate(extractKey(entity));
     }
 
-    template<typename Entity>
-    static io::Task<void> invalidateWithData(const InvalidationData<Entity>& data) {
-        using KeyT = decltype(extractKey(std::declval<Entity>()));
+    template<typename E>
+    static io::Task<void> invalidateWithData(const InvalidationData<E>& data) {
+        using KeyT = decltype(extractKey(std::declval<E>()));
         std::optional<KeyT> old_key, new_key;
 
         if (data.old_entity)
@@ -264,8 +264,8 @@ private:
         }
     }
 
-    template<typename Entity>
-    static auto extractKey(const Entity& entity) {
+    template<typename E>
+    static auto extractKey(const E& entity) {
         if constexpr (requires { SourceKeyExtractor(entity); })
             return SourceKeyExtractor(entity);
         else if constexpr (requires { (entity.*SourceKeyExtractor); })
@@ -279,26 +279,26 @@ private:
 
 template<typename... Dependencies>
 struct InvalidateOn {
-    template<typename Entity>
-    static io::Task<void> propagate(const Entity& entity) {
+    template<typename E>
+    static io::Task<void> propagate(const E& entity) {
         (co_await Dependencies::template invalidate(entity), ...);
     }
 
-    template<typename Entity>
-    static io::Task<void> propagateWithData(const InvalidationData<Entity>& data) {
+    template<typename E>
+    static io::Task<void> propagateWithData(const InvalidationData<E>& data) {
         (co_await Dependencies::template invalidateWithData(data), ...);
     }
 };
 
 template<>
 struct InvalidateOn<> {
-    template<typename Entity>
-    static io::Task<void> propagate(const Entity&) {
+    template<typename E>
+    static io::Task<void> propagate(const E&) {
         co_return;
     }
 
-    template<typename Entity>
-    static io::Task<void> propagateWithData(const InvalidationData<Entity>&) {
+    template<typename E>
+    static io::Task<void> propagateWithData(const InvalidationData<E>&) {
         co_return;
     }
 };
@@ -307,27 +307,27 @@ struct InvalidateOn<> {
 // propagateInvalidations - Helper functions for use in repositories
 // =============================================================================
 
-template<typename Entity, typename InvalidatesType>
-io::Task<void> propagateInvalidationsWithData(const InvalidationData<Entity>& data) {
+template<typename E, typename InvalidatesType>
+io::Task<void> propagateInvalidationsWithData(const InvalidationData<E>& data) {
     co_await InvalidatesType::template propagateWithData(data);
 }
 
-template<typename Entity, typename InvalidatesType>
-io::Task<void> propagateCreate(const Entity& entity) {
-    auto data = InvalidationData<Entity>::forCreate(entity);
-    co_await propagateInvalidationsWithData<Entity, InvalidatesType>(data);
+template<typename E, typename InvalidatesType>
+io::Task<void> propagateCreate(const E& entity) {
+    auto data = InvalidationData<E>::forCreate(entity);
+    co_await propagateInvalidationsWithData<E, InvalidatesType>(data);
 }
 
-template<typename Entity, typename InvalidatesType>
-io::Task<void> propagateUpdate(const Entity* old_entity, const Entity& new_entity) {
-    auto data = InvalidationData<Entity>::forUpdate(old_entity, new_entity);
-    co_await propagateInvalidationsWithData<Entity, InvalidatesType>(data);
+template<typename E, typename InvalidatesType>
+io::Task<void> propagateUpdate(const E* old_entity, const E& new_entity) {
+    auto data = InvalidationData<E>::forUpdate(old_entity, new_entity);
+    co_await propagateInvalidationsWithData<E, InvalidatesType>(data);
 }
 
-template<typename Entity, typename InvalidatesType>
-io::Task<void> propagateDelete(const Entity& entity) {
-    auto data = InvalidationData<Entity>::forDelete(entity);
-    co_await propagateInvalidationsWithData<Entity, InvalidatesType>(data);
+template<typename E, typename InvalidatesType>
+io::Task<void> propagateDelete(const E& entity) {
+    auto data = InvalidationData<E>::forDelete(entity);
+    co_await propagateInvalidationsWithData<E, InvalidatesType>(data);
 }
 
 // =============================================================================

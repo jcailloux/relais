@@ -27,7 +27,7 @@ namespace jcailloux::relais {
  * Repo with L1 RAM cache backed by CacheTier (ChunkMap + GDSF + ghosts).
  *
  * Thin wrapper: all L1 mechanics (find, store, evict, cleanup, inflight dedup,
- * GDSF admission, ghost lifecycle) are delegated to CacheTier<Key, Entity, Metadata>.
+ * GDSF admission, ghost lifecycle) are delegated to CacheTier<Key, E, Metadata>.
  *
  * LocalRepo adds only domain-specific concerns:
  * - Generation counter for stale write prevention
@@ -41,12 +41,12 @@ namespace jcailloux::relais {
  * Note: L1RepoConfig constraint is verified in Repo.h to avoid
  * eager evaluation issues with std::conditional_t.
  */
-template<typename Entity, config::FixedString Name, config::CacheConfig Cfg, typename Key>
-requires CacheableEntity<Entity>
+template<typename E, config::FixedString Name, config::CacheConfig Cfg, typename Key>
+requires CacheableEntity<E>
 class LocalRepo : public std::conditional_t<
     Cfg.cache_level == config::CacheLevel::L1,
-    PgRepo<Entity, Name, Cfg, Key>,
-    RedisRepo<Entity, Name, Cfg, Key>
+    PgRepo<E, Name, Cfg, Key>,
+    RedisRepo<E, Name, Cfg, Key>
 > {
     static constexpr bool HasRedis = (Cfg.cache_level == config::CacheLevel::L1_L2);
     static constexpr bool HasTTL = (std::chrono::nanoseconds(Cfg.l1_ttl).count() > 0);
@@ -55,12 +55,12 @@ class LocalRepo : public std::conditional_t<
 
     using Base = std::conditional_t<
         HasRedis,
-        RedisRepo<Entity, Name, Cfg, Key>,
-        PgRepo<Entity, Name, Cfg, Key>
+        RedisRepo<E, Name, Cfg, Key>,
+        PgRepo<E, Name, Cfg, Key>
     >;
 
     using Metadata = cache::CacheMetadata<HasGDSF, HasTTL>;
-    using Tier = cache::CacheTier<Key, Entity, Metadata>;
+    using Tier = cache::CacheTier<Key, E, Metadata>;
 
     /// TTL in seconds (compile-time, for metadata construction).
     static constexpr uint32_t kTtlSec = static_cast<uint32_t>(
@@ -71,7 +71,7 @@ public:
     using typename Base::EntityType;
     using typename Base::KeyType;
     using typename Base::WrapperType;
-    using FindResultType = cache::CacheView<Entity>;
+    using FindResultType = cache::CacheView<E>;
     using Base::name;
 
     static constexpr auto l1Ttl() { return std::chrono::nanoseconds(Cfg.l1_ttl); }
@@ -86,12 +86,12 @@ public:
 
     /// Find by ID with L1 -> (L2) -> DB fallback.
     /// L1 hit: zero overhead (Immediate holds CacheView directly, no Task).
-    static io::Immediate<cache::CacheView<Entity>> find(const Key& id) {
+    static io::Immediate<cache::CacheView<E>> find(const Key& id) {
         auto hit = tier().find(id);
         if (hit) {
             RELAIS_METRICS_INC(l1_counters_.hits);
-            return cache::CacheView<Entity>(
-                static_cast<const Entity*>(hit.value), std::move(hit.guard));
+            return cache::CacheView<E>(
+                static_cast<const E*>(hit.value), std::move(hit.guard));
         }
         RELAIS_METRICS_INC(l1_counters_.misses);
         return findSlow(id);
@@ -110,7 +110,7 @@ public:
 
     /// Find by ID and return binary (BEVE) vector (empty if not found).
     static io::Immediate<std::vector<uint8_t>> findBinary(const Key& id)
-        requires HasBinarySerialization<Entity>
+        requires HasBinarySerialization<E>
     {
         auto hit = tier().find(id);
         if (hit) {
@@ -126,8 +126,8 @@ public:
     // =========================================================================
 
     /// Insert entity and cache it. Returns epoch-guarded view.
-    static io::Task<cache::CacheView<Entity>> insert(const Entity& entity)
-        requires CreatableEntity<Entity, Key> && (!Cfg.read_only)
+    static io::Task<cache::CacheView<E>> insert(const E& entity)
+        requires CreatableEntity<E, Key> && (!Cfg.read_only)
     {
         auto result = co_await Base::insertRaw(entity);
         if (result) {
@@ -138,8 +138,8 @@ public:
     }
 
     /// Update entity in database with L1 cache handling.
-    static io::Task<bool> update(const Key& id, const Entity& entity)
-        requires MutableEntity<Entity> && (!Cfg.read_only)
+    static io::Task<bool> update(const Key& id, const E& entity)
+        requires MutableEntity<E> && (!Cfg.read_only)
     {
         using enum config::UpdateStrategy;
 
@@ -150,7 +150,7 @@ public:
             } else {
                 tier().onMutation(id);
                 bumpGeneration(id);
-                tier().store(id, Entity(entity), buildMetadata());
+                tier().store(id, E(entity), buildMetadata());
             }
         }
         co_return outcome.success;
@@ -159,8 +159,8 @@ public:
     /// Partial update: invalidates L1, delegates to Base::patchRaw,
     /// then moves result into cache.
     template<typename... Updates>
-    static io::Task<cache::CacheView<Entity>> patch(const Key& id, Updates&&... updates)
-        requires HasFieldUpdate<Entity> && (!Cfg.read_only)
+    static io::Task<cache::CacheView<E>> patch(const Key& id, Updates&&... updates)
+        requires HasFieldUpdate<E> && (!Cfg.read_only)
     {
         tier().onMutation(id);
         bumpGeneration(id);
@@ -177,9 +177,9 @@ public:
         requires (!Cfg.read_only)
     {
         // Provide L1 hint for partition pruning (free: ~0ns RAM lookup)
-        const Entity* hint = nullptr;
-        std::optional<Entity> local_hint;
-        if constexpr (HasPartitionHint<Entity>) {
+        const E* hint = nullptr;
+        std::optional<E> local_hint;
+        if constexpr (HasPartitionHint<E>) {
             auto hit = tier().find(id);
             if (hit) { local_hint.emplace(*hit.value); hint = &*local_hint; }
         }
@@ -251,24 +251,24 @@ protected:
     static L1Cache& cache() { return tier().map(); }
 
     /// Get from cache as CacheView.
-    static cache::CacheView<Entity> getFromCache(const Key& key) {
+    static cache::CacheView<E> getFromCache(const Key& key) {
         auto hit = tier().find(key);
         if (!hit) return {};
-        return cache::CacheView<Entity>(
-            static_cast<const Entity*>(hit.value), std::move(hit.guard));
+        return cache::CacheView<E>(
+            static_cast<const E*>(hit.value), std::move(hit.guard));
     }
 
     /// Put entity in cache (copy). Returns Hit for flexible use.
     /// No tick — the sweep counter is driven by fetch paths (DB misses),
     /// not by local cache mutations (update, insert via API).
-    static typename Tier::Hit putInCache(const Key& key, const Entity& src,
+    static typename Tier::Hit putInCache(const Key& key, const E& src,
         uint32_t now_sec = runtime::CachedClock::now())
     {
-        return tier().store(key, Entity(src), buildMetadata(now_sec));
+        return tier().store(key, E(src), buildMetadata(now_sec));
     }
 
     /// Put entity in cache (move). Returns Hit.
-    static typename Tier::Hit putInCache(const Key& key, Entity&& src,
+    static typename Tier::Hit putInCache(const Key& key, E&& src,
         uint32_t now_sec = runtime::CachedClock::now())
     {
         return tier().store(key, std::move(src), buildMetadata(now_sec));
@@ -329,10 +329,10 @@ private:
     // =========================================================================
 
     /// Store entity in cache and return CacheView.
-    static cache::CacheView<Entity> storeAndView(const Key& key, Entity&& src) {
+    static cache::CacheView<E> storeAndView(const Key& key, E&& src) {
         auto hit = tier().store(key, std::move(src), buildMetadata());
-        return cache::CacheView<Entity>(
-            static_cast<const Entity*>(hit.value), std::move(hit.guard));
+        return cache::CacheView<E>(
+            static_cast<const E*>(hit.value), std::move(hit.guard));
     }
 
     // =========================================================================
@@ -340,17 +340,17 @@ private:
     // =========================================================================
 
     /// Slow path for find(): L1 miss -> dedup -> (L2) -> DB -> cache.
-    static io::Task<cache::CacheView<Entity>> findSlow(const Key& id) {
+    static io::Task<cache::CacheView<E>> findSlow(const Key& id) {
         auto hit = co_await tier().findOrFetch(
             id,
-            [&id]() -> io::Task<std::optional<Entity>> {
+            [&id]() -> io::Task<std::optional<E>> {
                 co_return co_await Base::findRaw(id);
             },
-            [](const Entity&, float) -> Metadata { return buildMetadata(); }
+            [](const E&, float) -> Metadata { return buildMetadata(); }
         );
         if (hit) {
-            co_return cache::CacheView<Entity>(
-                static_cast<const Entity*>(hit.value), std::move(hit.guard));
+            co_return cache::CacheView<E>(
+                static_cast<const E*>(hit.value), std::move(hit.guard));
         }
         co_return {};
     }
@@ -359,10 +359,10 @@ private:
     static io::Task<std::string> findJsonSlow(const Key& id) {
         auto hit = co_await tier().findOrFetch(
             id,
-            [&id]() -> io::Task<std::optional<Entity>> {
+            [&id]() -> io::Task<std::optional<E>> {
                 co_return co_await Base::findRaw(id);
             },
-            [](const Entity&, float) -> Metadata { return buildMetadata(); }
+            [](const E&, float) -> Metadata { return buildMetadata(); }
         );
         if (hit) co_return hit.value->json();
         co_return std::string{};
@@ -370,14 +370,14 @@ private:
 
     /// Slow path for findBinary(): L1 miss -> dedup -> (L2) -> DB -> cache -> binary.
     static io::Task<std::vector<uint8_t>> findBinarySlow(const Key& id)
-        requires HasBinarySerialization<Entity>
+        requires HasBinarySerialization<E>
     {
         auto hit = co_await tier().findOrFetch(
             id,
-            [&id]() -> io::Task<std::optional<Entity>> {
+            [&id]() -> io::Task<std::optional<E>> {
                 co_return co_await Base::findRaw(id);
             },
-            [](const Entity&, float) -> Metadata { return buildMetadata(); }
+            [](const E&, float) -> Metadata { return buildMetadata(); }
         );
         if (hit) co_return hit.value->binary();
         co_return std::vector<uint8_t>{};
@@ -388,7 +388,7 @@ private:
     // =========================================================================
 
     static constexpr auto noExtraPred =
-        [](const Key&, const Metadata&, const Entity&, long) { return false; };
+        [](const Key&, const Metadata&, const E&, long) { return false; };
 
     // =========================================================================
     // Generation counter — stale write prevention (lock-free, cross-thread)

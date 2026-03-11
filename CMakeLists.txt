@@ -199,7 +199,7 @@ if(RELAIS_BUILD_TESTS)
     # -------------------------------------------------------------------------
     # Unit tests
     # -------------------------------------------------------------------------
-    relais_add_test(relais_tests                tests/relais/test_generated_wrapper.cpp          DEFINITIONS RELAIS_BUILDING_TESTS)
+    relais_add_test(relais_tests                tests/relais/test_generated_entity.cpp          DEFINITIONS RELAIS_BUILDING_TESTS)
     relais_add_test(test_relais_base_compile    tests/relais/test_pg_repo_compile.cpp    DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;compile")
     relais_add_test(test_relais_repo_compile    tests/relais/test_repo_compile.cpp         DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;compile")
     relais_add_test(test_io_task          tests/io/test_io_task.cpp               LABELS "io")
@@ -276,7 +276,7 @@ if(RELAIS_BUILD_TESTS)
     # GDSF tests are run via standalone binaries: test_relais_gdsf, test_relais_gdsf_disabled.
     add_executable(test_relais_all
         tests/relais/test_all_runner.cpp
-        tests/relais/test_generated_wrapper.cpp
+        tests/relais/test_generated_entity.cpp
         tests/relais/test_pg_repo.cpp
         tests/relais/test_redis_repo.cpp
         tests/relais/test_local_repo.cpp

@@ -68,23 +68,23 @@ inline constexpr auto RedisJson = Redis.with_l2_format(L2Format::Json);
 // =============================================================================
 
 /// TestUser normally uses BEVE; this repo forces JSON in Redis.
-using L2JsonTestUserRepo = Repo<TestUserWrapper, "test:user:l2:json", test_l2::RedisJson>;
+using L2JsonTestUserRepo = Repo<TestUserEntity, "test:user:l2:json", test_l2::RedisJson>;
 
 /// Article list repo with forced JSON format (lists normally stored as BEVE).
-class L2JsonTestArticleListRepo : public Repo<TestArticleWrapper, "test:article:list:l2:json", test_l2::RedisJson> {
+class L2JsonTestArticleListRepo : public Repo<TestArticleEntity, "test:article:list:l2:json", test_l2::RedisJson> {
 public:
-    static io::Task<std::vector<TestArticleWrapper>> getByCategory(
+    static io::Task<std::vector<TestArticleEntity>> getByCategory(
         const std::string& category, int limit = 10)
     {
         co_return co_await cachedList(
-            [category, limit]() -> io::Task<std::vector<TestArticleWrapper>> {
+            [category, limit]() -> io::Task<std::vector<TestArticleEntity>> {
                 auto result = co_await jcailloux::relais::PgProvider::queryArgs(
                     "SELECT id, category, author_id, title, view_count, is_published, published_at, created_at "
                     "FROM relais_test_articles WHERE category = $1 ORDER BY created_at DESC LIMIT $2",
                     category, limit);
-                std::vector<TestArticleWrapper> entities;
+                std::vector<TestArticleEntity> entities;
                 for (size_t i = 0; i < result.rows(); ++i) {
-                    if (auto e = entity::generated::TestArticleMapping::fromRow<TestArticleWrapper>(result[i]))
+                    if (auto e = entity::generated::TestArticleMapping::fromRow<TestArticleEntity>(result[i]))
                         entities.push_back(std::move(*e));
                 }
                 co_return entities;
@@ -104,16 +104,16 @@ public:
 // =============================================================================
 
 /// L2 user repo as cross-invalidation target.
-using L2InvTestUserRepo = Repo<TestUserWrapper, "test:user:l2:inv", cfg::Redis>;
+using L2InvTestUserRepo = Repo<TestUserEntity, "test:user:l2:inv", cfg::Redis>;
 
 /// L2 article repo as cross-invalidation target.
-using L2InvTestArticleRepo = Repo<TestArticleWrapper, "test:article:l2:inv", cfg::Redis>;
+using L2InvTestArticleRepo = Repo<TestArticleEntity, "test:article:l2:inv", cfg::Redis>;
 
 // =============================================================================
 // Standard cross-invalidation: Purchase → User
 // =============================================================================
 
-using L2TestPurchaseRepo = Repo<TestPurchaseWrapper, "test:purchase:l2",
+using L2TestPurchaseRepo = Repo<TestPurchaseEntity, "test:purchase:l2",
     cfg::Redis,
     Invalidate<L2InvTestUserRepo, purchaseUserId>>;
 
@@ -142,7 +142,7 @@ struct UserArticleResolver {
  * - Standard: invalidate the user's Redis cache (direct FK)
  * - Custom:   resolve user_id → article IDs, invalidate each article's Redis cache
  */
-using L2CustomTestPurchaseRepo = Repo<TestPurchaseWrapper, "test:purchase:l2:custom",
+using L2CustomTestPurchaseRepo = Repo<TestPurchaseEntity, "test:purchase:l2:custom",
     cfg::Redis,
     Invalidate<L2InvTestUserRepo, purchaseUserId>,
     InvalidateVia<L2InvTestArticleRepo, purchaseUserId, &UserArticleResolver::resolve>>;
@@ -154,7 +154,7 @@ using L2CustomTestPurchaseRepo = Repo<TestPurchaseWrapper, "test:purchase:l2:cus
 /**
  * L2 purchase repo whose writes invalidate a read-only user repo.
  */
-using L2ReadOnlyInvPurchaseRepo = Repo<TestPurchaseWrapper, "test:purchase:l2:readonly:inv",
+using L2ReadOnlyInvPurchaseRepo = Repo<TestPurchaseEntity, "test:purchase:l2:readonly:inv",
     cfg::Redis,
     Invalidate<ReadOnlyL2TestUserRepo, purchaseUserId>>;
 
@@ -165,20 +165,20 @@ using L2ReadOnlyInvPurchaseRepo = Repo<TestPurchaseWrapper, "test:purchase:l2:re
 /**
  * L2 article repo with cached list queries (JSON serialization).
  */
-class L2TestArticleListRepo : public Repo<TestArticleWrapper, "test:article:list:l2", cfg::Redis> {
+class L2TestArticleListRepo : public Repo<TestArticleEntity, "test:article:list:l2", cfg::Redis> {
 public:
-    static io::Task<std::vector<TestArticleWrapper>> getByCategory(
+    static io::Task<std::vector<TestArticleEntity>> getByCategory(
         const std::string& category, int limit = 10)
     {
         co_return co_await cachedList(
-            [category, limit]() -> io::Task<std::vector<TestArticleWrapper>> {
+            [category, limit]() -> io::Task<std::vector<TestArticleEntity>> {
                 auto result = co_await jcailloux::relais::PgProvider::queryArgs(
                     "SELECT id, category, author_id, title, view_count, is_published, published_at, created_at "
                     "FROM relais_test_articles WHERE category = $1 ORDER BY created_at DESC LIMIT $2",
                     category, limit);
-                std::vector<TestArticleWrapper> entities;
+                std::vector<TestArticleEntity> entities;
                 for (size_t i = 0; i < result.rows(); ++i) {
-                    if (auto e = entity::generated::TestArticleMapping::fromRow<TestArticleWrapper>(result[i]))
+                    if (auto e = entity::generated::TestArticleMapping::fromRow<TestArticleEntity>(result[i]))
                         entities.push_back(std::move(*e));
                 }
                 co_return entities;
@@ -196,7 +196,7 @@ public:
 /**
  * L2 article repo with binary list caching (BEVE serialization).
  */
-class L2TestArticleListAsRepo : public Repo<TestArticleWrapper, "test:article:listas:l2", cfg::Redis> {
+class L2TestArticleListAsRepo : public Repo<TestArticleEntity, "test:article:listas:l2", cfg::Redis> {
 public:
     static io::Task<TestArticleList> getByCategory(
         const std::string& category, int limit = 10)
@@ -222,20 +222,20 @@ public:
 /**
  * L2 purchase list repo: caches purchase lists by user_id.
  */
-class L2TestPurchaseListRepo : public Repo<TestPurchaseWrapper, "test:purchase:list:l2", cfg::Redis> {
+class L2TestPurchaseListRepo : public Repo<TestPurchaseEntity, "test:purchase:list:l2", cfg::Redis> {
 public:
-    static io::Task<std::vector<TestPurchaseWrapper>> getByUserId(
+    static io::Task<std::vector<TestPurchaseEntity>> getByUserId(
         int64_t user_id, int limit = 10)
     {
         co_return co_await cachedList(
-            [user_id, limit]() -> io::Task<std::vector<TestPurchaseWrapper>> {
+            [user_id, limit]() -> io::Task<std::vector<TestPurchaseEntity>> {
                 auto result = co_await jcailloux::relais::PgProvider::queryArgs(
                     "SELECT id, user_id, product_name, amount, status, created_at "
                     "FROM relais_test_purchases WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2",
                     user_id, limit);
-                std::vector<TestPurchaseWrapper> entities;
+                std::vector<TestPurchaseEntity> entities;
                 for (size_t i = 0; i < result.rows(); ++i) {
-                    if (auto e = entity::generated::TestPurchaseMapping::fromRow<TestPurchaseWrapper>(result[i]))
+                    if (auto e = entity::generated::TestPurchaseMapping::fromRow<TestPurchaseEntity>(result[i]))
                         entities.push_back(std::move(*e));
                 }
                 co_return entities;
@@ -261,7 +261,7 @@ public:
 class L2PurchaseListInvalidator {
 public:
     static io::Task<void> onEntityModified(
-        const TestPurchaseWrapper& entity)
+        const TestPurchaseEntity& entity)
     {
         co_await L2TestPurchaseListRepo::invalidateUserList(entity.user_id);
     }
@@ -273,7 +273,7 @@ public:
  * - Invalidates the user's entity cache
  * - Invalidates the user's purchase list cache
  */
-using L2ListInvPurchaseRepo = Repo<TestPurchaseWrapper, "test:purchase:l2:listinv",
+using L2ListInvPurchaseRepo = Repo<TestPurchaseEntity, "test:purchase:l2:listinv",
     cfg::Redis,
     Invalidate<L2InvTestUserRepo, purchaseUserId>,
     InvalidateList<L2PurchaseListInvalidator>>;
@@ -315,7 +315,7 @@ public:
  * - Standard: invalidate user entity cache
  * - Custom:   resolve user_id → article categories → invalidate article list caches
  */
-using L2CustomListPurchaseRepo = Repo<TestPurchaseWrapper, "test:purchase:l2:listcustom",
+using L2CustomListPurchaseRepo = Repo<TestPurchaseEntity, "test:purchase:l2:listcustom",
     cfg::Redis,
     Invalidate<L2InvTestUserRepo, purchaseUserId>,
     InvalidateVia<L2ArticleCategoryListInvalidator, purchaseUserId, &PurchaseToArticleCategoryResolver::resolve>>;
@@ -328,20 +328,20 @@ using L2CustomListPurchaseRepo = Repo<TestPurchaseWrapper, "test:purchase:l2:lis
  * L2 article repo with tracked list caching (group tracking for O(M) invalidation).
  * Tracks page keys in a Redis SET for efficient group invalidation.
  */
-class L2TrackedArticleListRepo : public Repo<TestArticleWrapper, "test:article:tracked:list:l2", cfg::Redis> {
+class L2TrackedArticleListRepo : public Repo<TestArticleEntity, "test:article:tracked:list:l2", cfg::Redis> {
 public:
-    static io::Task<std::vector<TestArticleWrapper>> getByCategory(
+    static io::Task<std::vector<TestArticleEntity>> getByCategory(
         const std::string& category, int limit = 10, int offset = 0)
     {
         co_return co_await cachedListTracked(
-            [category, limit, offset]() -> io::Task<std::vector<TestArticleWrapper>> {
+            [category, limit, offset]() -> io::Task<std::vector<TestArticleEntity>> {
                 auto result = co_await jcailloux::relais::PgProvider::queryArgs(
                     "SELECT id, category, author_id, title, view_count, is_published, published_at, created_at "
                     "FROM relais_test_articles WHERE category = $1 ORDER BY view_count DESC LIMIT $2 OFFSET $3",
                     category, limit, offset);
-                std::vector<TestArticleWrapper> entities;
+                std::vector<TestArticleEntity> entities;
                 for (size_t i = 0; i < result.rows(); ++i) {
-                    if (auto e = entity::generated::TestArticleMapping::fromRow<TestArticleWrapper>(result[i]))
+                    if (auto e = entity::generated::TestArticleMapping::fromRow<TestArticleEntity>(result[i]))
                         entities.push_back(std::move(*e));
                 }
                 co_return entities;
@@ -359,20 +359,20 @@ public:
 /**
  * Same as L2TrackedArticleListRepo but with a short TTL (6s) for timing tests.
  */
-class L2TrackedArticleShortTTLRepo : public Repo<TestArticleWrapper, "test:article:tracked:list:l2:short", test_l2::RedisShortTTL> {
+class L2TrackedArticleShortTTLRepo : public Repo<TestArticleEntity, "test:article:tracked:list:l2:short", test_l2::RedisShortTTL> {
 public:
-    static io::Task<std::vector<TestArticleWrapper>> getByCategory(
+    static io::Task<std::vector<TestArticleEntity>> getByCategory(
         const std::string& category, int limit = 10, int offset = 0)
     {
         co_return co_await cachedListTracked(
-            [category, limit, offset]() -> io::Task<std::vector<TestArticleWrapper>> {
+            [category, limit, offset]() -> io::Task<std::vector<TestArticleEntity>> {
                 auto result = co_await jcailloux::relais::PgProvider::queryArgs(
                     "SELECT id, category, author_id, title, view_count, is_published, published_at, created_at "
                     "FROM relais_test_articles WHERE category = $1 ORDER BY view_count DESC LIMIT $2 OFFSET $3",
                     category, limit, offset);
-                std::vector<TestArticleWrapper> entities;
+                std::vector<TestArticleEntity> entities;
                 for (size_t i = 0; i < result.rows(); ++i) {
-                    if (auto e = entity::generated::TestArticleMapping::fromRow<TestArticleWrapper>(result[i]))
+                    if (auto e = entity::generated::TestArticleMapping::fromRow<TestArticleEntity>(result[i]))
                         entities.push_back(std::move(*e));
                 }
                 co_return entities;
@@ -403,7 +403,7 @@ public:
  * - Standard: invalidate user entity cache
  * - Custom:   resolve user_id → article categories → invalidate tracked article list groups
  */
-using L2TrackedListPurchaseRepo = Repo<TestPurchaseWrapper, "test:purchase:l2:trackedlist",
+using L2TrackedListPurchaseRepo = Repo<TestPurchaseEntity, "test:purchase:l2:trackedlist",
     cfg::Redis,
     Invalidate<L2InvTestUserRepo, purchaseUserId>,
     InvalidateVia<L2TrackedArticleCategoryInvalidator, purchaseUserId, &PurchaseToArticleCategoryResolver::resolve>>;
@@ -529,7 +529,7 @@ TEST_CASE("RedisRepo<TestItem> - erase", "[integration][db][redis][item]") {
 // #############################################################################
 
 using jcailloux::relais::entity::set;
-using F = TestUserWrapper::Field;
+using F = TestUserEntity::Field;
 
 TEST_CASE("RedisRepo<TestUser> - binary caching", "[integration][db][redis][binary]") {
     TransactionGuard tx;
@@ -682,7 +682,7 @@ TEST_CASE("RedisRepo - findBinary", "[integration][db][redis][binary]") {
 
         REQUIRE(!result.empty());
         // Verify roundtrip: deserialize BEVE back to entity
-        auto entity = entity::generated::TestUserWrapper::fromBinary(result);
+        auto entity = entity::generated::TestUserEntity::fromBinary(result);
         REQUIRE(entity.has_value());
         REQUIRE(entity->username == "binary_user");
         REQUIRE(entity->balance == 100);
@@ -707,7 +707,7 @@ TEST_CASE("RedisRepo - findBinary", "[integration][db][redis][binary]") {
         // Second call — cached binary (still has old balance)
         auto result2 = sync(L2TestUserRepo::findBinary(id));
         REQUIRE(!result2.empty());
-        auto entity = entity::generated::TestUserWrapper::fromBinary(result2);
+        auto entity = entity::generated::TestUserEntity::fromBinary(result2);
         REQUIRE(entity.has_value());
         REQUIRE(entity->balance == 200);
     }
@@ -727,7 +727,7 @@ TEST_CASE("RedisRepo - findBinary", "[integration][db][redis][binary]") {
         // Should fetch fresh data from DB
         auto result = sync(L2TestUserRepo::findBinary(id));
         REQUIRE(!result.empty());
-        auto entity = entity::generated::TestUserWrapper::fromBinary(result);
+        auto entity = entity::generated::TestUserEntity::fromBinary(result);
         REQUIRE(entity.has_value());
         REQUIRE(entity->balance == 0);
     }
@@ -1611,27 +1611,27 @@ namespace list = jcailloux::relais::list;
  *
  * Sort: view_count DESC, Pagination: Offset
  */
-class L2SelectiveArticleListRepo : public Repo<TestArticleWrapper, "test:article:selective:list:l2", cfg::Redis> {
+class L2SelectiveArticleListRepo : public Repo<TestArticleEntity, "test:article:selective:list:l2", cfg::Redis> {
 public:
-    static io::Task<std::vector<TestArticleWrapper>> getByCategory(
+    static io::Task<std::vector<TestArticleEntity>> getByCategory(
         const std::string& category, int limit = 5, int offset = 0)
     {
         co_return co_await cachedListTrackedWithHeader(
-            [category, limit, offset]() -> io::Task<std::vector<TestArticleWrapper>> {
+            [category, limit, offset]() -> io::Task<std::vector<TestArticleEntity>> {
                 auto result = co_await jcailloux::relais::PgProvider::queryArgs(
                     "SELECT id, category, author_id, title, view_count, is_published, published_at, created_at "
                     "FROM relais_test_articles WHERE category = $1 ORDER BY view_count DESC LIMIT $2 OFFSET $3",
                     category, limit, offset);
-                std::vector<TestArticleWrapper> entities;
+                std::vector<TestArticleEntity> entities;
                 for (size_t i = 0; i < result.rows(); ++i) {
-                    if (auto e = entity::generated::TestArticleMapping::fromRow<TestArticleWrapper>(result[i]))
+                    if (auto e = entity::generated::TestArticleMapping::fromRow<TestArticleEntity>(result[i]))
                         entities.push_back(std::move(*e));
                 }
                 co_return entities;
             },
             limit, offset,
             // headerBuilder: extract view_count bounds from results
-            [](const std::vector<TestArticleWrapper>& results, int lim, int off)
+            [](const std::vector<TestArticleEntity>& results, int lim, int off)
                 -> std::optional<list::ListBoundsHeader>
             {
                 if (results.empty()) return std::nullopt;
@@ -1938,7 +1938,7 @@ struct PurchaseToArticleSelectiveResolver {
  * - Enriched resolver finds the user's articles with their sort values
  * - Selective invalidation targets only the affected list pages
  */
-using L2SelectiveListPurchaseRepo = Repo<TestPurchaseWrapper, "test:purchase:l2:selectivelist",
+using L2SelectiveListPurchaseRepo = Repo<TestPurchaseEntity, "test:purchase:l2:selectivelist",
     cfg::Redis,
     InvalidateListVia<
         L2SelectiveArticleListRepo,
@@ -2165,15 +2165,15 @@ struct MixedResolver {
 /**
  * Purchase repos for each granularity test.
  */
-using L2PerGroupPurchaseRepo = Repo<TestPurchaseWrapper, "test:purchase:l2:pergroup",
+using L2PerGroupPurchaseRepo = Repo<TestPurchaseEntity, "test:purchase:l2:pergroup",
     cfg::Redis,
     InvalidateListVia<L2SelectiveArticleListRepo, purchaseUserId, &PerGroupResolver::resolve>>;
 
-using L2FullPatternPurchaseRepo = Repo<TestPurchaseWrapper, "test:purchase:l2:fullpattern",
+using L2FullPatternPurchaseRepo = Repo<TestPurchaseEntity, "test:purchase:l2:fullpattern",
     cfg::Redis,
     InvalidateListVia<L2SelectiveArticleListRepo, purchaseUserId, &FullPatternResolver::resolve>>;
 
-using L2MixedPurchaseRepo = Repo<TestPurchaseWrapper, "test:purchase:l2:mixed",
+using L2MixedPurchaseRepo = Repo<TestPurchaseEntity, "test:purchase:l2:mixed",
     cfg::Redis,
     InvalidateListVia<L2SelectiveArticleListRepo, purchaseUserId, &MixedResolver::resolve>>;
 
@@ -2383,7 +2383,7 @@ TEST_CASE("RedisRepo - l2_format Json", "[integration][db][redis][l2-format]") {
         REQUIRE(!bin.empty());
 
         // Roundtrip: deserialize BEVE back to entity
-        auto entity = TestUserWrapper::fromBinary(bin);
+        auto entity = TestUserEntity::fromBinary(bin);
         REQUIRE(entity.has_value());
         REQUIRE(entity->username == "json_to_bin");
         REQUIRE(entity->balance == 300);
@@ -2619,7 +2619,7 @@ TEST_CASE("RedisRepo - findJson L2 hit uses cache (not RowView)", "[integration]
 
         auto beve = sync(L2TestUserRepo::findBinary(id));
         REQUIRE(!beve.empty());
-        auto entity = TestUserWrapper::fromBinary(beve);
+        auto entity = TestUserEntity::fromBinary(beve);
         REQUIRE(entity.has_value());
         REQUIRE(entity->balance == 300);
     }
@@ -2658,7 +2658,7 @@ TEST_CASE("RedisRepo - RowView with L2 JSON format", "[integration][db][redis][r
         // L2 miss → RowView BEVE returned + fire-and-forget JSON stored in L2
         auto beve = sync(L2JsonTestUserRepo::findBinary(id));
         REQUIRE(!beve.empty());
-        auto entity = TestUserWrapper::fromBinary(beve);
+        auto entity = TestUserEntity::fromBinary(beve);
         REQUIRE(entity.has_value());
         REQUIRE(entity->balance == 350);
 

@@ -73,36 +73,36 @@ namespace relais_test {
 namespace gt = gdsf_test;
 
 // Score / decay / eviction test repos
-using GDSFItemRepo     = Repo<TestItemWrapper, "gdsf:item",       gt::ManualCleanup>;
-using GDSFItemRepo2    = Repo<TestItemWrapper, "gdsf:item2",      gt::ManualCleanup>;
-using GDSFUserRepo     = Repo<TestUserWrapper, "gdsf:user",       gt::ManualCleanup>;
+using GDSFItemRepo     = Repo<TestItemEntity, "gdsf:item",       gt::ManualCleanup>;
+using GDSFItemRepo2    = Repo<TestItemEntity, "gdsf:item2",      gt::ManualCleanup>;
+using GDSFUserRepo     = Repo<TestUserEntity, "gdsf:user",       gt::ManualCleanup>;
 
 // TTL test repos
-using GDSFShortTTLRepo = Repo<TestItemWrapper, "gdsf:ttl:short",  gt::ShortTTL>;
-using GDSFNoTTLRepo    = Repo<TestItemWrapper, "gdsf:ttl:none",   gt::NoTTL>;
+using GDSFShortTTLRepo = Repo<TestItemEntity, "gdsf:ttl:short",  gt::ShortTTL>;
+using GDSFNoTTLRepo    = Repo<TestItemEntity, "gdsf:ttl:none",   gt::NoTTL>;
 
 // Memory tracking test repos (dedicated to avoid stale entry interference)
-using GDSFMemRepo      = Repo<TestItemWrapper, "gdsf:mem",        gt::ManualCleanup>;
+using GDSFMemRepo      = Repo<TestItemEntity, "gdsf:mem",        gt::ManualCleanup>;
 
 // Registration-only repos (first access enrolls them)
-using GDSFRegRepo1     = Repo<TestItemWrapper, "gdsf:reg:1",      gt::ManualCleanup>;
-using GDSFRegRepo2     = Repo<TestItemWrapper, "gdsf:reg:2",      gt::ManualCleanup>;
-using GDSFRegRepo3     = Repo<TestItemWrapper, "gdsf:reg:3",      gt::ManualCleanup>;
+using GDSFRegRepo1     = Repo<TestItemEntity, "gdsf:reg:1",      gt::ManualCleanup>;
+using GDSFRegRepo2     = Repo<TestItemEntity, "gdsf:reg:2",      gt::ManualCleanup>;
+using GDSFRegRepo3     = Repo<TestItemEntity, "gdsf:reg:3",      gt::ManualCleanup>;
 
 // Memory pressure test repos (dedicated to avoid stale-entry interference)
-using GDSFPressureRepo  = Repo<TestItemWrapper, "gdsf:pressure",   gt::ManualCleanup>;
-using GDSFPressureRepo2 = Repo<TestItemWrapper, "gdsf:pressure2",  gt::ManualCleanup>;
+using GDSFPressureRepo  = Repo<TestItemEntity, "gdsf:pressure",   gt::ManualCleanup>;
+using GDSFPressureRepo2 = Repo<TestItemEntity, "gdsf:pressure2",  gt::ManualCleanup>;
 
 // Ghost admission control test repos
-using GDSFGhostRepo   = Repo<TestItemWrapper, "gdsf:ghost",   gt::ManualCleanup>;
-using GDSFGhostRepo2  = Repo<TestItemWrapper, "gdsf:ghost2",  gt::ManualCleanup>;
+using GDSFGhostRepo   = Repo<TestItemEntity, "gdsf:ghost",   gt::ManualCleanup>;
+using GDSFGhostRepo2  = Repo<TestItemEntity, "gdsf:ghost2",  gt::ManualCleanup>;
 
 // Cross-repo coordination test repos
-using GDSFCoordRepo1  = Repo<TestItemWrapper, "gdsf:coord1",  gt::ManualCleanup>;
-using GDSFCoordRepo2  = Repo<TestItemWrapper, "gdsf:coord2",  gt::ManualCleanup>;
+using GDSFCoordRepo1  = Repo<TestItemEntity, "gdsf:coord1",  gt::ManualCleanup>;
+using GDSFCoordRepo2  = Repo<TestItemEntity, "gdsf:coord2",  gt::ManualCleanup>;
 
 // Stress test repo (Zipfian memory bound)
-using GDSFStressRepo  = Repo<TestItemWrapper, "gdsf:stress",  gt::ManualCleanup>;
+using GDSFStressRepo  = Repo<TestItemEntity, "gdsf:stress",  gt::ManualCleanup>;
 
 } // namespace relais_test
 

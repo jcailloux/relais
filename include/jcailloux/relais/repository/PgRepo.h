@@ -25,7 +25,7 @@ namespace jcailloux::relais {
 // Concepts
 // =========================================================================
 
-/// Entity supports partial field updates (has TraitsType with Field enum)
+/// E supports partial field updates (has TraitsType with Field enum)
 template<typename E>
 concept HasFieldUpdate = requires {
     typename E::TraitsType;
@@ -112,16 +112,16 @@ inline std::string buildUpdateReturning(
 // find() returns epoch-guarded CacheView. findJson()/findBinary() return
 // serialized data by value (std::string / std::vector<uint8_t>).
 
-template<typename Entity, config::FixedString Name, config::CacheConfig Cfg, typename Key>
-requires ReadableEntity<Entity>
+template<typename E, config::FixedString Name, config::CacheConfig Cfg, typename Key>
+requires ReadableEntity<E>
 class PgRepo {
-    using Mapping = typename Entity::MappingType;
+    using Mapping = typename E::MappingType;
 
 public:
-    using EntityType = Entity;
+    using EntityType = E;
     using KeyType = Key;
-    using WrapperType = Entity;
-    using FindResultType = cache::CacheView<Entity>;
+    using WrapperType = E;
+    using FindResultType = cache::CacheView<E>;
 
     static constexpr auto config = Cfg;
     static constexpr const char* name() { return Name; }
@@ -131,7 +131,7 @@ public:
     // =====================================================================
 
     /// Find by ID. Returns epoch-guarded CacheView (empty if not found).
-    static io::Task<cache::CacheView<Entity>> find(const Key& id) {
+    static io::Task<cache::CacheView<E>> find(const Key& id) {
         auto entity = co_await findRaw(id);
         if (!entity) co_return {};
         co_return makeView(std::move(*entity));
@@ -148,7 +148,7 @@ public:
             auto result = co_await PgProvider::queryParams(
                 Mapping::SQL::select_by_pk, params);
             if (result.empty()) co_return {};
-            auto entity = Entity::fromRow(result[0]);
+            auto entity = E::fromRow(result[0]);
             if (!entity) co_return {};
             co_return entity->json();
         } catch (const io::PgError& e) {
@@ -163,14 +163,14 @@ public:
 
     /// Find by ID and return binary (BEVE) vector (empty if not found).
     static io::Task<std::vector<uint8_t>> findBinary(const Key& id)
-        requires HasBinarySerialization<Entity>
+        requires HasBinarySerialization<E>
     {
         try {
             auto params = io::PgParams::fromKey(id);
             auto result = co_await PgProvider::queryParams(
                 Mapping::SQL::select_by_pk, params);
             if (result.empty()) co_return {};
-            auto entity = Entity::fromRow(result[0]);
+            auto entity = E::fromRow(result[0]);
             if (!entity) co_return {};
             co_return entity->binary();
         } catch (const io::PgError& e) {
@@ -184,8 +184,8 @@ public:
     // =====================================================================
 
     /// Insert entity in database. Returns epoch-guarded CacheView (empty on error).
-    static io::Task<cache::CacheView<Entity>> insert(const Entity& entity)
-        requires MutableEntity<Entity> && (!Cfg.read_only)
+    static io::Task<cache::CacheView<E>> insert(const E& entity)
+        requires MutableEntity<E> && (!Cfg.read_only)
     {
         auto result = co_await insertRaw(entity);
         if (!result) co_return {};
@@ -197,8 +197,8 @@ public:
     // =====================================================================
 
     /// Full update of entity in database. Returns true on success.
-    static io::Task<bool> update(const Key& id, const Entity& entity)
-        requires MutableEntity<Entity> && (!Cfg.read_only)
+    static io::Task<bool> update(const Key& id, const E& entity)
+        requires MutableEntity<E> && (!Cfg.read_only)
     {
         auto outcome = co_await updateOutcome(id, entity);
         co_return outcome.success;
@@ -219,7 +219,7 @@ public:
 protected:
     /// Internal erase with optional entity hint (for partition pruning).
     static io::Task<std::optional<size_t>> eraseImpl(
-        const Key& id, const Entity* hint = nullptr)
+        const Key& id, const E* hint = nullptr)
         requires (!Cfg.read_only)
     {
         auto outcome = co_await eraseOutcome(id, hint);
@@ -234,8 +234,8 @@ public:
 
     /// Partial update. Returns epoch-guarded CacheView (empty on error).
     template<typename... Updates>
-    static io::Task<cache::CacheView<Entity>> patch(const Key& id, Updates&&... updates)
-        requires HasFieldUpdate<Entity> && (!Cfg.read_only)
+    static io::Task<cache::CacheView<E>> patch(const Key& id, Updates&&... updates)
+        requires HasFieldUpdate<E> && (!Cfg.read_only)
     {
         auto entity = co_await patchRaw(id, std::forward<Updates>(updates)...);
         if (!entity) co_return {};
@@ -273,17 +273,17 @@ protected:
     // Epoch memory pool for temporary entity allocations
     // =====================================================================
 
-    static epoch::memory_pool<Entity>& pool() {
-        static epoch::memory_pool<Entity> p;
+    static epoch::memory_pool<E>& pool() {
+        static epoch::memory_pool<E> p;
         return p;
     }
 
     /// Allocate entity in pool, retire immediately, return epoch-guarded view.
-    static cache::CacheView<Entity> makeView(Entity entity) {
+    static cache::CacheView<E> makeView(E entity) {
         auto guard = epoch::EpochGuard::acquire();
         auto* ptr = pool().New(std::move(entity));
         pool().Retire(ptr);
-        return cache::CacheView<Entity>(ptr, std::move(guard));
+        return cache::CacheView<E>(ptr, std::move(guard));
     }
 
     // =====================================================================
@@ -292,14 +292,14 @@ protected:
 
     /// Find by ID, returning entity by value (no pool/view allocation).
     /// Routes through submitEntityRead for ANY-array batching.
-    static io::Task<std::optional<Entity>> findRaw(const Key& id) {
+    static io::Task<std::optional<E>> findRaw(const Key& id) {
         try {
             auto params = io::PgParams::fromKey(id);
             auto result = co_await PgProvider::entityQueryParams(
                 Mapping::SQL::select_by_pk_batch,
                 Mapping::SQL::select_by_pk, params);
             if (result.empty()) co_return std::nullopt;
-            co_return Entity::fromRow(result[0]);
+            co_return E::fromRow(result[0]);
         } catch (const io::PgError& e) {
             RELAIS_LOG_ERROR << name() << ": DB error - " << e.what();
             co_return std::nullopt;
@@ -307,15 +307,15 @@ protected:
     }
 
     /// Insert entity in database, returning entity by value.
-    static io::Task<std::optional<Entity>> insertRaw(const Entity& entity)
-        requires MutableEntity<Entity> && (!Cfg.read_only)
+    static io::Task<std::optional<E>> insertRaw(const E& entity)
+        requires MutableEntity<E> && (!Cfg.read_only)
     {
         try {
-            auto params = Entity::toInsertParams(entity);
+            auto params = E::toInsertParams(entity);
             auto result = co_await PgProvider::queryParams(
                 Mapping::SQL::insert, params);
             if (result.empty()) co_return std::nullopt;
-            co_return Entity::fromRow(result[0]);
+            co_return E::fromRow(result[0]);
         } catch (const io::PgError& e) {
             RELAIS_LOG_ERROR << name() << ": insert error - " << e.what();
             co_return std::nullopt;
@@ -324,8 +324,8 @@ protected:
 
     /// Partial update, returning entity by value.
     template<typename... Updates>
-    static io::Task<std::optional<Entity>> patchRaw(const Key& id, Updates&&... updates)
-        requires HasFieldUpdate<Entity> && (!Cfg.read_only)
+    static io::Task<std::optional<E>> patchRaw(const Key& id, Updates&&... updates)
+        requires HasFieldUpdate<E> && (!Cfg.read_only)
     {
         static_assert(sizeof...(Updates) > 0, "patch requires at least one field update");
         try {
@@ -334,20 +334,20 @@ protected:
                     return detail::buildUpdateReturning(
                         Mapping::table_name,
                         Mapping::primary_key_columns,
-                        {entity::fieldColumnName<typename Entity::TraitsType>(Updates{})...},
+                        {entity::fieldColumnName<typename E::TraitsType>(Updates{})...},
                         Mapping::SQL::returning_columns);
                 } else {
                     return detail::buildUpdateReturning(
                         Mapping::table_name,
                         Mapping::primary_key_column,
-                        {entity::fieldColumnName<typename Entity::TraitsType>(Updates{})...},
+                        {entity::fieldColumnName<typename E::TraitsType>(Updates{})...},
                         Mapping::SQL::returning_columns);
                 }
             }();
 
             io::PgParams params;
             auto fieldParams = io::PgParams::make(
-                entity::fieldValue<typename Entity::TraitsType>(
+                entity::fieldValue<typename E::TraitsType>(
                     std::forward<Updates>(updates))...);
             auto keyParams = io::PgParams::fromKey(id);
             params.params.reserve(fieldParams.params.size() + keyParams.params.size());
@@ -358,7 +358,7 @@ protected:
 
             auto result = co_await PgProvider::queryParams(sql.c_str(), params);
             if (result.empty()) co_return std::nullopt;
-            co_return Entity::fromRow(result[0]);
+            co_return E::fromRow(result[0]);
         } catch (const io::PgError& e) {
             RELAIS_LOG_ERROR << name() << ": patch error - " << e.what();
             co_return std::nullopt;
@@ -385,16 +385,16 @@ protected:
     };
 
     /// Update returning full outcome (success + coalesced flag).
-    static io::Task<WriteOutcome> updateOutcome(const Key& id, const Entity& entity)
-        requires MutableEntity<Entity> && (!Cfg.read_only)
+    static io::Task<WriteOutcome> updateOutcome(const Key& id, const E& entity)
+        requires MutableEntity<E> && (!Cfg.read_only)
     {
         try {
             auto keyParams = io::PgParams::fromKey(id);
             io::PgParams fieldParams;
             if constexpr (is_tuple_v<Key>) {
-                fieldParams = Entity::toUpdateParams(entity);
+                fieldParams = E::toUpdateParams(entity);
             } else {
-                fieldParams = Entity::toInsertParams(entity);
+                fieldParams = E::toInsertParams(entity);
             }
             io::PgParams params;
             params.params.reserve(keyParams.params.size() + fieldParams.params.size());
@@ -415,13 +415,13 @@ protected:
 
     /// Erase returning full outcome (affected + coalesced flag).
     static io::Task<EraseOutcome> eraseOutcome(
-        const Key& id, const Entity* hint = nullptr)
+        const Key& id, const E* hint = nullptr)
         requires (!Cfg.read_only)
     {
         try {
             int affected;
             bool coalesced;
-            if constexpr (HasPartitionHint<Entity>) {
+            if constexpr (HasPartitionHint<E>) {
                 if (hint) {
                     auto params = Mapping::makePartitionHintParams(*hint);
                     std::tie(affected, coalesced) = co_await PgProvider::execute(
@@ -462,7 +462,7 @@ protected:
     }
 
     template<typename QueryFn, typename... KeyArgs>
-    static io::Task<std::vector<Entity>> cachedList(
+    static io::Task<std::vector<E>> cachedList(
         QueryFn&& query,
         [[maybe_unused]] KeyArgs&&... keyParts)
     {
@@ -470,7 +470,7 @@ protected:
     }
 
     template<typename QueryFn, typename... GroupArgs>
-    static io::Task<std::vector<Entity>> cachedListTracked(
+    static io::Task<std::vector<E>> cachedListTracked(
         QueryFn&& query,
         [[maybe_unused]] int limit,
         [[maybe_unused]] int offset,
@@ -480,7 +480,7 @@ protected:
     }
 
     template<typename QueryFn, typename HeaderBuilder, typename... GroupArgs>
-    static io::Task<std::vector<Entity>> cachedListTrackedWithHeader(
+    static io::Task<std::vector<E>> cachedListTrackedWithHeader(
         QueryFn&& query,
         [[maybe_unused]] int limit,
         [[maybe_unused]] int offset,

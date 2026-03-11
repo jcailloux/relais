@@ -60,7 +60,7 @@ concept MemoryTrackable = requires(const V& v) {
 //
 // Template parameters:
 //   Key      — lookup key (int64_t, tuple, std::string, ...)
-//   Value    — stored value (EntityWrapper, ListWrapper, ...)
+//   Value    — stored value (Entity, ListWrapper, ...)
 //   Metadata — per-entry metadata (CacheMetadata variants, ListCacheMetadataImpl)
 //
 // Feature detection:

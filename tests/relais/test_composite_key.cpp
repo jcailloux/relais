@@ -22,7 +22,7 @@ using jcailloux::relais::entity::set;
 TEST_CASE("CompositeKey<TestMembership> - key() returns tuple",
           "[composite-key][compile]")
 {
-    TestMembershipWrapper m;
+    TestMembershipEntity m;
     m.user_id = 1;
     m.group_id = 2;
     auto k = m.key();
@@ -140,7 +140,7 @@ TEST_CASE("CompositeKey<TestMembership> - CRUD (Uncached)",
         auto wrapper = makeTestMembership(103, 203, "guest");
         sync(UncachedTestMembershipRepo::insert(wrapper));
 
-        using F = TestMembershipWrapper::Field;
+        using F = TestMembershipEntity::Field;
         Key key{103, 203};
         auto patched = sync(UncachedTestMembershipRepo::patch(key,
             set<F::role>(std::string("moderator"))));

@@ -24,10 +24,10 @@ using namespace relais_test;
 namespace decl = jcailloux::relais::list::spec;
 
 // =============================================================================
-// Helper: build a TestArticleWrapper from raw values (no DB round-trip)
+// Helper: build a TestArticleEntity from raw values (no DB round-trip)
 // =============================================================================
 
-TestArticleWrapper makeArticle(
+TestArticleEntity makeArticle(
     int64_t id,
     const std::string& category,
     int64_t author_id,

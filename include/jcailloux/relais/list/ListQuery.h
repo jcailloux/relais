@@ -174,9 +174,9 @@ struct ListQuery {
 // CachedListResult - Result stored in cache
 // =============================================================================
 
-template<typename Entity>
+template<typename E>
 struct CachedListResult {
-    using EntityPtr = std::shared_ptr<const Entity>;
+    using EntityPtr = std::shared_ptr<const E>;
     using Clock = std::chrono::steady_clock;
     using TimePoint = Clock::time_point;
 

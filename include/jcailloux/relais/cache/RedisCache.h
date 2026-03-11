@@ -21,7 +21,7 @@ namespace jcailloux::relais::cache {
 
     /**
      * Async Redis cache wrapper for L2 caching.
-     * Entity must implement json() and fromJson().
+     * E must implement json() and fromJson().
      *
      * All Redis operations go through PgProvider::redis() which wraps
      * io::RedisClient via type-erased std::function.
@@ -29,8 +29,8 @@ namespace jcailloux::relais::cache {
     class RedisCache {
         public:
 
-            template<typename Entity>
-            static io::Task<std::optional<Entity>> get(const std::string& key) {
+            template<typename E>
+            static io::Task<std::optional<E>> get(const std::string& key) {
                 if (!PgProvider::hasRedis()) {
                     co_return std::nullopt;
                 }
@@ -40,24 +40,24 @@ namespace jcailloux::relais::cache {
                     if (result.isNil()) {
                         co_return std::nullopt;
                     }
-                    co_return Entity::fromJson(result.asStringView());
+                    co_return E::fromJson(result.asStringView());
                 } catch (const std::exception& e) {
                     RELAIS_LOG_WARN << "RedisCache GET error: " << e.what();
                     co_return std::nullopt;
                 }
             }
 
-            template<typename Entity, typename Rep, typename Period>
-            static io::Task<std::optional<Entity>> getEx(const std::string& key,
+            template<typename E, typename Rep, typename Period>
+            static io::Task<std::optional<E>> getEx(const std::string& key,
                                                               std::chrono::duration<Rep, Period> ttl) {
                 if (auto json = co_await getRawEx(key, ttl)) {
-                    co_return Entity::fromJson(*json);
+                    co_return E::fromJson(*json);
                 }
                 co_return std::nullopt;
             }
 
-            template<typename Entity, typename Rep, typename Period>
-            static io::Task<bool> set(const std::string& key, const Entity& entity, std::chrono::duration<Rep, Period> ttl) {
+            template<typename E, typename Rep, typename Period>
+            static io::Task<bool> set(const std::string& key, const E& entity, std::chrono::duration<Rep, Period> ttl) {
                 if (!PgProvider::hasRedis()) {
                     co_return false;
                 }
@@ -73,8 +73,8 @@ namespace jcailloux::relais::cache {
                 }
             }
 
-            template<typename Entity>
-            static io::Task<std::optional<std::vector<Entity>>> getList(const std::string& key) {
+            template<typename E>
+            static io::Task<std::optional<std::vector<E>>> getList(const std::string& key) {
                 if (!PgProvider::hasRedis()) {
                     co_return std::nullopt;
                 }
@@ -85,25 +85,25 @@ namespace jcailloux::relais::cache {
                         co_return std::nullopt;
                     }
                     auto raw = result.asStringView();
-                    co_return parseListWithHeader<Entity>(raw);
+                    co_return parseListWithHeader<E>(raw);
                 } catch (const std::exception& e) {
                     RELAIS_LOG_WARN << "RedisCache GET list error: " << e.what();
                     co_return std::nullopt;
                 }
             }
 
-            template<typename Entity, typename Rep, typename Period>
-            static io::Task<std::optional<std::vector<Entity>>> getListEx(const std::string& key,
+            template<typename E, typename Rep, typename Period>
+            static io::Task<std::optional<std::vector<E>>> getListEx(const std::string& key,
                                                                                std::chrono::duration<Rep, Period> ttl) {
                 if (auto raw = co_await getRawEx(key, ttl)) {
-                    co_return parseListWithHeader<Entity>(*raw);
+                    co_return parseListWithHeader<E>(*raw);
                 }
                 co_return std::nullopt;
             }
 
-            template<typename Entity, typename Rep, typename Period>
+            template<typename E, typename Rep, typename Period>
             static io::Task<bool> setList(const std::string& key,
-                                               const std::vector<Entity>& entities,
+                                               const std::vector<E>& entities,
                                                std::chrono::duration<Rep, Period> ttl,
                                                std::optional<list::ListBoundsHeader> header = std::nullopt) {
                 if (!PgProvider::hasRedis()) {
@@ -135,29 +135,29 @@ namespace jcailloux::relais::cache {
             }
 
             // =================================================================
-            // List BEVE Methods (vector<Entity> via glz::write_beve/read_beve)
+            // List BEVE Methods (vector<E> via glz::write_beve/read_beve)
             // =================================================================
 
-            template<typename Entity>
-            static io::Task<std::optional<std::vector<Entity>>> getListBeve(const std::string& key) {
+            template<typename E>
+            static io::Task<std::optional<std::vector<E>>> getListBeve(const std::string& key) {
                 auto data = co_await getRawBinary(key);
                 if (!data) co_return std::nullopt;
-                co_return parseListBeveWithHeader<Entity>(*data);
+                co_return parseListBeveWithHeader<E>(*data);
             }
 
-            template<typename Entity, typename Rep, typename Period>
-            static io::Task<std::optional<std::vector<Entity>>> getListBeveEx(
+            template<typename E, typename Rep, typename Period>
+            static io::Task<std::optional<std::vector<E>>> getListBeveEx(
                 const std::string& key,
                 std::chrono::duration<Rep, Period> ttl)
             {
                 auto data = co_await getRawBinaryEx(key, ttl);
                 if (!data) co_return std::nullopt;
-                co_return parseListBeveWithHeader<Entity>(*data);
+                co_return parseListBeveWithHeader<E>(*data);
             }
 
-            template<typename Entity, typename Rep, typename Period>
+            template<typename E, typename Rep, typename Period>
             static io::Task<bool> setListBeve(const std::string& key,
-                                                   const std::vector<Entity>& entities,
+                                                   const std::vector<E>& entities,
                                                    std::chrono::duration<Rep, Period> ttl,
                                                    std::optional<list::ListBoundsHeader> header = std::nullopt) {
                 auto beve = serializeListBeve(entities);
@@ -314,7 +314,7 @@ namespace jcailloux::relais::cache {
             }
 
             // =================================================================
-            // List Entity Binary Methods
+            // List E Binary Methods
             // =================================================================
 
             /// Get a list entity from binary cache.
@@ -1131,8 +1131,8 @@ return total
             }
 
         private:
-            template<typename Entity>
-            static std::string serializeList(const std::vector<Entity>& entities) {
+            template<typename E>
+            static std::string serializeList(const std::vector<E>& entities) {
                 std::string buffer;
                 if (glz::write_json(entities, buffer)) {
                     return "[]";
@@ -1140,9 +1140,9 @@ return total
                 return buffer;
             }
 
-            template<typename Entity>
-            static std::optional<std::vector<Entity>> parseList(const std::string_view json) {
-                std::vector<Entity> result;
+            template<typename E>
+            static std::optional<std::vector<E>> parseList(const std::string_view json) {
+                std::vector<E> result;
                 if (auto ec = glz::read_json(result, json)) {
                     RELAIS_LOG_WARN << "RedisCache parseList error: " << glz::format_error(ec, json);
                     return std::nullopt;
@@ -1151,21 +1151,21 @@ return total
             }
 
             /// Parse a list value that may be prefixed with a ListBoundsHeader.
-            template<typename Entity>
-            static std::optional<std::vector<Entity>> parseListWithHeader(const std::string_view raw) {
+            template<typename E>
+            static std::optional<std::vector<E>> parseListWithHeader(const std::string_view raw) {
                 std::string_view data = raw;
                 if (data.size() >= list::kListBoundsHeaderSize
                     && static_cast<uint8_t>(data[0]) == list::kListBoundsHeaderMagic[0]
                     && static_cast<uint8_t>(data[1]) == list::kListBoundsHeaderMagic[1]) {
                     data.remove_prefix(list::kListBoundsHeaderSize);
                 }
-                return parseList<Entity>(data);
+                return parseList<E>(data);
             }
 
             // ----- BEVE list helpers -----
 
-            template<typename Entity>
-            static std::vector<uint8_t> serializeListBeve(const std::vector<Entity>& entities) {
+            template<typename E>
+            static std::vector<uint8_t> serializeListBeve(const std::vector<E>& entities) {
                 std::vector<uint8_t> buffer;
                 if (glz::write_beve(entities, buffer)) {
                     buffer.clear();
@@ -1173,10 +1173,10 @@ return total
                 return buffer;
             }
 
-            template<typename Entity>
-            static std::optional<std::vector<Entity>> parseListBeve(std::span<const uint8_t> data) {
+            template<typename E>
+            static std::optional<std::vector<E>> parseListBeve(std::span<const uint8_t> data) {
                 if (data.empty()) return std::nullopt;
-                std::vector<Entity> result;
+                std::vector<E> result;
                 if (glz::read_beve(result, std::string_view{
                         reinterpret_cast<const char*>(data.data()), data.size()})) {
                     return std::nullopt;
@@ -1184,8 +1184,8 @@ return total
                 return result;
             }
 
-            template<typename Entity>
-            static std::optional<std::vector<Entity>> parseListBeveWithHeader(
+            template<typename E>
+            static std::optional<std::vector<E>> parseListBeveWithHeader(
                     const std::vector<uint8_t>& raw) {
                 std::span<const uint8_t> data(raw);
                 if (data.size() >= list::kListBoundsHeaderSize
@@ -1193,7 +1193,7 @@ return total
                     && data[1] == list::kListBoundsHeaderMagic[1]) {
                     data = data.subspan(list::kListBoundsHeaderSize);
                 }
-                return parseListBeve<Entity>(data);
+                return parseListBeve<E>(data);
             }
     };
 

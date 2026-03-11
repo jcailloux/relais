@@ -145,8 +145,8 @@ using member_pointer_type_t = typename member_pointer_type<T>::type;
 // =============================================================================
 
 /// Extract value from entity using either data member or member function pointer
-template<auto MemberPtr, typename Entity>
-[[nodiscard]] decltype(auto) extractMemberValue(const Entity& entity) noexcept {
+template<auto MemberPtr, typename E>
+[[nodiscard]] decltype(auto) extractMemberValue(const E& entity) noexcept {
     if constexpr (std::is_member_function_pointer_v<decltype(MemberPtr)>) {
         // Member function: call it
         return (entity.*MemberPtr)();
@@ -157,25 +157,25 @@ template<auto MemberPtr, typename Entity>
 }
 
 // =============================================================================
-// Entity ID extraction - works with both id member and id() method
+// E ID extraction - works with both id member and id() method
 // =============================================================================
 
-/// Concept: Entity has id() method
-template<typename Entity>
-concept HasIdMethod = requires(const Entity& e) {
+/// Concept: E has id() method
+template<typename E>
+concept HasIdMethod = requires(const E& e) {
     { e.id() } -> std::convertible_to<int64_t>;
 };
 
-/// Concept: Entity has id data member
-template<typename Entity>
-concept HasIdMember = requires(const Entity& e) {
+/// Concept: E has id data member
+template<typename E>
+concept HasIdMember = requires(const E& e) {
     { e.id } -> std::convertible_to<int64_t>;
 };
 
 /// Extract entity ID (supports both data member and method)
-template<typename Entity>
-[[nodiscard]] int64_t extractEntityId(const Entity& entity) noexcept {
-    if constexpr (HasIdMethod<Entity>) {
+template<typename E>
+[[nodiscard]] int64_t extractEntityId(const E& entity) noexcept {
+    if constexpr (HasIdMethod<E>) {
         return entity.id();
     } else {
         return entity.id;
@@ -191,16 +191,16 @@ template<typename Entity>
 /// Declares a filter field for list queries
 ///
 /// @tparam Name            Field name (for HTTP query param and debugging)
-/// @tparam EntityMemberPtr Pointer to entity member (&Entity::field)
+/// @tparam EntityMemberPtr Pointer to entity member (&E::field)
 /// @tparam ColumnName      SQL column name as FixedString ("column_name")
 /// @tparam Operator        Comparison operator (default: EQ)
 /// @tparam Converter       Value conversion type (default: NoConvert)
 /// @tparam Invalidation    How to handle cache invalidation (default: based on Op)
 ///
 /// Example:
-///   Filter<"guild_id", &Entity::guild_id, "guild_id">{}
-///   Filter<"severity", &Entity::severity, "severity", Op::EQ, AsString>{}
-///   Filter<"date_from", &Entity::created_at, "created_at", Op::GE>{}
+///   Filter<"guild_id", &E::guild_id, "guild_id">{}
+///   Filter<"severity", &E::severity, "severity", Op::EQ, AsString>{}
+///   Filter<"date_from", &E::created_at, "created_at", Op::GE>{}
 ///
 template<
     FixedString Name,

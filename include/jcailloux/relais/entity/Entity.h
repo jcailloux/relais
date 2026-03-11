@@ -1,5 +1,5 @@
-#ifndef JCX_RELAIS_ENTITY_ENTITY_WRAPPER_H
-#define JCX_RELAIS_ENTITY_ENTITY_WRAPPER_H
+#ifndef JCX_RELAIS_ENTITY_H
+#define JCX_RELAIS_ENTITY_H
 
 #include <cstdint>
 #include <optional>
@@ -24,8 +24,12 @@ inline size_t heapCapacity(const std::string& s) {
     return (p < obj || p >= obj + sizeof(std::string)) ? s.capacity() : 0;
 }
 
+}  // namespace jcailloux::relais::entity
+
+namespace jcailloux::relais {
+
 // =============================================================================
-// EntityWrapper<Struct, Mapping> — API-side wrapper for pure data structs
+// Entity<Struct, Mapping> — ORM entity inheriting from pure data struct
 //
 // Inherits from Struct (pure declarative data) and adds:
 // - On-demand BEVE/JSON serialization via Glaze (no caching)
@@ -39,27 +43,27 @@ inline size_t heapCapacity(const std::string& s) {
 // =============================================================================
 
 template<typename Struct, typename Mapping>
-class EntityWrapper : public Struct {
+class Entity : public Struct {
 public:
     using Format = jcailloux::relais::StructFormat;
     using TraitsType = typename Mapping::TraitsType;
     using Field = typename TraitsType::Field;
     static constexpr bool read_only = Mapping::read_only;
 
-    EntityWrapper() = default;
-    explicit EntityWrapper(const Struct& s) : Struct(s) {}
-    explicit EntityWrapper(Struct&& s) noexcept : Struct(std::move(s)) {}
+    Entity() = default;
+    explicit Entity(const Struct& s) : Struct(s) {}
+    explicit Entity(Struct&& s) noexcept : Struct(std::move(s)) {}
 
-    ~EntityWrapper() = default;
+    ~Entity() = default;
 
     // No serialization caches — copies/moves are trivial (Struct-only).
-    EntityWrapper(const EntityWrapper& o) : Struct(static_cast<const Struct&>(o)) {}
-    EntityWrapper(EntityWrapper&& o) noexcept : Struct(static_cast<Struct&&>(std::move(o))) {}
-    EntityWrapper& operator=(const EntityWrapper& o) {
+    Entity(const Entity& o) : Struct(static_cast<const Struct&>(o)) {}
+    Entity(Entity&& o) noexcept : Struct(static_cast<Struct&&>(std::move(o))) {}
+    Entity& operator=(const Entity& o) {
         if (this != &o) Struct::operator=(static_cast<const Struct&>(o));
         return *this;
     }
-    EntityWrapper& operator=(EntityWrapper&& o) noexcept {
+    Entity& operator=(Entity&& o) noexcept {
         if (this != &o) Struct::operator=(static_cast<Struct&&>(std::move(o)));
         return *this;
     }
@@ -76,18 +80,18 @@ public:
     // SQL row mapping — delegated to Mapping
     // =========================================================================
 
-    static std::optional<EntityWrapper> fromRow(const io::PgResult::Row& row) {
-        return Mapping::template fromRow<EntityWrapper>(row);
+    static std::optional<Entity> fromRow(const io::PgResult::Row& row) {
+        return Mapping::template fromRow<Entity>(row);
     }
 
-    static io::PgParams toInsertParams(const EntityWrapper& e) {
-        return Mapping::template toInsertParams<EntityWrapper>(e);
+    static io::PgParams toInsertParams(const Entity& e) {
+        return Mapping::template toInsertParams<Entity>(e);
     }
 
-    static io::PgParams toUpdateParams(const EntityWrapper& e)
-        requires requires { Mapping::template toUpdateParams<EntityWrapper>(e); }
+    static io::PgParams toUpdateParams(const Entity& e)
+        requires requires { Mapping::template toUpdateParams<Entity>(e); }
     {
-        return Mapping::template toUpdateParams<EntityWrapper>(e);
+        return Mapping::template toUpdateParams<Entity>(e);
     }
 
     // =========================================================================
@@ -115,9 +119,9 @@ public:
         return buf;
     }
 
-    static std::optional<EntityWrapper> fromBinary(std::span<const uint8_t> data) {
+    static std::optional<Entity> fromBinary(std::span<const uint8_t> data) {
         if (data.empty()) return std::nullopt;
-        EntityWrapper entity;
+        Entity entity;
         if (glz::read_beve(entity, std::string_view{
             reinterpret_cast<const char*>(data.data()), data.size()}))
             return std::nullopt;
@@ -135,23 +139,23 @@ public:
         return buf;
     }
 
-    static std::optional<EntityWrapper> fromJson(std::string_view json) {
+    static std::optional<Entity> fromJson(std::string_view json) {
         if (json.empty()) return std::nullopt;
-        EntityWrapper entity;
+        Entity entity;
         if (glz::read_json(entity, json)) return std::nullopt;
         return entity;
     }
 
 };
 
-}  // namespace jcailloux::relais::entity
+}  // namespace jcailloux::relais
 
 // =============================================================================
 // Glaze metadata: prefer glz::meta<Struct> when available, else use Mapping
 //
 // If the shared struct header defines a glz::meta<Struct> specialization
-// (e.g., with custom JSON field names), EntityWrapper automatically uses it.
-// This ensures both the API (via EntityWrapper) and BEVE consumers (via the
+// (e.g., with custom JSON field names), Entity automatically uses it.
+// This ensures both the API (via Entity) and BEVE consumers (via the
 // raw struct) share the same field naming contract.
 //
 // If no glz::meta<Struct> exists, falls back to Mapping::glaze_value (which
@@ -159,8 +163,8 @@ public:
 // =============================================================================
 
 template<typename Struct, typename Mapping>
-struct glz::meta<jcailloux::relais::entity::EntityWrapper<Struct, Mapping>> {
-    using T = jcailloux::relais::entity::EntityWrapper<Struct, Mapping>;
+struct glz::meta<jcailloux::relais::Entity<Struct, Mapping>> {
+    using T = jcailloux::relais::Entity<Struct, Mapping>;
     static constexpr auto value = [] {
         if constexpr (requires { glz::meta<Struct>::value; }) {
             return glz::meta<Struct>::value;
@@ -170,4 +174,4 @@ struct glz::meta<jcailloux::relais::entity::EntityWrapper<Struct, Mapping>> {
     }();
 };
 
-#endif  // JCX_RELAIS_ENTITY_ENTITY_WRAPPER_H
+#endif  // JCX_RELAIS_ENTITY_H

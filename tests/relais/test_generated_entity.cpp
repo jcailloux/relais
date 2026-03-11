@@ -1,7 +1,7 @@
 /**
- * test_generated_wrapper.cpp
+ * test_generated_entity.cpp
  *
- * Tests for struct-based entity wrappers with Glaze BEVE/JSON serialization.
+ * Tests for struct-based entities with Glaze BEVE/JSON serialization.
  *
  *   1. TestUser       — basic entity (construction, field access, round-trips)
  *   2. TestArticle    — boolean, timestamp, nullable std::optional<T>
@@ -23,19 +23,19 @@
 #include <catch2/catch_test_macros.hpp>
 #include <glaze/glaze.hpp>
 
-#include "fixtures/generated/TestItemWrapper.h"
-#include "fixtures/generated/TestUserWrapper.h"
-#include "fixtures/generated/TestArticleWrapper.h"
-#include "fixtures/generated/TestPurchaseWrapper.h"
-#include "fixtures/generated/TestOrderWrapper.h"
+#include "fixtures/generated/TestItemEntity.h"
+#include "fixtures/generated/TestUserEntity.h"
+#include "fixtures/generated/TestArticleEntity.h"
+#include "fixtures/generated/TestPurchaseEntity.h"
+#include "fixtures/generated/TestOrderEntity.h"
 #include <jcailloux/relais/list/ListWrapper.h>
 
-// Shadow raw struct names with EntityWrapper types for testing
-using TestItem = entity::generated::TestItemWrapper;
-using TestUser = entity::generated::TestUserWrapper;
-using TestArticle = entity::generated::TestArticleWrapper;
-using TestPurchase = entity::generated::TestPurchaseWrapper;
-using TestOrder = entity::generated::TestOrderWrapper;
+// Shadow raw struct names with Entity types for testing
+using TestItem = entity::generated::TestItemEntity;
+using TestUser = entity::generated::TestUserEntity;
+using TestArticle = entity::generated::TestArticleEntity;
+using TestPurchase = entity::generated::TestPurchaseEntity;
+using TestOrder = entity::generated::TestOrderEntity;
 using relais_test::TestAddress;
 using relais_test::TestGeoLocation;
 using relais_test::TestCoordinateMetadata;
@@ -1004,7 +1004,7 @@ TEST_CASE("Glaze vector round-trip - TestOrder (complex)", "[wrapper][glaze][ord
 //  7. Custom JSON field names — glz::meta<Struct> override
 //
 //  When a shared struct header defines glz::meta<Struct> with custom JSON
-//  field names, EntityWrapper automatically detects and uses them for both
+//  field names, Entity automatically detects and uses them for both
 //  JSON and BEVE serialization. This ensures the API and BEVE consumers
 //  share the same naming contract.
 //
@@ -1025,7 +1025,7 @@ struct Product {
 } // namespace custom_json_test
 
 // Custom JSON field names — this would live alongside the struct in a shared header.
-// EntityWrapper detects this specialization and uses it instead of Mapping::glaze_value.
+// Entity detects this specialization and uses it instead of Mapping::glaze_value.
 template<>
 struct glz::meta<custom_json_test::Product> {
     using T = custom_json_test::Product;
@@ -1047,14 +1047,14 @@ struct ProductMapping {
         enum class Field : uint8_t {};
     };
 
-    template<typename Entity>
-    static auto key(const Entity& e) noexcept { return e.id; }
+    template<typename E>
+    static auto key(const E& e) noexcept { return e.id; }
 
-    template<typename Entity>
-    static std::optional<Entity> fromRow(const jcailloux::relais::io::PgResult::Row&) { return std::nullopt; }
+    template<typename E>
+    static std::optional<E> fromRow(const jcailloux::relais::io::PgResult::Row&) { return std::nullopt; }
 
-    template<typename Entity>
-    static jcailloux::relais::io::PgParams toInsertParams(const Entity&) { return jcailloux::relais::io::PgParams{}; }
+    template<typename E>
+    static jcailloux::relais::io::PgParams toInsertParams(const E&) { return jcailloux::relais::io::PgParams{}; }
 
     // Fallback: snake_case names (should be overridden by glz::meta<Product>)
     template<typename T>
@@ -1065,13 +1065,13 @@ struct ProductMapping {
     );
 };
 
-using ProductWrapper = jcailloux::relais::entity::EntityWrapper<Product, ProductMapping>;
+using ProductEntity = jcailloux::relais::Entity<Product, ProductMapping>;
 
 } // namespace custom_json_test
 
 TEST_CASE("Custom JSON field names via glz::meta<Struct>", "[wrapper][json][custom-names]") {
 
-    custom_json_test::ProductWrapper product;
+    custom_json_test::ProductEntity product;
     product.id = 42;
     product.product_name = "Widget";
     product.unit_price = 999;
@@ -1089,7 +1089,7 @@ TEST_CASE("Custom JSON field names via glz::meta<Struct>", "[wrapper][json][cust
 
     SECTION("[JSON] round-trip preserves all fields") {
         auto json = product.json();
-        auto restored = custom_json_test::ProductWrapper::fromJson(json);
+        auto restored = custom_json_test::ProductEntity::fromJson(json);
         REQUIRE(restored.has_value());
         REQUIRE(restored->id == 42);
         REQUIRE(restored->product_name == "Widget");
@@ -1097,7 +1097,7 @@ TEST_CASE("Custom JSON field names via glz::meta<Struct>", "[wrapper][json][cust
     }
 
     SECTION("[Binary] BEVE round-trip preserves all fields") {
-        auto restored = custom_json_test::ProductWrapper::fromBinary(product.binary());
+        auto restored = custom_json_test::ProductEntity::fromBinary(product.binary());
         REQUIRE(restored.has_value());
         REQUIRE(restored->id == 42);
         REQUIRE(restored->product_name == "Widget");
@@ -1111,14 +1111,14 @@ TEST_CASE("Custom JSON field names via glz::meta<Struct>", "[wrapper][json][cust
 
 TEST_CASE("ListWrapper items use custom JSON field names", "[wrapper][list][custom-names]") {
 
-    using ProductList = jcailloux::relais::list::ListWrapper<custom_json_test::ProductWrapper>;
+    using ProductList = jcailloux::relais::list::ListWrapper<custom_json_test::ProductEntity>;
 
-    custom_json_test::ProductWrapper p1;
+    custom_json_test::ProductEntity p1;
     p1.id = 1;
     p1.product_name = "Widget";
     p1.unit_price = 100;
 
-    custom_json_test::ProductWrapper p2;
+    custom_json_test::ProductEntity p2;
     p2.id = 2;
     p2.product_name = "Gadget";
     p2.unit_price = 200;

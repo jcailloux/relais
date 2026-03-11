@@ -41,7 +41,7 @@ using namespace relais_bench;
 // #############################################################################
 
 /// Bare L1 — no TTL, no GDSF, zero metadata per entry
-using BareL1TestItemRepo = Repo<TestItemWrapper, "bench:bare_l1", test_config::BareL1>;
+using BareL1TestItemRepo = Repo<TestItemEntity, "bench:bare_l1", test_config::BareL1>;
 
 namespace {
 inline std::string gdsf_banner() {

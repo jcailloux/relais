@@ -58,19 +58,19 @@ namespace relais_test {
 namespace ct = config_test;
 
 // TTL repos
-using TTL1sRepo   = Repo<TestItemWrapper, "cfg:l1:ttl1s",   ct::TTL1s>;
-using TTL3sRepo   = Repo<TestItemWrapper, "cfg:l1:ttl3s",   ct::TTL3s>;
+using TTL1sRepo   = Repo<TestItemEntity, "cfg:l1:ttl1s",   ct::TTL1s>;
+using TTL3sRepo   = Repo<TestItemEntity, "cfg:l1:ttl3s",   ct::TTL3s>;
 
 // Segment repos
-using Seg2Repo  = Repo<TestItemWrapper, "cfg:l1:seg2",  ct::Seg2>;
-using Seg16Repo = Repo<TestItemWrapper, "cfg:l1:seg16", ct::Seg16>;
+using Seg2Repo  = Repo<TestItemEntity, "cfg:l1:seg2",  ct::Seg2>;
+using Seg16Repo = Repo<TestItemEntity, "cfg:l1:seg16", ct::Seg16>;
 
 // Strategy repos
-using LazyReloadRepo  = Repo<TestItemWrapper, "cfg:l1:lazy",  ct::LazyReload>;
-using PopImmediateRepo = Repo<TestItemWrapper, "cfg:l1:pop",   ct::PopImmediate>;
+using LazyReloadRepo  = Repo<TestItemEntity, "cfg:l1:lazy",  ct::LazyReload>;
+using PopImmediateRepo = Repo<TestItemEntity, "cfg:l1:pop",   ct::PopImmediate>;
 
 // Read-only repo
-using ReadOnlyCfgRepo = Repo<TestItemWrapper, "cfg:l1:ro", ct::ReadOnlyL1>;
+using ReadOnlyCfgRepo = Repo<TestItemEntity, "cfg:l1:ro", ct::ReadOnlyL1>;
 
 } // namespace relais_test
 

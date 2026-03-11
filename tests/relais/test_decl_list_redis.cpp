@@ -30,8 +30,8 @@ namespace decl = jcailloux::relais::list::spec;
 
 namespace relais_test {
 
-using L2DeclArticleListRepo = Repo<TestArticleWrapper, "test:article:list:l2:decl", cfg::Redis>;
-using L2DeclPurchaseListRepo = Repo<TestPurchaseWrapper, "test:purchase:list:l2:decl", cfg::Redis>;
+using L2DeclArticleListRepo = Repo<TestArticleEntity, "test:article:list:l2:decl", cfg::Redis>;
+using L2DeclPurchaseListRepo = Repo<TestPurchaseEntity, "test:purchase:list:l2:decl", cfg::Redis>;
 
 // Type aliases for L2 list queries
 using L2ArticleListQuery = L2DeclArticleListRepo::ListQuery;
@@ -44,10 +44,10 @@ using L2ArticleDescQuery = decl::ListDescriptorQuery<L2ArticleDecl>;
 } // namespace relais_test
 
 // =============================================================================
-// Helper: build a TestArticleWrapper from raw values (for SortBounds tests)
+// Helper: build a TestArticleEntity from raw values (for SortBounds tests)
 // =============================================================================
 
-static TestArticleWrapper makeArticle(
+static TestArticleEntity makeArticle(
     int64_t id,
     const std::string& category,
     int64_t author_id,

@@ -18,9 +18,9 @@ namespace jcailloux::relais::list {
 // EntityModification - Represents a modification to an entity
 // =============================================================================
 
-template<typename Entity>
+template<typename E>
 struct EntityModification {
-    using EntityPtr = std::unique_ptr<const Entity>;
+    using EntityPtr = std::unique_ptr<const E>;
 
     enum class Type : uint8_t {
         Created,
@@ -34,28 +34,28 @@ struct EntityModification {
     uint32_t generation;    // monotonic generation number from the owning ListCache
 
     // Factory methods — caller provides the generation number
-    static EntityModification created(const Entity& entity, uint32_t gen) {
+    static EntityModification created(const E& entity, uint32_t gen) {
         return EntityModification{
             .type = Type::Created,
             .old_entity = nullptr,
-            .new_entity = std::make_unique<const Entity>(entity),
+            .new_entity = std::make_unique<const E>(entity),
             .generation = gen
         };
     }
 
-    static EntityModification updated(const Entity& old_entity, const Entity& new_entity, uint32_t gen) {
+    static EntityModification updated(const E& old_entity, const E& new_entity, uint32_t gen) {
         return EntityModification{
             .type = Type::Updated,
-            .old_entity = std::make_unique<const Entity>(old_entity),
-            .new_entity = std::make_unique<const Entity>(new_entity),
+            .old_entity = std::make_unique<const E>(old_entity),
+            .new_entity = std::make_unique<const E>(new_entity),
             .generation = gen
         };
     }
 
-    static EntityModification deleted(const Entity& entity, uint32_t gen) {
+    static EntityModification deleted(const E& entity, uint32_t gen) {
         return EntityModification{
             .type = Type::Deleted,
-            .old_entity = std::make_unique<const Entity>(entity),
+            .old_entity = std::make_unique<const E>(entity),
             .new_entity = nullptr,
             .generation = gen
         };
@@ -87,13 +87,13 @@ namespace detail {
 // TotalSegments = number of chunks, known at compile time (from ChunkMap config).
 //
 
-template<typename Entity, size_t TotalSegments>
+template<typename E, size_t TotalSegments>
 class ModificationTracker {
 public:
     static_assert(TotalSegments >= 2 && TotalSegments <= 64,
                   "TotalSegments must be between 2 and 64");
 
-    using Modification = EntityModification<Entity>;
+    using Modification = EntityModification<E>;
     using BitmapType = detail::SmallestUintFor<TotalSegments>;
 
     static constexpr BitmapType initial_bitmap_ =
@@ -130,15 +130,15 @@ public:
     // Track modifications
     // =========================================================================
 
-    void notifyCreated(const Entity& entity, uint32_t gen) {
+    void notifyCreated(const E& entity, uint32_t gen) {
         track(Modification::created(entity, gen));
     }
 
-    void notifyUpdated(const Entity& old_entity, const Entity& new_entity, uint32_t gen) {
+    void notifyUpdated(const E& old_entity, const E& new_entity, uint32_t gen) {
         track(Modification::updated(old_entity, new_entity, gen));
     }
 
-    void notifyDeleted(const Entity& entity, uint32_t gen) {
+    void notifyDeleted(const E& entity, uint32_t gen) {
         track(Modification::deleted(entity, gen));
     }
 

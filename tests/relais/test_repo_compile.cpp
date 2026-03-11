@@ -31,24 +31,24 @@ using namespace relais_test;
 TEST_CASE("Repo instantiation - all cache levels", "[repository][compile]") {
     SECTION("Uncached - PgRepo only") {
         STATIC_REQUIRE(std::is_same_v<UncachedTestItemRepo::EntityType,
-                                       entity::generated::TestItemWrapper>);
+                                       entity::generated::TestItemEntity>);
         STATIC_REQUIRE(std::is_same_v<UncachedTestItemRepo::KeyType, int64_t>);
     }
 
     SECTION("L1 - LocalRepo") {
         STATIC_REQUIRE(std::is_same_v<L1TestItemRepo::EntityType,
-                                       entity::generated::TestItemWrapper>);
+                                       entity::generated::TestItemEntity>);
         STATIC_REQUIRE(std::is_same_v<L1TestItemRepo::KeyType, int64_t>);
     }
 
     SECTION("L2 - RedisRepo") {
         STATIC_REQUIRE(std::is_same_v<L2TestItemRepo::EntityType,
-                                       entity::generated::TestItemWrapper>);
+                                       entity::generated::TestItemEntity>);
     }
 
     SECTION("L1+L2 - full hierarchy") {
         STATIC_REQUIRE(std::is_same_v<FullCacheTestItemRepo::EntityType,
-                                       entity::generated::TestItemWrapper>);
+                                       entity::generated::TestItemEntity>);
     }
 }
 
@@ -155,7 +155,7 @@ TEST_CASE("Config presets", "[repository][compile]") {
 TEST_CASE("ListMixin auto-detected from ListDescriptor", "[repository][compile][list]") {
     SECTION("Article repo with list") {
         STATIC_REQUIRE(std::is_same_v<TestArticleListRepo::EntityType,
-                                       entity::generated::TestArticleWrapper>);
+                                       entity::generated::TestArticleEntity>);
         // ListDescriptorType should exist if ListMixin is active
         using Desc = TestArticleListRepo::ListDescriptorType;
         (void)sizeof(Desc);  // verify type exists
@@ -194,7 +194,7 @@ TEST_CASE("ListMixin auto-detected from ListDescriptor", "[repository][compile][
 TEST_CASE("InvalidationMixin with cross-invalidation", "[repository][compile][invalidation]") {
     SECTION("Purchase repo with User invalidation") {
         STATIC_REQUIRE(std::is_same_v<L1TestPurchaseRepo::EntityType,
-                                       entity::generated::TestPurchaseWrapper>);
+                                       entity::generated::TestPurchaseEntity>);
     }
 }
 

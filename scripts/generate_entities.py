@@ -5,7 +5,7 @@ Struct Entity Wrapper Generator
 Scans C++ header files for @relais annotations, parses struct data members,
 and generates:
   - Standalone Mapping structs with fromRow/toInsertParams/TraitsType/FieldInfo
-  - EntityWrapper<Struct, Mapping> type aliases (public API)
+  - Entity<Struct, Mapping> type aliases (public API)
   - ListWrapper and ListDescriptor for list entities
 
 Uses jcailloux::relais::io for database access.
@@ -440,7 +440,7 @@ class StructParser:
 # =============================================================================
 
 class MappingGenerator:
-    """Generate Mapping structs + EntityWrapper aliases from parsed entities.
+    """Generate Mapping structs + Entity aliases from parsed entities.
 
     Generates SQL-direct code using jcailloux::relais::io.
     """
@@ -465,7 +465,7 @@ class MappingGenerator:
         """Generate the complete wrapper header."""
         a = entity.annotation
         mapping_name = f"{entity.class_name}Mapping"
-        wrapper_name = f"{entity.class_name}Wrapper"
+        wrapper_name = f"{entity.class_name}Entity"
 
         # Determine updateable fields (exclude PK, db_managed, json_fields)
         updateable = self._get_updateable_fields(entity)
@@ -501,7 +501,7 @@ class MappingGenerator:
         lines.append(f"// {wrapper_name} — public API type")
         lines.append("// ============================================================================")
         lines.append("")
-        lines.append(f"using {wrapper_name} = jcailloux::relais::entity::EntityWrapper<")
+        lines.append(f"using {wrapper_name} = jcailloux::relais::Entity<")
         lines.append(f"    {struct_fqn}, {mapping_name}>;")
 
         # === List wrapper (if list annotations present) ===
@@ -561,8 +561,8 @@ class MappingGenerator:
         if has_vector_char:
             lines.append("#include <vector>")
 
-        # EntityWrapper (always needed)
-        lines.append("#include <jcailloux/relais/entity/EntityWrapper.h>")
+        # Entity (always needed)
+        lines.append("#include <jcailloux/relais/entity/Entity.h>")
 
         # Struct header (relative path from generated file to source)
         struct_include = self._find_struct_include(entity, output_file)
@@ -1503,7 +1503,7 @@ def main():
     for filepath in files:
         entities = struct_parser.parse_file(filepath)
         for entity in entities:
-            filename = f"{entity.class_name}Wrapper.h"
+            filename = f"{entity.class_name}Entity.h"
             output_path = output_dir / filename
 
             print(f"  -> {entity.class_name}")

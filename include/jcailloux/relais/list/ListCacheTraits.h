@@ -11,36 +11,36 @@ namespace jcailloux::relais::list {
 // Concepts for ListCacheTraits requirements
 // =============================================================================
 
-template<typename Traits, typename Entity>
-concept HasMatchesFilters = requires(const Entity& e, const typename Traits::Filters& f) {
+template<typename Traits, typename E>
+concept HasMatchesFilters = requires(const E& e, const typename Traits::Filters& f) {
     { Traits::matchesFilters(e, f) } -> std::convertible_to<bool>;
 };
 
-template<typename Traits, typename Entity>
-concept HasCompare = requires(const Entity& a, const Entity& b,
+template<typename Traits, typename E>
+concept HasCompare = requires(const E& a, const E& b,
                               typename Traits::SortField field,
                               SortDirection dir) {
     { Traits::compare(a, b, field, dir) } -> std::convertible_to<int>;
 };
 
-template<typename Traits, typename Entity>
-concept HasCursorOperations = requires(const Entity& e, const Cursor& c,
+template<typename Traits, typename E>
+concept HasCursorOperations = requires(const E& e, const Cursor& c,
                                         SortSpec<typename Traits::SortField> sort) {
     { Traits::extractCursor(e, sort) } -> std::convertible_to<Cursor>;
     { Traits::isBeforeOrAtCursor(e, c, sort) } -> std::convertible_to<bool>;
 };
 
-template<typename Traits, typename Entity>
-concept HasExtractTags = requires(const Entity& e) {
+template<typename Traits, typename E>
+concept HasExtractTags = requires(const E& e) {
     { Traits::extractTags(e) } -> std::convertible_to<typename Traits::FilterTags>;
 };
 
-template<typename Traits, typename Entity>
+template<typename Traits, typename E>
 concept HasDefaultSort = requires {
     { Traits::defaultSort() } -> std::convertible_to<SortSpec<typename Traits::SortField>>;
 };
 
-template<typename Traits, typename Entity>
+template<typename Traits, typename E>
 concept HasLimitConfig = requires {
     { Traits::limitSteps } -> std::convertible_to<const std::array<uint16_t, 4>&>;
     { Traits::maxLimit } -> std::convertible_to<uint16_t>;
@@ -48,23 +48,23 @@ concept HasLimitConfig = requires {
 };
 
 // Combined concept for a valid ListCacheTraits
-template<typename Traits, typename Entity>
+template<typename Traits, typename E>
 concept ValidListCacheTraits =
-    HasMatchesFilters<Traits, Entity> &&
-    HasCompare<Traits, Entity> &&
-    HasCursorOperations<Traits, Entity> &&
-    HasExtractTags<Traits, Entity> &&
-    HasDefaultSort<Traits, Entity>;
+    HasMatchesFilters<Traits, E> &&
+    HasCompare<Traits, E> &&
+    HasCursorOperations<Traits, E> &&
+    HasExtractTags<Traits, E> &&
+    HasDefaultSort<Traits, E>;
 
 // =============================================================================
 // ListCacheTraits - Primary template (must be specialized per entity)
 // =============================================================================
 
-template<typename Entity>
+template<typename E>
 struct ListCacheTraits {
     // User must specialize this template for each entity type
     // See example specialization below
-    static_assert(sizeof(Entity) == 0,
+    static_assert(sizeof(E) == 0,
         "ListCacheTraits must be specialized for this entity type");
 };
 

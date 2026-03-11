@@ -11,7 +11,7 @@
 namespace jcailloux::relais {
 
 // =============================================================================
-// Entity Wrapper Concepts
+// E Wrapper Concepts
 //
 // Hierarchical concepts for entity wrappers used in repositories.
 // Each level adds requirements on top of the previous one.
@@ -80,22 +80,22 @@ concept CreatableEntity = MutableEntity<W> && Keyed<W, Key>;
 // ListDescriptor detection
 // -----------------------------------------------------------------------------
 
-/// Entity's Mapping has a ListDescriptor (for declarative list caching)
-template<typename Entity>
+/// E's Mapping has a ListDescriptor (for declarative list caching)
+template<typename E>
 concept HasListDescriptor = requires {
-    typename Entity::MappingType::ListDescriptor;
+    typename E::MappingType::ListDescriptor;
 };
 
-/// Entity's Mapping has partition hint support (partition-pruned DELETE).
+/// E's Mapping has partition hint support (partition-pruned DELETE).
 /// Auto-detected from Mapping providing delete_with_partition SQL and
 /// makePartitionHintParams method (generated when @relais partition_key is used).
 /// Distinct from composite keys where ALL key parts are required for
 /// identification — here, the cache key alone suffices but the partition
 /// column enables single-partition pruning when available from cache.
-template<typename Entity>
-concept HasPartitionHint = requires(const Entity& e) {
-    { Entity::MappingType::SQL::delete_with_partition } -> std::convertible_to<const char*>;
-    { Entity::MappingType::makePartitionHintParams(e) } -> std::convertible_to<io::PgParams>;
+template<typename E>
+concept HasPartitionHint = requires(const E& e) {
+    { E::MappingType::SQL::delete_with_partition } -> std::convertible_to<const char*>;
+    { E::MappingType::makePartitionHintParams(e) } -> std::convertible_to<io::PgParams>;
 };
 
 }  // namespace jcailloux::relais

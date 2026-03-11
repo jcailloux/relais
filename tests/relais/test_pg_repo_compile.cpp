@@ -16,11 +16,11 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "jcailloux/relais/repository/PgRepo.h"
-#include "fixtures/generated/TestItemWrapper.h"
-#include "fixtures/generated/TestUserWrapper.h"
-#include "fixtures/generated/TestOrderWrapper.h"
-#include "fixtures/generated/TestEventWrapper.h"
-#include "fixtures/generated/TestProductWrapper.h"
+#include "fixtures/generated/TestItemEntity.h"
+#include "fixtures/generated/TestUserEntity.h"
+#include "fixtures/generated/TestOrderEntity.h"
+#include "fixtures/generated/TestEventEntity.h"
+#include "fixtures/generated/TestProductEntity.h"
 
 using namespace jcailloux::relais;
 using jcailloux::relais::entity::set;
@@ -36,19 +36,19 @@ using jcailloux::relais::entity::fieldValue;
 // =========================================================================
 
 using ItemRepo = PgRepo<
-    ::entity::generated::TestItemWrapper, "test:item", config::Uncached, int64_t>;
+    ::entity::generated::TestItemEntity, "test:item", config::Uncached, int64_t>;
 using UserRepo = PgRepo<
-    ::entity::generated::TestUserWrapper, "test:user", config::Uncached, int64_t>;
+    ::entity::generated::TestUserEntity, "test:user", config::Uncached, int64_t>;
 using OrderRepo = PgRepo<
-    ::entity::generated::TestOrderWrapper, "test:order", config::Uncached, int64_t>;
+    ::entity::generated::TestOrderEntity, "test:order", config::Uncached, int64_t>;
 using EventRepo = PgRepo<
-    ::entity::generated::TestEventWrapper, "test:event", config::Uncached, int64_t>;
+    ::entity::generated::TestEventEntity, "test:event", config::Uncached, int64_t>;
 using ProductRepo = PgRepo<
-    ::entity::generated::TestProductWrapper, "test:product", config::Uncached, int64_t>;
+    ::entity::generated::TestProductEntity, "test:product", config::Uncached, int64_t>;
 
 // Read-only repo
 using ReadOnlyItemRepo = PgRepo<
-    ::entity::generated::TestItemWrapper, "test:item:ro",
+    ::entity::generated::TestItemEntity, "test:item:ro",
     config::Uncached.with_read_only(), int64_t>;
 
 // =========================================================================
@@ -58,13 +58,13 @@ using ReadOnlyItemRepo = PgRepo<
 TEST_CASE("PgRepo type traits", "[base_repo]") {
     SECTION("EntityType is correct") {
         STATIC_REQUIRE(std::is_same_v<
-            ItemRepo::EntityType, ::entity::generated::TestItemWrapper>);
+            ItemRepo::EntityType, ::entity::generated::TestItemEntity>);
         STATIC_REQUIRE(std::is_same_v<
-            UserRepo::EntityType, ::entity::generated::TestUserWrapper>);
+            UserRepo::EntityType, ::entity::generated::TestUserEntity>);
         STATIC_REQUIRE(std::is_same_v<
-            OrderRepo::EntityType, ::entity::generated::TestOrderWrapper>);
+            OrderRepo::EntityType, ::entity::generated::TestOrderEntity>);
         STATIC_REQUIRE(std::is_same_v<
-            EventRepo::EntityType, ::entity::generated::TestEventWrapper>);
+            EventRepo::EntityType, ::entity::generated::TestEventEntity>);
     }
 
     SECTION("Key type") {
@@ -93,40 +93,40 @@ TEST_CASE("PgRepo type traits", "[base_repo]") {
 
 TEST_CASE("PgRepo concepts", "[base_repo]") {
     SECTION("ReadableEntity") {
-        STATIC_REQUIRE(ReadableEntity<::entity::generated::TestItemWrapper>);
-        STATIC_REQUIRE(ReadableEntity<::entity::generated::TestUserWrapper>);
-        STATIC_REQUIRE(ReadableEntity<::entity::generated::TestOrderWrapper>);
-        STATIC_REQUIRE(ReadableEntity<::entity::generated::TestEventWrapper>);
+        STATIC_REQUIRE(ReadableEntity<::entity::generated::TestItemEntity>);
+        STATIC_REQUIRE(ReadableEntity<::entity::generated::TestUserEntity>);
+        STATIC_REQUIRE(ReadableEntity<::entity::generated::TestOrderEntity>);
+        STATIC_REQUIRE(ReadableEntity<::entity::generated::TestEventEntity>);
     }
 
     SECTION("MutableEntity") {
-        STATIC_REQUIRE(MutableEntity<::entity::generated::TestItemWrapper>);
-        STATIC_REQUIRE(MutableEntity<::entity::generated::TestUserWrapper>);
-        STATIC_REQUIRE(MutableEntity<::entity::generated::TestOrderWrapper>);
-        STATIC_REQUIRE(MutableEntity<::entity::generated::TestEventWrapper>);
+        STATIC_REQUIRE(MutableEntity<::entity::generated::TestItemEntity>);
+        STATIC_REQUIRE(MutableEntity<::entity::generated::TestUserEntity>);
+        STATIC_REQUIRE(MutableEntity<::entity::generated::TestOrderEntity>);
+        STATIC_REQUIRE(MutableEntity<::entity::generated::TestEventEntity>);
     }
 
     SECTION("Serializable") {
-        STATIC_REQUIRE(Serializable<::entity::generated::TestItemWrapper>);
-        STATIC_REQUIRE(Serializable<::entity::generated::TestOrderWrapper>);
+        STATIC_REQUIRE(Serializable<::entity::generated::TestItemEntity>);
+        STATIC_REQUIRE(Serializable<::entity::generated::TestOrderEntity>);
     }
 
     SECTION("Keyed") {
-        STATIC_REQUIRE(Keyed<::entity::generated::TestItemWrapper, int64_t>);
-        STATIC_REQUIRE(Keyed<::entity::generated::TestOrderWrapper, int64_t>);
+        STATIC_REQUIRE(Keyed<::entity::generated::TestItemEntity, int64_t>);
+        STATIC_REQUIRE(Keyed<::entity::generated::TestOrderEntity, int64_t>);
     }
 
     SECTION("HasFieldUpdate") {
-        STATIC_REQUIRE(HasFieldUpdate<::entity::generated::TestItemWrapper>);
-        STATIC_REQUIRE(HasFieldUpdate<::entity::generated::TestOrderWrapper>);
-        STATIC_REQUIRE(HasFieldUpdate<::entity::generated::TestEventWrapper>);
+        STATIC_REQUIRE(HasFieldUpdate<::entity::generated::TestItemEntity>);
+        STATIC_REQUIRE(HasFieldUpdate<::entity::generated::TestOrderEntity>);
+        STATIC_REQUIRE(HasFieldUpdate<::entity::generated::TestEventEntity>);
     }
 
     SECTION("HasPartitionHint") {
-        STATIC_REQUIRE(HasPartitionHint<::entity::generated::TestEventWrapper>);
-        STATIC_REQUIRE_FALSE(HasPartitionHint<::entity::generated::TestItemWrapper>);
-        STATIC_REQUIRE_FALSE(HasPartitionHint<::entity::generated::TestOrderWrapper>);
-        STATIC_REQUIRE_FALSE(HasPartitionHint<::entity::generated::TestUserWrapper>);
+        STATIC_REQUIRE(HasPartitionHint<::entity::generated::TestEventEntity>);
+        STATIC_REQUIRE_FALSE(HasPartitionHint<::entity::generated::TestItemEntity>);
+        STATIC_REQUIRE_FALSE(HasPartitionHint<::entity::generated::TestOrderEntity>);
+        STATIC_REQUIRE_FALSE(HasPartitionHint<::entity::generated::TestUserEntity>);
     }
 }
 
@@ -215,7 +215,7 @@ TEST_CASE("SQL strings for partition key entity", "[base_repo][sql][partition_ke
     }
 
     SECTION("makePartitionHintParams produces correct params") {
-        ::entity::generated::TestEventWrapper event;
+        ::entity::generated::TestEventEntity event;
         event.id = 42;
         event.region = "eu";
         auto params = EventMapping::makePartitionHintParams(event);
@@ -401,14 +401,14 @@ TEST_CASE("PgParams construction for CRUD operations", "[base_repo][params]") {
     }
 
     SECTION("toInsertParams excludes db_managed fields") {
-        ::entity::generated::TestItemWrapper item;
+        ::entity::generated::TestItemEntity item;
         item.id = 999;
         item.name = "test";
         item.value = 42;
         item.description = "desc";
         item.is_active = true;
         item.created_at = "2024-01-01 00:00:00";
-        auto params = ::entity::generated::TestItemWrapper::toInsertParams(item);
+        auto params = ::entity::generated::TestItemEntity::toInsertParams(item);
         // db_managed fields (id, created_at) are set on the struct but must
         // NOT appear in insert params — the DB manages them.
         // Only user-supplied fields: name, value, description, is_active
@@ -416,14 +416,14 @@ TEST_CASE("PgParams construction for CRUD operations", "[base_repo][params]") {
     }
 
     SECTION("update params construction: PK + insert params") {
-        ::entity::generated::TestItemWrapper item;
+        ::entity::generated::TestItemEntity item;
         item.id = 1;
         item.name = "test";
         item.value = 42;
         item.description = "desc";
         item.is_active = true;
 
-        auto insertParams = ::entity::generated::TestItemWrapper::toInsertParams(item);
+        auto insertParams = ::entity::generated::TestItemEntity::toInsertParams(item);
         jcailloux::relais::io::PgParams updateParams;
         updateParams.params.reserve(insertParams.params.size() + 1);
         // $1 = PK

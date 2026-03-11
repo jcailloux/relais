@@ -17,22 +17,22 @@ namespace jcailloux::relais {
 // These check what an entity CAN do (capability), not how it's configured.
 // =============================================================================
 
-/// Entity supports JSON serialization (json/fromJson).
+/// E supports JSON serialization (json/fromJson).
 /// json() returns std::string by value (on-demand serialization).
 /// fromJson(string_view) is the canonical input form.
-template<typename Entity>
-concept HasJsonSerialization = requires(const Entity& e, std::string_view json) {
+template<typename E>
+concept HasJsonSerialization = requires(const E& e, std::string_view json) {
     { e.json() } -> std::convertible_to<std::string>;
-    { Entity::fromJson(json) } -> std::convertible_to<std::optional<Entity>>;
+    { E::fromJson(json) } -> std::convertible_to<std::optional<E>>;
 };
 
-/// Entity supports binary serialization (binary/fromBinary).
+/// E supports binary serialization (binary/fromBinary).
 /// binary() returns std::vector<uint8_t> by value (on-demand serialization).
 /// fromBinary(span) is the canonical input form.
-template<typename Entity>
-concept HasBinarySerialization = requires(const Entity& e, std::span<const uint8_t> data) {
+template<typename E>
+concept HasBinarySerialization = requires(const E& e, std::span<const uint8_t> data) {
     { e.binary() } -> std::convertible_to<std::vector<uint8_t>>;
-    { Entity::fromBinary(data) } -> std::convertible_to<std::optional<Entity>>;
+    { E::fromBinary(data) } -> std::convertible_to<std::optional<E>>;
 };
 
 }  // namespace jcailloux::relais

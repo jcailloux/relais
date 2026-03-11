@@ -59,7 +59,7 @@ tests/
 │   │   ├── TestArticleMapping.h     # + ListDescriptor
 │   │   ├── TestPurchaseMapping.h    # + ListDescriptor
 │   │   ├── TestOrderMapping.h
-│   │   └── TestEventWrapper.h       # Partition key wrapper (Key + partition hint)
+│   │   └── TestEventEntity.h        # Partition key entity (Key + partition hint)
 │   ├── test_helper.h        # PgProvider init, TransactionGuard, sync helpers
 │   ├── TestItem.h            # Pure data struct with @relais annotations
 │   ├── TestUser.h            # ...
@@ -67,7 +67,7 @@ tests/
 │   ├── TestPurchase.h
 │   ├── TestOrder.h           # Complex struct (nested, enum, vectors, raw JSON)
 │   ├── TestEvent.h           # Pure data struct for partitioned table
-│   ├── TestEntities.h       # EntityWrapper<Struct, Mapping> type aliases
+│   ├── TestEntities.h       # Entity<Struct, Mapping> type aliases
 │   └── TestRepositories.h   # Repo classes with 4+ cache configs
 ├── migrations/
 │   ├── 000001_create_test_items.sql
@@ -76,7 +76,7 @@ tests/
 ├── config/
 │   ├── test_l1_config.cpp          # Exhaustive L1 config parameter tests (TTL, refresh, cleanup)
 │   └── test_l2_config.cpp          # Exhaustive L2 config parameter tests (TTL, refresh, strategy)
-├── test_generated_wrapper.cpp      # Unit tests for struct + EntityWrapper + ListWrapper
+├── test_generated_entity.cpp       # Unit tests for struct + Entity + ListWrapper
 ├── test_pg_repo.cpp                # Tests for PgRepo (no cache) + patch
 ├── test_redis_repo.cpp             # Tests for RedisRepo (L2 cache)
 ├── test_local_repo.cpp             # Tests for LocalRepo (L1 cache)

@@ -21,15 +21,15 @@ using namespace relais_test;
 namespace {
 
 // L1 user repo as cross-invalidation target for event tests
-using L1EventTargetUserRepo = Repo<TestUserWrapper, "test:user:l1:event">;
+using L1EventTargetUserRepo = Repo<TestUserEntity, "test:user:l1:event">;
 
 // L1 event repo as cross-invalidation SOURCE (Event → User)
-using L1EventSourceRepo = Repo<TestEventWrapper, "test:event:l1:crossinv",
+using L1EventSourceRepo = Repo<TestEventEntity, "test:event:l1:crossinv",
     cfg::Local,
     Invalidate<L1EventTargetUserRepo, eventUserId>>;
 
 // L1 event repo as cross-invalidation TARGET
-using L1EventAsTargetRepo = Repo<TestEventWrapper, "test:event:l1:target">;
+using L1EventAsTargetRepo = Repo<TestEventEntity, "test:event:l1:target">;
 
 // Async resolver: given a user_id, find event IDs for that user
 struct PurchaseToEventResolver {
@@ -45,7 +45,7 @@ struct PurchaseToEventResolver {
 };
 
 // L1 purchase repo that invalidates event cache via resolver
-using L1PurchaseInvEventRepo = Repo<TestPurchaseWrapper, "test:purchase:l1:event:target",
+using L1PurchaseInvEventRepo = Repo<TestPurchaseEntity, "test:purchase:l1:event:target",
     cfg::Local,
     InvalidateVia<L1EventAsTargetRepo, purchaseUserId, &PurchaseToEventResolver::resolve>>;
 
@@ -475,7 +475,7 @@ TEST_CASE("PartitionKey - serialization",
         CHECK(json.find("\"eu\"") != std::string::npos);
 
         // Round-trip
-        auto restored = TestEventWrapper::fromJson(json);
+        auto restored = TestEventEntity::fromJson(json);
         REQUIRE(restored.has_value());
         CHECK(restored->region == "eu");
         CHECK(restored->title == "JSON Test");
@@ -491,7 +491,7 @@ TEST_CASE("PartitionKey - serialization",
         auto binary = original->binary();
         REQUIRE(!binary.empty());
 
-        auto restored = TestEventWrapper::fromBinary(binary);
+        auto restored = TestEventEntity::fromBinary(binary);
         REQUIRE(restored.has_value());
         CHECK(restored->region == "us");
         CHECK(restored->title == "BEVE Test");
@@ -506,7 +506,7 @@ TEST_CASE("PartitionKey - serialization",
 // #############################################################################
 
 using jcailloux::relais::entity::set;
-using EF = TestEventWrapper::Field;
+using EF = TestEventEntity::Field;
 
 TEST_CASE("PartitionKey<TestEvent> - patch (Uncached)",
           "[integration][db][partition-key][patch]")

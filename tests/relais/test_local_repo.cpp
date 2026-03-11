@@ -63,16 +63,16 @@ namespace relais_test {
 // =============================================================================
 
 /// L1 user repo as cross-invalidation target.
-using L1InvTestUserRepo = Repo<TestUserWrapper, "test:user:l1:inv">;
+using L1InvTestUserRepo = Repo<TestUserEntity, "test:user:l1:inv">;
 
 /// L1 article repo as cross-invalidation target (for InvalidateVia).
-using L1InvTestArticleRepo = Repo<TestArticleWrapper, "test:article:l1:inv">;
+using L1InvTestArticleRepo = Repo<TestArticleEntity, "test:article:l1:inv">;
 
 // =============================================================================
 // Standard cross-invalidation: Purchase → User (L1)
 // =============================================================================
 
-using L1InvTestPurchaseRepo = Repo<TestPurchaseWrapper, "test:purchase:l1:inv",
+using L1InvTestPurchaseRepo = Repo<TestPurchaseEntity, "test:purchase:l1:inv",
     cfg::Local,
     Invalidate<L1InvTestUserRepo, purchaseUserId>>;
 
@@ -95,7 +95,7 @@ struct L1UserArticleResolver {
     }
 };
 
-using L1CustomTestPurchaseRepo = Repo<TestPurchaseWrapper, "test:purchase:l1:custom",
+using L1CustomTestPurchaseRepo = Repo<TestPurchaseEntity, "test:purchase:l1:custom",
     cfg::Local,
     Invalidate<L1InvTestUserRepo, purchaseUserId>,
     InvalidateVia<L1InvTestArticleRepo, purchaseUserId, &L1UserArticleResolver::resolve>>;
@@ -112,14 +112,14 @@ using L1CustomTestPurchaseRepo = Repo<TestPurchaseWrapper, "test:purchase:l1:cus
 class L1PurchaseListInvalidator {
 public:
     static io::Task<void> onEntityModified(
-        const TestPurchaseWrapper&)
+        const TestPurchaseEntity&)
     {
         TestInternals::resetListCacheState<TestPurchaseListRepo>();
         co_return;
     }
 };
 
-using L1ListInvPurchaseRepo = Repo<TestPurchaseWrapper, "test:purchase:l1:listinv",
+using L1ListInvPurchaseRepo = Repo<TestPurchaseEntity, "test:purchase:l1:listinv",
     cfg::Local,
     Invalidate<L1InvTestUserRepo, purchaseUserId>,
     InvalidateList<L1PurchaseListInvalidator>>;
@@ -255,19 +255,19 @@ struct L1MixedResolver {
 // Purchase repos for InvalidateListVia granularity tests
 // =============================================================================
 
-using L1PerPagePurchaseRepo = Repo<TestPurchaseWrapper, "test:purchase:l1:perpage",
+using L1PerPagePurchaseRepo = Repo<TestPurchaseEntity, "test:purchase:l1:perpage",
     cfg::Local,
     InvalidateListVia<L1MockArticleListRepo, purchaseUserId, &L1PerPageResolver::resolve>>;
 
-using L1PerGroupPurchaseRepo = Repo<TestPurchaseWrapper, "test:purchase:l1:pergroup",
+using L1PerGroupPurchaseRepo = Repo<TestPurchaseEntity, "test:purchase:l1:pergroup",
     cfg::Local,
     InvalidateListVia<L1MockArticleListRepo, purchaseUserId, &L1PerGroupResolver::resolve>>;
 
-using L1FullPatternPurchaseRepo = Repo<TestPurchaseWrapper, "test:purchase:l1:fullpattern",
+using L1FullPatternPurchaseRepo = Repo<TestPurchaseEntity, "test:purchase:l1:fullpattern",
     cfg::Local,
     InvalidateListVia<L1MockArticleListRepo, purchaseUserId, &L1FullPatternResolver::resolve>>;
 
-using L1MixedPurchaseRepo = Repo<TestPurchaseWrapper, "test:purchase:l1:mixed",
+using L1MixedPurchaseRepo = Repo<TestPurchaseEntity, "test:purchase:l1:mixed",
     cfg::Local,
     InvalidateListVia<L1MockArticleListRepo, purchaseUserId, &L1MixedResolver::resolve>>;
 
@@ -283,22 +283,22 @@ inline constexpr auto ReadOnlyUserL1 = Local.with_read_only();
 } // namespace test_local
 
 /// L1 read-only item repository — no writes allowed.
-using ReadOnlyL1TestItemRepo = Repo<TestItemWrapper, "test:readonly:l1",
+using ReadOnlyL1TestItemRepo = Repo<TestItemEntity, "test:readonly:l1",
     test_local::ReadOnlyL1>;
 
 /// L1 read-only user repository — LocalRepo provides invalidate().
-using ReadOnlyL1TestUserRepo = Repo<TestUserWrapper, "test:readonly:user:l1",
+using ReadOnlyL1TestUserRepo = Repo<TestUserEntity, "test:readonly:user:l1",
     test_local::ReadOnlyUserL1>;
 
 /// L1 purchase repo whose writes invalidate a read-only user repo.
-using L1ReadOnlyInvPurchaseRepo = Repo<TestPurchaseWrapper, "test:purchase:l1:readonly:inv",
+using L1ReadOnlyInvPurchaseRepo = Repo<TestPurchaseEntity, "test:purchase:l1:readonly:inv",
     cfg::Local,
     Invalidate<ReadOnlyL1TestUserRepo, purchaseUserId>>;
 
 } // namespace relais_test
 
 using jcailloux::relais::entity::set;
-using F = TestUserWrapper::Field;
+using F = TestUserEntity::Field;
 
 
 // #############################################################################

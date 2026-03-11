@@ -265,14 +265,14 @@ struct ListCacheMetadataImpl : cache::CacheMetadata<true, true> {
 // - Modification-based validation on get() and sweep extra predicate
 //
 // Template parameters:
-//   - Entity: The entity type being cached
+//   - E: The entity type being cached
 //   - ChunkCountLog2: log2 of chunk count (default: 3 = 8 chunks)
 //   - Key: The entity ID type (default: int64_t)
 //   - Traits: Traits for filter matching, sorting, etc.
 //   - GDSF: Enable GDSF score tracking
 
-template<typename Entity, uint8_t ChunkCountLog2 = 3,
-         typename Key = int64_t, typename Traits = ListCacheTraits<Entity>,
+template<typename E, uint8_t ChunkCountLog2 = 3,
+         typename Key = int64_t, typename Traits = ListCacheTraits<E>,
          bool GDSF = true>
 class ListCache {
 public:
@@ -281,11 +281,11 @@ public:
     using FilterSet = typename Traits::Filters;
     using SortFieldEnum = typename Traits::SortField;
     using Query = ListQuery<FilterSet, SortFieldEnum>;
-    using Result = jcailloux::relais::list::ListWrapper<Entity>;
+    using Result = jcailloux::relais::list::ListWrapper<E>;
     using ResultView = jcailloux::relais::cache::CacheView<Result>;
-    using Modification = EntityModification<Entity>;
+    using Modification = EntityModification<E>;
 
-    using ModTracker = ModificationTracker<Entity, ChunkCount>;
+    using ModTracker = ModificationTracker<E, ChunkCount>;
     using BitmapType = typename ModTracker::BitmapType;
 
 private:
@@ -386,19 +386,19 @@ public:
     // =========================================================================
 
     /// Record entity creation for invalidation
-    void onEntityCreated(const Entity& entity) {
+    void onEntityCreated(const E& entity) {
         uint32_t gen = generation_.fetch_add(1, std::memory_order_relaxed) + 1;
         modifications_.notifyCreated(entity, gen);
     }
 
     /// Record entity update for invalidation
-    void onEntityUpdated(const Entity& old_entity, const Entity& new_entity) {
+    void onEntityUpdated(const E& old_entity, const E& new_entity) {
         uint32_t gen = generation_.fetch_add(1, std::memory_order_relaxed) + 1;
         modifications_.notifyUpdated(old_entity, new_entity, gen);
     }
 
     /// Record entity deletion for invalidation
-    void onEntityDeleted(const Entity& entity) {
+    void onEntityDeleted(const E& entity) {
         uint32_t gen = generation_.fetch_add(1, std::memory_order_relaxed) + 1;
         modifications_.notifyDeleted(entity, gen);
     }
@@ -548,7 +548,7 @@ private:
     }
 
     /// Check if an entity falls within this page's sort range
-    bool isEntityInPageRange(const Entity& entity,
+    bool isEntityInPageRange(const E& entity,
                               const Query& query,
                               const Result& result,
                               const SortBounds& bounds,
@@ -568,7 +568,7 @@ private:
     }
 
     /// Slow path for range checking using entity comparison
-    bool isEntityInPageRangeSlow(const Entity& entity,
+    bool isEntityInPageRangeSlow(const E& entity,
                                   const Query& query,
                                   const Result& result,
                                   const SortSpec<SortFieldEnum>& sort) const {

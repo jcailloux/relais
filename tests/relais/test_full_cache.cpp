@@ -55,24 +55,24 @@ inline constexpr auto WriteThrough = Both
 // (already defined in TestRepositories.h)
 
 // Short L1 TTL + L2: for expiration fallback tests
-using ShortL1BothItemRepo = Repo<TestItemWrapper, "test:both:short", test_both::ShortL1>;
+using ShortL1BothItemRepo = Repo<TestItemEntity, "test:both:short", test_both::ShortL1>;
 
 // Write-through at L1+L2
-using WriteThroughBothItemRepo = Repo<TestItemWrapper, "test:both:wt", test_both::WriteThrough>;
+using WriteThroughBothItemRepo = Repo<TestItemEntity, "test:both:wt", test_both::WriteThrough>;
 
 // L1+L2 user repo for cross-invalidation target
-using FullCacheInvUserRepo = Repo<TestUserWrapper, "test:user:both:inv", cfg::Both>;
+using FullCacheInvUserRepo = Repo<TestUserEntity, "test:user:both:inv", cfg::Both>;
 
 // L1+L2 purchase repo with cross-invalidation → user
-using FullCachePurchaseRepo = Repo<TestPurchaseWrapper, "test:purchase:both",
+using FullCachePurchaseRepo = Repo<TestPurchaseEntity, "test:purchase:both",
     cfg::Both,
     Invalidate<FullCacheInvUserRepo, purchaseUserId>>;
 
 using jcailloux::relais::entity::set;
-using F = TestUserWrapper::Field;
+using F = TestUserEntity::Field;
 
 // L1+L2 article repo for InvalidateVia target
-using FullCacheInvArticleRepo = Repo<TestArticleWrapper, "test:article:both:inv", cfg::Both>;
+using FullCacheInvArticleRepo = Repo<TestArticleEntity, "test:article:both:inv", cfg::Both>;
 
 // Resolver: Purchase user_id → Article IDs by same author
 struct BothUserArticleResolver {
@@ -87,20 +87,20 @@ struct BothUserArticleResolver {
 };
 
 // Purchase repo with Invalidate<User> + InvalidateVia<Article> at cfg::Both
-using FullCacheCustomPurchaseRepo = Repo<TestPurchaseWrapper, "test:purchase:both:custom",
+using FullCacheCustomPurchaseRepo = Repo<TestPurchaseEntity, "test:purchase:both:custom",
     cfg::Both,
     Invalidate<FullCacheInvUserRepo, purchaseUserId>,
     InvalidateVia<FullCacheInvArticleRepo, purchaseUserId, &BothUserArticleResolver::resolve>>;
 
 // L1+L2 purchase list repo (target of InvalidateList cross-invalidation)
-using BothPurchaseListRepo = Repo<TestPurchaseWrapper, "test:purchase:list:both:forinv", cfg::Both>;
+using BothPurchaseListRepo = Repo<TestPurchaseEntity, "test:purchase:list:both:forinv", cfg::Both>;
 using BothPurchaseListQuery = BothPurchaseListRepo::ListQuery;
 
 // Invalidator that clears both L1 and L2 for the purchase list
 class BothPurchaseListInvalidator {
 public:
     static io::Task<void> onEntityModified(
-        const TestPurchaseWrapper&)
+        const TestPurchaseEntity&)
     {
         TestInternals::resetListCacheState<BothPurchaseListRepo>();
         co_await BothPurchaseListRepo::invalidateAllListGroups();
@@ -108,7 +108,7 @@ public:
 };
 
 // Purchase repo with InvalidateList at cfg::Both
-using FullCacheListInvPurchaseRepo = Repo<TestPurchaseWrapper, "test:purchase:both:listinv",
+using FullCacheListInvPurchaseRepo = Repo<TestPurchaseEntity, "test:purchase:both:listinv",
     cfg::Both,
     InvalidateList<BothPurchaseListInvalidator>>;
 

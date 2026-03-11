@@ -500,7 +500,7 @@ TEST_CASE("PgRepo<TestPurchase> - multiple purchases per user", "[integration][d
 
 using jcailloux::relais::entity::set;
 using jcailloux::relais::entity::setNull;
-using F = TestUserWrapper::Field;
+using F = TestUserEntity::Field;
 
 TEST_CASE("PgRepo - patch single field", "[integration][db][base][patch]") {
     TransactionGuard tx;
@@ -865,20 +865,20 @@ namespace uncached_list {
 /**
  * Uncached article list repo — uses cachedList pass-through.
  */
-class UncachedArticleListRepo : public Repo<TestArticleWrapper, "test:article:list:uncached", cfg::Uncached> {
+class UncachedArticleListRepo : public Repo<TestArticleEntity, "test:article:list:uncached", cfg::Uncached> {
 public:
-    static io::Task<std::vector<TestArticleWrapper>> getByCategory(
+    static io::Task<std::vector<TestArticleEntity>> getByCategory(
         const std::string& category, int limit = 10)
     {
         co_return co_await cachedList(
-            [category, limit]() -> io::Task<std::vector<TestArticleWrapper>> {
+            [category, limit]() -> io::Task<std::vector<TestArticleEntity>> {
                 auto result = co_await jcailloux::relais::PgProvider::queryArgs(
                     "SELECT id, category, author_id, title, view_count, is_published, published_at, created_at "
                     "FROM relais_test_articles WHERE category = $1 ORDER BY created_at DESC LIMIT $2",
                     category, limit);
-                std::vector<TestArticleWrapper> entities;
+                std::vector<TestArticleEntity> entities;
                 for (size_t i = 0; i < result.rows(); ++i) {
-                    if (auto e = entity::generated::TestArticleMapping::fromRow<TestArticleWrapper>(result[i]))
+                    if (auto e = entity::generated::TestArticleMapping::fromRow<TestArticleEntity>(result[i]))
                         entities.push_back(std::move(*e));
                 }
                 co_return entities;
@@ -887,18 +887,18 @@ public:
         );
     }
 
-    static io::Task<std::vector<TestArticleWrapper>> getByCategoryTracked(
+    static io::Task<std::vector<TestArticleEntity>> getByCategoryTracked(
         const std::string& category, int limit = 5, int offset = 0)
     {
         co_return co_await cachedListTracked(
-            [category, limit, offset]() -> io::Task<std::vector<TestArticleWrapper>> {
+            [category, limit, offset]() -> io::Task<std::vector<TestArticleEntity>> {
                 auto result = co_await jcailloux::relais::PgProvider::queryArgs(
                     "SELECT id, category, author_id, title, view_count, is_published, published_at, created_at "
                     "FROM relais_test_articles WHERE category = $1 ORDER BY view_count DESC LIMIT $2 OFFSET $3",
                     category, limit, offset);
-                std::vector<TestArticleWrapper> entities;
+                std::vector<TestArticleEntity> entities;
                 for (size_t i = 0; i < result.rows(); ++i) {
-                    if (auto e = entity::generated::TestArticleMapping::fromRow<TestArticleWrapper>(result[i]))
+                    if (auto e = entity::generated::TestArticleMapping::fromRow<TestArticleEntity>(result[i]))
                         entities.push_back(std::move(*e));
                 }
                 co_return entities;
@@ -929,7 +929,7 @@ public:
 /**
  * Uncached article list repo — uses cachedListAs pass-through (typed list entity).
  */
-class UncachedArticleListAsRepo : public Repo<TestArticleWrapper, "test:article:as:list:uncached", cfg::Uncached> {
+class UncachedArticleListAsRepo : public Repo<TestArticleEntity, "test:article:as:list:uncached", cfg::Uncached> {
 public:
     static io::Task<TestArticleList> getByCategory(
         const std::string& category, int limit = 10)
@@ -1120,7 +1120,7 @@ TEST_CASE("PgRepo - uncached list queries (listAs)", "[integration][db][base][li
 //
 // #############################################################################
 
-using ProductField = TestProductWrapper::Field;
+using ProductField = TestProductEntity::Field;
 
 TEST_CASE("PgRepo<TestProduct> - find with column= mapping", "[integration][db][base][product][column_mapping]") {
     TransactionGuard tx;
@@ -1446,7 +1446,7 @@ TEST_CASE("PgRepo - findBinary (Uncached)", "[integration][db][base][findBinary]
         REQUIRE(!beve.empty());
 
         // Roundtrip: BEVE → entity
-        auto entity = TestUserWrapper::fromBinary(beve);
+        auto entity = TestUserEntity::fromBinary(beve);
         REQUIRE(entity.has_value());
         REQUIRE(entity->username == "fb_user");
         REQUIRE(entity->balance == 200);
@@ -1466,7 +1466,7 @@ TEST_CASE("PgRepo - findBinary (Uncached)", "[integration][db][base][findBinary]
 
         auto beve2 = sync(UncachedTestUserRepo::findBinary(id));
         REQUIRE(!beve2.empty());
-        auto entity = TestUserWrapper::fromBinary(beve2);
+        auto entity = TestUserEntity::fromBinary(beve2);
         REQUIRE(entity.has_value());
         REQUIRE(entity->balance == 777);
     }

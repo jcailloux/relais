@@ -61,7 +61,7 @@ inline constexpr auto NoTTL = Local
 
 namespace relais_test {
 
-using GDSFBenchRepo = Repo<TestItemWrapper, "bench:gdsf:zipf", gdsf_bench::NoTTL>;
+using GDSFBenchRepo = Repo<TestItemEntity, "bench:gdsf:zipf", gdsf_bench::NoTTL>;
 
 } // namespace relais_test
 

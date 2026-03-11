@@ -12,7 +12,7 @@ Technical details about the relais test infrastructure.
 │  test_decl_list_cache.cpp      ListMixin (L1 lists)                  │
 │  test_local_repo.cpp           LocalRepo (L1 cache)          │
 │  test_partition_key.cpp         PartitionKey (composite PK, partitions) │
-│  test_generated_wrapper.cpp    Struct + EntityWrapper + ListWrapper  │
+│  test_generated_entity.cpp     Struct + Entity + ListWrapper          │
 └─────────────────────────────────────────────────────────────────────┘
                               │
                               ▼
@@ -30,7 +30,7 @@ Technical details about the relais test infrastructure.
 │                        Entity layer                                  │
 │    TestItem.h (pure struct)     TestUser.h     TestArticle.h        │
 │    TestPurchase.h     TestEvent.h (composite PK: id+region)         │
-│    generated/*Wrapper.h  (Mapping + EntityWrapper aliases)          │
+│    generated/*Entity.h   (Mapping + Entity aliases)                 │
 │    - fromRow / toInsertParams / key                       │
 └─────────────────────────────────────────────────────────────────────┘
                               │
@@ -93,22 +93,22 @@ Bypass the repository to set up test data:
 - `updateTestItem(id, name, value)` - Direct UPDATE
 - `deleteTestItem(id)` - Direct DELETE
 
-### Entity Structs + EntityWrapper
+### Entity Structs + Entity
 
 Each test entity has two layers:
 
 1. **Pure data struct** (e.g., `TestItem.h`): Framework-agnostic struct with `@relais` annotations and `glz::meta` specialization
-2. **EntityWrapper alias** (in `TestEntities.h`): `EntityWrapper<Struct, Mapping>` combining the struct with its generated ORM mapping
+2. **Entity alias** (in `TestEntities.h`): `Entity<Struct, Mapping>` combining the struct with its generated ORM mapping
 
 ```cpp
 // Pure struct
 struct TestItem { int64_t id; std::string name; ... };
 
-// Wrapped for API use
-using TestItemEntity = EntityWrapper<TestItem, generated::TestItemMapping>;
+// Entity for API use
+using TestItemEntity = Entity<TestItem, generated::TestItemMapping>;
 ```
 
-`EntityWrapper` inherits from the struct and adds:
+`Entity` inherits from the struct and adds:
 - `fromRow(PgResult::Row)` / `toInsertParams(Entity)` — delegated to Mapping
 - `binary()` / `json()` — thread-safe lazy serialization via Glaze
 - `key()` — delegated to Mapping
@@ -140,7 +140,7 @@ class L2TestItemRepo : public Repo<..., config::L2Only> {};
 class FullCacheTestItemRepo : public Repo<..., config::Both> {};
 ```
 
-All entity types are `EntityWrapper<Struct, Mapping>` aliases defined in `TestEntities.h`. List types use `ListWrapper<EntityType>`.
+All entity types are `Entity<Struct, Mapping>` aliases defined in `TestEntities.h`. List types use `ListWrapper<EntityType>`.
 
 ## Test Database Schema
 
@@ -234,7 +234,7 @@ L1Repo::clearCache();
 ./test_relais_base "[PgRepo] CRUD Operations" -s
 ```
 
-## Redis Repo Tests (`test_redis_repository.cpp`)
+## Redis Repo Tests (`test_redis_repo.cpp`)
 
 Comprehensive integration tests for the L2 (Redis) cache layer, organized in 17 logical sections:
 
