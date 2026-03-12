@@ -28,7 +28,7 @@ namespace detail {
 // =============================================================================
 
 struct FramePool {
-    static constexpr size_t kMaxFrameSize = 1024;   // frames > 1KB bypass pool
+    static constexpr size_t kMaxFrameSize = 1024;   // >1KB frames fall back to global allocator
     static constexpr size_t kMaxCached    = 128;     // max blocks per size class
 
     struct Block {
@@ -40,7 +40,7 @@ struct FramePool {
         size_t count = 0;
     };
 
-    // Size classes: 64, 128, 192, 256, 320, 384, 448, 512, 576, 640, 704, 768, 832, 896, 960, 1024
+    // Cache-line aligned. Classes: 64, 128, 192, ..., 1024
     static constexpr size_t kGranularity = 64;
     static constexpr size_t kNumClasses  = kMaxFrameSize / kGranularity;
 

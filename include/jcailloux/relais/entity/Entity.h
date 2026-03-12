@@ -112,6 +112,9 @@ public:
     // =========================================================================
     // Binary serialization (Glaze BEVE, on-demand)
     // =========================================================================
+    //
+    // On-demand serialization (allocates each call). For cached serialization,
+    // use Repo::findJson() / Repo::findBinary() which leverage L1/L2 cache.
 
     [[nodiscard]] std::vector<uint8_t> binary() const {
         std::vector<uint8_t> buf;

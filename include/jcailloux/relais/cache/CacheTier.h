@@ -151,6 +151,7 @@ public:
         }
 
         // GDSF access count bump
+        // Relaxed OK: best-effort counter, cleanup is single-threaded per chunk
         if constexpr (kHasGDSF) {
             ce->metadata.gdsfData().access_count.fetch_add(
                 GDSFScoreData::kCountScale, std::memory_order_relaxed);
@@ -223,6 +224,7 @@ public:
                     entry->outcome = result
                         ? InflightEntry::Outcome::found
                         : InflightEntry::Outcome::not_found;
+                    // Release: publishes outcome to follower coroutines
                     entry->done.store(true, std::memory_order_release);
                 }
             } catch (...) {
@@ -230,6 +232,7 @@ public:
                     std::lock_guard lk(entry->mu);
                     entry->outcome = InflightEntry::Outcome::error;
                     entry->error = std::current_exception();
+                    // Release: publishes outcome to follower coroutines
                     entry->done.store(true, std::memory_order_release);
                 }
                 for (auto h : entry->waiters) h.resume();
@@ -468,7 +471,7 @@ public:
 
     /// Record a construction cost measurement (updates EMA).
     void recordCost(float elapsed_us) {
-        constexpr float kAlpha = 0.1f;
+        constexpr float kAlpha = 0.1f;  // EMA smoothing: 10% new, 90% history
         float old_avg = avg_cost_us_.load(std::memory_order_relaxed);
         float new_avg;
         if (old_avg == 0.0f) {
@@ -555,6 +558,7 @@ private:
         std::shared_ptr<InflightEntry> entry;
 
         bool await_ready() const noexcept {
+            // Acquire: pairs with leader's release on done
             return entry->done.load(std::memory_order_acquire);
         }
 

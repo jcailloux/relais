@@ -36,9 +36,9 @@ namespace jcailloux::relais::cache {
 // =========================================================================
 
 struct GDSFConfig {
-    float decay_rate = 0.95f;
+    float decay_rate = 0.95f;                // x0.95 per sweep; after 14 sweeps: count ~ 49%
     float histogram_alpha = 0.3f;            // EMA smoothing for histogram merges
-    float admission_pressure = 0.95f;        // ghost gate activates at this pressure (0.0–1.0)
+    float admission_pressure = 0.95f;        // admit only above 95% memory use (5% headroom)
     size_t memory_counter_slots = 64;        // must be power of 2, <= 64
     size_t max_memory = 0;                   // L1 memory budget in bytes (0 = from env / unlimited)
     long chunk_count = 8;                    // number of chunks for all ChunkMaps (uniform)
@@ -65,7 +65,7 @@ inline float fast_log2_approx(float x) {
 // Size: 128 x 8B = 1KB.
 
 struct ScoreHistogram {
-    static constexpr int N = 128;
+    static constexpr int N = 128;                 // 128 log2 buckets covering [2^-10 .. 2^23.25]
     static constexpr float kLogMin = -10.0f;     // log2(0.001) ~ -10
     static constexpr float kLogMax = 23.25f;     // log2(10M) ~ 23.25
     static constexpr float kInvStep = static_cast<float>(N) / (kLogMax - kLogMin);

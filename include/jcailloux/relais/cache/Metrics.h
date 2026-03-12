@@ -21,7 +21,7 @@ namespace jcailloux::relais::cache {
 /// hash(thread_id) & 7 — on glibc, pthread_t addresses are 8MB-aligned so
 /// the low 3 bits are always 0, mapping all threads to the same slot.
 struct StripedCounter {
-    static constexpr unsigned kSlots = 8;
+    static constexpr unsigned kSlots = 8;   // <=8 threads: exact. >8: some lost (OK for diagnostics)
     static constexpr unsigned kMask = kSlots - 1;
 
     struct alignas(64) Slot {

@@ -400,7 +400,7 @@ private:
     // Hash collisions are safe: two keys sharing a slot may cause an
     // unnecessary cache miss (pessimistic), never stale data.
 
-    static constexpr size_t kGenSlots = 4096;
+    static constexpr size_t kGenSlots = 4096;  // Power-of-2 mask. Collision = pessimistic miss, never stale
     using GenHash = cache::detail::AutoHash<Key>;
     static inline std::array<std::atomic<uint32_t>, kGenSlots> generation_slots_{};
 

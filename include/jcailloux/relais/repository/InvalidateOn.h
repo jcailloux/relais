@@ -8,6 +8,22 @@
 namespace jcailloux::relais {
 
 // =============================================================================
+// Cross-invalidation — choose based on use case:
+//
+// 1. Invalidate<Target, &Source::fk>
+//    Direct entity->entity. Source change -> invalidate target by FK.
+//
+// 2. InvalidateList<ListRepo>
+//    Direct entity->list. Source change -> notify list cache.
+//
+// 3. InvalidateVia<Target, &Source::fk, &Resolver::resolve>
+//    Indirect entity->entity via async resolver.
+//
+// 4. InvalidateListVia<ListRepo, &Source::fk, &Resolver::resolve>
+//    Indirect entity->list with selective page invalidation.
+// =============================================================================
+
+// =============================================================================
 // InvalidationData - Carries old/new entity values for cross-invalidation
 // =============================================================================
 

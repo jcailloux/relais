@@ -57,6 +57,7 @@ struct GDSFScoreData {
     const GDSFScoreData& gdsfData() const { return *this; }
 
     // --- Manual copy/move (std::atomic is non-copyable) ---
+    // Relaxed loads: copy/move happens during single-threaded upsert only
 
     GDSFScoreData(const GDSFScoreData& o)
         : access_count(o.access_count.load(std::memory_order_relaxed)) {}

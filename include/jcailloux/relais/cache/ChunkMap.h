@@ -541,6 +541,7 @@ private:
     MapType& map_;
     epoch::memory_pool<CacheEntry>& pool_ = shared_pool();
     std::atomic<long> cleanup_cursor_{0};
+    // Approximate diagnostic counter (relaxed atomics, no cross-thread sync guarantee)
     std::atomic<long> live_count_{0};
 
 #ifdef RELAIS_BUILDING_TESTS

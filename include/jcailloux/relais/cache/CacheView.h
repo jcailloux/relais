@@ -13,6 +13,9 @@ namespace jcailloux::relais::cache {
 //
 // sizeof(CacheView) = 12 bytes (ptr 8 + ticket int 4).
 // Thread-agnostic: tickets migrate freely across threads (safe across co_await).
+//
+// Pointer valid ONLY while guard exists. Do not store the raw pointer;
+// store the CacheView itself (moveable, non-copyable).
 // =============================================================================
 
 template<typename T>

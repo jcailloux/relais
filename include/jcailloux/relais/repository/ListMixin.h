@@ -156,6 +156,7 @@ class ListMixin : public Base {
             return list::spec::sortFieldName<Descriptor>(field_index);
         }
 
+        // Bucketed page sizes for cache key normalization
         static constexpr std::array<uint16_t, 4> limitSteps = {10, 25, 50, 100};
         static constexpr uint16_t maxLimit = 100;
 
