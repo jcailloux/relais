@@ -27,8 +27,8 @@ using namespace relais_test;
 
 namespace relais_test {
 
-using FullCacheArticleListRepo = Repo<TestArticleWrapper, "test:article:list:both", cfg::Both>;
-using FullCachePurchaseListRepo = Repo<TestPurchaseWrapper, "test:purchase:list:both", cfg::Both>;
+using FullCacheArticleListRepo = Repo<TestArticleEntity, "test:article:list:both", cfg::Both>;
+using FullCachePurchaseListRepo = Repo<TestPurchaseEntity, "test:purchase:list:both", cfg::Both>;
 
 using FullArticleListQuery = FullCacheArticleListRepo::ListQuery;
 using FullPurchaseListQuery = FullCachePurchaseListRepo::ListQuery;
@@ -39,7 +39,7 @@ using FullPurchaseListQuery = FullCachePurchaseListRepo::ListQuery;
 // L1+L2 query helpers
 // =============================================================================
 
-namespace decl = jcailloux::relais::cache::list::decl;
+namespace decl = jcailloux::relais::list::spec;
 
 static FullArticleListQuery makeFullArticleQuery(
     std::optional<std::string> category = std::nullopt,
@@ -470,7 +470,7 @@ TEST_CASE("[DeclList L1+L2] L2 hit repopulates L1",
 // #############################################################################
 
 namespace {
-namespace list_ns = jcailloux::relais::cache::list;
+namespace list_ns = jcailloux::relais::list;
 
 using FullArticleDecl = FullCacheArticleListRepo::ListDescriptorType;
 using FullArticleDescQuery = decl::ListDescriptorQuery<FullArticleDecl>;

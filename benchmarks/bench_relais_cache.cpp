@@ -41,7 +41,7 @@ using namespace relais_bench;
 // #############################################################################
 
 /// Bare L1 — no TTL, no GDSF, zero metadata per entry
-using BareL1TestItemRepo = Repo<TestItemWrapper, "bench:bare_l1", test_config::BareL1>;
+using BareL1TestItemRepo = Repo<TestItemEntity, "bench:bare_l1", test_config::BareL1>;
 
 namespace {
 inline std::string gdsf_banner() {
@@ -60,19 +60,37 @@ TEST_CASE("Benchmark - L1 cache hit", "[benchmark][l1]")
 {
     TransactionGuard tx;
 
-    static constexpr int NUM_KEYS = 10000;
+    static constexpr int NUM_KEYS = 1000000;
     static constexpr int THREADS = 6;
 
     WARN(gdsf_banner());
 
+    // Bulk insert (single SQL round-trip)
+    auto t_insert = Clock::now();
+    auto bulk = execQueryArgs(
+        "INSERT INTO relais_test_items (name, value, description, is_active) "
+        "SELECT 'bench_l1_' || i, i::int4, 'desc_' || i, true "
+        "FROM generate_series(0, $1::int) AS i "
+        "RETURNING id",
+        NUM_KEYS - 1);
+    auto insert_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        Clock::now() - t_insert).count();
+
     std::vector<int64_t> ids;
     ids.reserve(NUM_KEYS);
-    for (int i = 0; i < NUM_KEYS; ++i) {
-        auto kid = insertTestItem("bench_l1_" + std::to_string(i), i);
-        sync(BareL1TestItemRepo::find(kid));
-        sync(L1TestItemRepo::find(kid));
-        ids.push_back(kid);
+    for (int r = 0; r < bulk.rows(); ++r)
+        ids.push_back(bulk[r].get<int64_t>(0));
+
+    // Warm both L1 caches (sequential find, each triggers DB fetch → L1 store)
+    auto t_warm = Clock::now();
+    for (auto id : ids) {
+        sync(BareL1TestItemRepo::find(id));
+        sync(L1TestItemRepo::find(id));
     }
+    auto warm_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        Clock::now() - t_warm).count();
+    WARN("\n  Insert: " << insert_ms << " ms  |  Warmup: " << warm_ms << " ms  |  "
+         << ids.size() << " keys");
 
     // Pure L1 lookup via getFromCache — no Immediate, no coroutine, no sync().
     // Measures: ParlayHash find + epoch guard + TTL check (if enabled)

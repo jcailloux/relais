@@ -10,7 +10,7 @@
  *   3. Eviction decisions      — histogram-based threshold eviction
  *   4. Avg construction time   — EMA convergence
  *   5. Optional TTL            — TTL-based vs score-only eviction
- *   6. CachedWrapper memory    — ctor charges, dtor discharges, lazy buffers
+ *   6. Memory tracking          — ParlayHash hook charges on insert/evict
  *   7. Memory pressure         — emergency cleanup when over budget
  *   8. Striped counter         — multi-slot memory accounting
  *   9. Repo auto-registration  — enrollment via std::call_once
@@ -58,9 +58,9 @@ using namespace jcailloux::relais::config;
 // Manual cleanup only (predictable tests — sweep triggered externally)
 inline constexpr auto ManualCleanup = Local;
 
-// Short TTL for expiration tests
+// Short TTL for expiration tests (1 second — CachedClock uses uint32_t seconds)
 inline constexpr auto ShortTTL = Local
-    .with_l1_ttl(std::chrono::milliseconds{50});
+    .with_l1_ttl(std::chrono::seconds{1});
 
 // No TTL (GDSF score only, 0ns disables TTL)
 inline constexpr auto NoTTL = Local
@@ -73,36 +73,36 @@ namespace relais_test {
 namespace gt = gdsf_test;
 
 // Score / decay / eviction test repos
-using GDSFItemRepo     = Repo<TestItemWrapper, "gdsf:item",       gt::ManualCleanup>;
-using GDSFItemRepo2    = Repo<TestItemWrapper, "gdsf:item2",      gt::ManualCleanup>;
-using GDSFUserRepo     = Repo<TestUserWrapper, "gdsf:user",       gt::ManualCleanup>;
+using GDSFItemRepo     = Repo<TestItemEntity, "gdsf:item",       gt::ManualCleanup>;
+using GDSFItemRepo2    = Repo<TestItemEntity, "gdsf:item2",      gt::ManualCleanup>;
+using GDSFUserRepo     = Repo<TestUserEntity, "gdsf:user",       gt::ManualCleanup>;
 
 // TTL test repos
-using GDSFShortTTLRepo = Repo<TestItemWrapper, "gdsf:ttl:short",  gt::ShortTTL>;
-using GDSFNoTTLRepo    = Repo<TestItemWrapper, "gdsf:ttl:none",   gt::NoTTL>;
+using GDSFShortTTLRepo = Repo<TestItemEntity, "gdsf:ttl:short",  gt::ShortTTL>;
+using GDSFNoTTLRepo    = Repo<TestItemEntity, "gdsf:ttl:none",   gt::NoTTL>;
 
-// Memory tracking test repos (dedicated to avoid stale CachedWrapper interference)
-using GDSFMemRepo      = Repo<TestItemWrapper, "gdsf:mem",        gt::ManualCleanup>;
+// Memory tracking test repos (dedicated to avoid stale entry interference)
+using GDSFMemRepo      = Repo<TestItemEntity, "gdsf:mem",        gt::ManualCleanup>;
 
 // Registration-only repos (first access enrolls them)
-using GDSFRegRepo1     = Repo<TestItemWrapper, "gdsf:reg:1",      gt::ManualCleanup>;
-using GDSFRegRepo2     = Repo<TestItemWrapper, "gdsf:reg:2",      gt::ManualCleanup>;
-using GDSFRegRepo3     = Repo<TestItemWrapper, "gdsf:reg:3",      gt::ManualCleanup>;
+using GDSFRegRepo1     = Repo<TestItemEntity, "gdsf:reg:1",      gt::ManualCleanup>;
+using GDSFRegRepo2     = Repo<TestItemEntity, "gdsf:reg:2",      gt::ManualCleanup>;
+using GDSFRegRepo3     = Repo<TestItemEntity, "gdsf:reg:3",      gt::ManualCleanup>;
 
 // Memory pressure test repos (dedicated to avoid stale-entry interference)
-using GDSFPressureRepo  = Repo<TestItemWrapper, "gdsf:pressure",   gt::ManualCleanup>;
-using GDSFPressureRepo2 = Repo<TestItemWrapper, "gdsf:pressure2",  gt::ManualCleanup>;
+using GDSFPressureRepo  = Repo<TestItemEntity, "gdsf:pressure",   gt::ManualCleanup>;
+using GDSFPressureRepo2 = Repo<TestItemEntity, "gdsf:pressure2",  gt::ManualCleanup>;
 
 // Ghost admission control test repos
-using GDSFGhostRepo   = Repo<TestItemWrapper, "gdsf:ghost",   gt::ManualCleanup>;
-using GDSFGhostRepo2  = Repo<TestItemWrapper, "gdsf:ghost2",  gt::ManualCleanup>;
+using GDSFGhostRepo   = Repo<TestItemEntity, "gdsf:ghost",   gt::ManualCleanup>;
+using GDSFGhostRepo2  = Repo<TestItemEntity, "gdsf:ghost2",  gt::ManualCleanup>;
 
 // Cross-repo coordination test repos
-using GDSFCoordRepo1  = Repo<TestItemWrapper, "gdsf:coord1",  gt::ManualCleanup>;
-using GDSFCoordRepo2  = Repo<TestItemWrapper, "gdsf:coord2",  gt::ManualCleanup>;
+using GDSFCoordRepo1  = Repo<TestItemEntity, "gdsf:coord1",  gt::ManualCleanup>;
+using GDSFCoordRepo2  = Repo<TestItemEntity, "gdsf:coord2",  gt::ManualCleanup>;
 
 // Stress test repo (Zipfian memory bound)
-using GDSFStressRepo  = Repo<TestItemWrapper, "gdsf:stress",  gt::ManualCleanup>;
+using GDSFStressRepo  = Repo<TestItemEntity, "gdsf:stress",  gt::ManualCleanup>;
 
 } // namespace relais_test
 
@@ -115,7 +115,7 @@ template<typename... Repos>
 void resetRepos() {
     // Unconditional cache clear (not threshold-based purge, which skips entries above threshold=0)
     (TestInternals::resetEntityCacheState<Repos>(), ...);
-    // Flush all deferred CachedWrapper destructors accumulated in the epoch pool.
+    // Flush all deferred destructors accumulated in the epoch pool.
     // Without this, the pool's reserve FIFO (capacity 500) eventually triggers
     // old dtors after resetGDSF() zeroed totalMemory, causing negative accounting.
     (TestInternals::clearEntityCachePools<Repos>(), ...);
@@ -401,8 +401,8 @@ TEST_CASE("GDSF - optional TTL",
 
         REQUIRE(GDSFShortTTLRepo::size() == 1);
 
-        // Wait for 50ms TTL to expire
-        waitForExpiration(std::chrono::milliseconds{80});
+        // Wait for 1s TTL to expire (worst-case quantization adds ~1s)
+        waitForExpiration(std::chrono::milliseconds{2200});
 
         // Cleanup should evict despite high access count
         GDSFShortTTLRepo::purge();
@@ -438,61 +438,31 @@ TEST_CASE("GDSF - optional TTL",
         auto meta = TestInternals::getEntityGDSFMetadata<GDSFNoTTLRepo>(id);
         REQUIRE(meta.has_value());
         // NoTTL repo uses CacheMetadata<true, false> — no TTL field
-        REQUIRE(meta->ttl_expiration_rep == 0);
+        REQUIRE(meta->ttl_expiration_sec == 0);
     }
 }
 
 
 // #############################################################################
 //
-//  6. GDSF - CachedWrapper memory tracking
+//  6. GDSF - memory tracking
 //
 // #############################################################################
 
-TEST_CASE("GDSF - CachedWrapper memory tracking",
+TEST_CASE("GDSF - memory tracking",
           "[integration][db][gdsf][memory][wrapper]")
 {
     TransactionGuard tx;
     resetRepos<GDSFMemRepo>();
 
-    SECTION("[wrapper] putInCache charges memory via CachedWrapper ctor") {
+    SECTION("[wrapper] putInCache charges memory via ParlayHash hook") {
         REQUIRE(GDSFPolicy::instance().totalMemory() == 0);
 
         auto id = insertTestItem("mem_charge", 42);
         sync(GDSFMemRepo::find(id));
 
-        // CachedWrapper ctor should have charged memory
+        // ParlayHash memory hook should have charged bucket allocations
         REQUIRE(GDSFPolicy::instance().totalMemory() > 0);
-    }
-
-    SECTION("[wrapper] lazy json() generation charges additional memory") {
-        auto id = insertTestItem("mem_json", 42);
-        sync(GDSFMemRepo::find(id));
-
-        size_t mem_after_find = GDSFPolicy::instance().totalMemory();
-        REQUIRE(mem_after_find > 0);
-
-        // Trigger JSON buffer generation via findJson
-        sync(GDSFMemRepo::findJson(id));
-
-        size_t mem_after_json = GDSFPolicy::instance().totalMemory();
-        // JSON buffer should have added memory
-        REQUIRE(mem_after_json > mem_after_find);
-    }
-
-    SECTION("[wrapper] lazy binary() generation charges additional memory") {
-        auto id = insertTestItem("mem_binary", 42);
-        sync(GDSFMemRepo::find(id));
-
-        size_t mem_after_find = GDSFPolicy::instance().totalMemory();
-        REQUIRE(mem_after_find > 0);
-
-        // Trigger BEVE buffer generation via findBinary
-        sync(GDSFMemRepo::findBinary(id));
-
-        size_t mem_after_binary = GDSFPolicy::instance().totalMemory();
-        // BEVE buffer should have added memory
-        REQUIRE(mem_after_binary > mem_after_find);
     }
 }
 
@@ -572,7 +542,7 @@ TEST_CASE("GDSF - memory pressure (global sweep)",
 
         // After sustained use, totalMemory should be bounded.
         // Tolerance accounts for: chunk-based sweep granularity,
-        // epoch-deferred CachedWrapper destructors, and ghost entry overhead.
+        // epoch-deferred destructors, and ghost entry overhead.
          size_t mem = GDSFPolicy::instance().totalMemory();
         REQUIRE(mem <= kSmallBudget * 3);
 
@@ -603,7 +573,7 @@ TEST_CASE("GDSF - memory pressure (global sweep)",
                 peak = std::max(peak, mem);
 
                 // Invariant: memory must not exceed 3× budget between sweeps.
-                // Overshoot comes from: epoch-deferred CachedWrapper destructors
+                // Overshoot comes from: epoch-deferred destructors
                 // (pool recycles items lazily), ghost entry overhead, and
                 // kSweepInterval new entries cached since last sweep.
                 REQUIRE(mem <= kSmallBudget * 3);
@@ -619,7 +589,7 @@ TEST_CASE("GDSF - memory pressure (global sweep)",
         size_t mem_final = GDSFPolicy::instance().totalMemory();
 
         // After stabilization, should be within 3× budget (accounts for
-        // epoch-deferred CachedWrapper destructors and ParlayHash overhead)
+        // epoch-deferred destructors and ParlayHash overhead)
         REQUIRE(mem_final <= kSmallBudget * 3);
 
         // Sanity: peak was above half budget (sweep was actually needed)
@@ -878,7 +848,7 @@ TEST_CASE("GDSF - memory accounting",
     TransactionGuard tx;
     resetAllTestRepos();
 
-    SECTION("[accounting] find charges memory via CachedWrapper") {
+    SECTION("[accounting] find charges memory via cache entry") {
         REQUIRE(GDSFPolicy::instance().totalMemory() == 0);
 
         auto id = insertTestItem("acct_charge", 42);
@@ -902,27 +872,7 @@ TEST_CASE("GDSF - memory accounting",
         }
     }
 
-    SECTION("[accounting] lazy json buffer charges additional memory") {
-        auto id = insertTestItem("acct_json", 42);
-        sync(GDSFMemRepo::find(id));
-        size_t mem_base = GDSFPolicy::instance().totalMemory();
-
-        // Trigger lazy JSON serialization (charges extra)
-        sync(GDSFMemRepo::findJson(id));
-        size_t mem_with_json = GDSFPolicy::instance().totalMemory();
-        REQUIRE(mem_with_json > mem_base);
-    }
-
-    SECTION("[accounting] lazy binary buffer charges additional memory") {
-        auto id = insertTestItem("acct_binary", 42);
-        sync(GDSFMemRepo::find(id));
-        size_t mem_base = GDSFPolicy::instance().totalMemory();
-
-        // Trigger lazy BEVE serialization (charges extra)
-        sync(GDSFMemRepo::findBinary(id));
-        size_t mem_with_binary = GDSFPolicy::instance().totalMemory();
-        REQUIRE(mem_with_binary > mem_base);
-    }
+    // (Removed: lazy json/binary buffer charge accounting tests — buffers no longer cached)
 
     SECTION("[accounting] update replaces entry, memory stays balanced") {
         auto id = insertTestItem("acct_update", 10);
@@ -931,7 +881,7 @@ TEST_CASE("GDSF - memory accounting",
         REQUIRE(mem_before > 0);
 
         // Update: InvalidateAndLazyReload → evict + re-cache on next find.
-        // Old entry's CachedWrapper dtor is deferred by epoch pool;
+        // Old entry's cache entry dtor is deferred by epoch pool;
         // new entry is charged immediately on the next find.
         auto updated = makeTestItem("acct_update_v2", 20, {}, true, id);
         sync(GDSFMemRepo::update(id, updated));
@@ -1414,7 +1364,7 @@ TEST_CASE("GDSF - effective discharge",
         REQUIRE(mem_after_insert > 0);
         size_t entry_size = mem_after_insert / 10;
 
-        // Clear cache (CachedWrapper dtors deferred by epoch pool)
+        // Clear cache (cache entry dtors deferred by epoch pool)
         TestInternals::resetEntityCacheState<GDSFPressureRepo2>();
 
         // Insert M=20 new entries (same name length) → pool recycling
@@ -1453,7 +1403,7 @@ TEST_CASE("GDSF - effective discharge",
             if (i % 20 == 19) {
                 policy.sweep();
                 // Memory bounded between sweeps despite continuous insertions.
-                // 3× accounts for: epoch-deferred CachedWrapper destructors,
+                // 3× accounts for: epoch-deferred destructors,
                 // ghost overhead, and kSweepInterval new entries since last sweep.
                 REQUIRE(policy.totalMemory() <= kSmallBudget * 3);
             }

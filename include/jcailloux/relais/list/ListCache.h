@@ -1,26 +1,26 @@
-#ifndef CODIBOT_LISTCACHE_H
-#define CODIBOT_LISTCACHE_H
+#ifndef JCX_RELAIS_LIST_LISTCACHE_H
+#define JCX_RELAIS_LIST_LISTCACHE_H
 
 #include <atomic>
 #include <chrono>
 #include <type_traits>
 
-#include "jcailloux/relais/cache/ChunkMap.h"
 #include "ListQuery.h"
 #include "ListCacheTraits.h"
 #include "ModificationTracker.h"
-#include "jcailloux/relais/wrapper/ListWrapper.h"
-#include "jcailloux/relais/wrapper/BufferView.h"
-#include "jcailloux/relais/cache/GDSFMetadata.h"
+#include "jcailloux/relais/list/ListWrapper.h"
+#include "jcailloux/relais/cache/CacheView.h"
+#include "jcailloux/relais/cache/CacheTier.h"
+#include "jcailloux/relais/cache/CacheMetadata.h"
 #include "jcailloux/relais/cache/GDSFPolicy.h"
 #include "jcailloux/relais/cache/TaggedEntry.h"
-#include "jcailloux/relais/config/CachedClock.h"
+#include "jcailloux/relais/runtime/CachedClock.h"
 
 #ifdef RELAIS_BUILDING_TESTS
 namespace relais_test { struct TestInternals; }
 #endif
 
-namespace jcailloux::relais::cache::list {
+namespace jcailloux::relais::list {
 
 // =============================================================================
 // PaginationMode - Distinguishes offset-based and cursor-based pagination
@@ -36,7 +36,7 @@ enum class PaginationMode : uint8_t {
 // =============================================================================
 
 struct ListCacheConfig {
-    std::chrono::seconds default_ttl{3600};   // 1 hour
+    uint32_t default_ttl_sec{3600};   // 1 hour, in seconds
 };
 
 // =============================================================================
@@ -192,82 +192,87 @@ struct ListBoundsHeader {
 // =============================================================================
 // ListCacheMetadataImpl - Stored inline in ChunkMap CacheEntry
 // =============================================================================
+//
+// Inherits from CacheMetadata<true, true> for unified GDSF + TTL handling.
+// Uses stored_generation (uint32_t) instead of cached_at_rep (int64_t) for
+// modification tracking — exact precision, no clock issues.
 
 template<typename FilterSet, typename SortFieldEnum>
-struct ListCacheMetadataImpl {
-    using Clock = std::chrono::steady_clock;
+struct ListCacheMetadataImpl : cache::CacheMetadata<true, true> {
+    using Base = cache::CacheMetadata<true, true>;
 
     ListQuery<FilterSet, SortFieldEnum> query;
-    int64_t cached_at_rep{0};  // steady_clock rep (immutable after construction)
+    uint32_t stored_generation{0};     // generation of the owning ListCache at cache time
     SortBounds sort_bounds;
     uint16_t result_count{0};
-    cache::GDSFScoreData gdsf;              // GDSF access_count tracking (mutable atomic)
-    float construction_time_us{0.0f};       // Measured cost for this page
+    float construction_time_us{0.0f};  // diagnostics only
 
     ListCacheMetadataImpl() = default;
 
     ListCacheMetadataImpl(ListQuery<FilterSet, SortFieldEnum> q,
-                          Clock::time_point cached_at,
+                          uint32_t gen,
+                          uint32_t ttl_expiration,
                           SortBounds bounds, uint16_t count,
                           float cost_us = 0.0f)
-        : query(std::move(q))
-        , cached_at_rep(cached_at.time_since_epoch().count())
+        : Base(cache::GDSFScoreData::kCountScale, ttl_expiration)
+        , query(std::move(q))
+        , stored_generation(gen)
         , sort_bounds(bounds)
         , result_count(count)
-        , gdsf(cache::GDSFScoreData::kCountScale)
         , construction_time_us(cost_us)
     {}
 
     /// Merge access history from old entry on upsert (kUpdatePenalty applied).
     void mergeFrom(const ListCacheMetadataImpl& old) {
-        gdsf.mergeFrom(old.gdsf);
+        Base::mergeFrom(old);
     }
 
     // Explicit move (GDSFScoreData has atomics requiring manual move)
     ListCacheMetadataImpl(ListCacheMetadataImpl&& o) noexcept
-        : query(std::move(o.query))
-        , cached_at_rep(o.cached_at_rep)
+        : Base(std::move(o))
+        , query(std::move(o.query))
+        , stored_generation(o.stored_generation)
         , sort_bounds(o.sort_bounds)
         , result_count(o.result_count)
-        , gdsf(std::move(o.gdsf))
         , construction_time_us(o.construction_time_us)
     {}
 
     ListCacheMetadataImpl& operator=(ListCacheMetadataImpl&& o) noexcept {
+        Base::operator=(std::move(o));
         query = std::move(o.query);
-        cached_at_rep = o.cached_at_rep;
+        stored_generation = o.stored_generation;
         sort_bounds = o.sort_bounds;
         result_count = o.result_count;
-        gdsf = std::move(o.gdsf);
         construction_time_us = o.construction_time_us;
         return *this;
     }
 
     ListCacheMetadataImpl(const ListCacheMetadataImpl&) = delete;
     ListCacheMetadataImpl& operator=(const ListCacheMetadataImpl&) = delete;
-
-    Clock::time_point cachedAt() const {
-        return Clock::time_point{Clock::duration{cached_at_rep}};
-    }
 };
 
 // =============================================================================
 // ListCache - L1 cache for paginated list queries with lazy validation
 // =============================================================================
 //
-// Uses ChunkMap (lock-free ParlayHash) for storage with epoch-based reclamation.
-// Modifications are tracked by ModificationTracker and validated lazily on get().
+// Thin wrapper around CacheTier<string, ListWrapper, ListCacheMetadataImpl>.
+// CacheTier handles: ChunkMap storage, GDSF scoring/admission, TTL, ghosts,
+// inflight dedup, and cleanup sweep mechanics.
+//
+// ListCache adds domain-specific concerns:
+// - ModificationTracker (lazy invalidation by filter/sort matching)
+// - Generation counter (monotonic, for modification ordering)
+// - Modification-based validation on get() and sweep extra predicate
 //
 // Template parameters:
-//   - Entity: The entity type being cached
-//   - ChunkCountLog2: log2 of chunk count (default: 3 = 8 chunks, from CacheConfig NTTP)
+//   - E: The entity type being cached
+//   - ChunkCountLog2: log2 of chunk count (default: 3 = 8 chunks)
 //   - Key: The entity ID type (default: int64_t)
 //   - Traits: Traits for filter matching, sorting, etc.
 //   - GDSF: Enable GDSF score tracking
-//
 
-template<typename Entity, uint8_t ChunkCountLog2 = 3,
-         typename Key = int64_t, typename Traits = ListCacheTraits<Entity>,
+template<typename E, uint8_t ChunkCountLog2 = 3,
+         typename Key = int64_t, typename Traits = ListCacheTraits<E>,
          bool GDSF = true>
 class ListCache {
 public:
@@ -276,58 +281,33 @@ public:
     using FilterSet = typename Traits::Filters;
     using SortFieldEnum = typename Traits::SortField;
     using Query = ListQuery<FilterSet, SortFieldEnum>;
-    using Result = jcailloux::relais::wrapper::ListWrapper<Entity>;
-    using ResultView = jcailloux::relais::wrapper::BufferView<Result>;
-    using Modification = EntityModification<Entity>;
-    using Clock = std::chrono::steady_clock;
-    using TimePoint = Clock::time_point;
-    using Duration = Clock::duration;
+    using Result = jcailloux::relais::list::ListWrapper<E>;
+    using ResultView = jcailloux::relais::cache::CacheView<Result>;
+    using Modification = EntityModification<E>;
 
-    using ModTracker = ModificationTracker<Entity, ChunkCount>;
+    using ModTracker = ModificationTracker<E, ChunkCount>;
     using BitmapType = typename ModTracker::BitmapType;
 
 private:
-    using CacheKey = std::string;  // Canonical binary buffer
+    using CacheKey = std::string;
     using MetadataImpl = ListCacheMetadataImpl<FilterSet, SortFieldEnum>;
-    using L1Cache = cache::ChunkMap<CacheKey, Result, MetadataImpl>;
+    using Tier = cache::CacheTier<CacheKey, Result, MetadataImpl>;
 
-    // --- GDSF memory tracking constants ---
+    /// Backward-compat alias for test accessors.
+    using L1Cache = typename Tier::Map;
 
-    template<typename T>
-    struct EpochWrapperMirror { T value; };
-
-    static constexpr size_t kEpochWrapperOverhead =
-        sizeof(EpochWrapperMirror<typename L1Cache::CacheEntry>)
-        - sizeof(typename L1Cache::CacheEntry);
-
-    /// Overhead charged per list entry (excludes bucket slot — tracked by hook).
-    static constexpr size_t kListChargeOverhead =
-        sizeof(typename L1Cache::CacheEntry) - sizeof(Result)
-        + kEpochWrapperOverhead;
-
-    /// Bucket slot size (score computation only).
-    static constexpr size_t kListBucketSlotSize =
-        sizeof(CacheKey) + sizeof(cache::TaggedEntry);
-
-    static void chargeHook(void* /*ctx*/, int64_t delta) {
-        cache::GDSFPolicy::instance().charge(delta);
-    }
-
-    L1Cache cache_;
+    Tier tier_;
     ModTracker modifications_;
     ListCacheConfig config_;
-    std::atomic<long> cleanup_cursor_{0};  // Own cursor for chunk-based cleanup
+    std::atomic<uint32_t> generation_{0};  // Monotonic mutation counter
 
 public:
     explicit ListCache(ListCacheConfig config = {})
         : config_(std::move(config))
-    {
-        config::CachedClock::ensureStarted();
-    }
+    {}
 
     ~ListCache() = default;
 
-    // Non-copyable, non-movable
     ListCache(const ListCache&) = delete;
     ListCache& operator=(const ListCache&) = delete;
     ListCache(ListCache&&) = delete;
@@ -343,39 +323,24 @@ public:
         return getByKey(query.cacheKey());
     }
 
-    /// Get cached result by pre-computed cache key (avoids toCacheQuery overhead).
-    /// Single-hash: hashes the key once for both lookup and chunk computation.
+    /// Get cached result by pre-computed cache key.
+    /// Delegates to CacheTier::find() for ghost/TTL/GDSF, then validates modifications.
+    /// Single-hash: chunk_id computed from Hit::key_hash (no re-hash).
     ResultView getByKey(const std::string& key) {
-        auto hk = L1Cache::make_key(key);
-        auto result = cache_.find(hk);
-        if (!result) return {};
+        auto hit = tier_.find(key);
+        if (!hit) return {};
 
-        auto* ce = result.asReal();
-        if (!ce) return {};
-        auto& meta = ce->metadata;
-        auto& value = ce->value;
-
-        // Single-hash chunk computation: extract hash from pre-computed hashed_key
-        size_t hash = L1Cache::get_hash(hk);
-        constexpr uint8_t kChunkBits = ChunkCountLog2;
-        constexpr size_t kChunkMask = ChunkCount - 1;
+        // Compute chunk_id from the hash already computed by find().
         long chunk_id = static_cast<long>(
-            (hash >> (48 - kChunkBits)) & kChunkMask);
+            (hit.key_hash >> (48 - ChunkCountLog2)) & (ChunkCount - 1));
 
-        if (isAffectedByModificationsForChunk(meta, value, config::CachedClock::now(), chunk_id)) {
-            cache_.remove_if(key, [ce](auto* e) { return e == static_cast<typename L1Cache::EntryHeader*>(ce); });
+        // Modification validation — if entry is stale, evict and return miss.
+        if (isAffectedByModificationsForChunk(*hit.meta, *hit.value, chunk_id)) {
+            tier_.evictIfSame(key, hit.value);
             return {};
         }
 
-        // Direct access counting: fetch_add(relaxed) on the entry's metadata.
-        // Safe: entry is alive under the EpochGuard held by FindResult.
-        if constexpr (GDSF) {
-            meta.gdsf.access_count.fetch_add(
-                cache::GDSFScoreData::kCountScale,
-                std::memory_order_relaxed);
-        }
-
-        return ResultView(&value, std::move(result.guard));
+        return ResultView(hit.value, std::move(hit.guard));
     }
 
     /// Store result for a query with optional sort bounds and construction cost.
@@ -383,34 +348,23 @@ public:
     ResultView put(const Query& query, Result result, SortBounds bounds = {},
                    float construction_time_us = 0.0f) {
         const auto& key = query.cacheKey();
-        const auto now = Clock::now();
+        uint32_t now_sec = runtime::CachedClock::now();
+        uint32_t gen = generation_.load(std::memory_order_relaxed);
 
         MetadataImpl meta(
-            query, now, bounds,
+            query, gen, now_sec + config_.default_ttl_sec, bounds,
             static_cast<uint16_t>(result.items.size()),
             construction_time_us);
 
+        auto hit = tier_.store(key, std::move(result), std::move(meta));
+
+        // Record construction cost in EMA + trigger deterministic cleanup
+        tier_.recordCost(construction_time_us);
         if constexpr (GDSF && cache::GDSFPolicy::enabled) {
-            size_t key_heap = (key.size() >= sizeof(CacheKey)) ? key.capacity() : 0;
-            size_t cursor_heap = query.cursor.data.capacity();
-            result.cache_overhead_ = kListChargeOverhead + 2 * key_heap + cursor_heap;
-            result.memory_hook_ = &chargeHook;
-            result.memory_hook_ctx_ = nullptr;
+            cache::GDSFPolicy::instance().tickInsertion();
         }
 
-        auto hk = L1Cache::make_key(key);
-        auto find_result = cache_.upsert(hk, std::move(result), std::move(meta));
-
-        if constexpr (GDSF && cache::GDSFPolicy::enabled) {
-            auto* ce = find_result.asReal();
-            chargeHook(nullptr, static_cast<int64_t>(
-                ce->value.memoryUsage() + ce->value.cache_overhead_));
-        }
-
-        // Deterministic cleanup trigger via global insertion counter
-        cache::GDSFPolicy::instance().tickInsertion();
-
-        return ResultView(&find_result.asReal()->value, std::move(find_result.guard));
+        return ResultView(hit.value, std::move(hit.guard));
     }
 
     /// Helper to extract sort bounds from a result
@@ -432,62 +386,40 @@ public:
     // =========================================================================
 
     /// Record entity creation for invalidation
-    void onEntityCreated(const Entity& entity) {
-        modifications_.notifyCreated(entity);
+    void onEntityCreated(const E& entity) {
+        uint32_t gen = generation_.fetch_add(1, std::memory_order_relaxed) + 1;
+        modifications_.notifyCreated(entity, gen);
     }
 
     /// Record entity update for invalidation
-    void onEntityUpdated(const Entity& old_entity, const Entity& new_entity) {
-        modifications_.notifyUpdated(old_entity, new_entity);
+    void onEntityUpdated(const E& old_entity, const E& new_entity) {
+        uint32_t gen = generation_.fetch_add(1, std::memory_order_relaxed) + 1;
+        modifications_.notifyUpdated(old_entity, new_entity, gen);
     }
 
     /// Record entity deletion for invalidation
-    void onEntityDeleted(const Entity& entity) {
-        modifications_.notifyDeleted(entity);
+    void onEntityDeleted(const E& entity) {
+        uint32_t gen = generation_.fetch_add(1, std::memory_order_relaxed) + 1;
+        modifications_.notifyDeleted(entity, gen);
     }
 
     /// Invalidate a specific query.
     void invalidate(const Query& query) {
-        cache_.invalidate(query.cacheKey());
+        tier_.evict(query.cacheKey());
     }
 
     // =========================================================================
-    // Cleanup API
+    // Cleanup API — delegates to CacheTier with modification extra predicate
     // =========================================================================
 
     /// Sweep one chunk (lock-free, always succeeds).
     bool trySweep() {
-        const auto now = Clock::now();
-        long n_chunks = GDSF
-            ? cache::GDSFPolicy::instance().chunkCount()
-            : static_cast<long>(ChunkCount);
-        long chunk = cleanup_cursor_.fetch_add(1, std::memory_order_relaxed)
-                   % n_chunks;
-
-        size_t removed = 0;
-
-        if constexpr (GDSF) {
-            float threshold = cache::GDSFPolicy::instance().threshold();
-            removed = cache_.cleanup_chunk(chunk, n_chunks,
-                [this, now, threshold, chunk](const CacheKey&, auto te) {
-                    auto* entry = static_cast<typename L1Cache::CacheEntry*>(
-                        te.template asReal<typename L1Cache::EntryHeader>());
-                    return cleanupPredicate(
-                        entry->metadata, entry->value, now, threshold, chunk);
-                });
-        } else {
-            removed = cache_.cleanup_chunk(chunk, n_chunks,
-                [this, now, chunk](const CacheKey&, auto te) {
-                    auto* entry = static_cast<typename L1Cache::CacheEntry*>(
-                        te.template asReal<typename L1Cache::EntryHeader>());
-                    return cleanupPredicate(entry->metadata, entry->value, now, 0.0f, chunk);
-                });
+        uint32_t cutoff_gen = generation_.load(std::memory_order_relaxed);
+        auto result = tier_.sweepChunk(modificationPred());
+        if (result.chunk_id >= 0) {
+            modifications_.drainChunk(cutoff_gen, static_cast<uint8_t>(result.chunk_id));
         }
-
-        if (removed > 0) cache_.reclaim();
-        modifications_.drainChunk(now, static_cast<uint8_t>(chunk));
-
-        return removed > 0;
+        return result.removed_any;
     }
 
     /// Sweep one chunk (identical to trySweep in lock-free design).
@@ -497,44 +429,20 @@ public:
 
     /// Sweep all chunks.
     size_t purge() {
-        const auto now = Clock::now();
-        size_t erased = 0;
-
-        if constexpr (GDSF) {
-            float threshold = cache::GDSFPolicy::instance().threshold();
-            long n_chunks = cache::GDSFPolicy::instance().chunkCount();
-
-            for (long chunk = 0; chunk < n_chunks; ++chunk) {
-                erased += cache_.cleanup_chunk(chunk, n_chunks,
-                    [this, now, threshold](const CacheKey&, auto te) {
-                        auto* entry = static_cast<typename L1Cache::CacheEntry*>(
-                            te.template asReal<typename L1Cache::EntryHeader>());
-                        return cleanupPredicateFull(
-                            entry->metadata, entry->value, now, threshold);
-                    });
-            }
-        } else {
-            erased = cache_.full_cleanup(
-                [this, now](const CacheKey&, auto te) {
-                    auto* entry = static_cast<typename L1Cache::CacheEntry*>(
-                        te.template asReal<typename L1Cache::EntryHeader>());
-                    return cleanupPredicateFull(entry->metadata, entry->value, now, 0.0f);
-                });
-        }
-
-        if (erased > 0) cache_.collect();
-        modifications_.drain(now);
-
-        return erased;
+        uint32_t cutoff_gen = generation_.load(std::memory_order_relaxed);
+        size_t removed = tier_.purgeAll(modificationPredFull());
+        modifications_.drain(cutoff_gen);
+        return removed;
     }
 
     // =========================================================================
     // Accessors
     // =========================================================================
 
-    [[nodiscard]] size_t size() { return static_cast<size_t>(cache_.size()); }
+    [[nodiscard]] size_t size() { return tier_.size(); }
     [[nodiscard]] static constexpr size_t chunkCount() { return ChunkCount; }
     [[nodiscard]] const ListCacheConfig& config() const { return config_; }
+    [[nodiscard]] Tier& tier() { return tier_; }
 
 #ifdef RELAIS_BUILDING_TESTS
     friend struct ::relais_test::TestInternals;
@@ -542,16 +450,34 @@ public:
 
 private:
     // =========================================================================
+    // Modification extra predicates for CacheTier::sweepChunk/purgeAll
+    // =========================================================================
+
+    /// Extra predicate for sweepChunk: uses bitmap skip optimization.
+    auto modificationPred() {
+        return [this](const CacheKey&, const MetadataImpl& meta,
+                      const Result& value, long chunk_id) -> bool {
+            return isAffectedByModificationsForChunk(meta, value, chunk_id);
+        };
+    }
+
+    /// Extra predicate for purgeAll: checks all modifications (no bitmap).
+    auto modificationPredFull() {
+        return [this](const CacheKey&, const MetadataImpl& meta,
+                      const Result& value, long /*chunk_id*/) -> bool {
+            return isAffectedByModifications(meta, value);
+        };
+    }
+
+    // =========================================================================
     // Validation logic
     // =========================================================================
 
-    /// Check if any recent modifications affect the cached result.
-    /// Used by get() — no chunk_id available, checks all modifications.
+    /// Check if any recent modifications affect the cached result (no bitmap).
     bool isAffectedByModifications(const MetadataImpl& meta,
-                                    const Result& result,
-                                    const Query& query) const {
-        auto cached_at = meta.cachedAt();
-        if (!modifications_.hasModificationsSince(cached_at)) {
+                                    const Result& result) const {
+        uint32_t stored_gen = meta.stored_generation;
+        if (!modifications_.hasModificationsSince(stored_gen)) {
             return false;
         }
 
@@ -559,8 +485,8 @@ private:
         modifications_.forEachModification(
             [&](const Modification& mod) {
                 if (affected) return;
-                if (mod.modified_at <= cached_at) return;
-                if (isModificationAffecting(mod, query, meta.sort_bounds, result)) {
+                if (mod.generation <= stored_gen) return;
+                if (isModificationAffecting(mod, meta.query, meta.sort_bounds, result)) {
                     affected = true;
                 }
             });
@@ -569,13 +495,11 @@ private:
     }
 
     /// Check if any recent modifications affect the cached result (with bitmap skip).
-    /// Used by cleanup — chunk_id is known.
     bool isAffectedByModificationsForChunk(const MetadataImpl& meta,
                                             const Result& result,
-                                            TimePoint now,
                                             long chunk_id) const {
-        auto cached_at = meta.cachedAt();
-        if (!modifications_.hasModificationsSince(cached_at)) {
+        uint32_t stored_gen = meta.stored_generation;
+        if (!modifications_.hasModificationsSince(stored_gen)) {
             return false;
         }
 
@@ -588,84 +512,12 @@ private:
                 if ((pending_chunks & (BitmapType{1} << chunk_id)) == 0) return;
 
                 // Skip: data created after modification
-                if (mod.modified_at <= cached_at) return;
+                if (mod.generation <= stored_gen) return;
 
                 if (isModificationAffecting(mod, meta.query, meta.sort_bounds, result)) {
                     affected = true;
                 }
             });
-
-        return affected;
-    }
-
-    /// Estimate memory usage for a list entry (memoryUsage + cache overhead).
-    static size_t estimateMemoryUsage(const Result& result) {
-        return result.memoryUsage() + result.cache_overhead_;
-    }
-
-    /// Cleanup predicate for chunk-based cleanup (with bitmap skip).
-    bool cleanupPredicate(const MetadataImpl& meta, const Result& result,
-                           TimePoint now, float threshold, long chunk_id) const {
-        // 1. GDSF: inline decay + compute score on-the-fly + record in histogram
-        if constexpr (GDSF) {
-            // Decay: single writer per chunk during sweep, plain store (no CAS)
-            float dr = cache::GDSFPolicy::instance().decayRate();
-            uint32_t old_count = meta.gdsf.access_count.load(std::memory_order_relaxed);
-            meta.gdsf.access_count.store(
-                static_cast<uint32_t>(static_cast<float>(old_count) * dr),
-                std::memory_order_relaxed);
-
-            // Score = access_count x avg_cost / memoryUsage (includes bucket slot)
-            size_t mem = estimateMemoryUsage(result);
-            float score = meta.gdsf.computeScore(meta.construction_time_us, mem + kListBucketSlotSize);
-
-            // Record in histogram (no ghosts in ListCache → no adjustment)
-            cache::GDSFPolicy::instance().recordEntry(score, mem);
-
-            if (score < threshold) return true;
-        }
-
-        // 2. TTL check (cached_at + default_ttl)
-        if (now > meta.cachedAt() + config_.default_ttl) return true;
-
-        // 3. Check if affected by modifications (with bitmap skip)
-        return isAffectedByModificationsForChunk(meta, result, now, chunk_id);
-    }
-
-    /// Cleanup predicate for full cleanup (no bitmap).
-    bool cleanupPredicateFull(const MetadataImpl& meta, const Result& result,
-                               TimePoint now, float threshold) const {
-        // 1. GDSF: inline decay + compute score on-the-fly + record in histogram
-        if constexpr (GDSF) {
-            float dr = cache::GDSFPolicy::instance().decayRate();
-            uint32_t old_count = meta.gdsf.access_count.load(std::memory_order_relaxed);
-            meta.gdsf.access_count.store(
-                static_cast<uint32_t>(static_cast<float>(old_count) * dr),
-                std::memory_order_relaxed);
-
-            // Score = access_count x avg_cost / memoryUsage (includes bucket slot)
-            size_t mem = estimateMemoryUsage(result);
-            float score = meta.gdsf.computeScore(meta.construction_time_us, mem + kListBucketSlotSize);
-
-            // Record in histogram (no ghosts in ListCache → no adjustment)
-            cache::GDSFPolicy::instance().recordEntry(score, mem);
-
-            if (score < threshold) return true;
-        }
-
-        // 2. TTL check (cached_at + default_ttl)
-        if (now > meta.cachedAt() + config_.default_ttl) return true;
-
-        // 3. Modification check (without bitmap)
-        auto cached_at = meta.cachedAt();
-        bool affected = false;
-        modifications_.forEachModification([&](const Modification& mod) {
-            if (affected) return;
-            if (mod.modified_at <= cached_at) return;
-            if (isModificationAffecting(mod, meta.query, meta.sort_bounds, result)) {
-                affected = true;
-            }
-        });
 
         return affected;
     }
@@ -696,7 +548,7 @@ private:
     }
 
     /// Check if an entity falls within this page's sort range
-    bool isEntityInPageRange(const Entity& entity,
+    bool isEntityInPageRange(const E& entity,
                               const Query& query,
                               const Result& result,
                               const SortBounds& bounds,
@@ -716,7 +568,7 @@ private:
     }
 
     /// Slow path for range checking using entity comparison
-    bool isEntityInPageRangeSlow(const Entity& entity,
+    bool isEntityInPageRangeSlow(const E& entity,
                                   const Query& query,
                                   const Result& result,
                                   const SortSpec<SortFieldEnum>& sort) const {
@@ -753,6 +605,6 @@ private:
     }
 };
 
-}  // namespace jcailloux::relais::cache::list
+}  // namespace jcailloux::relais::list
 
-#endif  // CODIBOT_LISTCACHE_H
+#endif  // JCX_RELAIS_LIST_LISTCACHE_H

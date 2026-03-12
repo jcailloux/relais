@@ -20,7 +20,7 @@
 #include "fixtures/RelaisTestAccessors.h"
 using namespace relais_test;
 
-namespace decl = jcailloux::relais::cache::list::decl;
+namespace decl = jcailloux::relais::list::spec;
 
 // #############################################################################
 //
@@ -30,8 +30,8 @@ namespace decl = jcailloux::relais::cache::list::decl;
 
 namespace relais_test {
 
-using L2DeclArticleListRepo = Repo<TestArticleWrapper, "test:article:list:l2:decl", cfg::Redis>;
-using L2DeclPurchaseListRepo = Repo<TestPurchaseWrapper, "test:purchase:list:l2:decl", cfg::Redis>;
+using L2DeclArticleListRepo = Repo<TestArticleEntity, "test:article:list:l2:decl", cfg::Redis>;
+using L2DeclPurchaseListRepo = Repo<TestPurchaseEntity, "test:purchase:list:l2:decl", cfg::Redis>;
 
 // Type aliases for L2 list queries
 using L2ArticleListQuery = L2DeclArticleListRepo::ListQuery;
@@ -44,10 +44,10 @@ using L2ArticleDescQuery = decl::ListDescriptorQuery<L2ArticleDecl>;
 } // namespace relais_test
 
 // =============================================================================
-// Helper: build a TestArticleWrapper from raw values (for SortBounds tests)
+// Helper: build a TestArticleEntity from raw values (for SortBounds tests)
 // =============================================================================
 
-static TestArticleWrapper makeArticle(
+static TestArticleEntity makeArticle(
     int64_t id,
     const std::string& category,
     int64_t author_id,
@@ -98,7 +98,7 @@ static L2ArticleDescQuery makeL2ViewCountQuery(std::string_view category, uint16
     L2ArticleDescQuery q;
     q.limit = limit;
     q.filters.get<1>() = category;
-    q.sort = jcailloux::relais::cache::list::SortSpec<size_t>{1, jcailloux::relais::cache::list::SortDirection::Desc};
+    q.sort = jcailloux::relais::list::SortSpec<size_t>{1, jcailloux::relais::list::SortDirection::Desc};
 
     q.group_key = decl::groupCacheKey<L2ArticleDecl>(q);
     q.cache_key = decl::cacheKey<L2ArticleDecl>(q);
@@ -739,7 +739,7 @@ TEST_CASE("[DeclList L2] Lua SortBounds — per-page precision",
 
         // Page 2: [60, 40] via cursor (fp=false, cursor mode, complete)
         auto q2 = makeL2ViewCountQuery("tech", 2);
-        q2.cursor = jcailloux::relais::cache::list::Cursor::decode(
+        q2.cursor = jcailloux::relais::list::Cursor::decode(
             std::string(p1->cursor())).value();
         q2.cache_key = decl::cacheKey<L2ArticleDecl>(q2);
         auto p2 = sync(L2DeclArticleListRepo::query(q2));
@@ -780,7 +780,7 @@ TEST_CASE("[DeclList L2] Lua SortBounds — per-page precision",
 
         // Page 2: [60, 40] via cursor
         auto q2 = makeL2ViewCountQuery("tech", 2);
-        q2.cursor = jcailloux::relais::cache::list::Cursor::decode(
+        q2.cursor = jcailloux::relais::list::Cursor::decode(
             std::string(p1->cursor())).value();
         q2.cache_key = decl::cacheKey<L2ArticleDecl>(q2);
         auto p2 = sync(L2DeclArticleListRepo::query(q2));
@@ -953,7 +953,7 @@ TEST_CASE("[DeclList L2] Lua all-in-one — multi-group correctness",
 // #############################################################################
 
 namespace {
-namespace list_ns = jcailloux::relais::cache::list;
+namespace list_ns = jcailloux::relais::list;
 
 /// Build the Redis page key for a declarative list query (reproduces ListMixin::redisPageKey).
 template<typename RepoT>
@@ -1085,8 +1085,8 @@ static L2ArticleDescQuery makeL2ViewCountQueryOffset(
     q.limit = limit;
     q.offset = offset;
     q.filters.get<1>() = category;
-    q.sort = jcailloux::relais::cache::list::SortSpec<size_t>{
-        1, jcailloux::relais::cache::list::SortDirection::Desc};
+    q.sort = jcailloux::relais::list::SortSpec<size_t>{
+        1, jcailloux::relais::list::SortDirection::Desc};
     q.group_key = decl::groupCacheKey<L2ArticleDecl>(q);
     q.cache_key = decl::cacheKey<L2ArticleDecl>(q);
     return q;
@@ -1323,10 +1323,9 @@ TEST_CASE("[DeclList L2] queryJson",
         auto q = makeL2ArticleQuery("tech");
         auto json = sync(L2DeclArticleListRepo::queryJson(q));
 
-        REQUIRE(json != nullptr);
-        REQUIRE(!json->empty());
-        REQUIRE(json->find("QJ Article 1") != std::string::npos);
-        REQUIRE(json->find("QJ Article 2") != std::string::npos);
+        REQUIRE(!json.empty());
+        REQUIRE(json.find("QJ Article 1") != std::string::npos);
+        REQUIRE(json.find("QJ Article 2") != std::string::npos);
     }
 
     SECTION("[queryJson] L2 hit transcodes BEVE to JSON") {
@@ -1345,19 +1344,19 @@ TEST_CASE("[DeclList L2] queryJson",
 
         // queryJson should hit L2 → BEVE→JSON transcode (still 2 articles)
         auto json = sync(L2DeclArticleListRepo::queryJson(q));
-        REQUIRE(json != nullptr);
-        REQUIRE(json->find("L2H Article 1") != std::string::npos);
-        REQUIRE(json->find("L2H Article 2") != std::string::npos);
+        REQUIRE(!json.empty());
+        REQUIRE(json.find("L2H Article 1") != std::string::npos);
+        REQUIRE(json.find("L2H Article 2") != std::string::npos);
         // Article 3 NOT in cached result
-        REQUIRE(json->find("L2H Article 3") == std::string::npos);
+        REQUIRE(json.find("L2H Article 3") == std::string::npos);
     }
 
-    SECTION("[queryJson] returns nullptr for empty result") {
+    SECTION("[queryJson] returns valid JSON for empty result") {
         auto q = makeL2ArticleQuery("nonexistent_qj");
         auto json = sync(L2DeclArticleListRepo::queryJson(q));
 
         // Empty list should still return valid JSON (empty array)
-        REQUIRE(json != nullptr);
+        REQUIRE(!json.empty());
     }
 
     SECTION("[queryJson] matches query().json() byte-for-byte") {
@@ -1374,10 +1373,10 @@ TEST_CASE("[DeclList L2] queryJson",
         // Evict L2 and re-query via queryJson (entity path on miss)
         TestInternals::resetListCacheState<L2DeclArticleListRepo>();
         auto rowJson = sync(L2DeclArticleListRepo::queryJson(q));
-        REQUIRE(rowJson != nullptr);
+        REQUIRE(!rowJson.empty());
 
         // Both should produce the same JSON content
-        REQUIRE(*rowJson == *entityJson);
+        REQUIRE(rowJson == entityJson);
     }
 }
 
@@ -1394,8 +1393,7 @@ TEST_CASE("[DeclList L2] queryBinary",
         auto q = makeL2ArticleQuery("tech");
         auto beve = sync(L2DeclArticleListRepo::queryBinary(q));
 
-        REQUIRE(beve != nullptr);
-        REQUIRE(!beve->empty());
+        REQUIRE(!beve.empty());
     }
 
     SECTION("[queryBinary] L2 hit returns raw binary (skips header)") {
@@ -1413,12 +1411,11 @@ TEST_CASE("[DeclList L2] queryBinary",
 
         // queryBinary should hit L2 (still 2 articles from cache)
         auto beve = sync(L2DeclArticleListRepo::queryBinary(q));
-        REQUIRE(beve != nullptr);
-        REQUIRE(!beve->empty());
+        REQUIRE(!beve.empty());
 
         // Verify content by transcoding to JSON
         std::string json;
-        auto err = glz::beve_to_json(*beve, json);
+        auto err = glz::beve_to_json(beve, json);
         REQUIRE(!err);
         REQUIRE(json.find("BinH Article 1") != std::string::npos);
         REQUIRE(json.find("BinH Article 2") != std::string::npos);

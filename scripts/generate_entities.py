@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Struct Entity Wrapper Generator
+Struct Entity Mapping Generator
 
 Scans C++ header files for @relais annotations, parses struct data members,
 and generates:
   - Standalone Mapping structs with fromRow/toInsertParams/TraitsType/FieldInfo
-  - EntityWrapper<Struct, Mapping> type aliases (public API)
+  - Entity<Struct, Mapping> type aliases (public API)
   - ListWrapper and ListDescriptor for list entities
 
 Uses jcailloux::relais::io for database access.
@@ -154,7 +154,12 @@ class StructParser:
 
     def parse_file(self, filepath: Path) -> list[ParsedEntity]:
         """Parse a header file and return all annotated entities."""
-        content = filepath.read_text()
+        try:
+            content = filepath.read_text()
+        except OSError as e:
+            print(f"Error: cannot read {filepath}: {e}", file=sys.stderr)
+            return []
+
         entities = []
 
         # Find all @relais annotation blocks followed by a class/struct declaration
@@ -163,6 +168,7 @@ class StructParser:
         while i < len(lines):
             # Look for @relais annotation block
             annotations = []
+            annotation_start_line = i + 1  # 1-based for error messages
             while i < len(lines) and self.ANNOTATION_RE.match(lines[i].strip()):
                 m = self.ANNOTATION_RE.match(lines[i].strip())
                 annotations.append((
@@ -191,31 +197,37 @@ class StructParser:
 
             class_name = class_match.group(1)
 
-            # Parse annotation key=value pairs
-            annot = self._parse_annotations(annotations)
+            try:
+                # Parse annotation key=value pairs
+                annot = self._parse_annotations(annotations)
 
-            # Find namespace
-            ns = self._find_namespace(content, lines[i])
+                # Find namespace
+                ns = self._find_namespace(content, lines[i])
 
-            # Set entity_fqn for Descriptor if not specified
-            if not annot.entity_fqn and ns:
-                annot.entity_fqn = f"{ns}::{class_name}"
-            elif not annot.entity_fqn:
-                annot.entity_fqn = class_name
+                # Set entity_fqn for Descriptor if not specified
+                if not annot.entity_fqn and ns:
+                    annot.entity_fqn = f"{ns}::{class_name}"
+                elif not annot.entity_fqn:
+                    annot.entity_fqn = class_name
 
-            # Parse data members from the class body (with inline annotations)
-            members = self._parse_members(lines, i)
+                # Parse data members from the class body (with inline annotations)
+                members = self._parse_members(lines, i)
 
-            # Apply inline member annotations to the EntityAnnotation
-            self._apply_member_annotations(annot, members)
+                # Apply inline member annotations to the EntityAnnotation
+                self._apply_member_annotations(annot, members)
 
-            entities.append(ParsedEntity(
-                class_name=class_name,
-                namespace=ns,
-                annotation=annot,
-                members=members,
-                source_file=filepath,
-            ))
+                entities.append(ParsedEntity(
+                    class_name=class_name,
+                    namespace=ns,
+                    annotation=annot,
+                    members=members,
+                    source_file=filepath,
+                ))
+            except Exception as e:
+                print(f"Error: {filepath}:{annotation_start_line}: "
+                      f"failed to parse entity '{class_name}': {e}",
+                      file=sys.stderr)
+                sys.exit(1)
 
             i += 1
 
@@ -440,7 +452,7 @@ class StructParser:
 # =============================================================================
 
 class MappingGenerator:
-    """Generate Mapping structs + EntityWrapper aliases from parsed entities.
+    """Generate Mapping structs + Entity aliases from parsed entities.
 
     Generates SQL-direct code using jcailloux::relais::io.
     """
@@ -465,7 +477,7 @@ class MappingGenerator:
         """Generate the complete wrapper header."""
         a = entity.annotation
         mapping_name = f"{entity.class_name}Mapping"
-        wrapper_name = f"{entity.class_name}Wrapper"
+        wrapper_name = f"{entity.class_name}Entity"
 
         # Determine updateable fields (exclude PK, db_managed, json_fields)
         updateable = self._get_updateable_fields(entity)
@@ -501,14 +513,14 @@ class MappingGenerator:
         lines.append(f"// {wrapper_name} — public API type")
         lines.append("// ============================================================================")
         lines.append("")
-        lines.append(f"using {wrapper_name} = jcailloux::relais::wrapper::EntityWrapper<")
+        lines.append(f"using {wrapper_name} = jcailloux::relais::Entity<")
         lines.append(f"    {struct_fqn}, {mapping_name}>;")
 
         # === List wrapper (if list annotations present) ===
         if a.has_list:
             list_wrapper_name = f"{entity.class_name}ListWrapper"
             lines.append("")
-            lines.append(f"using {list_wrapper_name} = jcailloux::relais::wrapper::ListWrapper<{wrapper_name}>;")
+            lines.append(f"using {list_wrapper_name} = jcailloux::relais::list::ListWrapper<{wrapper_name}>;")
 
         lines.append("")
         lines.append("}  // namespace entity::generated")
@@ -561,8 +573,8 @@ class MappingGenerator:
         if has_vector_char:
             lines.append("#include <vector>")
 
-        # EntityWrapper (always needed)
-        lines.append("#include <jcailloux/relais/wrapper/EntityWrapper.h>")
+        # Entity (always needed)
+        lines.append("#include <jcailloux/relais/entity/Entity.h>")
 
         # Struct header (relative path from generated file to source)
         struct_include = self._find_struct_include(entity, output_file)
@@ -570,9 +582,9 @@ class MappingGenerator:
 
         # List includes
         if a.has_list:
-            lines.append("#include <jcailloux/relais/wrapper/ListWrapper.h>")
-            lines.append("#include <jcailloux/relais/list/decl/FilterDescriptor.h>")
-            lines.append("#include <jcailloux/relais/list/decl/SortDescriptor.h>")
+            lines.append("#include <jcailloux/relais/list/ListWrapper.h>")
+            lines.append("#include <jcailloux/relais/list/spec/FilterDescriptor.h>")
+            lines.append("#include <jcailloux/relais/list/spec/SortDescriptor.h>")
 
         return lines
 
@@ -919,7 +931,7 @@ class MappingGenerator:
         """Generate toUpdateParams for composite key entities.
 
         Unlike toInsertParams (which includes PK fields), this returns only
-        the SET fields used in UPDATE statements. The caller (BaseRepo) prepends
+        the SET fields used in UPDATE statements. The caller (PgRepo) prepends
         the key params separately.
         """
         a = entity.annotation
@@ -997,7 +1009,7 @@ class MappingGenerator:
         Uses heapCapacity() for std::string to exclude SSO buffer (already in sizeof).
         """
         a = entity.annotation
-        hc = "jcailloux::relais::wrapper::heapCapacity"
+        hc = "jcailloux::relais::entity::heapCapacity"
         # Collect fields with dynamic heap allocations
         dynamic_fields = []
         for m in entity.members:
@@ -1229,7 +1241,7 @@ class MappingGenerator:
         a = entity.annotation
         struct_fqn = (f"{entity.namespace}::{entity.class_name}"
                       if entity.namespace else entity.class_name)
-        decl_ns = "jcailloux::relais::cache::list::decl"
+        decl_ns = "jcailloux::relais::list::spec"
 
         limits = a.limits if a.limits else [10, 25, 50]
         default_limit = limits[0]
@@ -1503,7 +1515,12 @@ def main():
     for filepath in files:
         entities = struct_parser.parse_file(filepath)
         for entity in entities:
-            filename = f"{entity.class_name}Wrapper.h"
+            # Validate: warn if @relais annotation lacks table=
+            if not entity.annotation.table and not entity.annotation.model:
+                print(f"  Warning: {filepath}: entity '{entity.class_name}' has "
+                      f"@relais annotations but no table= (using derived name)",
+                      file=sys.stderr)
+            filename = f"{entity.class_name}Entity.h"
             output_path = output_dir / filename
 
             print(f"  -> {entity.class_name}")
@@ -1513,7 +1530,7 @@ def main():
             output_path.write_text(code)
             generated_count += 1
 
-    print(f"Generated {generated_count} entity wrappers")
+    print(f"Generated {generated_count} entity mappings")
 
 
 if __name__ == "__main__":

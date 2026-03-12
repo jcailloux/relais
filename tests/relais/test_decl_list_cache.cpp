@@ -21,13 +21,13 @@
 #include "fixtures/RelaisTestAccessors.h"
 using namespace relais_test;
 
-namespace decl = jcailloux::relais::cache::list::decl;
+namespace decl = jcailloux::relais::list::spec;
 
 // =============================================================================
-// Helper: build a TestArticleWrapper from raw values (no DB round-trip)
+// Helper: build a TestArticleEntity from raw values (no DB round-trip)
 // =============================================================================
 
-TestArticleWrapper makeArticle(
+TestArticleEntity makeArticle(
     int64_t id,
     const std::string& category,
     int64_t author_id,
@@ -53,7 +53,7 @@ TestListQuery makeViewCountQuery(std::string_view category, uint16_t limit) {
     q.filters.get<1>() = category;
 
     // Sort index 1 = view_count, DESC
-    q.sort = jcailloux::relais::cache::list::SortSpec<size_t>{1, jcailloux::relais::cache::list::SortDirection::Desc};
+    q.sort = jcailloux::relais::list::SortSpec<size_t>{1, jcailloux::relais::list::SortDirection::Desc};
 
     // Canonical cache keys
     q.group_key = decl::groupCacheKey<TestDecl>(q);
@@ -597,9 +597,8 @@ TEST_CASE("[DeclListRepo] Modification cutoff safety",
         auto entity1 = makeArticle(9001, "tech", alice_id, "before_cutoff", 10);
         TestArticleListRepo::notifyCreated(entity1);
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
-        auto cutoff = std::chrono::steady_clock::now();
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        // Capture generation after M1 as cutoff
+        auto cutoff = TestInternals::listCacheGeneration<TestArticleListRepo>();
 
         // M2: after cutoff
         auto entity2 = makeArticle(9002, "tech", alice_id, "after_cutoff", 20);
@@ -622,16 +621,15 @@ TEST_CASE("[DeclListRepo] Modification cutoff safety",
         auto entity1 = makeArticle(9001, "tech", alice_id, "before_drain", 10);
         TestArticleListRepo::notifyCreated(entity1);
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
-        auto cutoff = std::chrono::steady_clock::now();
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        // Capture generation after M1 as cutoff
+        auto cutoff = TestInternals::listCacheGeneration<TestArticleListRepo>();
 
         auto entity2 = makeArticle(9002, "tech", alice_id, "after_drain", 20);
         TestArticleListRepo::notifyCreated(entity2);
 
         CHECK(TestInternals::pendingModificationCount<TestArticleListRepo>() == 2);
 
-        // Drain only modifications before cutoff
+        // Drain only modifications at or before cutoff generation
         TestInternals::drainModificationsWithCutoff<TestArticleListRepo>(cutoff);
 
         // M1: drained.  M2: still present
@@ -653,14 +651,12 @@ TEST_CASE("[DeclListRepo] Modification cutoff safety",
         auto entity1 = makeArticle(9001, "tech", alice_id, "cutoff_old", 25);
         TestArticleListRepo::notifyCreated(entity1);
 
-        // Re-query to absorb M1's invalidation and re-cache with fresh timestamp
+        // Re-query to absorb M1's invalidation and re-cache with fresh generation
         auto r2 = sync(TestArticleListRepo::query(q));
         REQUIRE(r2->size() == 5);  // DB still has 5 (entity1 not in DB)
 
-        // 3. Cutoff between M1 and M2
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
-        auto cutoff = std::chrono::steady_clock::now();
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        // 3. Capture generation as cutoff between M1 and M2
+        auto cutoff = TestInternals::listCacheGeneration<TestArticleListRepo>();
 
         // 4. M2 (after cutoff) — insert into DB + notify
         insertTestArticle("tech", alice_id, "cutoff_new", 35);
@@ -723,7 +719,7 @@ TEST_CASE("[DeclListRepo] Bitmap skip optimization",
 
         // 4. Clear ONLY the bit for the entry's chunk identity in the ModificationTracker.
         //    The modification still exists (other bits remain set), but bit chunk_id = 0.
-        auto cutoff = std::chrono::steady_clock::now();
+        auto cutoff = TestInternals::listCacheGeneration<TestArticleListRepo>();
         TestInternals::cleanupModificationsWithCutoff<TestArticleListRepo>(
             cutoff, chunk_id);
         // M still in tracker (other bits remain)

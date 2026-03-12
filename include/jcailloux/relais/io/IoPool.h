@@ -16,7 +16,7 @@
 #include "jcailloux/relais/io/pg/PgPool.h"
 #include "jcailloux/relais/io/redis/RedisPool.h"
 #include "jcailloux/relais/io/batch/BatchScheduler.h"
-#include "jcailloux/relais/DbProvider.h"
+#include "jcailloux/relais/PgProvider.h"
 
 namespace jcailloux::relais::io {
 
@@ -55,7 +55,7 @@ struct IoPoolConfig {
 // - A BatchScheduler (adaptive batching)
 // - A std::jthread (the actual OS thread)
 //
-// The IoPool configures DbProvider with thread_local dispatch so that
+// The IoPool configures PgProvider with thread_local dispatch so that
 // coroutines running on a worker thread automatically route to that
 // worker's BatchScheduler.
 
@@ -157,12 +157,12 @@ public:
         return pool;
     }
 
-    /// Register this IoPool as the DbProvider backend.
-    /// After this call, DbProvider::queryParams() etc. route through the
+    /// Register this IoPool as the PgProvider backend.
+    /// After this call, PgProvider::queryParams() etc. route through the
     /// BatchScheduler of the calling thread's worker.
     void registerAsProvider() {
         // PG query (simple)
-        DbProvider::pg_query_ = [this](const char* sql) -> Task<PgResult> {
+        PgProvider::pg_query_ = [this](const char* sql) -> Task<PgResult> {
             auto* batcher = getBatcher();
             if (batcher) {
                 co_return co_await batcher->directQuery(sql);
@@ -173,7 +173,7 @@ public:
         };
 
         // PG queryParams
-        DbProvider::pg_query_params_ = [this](const char* sql,
+        PgProvider::pg_query_params_ = [this](const char* sql,
                                                const PgParams& params)
             -> Task<PgResult>
         {
@@ -185,7 +185,7 @@ public:
         };
 
         // PG entityQueryParams (entity reads routed to submitEntityRead)
-        DbProvider::pg_entity_query_ = [this](const char* batch_sql,
+        PgProvider::pg_entity_query_ = [this](const char* batch_sql,
                                                const char* single_sql,
                                                const PgParams& params)
             -> Task<PgResult>
@@ -200,7 +200,7 @@ public:
         };
 
         // PG execute
-        DbProvider::pg_execute_ = [this](const char* sql,
+        PgProvider::pg_execute_ = [this](const char* sql,
                                           const PgParams& params)
             -> Task<std::pair<int, bool>>
         {
@@ -212,7 +212,7 @@ public:
         };
 
         // Redis
-        DbProvider::redis_exec_ = [this](int argc, const char** argv,
+        PgProvider::redis_exec_ = [this](int argc, const char** argv,
                                           const size_t* argvlen)
             -> Task<RedisResult>
         {
@@ -269,8 +269,8 @@ private:
     static inline thread_local int tl_worker_id_ = -1;
     static inline thread_local IoPool* tl_pool_ = nullptr;
 
-    // DbProvider needs access to the static function members
-    friend class jcailloux::relais::DbProvider;
+    // PgProvider needs access to the static function members
+    friend class jcailloux::relais::PgProvider;
 };
 
 } // namespace jcailloux::relais::io

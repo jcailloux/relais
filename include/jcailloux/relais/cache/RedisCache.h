@@ -10,62 +10,62 @@
 
 #include "jcailloux/relais/io/Task.h"
 #include "jcailloux/relais/io/redis/RedisResult.h"
-#include "jcailloux/relais/DbProvider.h"
+#include "jcailloux/relais/PgProvider.h"
 #include "jcailloux/relais/Log.h"
 
 #include <glaze/glaze.hpp>
 #include <jcailloux/relais/list/ListCache.h>
+#include "jcailloux/relais/entity/SerializationTraits.h"
 
 namespace jcailloux::relais::cache {
 
     /**
      * Async Redis cache wrapper for L2 caching.
-     * Entity must implement json() and fromJson().
+     * E must implement json() and fromJson().
      *
-     * All Redis operations go through DbProvider::redis() which wraps
+     * All Redis operations go through PgProvider::redis() which wraps
      * io::RedisClient via type-erased std::function.
      */
     class RedisCache {
         public:
 
-            template<typename Entity>
-            static io::Task<std::optional<Entity>> get(const std::string& key) {
-                if (!DbProvider::hasRedis()) {
+            template<typename E>
+            static io::Task<std::optional<E>> get(const std::string& key) {
+                if (!PgProvider::hasRedis()) {
                     co_return std::nullopt;
                 }
 
                 try {
-                    auto result = co_await DbProvider::redis("GET", key);
+                    auto result = co_await PgProvider::redis("GET", key);
                     if (result.isNil()) {
                         co_return std::nullopt;
                     }
-                    co_return Entity::fromJson(result.asStringView());
+                    co_return E::fromJson(result.asStringView());
                 } catch (const std::exception& e) {
                     RELAIS_LOG_WARN << "RedisCache GET error: " << e.what();
                     co_return std::nullopt;
                 }
             }
 
-            template<typename Entity, typename Rep, typename Period>
-            static io::Task<std::optional<Entity>> getEx(const std::string& key,
+            template<typename E, typename Rep, typename Period>
+            static io::Task<std::optional<E>> getEx(const std::string& key,
                                                               std::chrono::duration<Rep, Period> ttl) {
                 if (auto json = co_await getRawEx(key, ttl)) {
-                    co_return Entity::fromJson(*json);
+                    co_return E::fromJson(*json);
                 }
                 co_return std::nullopt;
             }
 
-            template<typename Entity, typename Rep, typename Period>
-            static io::Task<bool> set(const std::string& key, const Entity& entity, std::chrono::duration<Rep, Period> ttl) {
-                if (!DbProvider::hasRedis()) {
+            template<typename E, typename Rep, typename Period>
+            static io::Task<bool> set(const std::string& key, const E& entity, std::chrono::duration<Rep, Period> ttl) {
+                if (!PgProvider::hasRedis()) {
                     co_return false;
                 }
 
                 try {
                     auto ttl_seconds = std::chrono::duration_cast<std::chrono::seconds>(ttl).count();
-                    auto json = entity.json();
-                    co_await DbProvider::redis("SETEX", key,
-                        ttl_seconds, *json);
+                    co_await PgProvider::redis("SETEX", key,
+                        ttl_seconds, entity.json());
                     co_return true;
                 } catch (const std::exception& e) {
                     RELAIS_LOG_WARN << "RedisCache SET error: " << e.what();
@@ -73,40 +73,40 @@ namespace jcailloux::relais::cache {
                 }
             }
 
-            template<typename Entity>
-            static io::Task<std::optional<std::vector<Entity>>> getList(const std::string& key) {
-                if (!DbProvider::hasRedis()) {
+            template<typename E>
+            static io::Task<std::optional<std::vector<E>>> getList(const std::string& key) {
+                if (!PgProvider::hasRedis()) {
                     co_return std::nullopt;
                 }
 
                 try {
-                    auto result = co_await DbProvider::redis("GET", key);
+                    auto result = co_await PgProvider::redis("GET", key);
                     if (result.isNil()) {
                         co_return std::nullopt;
                     }
                     auto raw = result.asStringView();
-                    co_return parseListWithHeader<Entity>(raw);
+                    co_return parseListWithHeader<E>(raw);
                 } catch (const std::exception& e) {
                     RELAIS_LOG_WARN << "RedisCache GET list error: " << e.what();
                     co_return std::nullopt;
                 }
             }
 
-            template<typename Entity, typename Rep, typename Period>
-            static io::Task<std::optional<std::vector<Entity>>> getListEx(const std::string& key,
+            template<typename E, typename Rep, typename Period>
+            static io::Task<std::optional<std::vector<E>>> getListEx(const std::string& key,
                                                                                std::chrono::duration<Rep, Period> ttl) {
                 if (auto raw = co_await getRawEx(key, ttl)) {
-                    co_return parseListWithHeader<Entity>(*raw);
+                    co_return parseListWithHeader<E>(*raw);
                 }
                 co_return std::nullopt;
             }
 
-            template<typename Entity, typename Rep, typename Period>
+            template<typename E, typename Rep, typename Period>
             static io::Task<bool> setList(const std::string& key,
-                                               const std::vector<Entity>& entities,
+                                               const std::vector<E>& entities,
                                                std::chrono::duration<Rep, Period> ttl,
                                                std::optional<list::ListBoundsHeader> header = std::nullopt) {
-                if (!DbProvider::hasRedis()) {
+                if (!PgProvider::hasRedis()) {
                     co_return false;
                 }
 
@@ -120,11 +120,11 @@ namespace jcailloux::relais::cache {
                         header->writeTo(reinterpret_cast<uint8_t*>(prefixed.data()));
                         std::memcpy(prefixed.data() + list::kListBoundsHeaderSize,
                                     json.data(), json.size());
-                        co_await DbProvider::redis("SETEX", key,
+                        co_await PgProvider::redis("SETEX", key,
                             ttl_seconds,
                             std::string_view(prefixed.data(), prefixed.size()));
                     } else {
-                        co_await DbProvider::redis("SETEX", key,
+                        co_await PgProvider::redis("SETEX", key,
                             ttl_seconds, json);
                     }
                     co_return true;
@@ -135,29 +135,29 @@ namespace jcailloux::relais::cache {
             }
 
             // =================================================================
-            // List BEVE Methods (vector<Entity> via glz::write_beve/read_beve)
+            // List BEVE Methods (vector<E> via glz::write_beve/read_beve)
             // =================================================================
 
-            template<typename Entity>
-            static io::Task<std::optional<std::vector<Entity>>> getListBeve(const std::string& key) {
+            template<typename E>
+            static io::Task<std::optional<std::vector<E>>> getListBeve(const std::string& key) {
                 auto data = co_await getRawBinary(key);
                 if (!data) co_return std::nullopt;
-                co_return parseListBeveWithHeader<Entity>(*data);
+                co_return parseListBeveWithHeader<E>(*data);
             }
 
-            template<typename Entity, typename Rep, typename Period>
-            static io::Task<std::optional<std::vector<Entity>>> getListBeveEx(
+            template<typename E, typename Rep, typename Period>
+            static io::Task<std::optional<std::vector<E>>> getListBeveEx(
                 const std::string& key,
                 std::chrono::duration<Rep, Period> ttl)
             {
                 auto data = co_await getRawBinaryEx(key, ttl);
                 if (!data) co_return std::nullopt;
-                co_return parseListBeveWithHeader<Entity>(*data);
+                co_return parseListBeveWithHeader<E>(*data);
             }
 
-            template<typename Entity, typename Rep, typename Period>
+            template<typename E, typename Rep, typename Period>
             static io::Task<bool> setListBeve(const std::string& key,
-                                                   const std::vector<Entity>& entities,
+                                                   const std::vector<E>& entities,
                                                    std::chrono::duration<Rep, Period> ttl,
                                                    std::optional<list::ListBoundsHeader> header = std::nullopt) {
                 auto beve = serializeListBeve(entities);
@@ -176,12 +176,12 @@ namespace jcailloux::relais::cache {
 
             /// Get raw JSON string without deserialization.
             static io::Task<std::optional<std::string>> getRaw(const std::string& key) {
-                if (!DbProvider::hasRedis()) {
+                if (!PgProvider::hasRedis()) {
                     co_return std::nullopt;
                 }
 
                 try {
-                    auto result = co_await DbProvider::redis("GET", key);
+                    auto result = co_await PgProvider::redis("GET", key);
                     if (result.isNil()) {
                         co_return std::nullopt;
                     }
@@ -195,13 +195,13 @@ namespace jcailloux::relais::cache {
             template<typename Rep, typename Period>
             static io::Task<std::optional<std::string>> getRawEx(const std::string& key,
                                                                       std::chrono::duration<Rep, Period> ttl) {
-                if (!DbProvider::hasRedis()) {
+                if (!PgProvider::hasRedis()) {
                     co_return std::nullopt;
                 }
 
                 try {
                     auto ttl_seconds = std::chrono::duration_cast<std::chrono::seconds>(ttl).count();
-                    auto result = co_await DbProvider::redis("GETEX", key,
+                    auto result = co_await PgProvider::redis("GETEX", key,
                         "EX", ttl_seconds);
                     if (result.isNil()) {
                         co_return std::nullopt;
@@ -218,13 +218,13 @@ namespace jcailloux::relais::cache {
             static io::Task<bool> setRaw(const std::string& key,
                                               const std::string_view json,
                                               std::chrono::duration<Rep, Period> ttl) {
-                if (!DbProvider::hasRedis()) {
+                if (!PgProvider::hasRedis()) {
                     co_return false;
                 }
 
                 try {
                     auto ttl_seconds = std::chrono::duration_cast<std::chrono::seconds>(ttl).count();
-                    co_await DbProvider::redis("SETEX", key,
+                    co_await PgProvider::redis("SETEX", key,
                         ttl_seconds,
                         std::string_view(json.data(), json.size()));
                     co_return true;
@@ -247,12 +247,12 @@ namespace jcailloux::relais::cache {
 
             /// Get raw binary data (for BEVE or other binary formats).
             static io::Task<std::optional<std::vector<uint8_t>>> getRawBinary(const std::string& key) {
-                if (!DbProvider::hasRedis()) {
+                if (!PgProvider::hasRedis()) {
                     co_return std::nullopt;
                 }
 
                 try {
-                    auto result = co_await DbProvider::redis("GET", key);
+                    auto result = co_await PgProvider::redis("GET", key);
                     if (result.isNil()) {
                         co_return std::nullopt;
                     }
@@ -271,13 +271,13 @@ namespace jcailloux::relais::cache {
             static io::Task<std::optional<std::vector<uint8_t>>> getRawBinaryEx(
                 const std::string& key,
                 std::chrono::duration<Rep, Period> ttl) {
-                if (!DbProvider::hasRedis()) {
+                if (!PgProvider::hasRedis()) {
                     co_return std::nullopt;
                 }
 
                 try {
                     auto ttl_seconds = std::chrono::duration_cast<std::chrono::seconds>(ttl).count();
-                    auto result = co_await DbProvider::redis("GETEX", key,
+                    auto result = co_await PgProvider::redis("GETEX", key,
                         "EX", ttl_seconds);
                     if (result.isNil()) {
                         co_return std::nullopt;
@@ -297,13 +297,13 @@ namespace jcailloux::relais::cache {
             static io::Task<bool> setRawBinary(const std::string& key,
                                                     const std::vector<uint8_t>& data,
                                                     std::chrono::duration<Rep, Period> ttl) {
-                if (!DbProvider::hasRedis()) {
+                if (!PgProvider::hasRedis()) {
                     co_return false;
                 }
 
                 try {
                     auto ttl_seconds = std::chrono::duration_cast<std::chrono::seconds>(ttl).count();
-                    co_await DbProvider::redis("SETEX", key,
+                    co_await PgProvider::redis("SETEX", key,
                         ttl_seconds,
                         std::string_view(reinterpret_cast<const char*>(data.data()), data.size()));
                     co_return true;
@@ -314,7 +314,7 @@ namespace jcailloux::relais::cache {
             }
 
             // =================================================================
-            // List Entity Binary Methods
+            // List E Binary Methods
             // =================================================================
 
             /// Get a list entity from binary cache.
@@ -368,32 +368,30 @@ namespace jcailloux::relais::cache {
                 const ListEntity& listEntity,
                 std::chrono::duration<Rep, Period> ttl,
                 std::optional<list::ListBoundsHeader> header = std::nullopt)
-                requires requires(const ListEntity& l) {
-                    { l.binary() } -> std::convertible_to<std::shared_ptr<const std::vector<uint8_t>>>;
-                }
+                requires HasBinarySerialization<ListEntity>
             {
                 auto binary = listEntity.binary();
                 if (header) {
-                    std::vector<uint8_t> prefixed(list::kListBoundsHeaderSize + binary->size());
+                    std::vector<uint8_t> prefixed(list::kListBoundsHeaderSize + binary.size());
                     header->writeTo(prefixed.data());
                     std::memcpy(prefixed.data() + list::kListBoundsHeaderSize,
-                                binary->data(), binary->size());
+                                binary.data(), binary.size());
                     co_return co_await setRawBinary(key, prefixed, ttl);
                 }
-                co_return co_await setRawBinary(key, *binary, ttl);
+                co_return co_await setRawBinary(key, binary, ttl);
             }
 
             /// Refresh TTL without modifying the value.
             template<typename Rep, typename Period>
             static io::Task<bool> expire(const std::string& key,
                                               std::chrono::duration<Rep, Period> ttl) {
-                if (!DbProvider::hasRedis()) {
+                if (!PgProvider::hasRedis()) {
                     co_return false;
                 }
 
                 try {
                     auto ttl_seconds = std::chrono::duration_cast<std::chrono::seconds>(ttl).count();
-                    auto result = co_await DbProvider::redis("EXPIRE", key,
+                    auto result = co_await PgProvider::redis("EXPIRE", key,
                         ttl_seconds);
                     co_return result.asInteger() == 1;
                 } catch (const std::exception& e) {
@@ -403,12 +401,12 @@ namespace jcailloux::relais::cache {
             }
 
             static io::Task<bool> invalidate(const std::string& key) {
-                if (!DbProvider::hasRedis()) {
+                if (!PgProvider::hasRedis()) {
                     co_return false;
                 }
 
                 try {
-                    co_await DbProvider::redis("UNLINK", key);
+                    co_await PgProvider::redis("UNLINK", key);
                     co_return true;
                 } catch (const std::exception& e) {
                     RELAIS_LOG_WARN << "RedisCache UNLINK error: " << e.what();
@@ -420,7 +418,7 @@ namespace jcailloux::relais::cache {
             /// Safer than KEYS for production use.
             static io::Task<size_t> invalidatePatternSafe(const std::string& pattern,
                                                                size_t batch_size = 100) {
-                if (!DbProvider::hasRedis()) {
+                if (!PgProvider::hasRedis()) {
                     co_return 0;
                 }
 
@@ -431,7 +429,7 @@ namespace jcailloux::relais::cache {
                     do {
                         std::vector<std::string> batch_keys;
 
-                        auto result = co_await DbProvider::redis(
+                        auto result = co_await PgProvider::redis(
                             "SCAN", cursor, "MATCH", pattern, "COUNT", batch_size);
 
                         if (result.isNil() || !result.isArray()) {
@@ -456,7 +454,7 @@ namespace jcailloux::relais::cache {
 
                         for (const auto& k : batch_keys) {
                             try {
-                                co_await DbProvider::redis("UNLINK", k);
+                                co_await PgProvider::redis("UNLINK", k);
                                 ++count;
                             } catch (...) {}
                         }
@@ -478,7 +476,7 @@ namespace jcailloux::relais::cache {
             static io::Task<bool> trackListKey(const std::string& groupKey,
                                                     const std::string& listKey,
                                                     std::chrono::duration<Rep, Period> ttl) {
-                if (!DbProvider::hasRedis()) {
+                if (!PgProvider::hasRedis()) {
                     co_return false;
                 }
 
@@ -487,10 +485,10 @@ namespace jcailloux::relais::cache {
                     auto ttl_seconds = std::chrono::duration_cast<std::chrono::seconds>(ttl).count();
 
                     // Add to tracking set (binary-safe via argvlen)
-                    co_await DbProvider::redis("SADD", trackingKey, listKey);
+                    co_await PgProvider::redis("SADD", trackingKey, listKey);
 
                     // Set TTL on tracking set only if none exists (NX = don't renew)
-                    co_await DbProvider::redis("EXPIRE", trackingKey,
+                    co_await PgProvider::redis("EXPIRE", trackingKey,
                         ttl_seconds, "NX");
 
                     co_return true;
@@ -503,7 +501,7 @@ namespace jcailloux::relais::cache {
             /// Invalidate all list cache keys in a group.
             /// O(M) where M is the number of cached pages (typically small).
             static io::Task<size_t> invalidateListGroup(const std::string& groupKey) {
-                if (!DbProvider::hasRedis()) {
+                if (!PgProvider::hasRedis()) {
                     co_return 0;
                 }
 
@@ -522,7 +520,7 @@ namespace jcailloux::relais::cache {
                         return count
                     )";
 
-                    auto result = co_await DbProvider::redis(
+                    auto result = co_await PgProvider::redis(
                         "EVAL", lua, "1", trackingKey);
 
                     co_return result.isNil() ? 0 : static_cast<size_t>(result.asInteger());
@@ -541,7 +539,7 @@ namespace jcailloux::relais::cache {
                 const std::string& groupKey,
                 int64_t entity_sort_val)
             {
-                if (!DbProvider::hasRedis()) {
+                if (!PgProvider::hasRedis()) {
                     co_return 0;
                 }
 
@@ -618,7 +616,7 @@ if count == #keys then redis.call('UNLINK', KEYS[1]) end
 return count
 )";
 
-                    auto result = co_await DbProvider::redis(
+                    auto result = co_await PgProvider::redis(
                         "EVAL", lua, "1", trackingKey,
                         entity_sort_val,
                         static_cast<int>(list::kListBoundsHeaderSize));
@@ -637,7 +635,7 @@ return count
                 int64_t old_sort_val,
                 int64_t new_sort_val)
             {
-                if (!DbProvider::hasRedis()) {
+                if (!PgProvider::hasRedis()) {
                     co_return 0;
                 }
 
@@ -711,7 +709,7 @@ if count == #keys then redis.call('UNLINK', KEYS[1]) end
 return count
 )";
 
-                    auto result = co_await DbProvider::redis(
+                    auto result = co_await PgProvider::redis(
                         "EVAL", lua, "1", trackingKey,
                         old_sort_val, new_sort_val,
                         static_cast<int>(list::kListBoundsHeaderSize));
@@ -736,7 +734,7 @@ return count
                 const std::string& entityBlob,
                 const std::string& sortValues)
             {
-                if (!DbProvider::hasRedis()) co_return 0;
+                if (!PgProvider::hasRedis()) co_return 0;
 
                 try {
                     static constexpr std::string_view lua = R"(
@@ -894,7 +892,7 @@ end
 return total
 )";
 
-                    auto result = co_await DbProvider::redis(
+                    auto result = co_await PgProvider::redis(
                         "EVAL", lua, "1", masterKey,
                         std::to_string(prefixLen),
                         static_cast<int>(list::kListBoundsHeaderSize),
@@ -920,7 +918,7 @@ return total
                 const std::string& oldEntityBlob,
                 const std::string& oldSortValues)
             {
-                if (!DbProvider::hasRedis()) co_return 0;
+                if (!PgProvider::hasRedis()) co_return 0;
 
                 try {
                     static constexpr std::string_view lua = R"(
@@ -1117,7 +1115,7 @@ end
 return total
 )";
 
-                    auto result = co_await DbProvider::redis(
+                    auto result = co_await PgProvider::redis(
                         "EVAL", lua, "1", masterKey,
                         std::to_string(prefixLen),
                         static_cast<int>(list::kListBoundsHeaderSize),
@@ -1133,8 +1131,8 @@ return total
             }
 
         private:
-            template<typename Entity>
-            static std::string serializeList(const std::vector<Entity>& entities) {
+            template<typename E>
+            static std::string serializeList(const std::vector<E>& entities) {
                 std::string buffer;
                 if (glz::write_json(entities, buffer)) {
                     return "[]";
@@ -1142,9 +1140,9 @@ return total
                 return buffer;
             }
 
-            template<typename Entity>
-            static std::optional<std::vector<Entity>> parseList(const std::string_view json) {
-                std::vector<Entity> result;
+            template<typename E>
+            static std::optional<std::vector<E>> parseList(const std::string_view json) {
+                std::vector<E> result;
                 if (auto ec = glz::read_json(result, json)) {
                     RELAIS_LOG_WARN << "RedisCache parseList error: " << glz::format_error(ec, json);
                     return std::nullopt;
@@ -1153,21 +1151,21 @@ return total
             }
 
             /// Parse a list value that may be prefixed with a ListBoundsHeader.
-            template<typename Entity>
-            static std::optional<std::vector<Entity>> parseListWithHeader(const std::string_view raw) {
+            template<typename E>
+            static std::optional<std::vector<E>> parseListWithHeader(const std::string_view raw) {
                 std::string_view data = raw;
                 if (data.size() >= list::kListBoundsHeaderSize
                     && static_cast<uint8_t>(data[0]) == list::kListBoundsHeaderMagic[0]
                     && static_cast<uint8_t>(data[1]) == list::kListBoundsHeaderMagic[1]) {
                     data.remove_prefix(list::kListBoundsHeaderSize);
                 }
-                return parseList<Entity>(data);
+                return parseList<E>(data);
             }
 
             // ----- BEVE list helpers -----
 
-            template<typename Entity>
-            static std::vector<uint8_t> serializeListBeve(const std::vector<Entity>& entities) {
+            template<typename E>
+            static std::vector<uint8_t> serializeListBeve(const std::vector<E>& entities) {
                 std::vector<uint8_t> buffer;
                 if (glz::write_beve(entities, buffer)) {
                     buffer.clear();
@@ -1175,10 +1173,10 @@ return total
                 return buffer;
             }
 
-            template<typename Entity>
-            static std::optional<std::vector<Entity>> parseListBeve(std::span<const uint8_t> data) {
+            template<typename E>
+            static std::optional<std::vector<E>> parseListBeve(std::span<const uint8_t> data) {
                 if (data.empty()) return std::nullopt;
-                std::vector<Entity> result;
+                std::vector<E> result;
                 if (glz::read_beve(result, std::string_view{
                         reinterpret_cast<const char*>(data.data()), data.size()})) {
                     return std::nullopt;
@@ -1186,8 +1184,8 @@ return total
                 return result;
             }
 
-            template<typename Entity>
-            static std::optional<std::vector<Entity>> parseListBeveWithHeader(
+            template<typename E>
+            static std::optional<std::vector<E>> parseListBeveWithHeader(
                     const std::vector<uint8_t>& raw) {
                 std::span<const uint8_t> data(raw);
                 if (data.size() >= list::kListBoundsHeaderSize
@@ -1195,7 +1193,7 @@ return total
                     && data[1] == list::kListBoundsHeaderMagic[1]) {
                     data = data.subspan(list::kListBoundsHeaderSize);
                 }
-                return parseListBeve<Entity>(data);
+                return parseListBeve<E>(data);
             }
     };
 

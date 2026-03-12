@@ -510,8 +510,8 @@ TEST_CASE("Concurrency - concurrent patch",
 {
     TransactionGuard tx;
 
-    using jcailloux::relais::wrapper::set;
-    using F = TestUserWrapper::Field;
+    using jcailloux::relais::entity::set;
+    using F = TestUserEntity::Field;
 
     SECTION("[L1] concurrent patch on same user") {
         auto userId = insertTestUser("conc_patch", "conc_ub@test.com", 0);

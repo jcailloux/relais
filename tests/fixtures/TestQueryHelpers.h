@@ -8,11 +8,11 @@
 #pragma once
 
 #include "TestRepositories.h"
-#include "jcailloux/relais/list/decl/HttpQueryParser.h"
+#include "jcailloux/relais/list/spec/HttpQueryParser.h"
 
 namespace relais_test {
 
-namespace ld = jcailloux::relais::cache::list::decl;
+namespace ld = jcailloux::relais::list::spec;
 
 using ArticleListQuery = TestArticleListRepo::ListQuery;
 using PurchaseListQuery = TestPurchaseListRepo::ListQuery;

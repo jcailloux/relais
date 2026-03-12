@@ -14,7 +14,7 @@
 #include <jcailloux/relais/io/pg/PgResult.h>
 #include <jcailloux/relais/io/pg/PgParams.h>
 #include <jcailloux/relais/io/redis/RedisClient.h>
-#include <jcailloux/relais/DbProvider.h>
+#include <jcailloux/relais/PgProvider.h>
 
 #include <fixtures/EpollIoContext.h>
 #include <fixtures/TestRunner.h>
@@ -180,7 +180,7 @@ namespace detail {
     inline void cleanup() {
         if (isInitialized().exchange(false)) {
             testLoop().stop();
-            jcailloux::relais::DbProvider::reset();
+            jcailloux::relais::PgProvider::reset();
             testRedis().reset();
             testPg().reset();
         }
@@ -287,7 +287,7 @@ inline const char* getConnInfo() {
 
 /**
  * Initialize I/O for integration tests.
- * Phase 1: synchronous init (PgPool, Redis, DbProvider) via runTask().
+ * Phase 1: synchronous init (PgPool, Redis, PgProvider) via runTask().
  * Phase 2: start background event loop thread for concurrent sync() calls.
  */
 inline void initTest() {
@@ -323,7 +323,7 @@ inline void initTest() {
     }
     detail::testRedis() = redis;
 
-    jcailloux::relais::DbProvider::init(io, pool, redis, pg_max);
+    jcailloux::relais::PgProvider::init(io, pool, redis, pg_max);
 
     // Phase 2: Start background event loop thread
     detail::testLoop().start();
@@ -375,7 +375,7 @@ public:
 
 private:
     static void cleanup() {
-        if (!jcailloux::relais::DbProvider::initialized()) {
+        if (!jcailloux::relais::PgProvider::initialized()) {
             return;
         }
         flushRedis();

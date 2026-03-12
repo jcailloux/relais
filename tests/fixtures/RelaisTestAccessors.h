@@ -6,7 +6,7 @@
  * Test-only accessor for relais internal state.
  * Compiled only when RELAIS_BUILDING_TESTS is defined.
  * Provides cache reset, modification count inspection, forced cleanup,
- * and GDSF policy access via friend access to CachedRepo, ListMixin,
+ * and GDSF policy access via friend access to LocalRepo, ListMixin,
  * ListCache, ModificationTracker, and GDSFPolicy.
  */
 
@@ -28,7 +28,7 @@ struct TestInternals {
     template<typename Repo>
     static void resetListCacheState() {
         auto& cache = Repo::listCache();
-        cache.cache_.full_cleanup([](const auto&, const auto&) { return true; });
+        cache.tier_.map().full_cleanup([](const auto&, const auto&) { return true; });
         resetModificationTracker(cache.modifications_);
     }
 
@@ -58,19 +58,24 @@ struct TestInternals {
     }
 
     /// Call ModificationTracker::drainChunk() directly with a controlled cutoff and chunk identity.
-    /// Clears the bit for chunk_id in modifications with modified_at <= cutoff.
+    /// Clears the bit for chunk_id in modifications with generation <= cutoff_gen.
     template<typename Repo>
-    static void cleanupModificationsWithCutoff(
-            std::chrono::steady_clock::time_point cutoff, uint8_t chunk_id) {
-        Repo::listCache().modifications_.drainChunk(cutoff, chunk_id);
+    static void cleanupModificationsWithCutoff(uint32_t cutoff_gen, uint8_t chunk_id) {
+        Repo::listCache().modifications_.drainChunk(cutoff_gen, chunk_id);
     }
 
     /// Call ModificationTracker::drain() directly with a controlled cutoff.
-    /// Removes all modifications with modified_at <= cutoff in one pass.
+    /// Removes all modifications with generation <= cutoff_gen in one pass.
     template<typename Repo>
-    static void drainModificationsWithCutoff(
-            std::chrono::steady_clock::time_point cutoff) {
-        Repo::listCache().modifications_.drain(cutoff);
+    static void drainModificationsWithCutoff(uint32_t cutoff_gen) {
+        Repo::listCache().modifications_.drain(cutoff_gen);
+    }
+
+    /// Read the current generation counter of a list cache.
+    /// Used by tests to capture a cutoff between modifications.
+    template<typename Repo>
+    static uint32_t listCacheGeneration() {
+        return Repo::listCache().generation_.load(std::memory_order_relaxed);
     }
 
     /// Direct L1 cache get — bypasses coroutine overhead.
@@ -105,8 +110,6 @@ struct TestInternals {
     }
 
     /// Destroy all deferred entries in the epoch pool.
-    /// Flushes CachedWrapper destructors that would otherwise fire lazily
-    /// (reserve FIFO > 500) and corrupt totalMemory after resetGDSF.
     /// Only safe after resetEntityCacheState (map is empty).
     template<typename Repo>
     static void clearEntityCachePools() {
@@ -118,7 +121,7 @@ struct TestInternals {
     /// Computed by ChunkMap from the key (deterministic). Returns nullopt if not in cache.
     template<typename Repo>
     static std::optional<uint8_t> getListEntryChunkId(const std::string& cache_key) {
-        auto& cache = Repo::listCache().cache_;
+        auto& cache = Repo::listCache().tier_.map();
         constexpr long n_chunks = static_cast<long>(
             std::remove_reference_t<decltype(Repo::listCache())>::ChunkCount);
         long chunk = cache.key_chunk(cache_key, n_chunks);
@@ -131,7 +134,7 @@ struct TestInternals {
     template<typename Repo>
     static void resetCacheForGDSF() {
         resetEntityCacheState<Repo>();              // remove all entries
-        clearEntityCachePools<Repo>();              // drain epoch → CachedWrapper dtors fire
+        clearEntityCachePools<Repo>();              // drain epoch pool
         resetRepoGDSFState<Repo>();                 // reset avg_construction_time
         resetGDSF();                                // reset everything (histograms + memory)
     }
@@ -148,13 +151,13 @@ struct TestInternals {
     /// Reset per-repo GDSF state (avg_construction_time).
     template<typename Repo>
     static void resetRepoGDSFState() {
-        Repo::avg_construction_time_us_.store(0.0f, std::memory_order_relaxed);
+        Repo::tier().avg_cost_us_.store(0.0f, std::memory_order_relaxed);
     }
 
     /// Type-erased GDSF metadata for test assertions.
     struct GDSFTestMetadata {
         uint32_t access_count{0};
-        int64_t ttl_expiration_rep{0};
+        uint32_t ttl_expiration_sec{0};
     };
 
     /// Get GDSF metadata for a cached entity (read-only, no score bump).
@@ -171,8 +174,8 @@ struct TestInternals {
         if constexpr (requires { meta.access_count; }) {
             m.access_count = meta.access_count.load(std::memory_order_relaxed);
         }
-        if constexpr (requires { meta.ttl_expiration_rep; }) {
-            m.ttl_expiration_rep = meta.ttl_expiration_rep;
+        if constexpr (requires { meta.ttl_expiration_sec; }) {
+            m.ttl_expiration_sec = meta.ttl_expiration_sec;
         }
         return m;
     }
@@ -238,7 +241,7 @@ struct TestInternals {
     /// Seed the average construction time for a repo (test-only).
     template<typename Repo>
     static void seedAvgConstructionTime(float us) {
-        Repo::avg_construction_time_us_.store(us, std::memory_order_relaxed);
+        Repo::tier().avg_cost_us_.store(us, std::memory_order_relaxed);
     }
 
     /// Bucket slot size in bytes for a specific repo.
@@ -247,7 +250,8 @@ struct TestInternals {
     /// assertions on histogram entries and score denominators.
     template<typename Repo>
     static constexpr size_t bucketSlotSize() {
-        return Repo::kBucketSlotSize;
+        using TierType = std::remove_reference_t<decltype(*Repo::tier_ptr_)>;
+        return TierType::kBucketSlotSize;
     }
 
     // =========================================================================
@@ -302,9 +306,7 @@ private:
     static void resetModificationTracker(auto& t) {
         std::unique_lock lock(t.mutex_);
         t.modifications_.clear();
-        t.latest_modification_time_.store(
-            std::chrono::steady_clock::time_point::min(),
-            std::memory_order_relaxed);
+        t.latest_generation_.store(0, std::memory_order_relaxed);
     }
 };
 

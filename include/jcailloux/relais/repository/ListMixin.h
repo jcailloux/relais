@@ -7,19 +7,19 @@
 #include "jcailloux/relais/io/pg/PgError.h"
 #include "jcailloux/relais/io/pg/PgParams.h"
 
-#include "jcailloux/relais/DbProvider.h"
+#include "jcailloux/relais/PgProvider.h"
 #include "jcailloux/relais/Log.h"
 #include "jcailloux/relais/cache/RedisCache.h"
 #include "jcailloux/relais/list/ListCache.h"
 #include "jcailloux/relais/list/ListQuery.h"
-#include "jcailloux/relais/list/decl/ListDescriptor.h"
-#include "jcailloux/relais/list/decl/ListDescriptorQuery.h"
-#include "jcailloux/relais/list/decl/GeneratedFilters.h"
-#include "jcailloux/relais/list/decl/GeneratedTraits.h"
-#include "jcailloux/relais/list/decl/GeneratedCriteria.h"
-#include "jcailloux/relais/list/decl/HttpQueryParser.h"
-#include "jcailloux/relais/wrapper/EntityConcepts.h"
-#include "jcailloux/relais/wrapper/ListWrapper.h"
+#include "jcailloux/relais/list/spec/ListDescriptor.h"
+#include "jcailloux/relais/list/spec/ListDescriptorQuery.h"
+#include "jcailloux/relais/list/spec/GeneratedFilters.h"
+#include "jcailloux/relais/list/spec/GeneratedTraits.h"
+#include "jcailloux/relais/list/spec/GeneratedCriteria.h"
+#include "jcailloux/relais/list/spec/HttpQueryParser.h"
+#include "jcailloux/relais/entity/EntityConcepts.h"
+#include "jcailloux/relais/list/ListWrapper.h"
 #include "jcailloux/relais/cache/Metrics.h"
 
 #ifdef RELAIS_BUILDING_TESTS
@@ -34,7 +34,7 @@ namespace jcailloux::relais {
  * Activated when Entity has a ListDescriptor (detected via HasListDescriptor concept).
  * Sits in the mixin chain between the cache layer and InvalidationMixin.
  *
- * Chain: [InvalidationMixin] -> ListMixin -> CachedRepo -> [RedisRepo] -> BaseRepo
+ * Chain: [InvalidationMixin] -> ListMixin -> LocalRepo -> [RedisRepo] -> PgRepo
  *
  * Provides:
  * - query()           : paginated list queries with L1/L2 caching
@@ -74,8 +74,8 @@ class ListMixin : public Base {
     // Type aliases from list infrastructure
     // =========================================================================
 
-    using DescriptorFilters = cache::list::decl::Filters<Descriptor>;
-    using DescriptorSortSpec = cache::list::decl::SortSpec<Descriptor>;
+    using DescriptorFilters = list::spec::Filters<Descriptor>;
+    using DescriptorSortSpec = list::spec::SortSpec<Descriptor>;
 
     // =========================================================================
     // Traits adapter — bridges Descriptor helpers to ListCache interface
@@ -87,80 +87,54 @@ class ListMixin : public Base {
         using FilterTags = Filters;
 
         static bool matchesFilters(const Entity& e, const Filters& f) {
-            return cache::list::decl::matchesFilters<Descriptor>(e, f);
+            return list::spec::matchesFilters<Descriptor>(e, f);
         }
 
         static int compare(const Entity& a, const Entity& b,
-                          SortField field_index, cache::list::SortDirection dir) {
-            DescriptorSortSpec sort{field_index,
-                dir == cache::list::SortDirection::Asc
-                    ? cache::list::decl::SortDirection::Asc
-                    : cache::list::decl::SortDirection::Desc};
-            return cache::list::decl::compare<Descriptor>(a, b, sort);
+                          SortField field_index, list::SortDirection dir) {
+            return list::spec::compare<Descriptor>(a, b, {field_index, dir});
         }
 
-        static cache::list::Cursor extractCursor(const Entity& e,
-                                                  const cache::list::SortSpec<size_t>& sort) {
-            DescriptorSortSpec descriptor_sort{sort.field,
-                sort.direction == cache::list::SortDirection::Asc
-                    ? cache::list::decl::SortDirection::Asc
-                    : cache::list::decl::SortDirection::Desc};
-            auto cursor = cache::list::decl::extractCursor<Descriptor>(e, descriptor_sort);
-
-            cache::list::Cursor result;
-            result.data.reserve(cursor.data.size());
-            for (uint8_t b : cursor.data) {
-                result.data.push_back(static_cast<std::byte>(b));
-            }
-            return result;
+        static list::Cursor extractCursor(const Entity& e,
+                                                  const list::SortSpec<size_t>& sort) {
+            return list::spec::extractCursor<Descriptor>(
+                e, {sort.field, sort.direction});
         }
 
         static bool isBeforeOrAtCursor(const Entity& e,
-                                       const cache::list::Cursor& cursor,
-                                       const cache::list::SortSpec<size_t>& sort) {
-            cache::list::decl::Cursor descriptor_cursor;
-            descriptor_cursor.data.reserve(cursor.data.size());
-            for (std::byte b : cursor.data) {
-                descriptor_cursor.data.push_back(static_cast<uint8_t>(b));
-            }
-
-            DescriptorSortSpec descriptor_sort{sort.field,
-                sort.direction == cache::list::SortDirection::Asc
-                    ? cache::list::decl::SortDirection::Asc
-                    : cache::list::decl::SortDirection::Desc};
-            return cache::list::decl::isBeforeOrAtCursor<Descriptor>(
-                e, descriptor_cursor, descriptor_sort);
+                                       const list::Cursor& cursor,
+                                       const list::SortSpec<size_t>& sort) {
+            return list::spec::isBeforeOrAtCursor<Descriptor>(
+                e, cursor, {sort.field, sort.direction});
         }
 
         static FilterTags extractTags(const Entity& e) {
-            return cache::list::decl::extractTags<Descriptor>(e);
+            return list::spec::extractTags<Descriptor>(e);
         }
 
         static int64_t extractSortValue(const Entity& e, size_t field_index) {
-            return cache::list::decl::extractSortValue<Descriptor>(e, field_index);
+            return list::spec::extractSortValue<Descriptor>(e, field_index);
         }
 
-        static constexpr cache::list::SortSpec<size_t> defaultSort() {
-            auto descriptor_sort = cache::list::decl::defaultSort<Descriptor>();
-            return {descriptor_sort.field_index,
-                descriptor_sort.direction == cache::list::decl::SortDirection::Asc
-                    ? cache::list::SortDirection::Asc
-                    : cache::list::SortDirection::Desc};
+        static constexpr list::SortSpec<size_t> defaultSort() {
+            auto ds = list::spec::defaultSort<Descriptor>();
+            return {ds.field_index, ds.direction};
         }
 
         static std::optional<size_t> parseSortField(std::string_view field) {
-            return cache::list::decl::parseSortField<Descriptor>(field);
+            return list::spec::parseSortField<Descriptor>(field);
         }
 
         static std::string_view sortFieldName(size_t field_index) {
-            return cache::list::decl::sortFieldName<Descriptor>(field_index);
+            return list::spec::sortFieldName<Descriptor>(field_index);
         }
 
+        // Bucketed page sizes for cache key normalization
         static constexpr std::array<uint16_t, 4> limitSteps = {10, 25, 50, 100};
         static constexpr uint16_t maxLimit = 100;
 
         static uint16_t normalizeLimit(uint16_t requested) {
-            return cache::list::decl::normalizeLimit<Descriptor>(requested);
+            return list::spec::normalizeLimit<Descriptor>(requested);
         }
     };
 
@@ -170,13 +144,14 @@ class ListMixin : public Base {
 
     static constexpr bool HasGDSF = cache::GDSFPolicy::enabled;
 
-    using ListWrapperType = wrapper::ListWrapper<Entity>;
-    using ListCacheType = cache::list::ListCache<Entity, Base::config.l1_chunk_count_log2, Key, Traits, HasGDSF>;
+    using ListWrapperType = list::ListWrapper<Entity>;
+    using ListCacheType = list::ListCache<Entity, Base::config.l1_chunk_count_log2, Key, Traits, HasGDSF>;
 
-    static cache::list::ListCacheConfig listCacheConfig() {
+    static list::ListCacheConfig listCacheConfig() {
         return {
-            .default_ttl = std::chrono::duration_cast<std::chrono::seconds>(
-                std::chrono::nanoseconds(Base::config.l1_ttl)),
+            .default_ttl_sec = static_cast<uint32_t>(
+                std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::nanoseconds(Base::config.l1_ttl)).count()),
         };
     }
 
@@ -187,7 +162,7 @@ class ListMixin : public Base {
             std::call_once(gdsf_flag, []() {
                 static const std::string list_name =
                     std::string(Base::name()) + ":list";
-                cache::GDSFPolicy::instance().enroll({
+                instance.tier().enroll({
                     .sweep_fn = +[]() -> bool { return listCache().sweep(); },
                     .size_fn = +[]() -> size_t { return listCache().size(); },
                     .name = list_name.c_str()
@@ -200,27 +175,17 @@ class ListMixin : public Base {
     // L2 TTL helper
     static constexpr auto l2Ttl() { return std::chrono::nanoseconds(Base::config.l2_ttl); }
 
-    // Epoch pools for list wrappers and serialization buffers (non-L1 paths)
+    // Epoch pool for list wrappers (non-L1 paths only)
     static epoch::memory_pool<ListWrapperType>& listPool() {
         static epoch::memory_pool<ListWrapperType> p;
         return p;
     }
 
-    static wrapper::BufferView<ListWrapperType> makeListView(ListWrapperType&& w) {
+    static cache::CacheView<ListWrapperType> makeListView(ListWrapperType&& w) {
         auto guard = epoch::EpochGuard::acquire();
         auto* ptr = listPool().New(std::move(w));
         listPool().Retire(ptr);
-        return wrapper::BufferView<ListWrapperType>(ptr, std::move(guard));
-    }
-
-    static epoch::memory_pool<std::string>& jsonPool() {
-        static epoch::memory_pool<std::string> p;
-        return p;
-    }
-
-    static epoch::memory_pool<std::vector<uint8_t>>& binaryPool() {
-        static epoch::memory_pool<std::vector<uint8_t>> p;
-        return p;
+        return cache::CacheView<ListWrapperType>(ptr, std::move(guard));
     }
 
     // Redis key helpers for declarative list caching
@@ -246,7 +211,7 @@ class ListMixin : public Base {
     // Query types
     // =========================================================================
 
-    using CacheQuery = cache::list::ListQuery<DescriptorFilters, size_t>;
+    using CacheQuery = list::ListQuery<DescriptorFilters, size_t>;
 
     static CacheQuery toCacheQuery(const auto& q) {
         CacheQuery cq;
@@ -260,13 +225,10 @@ class ListMixin : public Base {
         return cq;
     }
 
-    /// Convert decl::defaultSort → cache::list::SortSpec<size_t>
-    static cache::list::SortSpec<size_t> defaultSortAsListSpec() {
-        auto ds = cache::list::decl::defaultSort<Descriptor>();
-        return {ds.field_index,
-            ds.direction == cache::list::decl::SortDirection::Asc
-                ? cache::list::SortDirection::Asc
-                : cache::list::SortDirection::Desc};
+    /// Convert spec::defaultSort → list::SortSpec<size_t>
+    static list::SortSpec<size_t> defaultSortAsListSpec() {
+        auto ds = list::spec::defaultSort<Descriptor>();
+        return {ds.field_index, ds.direction};
     }
 
 public:
@@ -286,10 +248,10 @@ public:
     using ListDescriptorType = Descriptor;
 
     /// List query type — compatible with parseListQueryStrict return type
-    using ListQuery = cache::list::decl::ListDescriptorQuery<Descriptor>;
+    using ListQuery = list::spec::ListDescriptorQuery<Descriptor>;
 
     /// List result type — returned by query() (epoch-guarded, zero-copy)
-    using ListResult = wrapper::BufferView<ListWrapperType>;
+    using ListResult = cache::CacheView<ListWrapperType>;
 
     /// Traits type — exposed for controllers (sort parsing, limit normalization, etc.)
     using ListTraits = Traits;
@@ -312,17 +274,15 @@ public:
     }
 
     /// Execute a paginated list query and return raw JSON string.
-    /// L1 hit: zero overhead (Immediate holds JsonView directly, no Task).
-    /// L2 hit (BEVE): transcodes via glz::beve_to_json (skips 19-byte ListBoundsHeader).
+    /// L1 hit: serialize on demand from cached entities (Immediate, no Task).
+    /// L2 hit (BEVE): transcodes via glz::beve_to_json (skips ListBoundsHeader).
     /// L2/DB miss: delegates to entity path (cachedListQuery).
-    static io::Immediate<wrapper::JsonView> queryJson(const ListQuery& q) {
+    static io::Immediate<std::string> queryJson(const ListQuery& q) {
         // L1 check: serialize from cached entities
         if constexpr (kHasL1) {
             if (auto cached = listCache().getByKey(q.cache_key)) {
                 RELAIS_METRICS_INC(list_l1_counters_.hits);
-                auto json_sp = cached->json();  // lazy serialization, returns shared_ptr
-                auto guard = cached.take_guard();
-                return wrapper::JsonView(json_sp.get(), std::move(guard));
+                return cached->json();
             }
             RELAIS_METRICS_INC(list_l1_counters_.misses);
         }
@@ -330,19 +290,17 @@ public:
     }
 
     /// Execute a paginated list query and return raw binary (BEVE).
-    /// L1 hit: zero overhead (Immediate holds BinaryView directly, no Task).
+    /// L1 hit: serialize on demand from cached entities (Immediate, no Task).
     /// L2 hit: returns raw binary (skips ListBoundsHeader).
     /// L2/DB miss: delegates to entity path (cachedListQuery).
-    static io::Immediate<wrapper::BinaryView> queryBinary(const ListQuery& q)
+    static io::Immediate<std::vector<uint8_t>> queryBinary(const ListQuery& q)
         requires HasBinarySerialization<Entity>
     {
         // L1 check: serialize from cached entities
         if constexpr (kHasL1) {
             if (auto cached = listCache().getByKey(q.cache_key)) {
                 RELAIS_METRICS_INC(list_l1_counters_.hits);
-                auto bin_sp = cached->binary();  // lazy serialization, returns shared_ptr
-                auto guard = cached.take_guard();
-                return wrapper::BinaryView(bin_sp.get(), std::move(guard));
+                return cached->binary();
             }
             RELAIS_METRICS_INC(list_l1_counters_.misses);
         }
@@ -363,7 +321,7 @@ public:
     // =========================================================================
 
     /// Insert entity and invalidate list caches.
-    static io::Task<wrapper::EntityView<Entity>> insert(const Entity& entity)
+    static io::Task<cache::CacheView<Entity>> insert(const Entity& entity)
         requires MutableEntity<Entity> && (!Base::config.read_only)
     {
         auto result = co_await Base::insert(entity);
@@ -400,7 +358,7 @@ public:
 
     /// Partial update and invalidate list caches.
     template<typename... Updates>
-    static io::Task<wrapper::EntityView<Entity>> patch(const Key& id, Updates&&... updates)
+    static io::Task<cache::CacheView<Entity>> patch(const Key& id, Updates&&... updates)
         requires HasFieldUpdate<Entity> && (!Base::config.read_only)
     {
         std::optional<Entity> old;
@@ -562,7 +520,7 @@ protected:
     }
 
     template<typename... Updates>
-    static io::Task<wrapper::EntityView<Entity>> patchWithContext(
+    static io::Task<cache::CacheView<Entity>> patchWithContext(
         const Key& id, const Entity* old_entity, Updates&&... updates)
         requires HasFieldUpdate<Entity> && (!Base::config.read_only)
     {
@@ -594,7 +552,7 @@ protected:
             size_t count = 0;
             ((result += (count++ > 0 ? "," : ""),
               result += std::to_string(Traits::extractSortValue(entity, Is))), ...);
-        }(std::make_index_sequence<cache::list::decl::sort_count<Descriptor>>{});
+        }(std::make_index_sequence<list::spec::sort_count<Descriptor>>{});
         return result;
     }
 
@@ -602,8 +560,8 @@ protected:
     static io::Task<size_t> invalidateL2Created(const Entity& entity) {
         auto masterKey = redisMasterSetKey();
         auto prefixLen = std::string(Base::name()).size() + 9; // ":dlist:g:"
-        auto schema = cache::list::decl::filterSchema<Descriptor>();
-        auto blob = cache::list::decl::encodeEntityFilterBlob<Descriptor>(entity);
+        auto schema = list::spec::filterSchema<Descriptor>();
+        auto blob = list::spec::encodeEntityFilterBlob<Descriptor>(entity);
         auto sortVals = buildSortValues(entity);
 
         co_return co_await cache::RedisCache::invalidateListGroupsSelective(
@@ -614,10 +572,10 @@ protected:
     static io::Task<size_t> invalidateL2Updated(const Entity& old_e, const Entity& new_e) {
         auto masterKey = redisMasterSetKey();
         auto prefixLen = std::string(Base::name()).size() + 9;
-        auto schema = cache::list::decl::filterSchema<Descriptor>();
-        auto newBlob = cache::list::decl::encodeEntityFilterBlob<Descriptor>(new_e);
+        auto schema = list::spec::filterSchema<Descriptor>();
+        auto newBlob = list::spec::encodeEntityFilterBlob<Descriptor>(new_e);
         auto newSortVals = buildSortValues(new_e);
-        auto oldBlob = cache::list::decl::encodeEntityFilterBlob<Descriptor>(old_e);
+        auto oldBlob = list::spec::encodeEntityFilterBlob<Descriptor>(old_e);
         auto oldSortVals = buildSortValues(old_e);
 
         co_return co_await cache::RedisCache::invalidateListGroupsSelectiveUpdate(
@@ -650,11 +608,11 @@ protected:
             co_return 0;
         } else {
             try {
-                if (!DbProvider::hasRedis()) co_return 0;
+                if (!PgProvider::hasRedis()) co_return 0;
 
                 auto masterKey = redisMasterSetKey();
 
-                auto result = co_await DbProvider::redis("HKEYS", masterKey);
+                auto result = co_await PgProvider::redis("HKEYS", masterKey);
                 if (result.isNil() || !result.isArray()) co_return 0;
 
                 auto groups = result.asStringArray();
@@ -664,7 +622,7 @@ protected:
                     count += co_await cache::RedisCache::invalidateListGroup(group);
                 }
 
-                co_await DbProvider::redis("UNLINK", masterKey);
+                co_await PgProvider::redis("UNLINK", masterKey);
 
                 co_return count;
             } catch (const std::exception& e) {
@@ -680,7 +638,7 @@ protected:
     // =========================================================================
 
     /// Slow path for queryJson(): L1 miss → L2 transcode or DB fetch.
-    static io::Task<wrapper::JsonView> queryJsonSlow(const ListQuery& q) {
+    static io::Task<std::string> queryJsonSlow(const ListQuery& q) {
         // L2 check: BEVE → JSON transcode (skip ListBoundsHeader)
         if constexpr (kHasL2) {
             auto pageKey = redisPageKey(q.cache_key);
@@ -693,30 +651,27 @@ protected:
             }
 
             if (beve) {
-                // Skip ListBoundsHeader (19 bytes, magic 0x53 0x52)
-                size_t off = (beve->size() > 19
-                    && (*beve)[0] == 0x53 && (*beve)[1] == 0x52) ? 19 : 0;
+                // Skip ListBoundsHeader if present (magic 0x53 0x52)
+                size_t off = (beve->size() > list::kListBoundsHeaderSize
+                    && (*beve)[0] == list::kListBoundsHeaderMagic[0]
+                    && (*beve)[1] == list::kListBoundsHeaderMagic[1])
+                    ? list::kListBoundsHeaderSize : 0;
                 std::string json;
                 if (!glz::beve_to_json(
                         std::span(beve->data() + off, beve->size() - off), json)) {
-                    auto guard = epoch::EpochGuard::acquire();
-                    auto* ptr = jsonPool().New(std::move(json));
-                    jsonPool().Retire(ptr);
-                    co_return wrapper::JsonView(ptr, std::move(guard));
+                    co_return json;
                 }
             }
         }
 
         // Miss: entity path (needed for cursor/bounds/L1 population)
         auto wrapper = co_await cachedListQuery(q);
-        if (!wrapper) co_return wrapper::JsonView{};
-        auto json_sp = wrapper->json();
-        auto guard = wrapper.take_guard();
-        co_return wrapper::JsonView(json_sp.get(), std::move(guard));
+        if (!wrapper) co_return std::string{};
+        co_return wrapper->json();
     }
 
     /// Slow path for queryBinary(): L1 miss → L2 or DB fetch.
-    static io::Task<wrapper::BinaryView> queryBinarySlow(const ListQuery& q)
+    static io::Task<std::vector<uint8_t>> queryBinarySlow(const ListQuery& q)
         requires HasBinarySerialization<Entity>
     {
         // L2 check: raw binary from Redis (skip ListBoundsHeader)
@@ -731,23 +686,20 @@ protected:
             }
 
             if (beve) {
-                // Skip ListBoundsHeader (19 bytes, magic 0x53 0x52)
-                size_t off = (beve->size() > 19
-                    && (*beve)[0] == 0x53 && (*beve)[1] == 0x52) ? 19 : 0;
-                auto guard = epoch::EpochGuard::acquire();
-                auto* ptr = binaryPool().New(
+                // Skip ListBoundsHeader if present (magic 0x53 0x52)
+                size_t off = (beve->size() > list::kListBoundsHeaderSize
+                    && (*beve)[0] == list::kListBoundsHeaderMagic[0]
+                    && (*beve)[1] == list::kListBoundsHeaderMagic[1])
+                    ? list::kListBoundsHeaderSize : 0;
+                co_return std::vector<uint8_t>(
                     beve->begin() + static_cast<ptrdiff_t>(off), beve->end());
-                binaryPool().Retire(ptr);
-                co_return wrapper::BinaryView(ptr, std::move(guard));
             }
         }
 
         // Miss: entity path (needed for cursor/bounds/L1 population)
         auto wrapper = co_await cachedListQuery(q);
-        if (!wrapper) co_return wrapper::BinaryView{};
-        auto bin_sp = wrapper->binary();
-        auto guard = wrapper.take_guard();
-        co_return wrapper::BinaryView(bin_sp.get(), std::move(guard));
+        if (!wrapper) co_return std::vector<uint8_t>{};
+        co_return wrapper->binary();
     }
 
     // =========================================================================
@@ -786,11 +738,11 @@ protected:
                             Clock::now() - start).count());
 
                     auto sort = query.sort.value_or(defaultSortAsListSpec());
-                    cache::list::SortBounds bounds;
+                    list::SortBounds bounds;
                     if (!cached->items.empty()) {
-                        bounds.first_value = cache::list::decl::extractSortValue<Descriptor>(
+                        bounds.first_value = list::spec::extractSortValue<Descriptor>(
                             cached->items.front(), sort.field);
-                        bounds.last_value = cache::list::decl::extractSortValue<Descriptor>(
+                        bounds.last_value = list::spec::extractSortValue<Descriptor>(
                             cached->items.back(), sort.field);
                         bounds.is_valid = true;
                     }
@@ -823,26 +775,26 @@ protected:
         }
 
         // Extract sort bounds from entities
-        cache::list::SortBounds bounds;
+        list::SortBounds bounds;
         if (!wrapper.items.empty()) {
-            bounds.first_value = cache::list::decl::extractSortValue<Descriptor>(
+            bounds.first_value = list::spec::extractSortValue<Descriptor>(
                 wrapper.items.front(), sort.field);
-            bounds.last_value = cache::list::decl::extractSortValue<Descriptor>(
+            bounds.last_value = list::spec::extractSortValue<Descriptor>(
                 wrapper.items.back(), sort.field);
             bounds.is_valid = true;
         }
 
         // 4. Store in L2 with ListBoundsHeader (BEFORE moving into L1)
         if constexpr (kHasL2) {
-            cache::list::ListBoundsHeader header;
+            list::ListBoundsHeader header;
             header.bounds = bounds;
-            header.sort_direction = (sort.direction == cache::list::SortDirection::Desc)
-                ? cache::list::SortDirection::Desc : cache::list::SortDirection::Asc;
+            header.sort_direction = (sort.direction == list::SortDirection::Desc)
+                ? list::SortDirection::Desc : list::SortDirection::Asc;
             header.is_first_page = query.cursor.data.empty() && query.offset == 0;
             header.is_incomplete = wrapper.items.size() < static_cast<size_t>(query.limit);
             header.pagination_mode = query.cursor.data.empty()
-                ? cache::list::PaginationMode::Offset
-                : cache::list::PaginationMode::Cursor;
+                ? list::PaginationMode::Offset
+                : list::PaginationMode::Cursor;
 
             auto pageKey = redisPageKey(query.cache_key);
             auto groupKey = redisGroupKey(query.group_key);
@@ -852,7 +804,7 @@ protected:
             // Track page in group SET
             co_await cache::RedisCache::trackListKey(groupKey, pageKey, l2Ttl());
             // Track group in master HASH (stores sort field index per group)
-            co_await DbProvider::redis("HSET", redisMasterSetKey(), groupKey, std::to_string(sort.field));
+            co_await PgProvider::redis("HSET", redisMasterSetKey(), groupKey, std::to_string(sort.field));
         }
 
         // 5. Store in L1 cache or epoch pool
@@ -871,12 +823,12 @@ protected:
     static io::Task<std::vector<Entity>> queryFromDb(const ListQuery& query) {
         try {
             // Build WHERE clause from filters
-            auto where = cache::list::decl::buildWhereClause<Descriptor>(query.filters);
+            auto where = list::spec::buildWhereClause<Descriptor>(query.filters);
 
             // Parse sort
             auto sort = query.sort.value_or(defaultSortAsListSpec());
-            auto sort_col = cache::list::decl::sortColumnName<Descriptor>(sort.field);
-            const bool is_desc = (sort.direction == cache::list::SortDirection::Desc);
+            auto sort_col = list::spec::sortColumnName<Descriptor>(sort.field);
+            const bool is_desc = (sort.direction == list::SortDirection::Desc);
 
             // Cursor keyset condition (page 2+ with cursor)
             if (!query.cursor.data.empty() && query.cursor.data.size() >= sizeof(int64_t) * 2) {
@@ -932,7 +884,7 @@ protected:
             }
 
             // Execute
-            auto result = co_await DbProvider::queryParams(sql.c_str(), where.params);
+            auto result = co_await PgProvider::queryParams(sql.c_str(), where.params);
 
             // Build entity vector from rows
             std::vector<Entity> entities;

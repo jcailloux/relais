@@ -13,7 +13,7 @@
 #include <thread>
 #include <vector>
 
-#include "jcailloux/relais/cache/GDSFMetadata.h"
+#include "jcailloux/relais/cache/CacheMetadata.h"
 #include "jcailloux/relais/cache/Metrics.h"
 #include "jcailloux/relais/Log.h"
 
@@ -36,9 +36,9 @@ namespace jcailloux::relais::cache {
 // =========================================================================
 
 struct GDSFConfig {
-    float decay_rate = 0.95f;
+    float decay_rate = 0.95f;                // x0.95 per sweep; after 14 sweeps: count ~ 49%
     float histogram_alpha = 0.3f;            // EMA smoothing for histogram merges
-    float admission_pressure = 0.95f;        // ghost gate activates at this pressure (0.0–1.0)
+    float admission_pressure = 0.95f;        // admit only above 95% memory use (5% headroom)
     size_t memory_counter_slots = 64;        // must be power of 2, <= 64
     size_t max_memory = 0;                   // L1 memory budget in bytes (0 = from env / unlimited)
     long chunk_count = 8;                    // number of chunks for all ChunkMaps (uniform)
@@ -65,7 +65,7 @@ inline float fast_log2_approx(float x) {
 // Size: 128 x 8B = 1KB.
 
 struct ScoreHistogram {
-    static constexpr int N = 128;
+    static constexpr int N = 128;                 // 128 log2 buckets covering [2^-10 .. 2^23.25]
     static constexpr float kLogMin = -10.0f;     // log2(0.001) ~ -10
     static constexpr float kLogMax = 23.25f;     // log2(10M) ~ 23.25
     static constexpr float kInvStep = static_cast<float>(N) / (kLogMax - kLogMin);
@@ -130,7 +130,7 @@ struct RepoRegistryEntry {
 // =========================================================================
 //
 // Leaking singleton (never destroyed) to avoid static destruction order
-// issues: CachedWrapper dtors may fire after static singletons are destroyed.
+// issues: cache entry dtors may fire after static singletons are destroyed.
 //
 // Thread-safe: all public methods are safe to call concurrently.
 //
@@ -145,8 +145,8 @@ class GDSFPolicy {
     static constexpr size_t kMaxMemorySlots = 64;
 
 public:
-    /// Compile-time GDSF toggle. Controls if constexpr guards in CachedRepo/ListMixin.
-    /// When false, all GDSF code paths (metadata, CachedWrapper, scoring) are eliminated.
+    /// Compile-time GDSF toggle. Controls if constexpr guards in LocalRepo/ListMixin.
+    /// When false, all GDSF code paths (metadata, scoring, ghosts) are eliminated.
     static constexpr bool enabled = RELAIS_GDSF_ENABLED;
 
     /// Compile-time cleanup frequency: sweep every 2^N insertions.
@@ -228,7 +228,7 @@ public:
     // =====================================================================
 
     /// Register a repo for global coordination (threshold, sweep).
-    /// Called once per CachedRepo instantiation via std::call_once.
+    /// Called once per LocalRepo instantiation via std::call_once.
     void enroll(RepoRegistryEntry entry) {
         std::unique_lock lock(registry_mutex_);
         registry_.push_back(std::move(entry));

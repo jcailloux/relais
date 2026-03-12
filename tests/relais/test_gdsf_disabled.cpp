@@ -15,7 +15,7 @@
  */
 
 #include "jcailloux/relais/cache/GDSFPolicy.h"
-#include "jcailloux/relais/cache/GDSFMetadata.h"
+#include "jcailloux/relais/cache/CacheMetadata.h"
 
 // These tests only compile when GDSF is disabled.
 // In the combined binary (test_relais_all), RELAIS_GDSF_ENABLED=1 -> skip.
@@ -37,19 +37,19 @@ namespace relais_test::gdsf_disabled {
 using namespace jcailloux::relais::config;
 
 // Default Local config (has default TTL of 1h, no GDSF)
-using DefaultTTLRepo = relais_test::Repo<TestItemWrapper, "gdsf_dis:item", Local>;
+using DefaultTTLRepo = relais_test::Repo<TestItemEntity, "gdsf_dis:item", Local>;
 
 // TTL-only (no GDSF, but explicit TTL active)
 inline constexpr auto WithTTL = Local
     .with_l1_ttl(std::chrono::seconds{60});
 
-using TTLOnlyRepo = relais_test::Repo<TestItemWrapper, "gdsf_dis:ttl", WithTTL>;
+using TTLOnlyRepo = relais_test::Repo<TestItemEntity, "gdsf_dis:ttl", WithTTL>;
 
 // No TTL, no GDSF — truly no cleanup
 inline constexpr auto NoCleanup = Local
     .with_l1_ttl(std::chrono::nanoseconds{0});
 
-using NoCleanupRepo = relais_test::Repo<TestItemWrapper, "gdsf_dis:noclean", NoCleanup>;
+using NoCleanupRepo = relais_test::Repo<TestItemEntity, "gdsf_dis:noclean", NoCleanup>;
 
 } // namespace relais_test::gdsf_disabled
 
@@ -76,20 +76,15 @@ TEST_CASE("GDSF disabled - zero overhead when not enabled",
 
     SECTION("TTL-only metadata when TTL configured but no GDSF") {
         using Metadata = jcailloux::relais::cache::CacheMetadata<false, true>;
-        static_assert(sizeof(Metadata) == sizeof(int64_t),
-            "CacheMetadata<false, true> should be 8 bytes (TTL only)");
+        static_assert(sizeof(Metadata) == sizeof(uint32_t),
+            "CacheMetadata<false, true> should be 4 bytes (TTL only)");
 
         // Verify TTL functionality
         Metadata meta{};
-        meta.ttl_expiration_rep = 1000;
+        meta.ttl_expiration_sec = 1000;
 
-        auto expired_tp = std::chrono::steady_clock::time_point{
-            std::chrono::steady_clock::duration{2000}};
-        REQUIRE(meta.isExpired(expired_tp));
-
-        auto not_expired_tp = std::chrono::steady_clock::time_point{
-            std::chrono::steady_clock::duration{500}};
-        REQUIRE_FALSE(meta.isExpired(not_expired_tp));
+        REQUIRE(meta.isExpired(2000));          // now > expiration → expired
+        REQUIRE_FALSE(meta.isExpired(500));     // now < expiration → not expired
     }
 
     SECTION("TTL repos register for global sweep, no-cleanup repos do not") {

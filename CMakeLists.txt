@@ -199,9 +199,9 @@ if(RELAIS_BUILD_TESTS)
     # -------------------------------------------------------------------------
     # Unit tests
     # -------------------------------------------------------------------------
-    relais_add_test(relais_tests                tests/relais/test_generated_wrapper.cpp          DEFINITIONS RELAIS_BUILDING_TESTS)
-    relais_add_test(test_relais_base_compile    tests/relais/test_base_repository_compile.cpp    DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;compile")
-    relais_add_test(test_relais_repo_compile    tests/relais/test_repository_compile.cpp         DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;compile")
+    relais_add_test(relais_tests                tests/relais/test_generated_entity.cpp          DEFINITIONS RELAIS_BUILDING_TESTS)
+    relais_add_test(test_relais_base_compile    tests/relais/test_pg_repo_compile.cpp    DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;compile")
+    relais_add_test(test_relais_repo_compile    tests/relais/test_repo_compile.cpp         DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;compile")
     relais_add_test(test_io_task          tests/io/test_io_task.cpp               LABELS "io")
     relais_add_test(test_io_context       tests/io/test_io_context.cpp            LABELS "io")
     relais_add_test(test_io_pg_types      tests/io/test_io_pg_types.cpp           LABELS "io")
@@ -220,10 +220,10 @@ if(RELAIS_BUILD_TESTS)
     relais_add_test(test_io_redis_pool        tests/io/test_redis_pool.cpp           LABELS "io;integration;redis-pool" RESOURCE_LOCK)
     relais_add_test(test_batch_scheduler_integration tests/io/test_batch_scheduler_integration.cpp LABELS "io;integration;batch" RESOURCE_LOCK)
 
-    relais_add_test(test_relais_base            tests/relais/test_base_repository.cpp      DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db"                 RESOURCE_LOCK)
-    relais_add_test(test_relais_redis           tests/relais/test_redis_repository.cpp     DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;redis"            RESOURCE_LOCK)
+    relais_add_test(test_relais_base            tests/relais/test_pg_repo.cpp      DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db"                 RESOURCE_LOCK)
+    relais_add_test(test_relais_redis           tests/relais/test_redis_repo.cpp     DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;redis"            RESOURCE_LOCK)
     relais_add_test(test_relais_decl_list_cache tests/relais/test_decl_list_cache.cpp      DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;list"             RESOURCE_LOCK)
-    relais_add_test(test_relais_cached          tests/relais/test_cached_repository.cpp    DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;cache"            RESOURCE_LOCK)
+    relais_add_test(test_relais_cached          tests/relais/test_local_repo.cpp    DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;cache"            RESOURCE_LOCK)
     relais_add_test(test_relais_partition_key     tests/relais/test_partition_key.cpp          DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;partition-key"      RESOURCE_LOCK)
     relais_add_test(test_relais_full_cache      tests/relais/test_full_cache.cpp           DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;full-cache"       RESOURCE_LOCK)
     relais_add_test(test_relais_decl_list_redis tests/relais/test_decl_list_redis.cpp      DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;redis;list"       RESOURCE_LOCK)
@@ -232,7 +232,7 @@ if(RELAIS_BUILD_TESTS)
     relais_add_test(test_relais_l1_config       tests/relais/config/test_l1_config.cpp     DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;config"           RESOURCE_LOCK)
     relais_add_test(test_relais_l2_config       tests/relais/config/test_l2_config.cpp     DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;redis;config"     RESOURCE_LOCK)
     relais_add_test(test_relais_concurrency     tests/relais/test_concurrency.cpp          DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;concurrency"      RESOURCE_LOCK)
-    relais_add_test(test_relais_dbprovider_log  tests/relais/test_dbprovider_log.cpp       DEFINITIONS RELAIS_BUILDING_TESTS LABELS "integration;relais"                     RESOURCE_LOCK)
+    relais_add_test(test_relais_dbprovider_log  tests/relais/test_pg_provider_log.cpp       DEFINITIONS RELAIS_BUILDING_TESTS LABELS "integration;relais"                     RESOURCE_LOCK)
     relais_add_test(test_relais_composite_key  tests/relais/test_composite_key.cpp        DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;composite-key"    RESOURCE_LOCK)
     relais_add_test(test_relais_gdsf          tests/relais/test_gdsf.cpp                DEFINITIONS RELAIS_BUILDING_TESTS "RELAIS_GDSF_ENABLED=1" LABELS "relais;integration;db;gdsf"             RESOURCE_LOCK)
     if(NOT RELAIS_GDSF_ENABLED)
@@ -276,10 +276,10 @@ if(RELAIS_BUILD_TESTS)
     # GDSF tests are run via standalone binaries: test_relais_gdsf, test_relais_gdsf_disabled.
     add_executable(test_relais_all
         tests/relais/test_all_runner.cpp
-        tests/relais/test_generated_wrapper.cpp
-        tests/relais/test_base_repository.cpp
-        tests/relais/test_redis_repository.cpp
-        tests/relais/test_cached_repository.cpp
+        tests/relais/test_generated_entity.cpp
+        tests/relais/test_pg_repo.cpp
+        tests/relais/test_redis_repo.cpp
+        tests/relais/test_local_repo.cpp
         tests/relais/test_decl_list_cache.cpp
         tests/relais/test_partition_key.cpp
         tests/relais/test_full_cache.cpp

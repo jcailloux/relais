@@ -2,7 +2,7 @@
 #define JCX_RELAIS_INVALIDATION_MIXIN_H
 
 #include "jcailloux/relais/io/Task.h"
-#include "jcailloux/relais/cache/InvalidateOn.h"
+#include "jcailloux/relais/repository/InvalidateOn.h"
 
 namespace jcailloux::relais {
 
@@ -19,19 +19,17 @@ concept HasListMixin = requires { typename T::ListDescriptorType; };
  * Sits at the top of the mixin chain and intercepts insert/update/erase
  * to propagate invalidations to dependent caches.
  *
- * Chain: InvalidationMixin -> [ListMixin] -> CachedRepo -> [RedisRepo] -> BaseRepo
+ * Chain: InvalidationMixin -> [ListMixin] -> LocalRepo -> [RedisRepo] -> PgRepo
  *
  * Method hiding: InvalidationMixin::update() hides Base::update().
  * The explicit Base::update() call delegates down the chain correctly.
  *
- * EntityView from find() is converted to shared_ptr for cross-invalidation
- * propagation (write paths only — read paths return views directly).
  */
 template<typename Base, typename... Invalidations>
 class InvalidationMixin : public Base {
     using Entity = typename Base::EntityType;
     using Key = typename Base::KeyType;
-    using InvList = cache::InvalidateOn<Invalidations...>;
+    using InvList = InvalidateOn<Invalidations...>;
 
 public:
     using typename Base::EntityType;
@@ -45,12 +43,12 @@ public:
     using Invalidates = InvList;
 
     /// Insert entity and propagate cross-invalidation to dependent caches.
-    static io::Task<wrapper::EntityView<Entity>> insert(const Entity& entity)
+    static io::Task<cache::CacheView<Entity>> insert(const Entity& entity)
         requires MutableEntity<Entity> && (!Base::config.read_only)
     {
         auto result = co_await Base::insert(entity);
         if (result) {
-            co_await cache::propagateCreate<Entity, InvList>(*result);
+            co_await propagateCreate<Entity, InvList>(*result);
         }
         co_return result;
     }
@@ -75,7 +73,7 @@ public:
         }
 
         if (ok) {
-            co_await cache::propagateUpdate<Entity, InvList>(
+            co_await propagateUpdate<Entity, InvList>(
                 old ? &*old : nullptr, entity);
         }
         co_return ok;
@@ -100,7 +98,7 @@ public:
         }
 
         if (result.has_value() && old) {
-            co_await cache::propagateDelete<Entity, InvList>(*old);
+            co_await propagateDelete<Entity, InvList>(*old);
         }
         co_return result;
     }
@@ -108,7 +106,7 @@ public:
     /// Partial update with cross-invalidation.
     /// When Base is ListMixin, reuses the pre-fetched old entity via WithContext.
     template<typename... Updates>
-    static io::Task<wrapper::EntityView<Entity>> patch(const Key& id, Updates&&... updates)
+    static io::Task<cache::CacheView<Entity>> patch(const Key& id, Updates&&... updates)
         requires HasFieldUpdate<Entity> && (!Base::config.read_only)
     {
         std::optional<Entity> old;
@@ -117,7 +115,7 @@ public:
             if (view) old.emplace(*view);
         }
 
-        wrapper::EntityView<Entity> result;
+        cache::CacheView<Entity> result;
         if constexpr (detail::HasListMixin<Base>) {
             result = co_await Base::patchWithContext(
                 id, old ? &*old : nullptr, std::forward<Updates>(updates)...);
@@ -126,7 +124,7 @@ public:
         }
 
         if (result) {
-            co_await cache::propagateUpdate<Entity, InvList>(
+            co_await propagateUpdate<Entity, InvList>(
                 old ? &*old : nullptr, *result);
         }
         co_return result;
@@ -140,7 +138,7 @@ public:
             if (view) old.emplace(*view);
         }
         if (old) {
-            co_await cache::propagateDelete<Entity, InvList>(*old);
+            co_await propagateDelete<Entity, InvList>(*old);
         }
         co_await Base::invalidate(id);
     }

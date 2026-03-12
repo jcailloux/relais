@@ -21,20 +21,20 @@ using namespace relais_test;
 namespace {
 
 // L1 user repo as cross-invalidation target for event tests
-using L1EventTargetUserRepo = Repo<TestUserWrapper, "test:user:l1:event">;
+using L1EventTargetUserRepo = Repo<TestUserEntity, "test:user:l1:event">;
 
 // L1 event repo as cross-invalidation SOURCE (Event → User)
-using L1EventSourceRepo = Repo<TestEventWrapper, "test:event:l1:crossinv",
+using L1EventSourceRepo = Repo<TestEventEntity, "test:event:l1:crossinv",
     cfg::Local,
-    cache::Invalidate<L1EventTargetUserRepo, eventUserId>>;
+    Invalidate<L1EventTargetUserRepo, eventUserId>>;
 
 // L1 event repo as cross-invalidation TARGET
-using L1EventAsTargetRepo = Repo<TestEventWrapper, "test:event:l1:target">;
+using L1EventAsTargetRepo = Repo<TestEventEntity, "test:event:l1:target">;
 
 // Async resolver: given a user_id, find event IDs for that user
 struct PurchaseToEventResolver {
     static io::Task<std::vector<int64_t>> resolve(int64_t user_id) {
-        auto result = co_await jcailloux::relais::DbProvider::queryArgs(
+        auto result = co_await jcailloux::relais::PgProvider::queryArgs(
             "SELECT id FROM relais_test_events WHERE user_id = $1", user_id);
         std::vector<int64_t> ids;
         for (size_t i = 0; i < result.rows(); ++i) {
@@ -45,15 +45,15 @@ struct PurchaseToEventResolver {
 };
 
 // L1 purchase repo that invalidates event cache via resolver
-using L1PurchaseInvEventRepo = Repo<TestPurchaseWrapper, "test:purchase:l1:event:target",
+using L1PurchaseInvEventRepo = Repo<TestPurchaseEntity, "test:purchase:l1:event:target",
     cfg::Local,
-    cache::InvalidateVia<L1EventAsTargetRepo, purchaseUserId, &PurchaseToEventResolver::resolve>>;
+    InvalidateVia<L1EventAsTargetRepo, purchaseUserId, &PurchaseToEventResolver::resolve>>;
 
 } // anonymous namespace
 
 // #############################################################################
 //
-//  1. PartitionKey CRUD (Uncached / BaseRepo)
+//  1. PartitionKey CRUD (Uncached / PgRepo)
 //
 // #############################################################################
 
@@ -468,15 +468,14 @@ TEST_CASE("PartitionKey - serialization",
         REQUIRE(original != nullptr);
 
         auto json = original->json();
-        REQUIRE(json != nullptr);
+        REQUIRE(!json.empty());
 
         // Verify region is in the JSON
-        auto jsonStr = *json;
-        CHECK(jsonStr.find("\"region\"") != std::string::npos);
-        CHECK(jsonStr.find("\"eu\"") != std::string::npos);
+        CHECK(json.find("\"region\"") != std::string::npos);
+        CHECK(json.find("\"eu\"") != std::string::npos);
 
         // Round-trip
-        auto restored = TestEventWrapper::fromJson(jsonStr);
+        auto restored = TestEventEntity::fromJson(json);
         REQUIRE(restored.has_value());
         CHECK(restored->region == "eu");
         CHECK(restored->title == "JSON Test");
@@ -490,10 +489,9 @@ TEST_CASE("PartitionKey - serialization",
         REQUIRE(original != nullptr);
 
         auto binary = original->binary();
-        REQUIRE(binary != nullptr);
-        REQUIRE(!binary->empty());
+        REQUIRE(!binary.empty());
 
-        auto restored = TestEventWrapper::fromBinary(*binary);
+        auto restored = TestEventEntity::fromBinary(binary);
         REQUIRE(restored.has_value());
         CHECK(restored->region == "us");
         CHECK(restored->title == "BEVE Test");
@@ -507,8 +505,8 @@ TEST_CASE("PartitionKey - serialization",
 //
 // #############################################################################
 
-using jcailloux::relais::wrapper::set;
-using EF = TestEventWrapper::Field;
+using jcailloux::relais::entity::set;
+using EF = TestEventEntity::Field;
 
 TEST_CASE("PartitionKey<TestEvent> - patch (Uncached)",
           "[integration][db][partition-key][patch]")

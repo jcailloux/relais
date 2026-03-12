@@ -27,7 +27,7 @@
 
 using namespace relais_test;
 
-namespace decl = jcailloux::relais::cache::list::decl;
+namespace decl = jcailloux::relais::list::spec;
 
 // #############################################################################
 //
@@ -55,29 +55,29 @@ inline constexpr auto WriteThrough = Both
 // (already defined in TestRepositories.h)
 
 // Short L1 TTL + L2: for expiration fallback tests
-using ShortL1BothItemRepo = Repo<TestItemWrapper, "test:both:short", test_both::ShortL1>;
+using ShortL1BothItemRepo = Repo<TestItemEntity, "test:both:short", test_both::ShortL1>;
 
 // Write-through at L1+L2
-using WriteThroughBothItemRepo = Repo<TestItemWrapper, "test:both:wt", test_both::WriteThrough>;
+using WriteThroughBothItemRepo = Repo<TestItemEntity, "test:both:wt", test_both::WriteThrough>;
 
 // L1+L2 user repo for cross-invalidation target
-using FullCacheInvUserRepo = Repo<TestUserWrapper, "test:user:both:inv", cfg::Both>;
+using FullCacheInvUserRepo = Repo<TestUserEntity, "test:user:both:inv", cfg::Both>;
 
 // L1+L2 purchase repo with cross-invalidation → user
-using FullCachePurchaseRepo = Repo<TestPurchaseWrapper, "test:purchase:both",
+using FullCachePurchaseRepo = Repo<TestPurchaseEntity, "test:purchase:both",
     cfg::Both,
-    cache::Invalidate<FullCacheInvUserRepo, purchaseUserId>>;
+    Invalidate<FullCacheInvUserRepo, purchaseUserId>>;
 
-using jcailloux::relais::wrapper::set;
-using F = TestUserWrapper::Field;
+using jcailloux::relais::entity::set;
+using F = TestUserEntity::Field;
 
 // L1+L2 article repo for InvalidateVia target
-using FullCacheInvArticleRepo = Repo<TestArticleWrapper, "test:article:both:inv", cfg::Both>;
+using FullCacheInvArticleRepo = Repo<TestArticleEntity, "test:article:both:inv", cfg::Both>;
 
 // Resolver: Purchase user_id → Article IDs by same author
 struct BothUserArticleResolver {
     static io::Task<std::vector<int64_t>> resolve(int64_t user_id) {
-        auto result = co_await jcailloux::relais::DbProvider::queryArgs(
+        auto result = co_await jcailloux::relais::PgProvider::queryArgs(
             "SELECT id FROM relais_test_articles WHERE author_id = $1", user_id);
         std::vector<int64_t> ids;
         for (size_t i = 0; i < result.rows(); ++i)
@@ -87,20 +87,20 @@ struct BothUserArticleResolver {
 };
 
 // Purchase repo with Invalidate<User> + InvalidateVia<Article> at cfg::Both
-using FullCacheCustomPurchaseRepo = Repo<TestPurchaseWrapper, "test:purchase:both:custom",
+using FullCacheCustomPurchaseRepo = Repo<TestPurchaseEntity, "test:purchase:both:custom",
     cfg::Both,
-    cache::Invalidate<FullCacheInvUserRepo, purchaseUserId>,
-    cache::InvalidateVia<FullCacheInvArticleRepo, purchaseUserId, &BothUserArticleResolver::resolve>>;
+    Invalidate<FullCacheInvUserRepo, purchaseUserId>,
+    InvalidateVia<FullCacheInvArticleRepo, purchaseUserId, &BothUserArticleResolver::resolve>>;
 
 // L1+L2 purchase list repo (target of InvalidateList cross-invalidation)
-using BothPurchaseListRepo = Repo<TestPurchaseWrapper, "test:purchase:list:both:forinv", cfg::Both>;
+using BothPurchaseListRepo = Repo<TestPurchaseEntity, "test:purchase:list:both:forinv", cfg::Both>;
 using BothPurchaseListQuery = BothPurchaseListRepo::ListQuery;
 
 // Invalidator that clears both L1 and L2 for the purchase list
 class BothPurchaseListInvalidator {
 public:
     static io::Task<void> onEntityModified(
-        const TestPurchaseWrapper&)
+        const TestPurchaseEntity&)
     {
         TestInternals::resetListCacheState<BothPurchaseListRepo>();
         co_await BothPurchaseListRepo::invalidateAllListGroups();
@@ -108,9 +108,9 @@ public:
 };
 
 // Purchase repo with InvalidateList at cfg::Both
-using FullCacheListInvPurchaseRepo = Repo<TestPurchaseWrapper, "test:purchase:both:listinv",
+using FullCacheListInvPurchaseRepo = Repo<TestPurchaseEntity, "test:purchase:both:listinv",
     cfg::Both,
-    cache::InvalidateList<BothPurchaseListInvalidator>>;
+    InvalidateList<BothPurchaseListInvalidator>>;
 
 } // namespace relais_test
 
@@ -562,13 +562,13 @@ TEST_CASE("FullCache - findJson at L1+L2",
         auto id = insertTestItem("json_item", 42);
 
         auto json1 = sync(FullCacheTestItemRepo::findJson(id));
-        REQUIRE(json1 != nullptr);
-        REQUIRE(json1->find("\"json_item\"") != std::string::npos);
+        REQUIRE(!json1.empty());
+        REQUIRE(json1.find("\"json_item\"") != std::string::npos);
 
-        // Second call returns same cached pointer
+        // Second call returns same cached value
         auto json2 = sync(FullCacheTestItemRepo::findJson(id));
-        REQUIRE(json2 != nullptr);
-        REQUIRE(*json1 == *json2);
+        REQUIRE(!json2.empty());
+        REQUIRE(json1 == json2);
     }
 
     SECTION("[json] L1 miss falls back to L2 JSON") {
@@ -582,8 +582,8 @@ TEST_CASE("FullCache - findJson at L1+L2",
 
         // Should fall back to L2
         auto json = sync(FullCacheTestItemRepo::findJson(id));
-        REQUIRE(json != nullptr);
-        REQUIRE(json->find("\"json_l2_item\"") != std::string::npos);
+        REQUIRE(!json.empty());
+        REQUIRE(json.find("\"json_l2_item\"") != std::string::npos);
     }
 }
 

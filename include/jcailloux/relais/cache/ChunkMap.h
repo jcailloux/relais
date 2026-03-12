@@ -94,6 +94,16 @@ inline uint64_t wyhash(const void* data, size_t len, uint64_t seed = 0) {
 template<typename T>
 struct AutoHash : std::hash<T> {};
 
+// Integers — ParlayHash's own rehash with is_avalanching (applied once, not twice)
+template<std::integral T>
+struct AutoHash<T> {
+    using is_avalanching = void;
+    size_t operator()(T x) const {
+        size_t h = static_cast<size_t>(x) * UINT64_C(0xbf58476d1ce4e5b9);
+        return h ^ (h >> 31);
+    }
+};
+
 // std::string — wyhash on raw bytes, skip ParlayHash rehash
 template<>
 struct AutoHash<std::string> {
@@ -193,7 +203,7 @@ public:
         : map_(*new MapType(initial_size, false,
                 GDSFPolicy::enabled ? &memoryHook : nullptr)) {}
 
-    // ChunkMap instances are static singletons (CachedRepo::cache(),
+    // ChunkMap instances are static singletons (LocalRepo::cache(),
     // ListCache::cache_). Their destruction happens during static cleanup
     // when dependent singletons (epoch, GDSFPolicy) may already be destroyed.
     // Both the ParlayHash map and the memory_pool are heap-allocated and
@@ -531,6 +541,7 @@ private:
     MapType& map_;
     epoch::memory_pool<CacheEntry>& pool_ = shared_pool();
     std::atomic<long> cleanup_cursor_{0};
+    // Approximate diagnostic counter (relaxed atomics, no cross-thread sync guarantee)
     std::atomic<long> live_count_{0};
 
 #ifdef RELAIS_BUILDING_TESTS

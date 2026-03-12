@@ -156,7 +156,9 @@ template<>
 inline int32_t PgResult::Row::get<int32_t>(int col) const {
     auto sv = rawValue(col);
     int32_t val = 0;
-    std::from_chars(sv.data(), sv.data() + sv.size(), val);
+    auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), val);
+    if (ec != std::errc{}) [[unlikely]]
+        throw PgError("from_chars failed for int32 column " + std::to_string(col));
     return val;
 }
 
@@ -164,7 +166,9 @@ template<>
 inline int64_t PgResult::Row::get<int64_t>(int col) const {
     auto sv = rawValue(col);
     int64_t val = 0;
-    std::from_chars(sv.data(), sv.data() + sv.size(), val);
+    auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), val);
+    if (ec != std::errc{}) [[unlikely]]
+        throw PgError("from_chars failed for int64 column " + std::to_string(col));
     return val;
 }
 
@@ -172,7 +176,9 @@ template<>
 inline double PgResult::Row::get<double>(int col) const {
     auto sv = rawValue(col);
     double val = 0;
-    std::from_chars(sv.data(), sv.data() + sv.size(), val);
+    auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), val);
+    if (ec != std::errc{}) [[unlikely]]
+        throw PgError("from_chars failed for double column " + std::to_string(col));
     return val;
 }
 

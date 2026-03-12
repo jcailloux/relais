@@ -5,11 +5,11 @@
 #include <type_traits>
 #include "jcailloux/relais/io/Task.h"
 #include "jcailloux/relais/Log.h"
-#include "jcailloux/relais/repository/CachedRepo.h"
+#include "jcailloux/relais/repository/LocalRepo.h"
 #include "jcailloux/relais/repository/InvalidationMixin.h"
 #include "jcailloux/relais/repository/ListMixin.h"
 #include "jcailloux/relais/config/FixedString.h"
-#include "jcailloux/relais/wrapper/EntityConcepts.h"
+#include "jcailloux/relais/entity/EntityConcepts.h"
 #include "jcailloux/relais/cache/Metrics.h"
 #include "jcailloux/relais/cache/GDSFPolicy.h"
 
@@ -20,12 +20,12 @@ namespace jcailloux::relais {
 // =============================================================================
 //
 // Chain (bottom to top):
-//   BaseRepos
+//   PgRepo
 //     ↑ (if L2 or L1_L2)
 //   RedisRepo
 //     ↑ (if L1 or L1_L2)
-//   CachedRepo
-//     ↑ (if Entity has ListDescriptor)
+//   LocalRepo
+//     ↑ (if E has ListDescriptor)
 //   ListMixin
 //     ↑ (if Invalidations... non-empty)
 //   InvalidationMixin
@@ -36,27 +36,27 @@ namespace jcailloux::relais {
 namespace detail {
 
 /// Select the cache layer based on CacheConfig::cache_level
-template<typename Entity, config::FixedString Name, config::CacheConfig Cfg, typename Key>
+template<typename E, config::FixedString Name, config::CacheConfig Cfg, typename Key>
 struct CacheLayerSelector {
     using type = std::conditional_t<
         Cfg.cache_level == config::CacheLevel::L1 || Cfg.cache_level == config::CacheLevel::L1_L2,
-        CachedRepo<Entity, Name, Cfg, Key>,
+        LocalRepo<E, Name, Cfg, Key>,
         std::conditional_t<
             Cfg.cache_level == config::CacheLevel::L2,
-            RedisRepo<Entity, Name, Cfg, Key>,
-            BaseRepo<Entity, Name, Cfg, Key>
+            RedisRepo<E, Name, Cfg, Key>,
+            PgRepo<E, Name, Cfg, Key>
         >
     >;
 };
 
 /// Stack optional mixins on top of the cache layer
-template<typename Entity, config::FixedString Name, config::CacheConfig Cfg, typename Key,
+template<typename E, config::FixedString Name, config::CacheConfig Cfg, typename Key,
          typename... Invalidations>
 struct MixinStack {
-    using CacheLayer = typename CacheLayerSelector<Entity, Name, Cfg, Key>::type;
+    using CacheLayer = typename CacheLayerSelector<E, Name, Cfg, Key>::type;
 
     using WithList = std::conditional_t<
-        HasListDescriptor<Entity>,
+        HasListDescriptor<E>,
         ListMixin<CacheLayer>,
         CacheLayer
     >;
@@ -75,31 +75,31 @@ struct MixinStack {
 // =============================================================================
 //
 // Usage:
-//   using MyRepo = Repo<MyWrapper, "MyEntity">;                     // L1 (default)
-//   using MyRepo = Repo<MyWrapper, "MyEntity", config::Both>;       // L1+L2
-//   using MyRepo = Repo<MyWrapper, "MyEntity", config::Local,
-//       Invalidate<OtherRepo, &MyStruct::other_id>>;                      // with cross-inv
+//   using MyRepo = Repo<MyEntity, "MyEntity">;                      // L1 (default)
+//   using MyRepo = Repo<MyEntity, "MyEntity", config::Both>;        // L1+L2
+//   using MyRepo = Repo<MyEntity, "MyEntity", config::Local,
+//       Invalidate<OtherRepo, &MyStruct::other_id>>;                // with cross-inv
 //
 
-template<typename Entity, config::FixedString Name, config::CacheConfig Cfg = config::Local,
+template<typename E, config::FixedString Name, config::CacheConfig Cfg = config::Local,
          typename... Invalidations>
 class Repo
     : public detail::MixinStack<
-          Entity, Name, Cfg,
-          decltype(std::declval<const Entity>().key()),
+          E, Name, Cfg,
+          decltype(std::declval<const E>().key()),
           Invalidations...
       >::type
 {
-    using Key = decltype(std::declval<const Entity>().key());
-    using Base = typename detail::MixinStack<Entity, Name, Cfg, Key, Invalidations...>::type;
+    using Key = decltype(std::declval<const E>().key());
+    using Base = typename detail::MixinStack<E, Name, Cfg, Key, Invalidations...>::type;
 
     // Compile-time validation
-    static_assert(ReadableEntity<Entity>,
-        "Entity must satisfy ReadableEntity (provide fromRow)");
+    static_assert(ReadableEntity<E>,
+        "E must satisfy ReadableEntity (provide fromRow)");
 
     static_assert(
         Cfg.cache_level == config::CacheLevel::None ||
-        CacheableEntity<Entity>,
+        CacheableEntity<E>,
         "Cached entities must satisfy CacheableEntity (provide JSON or binary serialization)");
 
     static_assert(
@@ -136,7 +136,7 @@ public:
         // L1 entity counters
         if constexpr (Cfg.cache_level == config::CacheLevel::L1
                     || Cfg.cache_level == config::CacheLevel::L1_L2) {
-            using CachedLayer = CachedRepo<Entity, Name, Cfg, Key>;
+            using CachedLayer = LocalRepo<E, Name, Cfg, Key>;
             snap.l1_hits   = CachedLayer::l1_counters_.hits.load();
             snap.l1_misses = CachedLayer::l1_counters_.misses.load();
         }
@@ -144,14 +144,14 @@ public:
         // L2 entity counters
         if constexpr (Cfg.cache_level == config::CacheLevel::L2
                     || Cfg.cache_level == config::CacheLevel::L1_L2) {
-            using RedisLayer = RedisRepo<Entity, Name, Cfg, Key>;
+            using RedisLayer = RedisRepo<E, Name, Cfg, Key>;
             snap.l2_hits   = RedisLayer::l2_counters_.hits.load();
             snap.l2_misses = RedisLayer::l2_counters_.misses.load();
         }
 
         // List counters
-        if constexpr (HasListDescriptor<Entity>) {
-            using CacheLayer = typename detail::CacheLayerSelector<Entity, Name, Cfg, Key>::type;
+        if constexpr (HasListDescriptor<E>) {
+            using CacheLayer = typename detail::CacheLayerSelector<E, Name, Cfg, Key>::type;
             using ListLayer = ListMixin<CacheLayer>;
             snap.list_l1_hits   = ListLayer::list_l1_counters_.hits.load();
             snap.list_l1_misses = ListLayer::list_l1_counters_.misses.load();
@@ -172,20 +172,20 @@ public:
     static void resetMetrics() {
         if constexpr (Cfg.cache_level == config::CacheLevel::L1
                     || Cfg.cache_level == config::CacheLevel::L1_L2) {
-            using CachedLayer = CachedRepo<Entity, Name, Cfg, Key>;
+            using CachedLayer = LocalRepo<E, Name, Cfg, Key>;
             CachedLayer::l1_counters_.hits.reset();
             CachedLayer::l1_counters_.misses.reset();
         }
 
         if constexpr (Cfg.cache_level == config::CacheLevel::L2
                     || Cfg.cache_level == config::CacheLevel::L1_L2) {
-            using RedisLayer = RedisRepo<Entity, Name, Cfg, Key>;
+            using RedisLayer = RedisRepo<E, Name, Cfg, Key>;
             RedisLayer::l2_counters_.hits.reset();
             RedisLayer::l2_counters_.misses.reset();
         }
 
-        if constexpr (HasListDescriptor<Entity>) {
-            using CacheLayer = typename detail::CacheLayerSelector<Entity, Name, Cfg, Key>::type;
+        if constexpr (HasListDescriptor<E>) {
+            using CacheLayer = typename detail::CacheLayerSelector<E, Name, Cfg, Key>::type;
             using ListLayer = ListMixin<CacheLayer>;
             ListLayer::list_l1_counters_.hits.reset();
             ListLayer::list_l1_counters_.misses.reset();
@@ -205,9 +205,9 @@ public:
     /// Update entity from JSON string.
     /// Parses JSON to create entity, then updates via the full mixin chain.
     static io::Task<bool> updateJson(const Key& id, std::string_view json)
-        requires MutableEntity<Entity> && (!Cfg.read_only)
+        requires MutableEntity<E> && (!Cfg.read_only)
     {
-        auto entity_opt = Entity::fromJson(json);
+        auto entity_opt = E::fromJson(json);
         if (!entity_opt) {
             RELAIS_LOG_ERROR << name() << ": updateJson failed to parse JSON";
             co_return false;
@@ -218,9 +218,9 @@ public:
     /// Update entity from binary data.
     /// Creates entity from binary, then updates via the full mixin chain.
     static io::Task<bool> updateBinary(const Key& id, std::span<const uint8_t> buffer)
-        requires MutableEntity<Entity> && HasBinarySerialization<Entity> && (!Cfg.read_only)
+        requires MutableEntity<E> && HasBinarySerialization<E> && (!Cfg.read_only)
     {
-        auto entity_opt = Entity::fromBinary(buffer);
+        auto entity_opt = E::fromBinary(buffer);
         if (!entity_opt) {
             RELAIS_LOG_ERROR << name() << ": updateBinary failed to parse binary data";
             co_return false;
