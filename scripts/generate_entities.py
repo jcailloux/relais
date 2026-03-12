@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Struct Entity Wrapper Generator
+Struct Entity Mapping Generator
 
 Scans C++ header files for @relais annotations, parses struct data members,
 and generates:
@@ -154,7 +154,12 @@ class StructParser:
 
     def parse_file(self, filepath: Path) -> list[ParsedEntity]:
         """Parse a header file and return all annotated entities."""
-        content = filepath.read_text()
+        try:
+            content = filepath.read_text()
+        except OSError as e:
+            print(f"Error: cannot read {filepath}: {e}", file=sys.stderr)
+            return []
+
         entities = []
 
         # Find all @relais annotation blocks followed by a class/struct declaration
@@ -163,6 +168,7 @@ class StructParser:
         while i < len(lines):
             # Look for @relais annotation block
             annotations = []
+            annotation_start_line = i + 1  # 1-based for error messages
             while i < len(lines) and self.ANNOTATION_RE.match(lines[i].strip()):
                 m = self.ANNOTATION_RE.match(lines[i].strip())
                 annotations.append((
@@ -191,31 +197,37 @@ class StructParser:
 
             class_name = class_match.group(1)
 
-            # Parse annotation key=value pairs
-            annot = self._parse_annotations(annotations)
+            try:
+                # Parse annotation key=value pairs
+                annot = self._parse_annotations(annotations)
 
-            # Find namespace
-            ns = self._find_namespace(content, lines[i])
+                # Find namespace
+                ns = self._find_namespace(content, lines[i])
 
-            # Set entity_fqn for Descriptor if not specified
-            if not annot.entity_fqn and ns:
-                annot.entity_fqn = f"{ns}::{class_name}"
-            elif not annot.entity_fqn:
-                annot.entity_fqn = class_name
+                # Set entity_fqn for Descriptor if not specified
+                if not annot.entity_fqn and ns:
+                    annot.entity_fqn = f"{ns}::{class_name}"
+                elif not annot.entity_fqn:
+                    annot.entity_fqn = class_name
 
-            # Parse data members from the class body (with inline annotations)
-            members = self._parse_members(lines, i)
+                # Parse data members from the class body (with inline annotations)
+                members = self._parse_members(lines, i)
 
-            # Apply inline member annotations to the EntityAnnotation
-            self._apply_member_annotations(annot, members)
+                # Apply inline member annotations to the EntityAnnotation
+                self._apply_member_annotations(annot, members)
 
-            entities.append(ParsedEntity(
-                class_name=class_name,
-                namespace=ns,
-                annotation=annot,
-                members=members,
-                source_file=filepath,
-            ))
+                entities.append(ParsedEntity(
+                    class_name=class_name,
+                    namespace=ns,
+                    annotation=annot,
+                    members=members,
+                    source_file=filepath,
+                ))
+            except Exception as e:
+                print(f"Error: {filepath}:{annotation_start_line}: "
+                      f"failed to parse entity '{class_name}': {e}",
+                      file=sys.stderr)
+                sys.exit(1)
 
             i += 1
 
@@ -1503,6 +1515,11 @@ def main():
     for filepath in files:
         entities = struct_parser.parse_file(filepath)
         for entity in entities:
+            # Validate: warn if @relais annotation lacks table=
+            if not entity.annotation.table and not entity.annotation.model:
+                print(f"  Warning: {filepath}: entity '{entity.class_name}' has "
+                      f"@relais annotations but no table= (using derived name)",
+                      file=sys.stderr)
             filename = f"{entity.class_name}Entity.h"
             output_path = output_dir / filename
 
@@ -1513,7 +1530,7 @@ def main():
             output_path.write_text(code)
             generated_count += 1
 
-    print(f"Generated {generated_count} entity wrappers")
+    print(f"Generated {generated_count} entity mappings")
 
 
 if __name__ == "__main__":
