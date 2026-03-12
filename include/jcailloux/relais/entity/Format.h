@@ -4,12 +4,12 @@
 namespace jcailloux::relais {
 
 // =============================================================================
-// Format tags - explicit type tags for wrapper format detection
+// Format tags - explicit type tags for entity format detection
 //
-// Declared via `using Format = StructFormat;` in entity wrappers.
+// Declared via `using Format = StructFormat;` in entity types.
 // =============================================================================
 
-/// Tag type for plain C++ struct wrappers (BEVE/JSON via Glaze)
+/// Tag type for plain C++ struct entities (BEVE/JSON via Glaze)
 struct StructFormat {};
 
 }  // namespace jcailloux::relais

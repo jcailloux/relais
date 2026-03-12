@@ -11,9 +11,9 @@
 namespace jcailloux::relais {
 
 // =============================================================================
-// E Wrapper Concepts
+// Entity Concepts
 //
-// Hierarchical concepts for entity wrappers used in repositories.
+// Hierarchical concepts for entity types used in repositories.
 // Each level adds requirements on top of the previous one.
 //
 //   Readable          — can be constructed from a PgResult::Row (fromRow)
@@ -34,26 +34,26 @@ namespace jcailloux::relais {
 // -----------------------------------------------------------------------------
 
 /// Can be constructed from a PostgreSQL result row
-template<typename W>
+template<typename E>
 concept Readable = requires(const io::PgResult::Row& row) {
-    { W::fromRow(row) } -> std::convertible_to<std::optional<W>>;
+    { E::fromRow(row) } -> std::convertible_to<std::optional<E>>;
 };
 
 /// Can be serialized for cache storage (JSON or binary)
-template<typename W>
-concept Serializable = HasJsonSerialization<W>
-                    || HasBinarySerialization<W>;
+template<typename E>
+concept Serializable = HasJsonSerialization<E>
+                    || HasBinarySerialization<E>;
 
 /// Can produce SQL insert parameters for DB writes
-template<typename W>
-concept Writable = requires(const W& w) {
-    { W::toInsertParams(w) } -> std::convertible_to<io::PgParams>;
+template<typename E>
+concept Writable = requires(const E& e) {
+    { E::toInsertParams(e) } -> std::convertible_to<io::PgParams>;
 };
 
 /// Has a primary key for cache key generation
-template<typename W, typename Key>
-concept Keyed = requires(const W& w) {
-    { w.key() } -> std::convertible_to<Key>;
+template<typename E, typename Key>
+concept Keyed = requires(const E& e) {
+    { e.key() } -> std::convertible_to<Key>;
 };
 
 // -----------------------------------------------------------------------------
@@ -61,20 +61,20 @@ concept Keyed = requires(const W& w) {
 // -----------------------------------------------------------------------------
 
 /// Minimum requirement for PgRepo (DB-only read)
-template<typename W>
-concept ReadableEntity = Readable<W>;
+template<typename E>
+concept ReadableEntity = Readable<E>;
 
 /// Required for RedisRepo / LocalRepo (read + cache)
-template<typename W>
-concept CacheableEntity = ReadableEntity<W> && Serializable<W>;
+template<typename E>
+concept CacheableEntity = ReadableEntity<E> && Serializable<E>;
 
 /// Required for insert() / update() methods (read + DB write)
-template<typename W>
-concept MutableEntity = ReadableEntity<W> && Writable<W>;
+template<typename E>
+concept MutableEntity = ReadableEntity<E> && Writable<E>;
 
 /// Required for insert() with cache population (read + DB write + primary key)
-template<typename W, typename Key>
-concept CreatableEntity = MutableEntity<W> && Keyed<W, Key>;
+template<typename E, typename Key>
+concept CreatableEntity = MutableEntity<E> && Keyed<E, Key>;
 
 // -----------------------------------------------------------------------------
 // ListDescriptor detection

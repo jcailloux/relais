@@ -40,10 +40,10 @@ namespace jcailloux::relais::config {
     // All fields are public structural types → usable as template parameter.
     //
     // Usage:
-    //   using MyRepo = Repo<MyWrapper, "MyEntity">;                // defaults to Local
-    //   using MyRepo = Repo<MyWrapper, "MyEntity", config::Both>;  // preset
-    //   using MyRepo = Repo<MyWrapper, "MyEntity",
-    //       config::Local.with_l1_ttl(30min).with_read_only()>;          // customized
+    //   using MyRepo = Repo<MyEntity, "MyEntity">;                 // Repo default: Local (L1)
+    //   using MyRepo = Repo<MyEntity, "MyEntity", config::Both>;   // preset
+    //   using MyRepo = Repo<MyEntity, "MyEntity",
+    //       config::Local.with_l1_ttl(30min).with_read_only()>;    // customized
     //
 
     struct CacheConfig {

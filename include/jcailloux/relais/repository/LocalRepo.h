@@ -38,7 +38,7 @@ namespace jcailloux::relais {
  * - CacheLevel::L1:    RAM -> Database (Redis bypassed)
  * - CacheLevel::L1_L2: RAM -> Redis -> Database (full hierarchy)
  *
- * Note: L1RepoConfig constraint is verified in Repo.h to avoid
+ * Note: L1 config constraints are verified in Repo.h to avoid
  * eager evaluation issues with std::conditional_t.
  */
 template<typename E, config::FixedString Name, config::CacheConfig Cfg, typename Key>

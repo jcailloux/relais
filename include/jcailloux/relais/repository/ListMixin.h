@@ -304,7 +304,7 @@ public:
 
     /// Execute a paginated list query and return raw JSON string.
     /// L1 hit: serialize on demand from cached entities (Immediate, no Task).
-    /// L2 hit (BEVE): transcodes via glz::beve_to_json (skips 19-byte ListBoundsHeader).
+    /// L2 hit (BEVE): transcodes via glz::beve_to_json (skips ListBoundsHeader).
     /// L2/DB miss: delegates to entity path (cachedListQuery).
     static io::Immediate<std::string> queryJson(const ListQuery& q) {
         // L1 check: serialize from cached entities
@@ -680,9 +680,11 @@ protected:
             }
 
             if (beve) {
-                // Skip ListBoundsHeader (19 bytes, magic 0x53 0x52)
-                size_t off = (beve->size() > 19
-                    && (*beve)[0] == 0x53 && (*beve)[1] == 0x52) ? 19 : 0;
+                // Skip ListBoundsHeader if present (magic 0x53 0x52)
+                size_t off = (beve->size() > list::kListBoundsHeaderSize
+                    && (*beve)[0] == list::kListBoundsHeaderMagic[0]
+                    && (*beve)[1] == list::kListBoundsHeaderMagic[1])
+                    ? list::kListBoundsHeaderSize : 0;
                 std::string json;
                 if (!glz::beve_to_json(
                         std::span(beve->data() + off, beve->size() - off), json)) {
@@ -713,9 +715,11 @@ protected:
             }
 
             if (beve) {
-                // Skip ListBoundsHeader (19 bytes, magic 0x53 0x52)
-                size_t off = (beve->size() > 19
-                    && (*beve)[0] == 0x53 && (*beve)[1] == 0x52) ? 19 : 0;
+                // Skip ListBoundsHeader if present (magic 0x53 0x52)
+                size_t off = (beve->size() > list::kListBoundsHeaderSize
+                    && (*beve)[0] == list::kListBoundsHeaderMagic[0]
+                    && (*beve)[1] == list::kListBoundsHeaderMagic[1])
+                    ? list::kListBoundsHeaderSize : 0;
                 co_return std::vector<uint8_t>(
                     beve->begin() + static_cast<ptrdiff_t>(off), beve->end());
             }

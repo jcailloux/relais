@@ -75,10 +75,10 @@ struct MixinStack {
 // =============================================================================
 //
 // Usage:
-//   using MyRepo = Repo<MyWrapper, "MyEntity">;                     // L1 (default)
-//   using MyRepo = Repo<MyWrapper, "MyEntity", config::Both>;       // L1+L2
-//   using MyRepo = Repo<MyWrapper, "MyEntity", config::Local,
-//       Invalidate<OtherRepo, &MyStruct::other_id>>;                      // with cross-inv
+//   using MyRepo = Repo<MyEntity, "MyEntity">;                      // L1 (default)
+//   using MyRepo = Repo<MyEntity, "MyEntity", config::Both>;        // L1+L2
+//   using MyRepo = Repo<MyEntity, "MyEntity", config::Local,
+//       Invalidate<OtherRepo, &MyStruct::other_id>>;                // with cross-inv
 //
 
 template<typename E, config::FixedString Name, config::CacheConfig Cfg = config::Local,
