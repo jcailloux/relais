@@ -92,44 +92,20 @@ class ListMixin : public Base {
 
         static int compare(const Entity& a, const Entity& b,
                           SortField field_index, list::SortDirection dir) {
-            DescriptorSortSpec sort{field_index,
-                dir == list::SortDirection::Asc
-                    ? list::spec::SortDirection::Asc
-                    : list::spec::SortDirection::Desc};
-            return list::spec::compare<Descriptor>(a, b, sort);
+            return list::spec::compare<Descriptor>(a, b, {field_index, dir});
         }
 
         static list::Cursor extractCursor(const Entity& e,
                                                   const list::SortSpec<size_t>& sort) {
-            DescriptorSortSpec descriptor_sort{sort.field,
-                sort.direction == list::SortDirection::Asc
-                    ? list::spec::SortDirection::Asc
-                    : list::spec::SortDirection::Desc};
-            auto cursor = list::spec::extractCursor<Descriptor>(e, descriptor_sort);
-
-            list::Cursor result;
-            result.data.reserve(cursor.data.size());
-            for (uint8_t b : cursor.data) {
-                result.data.push_back(static_cast<std::byte>(b));
-            }
-            return result;
+            return list::spec::extractCursor<Descriptor>(
+                e, {sort.field, sort.direction});
         }
 
         static bool isBeforeOrAtCursor(const Entity& e,
                                        const list::Cursor& cursor,
                                        const list::SortSpec<size_t>& sort) {
-            list::spec::Cursor descriptor_cursor;
-            descriptor_cursor.data.reserve(cursor.data.size());
-            for (std::byte b : cursor.data) {
-                descriptor_cursor.data.push_back(static_cast<uint8_t>(b));
-            }
-
-            DescriptorSortSpec descriptor_sort{sort.field,
-                sort.direction == list::SortDirection::Asc
-                    ? list::spec::SortDirection::Asc
-                    : list::spec::SortDirection::Desc};
             return list::spec::isBeforeOrAtCursor<Descriptor>(
-                e, descriptor_cursor, descriptor_sort);
+                e, cursor, {sort.field, sort.direction});
         }
 
         static FilterTags extractTags(const Entity& e) {
@@ -141,11 +117,8 @@ class ListMixin : public Base {
         }
 
         static constexpr list::SortSpec<size_t> defaultSort() {
-            auto descriptor_sort = list::spec::defaultSort<Descriptor>();
-            return {descriptor_sort.field_index,
-                descriptor_sort.direction == list::spec::SortDirection::Asc
-                    ? list::SortDirection::Asc
-                    : list::SortDirection::Desc};
+            auto ds = list::spec::defaultSort<Descriptor>();
+            return {ds.field_index, ds.direction};
         }
 
         static std::optional<size_t> parseSortField(std::string_view field) {
@@ -255,10 +228,7 @@ class ListMixin : public Base {
     /// Convert spec::defaultSort → list::SortSpec<size_t>
     static list::SortSpec<size_t> defaultSortAsListSpec() {
         auto ds = list::spec::defaultSort<Descriptor>();
-        return {ds.field_index,
-            ds.direction == list::spec::SortDirection::Asc
-                ? list::SortDirection::Asc
-                : list::SortDirection::Desc};
+        return {ds.field_index, ds.direction};
     }
 
 public:

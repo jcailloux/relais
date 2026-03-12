@@ -6,20 +6,13 @@
 #include <type_traits>
 
 #include "jcailloux/relais/config/FixedString.h"
+#include "jcailloux/relais/list/SortDirection.h"
 #include "FilterDescriptor.h"  // For detail::member_pointer_type_t
 
 namespace jcailloux::relais::list::spec {
 
 using config::FixedString;
-
-// =============================================================================
-// Sort direction
-// =============================================================================
-
-enum class SortDirection : uint8_t {
-    Asc,
-    Desc
-};
+using list::SortDirection;
 
 // =============================================================================
 // Sort value type constraint

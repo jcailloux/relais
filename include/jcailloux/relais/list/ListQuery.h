@@ -10,16 +10,9 @@
 #include <vector>
 #include <glaze/glaze.hpp>
 
+#include "jcailloux/relais/list/SortDirection.h"
+
 namespace jcailloux::relais::list {
-
-// =============================================================================
-// SortDirection - Ascending or Descending
-// =============================================================================
-
-enum class SortDirection : uint8_t {
-    Asc,
-    Desc
-};
 
 // =============================================================================
 // SortSpec - Sort field and direction

@@ -16,19 +16,12 @@
 #include "SortDescriptor.h"
 #include "ListDescriptor.h"
 #include "GeneratedFilters.h"
+#include "jcailloux/relais/list/ListQuery.h"  // list::Cursor (std::byte)
 
 namespace jcailloux::relais::list::spec {
 
-// =============================================================================
-// Cursor for keyset pagination
-// =============================================================================
-
-struct Cursor {
-    std::vector<uint8_t> data;
-
-    [[nodiscard]] bool empty() const noexcept { return data.empty(); }
-    void clear() noexcept { data.clear(); }
-};
+// Unified cursor type — same as list::Cursor (std::byte based)
+using Cursor = list::Cursor;
 
 // =============================================================================
 // matchesFilters - Check if entity matches all active filters
