@@ -114,6 +114,13 @@ private:
 
     void release(ConnectionType conn) {
         if (!waiters_.empty()) {
+            // Validate connection before handing to a waiter
+            if (!conn.connected()) {
+                --total_;
+                // Waiter stays queued — next release() will serve it,
+                // or acquire() will create a new connection.
+                return;
+            }
             auto* waiter = waiters_.front();
             waiters_.pop_front();
             waiter->conn.emplace(std::move(conn));
