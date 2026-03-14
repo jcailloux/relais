@@ -193,15 +193,8 @@ public:
     static hashed_key make_key(const K& key) { return MapType::make_key(key); }
     static size_t get_hash(const hashed_key& k) { return MapType::get_hash(k); }
 
-    static void memoryHook(int64_t delta) {
-        if constexpr (GDSFPolicy::enabled) {
-            GDSFPolicy::instance().charge(delta);
-        }
-    }
-
     explicit ChunkMap(long initial_size = 128)
-        : map_(*new MapType(initial_size, false,
-                GDSFPolicy::enabled ? &memoryHook : nullptr)) {}
+        : map_(*new MapType(initial_size, false, nullptr)) {}
 
     // ChunkMap instances are static singletons (LocalRepo::cache(),
     // ListCache::cache_). Their destruction happens during static cleanup

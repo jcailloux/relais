@@ -4,17 +4,19 @@
 #include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <shared_mutex>
-#include <thread>
 #include <vector>
 
 #include "jcailloux/relais/cache/CacheMetadata.h"
 #include "jcailloux/relais/cache/Metrics.h"
+#include "jcailloux/relais/runtime/CachedHeap.h"
+#include "jcailloux/relais/runtime/RuntimeThread.h"
 #include "jcailloux/relais/Log.h"
 
 #ifndef RELAIS_GDSF_ENABLED
@@ -38,8 +40,6 @@ namespace jcailloux::relais::cache {
 struct GDSFConfig {
     float decay_rate = 0.95f;                // x0.95 per sweep; after 14 sweeps: count ~ 49%
     float histogram_alpha = 0.3f;            // EMA smoothing for histogram merges
-    float admission_pressure = 0.95f;        // admit only above 95% memory use (5% headroom)
-    size_t memory_counter_slots = 64;        // must be power of 2, <= 64
     size_t max_memory = 0;                   // L1 memory budget in bytes (0 = from env / unlimited)
     long chunk_count = 8;                    // number of chunks for all ChunkMaps (uniform)
 };
@@ -120,9 +120,9 @@ struct ScoreHistogram {
 // =========================================================================
 
 struct RepoRegistryEntry {
-    bool (*sweep_fn)();         // cleanup one chunk, returns true if evicted something
-    size_t (*size_fn)();        // current L1 cache size (entry count)
-    const char* name;           // compile-time repo name (for logging)
+    bool (*sweep_fn)(long chunk_id);  // cleanup given chunk, returns true if evicted something
+    size_t (*size_fn)();              // current L1 cache size (entry count)
+    const char* name;                 // compile-time repo name (for logging)
 };
 
 // =========================================================================
@@ -135,15 +135,10 @@ struct RepoRegistryEntry {
 // Thread-safe: all public methods are safe to call concurrently.
 //
 // Eviction strategy:
-//   1. Compute usage_ratio = totalMemory / maxMemory()
-//   2. eviction_target_pct(usage_ratio) -> % of memory to free
-//   3. histogram_.thresholdForBytes(pct * budget) -> score threshold
-//   4. Each repo sweeps 1 chunk, evicting entries with score < threshold
-//   5. Building histogram merged into persistent histogram_ via EMA
+//   1. Each repo sweeps 1 chunk (ghost decay, TTL expiration, score-based eviction)
+//   2. Building histogram merged into persistent histogram_ via EMA
 
 class GDSFPolicy {
-    static constexpr size_t kMaxMemorySlots = 64;
-
 public:
     /// Compile-time GDSF toggle. Controls if constexpr guards in LocalRepo/ListMixin.
     /// When false, all GDSF code paths (metadata, scoring, ghosts) are eliminated.
@@ -163,12 +158,7 @@ public:
 
     /// Configure the policy. Call once at startup before any repo access.
     void configure(const GDSFConfig& cfg) {
-        assert((cfg.memory_counter_slots & (cfg.memory_counter_slots - 1)) == 0
-               && "memory_counter_slots must be power of 2");
-        assert(cfg.memory_counter_slots <= kMaxMemorySlots
-               && "memory_counter_slots exceeds maximum");
         config_ = cfg;
-        memory_slot_count_ = cfg.memory_counter_slots;
         if (cfg.max_memory > 0) max_memory_ = cfg.max_memory;
     }
 
@@ -178,26 +168,30 @@ public:
     /// var at construction, overridable via configure(). Returns 0 if unset (no limit).
     size_t maxMemory() const { return max_memory_; }
 
+    /// True when memory pressure exceeds the configured budget.
+    /// Two checks: (1) CachedHeap-based (periodic), (2) headroom exhausted
+    /// since last sweep (tracks cumulative admitted bytes — no staleness).
+    /// Cost: 2-3 relaxed loads (~2-3ns). Only called on cache miss path.
+    bool isOverBudget() const {
+        if (max_memory_ == 0) return false;
+        if (runtime::CachedHeap::bytes() >= max_memory_) return true;
+        return admitted_since_sweep_.load(std::memory_order_relaxed)
+            >= headroom_.load(std::memory_order_relaxed);
+    }
+
+    /// Record admitted bytes for headroom tracking.
+    /// Called on real L1 insertion only (not ghosts).
+    void recordAdmission(uint32_t est_bytes) {
+        admitted_since_sweep_.fetch_add(est_bytes, std::memory_order_relaxed);
+    }
+
     /// Number of chunks (uniform across all ChunkMaps).
     long chunkCount() const { return config_.chunk_count; }
-
-    /// Memory pressure ratio: totalMemory / maxMemory, clamped to [0, ∞).
-    /// Returns 0 when no budget is configured.
-    float memoryPressure() const {
-        size_t budget = max_memory_;
-        if (budget == 0) return 0.0f;
-        return static_cast<float>(totalMemory())
-             / static_cast<float>(budget);
-    }
 
     /// Constant decay rate for temporal aging of access counts.
     /// Applied to every entry during each sweep pass.
     ///
-    /// Decay controls score aging (how fast old access patterns fade),
-    /// NOT pressure response. Pressure is handled orthogonally by:
-    ///   - isOverBudget() → immediate sweep trigger (frequency)
-    ///   - eviction_target_pct() → quadratic curve up to 25% (volume)
-    ///
+    /// Decay controls score aging (how fast old access patterns fade).
     /// A constant rate preserves relative score differentiation across
     /// sweeps: after N sweeps at rate r, ratio A/B is unchanged.
     /// Pressure-adaptive decay destroyed differentiation under load
@@ -211,14 +205,13 @@ public:
     // =====================================================================
 
     /// Tick the global insertion counter. Fires a global sweep every
-    /// kCleanupMask+1 insertions, or immediately when over budget.
-    /// Called from every L1 cache insertion (putInCache, ghost creation, list put).
+    /// kCleanupMask+1 ticks. Two tick sources:
+    ///   - Real L1 insertion (under budget) — maintenance sweeps
+    ///   - Over-budget ghost — eviction demand
     void tickInsertion() {
         if (kCleanupFrequencyLog2 > 0
                 && (insertion_counter_.fetch_add(1, std::memory_order_relaxed)
                     & kCleanupMask) == kCleanupMask) {
-            sweep();
-        } else if (isOverBudget()) {
             sweep();
         }
     }
@@ -249,73 +242,13 @@ public:
     }
 
     // =====================================================================
-    // Eviction Target
-    // =====================================================================
-    //
-    // Two zones:
-    //   <= 95% usage -> 0% score-based eviction (ghost/TTL cleanup only)
-    //   > 95% usage  -> free (usage − 95%) to return to 95%
-    //
-    // At threshold = 0 (target 0%), sweeps still run ghost decay (count→0
-    // removal) and TTL expiration — these are handled by dedicated cleanup
-    // predicates, not the score threshold.
-    //
-    // At 100% usage: target 5%.  At 110%: target 15%.
-    // Combined with isOverBudget() reactive trigger, this keeps memory
-    // near 95% without the ×100 overshoot of the previous 25% curve.
-
-    static float eviction_target_pct(float usage) {
-        if (usage <= 0.95f) return 0.0f;
-        return usage - 0.95f;
-    }
-
-    // =====================================================================
-    // Memory Tracking (striped counter)
+    // Cycle Interval (EMA-smoothed full sweep cycle time)
     // =====================================================================
 
-    /// Charge or discharge memory. Positive = allocation, negative = deallocation.
-    void charge(int64_t delta) {
-        static thread_local uint32_t tl_idx = static_cast<uint32_t>(
-            std::hash<std::thread::id>{}(std::this_thread::get_id()));
-        size_t slot = tl_idx++ & (memory_slot_count_ - 1);
-        memory_slots_[slot].value.fetch_add(delta, std::memory_order_relaxed);
-    }
-
-    /// Sum of all memory counter slots (approximate under contention).
-    /// Returns size_t clamped to 0: memory is inherently non-negative.
-    /// Individual slots may be negative (striped counter design), but the
-    /// aggregate should never be negative in a well-behaved system.
-    size_t totalMemory() const {
-        int64_t total = 0;
-        for (size_t i = 0; i < memory_slot_count_; ++i) {
-            total += memory_slots_[i].value.load(std::memory_order_relaxed);
-        }
-        return static_cast<size_t>(std::max(int64_t{0}, total));
-    }
-
-    bool isOverBudget() const {
-        return max_memory_ > 0
-            && totalMemory() > max_memory_;
-    }
-
-    /// Memory pressure >= 50% — eviction curve reference point.
-    bool hasMemoryPressure() const {
-        size_t budget = max_memory_;
-        if (budget == 0) return false;
-        float usage = static_cast<float>(totalMemory())
-                    / static_cast<float>(budget);
-        return usage >= 0.50f;
-    }
-
-    /// Admission pressure — ghost gate activates above this threshold.
-    /// Below this, all fetches are cached directly and the sweep handles eviction.
-    /// Default: 0.95 (95% memory usage).
-    bool hasAdmissionPressure() const {
-        size_t budget = max_memory_;
-        if (budget == 0) return false;
-        float usage = static_cast<float>(totalMemory())
-                    / static_cast<float>(budget);
-        return usage >= config_.admission_pressure;
+    /// Average time for a full sweep cycle (all chunks), in microseconds.
+    /// EMA-smoothed (α=0.2, half-life ≈ 3 cycles).
+    float avgCycleIntervalUs() const {
+        return avg_cycle_interval_us_.load(std::memory_order_relaxed);
     }
 
     // =====================================================================
@@ -335,7 +268,6 @@ public:
 
     /// Global sweep: iterates all repos, sweeps one chunk per repo.
     /// Uses atomic_flag for instant abandon if a sweep is already in progress.
-    /// Runs a second pass if memory is still over budget after the first.
     void sweep() {
         if (sweep_flag_.test_and_set(std::memory_order_acquire)) return;
 
@@ -343,67 +275,71 @@ public:
         auto sweep_t0 = std::chrono::steady_clock::now();
 #endif
 
-        // 1. Compute eviction target from current memory usage
-        float usage_ratio = 0.0f;
-        size_t budget = max_memory_;
-        if constexpr (enabled) {
-            if (budget > 0) {
-                usage_ratio = static_cast<float>(totalMemory())
-                            / static_cast<float>(budget);
+        // 1. Advance global chunk cursor — all repos sweep the SAME chunk.
+        long chunk_id = sweep_cursor_.fetch_add(1, std::memory_order_relaxed)
+                        % config_.chunk_count;
+
+        // 2. Track cycle interval (full rotation of all chunks).
+        if (chunk_id == 0) {
+            auto now = std::chrono::steady_clock::now();
+            if (last_cycle_tp_ != std::chrono::steady_clock::time_point{}) {
+                auto elapsed_us = static_cast<float>(
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        now - last_cycle_tp_).count());
+                float prev = avg_cycle_interval_us_.load(std::memory_order_relaxed);
+                avg_cycle_interval_us_.store(
+                    prev == 0.0f ? elapsed_us
+                                 : kCycleAlpha * elapsed_us + (1.0f - kCycleAlpha) * prev,
+                    std::memory_order_relaxed);
             }
+            last_cycle_tp_ = now;
         }
-        float pct = eviction_target_pct(usage_ratio);
-        size_t bytes_to_free = (pct > 0.0f && budget > 0)
-            ? static_cast<size_t>(pct * static_cast<float>(budget))
-            : 0;
 
-        // 2. Derive threshold from persistent histogram (EMA-smoothed).
-        //    The histogram represents ~1 chunk (EMA of per-chunk snapshots).
-        //    Scale bytes_to_free to the histogram's resolution to avoid
-        //    nuclear threshold when bytes_to_free > histogram total.
-        cached_threshold_.store(
-            scaleAndThreshold(bytes_to_free),
-            std::memory_order_relaxed);
+        // 3. Compute eviction threshold from heap pressure.
+        //    The histogram represents one average chunk (EMA-smoothed), so
+        //    thresholdForBytes(overshoot) returns the score below which enough
+        //    bytes exist to cover the full overshoot.  When overshoot exceeds
+        //    the chunk's total, the threshold goes nuclear (evict all) — this
+        //    is correct bang-bang behaviour that converges quickly.
+        //    Histogram discretisation naturally over-targets (~×1.2 per bucket),
+        //    compensating for inter-sweep admissions.
+        {
+            float threshold = 0.0f;
+            if (max_memory_ > 0) {
+                auto heap = runtime::CachedHeap::bytes();
+                if (heap > max_memory_) {
+                    threshold = histogram_.thresholdForBytes(heap - max_memory_);
+                }
+            }
+            cached_threshold_.store(threshold, std::memory_order_relaxed);
+        }
 
-        // 3. Sweep all repos (each cleans 1 chunk, records into building_histogram_)
+        // 4. Sweep all repos on that chunk (records into building_histogram_)
         building_histogram_.reset();
         {
             std::shared_lock rlock(registry_mutex_);
             for (const auto& entry : registry_) {
-                entry.sweep_fn();
+                entry.sweep_fn(chunk_id);
             }
         }
 
-        // 4. Merge building histogram into persistent (EMA)
+        // 5. Merge building histogram into persistent (EMA)
         histogram_.mergeEMA(building_histogram_, config_.histogram_alpha);
 
-        // 5. Extra passes: keep sweeping chunks until memory drops below
-        //    budget. Each pass recomputes usage and targets 95% occupancy.
-        //    Stops when: (a) under budget, or (b) a pass evicts nothing
-        //    (remaining memory is non-evictable structural overhead).
-        if constexpr (enabled) {
-            while (isOverBudget()) {
-                float cur_usage = static_cast<float>(totalMemory())
-                    / static_cast<float>(budget);
-                float new_pct = eviction_target_pct(cur_usage);
-                size_t new_bytes = (new_pct > 0.0f)
-                    ? static_cast<size_t>(new_pct * static_cast<float>(budget))
-                    : 0;
-                cached_threshold_.store(
-                    scaleAndThreshold(new_bytes),
-                    std::memory_order_relaxed);
+        // 6. Refresh heap measurement for immediate admission feedback.
+        //    Without this, isOverBudget() uses a stale value for up to 100ms
+        //    after eviction, blocking insertions unnecessarily.
+        runtime::CachedHeap::tick();
 
-                building_histogram_.reset();
-                bool any_evicted = false;
-                {
-                    std::shared_lock rlock(registry_mutex_);
-                    for (const auto& entry : registry_) {
-                        any_evicted |= entry.sweep_fn();
-                    }
-                }
-                histogram_.mergeEMA(building_histogram_, config_.histogram_alpha);
-                if (!any_evicted) break;
-            }
+        // 7. Refresh headroom for inter-sweep admission control.
+        //    headroom = budget - heap (how many bytes can be admitted before
+        //    next sweep). Reset admitted counter to zero.
+        {
+            auto heap = runtime::CachedHeap::bytes();
+            uint64_t room = (max_memory_ > 0 && heap < max_memory_)
+                ? max_memory_ - heap : 0ULL;
+            headroom_.store(room, std::memory_order_relaxed);
+            admitted_since_sweep_.store(0, std::memory_order_relaxed);
         }
 
 #if RELAIS_ENABLE_METRICS
@@ -422,17 +358,6 @@ public:
 #endif
 
 private:
-    /// Scale global bytes_to_free to per-chunk target and compute threshold.
-    /// The persistent histogram represents ~1 chunk (EMA of per-chunk snapshots).
-    /// Each sweep processes one chunk per repo, so the per-chunk target is
-    /// simply bytes_to_free / chunk_count.
-    float scaleAndThreshold(size_t bytes_to_free) const {
-        if (bytes_to_free == 0) return 0.0f;
-        auto per_chunk = static_cast<size_t>(bytes_to_free)
-            / static_cast<size_t>(config_.chunk_count);
-        return histogram_.thresholdForBytes(std::max(per_chunk, size_t(1)));
-    }
-
     GDSFPolicy() : max_memory_(readMaxMemoryFromEnv()) {}
 
     static size_t readMaxMemoryFromEnv() {
@@ -445,15 +370,16 @@ private:
     }
 
     /// Reset all global state for test isolation.
-    /// Call AFTER evicting all cache entries (so dtor discharge doesn't go negative).
     void reset() {
         cached_threshold_.store(0.0f, std::memory_order_relaxed);
         histogram_.reset();
         building_histogram_.reset();
-        for (size_t i = 0; i < kMaxMemorySlots; ++i) {
-            memory_slots_[i].value.store(0, std::memory_order_relaxed);
-        }
         insertion_counter_.store(0, std::memory_order_relaxed);
+        sweep_cursor_.store(0, std::memory_order_relaxed);
+        last_cycle_tp_ = {};
+        avg_cycle_interval_us_.store(0.0f, std::memory_order_relaxed);
+        headroom_.store(UINT64_MAX, std::memory_order_relaxed);
+        admitted_since_sweep_.store(0, std::memory_order_relaxed);
 #if RELAIS_ENABLE_METRICS
         sweep_counters_.reset();
 #endif
@@ -461,15 +387,7 @@ private:
     }
 
     GDSFConfig config_{};
-    size_t memory_slot_count_{kMaxMemorySlots};
     size_t max_memory_;
-
-    // Striped memory counter — one slot per cache line to eliminate false sharing.
-    // Each slot is 64-byte aligned (one cache line), costing 4 KB total (negligible).
-    struct alignas(64) MemorySlot {
-        std::atomic<int64_t> value{0};
-    };
-    MemorySlot memory_slots_[kMaxMemorySlots];
 
     // Repo registry (reader-writer lock: enroll=write, threshold/sweep=read)
     mutable std::shared_mutex registry_mutex_;
@@ -482,6 +400,20 @@ private:
 
     // Deterministic insertion counter (replaces probabilistic hash-based trigger)
     std::atomic<uint32_t> insertion_counter_{0};
+
+    // Global chunk cursor — all repos sweep the same chunk per sweep round.
+    std::atomic<uint32_t> sweep_cursor_{0};
+
+    // Cycle interval tracking (protected by sweep_flag_, single writer)
+    static constexpr float kCycleAlpha = 0.2f;  // EMA α — half-life ≈ 3 cycles
+    std::chrono::steady_clock::time_point last_cycle_tp_{};
+    std::atomic<float> avg_cycle_interval_us_{0.0f};
+
+    // Inter-sweep headroom tracking.
+    // headroom_ = budget - heap after last sweep. admitted_since_sweep_ accumulates
+    // est_bytes of real insertions. isOverBudget() closes the gate when exhausted.
+    std::atomic<uint64_t> headroom_{UINT64_MAX};  // UINT64_MAX = not yet active
+    std::atomic<uint64_t> admitted_since_sweep_{0};
 
     // Sweep serialization — lock-free, guaranteed on all platforms
     std::atomic_flag sweep_flag_{};

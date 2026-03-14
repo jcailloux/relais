@@ -215,14 +215,9 @@ public:
     // Cleanup
     // =========================================================================
 
-    /// Sweep one chunk (lock-free, always succeeds).
-    static bool trySweep() {
-        return tier().sweepChunk(noExtraPred).removed_any;
-    }
-
-    /// Sweep one chunk (identical to trySweep in lock-free design).
-    static bool sweep() {
-        return trySweep();
+    /// Sweep a specific chunk (called by GDSFPolicy::sweep via sweep_fn).
+    static bool sweep(long chunk_id) {
+        return tier().sweepChunk(chunk_id, noExtraPred).removed_any;
     }
 
     /// Sweep all chunks.
@@ -312,8 +307,12 @@ private:
             Tier instance;
             Holder() {
                 instance.enroll({
-                    .sweep_fn = +[]() -> bool { return sweep(); },
-                    .size_fn = +[]() -> size_t { return size(); },
+                    .sweep_fn = +[](long chunk_id) -> bool {
+                        return sweep(chunk_id);
+                    },
+                    .size_fn = +[]() -> size_t {
+                        return size();
+                    },
                     .name = static_cast<const char*>(Name)
                 });
                 tier_ptr_ = &instance;

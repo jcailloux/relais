@@ -163,8 +163,12 @@ class ListMixin : public Base {
                 static const std::string list_name =
                     std::string(Base::name()) + ":list";
                 instance.tier().enroll({
-                    .sweep_fn = +[]() -> bool { return listCache().sweep(); },
-                    .size_fn = +[]() -> size_t { return listCache().size(); },
+                    .sweep_fn = +[](long chunk_id) -> bool {
+                        return listCache().sweep(chunk_id);
+                    },
+                    .size_fn = +[]() -> size_t {
+                        return listCache().size();
+                    },
                     .name = list_name.c_str()
                 });
             });
@@ -387,58 +391,23 @@ public:
     // Cache management — unified entity + list cleanup
     // =========================================================================
 
-    /// Try to sweep one chunk on both entity and list caches.
-    static bool trySweep() {
-        bool entity_cleaned = Base::trySweep();
+    /// Sweep a specific chunk on both entity and list caches.
+    /// Called by GDSFPolicy::sweep via sweep_fn — chunk_id is globally coordinated.
+    static bool sweep(long chunk_id) {
+        bool entity_cleaned = Base::sweep(chunk_id);
         if constexpr (kHasL1) {
-            return entity_cleaned | listCache().trySweep();
+            return entity_cleaned | listCache().sweep(chunk_id);
         }
         return entity_cleaned;
     }
 
-    /// Sweep one chunk on both entity and list caches.
-    static bool sweep() {
-        bool entity_cleaned = Base::sweep();
-        if constexpr (kHasL1) {
-            return entity_cleaned | listCache().sweep();
-        }
-        return entity_cleaned;
-    }
-
-    /// Sweep all chunks on both entity and list caches.
+    /// Purge all chunks on both entity and list caches.
     static size_t purge() {
         size_t entity_erased = Base::purge();
         if constexpr (kHasL1) {
             return entity_erased + listCache().purge();
         }
         return entity_erased;
-    }
-
-    /// Try to sweep one entity cache chunk.
-    static bool trySweepEntities() { return Base::trySweep(); }
-
-    /// Sweep one entity cache chunk.
-    static bool sweepEntities() { return Base::sweep(); }
-
-    /// Sweep all entity cache chunks.
-    static size_t purgeEntities() { return Base::purge(); }
-
-    /// Try to sweep one list cache chunk.
-    static bool trySweepLists() {
-        if constexpr (kHasL1) { return listCache().trySweep(); }
-        return false;
-    }
-
-    /// Sweep one list cache chunk.
-    static bool sweepLists() {
-        if constexpr (kHasL1) { return listCache().sweep(); }
-        return false;
-    }
-
-    /// Sweep all list cache chunks.
-    static size_t purgeLists() {
-        if constexpr (kHasL1) { return listCache().purge(); }
-        return 0;
     }
 
     /// Invalidate entity cache. L1 list cache uses lazy invalidation via ModificationTracker.

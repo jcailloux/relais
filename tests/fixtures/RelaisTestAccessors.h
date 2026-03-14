@@ -44,10 +44,10 @@ struct TestInternals {
         return std::remove_reference_t<decltype(Repo::listCache())>::ChunkCount;
     }
 
-    /// Force a modification tracker cleanup cycle (partial, one chunk).
+    /// Force a modification tracker cleanup cycle (partial, one chunk via global sweep).
     template<typename Repo>
     static void forceModificationTrackerCleanup() {
-        Repo::listCache().trySweep();
+        jcailloux::relais::cache::GDSFPolicy::instance().sweep();
     }
 
     /// Full cleanup of list cache only (entity cache untouched).
