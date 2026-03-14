@@ -15,7 +15,7 @@
 
 #include "jcailloux/relais/cache/CacheMetadata.h"
 #include "jcailloux/relais/cache/Metrics.h"
-#include "jcailloux/relais/runtime/CachedHeap.h"
+#include "jcailloux/relais/runtime/CachedMemory.h"
 #include "jcailloux/relais/runtime/RuntimeThread.h"
 #include "jcailloux/relais/Log.h"
 
@@ -170,13 +170,13 @@ public:
 
     /// True when estimated live heap (+ extra) would exceed the budget.
     /// heap_cached + admitted_since_tick + extra ≥ budget.
-    /// CachedHeap is refreshed every ~100ms; admitted_since_tick_ bridges
+    /// CachedMemory is refreshed every ~100ms; admitted_since_tick_ bridges
     /// the gap by tracking bytes admitted since the last refresh.
     /// Pass est_bytes as extra to pre-check that an admission won't overshoot.
     /// Cost: 2 relaxed loads + add (~2ns). Only called on cache miss path.
     bool isOverBudget(uint64_t extra = 0) const {
         if (max_memory_ == 0) return false;
-        return runtime::CachedHeap::bytes()
+        return runtime::CachedMemory::bytes()
              + admitted_since_tick_.load(std::memory_order_relaxed)
              + extra
              >= max_memory_;
@@ -315,7 +315,7 @@ public:
         {
             float threshold = 0.0f;
             if (max_memory_ > 0) {
-                auto heap = runtime::CachedHeap::bytes();
+                auto heap = runtime::CachedMemory::bytes();
                 if (heap > max_memory_) {
                     threshold = histogram_.thresholdForBytes(heap - max_memory_);
                 }
@@ -337,7 +337,7 @@ public:
 
         // 6. Refresh heap + reset admitted counter so isOverBudget()
         //    immediately reflects the post-eviction state.
-        runtime::CachedHeap::tick();
+        runtime::CachedMemory::tick();
         onHeapRefresh();
 
 #if RELAIS_ENABLE_METRICS
@@ -410,7 +410,7 @@ private:
     std::chrono::steady_clock::time_point last_cycle_tp_{};
     std::atomic<float> avg_cycle_interval_us_{0.0f};
 
-    // Admitted bytes since last CachedHeap refresh.  Reset by onHeapRefresh()
+    // Admitted bytes since last CachedMemory refresh.  Reset by onHeapRefresh()
     // (called by RuntimeThread every ~100ms and by sweep after eviction).
     // isOverBudget() uses heap + admitted ≥ budget to bridge measurement gaps.
     std::atomic<uint64_t> admitted_since_tick_{0};

@@ -611,7 +611,7 @@ private:
             // Lookup existing ghost — scoped to release EpochGuard before
             // tickInsertion(), which may trigger sweep() → reclaim().
             // Holding the guard during reclaim() prevents epoch advancement,
-            // so evicted entries stay allocated and inflate CachedHeap readings.
+            // so evicted entries stay allocated and inflate CachedMemory readings.
             uint32_t count;
             bool has_ghost;
             {

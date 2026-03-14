@@ -42,13 +42,13 @@
 #include <numeric>
 #include <random>
 
-#include <jcailloux/relais/runtime/CachedHeap.h>
+#include <jcailloux/relais/runtime/CachedMemory.h>
 #include <jcailloux/relais/runtime/RuntimeThread.h>
 
 using namespace relais_test;
 using namespace relais_bench;
 using GDSFPolicy = jcailloux::relais::cache::GDSFPolicy;
-using CachedHeap = jcailloux::relais::runtime::CachedHeap;
+using CachedMemory = jcailloux::relais::runtime::CachedMemory;
 using RuntimeThread = jcailloux::relais::runtime::RuntimeThread;
 
 static_assert(GDSFPolicy::enabled,
@@ -121,7 +121,7 @@ struct SetupResult {
 
 SetupResult setupGDSFBench(size_t n_items, double pressure,
                             bool varied_sizes = false) {
-    // Ensure RuntimeThread is running so CachedHeap is populated.
+    // Ensure RuntimeThread is running so CachedMemory is populated.
     RuntimeThread::ensureStarted();
 
     // Reset everything (drain epoch pool before zeroing memory counters)
@@ -132,8 +132,8 @@ SetupResult setupGDSFBench(size_t n_items, double pressure,
     GDSFPolicy::instance().configure({.max_memory = SIZE_MAX});
 
     // Snapshot RSS BEFORE inserting cache entries.
-    CachedHeap::tick();
-    auto rss_baseline = CachedHeap::bytes();
+    CachedMemory::tick();
+    auto rss_baseline = CachedMemory::bytes();
 
     // Each entry gets a ~1KB description so cache footprint is significant.
     // With 10K items × ~1KB = ~10MB of cache, visible in RSS.
@@ -160,8 +160,8 @@ SetupResult setupGDSFBench(size_t n_items, double pressure,
     // Measure actual cache footprint in RSS, then apply pressure.
     // pressure=0.9 → allow 90% of cache to stay, evict 10%.
     // pressure=0.2 → allow 20% of cache to stay, evict 80%.
-    CachedHeap::tick();
-    auto rss_after = CachedHeap::bytes();
+    CachedMemory::tick();
+    auto rss_after = CachedMemory::bytes();
     auto cache_footprint = (rss_after > rss_baseline)
         ? rss_after - rss_baseline : 0ULL;
     auto budget = rss_baseline
@@ -214,7 +214,7 @@ struct HeapStats {
     size_t count = 0;
 
     void sample() {
-        auto kb = CachedHeap::bytes() / 1024;
+        auto kb = CachedMemory::bytes() / 1024;
         if (kb < min_kb) min_kb = kb;
         if (kb > max_kb) max_kb = kb;
         sum_kb += static_cast<double>(kb);
