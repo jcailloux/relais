@@ -552,13 +552,12 @@ TEST_CASE("LocalRepo - FewChunks config",
         CHECK(getCacheSize<FewChunksTestItemRepo>() == sizeBefore);
     }
 
-    SECTION("[cleanup] trySweep processes one chunk at a time") {
+    SECTION("[cleanup] global sweep processes one chunk at a time") {
         auto id = insertTestItem("Trigger", 1);
         sync(FewChunksTestItemRepo::find(id));
 
-        // trySweep runs but removes nothing (entry not expired)
-        auto cleaned = FewChunksTestItemRepo::trySweep();
-        CHECK_FALSE(cleaned);
+        // Global sweep runs but removes nothing (entry not expired)
+        jcailloux::relais::cache::GDSFPolicy::instance().sweep();
 
         // Non-expired entry survives
         auto result = sync(FewChunksTestItemRepo::find(id));

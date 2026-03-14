@@ -412,19 +412,14 @@ public:
     // Cleanup API — delegates to CacheTier with modification extra predicate
     // =========================================================================
 
-    /// Sweep one chunk (lock-free, always succeeds).
-    bool trySweep() {
+    /// Sweep given chunk (lock-free, always succeeds).
+    bool sweep(long chunk_id) {
         uint32_t cutoff_gen = generation_.load(std::memory_order_relaxed);
-        auto result = tier_.sweepChunk(modificationPred());
+        auto result = tier_.sweepChunk(chunk_id, modificationPred());
         if (result.chunk_id >= 0) {
             modifications_.drainChunk(cutoff_gen, static_cast<uint8_t>(result.chunk_id));
         }
         return result.removed_any;
-    }
-
-    /// Sweep one chunk (identical to trySweep in lock-free design).
-    bool sweep() {
-        return trySweep();
     }
 
     /// Sweep all chunks.

@@ -17,6 +17,7 @@
 #include "jcailloux/relais/cache/GDSFPolicy.h"
 #include "jcailloux/relais/cache/TaggedEntry.h"
 #include "jcailloux/relais/runtime/CachedClock.h"
+#include "jcailloux/relais/runtime/RuntimeThread.h"
 #include "jcailloux/relais/io/Task.h"
 
 #include <utils/epoch.h>
@@ -114,7 +115,7 @@ public:
     // =========================================================================
 
     CacheTier() {
-        runtime::CachedClock::ensureStarted();
+        runtime::RuntimeThread::ensureStarted();
     }
 
     ~CacheTier() = default;
@@ -167,8 +168,9 @@ public:
 
     /// Upsert value + metadata. Returns Hit pointing to the stored entry.
     /// Upsert value + metadata. Returns Hit pointing to the stored entry.
-    /// Does NOT tick the sweep counter — ticking is the fetch path's
-    /// responsibility (fetchAndAdmit calls tickInsertion on every DB miss).
+    /// Does NOT tick the sweep counter — ticking is the admission path's
+    /// responsibility (fetchAndAdmit ticks on real insertions and blocked
+    /// qualified ghosts).
     Hit store(const Key& key, Value&& v, Metadata m) {
         auto hk = Map::make_key(key);
         auto r = map_.upsert(hk, std::move(v), std::move(m));
@@ -289,10 +291,11 @@ public:
         long chunk_id = -1;
     };
 
-    /// Sweep one chunk. ExtraPred(key, meta, value, chunk_id) → bool adds domain-specific eviction.
+    /// Sweep one chunk. chunk_id is determined by GDSFPolicy (global cursor).
+    /// ExtraPred(key, meta, value, chunk_id) → bool adds domain-specific eviction.
     /// Returns SweepResult with chunk_id for post-sweep operations (e.g., drainChunk).
     template<typename ExtraPred>
-    SweepResult sweepChunk(ExtraPred&& extra) {
+    SweepResult sweepChunk(long chunk_id, ExtraPred&& extra) {
         if constexpr (!kHasCleanup) {
             return {};
         } else {
@@ -303,13 +306,11 @@ public:
             std::vector<typename CleanupContext::GhostCandidate> candidates;
             std::vector<typename CleanupContext::GhostDecay> ghost_decays;
             if constexpr (kHasGDSF) {
-                if (policy.hasAdmissionPressure() && !policy.isOverBudget())
-                    ctx.ghost_candidates = &candidates;
+                ctx.ghost_candidates = &candidates;
                 ctx.ghost_decays = &ghost_decays;
             }
 
             long n_chunks = policy.chunkCount();
-            long chunk_id = map_.advance_cleanup_cursor(n_chunks);
 
             size_t removed = 0;
 
@@ -364,8 +365,7 @@ public:
             std::vector<typename CleanupContext::GhostCandidate> candidates;
             std::vector<typename CleanupContext::GhostDecay> ghost_decays;
             if constexpr (kHasGDSF) {
-                if (policy.hasAdmissionPressure() && !policy.isOverBudget())
-                    ctx.ghost_candidates = &candidates;
+                ctx.ghost_candidates = &candidates;
                 ctx.ghost_decays = &ghost_decays;
             }
 
@@ -396,7 +396,7 @@ public:
 
             if (removed > 0) map_.collect();
 
-            // Post-sweep
+            // Post-sweep: apply ghost decays + insertions
             if constexpr (kHasGDSF) {
                 for (auto& gd : ghost_decays) {
                     map_.update_ghost(gd.key, [&gd](TaggedEntry te) {
@@ -596,25 +596,27 @@ private:
             recordCost(elapsed_us);
 
             auto& policy = GDSFPolicy::instance();
-            policy.tickInsertion();
 
-            if (policy.hasAdmissionPressure()) {
-                // Lookup existing ghost
+            // Compute estimated bytes (independent of ghost lookup)
+            size_t mem = 0;
+            if constexpr (MemoryTrackable<Value>) {
+                mem = opt->memoryUsage();
+            } else {
+                mem = sizeof(Value);
+            }
+            uint32_t est_bytes = static_cast<uint32_t>(
+                mem + kEntryOverhead + kBucketSlotSize);
+            uint8_t est_flags = 0;
+
+            // Lookup existing ghost — scoped to release EpochGuard before
+            // tickInsertion(), which may trigger sweep() → reclaim().
+            // Holding the guard during reclaim() prevents epoch advancement,
+            // so evicted entries stay allocated and inflate CachedHeap readings.
+            uint32_t count;
+            bool has_ghost;
+            {
                 auto ghost_result = map_.find(key);
-                bool has_ghost = ghost_result && ghost_result.isGhost();
-
-                // Compute estimated bytes
-                size_t mem = 0;
-                if constexpr (MemoryTrackable<Value>) {
-                    mem = opt->memoryUsage();
-                } else {
-                    mem = sizeof(Value);
-                }
-                uint32_t est_bytes = static_cast<uint32_t>(
-                    mem + kEntryOverhead + kBucketSlotSize);
-                uint8_t est_flags = 0;
-
-                uint32_t count;
+                has_ghost = ghost_result && ghost_result.isGhost();
                 if (has_ghost) {
                     uint32_t old_count = ghost_result.ghostCount();
                     count = old_count + GDSFScoreData::kCountScale;
@@ -624,46 +626,34 @@ private:
                 } else {
                     count = GDSFScoreData::kCountScale;
                 }
+            }
 
-                float avg_cost = avg_cost_us_.load(std::memory_order_relaxed);
-                float decayed = static_cast<float>(count) * policy.decayRate();
-                float score = decayed * avg_cost
-                    / static_cast<float>(std::max(est_bytes, uint32_t{1}));
-
-                if (score >= policy.threshold()) {
-                    // === CACHE (or PROMOTE from ghost) ===
-                    auto meta = mb(*opt, elapsed_us);
-                    auto r = map_.upsert(Map::make_key(key), std::move(*opt), std::move(meta));
-                    if (has_ghost) {
-                        r.entry()->metadata.gdsfData().access_count.store(
-                            count, std::memory_order_relaxed);
-                    }
-                    auto* ce = r.asReal();
-                    co_return Hit{&ce->value, &ce->metadata, std::move(r.guard)};
-                } else {
-                    // === GHOST (create or keep) ===
-                    if (!has_ghost) {
-                        map_.insert_ghost(key, GDSFScoreData::kCountScale,
-                                         est_bytes, est_flags);
-                    }
-                    // Return via transient pool
-                    auto guard = epoch::EpochGuard::acquire();
-                    auto* ptr = transientPool().New(std::move(*opt));
-                    transientPool().Retire(ptr);
-                    co_return Hit{ptr, nullptr, std::move(guard)};
+            if (!policy.isOverBudget()) {
+                // === CACHE (or PROMOTE from ghost) ===
+                policy.tickInsertion();
+                policy.recordAdmission(est_bytes);
+                auto meta = mb(*opt, elapsed_us);
+                auto r = map_.upsert(Map::make_key(key), std::move(*opt), std::move(meta));
+                if (has_ghost) {
+                    r.entry()->metadata.gdsfData().access_count.store(
+                        count, std::memory_order_relaxed);
                 }
+                auto* ce = r.asReal();
+                co_return Hit{&ce->value, &ce->metadata, std::move(r.guard)};
+            } else {
+                // === GHOST (create or keep) ===
+                // Tick to signal eviction demand and trigger sweeps.
+                policy.tickInsertion();
+                if (!has_ghost) {
+                    map_.insert_ghost(key, GDSFScoreData::kCountScale,
+                                     est_bytes, est_flags);
+                }
+                // Return via transient pool
+                auto guard = epoch::EpochGuard::acquire();
+                auto* ptr = transientPool().New(std::move(*opt));
+                transientPool().Retire(ptr);
+                co_return Hit{ptr, nullptr, std::move(guard)};
             }
-
-            // No pressure: cache normally, remove stale ghost
-            auto ghost_result = map_.find(key);
-            if (ghost_result && ghost_result.isGhost()) {
-                map_.remove(key);
-            }
-
-            auto meta = mb(*opt, elapsed_us);
-            auto r = map_.upsert(Map::make_key(key), std::move(*opt), std::move(meta));
-            auto* ce = r.asReal();
-            co_return Hit{&ce->value, &ce->metadata, std::move(r.guard)};
         } else {
             // Non-GDSF path
             auto opt = co_await f();
@@ -703,7 +693,8 @@ private:
             float avg_cost = avg_cost_us_.load(std::memory_order_relaxed);
             float score = gdsf.computeScore(avg_cost, mem + kBucketSlotSize);
 
-            // Histogram
+            // Histogram — when ghost candidates are active, only count the
+            // freeable portion (real entry minus the bucket slot that stays).
             size_t freeable = ctx.ghost_candidates
                 ? (mem - std::min(mem, kBucketSlotSize))
                 : mem;
@@ -714,7 +705,7 @@ private:
                 if (meta.isExpired(ctx.now_sec)) return true;
             }
 
-            // Score threshold
+            // Score threshold — evicted entries become ghost candidates
             if (score < ctx.threshold) {
                 if (ctx.ghost_candidates) {
                     ctx.ghost_candidates->push_back({key, old_count,

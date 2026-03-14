@@ -105,17 +105,6 @@ TEST_CASE("LocalRepo features", "[repository][compile][cached]") {
         REQUIRE(size == 0);  // empty at start
     }
 
-    SECTION("trySweep") {
-        auto result = L1TestItemRepo::trySweep();
-        // Just verify it compiles and returns bool
-        (void)result;
-    }
-
-    SECTION("sweep") {
-        auto result = L1TestItemRepo::sweep();
-        (void)result;
-    }
-
     SECTION("purge") {
         auto erased = L1TestItemRepo::purge();
         REQUIRE(erased == 0);  // empty cache
@@ -161,24 +150,8 @@ TEST_CASE("ListMixin auto-detected from ListDescriptor", "[repository][compile][
         (void)sizeof(Desc);  // verify type exists
     }
 
-    SECTION("sweep — unified (entity + list)") {
-        (void)TestArticleListRepo::trySweep();
-        (void)TestArticleListRepo::sweep();
+    SECTION("purge — unified (entity + list)") {
         auto erased = TestArticleListRepo::purge();
-        REQUIRE(erased == 0);
-    }
-
-    SECTION("sweepEntities — entity cache only") {
-        (void)TestArticleListRepo::trySweepEntities();
-        (void)TestArticleListRepo::sweepEntities();
-        auto erased = TestArticleListRepo::purgeEntities();
-        REQUIRE(erased == 0);
-    }
-
-    SECTION("sweepLists — list cache only") {
-        (void)TestArticleListRepo::trySweepLists();
-        (void)TestArticleListRepo::sweepLists();
-        auto erased = TestArticleListRepo::purgeLists();
         REQUIRE(erased == 0);
     }
 

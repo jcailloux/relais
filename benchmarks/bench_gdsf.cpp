@@ -7,16 +7,20 @@
  * Matrix: 3 skews × 3 pressures × 2 size profiles = 18 combinations
  *   - Skew:     s=0.8 (mild), s=1.0 (standard Zipf), s=1.2 (heavy)
  *   - Pressure: 90% (low eviction), 50% (medium), 20% (high eviction)
- *   - Sizes:    uniform (~200B each) or varied (alternating ~200B / ~450B)
+ *   - Sizes:    uniform (~1KB each) or varied (alternating ~1KB / ~2KB)
  *
- * Budget is computed dynamically from totalMemory() AFTER insertion,
- * so ParlayHash bucket array overhead is automatically included.
+ * Working set: 10K items × ~1KB = ~10MB cache footprint (significant vs ~15-25MB RSS).
+ *
+ * Budget is self-calibrating: RSS is measured before and after cache insertion.
+ * max_memory = RSS_baseline + actual_cache_footprint × pressure.
+ * Each entry carries a ~1KB description so the cache footprint (~10MB for 10K items)
+ * is significant relative to process RSS.
  *
  * Design:
- *   1. Insert N items into DB + L1 (all cached, access_count=1)
- *   2. Compute budget = totalMemory() × pressure_ratio
+ *   1. Snapshot RSS baseline, insert N items into DB + L1 (all cached, access_count=1)
+ *   2. Set budget = RSS_baseline + cache_headroom (pressure × estimated cache size)
  *   3. Warm up: run target distribution to build access counts (all L1 hits)
- *   4. Evict: sweep until memory <= budget (GDSF retains hot items)
+ *   4. Sweep rounds: threshold computed from RSS vs budget via histogram
  *   5. Measure: 100K fixed-ops L1-only lookups, count hits vs misses
  *
  * Run with:
@@ -38,9 +42,14 @@
 #include <numeric>
 #include <random>
 
+#include <jcailloux/relais/runtime/CachedHeap.h>
+#include <jcailloux/relais/runtime/RuntimeThread.h>
+
 using namespace relais_test;
 using namespace relais_bench;
 using GDSFPolicy = jcailloux::relais::cache::GDSFPolicy;
+using CachedHeap = jcailloux::relais::runtime::CachedHeap;
+using RuntimeThread = jcailloux::relais::runtime::RuntimeThread;
 
 static_assert(GDSFPolicy::enabled,
     "bench_gdsf.cpp must be compiled with RELAIS_GDSF_ENABLED=1");
@@ -108,11 +117,13 @@ namespace {
 /// eviction is guided by GDSF scores, not a cold-start nuclear threshold.
 struct SetupResult {
     std::vector<int64_t> ids;
-    size_t entry_memory;   // delta: memory from entries only (no structural overhead)
 };
 
-SetupResult setupGDSFBench(size_t n_items, size_t max_memory_bytes,
+SetupResult setupGDSFBench(size_t n_items, double pressure,
                             bool varied_sizes = false) {
+    // Ensure RuntimeThread is running so CachedHeap is populated.
+    RuntimeThread::ensureStarted();
+
     // Reset everything (drain epoch pool before zeroing memory counters)
     TestInternals::resetCacheForGDSF<GDSFBenchRepo>();
 
@@ -120,35 +131,49 @@ SetupResult setupGDSFBench(size_t n_items, size_t max_memory_bytes,
     // nuking chunks with an empty histogram.
     GDSFPolicy::instance().configure({.max_memory = SIZE_MAX});
 
-    // Snapshot memory BEFORE insertions (captures structural overhead baseline)
-    auto mem_before = GDSFPolicy::instance().totalMemory();
+    // Snapshot RSS BEFORE inserting cache entries.
+    CachedHeap::tick();
+    auto rss_baseline = CachedHeap::bytes();
 
-    std::string long_desc(200, 'x');
+    // Each entry gets a ~1KB description so cache footprint is significant.
+    // With 10K items × ~1KB = ~10MB of cache, visible in RSS.
+    std::string base_desc(1024, 'x');
 
     std::vector<int64_t> ids;
     ids.reserve(n_items);
     for (size_t i = 0; i < n_items; ++i) {
-        std::optional<std::string> desc;
-        if (varied_sizes && (i % 2 == 1))
-            desc = long_desc + "_" + std::to_string(i);
+        // Varied: alternate ~1KB / ~2KB descriptions.
+        auto desc = varied_sizes && (i % 2 == 1)
+            ? base_desc + base_desc + "_" + std::to_string(i)
+            : base_desc + "_" + std::to_string(i);
         auto kid = insertTestItem("gdsf_bench_" + std::to_string(i),
                                    static_cast<int32_t>(i), desc);
         sync(GDSFBenchRepo::find(kid));
         ids.push_back(kid);
     }
 
-    // Entry-only memory (excludes bucket array / structural overhead)
-    auto entry_memory = GDSFPolicy::instance().totalMemory() - mem_before;
-
-    // Pre-warm histogram: 16 sweeps (2 full rounds of 8 chunks) with no
-    // budget pressure. This populates the persistent EMA histogram so that
-    // eviction uses real score distributions, not exp2(23.25).
+    // Pre-warm histogram: 16 sweeps (2 full rounds of 8 chunks).
+    // Populates the persistent EMA histogram so that eviction uses
+    // real score distributions, not exp2(23.25).
     for (int i = 0; i < 16; ++i) GDSFPolicy::instance().sweep();
 
-    // Now set the real budget for eviction.
-    GDSFPolicy::instance().configure({.max_memory = max_memory_bytes});
+    // Measure actual cache footprint in RSS, then apply pressure.
+    // pressure=0.9 → allow 90% of cache to stay, evict 10%.
+    // pressure=0.2 → allow 20% of cache to stay, evict 80%.
+    CachedHeap::tick();
+    auto rss_after = CachedHeap::bytes();
+    auto cache_footprint = (rss_after > rss_baseline)
+        ? rss_after - rss_baseline : 0ULL;
+    auto budget = rss_baseline
+        + static_cast<uint64_t>(static_cast<double>(cache_footprint) * pressure);
+    GDSFPolicy::instance().configure({.max_memory = static_cast<size_t>(budget)});
 
-    return {std::move(ids), entry_memory};
+    WARN("  [setup] heap_baseline=" << (rss_baseline / 1024) << " KB"
+         << "  heap_after=" << (rss_after / 1024) << " KB"
+         << "  footprint=" << (cache_footprint / 1024) << " KB"
+         << "  budget=" << (budget / 1024) << " KB");
+
+    return {std::move(ids)};
 }
 
 /// Build access counts with the given distribution (L1 hits only, no sync).
@@ -167,36 +192,51 @@ void warmupAccess(const std::vector<int64_t>& ids, KeyGen&& gen, size_t ops = 10
 
     // Rebuild histogram to reflect post-warmup scores.
     // Temporarily disable budget so sweeps only record, not evict.
-    auto saved = GDSFPolicy::instance().maxMemory();
+    // Then re-anchor budget to current RSS + original cache headroom.
+    auto saved_budget = GDSFPolicy::instance().maxMemory();
     GDSFPolicy::instance().configure({.max_memory = SIZE_MAX});
     for (int i = 0; i < 16; ++i) GDSFPolicy::instance().sweep();
-    GDSFPolicy::instance().configure({.max_memory = saved});
+    GDSFPolicy::instance().configure({.max_memory = saved_budget});
 }
 
-/// Sweep until memory is within budget (or no progress / max iterations).
-/// Stops early when sweep didn't evict anything (epoch-deferred memory lag).
-int evictToBudget(int max_rounds = 200) {
-    int rounds = 0;
-    int stalls = 0;
-    while (rounds < max_rounds && GDSFPolicy::instance().isOverBudget()) {
-        auto before = GDSFBenchRepo::size();
+/// Run multiple sweep rounds to converge on eviction threshold.
+void sweepRounds(int rounds = 8) {
+    for (int i = 0; i < rounds; ++i)
         GDSFPolicy::instance().sweep();
-        auto after = GDSFBenchRepo::size();
-        if (before == after) {
-            if (++stalls >= 3) break;  // 3 stalls → epoch lag, give up
-        } else {
-            stalls = 0;
-        }
-        ++rounds;
-    }
-    return rounds;
 }
+
+/// Running statistics for heap sampling during workload.
+struct HeapStats {
+    uint64_t min_kb = UINT64_MAX;
+    uint64_t max_kb = 0;
+    double sum_kb = 0.0;
+    double sum_sq_kb = 0.0;
+    size_t count = 0;
+
+    void sample() {
+        auto kb = CachedHeap::bytes() / 1024;
+        if (kb < min_kb) min_kb = kb;
+        if (kb > max_kb) max_kb = kb;
+        sum_kb += static_cast<double>(kb);
+        sum_sq_kb += static_cast<double>(kb) * static_cast<double>(kb);
+        ++count;
+    }
+
+    double avg() const { return count > 0 ? sum_kb / static_cast<double>(count) : 0.0; }
+    double stddev() const {
+        if (count < 2) return 0.0;
+        double n = static_cast<double>(count);
+        double mean = sum_kb / n;
+        return std::sqrt((sum_sq_kb / n) - mean * mean);
+    }
+};
 
 struct AccessStats {
     int64_t hits = 0;
     int64_t misses = 0;
     int64_t cache_size = 0;
     Clock::duration elapsed{};
+    HeapStats heap{};
 
     double hitRate() const {
         auto total = hits + misses;
@@ -212,6 +252,7 @@ struct AccessStats {
 
 /// Fixed-ops steady-state workload: misses fetch from DB and re-admit into L1,
 /// triggering GDSF sweeps. Measures the dynamic equilibrium hit rate.
+/// Samples heap every 1024 ops for min/max/avg/stddev statistics.
 template<typename KeyGen>
 AccessStats runWorkloadFixed(const std::vector<int64_t>& ids, KeyGen&& gen,
                              size_t num_ops) {
@@ -223,7 +264,9 @@ AccessStats runWorkloadFixed(const std::vector<int64_t>& ids, KeyGen&& gen,
     for (size_t i = 0; i < num_ops; ++i) {
         size_t idx = gen();
         doNotOptimize(sync(GDSFBenchRepo::find(ids[idx])));
+        if ((i & 1023) == 0) stats.heap.sample();
     }
+    stats.heap.sample();  // final sample
 
     auto m = GDSFBenchRepo::metrics();
     stats.hits = static_cast<int64_t>(m.l1_hits);
@@ -284,7 +327,11 @@ std::string formatAccessStats(const std::string& label, const AccessStats& s) {
         << "\n  L1 misses:    " << s.misses
         << "\n  hit rate:     " << std::fixed << std::setprecision(1) << s.hitRate() << "%"
         << "\n  cache size:   " << s.cache_size << " entries"
-        << "\n  L1 memory:    " << GDSFPolicy::instance().totalMemory() << " B"
+        << "\n  heap:         " << "min=" << s.heap.min_kb
+            << " avg=" << std::fixed << std::setprecision(0) << s.heap.avg()
+            << " max=" << s.heap.max_kb
+            << " sd=" << std::setprecision(0) << s.heap.stddev() << " KB"
+        << "\n  max_memory:   " << (GDSFPolicy::instance().maxMemory() / 1024) << " KB"
         << "\n  throughput:   " << fmtOps(s.opsPerSec())
 #if RELAIS_ENABLE_METRICS
         << formatSweepMetrics()
@@ -306,33 +353,25 @@ TEST_CASE("Benchmark - GDSF matrix", "[benchmark][gdsf]")
 {
     TransactionGuard tx;
 
-    static constexpr size_t NUM_KEYS = 1000;
-    static constexpr size_t NUM_OPS = 100'000;
+    static constexpr size_t NUM_KEYS = 10'000;
+    static constexpr size_t NUM_OPS = 1'00'000;
 
     auto skew = GENERATE(0.8, 1.0, 1.2);
     auto pressure = GENERATE(0.90, 0.50, 0.20);
     auto varied = GENERATE(false, true);
 
-    // 1. Insert all items (no budget limit)
-    auto [ids, entry_memory] = setupGDSFBench(NUM_KEYS, SIZE_MAX, varied);
+    // 1. Insert all items, measure actual RSS footprint, apply pressure.
+    //    pressure=0.9 → allow 90% of cache, pressure=0.2 → allow 20%.
+    auto [ids] = setupGDSFBench(NUM_KEYS, pressure, varied);
 
-    // 2. Compute budget: evict (1 - pressure) fraction of entry memory.
-    //    Formulated as total − bytes_to_evict (safe unsigned arithmetic)
-    //    rather than structural + entries×pressure (vulnerable to epoch drift).
-    auto total = GDSFPolicy::instance().totalMemory();
-    auto bytes_to_evict = static_cast<size_t>(
-        static_cast<double>(entry_memory) * (1.0 - pressure));
-    auto budget = (total > bytes_to_evict) ? (total - bytes_to_evict) : size_t{0};
-    GDSFPolicy::instance().configure({.max_memory = budget});
-
-    // 3. Warmup access counts with target distribution
+    // 2. Warmup access counts with target distribution
     ZipfGenerator warmup_zipf(NUM_KEYS, skew, 42);
     warmupAccess(ids, [&]() { return warmup_zipf.next(); });
 
-    // 4. Evict to budget
-    evictToBudget();
+    // 3. Sweep to converge on eviction threshold
+    sweepRounds();
 
-    // 5. Measure hit rate (100K fixed ops)
+    // 4. Measure hit rate (100K fixed ops)
     ZipfGenerator zipf(NUM_KEYS, skew, 123);
     auto stats = runWorkloadFixed(ids, [&]() { return zipf.next(); }, NUM_OPS);
 

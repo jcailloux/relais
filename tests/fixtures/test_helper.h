@@ -639,7 +639,7 @@ void forcePurge() {
 
 template<typename Repo>
 void trySweep() {
-    Repo::trySweep();
+    jcailloux::relais::cache::GDSFPolicy::instance().sweep();
 }
 
 } // namespace relais_test
