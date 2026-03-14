@@ -628,7 +628,7 @@ private:
                 }
             }
 
-            if (!policy.isOverBudget()) {
+            if (!policy.isOverBudget(est_bytes)) {
                 // === CACHE (or PROMOTE from ghost) ===
                 policy.tickInsertion();
                 policy.recordAdmission(est_bytes);
@@ -642,11 +642,22 @@ private:
                 co_return Hit{&ce->value, &ce->metadata, std::move(r.guard)};
             } else {
                 // === GHOST (create or keep) ===
-                // Tick to signal eviction demand and trigger sweeps.
-                policy.tickInsertion();
                 if (!has_ghost) {
+                    // New ghost: first appearance — always tick (maintenance).
                     map_.insert_ghost(key, GDSFScoreData::kCountScale,
                                      est_bytes, est_flags);
+                    policy.tickInsertion();
+                } else {
+                    // Existing ghost re-accessed: tick only if its score
+                    // would survive the current eviction threshold — signals
+                    // genuine demand for cache space.
+                    float avg_cost = avg_cost_us_.load(std::memory_order_relaxed);
+                    float score = static_cast<float>(count) * policy.decayRate()
+                        * avg_cost
+                        / static_cast<float>(std::max(est_bytes, uint32_t{1}));
+                    if (score >= policy.threshold()) {
+                        policy.tickInsertion();
+                    }
                 }
                 // Return via transient pool
                 auto guard = epoch::EpochGuard::acquire();

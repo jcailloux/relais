@@ -20,6 +20,10 @@ struct RuntimeThread {
         static_cast<float>(std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::milliseconds{100}).count());
 
+    /// Optional callback invoked after each CachedHeap::tick().
+    /// Set by GDSFPolicy to reset its admitted counter on heap refresh.
+    static inline void (*on_heap_refresh)() noexcept = nullptr;
+
     /// Ensure the background thread is running (idempotent via call_once).
     static void ensureStarted() {
         std::call_once(start_flag_, [] {
@@ -27,6 +31,7 @@ struct RuntimeThread {
                 while (!st.stop_requested()) {
                     CachedClock::tick();
                     CachedHeap::tick();
+                    if (on_heap_refresh) on_heap_refresh();
                     std::this_thread::sleep_for(kInterval);
                 }
             }};

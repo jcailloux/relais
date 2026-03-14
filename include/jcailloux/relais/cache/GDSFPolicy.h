@@ -168,21 +168,29 @@ public:
     /// var at construction, overridable via configure(). Returns 0 if unset (no limit).
     size_t maxMemory() const { return max_memory_; }
 
-    /// True when memory pressure exceeds the configured budget.
-    /// Two checks: (1) CachedHeap-based (periodic), (2) headroom exhausted
-    /// since last sweep (tracks cumulative admitted bytes — no staleness).
-    /// Cost: 2-3 relaxed loads (~2-3ns). Only called on cache miss path.
-    bool isOverBudget() const {
+    /// True when estimated live heap (+ extra) would exceed the budget.
+    /// heap_cached + admitted_since_tick + extra ≥ budget.
+    /// CachedHeap is refreshed every ~100ms; admitted_since_tick_ bridges
+    /// the gap by tracking bytes admitted since the last refresh.
+    /// Pass est_bytes as extra to pre-check that an admission won't overshoot.
+    /// Cost: 2 relaxed loads + add (~2ns). Only called on cache miss path.
+    bool isOverBudget(uint64_t extra = 0) const {
         if (max_memory_ == 0) return false;
-        if (runtime::CachedHeap::bytes() >= max_memory_) return true;
-        return admitted_since_sweep_.load(std::memory_order_relaxed)
-            >= headroom_.load(std::memory_order_relaxed);
+        return runtime::CachedHeap::bytes()
+             + admitted_since_tick_.load(std::memory_order_relaxed)
+             + extra
+             >= max_memory_;
     }
 
-    /// Record admitted bytes for headroom tracking.
-    /// Called on real L1 insertion only (not ghosts).
+    /// Record admitted bytes.  Called on real L1 insertion only (not ghosts).
     void recordAdmission(uint32_t est_bytes) {
-        admitted_since_sweep_.fetch_add(est_bytes, std::memory_order_relaxed);
+        admitted_since_tick_.fetch_add(est_bytes, std::memory_order_relaxed);
+    }
+
+    /// Reset admitted counter after a fresh heap measurement.
+    /// Called by RuntimeThread (every ~100ms) and by sweep (step 6).
+    void onHeapRefresh() {
+        admitted_since_tick_.store(0, std::memory_order_relaxed);
     }
 
     /// Number of chunks (uniform across all ChunkMaps).
@@ -205,9 +213,10 @@ public:
     // =====================================================================
 
     /// Tick the global insertion counter. Fires a global sweep every
-    /// kCleanupMask+1 ticks. Two tick sources:
+    /// kCleanupMask+1 ticks. Three tick sources:
     ///   - Real L1 insertion (under budget) — maintenance sweeps
-    ///   - Over-budget ghost — eviction demand
+    ///   - New ghost creation (over budget, first appearance) — tracking
+    ///   - Qualified ghost re-access (over budget, score ≥ threshold) — eviction demand
     void tickInsertion() {
         if (kCleanupFrequencyLog2 > 0
                 && (insertion_counter_.fetch_add(1, std::memory_order_relaxed)
@@ -326,21 +335,10 @@ public:
         // 5. Merge building histogram into persistent (EMA)
         histogram_.mergeEMA(building_histogram_, config_.histogram_alpha);
 
-        // 6. Refresh heap measurement for immediate admission feedback.
-        //    Without this, isOverBudget() uses a stale value for up to 100ms
-        //    after eviction, blocking insertions unnecessarily.
+        // 6. Refresh heap + reset admitted counter so isOverBudget()
+        //    immediately reflects the post-eviction state.
         runtime::CachedHeap::tick();
-
-        // 7. Refresh headroom for inter-sweep admission control.
-        //    headroom = budget - heap (how many bytes can be admitted before
-        //    next sweep). Reset admitted counter to zero.
-        {
-            auto heap = runtime::CachedHeap::bytes();
-            uint64_t room = (max_memory_ > 0 && heap < max_memory_)
-                ? max_memory_ - heap : 0ULL;
-            headroom_.store(room, std::memory_order_relaxed);
-            admitted_since_sweep_.store(0, std::memory_order_relaxed);
-        }
+        onHeapRefresh();
 
 #if RELAIS_ENABLE_METRICS
         auto sweep_ns = static_cast<uint64_t>(
@@ -358,7 +356,11 @@ public:
 #endif
 
 private:
-    GDSFPolicy() : max_memory_(readMaxMemoryFromEnv()) {}
+    GDSFPolicy() : max_memory_(readMaxMemoryFromEnv()) {
+        runtime::RuntimeThread::on_heap_refresh = [] () noexcept {
+            GDSFPolicy::instance().onHeapRefresh();
+        };
+    }
 
     static size_t readMaxMemoryFromEnv() {
         if (auto* env = std::getenv("RELAIS_L1_MAX_MEMORY")) {
@@ -378,8 +380,7 @@ private:
         sweep_cursor_.store(0, std::memory_order_relaxed);
         last_cycle_tp_ = {};
         avg_cycle_interval_us_.store(0.0f, std::memory_order_relaxed);
-        headroom_.store(UINT64_MAX, std::memory_order_relaxed);
-        admitted_since_sweep_.store(0, std::memory_order_relaxed);
+        admitted_since_tick_.store(0, std::memory_order_relaxed);
 #if RELAIS_ENABLE_METRICS
         sweep_counters_.reset();
 #endif
@@ -409,11 +410,10 @@ private:
     std::chrono::steady_clock::time_point last_cycle_tp_{};
     std::atomic<float> avg_cycle_interval_us_{0.0f};
 
-    // Inter-sweep headroom tracking.
-    // headroom_ = budget - heap after last sweep. admitted_since_sweep_ accumulates
-    // est_bytes of real insertions. isOverBudget() closes the gate when exhausted.
-    std::atomic<uint64_t> headroom_{UINT64_MAX};  // UINT64_MAX = not yet active
-    std::atomic<uint64_t> admitted_since_sweep_{0};
+    // Admitted bytes since last CachedHeap refresh.  Reset by onHeapRefresh()
+    // (called by RuntimeThread every ~100ms and by sweep after eviction).
+    // isOverBudget() uses heap + admitted ≥ budget to bridge measurement gaps.
+    std::atomic<uint64_t> admitted_since_tick_{0};
 
     // Sweep serialization — lock-free, guaranteed on all platforms
     std::atomic_flag sweep_flag_{};
