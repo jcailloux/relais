@@ -6,7 +6,7 @@
 #include <thread>
 
 #include "jcailloux/relais/runtime/CachedClock.h"
-#include "jcailloux/relais/runtime/CachedHeap.h"
+#include "jcailloux/relais/runtime/CachedMemory.h"
 
 namespace jcailloux::relais::runtime {
 
@@ -20,7 +20,7 @@ struct RuntimeThread {
         static_cast<float>(std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::milliseconds{100}).count());
 
-    /// Optional callback invoked after each CachedHeap::tick().
+    /// Optional callback invoked after each CachedMemory::tick().
     /// Set by GDSFPolicy to reset its admitted counter on heap refresh.
     static inline void (*on_heap_refresh)() noexcept = nullptr;
 
@@ -30,7 +30,7 @@ struct RuntimeThread {
             thread_ = std::jthread{[](std::stop_token st) {
                 while (!st.stop_requested()) {
                     CachedClock::tick();
-                    CachedHeap::tick();
+                    CachedMemory::tick();
                     if (on_heap_refresh) on_heap_refresh();
                     std::this_thread::sleep_for(kInterval);
                 }
