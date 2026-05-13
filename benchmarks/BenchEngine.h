@@ -431,6 +431,131 @@ inline std::string formatMixedThroughput(
     return out.str();
 }
 
+// =============================================================================
+// Multi-event-loop throughput engine (shared-nothing)
+//
+// Each worker thread runs its own EpollIoContext with its own pool and
+// `concurrency_per_thread` detached coroutines. No state is shared between
+// threads beyond the stop flag and the aggregated op counter. This is the
+// model the relais runtime is meant to scale with — one event loop per core.
+//
+// Defaults to `hardware_concurrency()/2` threads so PG/Redis on the same
+// host can use the remaining cores. Override with `BENCH_THREADS=N`.
+// =============================================================================
+
+inline int benchThreads() {
+    static int n = [] {
+        if (auto* env = std::getenv("BENCH_THREADS"))
+            if (int v = std::atoi(env); v > 0) return v;
+        unsigned hw = std::thread::hardware_concurrency();
+        if (hw < 2) return 1;
+        return static_cast<int>(hw / 2);
+    }();
+    return n;
+}
+
+struct ThroughputResult {
+    int threads;
+    int concurrency_per_thread;
+    int64_t total_ops;
+    double duration_s;
+    double throughput;          // ops/s, aggregated
+    double speedup;             // vs first result
+};
+
+/// Spawns `num_threads` worker threads and orchestrates the timed run.
+///
+/// `thread_fn` runs on each worker thread and must:
+///   1. set up its own EpollIoContext + pool (synchronous bootstrap)
+///   2. `ready.count_down()` once setup is done
+///   3. `go.wait()` to start measurement together with peers
+///   4. spawn `concurrency` DetachedTask workers that loop while `running` is
+///      true, incrementing `thread_ops` on each completed op
+///   5. `io.runUntil([&]{ return !running.load(relaxed); })` then drain
+///
+/// Bootstrap (connections, prepares, etc.) happens before `ready.count_down`
+/// so connection setup latency does not pollute the throughput window.
+template<typename ThreadFn>
+inline ThroughputResult measureMultiLoopThroughput(
+        int num_threads, int concurrency_per_thread,
+        double baseline_throughput,
+        ThreadFn&& thread_fn)
+{
+    std::atomic<bool> running{true};
+    std::atomic<int64_t> total_ops{0};
+    std::latch ready{num_threads};
+    std::latch go{1};
+
+    std::vector<std::jthread> threads;
+    threads.reserve(num_threads);
+
+    for (int i = 0; i < num_threads; ++i) {
+        threads.emplace_back([&, i] {
+            std::atomic<int64_t> thread_ops{0};
+            thread_fn(i, concurrency_per_thread, ready, go, running, thread_ops);
+            total_ops.fetch_add(thread_ops.load(std::memory_order_relaxed),
+                                std::memory_order_relaxed);
+        });
+    }
+
+    // Wait for all threads to finish setup before starting the clock.
+    ready.wait();
+    auto start = Clock::now();
+    go.count_down();
+
+    int duration_s = benchDurationSeconds();
+    std::this_thread::sleep_for(std::chrono::seconds(duration_s));
+    running.store(false, std::memory_order_relaxed);
+
+    for (auto& t : threads) t.join();
+    auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        Clock::now() - start).count();
+
+    int64_t ops_total = total_ops.load(std::memory_order_relaxed);
+    double throughput = (elapsed_us > 0)
+        ? ops_total * 1'000'000.0 / elapsed_us : 0.0;
+    double speedup = (baseline_throughput > 0)
+        ? throughput / baseline_throughput : 1.0;
+
+    return {num_threads, concurrency_per_thread,
+            ops_total,
+            static_cast<double>(elapsed_us) / 1'000'000.0,
+            throughput, speedup};
+}
+
+inline std::string formatThroughputTable(
+        const std::string& title, int num_threads,
+        const std::vector<ThroughputResult>& results)
+{
+    int duration_s = benchDurationSeconds();
+    std::ostringstream out;
+    auto bar = std::string(64, '=');
+    out << "\n  " << bar << "\n"
+        << "  " << title << "\n"
+        << "  " << bar << "\n"
+        << "  threads:        " << num_threads
+        << "  (BENCH_THREADS to override; default = hw_conc/2)\n"
+        << "  duration:       " << duration_s << ".0s\n"
+        << "\n"
+        << "  " << std::left << std::setw(22) << "workers (T x N)"
+        << std::setw(16) << "throughput"
+        << "speedup\n"
+        << "  " << std::string(22, '-') << std::string(16, '-')
+        << std::string(10, '-') << "\n";
+
+    for (const auto& r : results) {
+        std::ostringstream conc;
+        conc << r.threads << " x " << r.concurrency_per_thread
+             << " = " << (r.threads * r.concurrency_per_thread);
+        out << "  " << std::left << std::setw(22) << conc.str()
+            << std::setw(16) << fmtOps(r.throughput)
+            << std::fixed << std::setprecision(2) << r.speedup << "x\n";
+    }
+
+    out << "  " << bar;
+    return out.str();
+}
+
 #if RELAIS_ENABLE_METRICS
 inline std::string formatSweepMetrics() {
     auto& sc = jcailloux::relais::cache::GDSFPolicy::instance().sweepCounters();
