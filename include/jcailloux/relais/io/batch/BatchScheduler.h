@@ -162,6 +162,23 @@ private:
     // Internal data structures
     // =========================================================================
 
+    // -----------------------------------------------------------------------
+    // Entry lifetime
+    // -----------------------------------------------------------------------
+    // Entries are heap-allocated (unique_ptr) by their awaiter, transferred
+    // to the batch on await_suspend, and deleted *after* their continuation
+    // resumes (the awaiter's destructor cleans up via reclaim).
+    //
+    // cancelled  : set by awaiter's destructor when the caller coroutine is
+    //              destroyed before await_resume runs. The fire-functions
+    //              skip resume and delete the entry instead.
+    // error      : set by fire-functions when the pipeline as a whole fails
+    //              (or a per-segment exception was caught). Rethrown by
+    //              await_resume so callers see a proper exception, not a
+    //              silently-empty PgResult.
+    // followers  : peer entries coalesced onto this one (identical SQL +
+    //              params). They share leader's result/error on completion.
+
     struct PgReadEntry {
         const char* batch_sql = nullptr;   // ANY batch SQL (null if not entity)
         const char* single_sql = nullptr;  // Single-row / list SQL
@@ -175,6 +192,11 @@ private:
 
         // Key values for ANY-batch result matching (populated before ANY send)
         std::vector<std::string> key_values;
+
+        // Lifecycle / error / coalescing
+        bool cancelled = false;
+        std::exception_ptr error;
+        std::vector<PgReadEntry*> followers;  // coalesced peers
     };
 
     struct PgWriteEntry {
@@ -187,6 +209,10 @@ private:
         int64_t processing_time_us = 0;
         bool coalesced = false;
         std::vector<PgWriteEntry*> followers;
+
+        // Lifecycle / error
+        bool cancelled = false;
+        std::exception_ptr error;
     };
 
     struct RedisEntry {
@@ -194,6 +220,10 @@ private:
 
         std::coroutine_handle<> continuation{};
         RedisResult result;
+
+        // Lifecycle / error
+        bool cancelled = false;
+        std::exception_ptr error;
     };
 
     struct PgReadBatch {
@@ -257,19 +287,53 @@ private:
     // Submit helpers — add entry to batch, schedule departure
     // =========================================================================
 
+    // -----------------------------------------------------------------------
+    // Awaiters
+    //
+    // Each awaiter owns its Entry on the heap (unique_ptr) until await_suspend
+    // transfers ownership to the batch. On normal completion (await_resume
+    // runs), we reclaim ownership via unique_ptr and delete after extracting
+    // the result. On cancellation (caller coroutine destroyed before
+    // await_resume), the destructor flags `cancelled` so the fire-function
+    // detects and deletes the entry instead of resuming a dead continuation.
+    // -----------------------------------------------------------------------
+
     struct PgReadAwaiter {
         BatchScheduler* self;
-        PgReadEntry entry;
+        std::unique_ptr<PgReadEntry> entry_owner;
+        PgReadEntry* entry_ptr;
+        bool resumed = false;
+
+        PgReadAwaiter(BatchScheduler* s, PgReadEntry e)
+            : self(s)
+            , entry_owner(std::make_unique<PgReadEntry>(std::move(e)))
+            , entry_ptr(entry_owner.get()) {}
+
+        PgReadAwaiter(const PgReadAwaiter&) = delete;
+        PgReadAwaiter(PgReadAwaiter&&) = delete;
 
         bool await_ready() const noexcept { return false; }
 
         void await_suspend(std::coroutine_handle<> h) {
-            entry.continuation = h;
-            self->addToPgReadBatch(&entry);
+            entry_ptr->continuation = h;
+            self->addToPgReadBatch(entry_owner.release());
         }
 
         PgResult await_resume() {
-            return std::move(entry.result);
+            resumed = true;
+            std::unique_ptr<PgReadEntry> entry(entry_ptr);
+            if (entry->error) std::rethrow_exception(entry->error);
+            return std::move(entry->result);
+        }
+
+        ~PgReadAwaiter() {
+            // Three exit paths:
+            //   1. never suspended → entry_owner still holds → unique_ptr cleans up
+            //   2. resumed normally → entry_owner already released, await_resume deleted
+            //   3. cancelled mid-await → entry still owned by batch → mark cancelled
+            if (entry_owner)   return;            // (1)
+            if (resumed)       return;            // (2)
+            entry_ptr->cancelled = true;          // (3)
         }
     };
 
@@ -300,17 +364,36 @@ private:
 
     struct PgWriteAwaiter {
         BatchScheduler* self;
-        PgWriteEntry entry;
+        std::unique_ptr<PgWriteEntry> entry_owner;
+        PgWriteEntry* entry_ptr;
+        bool resumed = false;
+
+        PgWriteAwaiter(BatchScheduler* s, PgWriteEntry e)
+            : self(s)
+            , entry_owner(std::make_unique<PgWriteEntry>(std::move(e)))
+            , entry_ptr(entry_owner.get()) {}
+
+        PgWriteAwaiter(const PgWriteAwaiter&) = delete;
+        PgWriteAwaiter(PgWriteAwaiter&&) = delete;
 
         bool await_ready() const noexcept { return false; }
 
         void await_suspend(std::coroutine_handle<> h) {
-            entry.continuation = h;
-            self->addToPgWriteBatch(&entry);
+            entry_ptr->continuation = h;
+            self->addToPgWriteBatch(entry_owner.release());
         }
 
         WriteResult await_resume() {
-            return {std::move(entry.result), entry.coalesced};
+            resumed = true;
+            std::unique_ptr<PgWriteEntry> entry(entry_ptr);
+            if (entry->error) std::rethrow_exception(entry->error);
+            return {std::move(entry->result), entry->coalesced};
+        }
+
+        ~PgWriteAwaiter() {
+            if (entry_owner)   return;
+            if (resumed)       return;
+            entry_ptr->cancelled = true;
         }
     };
 
@@ -342,17 +425,36 @@ private:
 
     struct RedisAwaiter {
         BatchScheduler* self;
-        RedisEntry entry;
+        std::unique_ptr<RedisEntry> entry_owner;
+        RedisEntry* entry_ptr;
+        bool resumed = false;
+
+        RedisAwaiter(BatchScheduler* s, RedisEntry e)
+            : self(s)
+            , entry_owner(std::make_unique<RedisEntry>(std::move(e)))
+            , entry_ptr(entry_owner.get()) {}
+
+        RedisAwaiter(const RedisAwaiter&) = delete;
+        RedisAwaiter(RedisAwaiter&&) = delete;
 
         bool await_ready() const noexcept { return false; }
 
         void await_suspend(std::coroutine_handle<> h) {
-            entry.continuation = h;
-            self->addToRedisBatch(&entry);
+            entry_ptr->continuation = h;
+            self->addToRedisBatch(entry_owner.release());
         }
 
         RedisResult await_resume() {
-            return std::move(entry.result);
+            resumed = true;
+            std::unique_ptr<RedisEntry> entry(entry_ptr);
+            if (entry->error) std::rethrow_exception(entry->error);
+            return std::move(entry->result);
+        }
+
+        ~RedisAwaiter() {
+            if (entry_owner)   return;
+            if (resumed)       return;
+            entry_ptr->cancelled = true;
         }
     };
 
@@ -390,6 +492,21 @@ private:
     // =========================================================================
 
     void addToPgReadBatch(PgReadEntry* entry) {
+        // Coalescing: identical reads share the leader's result. Two reads
+        // coalesce iff same SQL (both batch_sql and single_sql pointers) and
+        // identical params. Applies to query reads and entity reads with the
+        // same PK — saves a duplicate row fetch when N coroutines request
+        // the same key concurrently.
+        for (auto* existing : pg_read_batch_.entries) {
+            if (existing->batch_sql == entry->batch_sql &&
+                existing->single_sql == entry->single_sql &&
+                existing->params == entry->params)
+            {
+                existing->followers.push_back(entry);
+                return;
+            }
+        }
+
         double entry_cost = estimator_.getRequestTime(
             entry->batch_sql ? entry->batch_sql : entry->single_sql);
 
@@ -642,21 +759,32 @@ private:
 
             conn.exitPipelineMode();
 
-            // Distribute results to waiters
+            // Distribute results to waiters (+ propagate to coalesced followers)
             for (size_t i = 0; i < segments.size(); ++i) {
                 auto& seg = segments[i];
                 auto& pr = results[i];
 
                 if (!seg.is_any) {
-                    // Non-ANY segment: single waiter gets full result
+                    // Non-ANY segment: typically one waiter, plus its followers.
                     for (auto* waiter : seg.waiters) {
-                        waiter->result = std::move(pr.result);
+                        waiter->result = pr.result;  // shared_ptr copy — keep pr.result usable for followers
                         waiter->processing_time_us = pr.processing_time_us;
+                        for (auto* f : waiter->followers) {
+                            f->result = pr.result;
+                            f->processing_time_us = pr.processing_time_us;
+                        }
                     }
                 } else {
-                    // ANY segment: match result rows to waiters by PK values
+                    // ANY segment: match result rows to waiters by PK values.
                     distributeAnyResults(seg.waiters, pr.result,
                                          pr.processing_time_us);
+                    // Propagate each waiter's matched slice to its followers.
+                    for (auto* waiter : seg.waiters) {
+                        for (auto* f : waiter->followers) {
+                            f->result = waiter->result;
+                            f->processing_time_us = waiter->processing_time_us;
+                        }
+                    }
 
                     // Update timing estimator for per-key cost
                     if (!seg.waiters.empty()) {
@@ -679,23 +807,42 @@ private:
             }
 
         } catch (...) {
-            // On error, try to exit pipeline mode gracefully
+            // On pipeline-wide failure, propagate exception to ALL waiters
+            // (leaders + coalesced followers) so callers see a real error
+            // instead of a silently-empty PgResult.
+            auto eptr = std::current_exception();
             try { conn.exitPipelineMode(); } catch (...) {}
-
-            // Resume all waiters with empty results
             for (auto* e : entries) {
-                e->result = PgResult{};
+                e->error = eptr;
+                for (auto* f : e->followers) f->error = eptr;
             }
         }
 
         gate_.release();
 
-        // Resume all waiting coroutines
+        // Collect handles BEFORE resuming any — resuming a leader can destroy
+        // its coroutine frame (symmetric transfer), invalidating followers
+        // pointers on the leader's entry. Cancelled entries are deleted here
+        // since their continuation will never run.
+        std::vector<std::coroutine_handle<>> to_resume;
+        std::vector<PgReadEntry*> to_delete;
+        to_resume.reserve(entries.size() * 2);
         for (auto* e : entries) {
-            if (e->continuation) {
-                e->continuation.resume();
+            if (e->cancelled) {
+                to_delete.push_back(e);
+            } else if (e->continuation) {
+                to_resume.push_back(e->continuation);
+            }
+            for (auto* f : e->followers) {
+                if (f->cancelled) {
+                    to_delete.push_back(f);
+                } else if (f->continuation) {
+                    to_resume.push_back(f->continuation);
+                }
             }
         }
+        for (auto h : to_resume) h.resume();
+        for (auto* e : to_delete) delete e;
 
         // Chain: fire next accumulated batch or clear inflight
         if (!pg_read_batch_.entries.empty()) {
@@ -754,12 +901,12 @@ private:
             }
 
         } catch (...) {
+            // Propagate exception to all waiters instead of silent PgResult{}.
+            auto eptr = std::current_exception();
             try { conn.exitPipelineMode(); } catch (...) {}
             for (auto* e : entries) {
-                e->result = PgResult{};
-                for (auto* f : e->followers) {
-                    f->result = PgResult{};
-                }
+                e->error = eptr;
+                for (auto* f : e->followers) f->error = eptr;
             }
         }
 
@@ -768,17 +915,27 @@ private:
         // Collect all continuation handles BEFORE resuming any.
         // Resuming a leader can destroy its coroutine frame (symmetric
         // transfer chain), which would make e->followers a dangling pointer.
+        // Cancelled entries are deleted here since their continuation will
+        // never run.
         std::vector<std::coroutine_handle<>> to_resume;
+        std::vector<PgWriteEntry*> to_delete;
         to_resume.reserve(entries.size() * 2);
         for (auto* e : entries) {
-            if (e->continuation) to_resume.push_back(e->continuation);
+            if (e->cancelled) {
+                to_delete.push_back(e);
+            } else if (e->continuation) {
+                to_resume.push_back(e->continuation);
+            }
             for (auto* f : e->followers) {
-                if (f->continuation) to_resume.push_back(f->continuation);
+                if (f->cancelled) {
+                    to_delete.push_back(f);
+                } else if (f->continuation) {
+                    to_resume.push_back(f->continuation);
+                }
             }
         }
-        for (auto h : to_resume) {
-            h.resume();
-        }
+        for (auto h : to_resume) h.resume();
+        for (auto* e : to_delete) delete e;
 
         // Chain: fire next accumulated batch or clear inflight
         if (!pg_write_batch_.entries.empty()) {
@@ -842,18 +999,31 @@ private:
                 estimator_.updateRedisNetworkTime(elapsed_ns);
 
         } catch (...) {
+            // Propagate exception to all waiters instead of silent RedisResult{}.
+            auto eptr = std::current_exception();
             for (auto* e : entries) {
-                e->result = RedisResult{};
+                e->error = eptr;
             }
         }
 
         gate_.release();
 
+        // Collect handles BEFORE resuming any — symmetric transfer can destroy
+        // the resumed coroutine's frame, and we'd be iterating `entries` after
+        // the entry pointer has been deleted (await_resume reclaims via
+        // unique_ptr). Cancelled entries are deleted here.
+        std::vector<std::coroutine_handle<>> to_resume;
+        std::vector<RedisEntry*> to_delete;
+        to_resume.reserve(entries.size());
         for (auto* e : entries) {
-            if (e->continuation) {
-                e->continuation.resume();
+            if (e->cancelled) {
+                to_delete.push_back(e);
+            } else if (e->continuation) {
+                to_resume.push_back(e->continuation);
             }
         }
+        for (auto h : to_resume) h.resume();
+        for (auto* e : to_delete) delete e;
 
         // Chain: fire next accumulated batch or clear inflight
         if (!redis_batch_.entries.empty()) {
