@@ -297,12 +297,12 @@ template<typename... Dependencies>
 struct InvalidateOn {
     template<typename E>
     static io::Task<void> propagate(const E& entity) {
-        (co_await Dependencies::template invalidate(entity), ...);
+        (co_await Dependencies::template invalidate<E>(entity), ...);
     }
 
     template<typename E>
     static io::Task<void> propagateWithData(const InvalidationData<E>& data) {
-        (co_await Dependencies::template invalidateWithData(data), ...);
+        (co_await Dependencies::template invalidateWithData<E>(data), ...);
     }
 };
 
@@ -325,7 +325,7 @@ struct InvalidateOn<> {
 
 template<typename E, typename InvalidatesType>
 io::Task<void> propagateInvalidationsWithData(const InvalidationData<E>& data) {
-    co_await InvalidatesType::template propagateWithData(data);
+    co_await InvalidatesType::template propagateWithData<E>(data);
 }
 
 template<typename E, typename InvalidatesType>
