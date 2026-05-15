@@ -44,10 +44,17 @@ struct TestInternals {
         return std::remove_reference_t<decltype(Repo::listCache())>::ChunkCount;
     }
 
-    /// Force a modification tracker cleanup cycle (partial, one chunk via global sweep).
+    /// Drain every chunk bit of the modification tracker for `Repo`.
+    /// Deterministic: bypasses the global GDSF sweep cursor and sweep_flag_
+    /// — does not interfere with background sweep threads.
+    /// After this call, every modification with generation <= cutoff_gen is removed.
     template<typename Repo>
-    static void forceModificationTrackerCleanup() {
-        jcailloux::relais::cache::GDSFPolicy::instance().sweep();
+    static void drainAllModificationChunks(uint32_t cutoff_gen) {
+        using Cache = std::remove_reference_t<decltype(Repo::listCache())>;
+        auto& tracker = Repo::listCache().modifications_;
+        for (uint8_t c = 0; c < Cache::ChunkCount; ++c) {
+            tracker.drainChunk(cutoff_gen, c);
+        }
     }
 
     /// Full cleanup of list cache only (entity cache untouched).

@@ -499,51 +499,50 @@ TEST_CASE("[DeclListRepo] ModificationTracker cleanup",
         insertTestArticle("tech", alice_id, "cleanup_" + std::to_string(vc), vc);
     }
 
-    SECTION("[tracker-cleanup] old modifications are removed after enough cleanup cycles") {
+    SECTION("[tracker-cleanup] modifications are removed after draining all chunks") {
         // Build entity manually (no DB round-trip needed for notification)
         auto entity1 = makeArticle(9001, "tech", alice_id, "cleanup_new", 35);
         TestArticleListRepo::notifyCreated(entity1);
         CHECK(TestInternals::pendingModificationCount<TestArticleListRepo>() == 1);
 
-        // ModificationTracker uses a bitmap with ShardCount bits (one per shard).
-        // Each cleanup cycle clears one shard's bit. After ShardCount cycles,
-        // all bits are cleared → bitmap=0 → modification removed.
-        constexpr auto N = TestInternals::listCacheChunkCount<TestArticleListRepo>();
-        for (size_t i = 0; i < N; ++i) {
-            TestInternals::forceModificationTrackerCleanup<TestArticleListRepo>();
-        }
+        // ModificationTracker uses a bitmap with ChunkCount bits (one per chunk).
+        // Draining every chunk clears the bitmap → modification removed.
+        auto cutoff = TestInternals::listCacheGeneration<TestArticleListRepo>();
+        TestInternals::drainAllModificationChunks<TestArticleListRepo>(cutoff);
 
         CHECK(TestInternals::pendingModificationCount<TestArticleListRepo>() == 0);
     }
 
-    SECTION("[tracker-cleanup] recent modifications survive cleanup") {
+    SECTION("[tracker-cleanup] recent modifications survive partial drain") {
         constexpr auto N = TestInternals::listCacheChunkCount<TestArticleListRepo>();
 
         // Build entities manually
         auto entity1 = makeArticle(9001, "tech", alice_id, "cleanup_a", 15);
         TestArticleListRepo::notifyCreated(entity1);
+        auto cutoff1 = TestInternals::listCacheGeneration<TestArticleListRepo>();
         CHECK(TestInternals::pendingModificationCount<TestArticleListRepo>() == 1);
 
-        // Run 1 cleanup cycle
-        TestInternals::forceModificationTrackerCleanup<TestArticleListRepo>();
-        CHECK(TestInternals::pendingModificationCount<TestArticleListRepo>() == 1);  // Still there
+        // Drain chunk 0 → entity1 has N-1 bits remaining
+        TestInternals::cleanupModificationsWithCutoff<TestArticleListRepo>(cutoff1, 0);
+        CHECK(TestInternals::pendingModificationCount<TestArticleListRepo>() == 1);
 
         // Notify second creation
         auto entity2 = makeArticle(9002, "tech", alice_id, "cleanup_b", 25);
         TestArticleListRepo::notifyCreated(entity2);
+        auto cutoff2 = TestInternals::listCacheGeneration<TestArticleListRepo>();
         CHECK(TestInternals::pendingModificationCount<TestArticleListRepo>() == 2);
 
-        // Run N-1 more cycles — entity1 has seen N total shards, entity2 has seen N-1
-        for (size_t i = 0; i < N - 1; ++i) {
-            TestInternals::forceModificationTrackerCleanup<TestArticleListRepo>();
+        // Drain chunks 1..N-1 with cutoff2 → affects both entity1 and entity2
+        for (uint8_t c = 1; c < N; ++c) {
+            TestInternals::cleanupModificationsWithCutoff<TestArticleListRepo>(cutoff2, c);
         }
 
-        // entity1: 1 + (N-1) = N bits cleared → bitmap=0 → REMOVED
-        // entity2: 0 + (N-1) = N-1 bits cleared → 1 bit remaining → KEPT
+        // entity1: chunks 0,1,...,N-1 all cleared → bitmap=0 → REMOVED
+        // entity2: chunks 1,...,N-1 cleared (N-1 bits), chunk 0 still set → KEPT
         CHECK(TestInternals::pendingModificationCount<TestArticleListRepo>() == 1);
 
-        // One more cycle removes entity2
-        TestInternals::forceModificationTrackerCleanup<TestArticleListRepo>();
+        // Drain chunk 0 with cutoff2 → entity2 removed
+        TestInternals::cleanupModificationsWithCutoff<TestArticleListRepo>(cutoff2, 0);
         CHECK(TestInternals::pendingModificationCount<TestArticleListRepo>() == 0);
     }
 
