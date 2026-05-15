@@ -628,7 +628,15 @@ private:
                 }
             }
 
-            if (!policy.isOverBudget(est_bytes)) {
+            // Admission gate: anticipated score after next decay must clear
+            // the current eviction threshold (i.e. the entry would survive
+            // the next sweep), and the heap must have room. Otherwise we
+            // ghost — fresh candidates start tracked but unmaterialized.
+            float avg_cost = avg_cost_us_.load(std::memory_order_relaxed);
+            float score = static_cast<float>(count) * policy.decayRate() * avg_cost / static_cast<float>(std::max(est_bytes, uint32_t{1}));
+            bool qualifies = score >= policy.threshold();
+
+            if (qualifies && !policy.isOverBudget(est_bytes)) {
                 // === CACHE (or PROMOTE from ghost) ===
                 policy.tickInsertion();
                 policy.recordAdmission(est_bytes);
@@ -644,20 +652,12 @@ private:
                 // === GHOST (create or keep) ===
                 if (!has_ghost) {
                     // New ghost: first appearance — always tick (maintenance).
-                    map_.insert_ghost(key, GDSFScoreData::kCountScale,
-                                     est_bytes, est_flags);
+                    map_.insert_ghost(key, count, est_bytes, est_flags);
                     policy.tickInsertion();
-                } else {
-                    // Existing ghost re-accessed: tick only if its score
-                    // would survive the current eviction threshold — signals
-                    // genuine demand for cache space.
-                    float avg_cost = avg_cost_us_.load(std::memory_order_relaxed);
-                    float score = static_cast<float>(count) * policy.decayRate()
-                        * avg_cost
-                        / static_cast<float>(std::max(est_bytes, uint32_t{1}));
-                    if (score >= policy.threshold()) {
-                        policy.tickInsertion();
-                    }
+                } else if (qualifies) {
+                    // Existing ghost re-accessed and qualified, but no room:
+                    // tick to signal genuine demand for cache space.
+                    policy.tickInsertion();
                 }
                 // Return via transient pool
                 auto guard = epoch::EpochGuard::acquire();
