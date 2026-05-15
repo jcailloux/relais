@@ -79,6 +79,39 @@ public:
 
     // Execute with pre-built argv
 
+    /// Descriptor for a single command in a pipeline (non-owning).
+    struct PipelineCmd {
+        int argc;
+        const char** argv;
+        const size_t* argvlen;
+    };
+
+    /// Execute N commands as a single pipeline.
+    /// Acquires the lock once, queues all commands, flushes once, reads N results.
+    Task<std::vector<RedisResult>> pipelineExec(const PipelineCmd* cmds, int count) {
+        co_await acquireLock();
+
+        std::vector<RedisResult> results;
+        results.reserve(count);
+
+        try {
+            for (int i = 0; i < count; ++i)
+                conn_.queueCommand(cmds[i].argc, cmds[i].argv, cmds[i].argvlen);
+
+            co_await conn_.flushPipeline();
+
+            auto parsers = co_await conn_.readPipelineResults(count);
+            for (auto& p : parsers)
+                results.emplace_back(std::move(p));
+        } catch (...) {
+            releaseLock();
+            throw;
+        }
+
+        releaseLock();
+        co_return results;
+    }
+
     Task<RedisResult> execArgv(int argc, const char** argv, const size_t* argvlen) {
         // Serialize access: wait if another command is in progress
         co_await acquireLock();

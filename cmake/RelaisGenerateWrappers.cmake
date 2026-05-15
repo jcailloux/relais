@@ -3,7 +3,7 @@ RelaisGenerateWrappers
 ----------------------
 
 Provides the ``relais_generate_wrappers()`` function for generating
-EntityWrapper headers from ``@relais``-annotated C++ structs.
+Entity headers from ``@relais``-annotated C++ structs.
 
 Usage::
 
@@ -52,7 +52,7 @@ function(relais_generate_wrappers)
             --sources ${_abs_sources}
             --output-dir ${_abs_output}
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-        COMMENT "Generating entity wrappers from @relais annotations"
+        COMMENT "Generating entity mappings from @relais annotations"
         VERBATIM
     )
 endfunction()

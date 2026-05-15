@@ -64,13 +64,20 @@ public:
     explicit PgResult(PGresult* result) noexcept
         : result_(result, &PQclear) {}
 
+    /// Construct from a shared_ptr (for pipeline coalescing — multiple waiters
+    /// can share the same PGresult without copying).
+    explicit PgResult(std::shared_ptr<PGresult> shared) noexcept
+        : result_(std::move(shared)) {}
+
     [[nodiscard]] bool valid() const noexcept { return result_ != nullptr; }
     [[nodiscard]] bool empty() const noexcept { return rows() == 0; }
 
     // Dimensions
 
     [[nodiscard]] int rows() const noexcept {
-        return result_ ? PQntuples(result_.get()) : 0;
+        if (!result_) return 0;
+        if (is_slice_) return 1;
+        return PQntuples(result_.get());
     }
 
     // Status
@@ -80,6 +87,12 @@ public:
         auto s = PQresultStatus(result_.get());
         return s == PGRES_TUPLES_OK || s == PGRES_COMMAND_OK
             || s == PGRES_SINGLE_TUPLE;
+    }
+
+    /// Check if this result represents a pipeline aborted state.
+    [[nodiscard]] bool pipelineAborted() const noexcept {
+        if (!result_) return false;
+        return PQresultStatus(result_.get()) == PGRES_PIPELINE_ABORTED;
     }
 
     /// Number of rows affected by INSERT/UPDATE/DELETE.
@@ -92,15 +105,39 @@ public:
     // Row access
 
     [[nodiscard]] Row operator[](int row) const noexcept {
-        return Row(*this, row);
+        return Row(*this, is_slice_ ? row_offset_ : row);
     }
 
     // Raw access (used internally by Row)
 
     [[nodiscard]] PGresult* raw() const noexcept { return result_.get(); }
 
+    /// Get the underlying shared_ptr (for pipeline coalescing).
+    [[nodiscard]] const std::shared_ptr<PGresult>& shared() const noexcept {
+        return result_;
+    }
+
+    /// Number of columns in the result.
+    [[nodiscard]] int cols() const noexcept {
+        return result_ ? PQnfields(result_.get()) : 0;
+    }
+
+    /// Create a single-row view sharing the same PGresult.
+    /// The returned PgResult shares ownership of the underlying PGresult
+    /// but presents a view offset to the given row index.
+    /// This enables zero-copy distribution of ANY-batch results.
+    static PgResult sliceRow(const PgResult& batch, int row_index) {
+        PgResult r;
+        r.result_ = batch.result_;
+        r.row_offset_ = row_index;
+        r.is_slice_ = true;
+        return r;
+    }
+
 private:
-    std::unique_ptr<PGresult, decltype(&PQclear)> result_{nullptr, &PQclear};
+    std::shared_ptr<PGresult> result_{nullptr, &PQclear};
+    int row_offset_ = 0;   // for sliceRow views
+    bool is_slice_ = false;
 };
 
 // Type specializations for Row::get<T>
@@ -119,7 +156,9 @@ template<>
 inline int32_t PgResult::Row::get<int32_t>(int col) const {
     auto sv = rawValue(col);
     int32_t val = 0;
-    std::from_chars(sv.data(), sv.data() + sv.size(), val);
+    auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), val);
+    if (ec != std::errc{}) [[unlikely]]
+        throw PgError("from_chars failed for int32 column " + std::to_string(col));
     return val;
 }
 
@@ -127,7 +166,9 @@ template<>
 inline int64_t PgResult::Row::get<int64_t>(int col) const {
     auto sv = rawValue(col);
     int64_t val = 0;
-    std::from_chars(sv.data(), sv.data() + sv.size(), val);
+    auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), val);
+    if (ec != std::errc{}) [[unlikely]]
+        throw PgError("from_chars failed for int64 column " + std::to_string(col));
     return val;
 }
 
@@ -135,7 +176,9 @@ template<>
 inline double PgResult::Row::get<double>(int col) const {
     auto sv = rawValue(col);
     double val = 0;
-    std::from_chars(sv.data(), sv.data() + sv.size(), val);
+    auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), val);
+    if (ec != std::errc{}) [[unlikely]]
+        throw PgError("from_chars failed for double column " + std::to_string(col));
     return val;
 }
 

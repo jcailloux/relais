@@ -9,8 +9,8 @@ A header-only C++23 repository pattern library with integrated multi-tier cachin
 - **Zero boilerplate**: One `using` alias per repository, auto-assembled from template parameters
 - **CacheConfig NTTP**: Compile-time configuration via structural aggregate with `consteval` fluent chaining
 - **Configurable**: Choose caching strategy per repository (none, L1, L2, or both) via presets
-- **Wrapper-centric design**: Repositories work only with immutable wrappers (`WrapperPtr = shared_ptr<const Entity>`)
-- **Struct-based entities**: Pure C++ structs with `EntityWrapper<Struct, Mapping>` adding ORM + serialization at the API layer
+- **Entity-centric design**: Repositories work only with immutable entities (`EntityPtr = shared_ptr<const Entity>`)
+- **Struct-based entities**: Pure C++ structs with `Entity<Struct, Mapping>` adding ORM + serialization at the API layer
 - **ORM decoupled**: Entity structs are framework-agnostic and can be shared across projects
 - **Auto-detected list caching**: ListMixin activates when the entity's Mapping has an embedded `ListDescriptor`
 - **Smart invalidation**: Cross-cache dependency propagation via variadic `Invalidations...` pack
@@ -64,12 +64,12 @@ target_link_libraries(my_app PRIVATE jcailloux::relais)
 
 ### 1. Define your entity
 
-Entities are pure C++ structs with `@relais` inline annotations. The Python generator reads these annotations and produces a standalone Mapping struct. At the API layer, `EntityWrapper<Struct, Mapping>` combines the struct with its ORM mapping and provides thread-safe lazy serialization.
+Entities are pure C++ structs with `@relais` inline annotations. The Python generator reads these annotations and produces a standalone Mapping struct. At the API layer, `Entity<Struct, Mapping>` combines the struct with its ORM mapping and provides thread-safe lazy serialization.
 
 ```cpp
 // 1. Pure data struct (framework-agnostic, shareable)
 // @relais table=users
-// @relais output=entities/generated/UserWrapper.h
+// @relais output=entities/generated/UserEntity.h
 struct User {
     int64_t id = 0;    // @relais primary_key db_managed
     std::string username;
@@ -95,9 +95,9 @@ template<> struct glz::meta<User> {
 //    - glaze_value (fallback Glaze metadata)
 //    - ListDescriptor (if filterable/sortable annotations present)
 
-// 3. EntityWrapper alias (generated):
-using UserWrapper = jcailloux::relais::wrapper::EntityWrapper<User, generated::UserMapping>;
-// UserWrapper inherits from User and adds:
+// 3. Entity alias (generated):
+using UserEntity = jcailloux::relais::Entity<User, generated::UserMapping>;
+// UserEntity inherits from User and adds:
 // - fromRow/toInsertParams (delegated to Mapping)
 // - binary/json (thread-safe lazy BEVE/JSON via Glaze)
 // - key
@@ -112,28 +112,28 @@ namespace relais = jcailloux::relais;
 namespace config = relais::config;
 
 // Simple — L1 RAM cache (default)
-using UserRepo = relais::Repo<UserWrapper, "User">;
+using UserRepo = relais::Repo<UserEntity, "User">;
 
 // Custom cache preset
-using MetricsRepo = relais::Repo<MetricsWrapper, "Metrics", config::Both>;
+using MetricsRepo = relais::Repo<MetricsEntity, "Metrics", config::Both>;
 
 // Customized preset with fluent chaining
 using SessionRepo = relais::Repo<
-    SessionWrapper, "Session",
+    SessionEntity, "Session",
     config::Local.with_l1_ttl(std::chrono::minutes{30}).with_read_only()>;
 
 // With cross-invalidation
 using PurchaseRepo = relais::Repo<
-    PurchaseWrapper, "Purchase", config::Local,
+    PurchaseEntity, "Purchase", config::Local,
     cache::Invalidate<UserStatsRepo, &Purchase::user_id>>;
 ```
 
 **Inherited methods:**
-- `find(id)` — `Task<WrapperPtr>` (cached)
+- `find(id)` — `Task<EntityPtr>` (cached)
 - `findJson(id)` — `Task<shared_ptr<const string>>`
-- `insert(wrapper)` — `Task<WrapperPtr>` (requires `!read_only`)
+- `insert(entity)` — `Task<EntityPtr>` (requires `!read_only`)
 - `update(id, wrapper)` — `Task<bool>` (requires `!read_only`)
-- `patch(id, set<F>(v)...)` — `Task<WrapperPtr>` (requires `HasFieldUpdate`)
+- `patch(id, set<F>(v)...)` — `Task<EntityPtr>` (requires `HasFieldUpdate`)
 - `erase(id)` — `Task<optional<size_t>>` (requires `!read_only`)
 - `invalidate(id)` — `Task<void>`
 
@@ -146,7 +146,7 @@ If the entity has an embedded `ListDescriptor` (from `filterable`/`sortable` ann
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `Entity` | type | — | `EntityWrapper<Struct, Mapping>` |
+| `Entity` | type | — | `Entity<Struct, Mapping>` |
 | `Name` | `FixedString` | — | Compile-time string literal (repository name, Redis key prefix) |
 | `Cfg` | `CacheConfig` | `config::Local` | NTTP aggregate configuring cache behavior |
 | `Invalidations...` | types | — | Variadic cross-invalidation descriptors |
@@ -159,7 +159,7 @@ For PostgreSQL partitioned tables with composite primary keys (e.g., `PRIMARY KE
 
 ```cpp
 // @relais table=events
-// @relais output=entities/generated/EventWrapper.h
+// @relais output=entities/generated/EventEntity.h
 struct Event {
     int64_t id = 0;         // @relais primary_key db_managed
     std::string region;     // @relais partition_key
@@ -175,13 +175,13 @@ The generator produces:
 The `HasPartitionKey` concept auto-detects these capabilities. At runtime, `erase(id)` uses an **opportunistic hint** pattern:
 
 ```
-CachedRepo::erase(id)
+LocalRepo::erase(id)
   |-- hint = L1 cache lookup (~0ns, free)
   v
 RedisRepo::eraseImpl(id, hint)
   |-- if no hint: try L2 Redis (~0.1ms)
   v
-BaseRepo::eraseImpl(id, hint)
+PgRepo::eraseImpl(id, hint)
   |-- if hint: DELETE ... WHERE id=$1 AND region=$2  → 1 partition
   |-- else:    DELETE ... WHERE id=$1                → N partitions
 ```
@@ -190,7 +190,7 @@ BaseRepo::eraseImpl(id, hint)
 
 ```cpp
 // Repo — no special configuration needed
-using EventRepo = relais::Repo<EventWrapper, "Event", config::Both>;
+using EventRepo = relais::Repo<EventEntity, "Event", config::Both>;
 // Key = int64_t (from key)
 // HasPartitionKey auto-detected from Mapping
 ```
@@ -206,25 +206,25 @@ io::Task<void> example() {
     }
 
     // insert (automatically caches result) - only if !read_only
-    UserWrapper newUser;
+    UserEntity newUser;
     newUser.username = "alice";
     newUser.email = "alice@example.com";
     auto created = co_await UserRepo::insert(
-        std::make_shared<const UserWrapper>(std::move(newUser)));
+        std::make_shared<const UserEntity>(std::move(newUser)));
 
     // Update - only if !read_only
-    UserWrapper modified = *created;
+    UserEntity modified = *created;
     modified.balance = 100;
     co_await UserRepo::update(created->id,
-        std::make_shared<const UserWrapper>(std::move(modified)));
+        std::make_shared<const UserEntity>(std::move(modified)));
 
     // Partial update - only modifies specified fields (requires generated entity with Field enum)
-    using F = UserWrapper::Field;
-    using jcailloux::relais::wrapper::set;
+    using F = UserEntity::Field;
+    using jcailloux::relais::entity::set;
     auto updated = co_await UserRepo::patch(created->id,
         set<F::balance>(999),
         set<F::username>("bob"));
-    // updated is a re-fetched WrapperPtr with all fields populated
+    // updated is a re-fetched EntityPtr with all fields populated
 
     // Delete - only if !read_only
     co_await UserRepo::erase(created->id);
@@ -268,7 +268,7 @@ struct glz::meta<Product> {
 };
 ```
 
-`EntityWrapper` automatically detects and uses `glz::meta<Struct>` when it exists. If no specialization is defined, the generated `Mapping::glaze_value` is used (member names as keys).
+`Entity` automatically detects and uses `glz::meta<Struct>` when it exists. If no specialization is defined, the generated `Mapping::glaze_value` is used (member names as keys).
 
 **Sharing the naming contract:** Since `glz::meta<Struct>` lives in the struct header (which is framework-agnostic), any C++ application that includes this header — whether the API or a BEVE consumer — uses the same field names. Both sides need matching `glz::meta` keys for BEVE interoperability.
 
@@ -333,7 +333,7 @@ inline constexpr auto ReadOnlyShort =
     config::Local.with_l1_ttl(std::chrono::minutes{5}).with_read_only();
 
 // Use directly as template argument
-using MyRepo = Repo<MyWrapper, "My", config::Local.with_l1_ttl(30min)>;
+using MyRepo = Repo<MyEntity, "My", config::Local.with_l1_ttl(30min)>;
 ```
 
 ## Read-Only Repositories
@@ -341,7 +341,7 @@ using MyRepo = Repo<MyWrapper, "My", config::Local.with_l1_ttl(30min)>;
 Mark repositories as read-only to disable modification operations at compile-time:
 
 ```cpp
-using AuditLogRepo = Repo<AuditLogWrapper, "AuditLog",
+using AuditLogRepo = Repo<AuditLogEntity, "AuditLog",
     config::Local.with_read_only()>;
 // find() — available
 // insert(), update(), erase() — COMPILE ERROR if called
@@ -349,7 +349,7 @@ using AuditLogRepo = Repo<AuditLogWrapper, "AuditLog",
 
 This is enforced via `requires` clauses:
 ```cpp
-static Task<bool> update(const Key& id, WrapperPtr wrapper)
+static Task<bool> update(const Key& id, EntityPtr entity)
     requires MutableEntity<Entity> && (!Cfg.read_only);
 ```
 
@@ -358,9 +358,9 @@ static Task<bool> update(const Key& id, WrapperPtr wrapper)
 Generated entities expose a `Field` enum for type-safe partial updates. Only the specified columns are written to the database (via dynamic `UPDATE ... SET` built from `FieldInfo::column_name`), and the full entity is re-fetched after the update.
 
 ```cpp
-using F = UserWrapper::Field;
-using jcailloux::relais::wrapper::set;
-using jcailloux::relais::wrapper::setNull;
+using F = UserEntity::Field;
+using jcailloux::relais::entity::set;
+using jcailloux::relais::entity::setNull;
 
 // Update a single field
 auto updated = co_await UserRepo::patch(id, set<F::balance>(999));
@@ -380,7 +380,7 @@ Requirements:
 - Hand-written entities without `TraitsType` do not support `patch` (the `HasFieldUpdate` concept gates availability)
 
 Cache handling:
-- **CachedRepo**: L1 is invalidated before the update
+- **LocalRepo**: L1 is invalidated before the update
 - **RedisRepo**: L2 is invalidated before the update
 - The re-fetched entity repopulates caches on subsequent `find` calls
 
@@ -402,7 +402,7 @@ Cross-invalidation is declared via the variadic `Invalidations...` pack on `Repo
 ### Declaring Dependencies
 
 ```cpp
-using PurchaseRepo = Repo<PurchaseWrapper, "Purchase", config::Local,
+using PurchaseRepo = Repo<PurchaseEntity, "Purchase", config::Local,
     cache::Invalidate<UserStatsRepo, &Purchase::user_id>,   // Table -> Table
     cache::InvalidateList<PurchaseListRepo>                  // Table -> List
 >;
@@ -434,7 +434,7 @@ struct UserToGuildsResolver {
     }
 };
 
-using UserRepo = Repo<UserWrapper, "User", config::Local,
+using UserRepo = Repo<UserEntity, "User", config::Local,
     cache::InvalidateVia<GuildDetailRepo, &User::user_id, &UserToGuildsResolver::resolve>
 >;
 ```
@@ -466,7 +466,7 @@ struct PurchaseToArticleResolver {
     }
 };
 
-using PurchaseRepo = Repo<PurchaseWrapper, "Purchase", config::Local,
+using PurchaseRepo = Repo<PurchaseEntity, "Purchase", config::Local,
     cache::InvalidateListVia<ArticleListRepo, &Purchase::user_id,
         &PurchaseToArticleResolver::resolve>
 >;
@@ -504,7 +504,7 @@ Annotate fields with `filterable` and `sortable` in the struct header. The gener
 
 ```cpp
 // @relais table=audit_logs
-// @relais output=entities/generated/AuditLogWrapper.h
+// @relais output=entities/generated/AuditLogEntity.h
 // @relais_list limits=10,25,50,100
 struct AuditLog {
     int64_t id = 0;            // @relais primary_key db_managed sortable:asc
@@ -530,7 +530,7 @@ struct AuditLog {
 
 ```cpp
 // Repo — one line, list support auto-detected
-using AuditLogRepo = Repo<AuditLogWrapper, "AuditLog">;
+using AuditLogRepo = Repo<AuditLogEntity, "AuditLog">;
 
 // In controller:
 #include <jcailloux/relais/list/decl/HttpQueryParser.h>
@@ -582,7 +582,7 @@ Annotations are inline comments on struct declarations and data members:
 
 ```cpp
 // @relais table=audit_logs
-// @relais output=entities/generated/AuditLogWrapper.h
+// @relais output=entities/generated/AuditLogEntity.h
 // @relais_list limits=10,25,50,100
 struct AuditLog {
     int64_t id = 0;            // @relais primary_key db_managed sortable:asc
@@ -596,7 +596,7 @@ struct AuditLog {
 | Annotation (struct-level) | Description |
 |--------------------------|-------------|
 | `table=table_name` | PostgreSQL table name |
-| `output=path/to/Wrapper.h` | Generated file path (relative to `--output-dir`) |
+| `output=path/to/Entity.h` | Generated file path (relative to `--output-dir`) |
 | `read_only` | Mark entity as read-only |
 
 | Annotation (field-level) | Description |
@@ -619,7 +619,7 @@ Filter and sort capabilities are declared per-field. Pagination limits stay at c
 
 ```cpp
 // @relais table=articles
-// @relais output=entities/generated/ArticleWrapper.h
+// @relais output=entities/generated/ArticleEntity.h
 // @relais_list limits=10,25,50
 struct Article {
     int64_t id = 0;            // @relais primary_key db_managed
@@ -659,14 +659,14 @@ Column names are derived automatically from the field name.
 
 ### Generated Output
 
-The generator produces standalone Mapping structs with template `fromRow<Entity>` / `toInsertParams<Entity>` / `key<Entity>` methods. These are used by `EntityWrapper<Struct, Mapping>`.
+The generator produces standalone Mapping structs with template `fromRow<Entity>` / `toInsertParams<Entity>` / `key<Entity>` methods. These are used by `Entity<Struct, Mapping>`.
 
 For each entity:
 - **Mapping struct**: SQL strings, `TraitsType`, `FieldInfo` specializations, `glaze_value`
 - **Partition key entities** (`partition_key` annotation): `SQL::delete_by_full_pk` + `makeFullKeyParams()` for single-partition DELETE
 - **List entities**: Embedded `ListDescriptor` struct (filters, sorts, limits) inside the Mapping
-- **EntityWrapper alias**: `using XxxWrapper = EntityWrapper<Struct, Mapping>;`
-- **ListWrapper alias** (if list): `using XxxListWrapper = ListWrapper<XxxWrapper>;`
+- **Entity alias**: `using XxxEntity = Entity<Struct, Mapping>;`
+- **ListWrapper alias** (if list): `using XxxListWrapper = ListWrapper<XxxEntity>;`
 
 ### Usage
 
@@ -684,17 +684,17 @@ python scripts/generate_entities.py --files src/entities/User.h --output-dir src
 
 | Method | Return Type | Constraint | Description |
 |--------|-------------|------------|-------------|
-| `find(id)` | `Task<WrapperPtr>` | - | Find by primary key (cached) |
+| `find(id)` | `Task<EntityPtr>` | - | Find by primary key (cached) |
 | `findJson(id)` | `Task<shared_ptr<const string>>` | - | Find and return JSON directly |
-| `insert(wrapper)` | `Task<WrapperPtr>` | `!read_only` | Insert and cache |
-| `update(id, wrapper)` | `Task<bool>` | `!read_only` | Full update and handle cache |
-| `patch(id, set<F>()...)` | `Task<WrapperPtr>` | `!read_only`, `HasFieldUpdate` | Partial update, re-fetches entity |
+| `insert(entity)` | `Task<EntityPtr>` | `!read_only` | Insert and cache |
+| `update(id, entity)` | `Task<bool>` | `!read_only` | Full update and handle cache |
+| `patch(id, set<F>()...)` | `Task<EntityPtr>` | `!read_only`, `HasFieldUpdate` | Partial update, re-fetches entity |
 | `erase(id)` | `Task<optional<size_t>>` | `!read_only` | Delete and invalidate cache |
 | `invalidate(id)` | `Task<void>` | - | Explicit cache invalidation |
 | `updateJson(id, json)` | `Task<bool>` | `!read_only` | Parse JSON and update |
 | `updateBinary(id, data)` | `Task<bool>` | `!read_only`, `HasBinarySerialization` | Parse binary and update |
 
-### CachedRepo Additional Methods
+### LocalRepo Additional Methods
 
 | Method | Description |
 |--------|-------------|
@@ -732,9 +732,9 @@ ctest --test-dir build --output-on-failure
 
 | File | Coverage |
 |------|----------|
-| `test_base_repository.cpp` | BaseRepo (L3): CRUD, edge cases, read-only, uncached list queries |
-| `test_redis_repository.cpp` | RedisRepo (L2): CRUD caching, cross-invalidation, list caching, selective Lua invalidation, InvalidateListVia |
-| `test_cached_repository.cpp` | CachedRepo (L1+L2): RAM cache, TTL, config variants |
+| `test_pg_repo.cpp` | PgRepo (L3): CRUD, edge cases, read-only, uncached list queries |
+| `test_redis_repo.cpp` | RedisRepo (L2): CRUD caching, cross-invalidation, list caching, selective Lua invalidation, InvalidateListVia |
+| `test_local_repo.cpp` | LocalRepo (L1+L2): RAM cache, TTL, config variants |
 | `test_decl_list_cache.cpp` | ListMixin: query/ItemView, SortBounds invalidation, ModificationTracker |
 | `test_partition_key.cpp` | Partition key repositories: composite PK, criteria-based patch, erase with cache hints, cross-invalidation |
 

@@ -7,7 +7,7 @@ This document describes the internal architecture of relais for contributors and
 The library uses a **mixin architecture with method hiding** for compile-time composition. No CRTP — no `Derived` template parameter. Each layer calls `Base::method()` downward.
 
 ```
-BaseRepo<Entity, Name, Cfg, Key>
+PgRepo<Entity, Name, Cfg, Key>
        |
        |  (adds Redis caching — if L2 or L1_L2)
        v
@@ -15,7 +15,7 @@ RedisRepo<Entity, Name, Cfg, Key>
        |
        |  (adds RAM caching — if L1 or L1_L2)
        v
-CachedRepo<Entity, Name, Cfg, Key>
+LocalRepo<Entity, Name, Cfg, Key>
        |
        |  (adds list caching — if Entity has ListDescriptor)
        v
@@ -37,7 +37,7 @@ All layers share the same four template parameters:
 template<typename Entity, config::FixedString Name, config::CacheConfig Cfg, typename Key>
 ```
 
-- **Entity**: `EntityWrapper<Struct, Mapping>` type
+- **Entity**: `Entity<Struct, Mapping>` type
 - **Name**: `FixedString` NTTP — compile-time string literal for the repository name and Redis key prefix
 - **Cfg**: `CacheConfig` NTTP — structural aggregate (all fields are public structural types)
 - **Key**: Auto-deduced from `decltype(std::declval<const Entity>().key())`
@@ -48,12 +48,12 @@ No `Config` struct, no `typename Derived`, no separate ORM model type.
 
 Each mixin layer can override methods from its `Base` by declaring a method with the same name. The upper method calls `Base::method()` explicitly to delegate. This is standard C++ name hiding — no virtuals, no CRTP.
 
-Example: `ListMixin::update()` hides `CachedRepo::update()`:
+Example: `ListMixin::update()` hides `LocalRepo::update()`:
 
 ```cpp
 template<typename Base>
 class ListMixin : public Base {
-    static io::Task<bool> update(const Key& id, WrapperPtrType wrapper) {
+    static io::Task<bool> update(const Key& id, EntityPtr wrapper) {
         auto old = co_await Base::find(id);     // cache-aware
         bool ok = co_await Base::update(id, wrapper); // delegates down
         if (ok) listCache().onEntityUpdated(old, wrapper);
@@ -74,11 +74,11 @@ template<typename Entity, config::FixedString Name, config::CacheConfig Cfg, typ
 struct CacheLayerSelector {
     using type = std::conditional_t<
         Cfg.cache_level == CacheLevel::L1 || Cfg.cache_level == CacheLevel::L1_L2,
-        CachedRepo<Entity, Name, Cfg, Key>,
+        LocalRepo<Entity, Name, Cfg, Key>,
         std::conditional_t<
             Cfg.cache_level == CacheLevel::L2,
             RedisRepo<Entity, Name, Cfg, Key>,
-            BaseRepo<Entity, Name, Cfg, Key>
+            PgRepo<Entity, Name, Cfg, Key>
         >
     >;
 };
@@ -114,20 +114,20 @@ The `Repo<>` class inherits from `MixinStack::type` and adds:
 
 | `Cfg.cache_level` | Selected Base |
 |--------------------|---------------|
-| `CacheLevel::None` | `BaseRepo` |
+| `CacheLevel::None` | `PgRepo` |
 | `CacheLevel::L2` | `RedisRepo` |
-| `CacheLevel::L1` | `CachedRepo` (inherits `BaseRepo`) |
-| `CacheLevel::L1_L2` | `CachedRepo` (inherits `RedisRepo`) |
+| `CacheLevel::L1` | `LocalRepo` (inherits `PgRepo`) |
+| `CacheLevel::L1_L2` | `LocalRepo` (inherits `RedisRepo`) |
 
-### Conditional Inheritance in CachedRepo
+### Conditional Inheritance in LocalRepo
 
-`CachedRepo` uses `std::conditional_t` to choose its base class at compile time:
+`LocalRepo` uses `std::conditional_t` to choose its base class at compile time:
 
 ```cpp
 template<typename Entity, config::FixedString Name, config::CacheConfig Cfg, typename Key>
-class CachedRepo : public std::conditional_t<
+class LocalRepo : public std::conditional_t<
     Cfg.cache_level == CacheLevel::L1,
-    BaseRepo<Entity, Name, Cfg, Key>,      // L1-only: skip Redis
+    PgRepo<Entity, Name, Cfg, Key>,      // L1-only: skip Redis
     RedisRepo<Entity, Name, Cfg, Key>       // L1_L2: include Redis layer
 > { ... };
 ```
@@ -187,7 +187,7 @@ The L1 (RAM) cache uses [shardmap](../jcailloux-shardmap), a thread-safe concurr
 ### Cache Storage with Metadata
 
 ```cpp
-// CachedRepo.h
+// LocalRepo.h
 struct EntityCacheMetadata {
     std::atomic<int64_t> expiration_rep{0};  // Atomic for shared-lock safety
     // ... constructor from time_point, expiration()/setExpiration() accessors
@@ -288,18 +288,18 @@ Database Query --> Store in L2 --> Store in L1 --> Return
 
 For standard repositories:
 ```
-CachedRepo::erase(id)
+LocalRepo::erase(id)
     |-- evict(id)
     v
 RedisRepo::erase(id)
-    |-- co_await BaseRepo::erase(id)  -> deleteByPrimaryKey(id)
+    |-- co_await PgRepo::erase(id)  -> deleteByPrimaryKey(id)
     |-- co_await evictRedisInternal(id)
 ```
 
 For partition key repositories, `erase` uses an **opportunistic hint** pattern — cache layers pass any already-available entity to the base layer to enable full PK deletion (partition pruning):
 
 ```
-CachedRepo::erase(id)
+LocalRepo::erase(id)
     |-- hint = getFromCache(id)         // Free L1 check (~0ns)
     |
     v
@@ -308,7 +308,7 @@ RedisRepo::eraseImpl(id, hint)
     |     hint = co_await getFromCache(redisKey)  // L2 check (~0.1-1ms)
     |
     v
-BaseRepo::eraseImpl(id, hint)
+PgRepo::eraseImpl(id, hint)
     |-- if (hint):
     |     params = Entity::makeFullKeyParams(*hint)
     |     DELETE ... WHERE id=$1 AND region=$2     // Full composite PK -> 1 partition
@@ -373,8 +373,8 @@ This augmented descriptor is exposed as `ListDescriptorType` for use with `parse
 
 ListMixin uses **two independent shardmap instances** — one for entities, one for lists:
 
-- **Entity cache** (from CachedRepo): `shardmap::ShardMap<Key, EntityPtr, EntityCacheMetadata>` — keys = PK values
-- **List cache** (from ListMixin): `shardmap::ShardMap<size_t, ResultPtr, ListCacheMetadata>` — keys = XXH3 hash of query
+- **Entity cache** (from LocalRepo): `shardmap::ShardMap<Key, EntityPtr, EntityCacheMetadata>` — keys = PK values
+- **List cache** (from ListMixin): `shardmap::ShardMap<std::string, ResultPtr, ListCacheMetadata>` — keys = canonical binary buffer of query
 
 These are different template instantiations, so they are distinct static objects with independent `KeyTracker`, cleanup state, and segments. No collision is possible.
 
@@ -426,7 +426,7 @@ struct Traits {
 `ListMixin` intercepts `insert()`, `update()`, `erase()`, and `patch()` to notify the list cache of entity changes:
 
 ```cpp
-static io::Task<bool> update(const Key& id, WrapperPtrType wrapper) {
+static io::Task<bool> update(const Key& id, EntityPtr wrapper) {
     auto old = co_await Base::find(id);
     bool ok = co_await Base::update(id, wrapper);
     if (ok) listCache().onEntityUpdated(old, wrapper);
@@ -441,9 +441,9 @@ The `ModificationTracker` records these changes. List cache entries are validate
 For external cross-invalidation (via `InvalidateList`), `ListMixin` exposes:
 
 ```cpp
-static void notifyCreated(WrapperPtrType entity);
-static void notifyUpdated(WrapperPtrType old, WrapperPtrType new_entity);
-static void notifyDeleted(WrapperPtrType entity);
+static void notifyCreated(EntityPtr entity);
+static void notifyUpdated(EntityPtr old, EntityPtr new_entity);
+static void notifyDeleted(EntityPtr entity);
 ```
 
 ### DB Query Path
@@ -477,7 +477,7 @@ class InvalidationMixin : public Base {
 Each CRUD method fetches the old entity (for propagation data), delegates to `Base`, then propagates:
 
 ```cpp
-static io::Task<bool> update(const Key& id, WrapperPtrType wrapper) {
+static io::Task<bool> update(const Key& id, EntityPtr wrapper) {
     auto old = co_await Base::find(id);  // cache-aware
     bool ok = co_await Base::update(id, std::move(wrapper));
     if (ok) co_await cache::propagateUpdate<Entity, InvList>(old, wrapper);
@@ -704,7 +704,7 @@ Same as above, but checks interval overlap:
 
 List query methods exist at all repository levels for config-level switching:
 
-| Method | BaseRepo | RedisRepo |
+| Method | PgRepo | RedisRepo |
 |--------|---------------|-----------------|
 | `cachedList(query, keyParts...)` | Pass-through (executes query) | Redis-cached |
 | `cachedListTracked(query, limit, offset, groupParts...)` | Pass-through | Redis-cached + tracked |
@@ -815,16 +815,16 @@ A modification affects a cache entry if:
 1. The entity (old or new) matches the query filters
 2. The entity's sort value falls within the page's sort bounds
 
-## Wrapper Concept Hierarchy
+## Entity Concept Hierarchy
 
-Wrappers declare their format via an explicit tag type:
+Entities declare their format via an explicit tag type:
 
 ```cpp
-// wrapper/Format.h
+// entity/Format.h
 struct StructFormat {};
 ```
 
-### Entity Concepts (`wrapper/EntityConcepts.h`)
+### Entity Concepts (`entity/EntityConcepts.h`)
 
 Building blocks:
 
@@ -854,12 +854,12 @@ Composed concepts used in repository `requires` clauses:
 
 | Concept | Definition | Used by |
 |---------|------------|---------|
-| `ReadableEntity<W>` | Has Mapping with SQL queries | `BaseRepo` |
-| `CacheableEntity<W>` | `Readable + Serializable` | `RedisRepo`, `CachedRepo` |
+| `ReadableEntity<W>` | Has Mapping with SQL queries | `PgRepo` |
+| `CacheableEntity<W>` | `Readable + Serializable` | `RedisRepo`, `LocalRepo` |
 | `MutableEntity<W>` | `Readable + has insert/update SQL` | `insert()`, `update()` |
 | `CreatableEntity<W, K>` | `Mutable + Keyed` | `insert()` with cache population |
 
-### Serialization Capabilities (`wrapper/SerializationTraits.h`)
+### Serialization Capabilities (`entity/SerializationTraits.h`)
 
 Low-level capability detection:
 
@@ -888,13 +888,13 @@ if constexpr (HasBinarySerialization<Entity>) {
 }
 ```
 
-### EntityWrapper<Struct, Mapping>
+### Entity<Struct, Mapping>
 
-`EntityWrapper` inherits from the pure data `Struct` and adds API-layer concerns:
+`Entity` inherits from the pure data `Struct` and adds API-layer concerns:
 
 ```cpp
 template<typename Struct, typename Mapping>
-class EntityWrapper : public Struct {
+class Entity : public Struct {
     // Delegates fromRow/toInsertParams/key to Mapping
     // Conditionally exposes makeFullKeyParams (if Mapping has it)
     // Conditionally exposes ListDescriptor (if Mapping has it)
@@ -911,8 +911,8 @@ class EntityWrapper : public Struct {
 
 ```cpp
 template<typename Struct, typename Mapping>
-struct glz::meta<EntityWrapper<Struct, Mapping>> {
-    using T = EntityWrapper<Struct, Mapping>;
+struct glz::meta<Entity<Struct, Mapping>> {
+    using T = Entity<Struct, Mapping>;
     static constexpr auto value = [] {
         if constexpr (requires { glz::meta<Struct>::value; }) {
             return glz::meta<Struct>::value;   // Struct defines custom names
@@ -925,7 +925,7 @@ struct glz::meta<EntityWrapper<Struct, Mapping>> {
 
 **Priority**: `glz::meta<Struct>` (if specialized) > `Mapping::glaze_value` (generated fallback).
 
-**Why base-class member pointers work**: `EntityWrapper<Struct, Mapping>` inherits publicly from `Struct`. Member pointers like `&Struct::field` are implicitly convertible to `&EntityWrapper::field` in C++.
+**Why base-class member pointers work**: `Entity<Struct, Mapping>` inherits publicly from `Struct`. Member pointers like `&Struct::field` are implicitly convertible to `&Entity::field` in C++.
 
 ### ListWrapper<Item>
 
@@ -963,12 +963,12 @@ template<> struct TraitsType::FieldInfo<TraitsType::Field::balance> {
 };
 ```
 
-### FieldUpdate Helpers (`wrapper/FieldUpdate.h`)
+### FieldUpdate Helpers (`entity/FieldUpdate.h`)
 
 Type-safe update descriptors using NTTP:
 
 ```cpp
-namespace jcailloux::relais::wrapper {
+namespace jcailloux::relais::entity {
 
 template<auto F, typename V> struct FieldUpdate { V value; };
 template<auto F>             struct FieldSetNull {};
@@ -981,7 +981,7 @@ template<auto F> auto setNull();          // Returns FieldSetNull<F>
 ### patch Flow Across Tiers
 
 ```
-CachedRepo::patch(id, set<F>(v)...)
+LocalRepo::patch(id, set<F>(v)...)
     |-- evict(id)
     |
     v
@@ -989,7 +989,7 @@ RedisRepo::patch(id, set<F>(v)...)
     |-- co_await evictRedisInternal(id)
     |
     v
-BaseRepo::patch(id, set<F>(v)...)
+PgRepo::patch(id, set<F>(v)...)
     |-- [optional] Fetch old entity for cross-invalidation
     |
     |-- Build dynamic SQL: UPDATE table SET "col1"=$1, "col2"=$2 WHERE "pk"=$3 RETURNING *
@@ -1024,12 +1024,12 @@ Partition key support is auto-detected at compile time via the `HasPartitionKey`
 ## Namespace Organization
 
 ```
-jcailloux::relais::                     # Repo, BaseRepo, RedisRepo,
-                                        # CachedRepo, ListMixin, InvalidationMixin
+jcailloux::relais::                     # Repo, PgRepo, RedisRepo, LocalRepo,
+                                        # ListMixin, InvalidationMixin,
+                                        # Entity<Struct, Mapping>, ListWrapper<Item>
 jcailloux::relais::config::             # CacheConfig, CacheLevel, UpdateStrategy,
                                         # Duration, FixedString, presets
-jcailloux::relais::wrapper::            # EntityWrapper<Struct, Mapping>, ListWrapper<Item>
-                                        # FieldUpdate, set<F>(), setNull<F>()
+jcailloux::relais::entity::             # FieldUpdate, set<F>(), setNull<F>()
 jcailloux::relais::cache::              # RedisCache, InvalidateOn, Invalidate, InvalidateVia,
                                         # InvalidateList, InvalidateListVia, ListInvalidationTarget
 jcailloux::relais::cache::list::        # ListCache, ListBoundsHeader, PaginationMode,
@@ -1040,17 +1040,16 @@ jcailloux::relais::io::                 # Task, PgPool, PgClient, PgResult, PgPa
                                         # RedisClient, RedisResult, IoContext
 ```
 
-### Wrapper Headers (`wrapper/`)
+### Entity Headers (`entity/`)
 
 ```
-wrapper/
+entity/
 ├── Format.h               # StructFormat tag
 ├── SerializationTraits.h   # HasJsonSerialization, HasBinarySerialization
 ├── EntityConcepts.h        # Readable, Serializable, Writable, Keyed + composed concepts
 │                           # HasListDescriptor, HasPartitionKey
 ├── FieldUpdate.h          # set<F>(), setNull<F>(), applyFieldUpdate
-├── EntityWrapper.h        # EntityWrapper<Struct, Mapping>
-└── ListWrapper.h          # ListWrapper<Item>
+└── Entity.h               # Entity<Struct, Mapping>
 ```
 
 ## Thread Safety
@@ -1089,14 +1088,14 @@ The `scripts/generate_entities.py` script generates standalone ORM Mapping struc
 - `template<typename Entity> fromRow(const PgResult::Row&) -> optional<Entity>`
 - `template<typename Entity> toInsertParams(const Entity&) -> PgParams`
 - `template<typename Entity> key(const Entity&) -> auto`
-- `using XxxWrapper = EntityWrapper<Struct, Mapping>;`
+- `using XxxEntity = Entity<Struct, Mapping>;`
 
 **For partition key entities (`@relais partition_key`):**
 - `makeFullKeyParams(const Entity&) -> PgParams` (for single-partition DELETE)
 
 **For list entities (with `filterable`/`sortable` annotations):**
 - Embedded `ListDescriptor` struct inside the Mapping (not a standalone struct)
-- `using XxxListWrapper = ListWrapper<XxxWrapper>;`
+- `using XxxListWrapper = ListWrapper<XxxEntity>;`
 
 ### Annotations
 
@@ -1105,7 +1104,7 @@ The `scripts/generate_entities.py` script generates standalone ORM Mapping struc
 | Annotation | Description |
 |-----------|-------------|
 | `table=table_name` | PostgreSQL table name |
-| `output=path/to/Wrapper.h` | Generated file path (relative to `--output-dir`) |
+| `output=path/to/Entity.h` | Generated file path (relative to `--output-dir`) |
 | `read_only` | Mark entity as read-only |
 
 **Field-level** (inline comment on data member):

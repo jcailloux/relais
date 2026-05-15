@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Struct Entity Wrapper Generator
+Struct Entity Mapping Generator
 
 Scans C++ header files for @relais annotations, parses struct data members,
 and generates:
   - Standalone Mapping structs with fromRow/toInsertParams/TraitsType/FieldInfo
-  - EntityWrapper<Struct, Mapping> type aliases (public API)
+  - Entity<Struct, Mapping> type aliases (public API)
   - ListWrapper and ListDescriptor for list entities
 
 Uses jcailloux::relais::io for database access.
@@ -94,7 +94,7 @@ class EntityAnnotation:
     """Parsed @relais annotations for an entity."""
     table: str = ""       # PostgreSQL table name
     model: str = ""       # Parsed but ignored (table= is used instead)
-    primary_key: str = "id"
+    primary_keys: list[str] = field(default_factory=list)  # multiple @relais primary_key fields
     partition_keys: list[str] = field(default_factory=list)
     db_managed: list[str] = field(default_factory=list)
     timestamps: list[str] = field(default_factory=list)
@@ -107,6 +107,16 @@ class EntityAnnotation:
     sorts: list[SortConfig] = field(default_factory=list)
     limits: list[int] = field(default_factory=list)
     entity_fqn: str = ""  # Fully qualified entity class name for Descriptor
+
+    @property
+    def primary_key(self) -> str:
+        """First (or only) primary key field name. Falls back to 'id'."""
+        return self.primary_keys[0] if self.primary_keys else "id"
+
+    @property
+    def is_composite(self) -> bool:
+        """True if entity has a composite primary key (multiple @relais primary_key fields)."""
+        return len(self.primary_keys) > 1
 
     @property
     def has_list(self) -> bool:
@@ -144,7 +154,12 @@ class StructParser:
 
     def parse_file(self, filepath: Path) -> list[ParsedEntity]:
         """Parse a header file and return all annotated entities."""
-        content = filepath.read_text()
+        try:
+            content = filepath.read_text()
+        except OSError as e:
+            print(f"Error: cannot read {filepath}: {e}", file=sys.stderr)
+            return []
+
         entities = []
 
         # Find all @relais annotation blocks followed by a class/struct declaration
@@ -153,6 +168,7 @@ class StructParser:
         while i < len(lines):
             # Look for @relais annotation block
             annotations = []
+            annotation_start_line = i + 1  # 1-based for error messages
             while i < len(lines) and self.ANNOTATION_RE.match(lines[i].strip()):
                 m = self.ANNOTATION_RE.match(lines[i].strip())
                 annotations.append((
@@ -181,31 +197,37 @@ class StructParser:
 
             class_name = class_match.group(1)
 
-            # Parse annotation key=value pairs
-            annot = self._parse_annotations(annotations)
+            try:
+                # Parse annotation key=value pairs
+                annot = self._parse_annotations(annotations)
 
-            # Find namespace
-            ns = self._find_namespace(content, lines[i])
+                # Find namespace
+                ns = self._find_namespace(content, lines[i])
 
-            # Set entity_fqn for Descriptor if not specified
-            if not annot.entity_fqn and ns:
-                annot.entity_fqn = f"{ns}::{class_name}"
-            elif not annot.entity_fqn:
-                annot.entity_fqn = class_name
+                # Set entity_fqn for Descriptor if not specified
+                if not annot.entity_fqn and ns:
+                    annot.entity_fqn = f"{ns}::{class_name}"
+                elif not annot.entity_fqn:
+                    annot.entity_fqn = class_name
 
-            # Parse data members from the class body (with inline annotations)
-            members = self._parse_members(lines, i)
+                # Parse data members from the class body (with inline annotations)
+                members = self._parse_members(lines, i)
 
-            # Apply inline member annotations to the EntityAnnotation
-            self._apply_member_annotations(annot, members)
+                # Apply inline member annotations to the EntityAnnotation
+                self._apply_member_annotations(annot, members)
 
-            entities.append(ParsedEntity(
-                class_name=class_name,
-                namespace=ns,
-                annotation=annot,
-                members=members,
-                source_file=filepath,
-            ))
+                entities.append(ParsedEntity(
+                    class_name=class_name,
+                    namespace=ns,
+                    annotation=annot,
+                    members=members,
+                    source_file=filepath,
+                ))
+            except Exception as e:
+                print(f"Error: {filepath}:{annotation_start_line}: "
+                      f"failed to parse entity '{class_name}': {e}",
+                      file=sys.stderr)
+                sys.exit(1)
 
             i += 1
 
@@ -271,7 +293,7 @@ class StructParser:
         """Populate EntityAnnotation fields from inline member @relais tags."""
         for m in members:
             if 'primary_key' in m.tags:
-                annot.primary_key = m.name
+                annot.primary_keys.append(m.name)
             if 'partition_key' in m.tags:
                 annot.partition_keys.append(m.name)
             if 'db_managed' in m.tags:
@@ -430,7 +452,7 @@ class StructParser:
 # =============================================================================
 
 class MappingGenerator:
-    """Generate Mapping structs + EntityWrapper aliases from parsed entities.
+    """Generate Mapping structs + Entity aliases from parsed entities.
 
     Generates SQL-direct code using jcailloux::relais::io.
     """
@@ -455,7 +477,7 @@ class MappingGenerator:
         """Generate the complete wrapper header."""
         a = entity.annotation
         mapping_name = f"{entity.class_name}Mapping"
-        wrapper_name = f"{entity.class_name}Wrapper"
+        wrapper_name = f"{entity.class_name}Entity"
 
         # Determine updateable fields (exclude PK, db_managed, json_fields)
         updateable = self._get_updateable_fields(entity)
@@ -491,27 +513,31 @@ class MappingGenerator:
         lines.append(f"// {wrapper_name} — public API type")
         lines.append("// ============================================================================")
         lines.append("")
-        lines.append(f"using {wrapper_name} = jcailloux::relais::wrapper::EntityWrapper<")
+        lines.append(f"using {wrapper_name} = jcailloux::relais::Entity<")
         lines.append(f"    {struct_fqn}, {mapping_name}>;")
 
         # === List wrapper (if list annotations present) ===
         if a.has_list:
             list_wrapper_name = f"{entity.class_name}ListWrapper"
             lines.append("")
-            lines.append(f"using {list_wrapper_name} = jcailloux::relais::wrapper::ListWrapper<{wrapper_name}>;")
+            lines.append(f"using {list_wrapper_name} = jcailloux::relais::list::ListWrapper<{wrapper_name}>;")
 
         lines.append("")
         lines.append("}  // namespace entity::generated")
 
-        # === glz::meta for struct and enums (outside namespace) ===
+        # === glz::meta for struct, enums, and RowView (outside namespace) ===
         struct_meta = self._generate_struct_meta(entity, source_content)
         enum_metas = self._generate_enum_metas(entity, source_content)
+        row_view_meta = self._generate_row_view_meta(entity, mapping_name)
         if struct_meta:
             lines.append("")
             lines.extend(struct_meta)
         if enum_metas:
             lines.append("")
             lines.extend(enum_metas)
+        if row_view_meta:
+            lines.append("")
+            lines.extend(row_view_meta)
 
         lines.append("")
 
@@ -527,7 +553,13 @@ class MappingGenerator:
             "#include <cstdint>",
             "#include <optional>",
             "#include <string>",
+            "#include <string_view>",
         ]
+
+        # Composite key needs <tuple> and <array>
+        if a.is_composite:
+            lines.append("#include <array>")
+            lines.append("#include <tuple>")
 
         # Glaze for json_fields deserialization
         if a.json_fields:
@@ -541,8 +573,8 @@ class MappingGenerator:
         if has_vector_char:
             lines.append("#include <vector>")
 
-        # EntityWrapper (always needed)
-        lines.append("#include <jcailloux/relais/wrapper/EntityWrapper.h>")
+        # Entity (always needed)
+        lines.append("#include <jcailloux/relais/entity/Entity.h>")
 
         # Struct header (relative path from generated file to source)
         struct_include = self._find_struct_include(entity, output_file)
@@ -550,9 +582,9 @@ class MappingGenerator:
 
         # List includes
         if a.has_list:
-            lines.append("#include <jcailloux/relais/wrapper/ListWrapper.h>")
-            lines.append("#include <jcailloux/relais/list/decl/FilterDescriptor.h>")
-            lines.append("#include <jcailloux/relais/list/decl/SortDescriptor.h>")
+            lines.append("#include <jcailloux/relais/list/ListWrapper.h>")
+            lines.append("#include <jcailloux/relais/list/spec/FilterDescriptor.h>")
+            lines.append("#include <jcailloux/relais/list/spec/SortDescriptor.h>")
 
         return lines
 
@@ -574,9 +606,15 @@ class MappingGenerator:
             f"struct {mapping_name} {{",
             f"    static constexpr bool read_only = {'true' if a.read_only else 'false'};",
             f'    static constexpr const char* table_name = "{table_name}";',
-            f'    static constexpr const char* primary_key_column = "{self._col(entity, a.primary_key)}";',
-            "",
         ]
+
+        if a.is_composite:
+            pk_cols_str = ", ".join(f'"{self._col(entity, pk)}"' for pk in a.primary_keys)
+            lines.append(f"    static constexpr std::array<const char*, {len(a.primary_keys)}> primary_key_columns = {{{pk_cols_str}}};")
+        else:
+            lines.append(f'    static constexpr const char* primary_key_column = "{self._col(entity, a.primary_key)}";')
+
+        lines.append("")
 
         # Col enum — column indices for O(1) access in fromRow
         col_entries = ", ".join(
@@ -595,16 +633,20 @@ class MappingGenerator:
         # key
         lines.append("    template<typename Entity>")
         lines.append("    static auto key(const Entity& e) noexcept {")
-        lines.append(f"        return e.{a.primary_key};")
+        if a.is_composite:
+            pk_args = ", ".join(f"e.{pk}" for pk in a.primary_keys)
+            lines.append(f"        return std::make_tuple({pk_args});")
+        else:
+            lines.append(f"        return e.{a.primary_key};")
         lines.append("    }")
         lines.append("")
 
-        # makeFullKeyParams (for composite key partition pruning)
+        # makePartitionHintParams (for partition pruning — distinct from composite key)
         if a.partition_keys:
             args = [f"e.{a.primary_key}"] + [f"e.{pk}" for pk in a.partition_keys]
             args_str = ",\n            ".join(args)
             lines.append("    template<typename Entity>")
-            lines.append("    static jcailloux::relais::io::PgParams makeFullKeyParams(const Entity& e) {")
+            lines.append("    static jcailloux::relais::io::PgParams makePartitionHintParams(const Entity& e) {")
             lines.append(f"        return jcailloux::relais::io::PgParams::make(")
             lines.append(f"            {args_str}")
             lines.append(f"        );")
@@ -619,9 +661,22 @@ class MappingGenerator:
             lines.append("")
             lines.extend(self._generate_to_insert_params(entity))
 
+        # toUpdateParams (skip for read-only; only generated for composite keys)
+        if not a.read_only and a.is_composite:
+            lines.append("")
+            lines.extend(self._generate_to_update_params(entity))
+
+        # dynamicSize (heap memory for strings/vectors)
+        lines.append("")
+        lines.extend(self._generate_dynamic_size(entity))
+
         # Glaze metadata template
         lines.append("")
         lines.extend(self._generate_glaze_value(entity))
+
+        # RowView + rowToJson + rowToBeve (direct serialization from PgResult)
+        lines.append("")
+        lines.extend(self._generate_row_view(entity))
 
         # Embedded ListDescriptor (if list annotations present)
         if a.has_list:
@@ -637,7 +692,6 @@ class MappingGenerator:
 
     def _generate_sql_struct(self, entity: ParsedEntity, table_name: str) -> list[str]:
         a = entity.annotation
-        pk_col = self._col(entity, a.primary_key)
         all_cols = [m.col_name for m in entity.members]
         all_cols_str = ", ".join(all_cols)
 
@@ -646,10 +700,20 @@ class MappingGenerator:
         insert_cols_str = ", ".join(insert_cols)
         insert_params = ", ".join(f"${i+1}" for i in range(len(insert_cols)))
 
-        # UPDATE: skip PK (PK goes in WHERE clause as $1) and db_managed fields
-        update_cols = [m.col_name for m in entity.members if m.name != a.primary_key and m.name not in a.db_managed]
+        # PK columns for WHERE clauses
+        pk_cols = [self._col(entity, pk) for pk in a.primary_keys] if a.primary_keys else [self._col(entity, "id")]
+        pk_count = len(pk_cols)
+
+        # WHERE clause for PK: pk1=$1 AND pk2=$2 ...
+        pk_where = " AND ".join(f"{col} = ${i+1}" for i, col in enumerate(pk_cols))
+
+        # UPDATE: skip all PKs and db_managed fields
+        pk_set = set(a.primary_keys) if a.primary_keys else {"id"}
+        update_cols = [m.col_name for m in entity.members
+                       if m.name not in pk_set and m.name not in a.db_managed]
+        # SET params start after PK params: $pk_count+1, $pk_count+2, ...
         update_set = ", ".join(
-            f"{col}=${i+2}" for i, col in enumerate(update_cols))
+            f"{col}=${i + pk_count + 1}" for i, col in enumerate(update_cols))
 
         lines = [
             "    struct SQL {",
@@ -657,7 +721,7 @@ class MappingGenerator:
             f'            "{all_cols_str}";',
             f"        static constexpr const char* select_by_pk =",
             f'            "SELECT {all_cols_str} '
-            f'FROM {table_name} WHERE {pk_col} = $1";',
+            f'FROM {table_name} WHERE {pk_where}";',
             f"        static constexpr const char* insert =",
             f'            "INSERT INTO {table_name} ({insert_cols_str}) '
             f'VALUES ({insert_params}) RETURNING {all_cols_str}";',
@@ -667,22 +731,36 @@ class MappingGenerator:
             lines.append(f"        static constexpr const char* update =")
             lines.append(
                 f'            "UPDATE {table_name} SET {update_set} '
-                f'WHERE {pk_col} = $1";')
+                f'WHERE {pk_where}";')
+
+        # SELECT ... WHERE pk = ANY($1) for batch reads
+        if pk_count == 1:
+            # Simple key: WHERE pk_col = ANY($1)
+            batch_where = f"{pk_cols[0]} = ANY($1)"
+        else:
+            # Composite key: WHERE (k1, k2) IN (SELECT unnest($1::type[]), unnest($2::type[]))
+            unnest_parts = ", ".join(f"unnest(${i+1})" for i in range(pk_count))
+            key_tuple = ", ".join(pk_cols)
+            batch_where = f"({key_tuple}) IN (SELECT {unnest_parts})"
+        lines.append(f"        static constexpr const char* select_by_pk_batch =")
+        lines.append(
+            f'            "SELECT {all_cols_str} '
+            f'FROM {table_name} WHERE {batch_where}";')
 
         lines.append(f"        static constexpr const char* delete_by_pk =")
         lines.append(
-            f'            "DELETE FROM {table_name} WHERE {pk_col} = $1";')
+            f'            "DELETE FROM {table_name} WHERE {pk_where}";')
 
-        # Full composite key DELETE for partition pruning (when partition_keys present)
+        # Partition-pruned DELETE (when partition_keys present, distinct from composite PK)
         if a.partition_keys:
-            where_parts = [f"{pk_col} = $1"]
+            hint_where_parts = [f"{col} = ${i+1}" for i, col in enumerate(pk_cols)]
             for i, pk in enumerate(a.partition_keys):
                 pk_db_col = self._col(entity, pk)
-                where_parts.append(f"{pk_db_col} = ${i + 2}")
-            where_clause = " AND ".join(where_parts)
-            lines.append(f"        static constexpr const char* delete_by_full_pk =")
+                hint_where_parts.append(f"{pk_db_col} = ${pk_count + i + 1}")
+            hint_where_clause = " AND ".join(hint_where_parts)
+            lines.append(f"        static constexpr const char* delete_with_partition =")
             lines.append(
-                f'            "DELETE FROM {table_name} WHERE {where_clause}";')
+                f'            "DELETE FROM {table_name} WHERE {hint_where_clause}";')
 
         lines.append("    };")
 
@@ -846,8 +924,116 @@ class MappingGenerator:
         return lines
 
     # =========================================================================
+    # toUpdateParams (for composite keys: only non-PK, non-db_managed fields)
+    # =========================================================================
+
+    def _generate_to_update_params(self, entity: ParsedEntity) -> list[str]:
+        """Generate toUpdateParams for composite key entities.
+
+        Unlike toInsertParams (which includes PK fields), this returns only
+        the SET fields used in UPDATE statements. The caller (PgRepo) prepends
+        the key params separately.
+        """
+        a = entity.annotation
+        pk_set = set(a.primary_keys)
+
+        # Fields for SET: not PK, not db_managed
+        update_members = [
+            m for m in entity.members
+            if m.name not in pk_set and m.name not in a.db_managed
+        ]
+
+        has_special = any(
+            m.name in a.json_fields or m.is_raw_json or
+            self._find_enum_mapping(a, m.name)
+            for m in update_members
+        )
+
+        lines = [
+            "    template<typename Entity>",
+            "    static jcailloux::relais::io::PgParams toUpdateParams(const Entity& e) {",
+        ]
+
+        if not has_special:
+            args = [f"            e.{m.name}" for m in update_members]
+            lines.append("        return jcailloux::relais::io::PgParams::make(")
+            lines.append(",\n".join(args))
+            lines.append("        );")
+        else:
+            lines.append("        jcailloux::relais::io::PgParams p;")
+            for m in update_members:
+                enum_mapping = self._find_enum_mapping(a, m.name)
+                if m.name in a.json_fields:
+                    if m.is_optional:
+                        lines.append(f"        if (e.{m.name}) {{")
+                        lines.append(f"            std::string json;")
+                        lines.append(f"            glz::write_json(*e.{m.name}, json);")
+                        lines.append(f"            p.push(json);")
+                        lines.append(f"        }} else {{")
+                        lines.append(f"            p.pushNull();")
+                        lines.append(f"        }}")
+                    else:
+                        lines.append(f"        {{ std::string json; glz::write_json(e.{m.name}, json); p.push(json); }}")
+                elif m.is_raw_json:
+                    lines.append(f"        p.push(e.{m.name}.str);")
+                elif enum_mapping:
+                    enum_fqn = self._qualify_type(entity, enum_mapping.cpp_type)
+                    if m.is_optional:
+                        lines.append(f"        if (e.{m.name}.has_value()) {{")
+                        lines.append(f"            switch (*e.{m.name}) {{")
+                        for db_val, enum_val in enum_mapping.pairs:
+                            lines.append(f'                case {enum_fqn}::{enum_val}: p.push("{db_val}"); break;')
+                        lines.append(f"            }}")
+                        lines.append(f"        }} else {{")
+                        lines.append(f"            p.pushNull();")
+                        lines.append(f"        }}")
+                    else:
+                        lines.append(f"        switch (e.{m.name}) {{")
+                        for db_val, enum_val in enum_mapping.pairs:
+                            lines.append(f'            case {enum_fqn}::{enum_val}: p.push("{db_val}"); break;')
+                        lines.append(f"        }}")
+                else:
+                    lines.append(f"        p.push(e.{m.name});")
+            lines.append("        return p;")
+
+        lines.append("    }")
+        return lines
+
+    # =========================================================================
     # Glaze metadata (variable template inside Mapping)
     # =========================================================================
+
+    def _generate_dynamic_size(self, entity: ParsedEntity) -> list[str]:
+        """Generate dynamicSize() — heap memory used by dynamic fields (strings, vectors, raw_json).
+
+        Uses heapCapacity() for std::string to exclude SSO buffer (already in sizeof).
+        """
+        a = entity.annotation
+        hc = "jcailloux::relais::entity::heapCapacity"
+        # Collect fields with dynamic heap allocations
+        dynamic_fields = []
+        for m in entity.members:
+            if m.cpp_type == "std::string":
+                dynamic_fields.append(f"{hc}(s.{m.name})")
+            elif m.cpp_type == "std::optional<std::string>":
+                dynamic_fields.append(f"(s.{m.name} ? {hc}(*s.{m.name}) : 0)")
+            elif m.cpp_type == "std::vector<char>":
+                dynamic_fields.append(f"s.{m.name}.capacity()")
+            elif m.cpp_type == "std::optional<std::vector<char>>":
+                dynamic_fields.append(f"(s.{m.name} ? s.{m.name}->capacity() : 0)")
+            elif m.is_raw_json:
+                dynamic_fields.append(f"{hc}(s.{m.name}.str)")
+
+        if not dynamic_fields:
+            return []
+
+        struct_fqn = f"{entity.namespace}::{entity.class_name}" if entity.namespace else entity.class_name
+        lines = [
+            f"    static size_t dynamicSize(const {struct_fqn}& s) {{",
+            f"        return {' + '.join(dynamic_fields)};",
+            f"    }}",
+        ]
+        return lines
 
     def _generate_glaze_value(self, entity: ParsedEntity) -> list[str]:
         """Generate template<typename T> static constexpr auto glaze_value."""
@@ -862,6 +1048,191 @@ class MappingGenerator:
         return lines
 
     # =========================================================================
+    # RowView — zero-copy view for direct serialization from PgResult
+    # =========================================================================
+
+    def _rowview_type(self, member: DataMember, annotation: EntityAnnotation,
+                      entity: ParsedEntity) -> str:
+        """Map entity type to RowView type (string_view for strings, raw_json_view for raw_json)."""
+        if member.name in annotation.json_fields:
+            return self._qualify_cpp_type(member.cpp_type, entity)
+        if member.is_raw_json:
+            return "glz::raw_json_view"
+        if member.cpp_type == "std::string":
+            return "std::string_view"
+        if member.cpp_type == "std::optional<std::string>":
+            return "std::optional<std::string_view>"
+        return self._qualify_cpp_type(member.cpp_type, entity)
+
+    _FUNDAMENTAL_TYPES = frozenset((
+        "int8_t", "int16_t", "int32_t", "int64_t",
+        "uint8_t", "uint16_t", "uint32_t", "uint64_t",
+        "float", "double", "bool", "char",
+    ))
+
+    def _qualify_cpp_type(self, cpp_type: str, entity: ParsedEntity) -> str:
+        """Qualify user-defined types with entity's namespace (for use in generated namespace)."""
+        # Standard library templates: qualify inner type
+        for prefix in ("std::optional<", "std::vector<"):
+            if cpp_type.startswith(prefix):
+                inner = cpp_type[len(prefix):-1]
+                return f"{prefix}{self._qualify_cpp_type(inner, entity)}>"
+        # Standard/Glaze types: no qualification
+        if cpp_type.startswith("std::") or cpp_type.startswith("glz::"):
+            return cpp_type
+        if cpp_type in self._FUNDAMENTAL_TYPES:
+            return cpp_type
+        # Already qualified
+        if "::" in cpp_type:
+            return cpp_type
+        # User-defined type: qualify with entity namespace
+        if entity.namespace:
+            return f"{entity.namespace}::{cpp_type}"
+        return cpp_type
+
+    def _generate_row_view(self, entity: ParsedEntity) -> list[str]:
+        """Generate RowView struct + rowToJson + rowToBeve inside the Mapping."""
+        a = entity.annotation
+        lines = [
+            "    // RowView — zero-copy view for direct serialization from PgResult",
+            "    struct RowView {",
+        ]
+
+        _FUNDAMENTAL = frozenset((
+            "int8_t", "int16_t", "int32_t", "int64_t",
+            "uint8_t", "uint16_t", "uint32_t", "uint64_t",
+            "float", "double", "bool",
+        ))
+
+        for m in entity.members:
+            rv_type = self._rowview_type(m, a, entity)
+            enum_mapping = self._find_enum_mapping(a, m.name)
+            # Zero-init for fundamental types and non-optional enums
+            if rv_type in _FUNDAMENTAL:
+                default = " = {}"
+            elif enum_mapping and not m.is_optional:
+                default = " = {}"
+            else:
+                default = ""
+            lines.append(f"        {rv_type} {m.name}{default};")
+
+        lines.append("    };")
+        lines.append("")
+
+        # rowToJson
+        lines.extend(self._generate_row_to_json(entity))
+        lines.append("")
+
+        # rowToBeve
+        lines.extend(self._generate_row_to_beve(entity))
+
+        return lines
+
+    def _generate_rowview_populate(self, entity: ParsedEntity, var: str = "v") -> list[str]:
+        """Generate code to populate a RowView from a PgResult::Row."""
+        a = entity.annotation
+        lines = []
+
+        for m in entity.members:
+            enum_mapping = self._find_enum_mapping(a, m.name)
+
+            if m.name in a.json_fields:
+                # JSON field: parse from string_view (avoids intermediate std::string alloc)
+                if m.is_optional:
+                    lines.append(f"        if (!row.isNull(Col::{m.name})) {{")
+                    lines.append(f"            auto json_sv = row.get<std::string_view>(Col::{m.name});")
+                    lines.append(f"            if (!json_sv.empty()) {{")
+                    lines.append(f"                typename std::remove_reference_t<decltype(*{var}.{m.name})> tmp;")
+                    lines.append(f"                if (!glz::read_json(tmp, json_sv))")
+                    lines.append(f"                    {var}.{m.name} = std::move(tmp);")
+                    lines.append(f"            }}")
+                    lines.append(f"        }}")
+                else:
+                    lines.append(f"        (void)glz::read_json({var}.{m.name}, row.get<std::string_view>(Col::{m.name}));")
+            elif m.is_raw_json:
+                # Raw JSON: zero-copy string_view into raw_json_view
+                lines.append(f"        {var}.{m.name}.str = row.get<std::string_view>(Col::{m.name});")
+            elif enum_mapping:
+                # Enum: compare string_view (zero alloc)
+                enum_fqn = self._qualify_type(entity, enum_mapping.cpp_type)
+                if m.is_optional:
+                    lines.append(f"        if (!row.isNull(Col::{m.name})) {{")
+                    lines.append(f"            auto s = row.get<std::string_view>(Col::{m.name});")
+                    for db_val, enum_val in enum_mapping.pairs:
+                        lines.append(f'            if (s == "{db_val}") {var}.{m.name} = {enum_fqn}::{enum_val};')
+                    lines.append(f"        }}")
+                else:
+                    lines.append(f"        {{")
+                    lines.append(f"            auto s = row.get<std::string_view>(Col::{m.name});")
+                    for db_val, enum_val in enum_mapping.pairs:
+                        lines.append(f'            if (s == "{db_val}") {var}.{m.name} = {enum_fqn}::{enum_val};')
+                    lines.append(f"        }}")
+            elif m.is_optional:
+                # Optional: use getOpt with RowView-appropriate inner type
+                inner = m.inner_type
+                if inner == "std::string":
+                    inner = "std::string_view"
+                lines.append(f"        {var}.{m.name} = row.getOpt<{inner}>(Col::{m.name});")
+            else:
+                # Simple field: direct get with RowView type
+                rv_type = self._rowview_type(m, a, entity)
+                lines.append(f"        {var}.{m.name} = row.get<{rv_type}>(Col::{m.name});")
+
+        return lines
+
+    def _generate_row_to_json(self, entity: ParsedEntity) -> list[str]:
+        """Generate rowToJson() static method inside the Mapping.
+        Uses template<typename V = RowView> so that v's type is dependent, deferring
+        glz::meta<RowView> lookup to instantiation time (after the specialization is visible)."""
+        lines = [
+            "    template<typename V = RowView>",
+            "    static std::shared_ptr<const std::string> rowToJson(",
+            "            const jcailloux::relais::io::PgResult::Row& row) {",
+            "        V v;",
+        ]
+        lines.extend(self._generate_rowview_populate(entity))
+        lines.extend([
+            "        auto json = std::make_shared<std::string>();",
+            "        json->reserve(256);",
+            "        if (glz::write_json(v, *json))",
+            "            return nullptr;",
+            "        return json;",
+            "    }",
+        ])
+        return lines
+
+    def _generate_row_to_beve(self, entity: ParsedEntity) -> list[str]:
+        """Generate rowToBeve() static method inside the Mapping.
+        Uses template<typename V = RowView> so that v's type is dependent, deferring
+        glz::meta<RowView> lookup to instantiation time (after the specialization is visible)."""
+        lines = [
+            "    template<typename V = RowView>",
+            "    static std::shared_ptr<const std::vector<uint8_t>> rowToBeve(",
+            "            const jcailloux::relais::io::PgResult::Row& row) {",
+            "        V v;",
+        ]
+        lines.extend(self._generate_rowview_populate(entity))
+        lines.extend([
+            "        auto buf = std::make_shared<std::vector<uint8_t>>();",
+            "        if (glz::write_beve(v, *buf))",
+            "            return nullptr;",
+            "        return buf;",
+            "    }",
+        ])
+        return lines
+
+    def _generate_row_view_meta(self, entity: ParsedEntity, mapping_name: str) -> list[str]:
+        """Generate glz::meta<Mapping::RowView> specialization (outside namespace)."""
+        fqn = f"entity::generated::{mapping_name}"
+        return [
+            f"template<>",
+            f"struct glz::meta<{fqn}::RowView> {{",
+            f"    using T = {fqn}::RowView;",
+            f"    static constexpr auto value = {fqn}::glaze_value<T>;",
+            f"}};",
+        ]
+
+    # =========================================================================
     # Embedded ListDescriptor (nested inside Mapping — auto-detected by ListMixin)
     # =========================================================================
 
@@ -870,7 +1241,7 @@ class MappingGenerator:
         a = entity.annotation
         struct_fqn = (f"{entity.namespace}::{entity.class_name}"
                       if entity.namespace else entity.class_name)
-        decl_ns = "jcailloux::relais::cache::list::decl"
+        decl_ns = "jcailloux::relais::list::spec"
 
         limits = a.limits if a.limits else [10, 25, 50]
         default_limit = limits[0]
@@ -882,6 +1253,8 @@ class MappingGenerator:
         ]
 
         if a.filters:
+            # Sort filters alphabetically by param name for deterministic cache keys
+            a.filters.sort(key=lambda f: f.param)
             lines.append("")
             lines.append("        static constexpr auto filters = std::tuple{")
             for i, f in enumerate(a.filters):
@@ -1067,11 +1440,12 @@ class MappingGenerator:
         return re.findall(r'"([^"]+)"\s*,\s*(\w+)', enumerate_body)
 
     def _get_updateable_fields(self, entity: ParsedEntity) -> list[DataMember]:
-        """Return fields eligible for Field enum (exclude PK, db_managed, json_fields)."""
+        """Return fields eligible for Field enum (exclude all PKs, db_managed, json_fields)."""
         a = entity.annotation
+        pk_set = set(a.primary_keys) if a.primary_keys else {"id"}
         result = []
         for m in entity.members:
-            if m.name == a.primary_key:
+            if m.name in pk_set:
                 continue
             if m.name in a.db_managed:
                 continue
@@ -1141,7 +1515,12 @@ def main():
     for filepath in files:
         entities = struct_parser.parse_file(filepath)
         for entity in entities:
-            filename = f"{entity.class_name}Wrapper.h"
+            # Validate: warn if @relais annotation lacks table=
+            if not entity.annotation.table and not entity.annotation.model:
+                print(f"  Warning: {filepath}: entity '{entity.class_name}' has "
+                      f"@relais annotations but no table= (using derived name)",
+                      file=sys.stderr)
+            filename = f"{entity.class_name}Entity.h"
             output_path = output_dir / filename
 
             print(f"  -> {entity.class_name}")
@@ -1151,7 +1530,7 @@ def main():
             output_path.write_text(code)
             generated_count += 1
 
-    print(f"Generated {generated_count} entity wrappers")
+    print(f"Generated {generated_count} entity mappings")
 
 
 if __name__ == "__main__":

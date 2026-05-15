@@ -11,6 +11,50 @@ target_include_directories(jcailloux-relais INTERFACE
 
 target_compile_features(jcailloux-relais INTERFACE cxx_std_23)
 
+# GDSF eviction: compile-time toggle (memory budget is runtime via RELAIS_L1_MAX_MEMORY env var)
+option(RELAIS_GDSF_ENABLED "Enable GDSF size-aware L1 eviction" OFF)
+if(RELAIS_GDSF_ENABLED)
+    target_compile_definitions(jcailloux-relais INTERFACE RELAIS_GDSF_ENABLED=1)
+endif()
+
+# Cache hit/miss metrics: zero-cost when disabled (OFF by default, always ON for benchmarks)
+option(RELAIS_ENABLE_METRICS "Enable per-repo cache hit/miss metrics" OFF)
+if(RELAIS_ENABLE_METRICS)
+    target_compile_definitions(jcailloux-relais INTERFACE RELAIS_ENABLE_METRICS=1)
+endif()
+
+# L1 cleanup frequency: sweep every 2^N insertions (0 = disabled, default 9 = every 512)
+set(RELAIS_CLEANUP_FREQUENCY_LOG2 9 CACHE STRING "L1 cleanup frequency as log2 (0=disabled, 9=every 512 insertions)")
+if(NOT RELAIS_CLEANUP_FREQUENCY_LOG2 EQUAL 9)
+    target_compile_definitions(jcailloux-relais INTERFACE RELAIS_CLEANUP_FREQUENCY_LOG2=${RELAIS_CLEANUP_FREQUENCY_LOG2})
+endif()
+
+# Profile-Guided Optimization: propagated via INTERFACE to all consumers
+# Usage (same build directory for both phases):
+#   1. cmake -B build -DRELAIS_ENABLE_PGO=generate -DCMAKE_BUILD_TYPE=Release
+#      cmake --build build -j$(nproc) && ./build/my_app   # training workload
+#   2. cmake -B build -DRELAIS_ENABLE_PGO=use
+#      cmake --build build -j$(nproc)                     # optimized binary
+set(RELAIS_ENABLE_PGO "OFF" CACHE STRING "Profile-Guided Optimization (OFF, generate, use)")
+set_property(CACHE RELAIS_ENABLE_PGO PROPERTY STRINGS OFF generate use)
+
+if(NOT RELAIS_ENABLE_PGO STREQUAL "OFF")
+    set(RELAIS_PGO_DIR "${CMAKE_BINARY_DIR}/pgo-data")
+    if(RELAIS_ENABLE_PGO STREQUAL "generate")
+        target_compile_options(jcailloux-relais INTERFACE
+            -fprofile-generate=${RELAIS_PGO_DIR} -fprofile-update=atomic)
+        target_link_options(jcailloux-relais INTERFACE
+            -fprofile-generate=${RELAIS_PGO_DIR})
+    elseif(RELAIS_ENABLE_PGO STREQUAL "use")
+        target_compile_options(jcailloux-relais INTERFACE
+            -fprofile-use=${RELAIS_PGO_DIR}
+            -fprofile-correction
+            -Wno-missing-profile)
+        target_link_options(jcailloux-relais INTERFACE
+            -fprofile-use=${RELAIS_PGO_DIR})
+    endif()
+endif()
+
 # CMake modules (available to consumers via FetchContent)
 list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
 
@@ -20,24 +64,26 @@ list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
 include(FetchContent)
 
 FetchContent_Declare(
-    shardmap
-    GIT_REPOSITORY https://github.com/jcailloux/shardmap
-    GIT_TAG        v1.0.0
-    FIND_PACKAGE_ARGS 1.0
-)
-FetchContent_Declare(
     glaze
     GIT_REPOSITORY https://github.com/stephenberry/glaze.git
     GIT_TAG        v7.0.2
     FIND_PACKAGE_ARGS 7.0
 )
-FetchContent_MakeAvailable(shardmap glaze)
+FetchContent_MakeAvailable(glaze)
 
+# ParlayHash (vendored) — lock-free hash map + epoch-based reclamation
+add_library(parlayhash INTERFACE)
+target_include_directories(parlayhash INTERFACE
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/parlayhash/include")
+target_compile_features(parlayhash INTERFACE cxx_std_17)
+
+find_package(Threads REQUIRED)
 find_package(PostgreSQL REQUIRED)
 
 target_link_libraries(jcailloux-relais INTERFACE
-    $<BUILD_INTERFACE:shardmap>
     $<BUILD_INTERFACE:glaze::glaze>
+    $<BUILD_INTERFACE:parlayhash>
+    Threads::Threads
     PostgreSQL::PostgreSQL
 )
 
@@ -153,26 +199,31 @@ if(RELAIS_BUILD_TESTS)
     # -------------------------------------------------------------------------
     # Unit tests
     # -------------------------------------------------------------------------
-    relais_add_test(relais_tests                tests/relais/test_generated_wrapper.cpp          DEFINITIONS RELAIS_BUILDING_TESTS)
-    relais_add_test(test_relais_base_compile    tests/relais/test_base_repository_compile.cpp    DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;compile")
-    relais_add_test(test_relais_repo_compile    tests/relais/test_repository_compile.cpp         DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;compile")
+    relais_add_test(relais_tests                tests/relais/test_generated_entity.cpp          DEFINITIONS RELAIS_BUILDING_TESTS)
+    relais_add_test(test_relais_base_compile    tests/relais/test_pg_repo_compile.cpp    DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;compile")
+    relais_add_test(test_relais_repo_compile    tests/relais/test_repo_compile.cpp         DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;compile")
     relais_add_test(test_io_task          tests/io/test_io_task.cpp               LABELS "io")
     relais_add_test(test_io_context       tests/io/test_io_context.cpp            LABELS "io")
     relais_add_test(test_io_pg_types      tests/io/test_io_pg_types.cpp           LABELS "io")
     relais_add_test(test_io_redis_types   tests/io/test_io_redis_types.cpp        LABELS "io")
     relais_add_test(test_io_pg_pool_compile tests/io/test_io_pg_pool_compile.cpp  LABELS "io")
     relais_add_test(test_io_resp2         tests/io/test_io_resp2.cpp              LABELS "io")
+    relais_add_test(test_epoll_io_context tests/io/test_epoll_io_context.cpp    LABELS "io;epoll")
+    relais_add_test(test_batch_scheduler  tests/io/test_batch_scheduler.cpp     LABELS "io;batch")
 
     # -------------------------------------------------------------------------
     # Integration tests (require PostgreSQL + Redis)
     # -------------------------------------------------------------------------
     relais_add_test(test_io_pg_integration    tests/io/test_io_pg_integration.cpp    LABELS "io;integration" RESOURCE_LOCK)
     relais_add_test(test_io_redis_integration tests/io/test_io_redis_integration.cpp LABELS "io;integration" RESOURCE_LOCK)
+    relais_add_test(test_io_pg_pipeline       tests/io/test_pg_pipeline.cpp          LABELS "io;integration;pipeline" RESOURCE_LOCK)
+    relais_add_test(test_io_redis_pool        tests/io/test_redis_pool.cpp           LABELS "io;integration;redis-pool" RESOURCE_LOCK)
+    relais_add_test(test_batch_scheduler_integration tests/io/test_batch_scheduler_integration.cpp LABELS "io;integration;batch" RESOURCE_LOCK)
 
-    relais_add_test(test_relais_base            tests/relais/test_base_repository.cpp      DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db"                 RESOURCE_LOCK)
-    relais_add_test(test_relais_redis           tests/relais/test_redis_repository.cpp     DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;redis"            RESOURCE_LOCK)
+    relais_add_test(test_relais_base            tests/relais/test_pg_repo.cpp      DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db"                 RESOURCE_LOCK)
+    relais_add_test(test_relais_redis           tests/relais/test_redis_repo.cpp     DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;redis"            RESOURCE_LOCK)
     relais_add_test(test_relais_decl_list_cache tests/relais/test_decl_list_cache.cpp      DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;list"             RESOURCE_LOCK)
-    relais_add_test(test_relais_cached          tests/relais/test_cached_repository.cpp    DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;cache"            RESOURCE_LOCK)
+    relais_add_test(test_relais_cached          tests/relais/test_local_repo.cpp    DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;cache"            RESOURCE_LOCK)
     relais_add_test(test_relais_partition_key     tests/relais/test_partition_key.cpp          DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;partition-key"      RESOURCE_LOCK)
     relais_add_test(test_relais_full_cache      tests/relais/test_full_cache.cpp           DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;full-cache"       RESOURCE_LOCK)
     relais_add_test(test_relais_decl_list_redis tests/relais/test_decl_list_redis.cpp      DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;redis;list"       RESOURCE_LOCK)
@@ -181,7 +232,12 @@ if(RELAIS_BUILD_TESTS)
     relais_add_test(test_relais_l1_config       tests/relais/config/test_l1_config.cpp     DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;config"           RESOURCE_LOCK)
     relais_add_test(test_relais_l2_config       tests/relais/config/test_l2_config.cpp     DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;redis;config"     RESOURCE_LOCK)
     relais_add_test(test_relais_concurrency     tests/relais/test_concurrency.cpp          DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;concurrency"      RESOURCE_LOCK)
-    relais_add_test(test_relais_dbprovider_log  tests/relais/test_dbprovider_log.cpp       DEFINITIONS RELAIS_BUILDING_TESTS LABELS "integration;relais"                     RESOURCE_LOCK)
+    relais_add_test(test_relais_dbprovider_log  tests/relais/test_pg_provider_log.cpp       DEFINITIONS RELAIS_BUILDING_TESTS LABELS "integration;relais"                     RESOURCE_LOCK)
+    relais_add_test(test_relais_composite_key  tests/relais/test_composite_key.cpp        DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;composite-key"    RESOURCE_LOCK)
+    relais_add_test(test_relais_gdsf          tests/relais/test_gdsf.cpp                DEFINITIONS RELAIS_BUILDING_TESTS "RELAIS_GDSF_ENABLED=1" LABELS "relais;integration;db;gdsf"             RESOURCE_LOCK)
+    if(NOT RELAIS_GDSF_ENABLED)
+        relais_add_test(test_relais_gdsf_disabled tests/relais/test_gdsf_disabled.cpp       DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;gdsf")
+    endif()
 
     # Thread Sanitizer support for concurrency tests
     option(RELAIS_ENABLE_TSAN "Enable Thread Sanitizer for concurrency tests" OFF)
@@ -209,16 +265,21 @@ if(RELAIS_BUILD_TESTS)
             test_relais_l1_config
             test_relais_l2_config
             test_relais_concurrency
+            test_relais_composite_key
+            test_relais_gdsf
+            test_relais_gdsf_disabled
         COMMENT "Build all relais integration tests"
     )
 
-    # Single binary combining all relais tests
+    # Single binary combining all relais tests (excluding GDSF tests which
+    # require RELAIS_GDSF_ENABLED and would change behavior of all repos).
+    # GDSF tests are run via standalone binaries: test_relais_gdsf, test_relais_gdsf_disabled.
     add_executable(test_relais_all
         tests/relais/test_all_runner.cpp
-        tests/relais/test_generated_wrapper.cpp
-        tests/relais/test_base_repository.cpp
-        tests/relais/test_redis_repository.cpp
-        tests/relais/test_cached_repository.cpp
+        tests/relais/test_generated_entity.cpp
+        tests/relais/test_pg_repo.cpp
+        tests/relais/test_redis_repo.cpp
+        tests/relais/test_local_repo.cpp
         tests/relais/test_decl_list_cache.cpp
         tests/relais/test_partition_key.cpp
         tests/relais/test_full_cache.cpp
@@ -228,6 +289,7 @@ if(RELAIS_BUILD_TESTS)
         tests/relais/config/test_l1_config.cpp
         tests/relais/config/test_l2_config.cpp
         tests/relais/test_concurrency.cpp
+        tests/relais/test_composite_key.cpp
     )
     target_include_directories(test_relais_all PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
     target_compile_definitions(test_relais_all PRIVATE RELAIS_BUILDING_TESTS RELAIS_COMBINED_TESTS)
@@ -254,18 +316,34 @@ if(RELAIS_BUILD_BENCHMARKS)
     target_include_directories(bench_relais_cache PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks
         ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-    target_compile_definitions(bench_relais_cache PRIVATE RELAIS_BUILDING_TESTS)
+    target_compile_definitions(bench_relais_cache PRIVATE RELAIS_BUILDING_TESTS RELAIS_ENABLE_METRICS=1)
     target_link_libraries(bench_relais_cache PRIVATE jcailloux::relais Catch2::Catch2WithMain)
 
     add_executable(bench_io_redis benchmarks/bench_io_redis.cpp)
     target_include_directories(bench_io_redis PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks
         ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_compile_definitions(bench_io_redis PRIVATE RELAIS_ENABLE_METRICS=1)
     target_link_libraries(bench_io_redis PRIVATE jcailloux::relais Catch2::Catch2WithMain)
 
     add_executable(bench_io_pg benchmarks/bench_io_pg.cpp)
     target_include_directories(bench_io_pg PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks
         ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_compile_definitions(bench_io_pg PRIVATE RELAIS_ENABLE_METRICS=1)
     target_link_libraries(bench_io_pg PRIVATE jcailloux::relais Catch2::Catch2WithMain)
+
+    add_executable(bench_io_batch benchmarks/bench_io_batch.cpp)
+    target_include_directories(bench_io_batch PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_compile_definitions(bench_io_batch PRIVATE RELAIS_BUILDING_TESTS RELAIS_ENABLE_METRICS=1)
+    target_link_libraries(bench_io_batch PRIVATE jcailloux::relais Catch2::Catch2WithMain)
+
+    add_executable(bench_gdsf benchmarks/bench_gdsf.cpp)
+    target_include_directories(bench_gdsf PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_compile_definitions(bench_gdsf PRIVATE RELAIS_BUILDING_TESTS RELAIS_GDSF_ENABLED=1 RELAIS_ENABLE_METRICS=1)
+    target_link_libraries(bench_gdsf PRIVATE jcailloux::relais Catch2::Catch2WithMain)
 endif()

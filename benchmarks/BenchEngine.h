@@ -13,6 +13,7 @@
  */
 
 #include "jcailloux/relais/io/Task.h"
+#include "jcailloux/relais/cache/GDSFPolicy.h"
 
 #include <algorithm>
 #include <atomic>
@@ -143,29 +144,47 @@ inline BenchResult computeStats(const std::string& name, std::vector<double>& ti
 }
 
 template<typename Fn>
+inline BenchResult bench(const std::string& name, Fn&& fn) {
+    for (int i = 0; i < WARMUP; ++i) fn();
+
+    const int samples = benchSamples();
+    std::vector<double> times(samples);
+    for (int i = 0; i < samples; ++i) {
+        auto t0 = Clock::now();
+        fn();
+        times[i] = std::chrono::duration<double, std::micro>(Clock::now() - t0).count();
+    }
+
+    return computeStats(name, times);
+}
+
+template<typename SetupFn, typename Fn>
+inline BenchResult benchWithSetup(
+        const std::string& name, SetupFn&& setup, Fn&& fn) {
+    for (int i = 0; i < WARMUP; ++i) { setup(); fn(); }
+
+    const int samples = benchSamples();
+    std::vector<double> times(samples);
+    for (int i = 0; i < samples; ++i) {
+        setup();
+        auto t0 = Clock::now();
+        fn();
+        times[i] = std::chrono::duration<double, std::micro>(Clock::now() - t0).count();
+    }
+
+    return computeStats(name, times);
+}
+
+// Coroutine variants — used by I/O layer benchmarks (bench_io_redis, bench_io_pg)
+// where the overhead (~40ns) is negligible vs μs-scale I/O round-trips.
+
+template<typename Fn>
 inline io::Task<BenchResult> benchAsync(const std::string& name, Fn&& fn) {
     for (int i = 0; i < WARMUP; ++i) co_await fn();
 
     const int samples = benchSamples();
     std::vector<double> times(samples);
     for (int i = 0; i < samples; ++i) {
-        auto t0 = Clock::now();
-        co_await fn();
-        times[i] = std::chrono::duration<double, std::micro>(Clock::now() - t0).count();
-    }
-
-    co_return computeStats(name, times);
-}
-
-template<typename SetupFn, typename Fn>
-inline io::Task<BenchResult> benchWithSetupAsync(
-        const std::string& name, SetupFn&& setup, Fn&& fn) {
-    for (int i = 0; i < WARMUP; ++i) { co_await setup(); co_await fn(); }
-
-    const int samples = benchSamples();
-    std::vector<double> times(samples);
-    for (int i = 0; i < samples; ++i) {
-        co_await setup();
         auto t0 = Clock::now();
         co_await fn();
         times[i] = std::chrono::duration<double, std::micro>(Clock::now() - t0).count();
@@ -345,7 +364,9 @@ inline std::string formatDurationThroughput(
         const DurationResult& result) {
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(result.elapsed).count();
     auto ops_per_sec = (us > 0) ? result.total_ops * 1'000'000.0 / us : 0.0;
-    auto avg_us = (result.total_ops > 0) ? static_cast<double>(us) / result.total_ops : 0.0;
+    // Per-thread avg latency: wall_time / ops_per_thread
+    auto ops_per_thread = result.total_ops / std::max(threads, 1);
+    auto avg_us = (ops_per_thread > 0) ? static_cast<double>(us) / ops_per_thread : 0.0;
 
     auto bar = std::string(50, '-');
     std::ostringstream out;
@@ -362,5 +383,194 @@ inline std::string formatDurationThroughput(
         << "  " << bar;
     return out.str();
 }
+
+inline std::string formatMixedThroughput(
+        const std::string& label, int threads,
+        const DurationResult& result,
+        int64_t total_reads, int64_t total_writes,
+        double read_only_ops_per_sec = 0.0) {
+    auto us = std::chrono::duration_cast<std::chrono::microseconds>(result.elapsed).count();
+    auto read_ops_s = (us > 0) ? total_reads * 1'000'000.0 / us : 0.0;
+    auto write_ops_s = (us > 0) ? total_writes * 1'000'000.0 / us : 0.0;
+    auto total_ops_s = (us > 0) ? result.total_ops * 1'000'000.0 / us : 0.0;
+
+    // Per-thread avg operation time (blended reads + writes)
+    auto ops_per_thread = result.total_ops / std::max(threads, 1);
+    auto avg_op_us = (ops_per_thread > 0) ? static_cast<double>(us) / ops_per_thread : 0.0;
+
+    // Estimate per-write cost: if read cost = avg_op from read-only benchmark,
+    // then 0.75 * read_cost + 0.25 * write_cost = avg_op
+    // => write_cost = (avg_op - 0.75 * read_cost) / 0.25
+    double read_ratio = (result.total_ops > 0)
+        ? static_cast<double>(total_reads) / result.total_ops : 0.75;
+    double write_ratio = 1.0 - read_ratio;
+
+    auto bar = std::string(50, '-');
+    std::ostringstream out;
+    out << "\n"
+        << "  " << bar << "\n"
+        << "  " << label << "\n"
+        << "  " << bar << "\n"
+        << "  threads:         " << threads << "\n"
+        << "  duration:        " << std::fixed << std::setprecision(2)
+                                 << static_cast<double>(us) / 1'000'000 << " s\n"
+        << "  read  throughput:" << std::setw(15) << fmtOps(read_ops_s) << "\n"
+        << "  write throughput:" << std::setw(15) << fmtOps(write_ops_s) << "\n"
+        << "  total throughput:" << std::setw(15) << fmtOps(total_ops_s) << "\n"
+        << "  avg op latency:  " << fmtDuration(avg_op_us) << " /thread\n";
+
+    if (read_only_ops_per_sec > 0.0) {
+        double read_only_lat = 1'000'000.0 / (read_only_ops_per_sec / threads);
+        double est_write_lat = (avg_op_us - read_ratio * read_only_lat)
+                             / std::max(write_ratio, 0.01);
+        out << "  est. read cost:  " << fmtDuration(read_only_lat) << "\n"
+            << "  est. write cost: " << fmtDuration(est_write_lat) << "\n";
+    }
+
+    out << "  " << bar;
+    return out.str();
+}
+
+// =============================================================================
+// Multi-event-loop throughput engine (shared-nothing)
+//
+// Each worker thread runs its own EpollIoContext with its own pool and
+// `concurrency_per_thread` detached coroutines. No state is shared between
+// threads beyond the stop flag and the aggregated op counter. This is the
+// model the relais runtime is meant to scale with — one event loop per core.
+//
+// Defaults to `hardware_concurrency()/2` threads so PG/Redis on the same
+// host can use the remaining cores. Override with `BENCH_THREADS=N`.
+// =============================================================================
+
+inline int benchThreads() {
+    static int n = [] {
+        if (auto* env = std::getenv("BENCH_THREADS"))
+            if (int v = std::atoi(env); v > 0) return v;
+        unsigned hw = std::thread::hardware_concurrency();
+        if (hw < 2) return 1;
+        return static_cast<int>(hw / 2);
+    }();
+    return n;
+}
+
+struct ThroughputResult {
+    int threads;
+    int concurrency_per_thread;
+    int64_t total_ops;
+    double duration_s;
+    double throughput;          // ops/s, aggregated
+    double speedup;             // vs first result
+};
+
+/// Spawns `num_threads` worker threads and orchestrates the timed run.
+///
+/// `thread_fn` runs on each worker thread and must:
+///   1. set up its own EpollIoContext + pool (synchronous bootstrap)
+///   2. `ready.count_down()` once setup is done
+///   3. `go.wait()` to start measurement together with peers
+///   4. spawn `concurrency` DetachedTask workers that loop while `running` is
+///      true, incrementing `thread_ops` on each completed op
+///   5. `io.runUntil([&]{ return !running.load(relaxed); })` then drain
+///
+/// Bootstrap (connections, prepares, etc.) happens before `ready.count_down`
+/// so connection setup latency does not pollute the throughput window.
+template<typename ThreadFn>
+inline ThroughputResult measureMultiLoopThroughput(
+        int num_threads, int concurrency_per_thread,
+        double baseline_throughput,
+        ThreadFn&& thread_fn)
+{
+    std::atomic<bool> running{true};
+    std::atomic<int64_t> total_ops{0};
+    std::latch ready{num_threads};
+    std::latch go{1};
+
+    std::vector<std::jthread> threads;
+    threads.reserve(num_threads);
+
+    for (int i = 0; i < num_threads; ++i) {
+        threads.emplace_back([&, i] {
+            std::atomic<int64_t> thread_ops{0};
+            thread_fn(i, concurrency_per_thread, ready, go, running, thread_ops);
+            total_ops.fetch_add(thread_ops.load(std::memory_order_relaxed),
+                                std::memory_order_relaxed);
+        });
+    }
+
+    // Wait for all threads to finish setup before starting the clock.
+    ready.wait();
+    auto start = Clock::now();
+    go.count_down();
+
+    int duration_s = benchDurationSeconds();
+    std::this_thread::sleep_for(std::chrono::seconds(duration_s));
+    running.store(false, std::memory_order_relaxed);
+
+    for (auto& t : threads) t.join();
+    auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        Clock::now() - start).count();
+
+    int64_t ops_total = total_ops.load(std::memory_order_relaxed);
+    double throughput = (elapsed_us > 0)
+        ? ops_total * 1'000'000.0 / elapsed_us : 0.0;
+    double speedup = (baseline_throughput > 0)
+        ? throughput / baseline_throughput : 1.0;
+
+    return {num_threads, concurrency_per_thread,
+            ops_total,
+            static_cast<double>(elapsed_us) / 1'000'000.0,
+            throughput, speedup};
+}
+
+inline std::string formatThroughputTable(
+        const std::string& title, int num_threads,
+        const std::vector<ThroughputResult>& results)
+{
+    int duration_s = benchDurationSeconds();
+    std::ostringstream out;
+    auto bar = std::string(64, '=');
+    out << "\n  " << bar << "\n"
+        << "  " << title << "\n"
+        << "  " << bar << "\n"
+        << "  threads:        " << num_threads
+        << "  (BENCH_THREADS to override; default = hw_conc/2)\n"
+        << "  duration:       " << duration_s << ".0s\n"
+        << "\n"
+        << "  " << std::left << std::setw(22) << "workers (T x N)"
+        << std::setw(16) << "throughput"
+        << "speedup\n"
+        << "  " << std::string(22, '-') << std::string(16, '-')
+        << std::string(10, '-') << "\n";
+
+    for (const auto& r : results) {
+        std::ostringstream conc;
+        conc << r.threads << " x " << r.concurrency_per_thread
+             << " = " << (r.threads * r.concurrency_per_thread);
+        out << "  " << std::left << std::setw(22) << conc.str()
+            << std::setw(16) << fmtOps(r.throughput)
+            << std::fixed << std::setprecision(2) << r.speedup << "x\n";
+    }
+
+    out << "  " << bar;
+    return out.str();
+}
+
+#if RELAIS_ENABLE_METRICS
+inline std::string formatSweepMetrics() {
+    auto& sc = jcailloux::relais::cache::GDSFPolicy::instance().sweepCounters();
+    auto count = sc.count.load(std::memory_order_relaxed);
+    if (count == 0) return "\n  sweeps:          0";
+    auto total_ns = sc.total_ns.load(std::memory_order_relaxed);
+    double avg_us = static_cast<double>(total_ns) / static_cast<double>(count) / 1000.0;
+    auto max_ns = sc.max_ns.load(std::memory_order_relaxed);
+    double max_us = static_cast<double>(max_ns) / 1000.0;
+    std::ostringstream out;
+    out << "\n  sweeps:          " << count
+        << " (avg " << fmtDuration(avg_us)
+        << ", max " << fmtDuration(max_us) << ")";
+    return out.str();
+}
+#endif
 
 } // namespace relais_bench

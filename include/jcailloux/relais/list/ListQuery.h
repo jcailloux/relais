@@ -1,5 +1,5 @@
-#ifndef CODIBOT_LISTQUERY_H
-#define CODIBOT_LISTQUERY_H
+#ifndef JCX_RELAIS_LIST_LISTQUERY_H
+#define JCX_RELAIS_LIST_LISTQUERY_H
 
 #include <chrono>
 #include <cstdint>
@@ -10,16 +10,9 @@
 #include <vector>
 #include <glaze/glaze.hpp>
 
-namespace jcailloux::relais::cache::list {
+#include "jcailloux/relais/list/SortDirection.h"
 
-// =============================================================================
-// SortDirection - Ascending or Descending
-// =============================================================================
-
-enum class SortDirection : uint8_t {
-    Asc,
-    Desc
-};
+namespace jcailloux::relais::list {
 
 // =============================================================================
 // SortSpec - Sort field and direction
@@ -123,21 +116,19 @@ struct Cursor {
 // =============================================================================
 
 /**
- * ListQuery holds both the structured query parameters and a pre-computed hash.
+ * ListQuery holds both the structured query parameters and a canonical cache key.
  *
- * The hash is computed from the raw HTTP query string by QueryHashFilter
- * using XXH3 for maximum performance. This avoids re-hashing on every cache
- * lookup since the hash is computed once at request entry.
+ * The cache_key is a binary canonical buffer built from the parsed query fields
+ * (filters, sort, limit, cursor) in declaration order. This deterministic
+ * representation is used directly as cache key identity — no hashing.
  *
  * Usage:
- *   // In controller, after QueryHashFilter has run:
- *   auto query_hash = req->attributes()->get<size_t>("query_hash");
  *   ListQuery<Filters, SortField> query{
  *       .filters = parseFilters(req),
  *       .sort = parseSort(req),
  *       .limit = parseLimit(req),
  *       .cursor = parseCursor(req),
- *       .query_hash = query_hash
+ *       .cache_key = computedKey
  *   };
  */
 template<typename FilterSet, typename SortFieldEnum>
@@ -150,10 +141,10 @@ struct ListQuery {
     std::optional<Sort> sort;
     uint16_t limit{20};
     Cursor cursor;
-    size_t query_hash{0};  ///< Pre-computed XXH3 hash from QueryHashFilter
+    std::string cache_key;  ///< Canonical binary buffer (L1 cache key identity)
 
-    /// Returns the pre-computed hash (from HTTP query string)
-    [[nodiscard]] size_t hash() const noexcept { return query_hash; }
+    /// Returns the canonical cache key
+    [[nodiscard]] const std::string& cacheKey() const noexcept { return cache_key; }
 
     [[nodiscard]] std::shared_ptr<const std::string> json() const {
         auto buffer = std::make_shared<std::string>();
@@ -176,9 +167,9 @@ struct ListQuery {
 // CachedListResult - Result stored in cache
 // =============================================================================
 
-template<typename Entity>
+template<typename E>
 struct CachedListResult {
-    using EntityPtr = std::shared_ptr<const Entity>;
+    using EntityPtr = std::shared_ptr<const E>;
     using Clock = std::chrono::steady_clock;
     using TimePoint = Clock::time_point;
 
@@ -190,20 +181,20 @@ struct CachedListResult {
     [[nodiscard]] size_t size() const noexcept { return items.size(); }
 };
 
-}  // namespace jcailloux::relais::cache::list
+}  // namespace jcailloux::relais::list
 
 // =============================================================================
 // Glaze metadata for serialization
 // =============================================================================
 
 template<>
-struct glz::meta<jcailloux::relais::cache::list::SortDirection> {
-    using enum jcailloux::relais::cache::list::SortDirection;
+struct glz::meta<jcailloux::relais::list::SortDirection> {
+    using enum jcailloux::relais::list::SortDirection;
     static constexpr auto value = enumerate(Asc, Desc);
 };
 
 template<>
-struct glz::meta<jcailloux::relais::cache::list::Cursor> {
+struct glz::meta<jcailloux::relais::list::Cursor> {
     static constexpr auto value = object(
         "data", [](auto& self) -> auto& {
             // Serialize as base64 string
@@ -214,4 +205,4 @@ struct glz::meta<jcailloux::relais::cache::list::Cursor> {
     );
 };
 
-#endif  // CODIBOT_LISTQUERY_H
+#endif  // JCX_RELAIS_LIST_LISTQUERY_H

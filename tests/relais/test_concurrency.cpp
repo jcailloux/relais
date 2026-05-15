@@ -510,8 +510,8 @@ TEST_CASE("Concurrency - concurrent patch",
 {
     TransactionGuard tx;
 
-    using jcailloux::relais::wrapper::set;
-    using F = TestUserWrapper::Field;
+    using jcailloux::relais::entity::set;
+    using F = TestUserEntity::Field;
 
     SECTION("[L1] concurrent patch on same user") {
         auto userId = insertTestUser("conc_patch", "conc_ub@test.com", 0);
@@ -762,7 +762,7 @@ TEST_CASE("Concurrency - progressive tracker reduction",
     TransactionGuard tx;
     TestInternals::resetListCacheState<TestArticleListRepo>();
 
-    SECTION("[L1] trySweep progressively reduces modification count") {
+    SECTION("[L1] full drain removes all modifications") {
         auto userId = insertTestUser("conc_prog_author", "conc_prog@test.com", 0);
 
         // insert modifications (no concurrent cleanup)
@@ -774,18 +774,13 @@ TEST_CASE("Concurrency - progressive tracker reduction",
             sync(TestArticleListRepo::insert(article));
         }
 
-        auto initial_count = TestInternals::pendingModificationCount<TestArticleListRepo>();
-        REQUIRE(initial_count == 10);
+        REQUIRE(TestInternals::pendingModificationCount<TestArticleListRepo>() == 10);
 
-        // Run cleanup cycles (2× ShardCount to ensure all bitmap bits are cleared)
-        constexpr auto N = TestInternals::listCacheShardCount<TestArticleListRepo>();
-        for (size_t i = 0; i < 2 * N; ++i) {
-            TestInternals::forceModificationTrackerCleanup<TestArticleListRepo>();
-        }
+        // Drain every chunk deterministically (no background sweep dependency).
+        auto cutoff = TestInternals::listCacheGeneration<TestArticleListRepo>();
+        TestInternals::drainAllModificationChunks<TestArticleListRepo>(cutoff);
 
-        // After enough cycles, all 10 modifications should have been drained
-        auto final_count = TestInternals::pendingModificationCount<TestArticleListRepo>();
-        REQUIRE(final_count < initial_count);
+        REQUIRE(TestInternals::pendingModificationCount<TestArticleListRepo>() == 0);
     }
 
     SECTION("[L1] concurrent cleanup + queries don't leak modifications") {

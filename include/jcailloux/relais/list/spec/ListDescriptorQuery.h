@@ -1,0 +1,37 @@
+#ifndef JCX_RELAIS_LIST_SPEC_LISTDESCRIPTORQUERY_H
+#define JCX_RELAIS_LIST_SPEC_LISTDESCRIPTORQUERY_H
+
+#include <cstdint>
+#include <optional>
+#include <string>
+
+#include "GeneratedFilters.h"
+#include "jcailloux/relais/list/ListQuery.h"
+
+namespace jcailloux::relais::list::spec {
+
+// =============================================================================
+// ListDescriptorQuery - Query type for the declarative list system
+// =============================================================================
+
+template<typename Descriptor>
+using DescriptorSortSpec = list::SortSpec<size_t>;  // Use index instead of enum
+
+template<typename Descriptor>
+struct ListDescriptorQuery {
+    Filters<Descriptor> filters;
+    std::optional<DescriptorSortSpec<Descriptor>> sort;
+    uint16_t limit{20};
+    list::Cursor cursor;
+    uint32_t offset{0};      ///< Offset for traditional offset+limit pagination
+    std::string group_key;   ///< Canonical key for filters+sort (Redis group tracking)
+    std::string cache_key;   ///< Full canonical key: group_key + limit + cursor + offset
+
+    [[nodiscard]] const std::string& cacheKey() const noexcept { return cache_key; }
+
+    bool operator==(const ListDescriptorQuery&) const = default;
+};
+
+}  // namespace jcailloux::relais::list::spec
+
+#endif  // JCX_RELAIS_LIST_SPEC_LISTDESCRIPTORQUERY_H

@@ -1,0 +1,584 @@
+// ***************************
+// Epoch-based memory reclamation
+// Supports:
+//     epoch::with_epoch(F f),
+// which runs f within an epoch, as well as:
+//     epoch::New<T>(args...)
+//     epoch::Retire(T* a)   -- delays destruction and free
+//     epoch::Delete(T* a)   -- destructs and frees immediately
+// Retire delays destruction and free until no operation that was in a
+// with_epoch at the time it was run is still within the with_epoch.
+//
+// All operations take constant time overhead (beyond the cost of the
+// system malloc and free).
+//
+// Designed to work with C++ threads, or compatible threading
+// libraries.  In particular it uses thread_local variables, and no two
+// concurrent processes can share the same instance of the  variable.
+//
+// When NDEBUG is not set, the operations check for memory corruption
+// of the bytes immediately before and after the object, and check
+// for double retires/deletes.  Also:
+//     epoch::check_ptr(T* a)
+// will check that an object allocated using epoch::New(..) has not
+// been corrupted.
+//
+// New<T>, Retire and Delete use a shared pool for the retired lists,
+// which, although not very large, is not cleared until program
+// termination.  A private pool can be created with
+//     epoch::memory_pool<T> a;
+// which then supports a->New(args...), a->Retire(T*) and
+// a->Delete(T*).  On destruction of "a", all elements of the retired
+// lists will be destructed and freed.
+//
+// Achieves constant times overhead by incrementally taking steps.
+// In particular every Retire takes at most a constant number of
+// incremental steps towards updating the epoch and clearing the
+// retired lists.
+//
+// Developed as part of parlay project at CMU, initially for flock then
+// used for verlib, and parlayhash.
+// Current dependence on parlay is just for parlay::my_thread_id() and
+// parlay::num_thread_ids() which are from "parlay/thread_specific.h".
+// ***************************
+
+#include <atomic>
+#include <cstdlib>
+#include <functional>
+#include <ostream>
+#include <vector>
+#include <type_traits>
+#include <utility>
+// Needed for parlay::my_thread_id of parlay::num_thread_ids
+#include "threads/thread_specific.h"
+
+#ifndef PARLAY_EPOCH_H_
+#define PARLAY_EPOCH_H_
+
+#ifndef NDEBUG
+// Checks for corruption of bytes before and after allocated structures, as well as double frees.
+// Requires some extra memory to pad the front and back of a structure.
+#define EpochMemCheck 1
+#endif
+//#define EpochMemCheck 1
+
+#ifdef __linux__
+#include <linux/membarrier.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
+
+// ***************************
+// epoch structure
+// ***************************
+
+namespace epoch {
+
+  namespace internal {
+
+  inline int worker_id() {return parlay::my_thread_id(); }
+  inline int num_workers() {return parlay::num_thread_ids();}
+  constexpr int max_num_workers = 1024;
+
+    inline void epoch_barrier() {
+    #ifdef __linux__
+          syscall(__NR_membarrier, MEMBARRIER_CMD_PRIVATE_EXPEDITED, 0, 0);
+    #else
+          std::atomic_thread_fence(std::memory_order_seq_cst);
+    #endif
+        }
+
+        inline void init_membarrier() {
+    #ifdef __linux__
+          syscall(__NR_membarrier, MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED, 0, 0);
+    #endif
+    }
+
+struct alignas(64) epoch_s {
+
+  // functions to run when epoch is incremented
+  std::vector<std::function<void()>> before_epoch_hooks;
+  std::vector<std::function<void()>> after_epoch_hooks;
+
+  struct alignas(64) announce_slot {
+    std::atomic<long> last;
+    announce_slot() : last(-1l) {}
+  };
+
+  std::vector<announce_slot> announcements;
+
+  // Ticket-based epoch protection (thread-hop safe)
+  struct alignas(64) epoch_ticket {
+      std::atomic<long> epoch{-1};  // -1 = inactive
+  };
+
+  static constexpr int max_tickets = 4096;
+  epoch_ticket tickets[max_tickets];
+  std::atomic<int> ticket_free_head{0};
+  std::atomic<int> ticket_high_water{0};  // max ticket index ever acquired + 1
+  int ticket_next[max_tickets];
+  static inline thread_local int tl_cached_ticket = -1;
+
+  std::atomic<long> current_epoch;
+  epoch_s() :
+    announcements(std::vector<announce_slot>(max_num_workers)),
+    current_epoch(0),
+    epoch_state(0) {
+    for (int i = 0; i < max_tickets - 1; i++) ticket_next[i] = i + 1;
+    ticket_next[max_tickets - 1] = -1;
+    init_membarrier();
+  }
+
+  long get_current() {
+    return current_epoch.load(std::memory_order_relaxed);
+  }
+
+  long get_my_epoch() {
+    return announcements[worker_id()].last;
+  }
+
+  void set_my_epoch(long e) {
+    announcements[worker_id()].last = e;
+  }
+
+  int announce() {
+    size_t id = worker_id();
+    assert(id < max_num_workers);
+    while (true) {
+      long current_e = get_current();
+#ifdef __linux__
+      announcements[id].last.store(current_e, std::memory_order_relaxed);
+#else
+      long tmp = current_e;
+      announcements[id].last.exchange(tmp, std::memory_order_seq_cst);
+#endif
+      if (get_current() == current_e) return id;
+    }
+  }
+
+  void unannounce(size_t id) {
+    announcements[id].last.store(-1l, std::memory_order_release);
+  }
+
+  // Ticket-based announce/unannounce (thread-hop safe)
+  int acquire_ticket() {
+    int t = tl_cached_ticket;
+    if (t >= 0) { tl_cached_ticket = -1; return t; }
+    int head = ticket_free_head.load(std::memory_order_acquire);
+    while (head >= 0) {
+      if (ticket_free_head.compare_exchange_weak(
+              head, ticket_next[head],
+              std::memory_order_acq_rel, std::memory_order_acquire))
+        return head;
+    }
+    std::cerr << "epoch: out of tickets" << std::endl; abort();
+  }
+
+  void release_ticket(int t) {
+    tickets[t].epoch.store(-1l, std::memory_order_release);
+    if (tl_cached_ticket < 0) { tl_cached_ticket = t; return; }
+    int head = ticket_free_head.load(std::memory_order_relaxed);
+    do { ticket_next[t] = head; }
+    while (!ticket_free_head.compare_exchange_weak(head, t,
+            std::memory_order_release, std::memory_order_relaxed));
+  }
+
+  int announce_ticket() {
+    int t = acquire_ticket();
+    // Update high-water mark BEFORE publishing the epoch (seq_cst ordering
+    // ensures the scanner sees the high-water update before the epoch store).
+    // Safe even if scanner reads high-water before the epoch is set: the
+    // ticket has epoch=-1 (inactive), so the scanner skips it.
+    int hw = ticket_high_water.load(std::memory_order_relaxed);
+    while (t >= hw) {
+      if (ticket_high_water.compare_exchange_weak(hw, t + 1,
+              std::memory_order_seq_cst, std::memory_order_relaxed))
+        break;
+    }
+#ifdef __linux__
+    // On Linux, epoch_barrier() (MEMBARRIER_CMD_PRIVATE_EXPEDITED) guarantees
+    // that when the scanner reads this ticket, it sees our store. A stale
+    // epoch value is safe: it's conservative (prevents the scanner from
+    // advancing), and we don't hold pointers to data from before our announce.
+    // This eliminates the verification re-read of current_epoch.
+    tickets[t].epoch.store(get_current(), std::memory_order_relaxed);
+    return t;
+#else
+    while (true) {
+      long current_e = get_current();
+      long tmp = current_e;
+      tickets[t].epoch.exchange(tmp, std::memory_order_seq_cst);
+      if (get_current() == current_e) return t;
+    }
+#endif
+  }
+
+  void unannounce_ticket(int t) { release_ticket(t); }
+
+  // top 16 bits are used for the process id, and the bottom 48 for
+  // the epoch number
+  using state = size_t;
+  std::atomic<state> epoch_state;
+
+  // Attempts to takes num_steps checking the announcement array to
+  // see that all slots are up-to-date with the current epoch.  Once
+  // they are, the epoch is updated.  Designed to deamortize the cost
+  // of sweeping the announcement array--every thread only does
+  // constant work.
+  state update_epoch_steps(state prev_state, int num_steps) {
+    state current_state = epoch_state.load();
+    if (prev_state != current_state)
+      return current_state;
+    size_t i = current_state >> 48;
+    if (i == 0) epoch_barrier();
+    size_t current_e = ((1ul << 48) - 1) & current_state;
+    size_t workers = num_workers();
+    if (i == workers) {
+      // Scan only allocated tickets (high-water mark) before incrementing epoch
+      int hw = ticket_high_water.load(std::memory_order_seq_cst);
+      for (int t = 0; t < hw; t++) {
+        long te = tickets[t].epoch.load(std::memory_order_acquire);
+        if (te != -1l && te < (long)current_e) return current_state;
+      }
+      for (const auto h : before_epoch_hooks) h();
+      long tmp = current_e;
+      if (current_epoch.load() == current_e &&
+	  current_epoch.compare_exchange_strong(tmp, current_e+1)) {
+	for (const auto h : after_epoch_hooks) h();
+      }
+      state new_state = current_e + 1;
+      epoch_state.compare_exchange_strong(current_state, new_state);
+      return epoch_state.load();
+    }
+    size_t j;
+    for (j = i ; j < i + num_steps && j < workers; j++)
+      if ((announcements[j].last != -1l) && announcements[j].last < current_e)
+	return current_state;
+    state new_state = (j << 48 | current_e);
+    if (epoch_state.compare_exchange_strong(current_state, new_state))
+      return new_state;
+    return current_state;
+  }
+
+  // this version does the full sweep
+  void update_epoch() {
+    long current_e = get_current();
+    epoch_barrier();
+
+    // check if everyone is done with earlier epochs
+    int workers;
+    do {
+      workers = num_workers();
+      if (workers > max_num_workers) {
+	std::cerr << "number of threads: " << workers
+		  << ", greater than max_num_threads: " << max_num_workers << std::endl;
+	abort();
+      }
+      for (int i=0; i < workers; i++)
+	if ((announcements[i].last != -1l) && announcements[i].last < current_e)
+	  return;
+    } while (num_workers() != workers); // this is unlikely to loop
+
+    // Scan only allocated tickets (high-water mark) before incrementing epoch
+    int hw = ticket_high_water.load(std::memory_order_seq_cst);
+    for (int t = 0; t < hw; t++) {
+      long te = tickets[t].epoch.load(std::memory_order_acquire);
+      if (te != -1l && te < current_e) return;
+    }
+
+    // if so then increment current epoch
+    for (const auto h : before_epoch_hooks) h();
+    if (current_epoch.compare_exchange_strong(current_e, current_e+1)) {
+      for (const auto h : after_epoch_hooks) h();
+    }
+  }
+};
+
+  // Cached pointer for fast hot-path access (single relaxed load + branch).
+  // C++17 inline variable: single instance across all translation units.
+  inline std::atomic<epoch_s*> epoch_ptr_{nullptr};
+
+  [[gnu::noinline]] inline epoch_s& get_epoch_slow() {
+    static epoch_s epoch;
+    epoch_ptr_.store(&epoch, std::memory_order_relaxed);
+    return epoch;
+  }
+
+  // Juat one epoch structure shared by all
+  extern inline epoch_s& get_epoch() {
+    auto* p = epoch_ptr_.load(std::memory_order_relaxed);
+    if (p) [[likely]] return *p;
+    return get_epoch_slow();
+  }
+
+// ***************************
+// type specific memory pools
+// ***************************
+
+template <typename T>
+struct alignas(64) memory_pool {
+private:
+
+  // wrapper used so can pad for the memory checked version.
+  struct wrapper {
+#ifdef EpochMemCheck
+    long pad;
+    std::atomic<long> head;
+    T value;
+    std::atomic<long> tail;
+#else
+    T value;
+#endif
+  };
+
+  // each thread keeps one of these
+  struct alignas(256) old_current {
+    std::vector<wrapper*> old;      // retired items from previous epoch
+    std::vector<wrapper*> current;  // retired items from current epoch
+    long epoch; // epoch on last retire, updated on a retire
+    long retire_count; // number of retires so far, reset on updating the epoch
+    epoch_s::state e_state;
+    old_current() : epoch(0), retire_count(0), e_state(0) {}
+  };
+
+  std::vector<old_current> pools;
+
+  // values used to check for corruption or double delete
+  static constexpr long default_val = 10;
+  static constexpr long deleted_val = 55;
+
+  // given a pointer to value in a wrapper, return a pointer to the wrapper.
+  wrapper* wrapper_from_value(T* p) {
+    size_t offset = ((char*) &((wrapper*) p)->value) - ((char*) p);
+    return (wrapper*) (((char*) p) - offset);
+  }
+
+  // destructs entries on a list
+  void clear_list(std::vector<wrapper*>& lst) {
+    for (wrapper* w : lst) {
+      w->value.~T();
+      free_wrapper(w);
+    }
+    lst.clear();
+  }
+
+  void advance_epoch(int i, old_current& pid) {
+    int delay = 0;
+    long current = get_epoch().get_current();
+    if (pid.epoch + delay < current) {
+      clear_list(pid.old);
+      std::swap(pid.old, pid.current);
+      pid.epoch = current;
+    }
+    // a heuristic
+    long update_threshold = 10;
+    if (++pid.retire_count == update_threshold) {
+      pid.retire_count = 0;
+      pid.e_state = get_epoch().update_epoch_steps(pid.e_state, 8);
+    }
+  }
+
+  void check_wrapper_on_destruct(wrapper* x) {
+#ifdef EpochMemCheck
+    // check nothing is corrupted or double deleted
+    if (x->head != default_val || x->tail != default_val) {
+      if (x->head == deleted_val) std::cerr << "double free" << std::endl;
+      else if (x->head != default_val)  std::cerr << "corrupted head" << x->head << std::endl;
+      if (x->tail != default_val) std::cerr << "corrupted tail: " << x->tail << std::endl;
+      abort();
+    }
+    x->head = deleted_val;
+#endif
+  }
+
+  void set_wrapper_on_construct(wrapper* x) {
+#ifdef EpochMemCheck
+    x->pad = x->head = x->tail = default_val;
+#endif
+  }
+
+  void free_wrapper(wrapper* x) {
+    check_wrapper_on_destruct(x);
+    std::free(x);
+  }
+
+  wrapper* allocate_wrapper() {
+    wrapper* w = (wrapper*) std::malloc(sizeof(wrapper));
+    set_wrapper_on_construct(w);
+    return w;
+  }
+
+ public:
+  memory_pool() {
+    long workers = max_num_workers;
+    pools = std::vector<old_current>(workers);
+    for (int i = 0; i < workers; i++) {
+      pools[i].retire_count = 0;
+    }
+  }
+
+  memory_pool(const memory_pool&) = delete;
+  ~memory_pool() { clear(); }
+
+  // for backwards compatibility
+  void acquire(T* p) { }
+
+  template <typename ... Args>
+  T* New(Args&&... args) {
+    wrapper* x = allocate_wrapper();
+    T* newv = &x->value;
+    new (newv) T(std::forward<Args>(args)...);
+    return newv;
+  }
+
+  // f is a function that initializes a new object before it is shared
+  template <typename F, typename ... Args>
+  T* New_Init(F f, Args&&... args) {
+    T* x = New(std::forward<Args>(args)...);
+    f(x);
+    return x;
+  }
+
+  void Retire(T* p) {
+    auto i = worker_id();
+    auto &pid = pools[i];
+    advance_epoch(i, pid);
+    wrapper* w = wrapper_from_value(p);
+    pid.current.push_back(w);
+  }
+
+  // destructs and frees the object immediately
+  void Delete(T* p) {
+    p->~T();
+    free_wrapper(wrapper_from_value(p));
+  }
+
+  bool check_ptr(T* ptr, bool silent=false) {
+#ifdef EpochMemCheck
+    if (ptr == nullptr) return true;
+    wrapper* x = wrapper_from_value(ptr);
+    if (!silent) {
+      if (x->pad != default_val) std::cerr << "memory_pool, check: pad word corrupted" << x->pad << std::endl;
+      if (x->head != default_val) std::cerr << "memory_pool, check: head word corrupted" << x->head << std::endl;
+      if (x->tail != default_val) std::cerr << "memory_pool, check: tail word corrupted: " << x->tail << std::endl;
+    }
+    return (x->pad == default_val && x->head == default_val && x->tail == default_val);
+#endif
+    return true;
+  }
+
+  // Clears all the lists, to be used on termination, or could be use
+  // at a quiescent point when noone is reading any retired items.
+  void clear() {
+    get_epoch().update_epoch();
+    for (int i=0; i < num_workers(); i++) {
+      clear_list(pools[i].old);
+      clear_list(pools[i].current);
+    }
+  }
+
+  // Force a GC cycle for this worker's pool.
+  // Advances the epoch and reclaims objects that have passed the safety window.
+  void collect() {
+    get_epoch().update_epoch();
+    auto i = worker_id();
+    advance_epoch(i, pools[i]);
+  }
+
+  // Immediately reclaim all retired entries that are safe to free.
+  // Performs two epoch advancements to complete the full retirement cycle
+  // (current→old, then clear old). Entries guarded by active EpochGuards
+  // remain in the pool and will be reclaimed on subsequent calls.
+  void reclaim() {
+    auto& ep = get_epoch();
+    auto i = worker_id();
+    for (int round = 0; round < 2; ++round) {
+      ep.update_epoch();
+      advance_epoch(i, pools[i]);
+    }
+  }
+
+  void stats() {}
+};
+
+} // namespace internal
+
+// ***************************
+// The public interface
+// ***************************
+  
+  template <typename T>
+  using memory_pool = internal::memory_pool<T>;
+
+  template <typename T>
+  extern inline memory_pool<T>& get_default_pool() {
+    // Force epoch_s and ThreadIdPool initialization before memory_pool.
+    // ~memory_pool() → clear() → get_epoch().update_epoch() → num_workers().
+    // Both must outlive memory_pool, so they must be constructed first
+    // (statics are destroyed in reverse construction order).
+    // Uses static init — runs once, not on every call.
+    static const int deps_ [[maybe_unused]] =
+        (internal::get_epoch(), parlay::num_thread_ids(), 0);
+    static memory_pool<T> pool;
+    return pool;
+  }
+
+  template <typename T, typename ... Args>
+  static T* New(Args... args) {
+    return get_default_pool<T>().New(std::forward<Args>(args)...);}
+
+  template <typename T>
+  static void Delete(T* p) {get_default_pool<T>().Delete(p);}
+
+  template <typename T>
+  void Retire(T* p) {get_default_pool<T>().Retire(p);}
+    
+  template <typename T>
+  static bool check_ptr(T* p, bool silent=false) {
+    return get_default_pool<T>().check_ptr(p, silent);}
+
+  template <typename T>
+  static void clear() {get_default_pool<T>().clear();}
+
+  //template <typename T>
+  //static void stats() {get_default_pool<T>().stats();}
+
+  template <typename Thunk>
+  auto with_epoch(Thunk f) {
+    int id = internal::get_epoch().announce();
+    if constexpr (std::is_void_v<std::invoke_result_t<Thunk>>) {
+      f();
+      internal::get_epoch().unannounce(id);
+    } else {
+      auto v = f();
+      internal::get_epoch().unannounce(id);
+      return v;
+    }
+  }
+
+  // RAII guard using ticket-based epoch protection (thread-hop safe).
+  // Safe to hold across co_await — tickets are thread-agnostic.
+  struct EpochGuard {
+    int ticket_ = -1;
+    EpochGuard() = default;
+    static EpochGuard acquire() {
+      EpochGuard g;
+      g.ticket_ = internal::get_epoch().announce_ticket();
+      return g;
+    }
+    ~EpochGuard() {
+      if (ticket_ >= 0) internal::get_epoch().unannounce_ticket(ticket_);
+    }
+    EpochGuard(EpochGuard&& o) noexcept : ticket_(o.ticket_) { o.ticket_ = -1; }
+    EpochGuard& operator=(EpochGuard&& o) noexcept {
+      if (ticket_ >= 0) internal::get_epoch().unannounce_ticket(ticket_);
+      ticket_ = o.ticket_; o.ticket_ = -1; return *this;
+    }
+    EpochGuard(const EpochGuard&) = delete;
+    EpochGuard& operator=(const EpochGuard&) = delete;
+    bool active() const { return ticket_ >= 0; }
+  };
+
+} // end namespace epoch
+
+#endif //PARLAY_EPOCH_H_

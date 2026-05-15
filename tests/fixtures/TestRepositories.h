@@ -11,31 +11,38 @@
 #pragma once
 
 #include <jcailloux/relais/repository/Repo.h>
-#include <jcailloux/relais/config/repo_config.h>
-#include <jcailloux/relais/cache/InvalidateOn.h>
-#include "generated/TestItemWrapper.h"
-#include "generated/TestUserWrapper.h"
-#include "generated/TestArticleWrapper.h"
-#include "generated/TestPurchaseWrapper.h"
-#include "generated/TestEventWrapper.h"
-#include "generated/TestProductWrapper.h"
+#include <jcailloux/relais/config/CacheConfig.h>
+#include <jcailloux/relais/repository/InvalidateOn.h>
+#include "generated/TestItemEntity.h"
+#include "generated/TestUserEntity.h"
+#include "generated/TestArticleEntity.h"
+#include "generated/TestPurchaseEntity.h"
+#include "generated/TestEventEntity.h"
+#include "generated/TestProductEntity.h"
+#include "generated/TestMembershipEntity.h"
 
 namespace relais_test {
 
 // Convenience aliases
 using jcailloux::relais::Repo;
+using jcailloux::relais::Invalidate;
+using jcailloux::relais::InvalidateOn;
+using jcailloux::relais::InvalidateList;
+using jcailloux::relais::InvalidateVia;
+using jcailloux::relais::InvalidateListVia;
 namespace cache = jcailloux::relais::cache;
 namespace cfg = jcailloux::relais::config;
 
 // Type aliases — import generated wrapper names into relais_test namespace
-using entity::generated::TestItemWrapper;
-using entity::generated::TestUserWrapper;
-using entity::generated::TestArticleWrapper;
-using entity::generated::TestPurchaseWrapper;
+using entity::generated::TestItemEntity;
+using entity::generated::TestUserEntity;
+using entity::generated::TestArticleEntity;
+using entity::generated::TestPurchaseEntity;
 using TestArticleList = entity::generated::TestArticleListWrapper;
 using TestPurchaseList = entity::generated::TestPurchaseListWrapper;
-using entity::generated::TestEventWrapper;
-using entity::generated::TestProductWrapper;
+using entity::generated::TestEventEntity;
+using entity::generated::TestProductEntity;
+using entity::generated::TestMembershipEntity;
 
 // Cross-invalidation key extractors
 inline constexpr auto purchaseUserId = [](const auto& p) -> int64_t { return p.user_id; };
@@ -44,53 +51,53 @@ inline constexpr auto purchaseUserId = [](const auto& p) -> int64_t { return p.u
 // Entity Construction Helpers
 // =============================================================================
 
-inline auto makeTestItem(
+inline TestItemEntity makeTestItem(
     const std::string& name,
     int32_t value = 0,
     const std::string& description = {},
     bool is_active = true,
     int64_t id = 0
 ) {
-    TestItemWrapper entity;
+    TestItemEntity entity;
     entity.id = id;
     entity.name = name;
     entity.value = value;
     entity.description = description;
     entity.is_active = is_active;
-    return std::make_shared<const TestItemWrapper>(std::move(entity));
+    return entity;
 }
 
-inline auto makeTestUser(
+inline TestUserEntity makeTestUser(
     const std::string& username,
     const std::string& email,
     int32_t balance = 0,
     int64_t id = 0
 ) {
-    TestUserWrapper entity;
+    TestUserEntity entity;
     entity.id = id;
     entity.username = username;
     entity.email = email;
     entity.balance = balance;
-    return std::make_shared<const TestUserWrapper>(std::move(entity));
+    return entity;
 }
 
-inline auto makeTestPurchase(
+inline TestPurchaseEntity makeTestPurchase(
     int64_t user_id,
     const std::string& product_name,
     int32_t amount,
     const std::string& status = "pending",
     int64_t id = 0
 ) {
-    TestPurchaseWrapper entity;
+    TestPurchaseEntity entity;
     entity.id = id;
     entity.user_id = user_id;
     entity.product_name = product_name;
     entity.amount = amount;
     entity.status = status;
-    return std::make_shared<const TestPurchaseWrapper>(std::move(entity));
+    return entity;
 }
 
-inline auto makeTestArticle(
+inline TestArticleEntity makeTestArticle(
     const std::string& category,
     int64_t author_id,
     const std::string& title,
@@ -98,14 +105,14 @@ inline auto makeTestArticle(
     bool is_published = false,
     int64_t id = 0
 ) {
-    TestArticleWrapper entity;
+    TestArticleEntity entity;
     entity.id = id;
     entity.category = category;
     entity.author_id = author_id;
     entity.title = title;
     entity.view_count = view_count;
     entity.is_published = is_published;
-    return std::make_shared<const TestArticleWrapper>(std::move(entity));
+    return entity;
 }
 
 // =============================================================================
@@ -116,31 +123,22 @@ namespace test_config {
 
 using namespace jcailloux::relais::config;
 
-/// Short TTL for expiration tests — L1 expires quickly, no expired acceptance
+/// Short TTL for expiration tests — L1 expires quickly, GDSF evicts on cleanup
+/// CachedClock uses uint32_t seconds → minimum useful TTL is 1 second.
 inline constexpr auto ShortTTL = Local
-    .with_l1_ttl(std::chrono::milliseconds{100})
-    .with_l1_accept_expired_on_get(false)
-    .with_l1_refresh_on_get(false);
+    .with_l1_ttl(std::chrono::seconds{1});
 
 /// Write-through strategy — PopulateImmediately on update
 inline constexpr auto WriteThrough = Local
     .with_update_strategy(UpdateStrategy::PopulateImmediately);
 
-/// No refresh on get — TTL not extended on cache hit
-inline constexpr auto NoRefresh = Local
-    .with_l1_ttl(std::chrono::milliseconds{200})
-    .with_l1_refresh_on_get(false)
-    .with_l1_accept_expired_on_get(true);
+/// Few chunks for predictable cleanup testing
+inline constexpr auto FewChunks = Local
+    .with_l1_chunk_count_log2(1);  // 2^1 = 2 chunks
 
-/// Accept expired entries — returns expired entries until cleanup
-inline constexpr auto AcceptExpired = Local
-    .with_l1_ttl(std::chrono::milliseconds{100})
-    .with_l1_accept_expired_on_get(true)
-    .with_l1_refresh_on_get(false);
-
-/// Few shards for predictable cleanup testing
-inline constexpr auto FewShards = Local
-    .with_l1_shard_count_log2(1);  // 2^1 = 2 shards
+/// Bare L1 for benchmarks — no TTL, no GDSF, zero metadata per entry
+inline constexpr auto BareL1 = Local
+    .with_l1_ttl(Duration{});
 
 /// Read-only presets
 inline constexpr auto ReadOnlyUncached = Uncached.with_read_only();
@@ -152,87 +150,85 @@ inline constexpr auto ReadOnlyL2 = Redis.with_read_only();
 // Test Repositories - TestItem (no ListDescriptor)
 // =============================================================================
 
-/// No caching — tests BaseRepo directly
-using UncachedTestItemRepo = Repo<TestItemWrapper, "test:uncached", cfg::Uncached>;
+/// No caching — tests PgRepo directly
+using UncachedTestItemRepo = Repo<TestItemEntity, "test:uncached", cfg::Uncached>;
 
-/// L1 only — tests CachedRepo without Redis
-using L1TestItemRepo = Repo<TestItemWrapper, "test:l1">;
+/// L1 only — tests LocalRepo without Redis
+using L1TestItemRepo = Repo<TestItemEntity, "test:l1">;
 
 /// L2 only — tests RedisRepo
-using L2TestItemRepo = Repo<TestItemWrapper, "test:l2", cfg::Redis>;
+using L2TestItemRepo = Repo<TestItemEntity, "test:l2", cfg::Redis>;
 
 /// Both L1+L2 — tests full hierarchy
-using FullCacheTestItemRepo = Repo<TestItemWrapper, "test:both", cfg::Both>;
+using FullCacheTestItemRepo = Repo<TestItemEntity, "test:both", cfg::Both>;
 
 // Configuration test repositories
-using ShortTTLTestItemRepo = Repo<TestItemWrapper, "test:short_ttl", test_config::ShortTTL>;
-using WriteThroughTestItemRepo = Repo<TestItemWrapper, "test:write_through", test_config::WriteThrough>;
-using NoRefreshTestItemRepo = Repo<TestItemWrapper, "test:no_refresh", test_config::NoRefresh>;
-using AcceptExpiredTestItemRepo = Repo<TestItemWrapper, "test:accept_expired", test_config::AcceptExpired>;
-using FewShardsTestItemRepo = Repo<TestItemWrapper, "test:few_shards", test_config::FewShards>;
+using ShortTTLTestItemRepo = Repo<TestItemEntity, "test:short_ttl", test_config::ShortTTL>;
+using WriteThroughTestItemRepo = Repo<TestItemEntity, "test:write_through", test_config::WriteThrough>;
+using FewChunksTestItemRepo = Repo<TestItemEntity, "test:few_chunks", test_config::FewChunks>;
 
 // =============================================================================
 // User Repositories (no ListDescriptor)
 // =============================================================================
 
-using UncachedTestUserRepo = Repo<TestUserWrapper, "test:user:uncached", cfg::Uncached>;
-using L1TestUserRepo = Repo<TestUserWrapper, "test:user:l1">;
-using L2TestUserRepo = Repo<TestUserWrapper, "test:user:l2", cfg::Redis>;
-using FullCacheTestUserRepo = Repo<TestUserWrapper, "test:user:both", cfg::Both>;
+using UncachedTestUserRepo = Repo<TestUserEntity, "test:user:uncached", cfg::Uncached>;
+using L1TestUserRepo = Repo<TestUserEntity, "test:user:l1">;
+using L2TestUserRepo = Repo<TestUserEntity, "test:user:l2", cfg::Redis>;
+using FullCacheTestUserRepo = Repo<TestUserEntity, "test:user:both", cfg::Both>;
 
 // =============================================================================
 // Purchase Repositories (has ListDescriptor → ListMixin auto-detected)
 // =============================================================================
 
 /// Purchase without cross-invalidation
-using UncachedTestPurchaseRepo = Repo<TestPurchaseWrapper, "test:purchase:uncached", cfg::Uncached>;
+using UncachedTestPurchaseRepo = Repo<TestPurchaseEntity, "test:purchase:uncached", cfg::Uncached>;
 
 /// Purchase L1 with cross-invalidation → User
-using L1TestPurchaseRepo = Repo<TestPurchaseWrapper, "test:purchase:l1", cfg::Local,
-    cache::Invalidate<L1TestUserRepo, purchaseUserId>>;
+using L1TestPurchaseRepo = Repo<TestPurchaseEntity, "test:purchase:l1", cfg::Local,
+    Invalidate<L1TestUserRepo, purchaseUserId>>;
 
 // =============================================================================
 // Article Repositories (has ListDescriptor → ListMixin auto-detected)
 // =============================================================================
 
-using UncachedTestArticleRepo = Repo<TestArticleWrapper, "test:article:uncached", cfg::Uncached>;
-using L1TestArticleRepo = Repo<TestArticleWrapper, "test:article:l1">;
-using L2TestArticleRepo = Repo<TestArticleWrapper, "test:article:l2", cfg::Redis>;
+using UncachedTestArticleRepo = Repo<TestArticleEntity, "test:article:uncached", cfg::Uncached>;
+using L1TestArticleRepo = Repo<TestArticleEntity, "test:article:l1">;
+using L2TestArticleRepo = Repo<TestArticleEntity, "test:article:l2", cfg::Redis>;
 
 // =============================================================================
 // ListDescriptor Repositories — auto-detected from Entity's embedded descriptor
 // =============================================================================
 
-/// Article list — ListMixin auto-detected (TestArticleWrapper has ListDescriptor)
-using TestArticleListRepo = Repo<TestArticleWrapper, "test:article:list:l1">;
+/// Article list — ListMixin auto-detected (TestArticleEntity has ListDescriptor)
+using TestArticleListRepo = Repo<TestArticleEntity, "test:article:list:l1">;
 
 /// Alias for the augmented descriptor — used by tests building ListDescriptorQuery
 using TestArticleListDecl = TestArticleListRepo::ListDescriptorType;
 
 /// Purchase list — same pattern
-using TestPurchaseListRepo = Repo<TestPurchaseWrapper, "test:purchase:list:l1">;
+using TestPurchaseListRepo = Repo<TestPurchaseEntity, "test:purchase:list:l1">;
 
 // =============================================================================
 // Read-only Repositories
 // =============================================================================
 
 /// Base-level read-only — no caching, no writes allowed
-using ReadOnlyTestItemRepo = Repo<TestItemWrapper, "test:readonly:uncached", test_config::ReadOnlyUncached>;
+using ReadOnlyTestItemRepo = Repo<TestItemEntity, "test:readonly:uncached", test_config::ReadOnlyUncached>;
 
 /// L2 read-only — Redis caching, no writes allowed
-using ReadOnlyL2TestItemRepo = Repo<TestItemWrapper, "test:readonly:l2", test_config::ReadOnlyL2>;
+using ReadOnlyL2TestItemRepo = Repo<TestItemEntity, "test:readonly:l2", test_config::ReadOnlyL2>;
 
 /// L2 read-only user — Redis caching, no writes.
 /// RedisRepo provides invalidate() for cross-invalidation target use.
-using ReadOnlyL2TestUserRepo = Repo<TestUserWrapper, "test:readonly:user:l2", test_config::ReadOnlyL2>;
+using ReadOnlyL2TestUserRepo = Repo<TestUserEntity, "test:readonly:user:l2", test_config::ReadOnlyL2>;
 
 // =============================================================================
 // Product Repositories (column= mapping: C++ field names ≠ DB column names)
 // =============================================================================
 
-using UncachedTestProductRepo = Repo<TestProductWrapper, "test:product:uncached", cfg::Uncached>;
+using UncachedTestProductRepo = Repo<TestProductEntity, "test:product:uncached", cfg::Uncached>;
 
-inline auto makeTestProduct(
+inline TestProductEntity makeTestProduct(
     const std::string& productName,
     int32_t stockLevel = 0,
     std::optional<int32_t> discountPct = std::nullopt,
@@ -240,14 +236,14 @@ inline auto makeTestProduct(
     const std::string& description = {},
     int64_t id = 0
 ) {
-    TestProductWrapper entity;
+    TestProductEntity entity;
     entity.id = id;
     entity.productName = productName;
     entity.stockLevel = stockLevel;
     entity.discountPct = discountPct;
     entity.available = available;
     entity.description = description;
-    return std::make_shared<const TestProductWrapper>(std::move(entity));
+    return entity;
 }
 
 // =============================================================================
@@ -257,29 +253,50 @@ inline auto makeTestProduct(
 // Cross-invalidation key extractor: Event -> User
 inline constexpr auto eventUserId = [](const auto& e) -> int64_t { return e.user_id; };
 
-inline auto makeTestEvent(
+inline TestEventEntity makeTestEvent(
     const std::string& region,
     int64_t user_id,
     const std::string& title,
     int32_t priority = 0,
     int64_t id = 0
 ) {
-    TestEventWrapper entity;
+    TestEventEntity entity;
     entity.id = id;
     entity.region = region;
     entity.user_id = user_id;
     entity.title = title;
     entity.priority = priority;
-    return std::make_shared<const TestEventWrapper>(std::move(entity));
+    return entity;
 }
 
 // =============================================================================
 // Event Repositories (PartitionKey: Key auto-deduced as int64_t from Mapping)
 // =============================================================================
 
-using UncachedTestEventRepo = Repo<TestEventWrapper, "test:event:partial:uncached", cfg::Uncached>;
-using L1TestEventRepo = Repo<TestEventWrapper, "test:event:partial:l1">;
-using L2TestEventRepo = Repo<TestEventWrapper, "test:event:partial:l2", cfg::Redis>;
-using L1L2TestEventRepo = Repo<TestEventWrapper, "test:event:partial:both", cfg::Both>;
+using UncachedTestEventRepo = Repo<TestEventEntity, "test:event:partial:uncached", cfg::Uncached>;
+using L1TestEventRepo = Repo<TestEventEntity, "test:event:partial:l1">;
+using L2TestEventRepo = Repo<TestEventEntity, "test:event:partial:l2", cfg::Redis>;
+using L1L2TestEventRepo = Repo<TestEventEntity, "test:event:partial:both", cfg::Both>;
+
+// =============================================================================
+// Membership Repositories (composite key: user_id + group_id)
+// =============================================================================
+
+using UncachedTestMembershipRepo = Repo<TestMembershipEntity, "test:member:uncached", cfg::Uncached>;
+using L1TestMembershipRepo = Repo<TestMembershipEntity, "test:member:l1">;
+using L2TestMembershipRepo = Repo<TestMembershipEntity, "test:member:l2", cfg::Redis>;
+using FullCacheTestMembershipRepo = Repo<TestMembershipEntity, "test:member:both", cfg::Both>;
+
+inline TestMembershipEntity makeTestMembership(
+    int64_t user_id,
+    int64_t group_id,
+    const std::string& role = ""
+) {
+    TestMembershipEntity entity;
+    entity.user_id = user_id;
+    entity.group_id = group_id;
+    entity.role = role;
+    return entity;
+}
 
 } // namespace relais_test

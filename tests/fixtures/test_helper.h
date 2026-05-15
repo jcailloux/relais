@@ -14,10 +14,11 @@
 #include <jcailloux/relais/io/pg/PgResult.h>
 #include <jcailloux/relais/io/pg/PgParams.h>
 #include <jcailloux/relais/io/redis/RedisClient.h>
-#include <jcailloux/relais/DbProvider.h>
+#include <jcailloux/relais/PgProvider.h>
 
 #include <fixtures/EpollIoContext.h>
 #include <fixtures/TestRunner.h>
+#include <jcailloux/relais/cache/GDSFPolicy.h>
 
 #include <catch2/reporters/catch_reporter_event_listener.hpp>
 #include <catch2/reporters/catch_reporter_registrars.hpp>
@@ -179,7 +180,7 @@ namespace detail {
     inline void cleanup() {
         if (isInitialized().exchange(false)) {
             testLoop().stop();
-            jcailloux::relais::DbProvider::reset();
+            jcailloux::relais::PgProvider::reset();
             testRedis().reset();
             testPg().reset();
         }
@@ -248,6 +249,13 @@ inline void sync(io::Task<void> task) {
     future.get();
 }
 
+template<typename T>
+T sync(io::Immediate<T> imm) {
+    if (imm.await_ready())
+        return imm.await_resume();
+    return sync(imm.take_task());
+}
+
 /**
  * Execute a query and return the PgResult.
  */
@@ -279,7 +287,7 @@ inline const char* getConnInfo() {
 
 /**
  * Initialize I/O for integration tests.
- * Phase 1: synchronous init (PgPool, Redis, DbProvider) via runTask().
+ * Phase 1: synchronous init (PgPool, Redis, PgProvider) via runTask().
  * Phase 2: start background event loop thread for concurrent sync() calls.
  */
 inline void initTest() {
@@ -290,8 +298,16 @@ inline void initTest() {
     auto& io = detail::testIo();
 
     // Phase 1: Synchronous initialization (no background thread yet)
+    int pg_min = 2, pg_max = 4;
+    if (auto* env = std::getenv("BENCH_PG_POOL_MAX")) {
+        int v = std::atoi(env);
+        if (v >= 2 && v <= 64) {
+            pg_max = v;
+            pg_min = std::max(2, v / 4);
+        }
+    }
     auto pool = io::test::runTask(io,
-        io::PgPool<IoCtx>::create(io, getConnInfo(), 2, 4));
+        io::PgPool<IoCtx>::create(io, getConnInfo(), pg_min, pg_max));
 
     detail::testPg() = std::make_shared<io::PgClient<IoCtx>>(pool);
 
@@ -307,7 +323,7 @@ inline void initTest() {
     }
     detail::testRedis() = redis;
 
-    jcailloux::relais::DbProvider::init(pool, redis);
+    jcailloux::relais::PgProvider::init(io, pool, redis, pg_max);
 
     // Phase 2: Start background event loop thread
     detail::testLoop().start();
@@ -359,7 +375,7 @@ public:
 
 private:
     static void cleanup() {
-        if (!jcailloux::relais::DbProvider::initialized()) {
+        if (!jcailloux::relais::PgProvider::initialized()) {
             return;
         }
         flushRedis();
@@ -372,6 +388,10 @@ private:
         try { sync(pg->query("DELETE FROM relais_test_users")); } catch (...) {}
         try { sync(pg->query("DELETE FROM relais_test_items")); } catch (...) {}
         try { sync(pg->query("DELETE FROM relais_test_products")); } catch (...) {}
+        try { sync(pg->query("DELETE FROM relais_test_memberships")); } catch (...) {}
+
+        // Reset GDSF global state for test isolation
+        jcailloux::relais::cache::GDSFPolicy::instance().resetForTesting();
     }
 };
 
@@ -588,6 +608,22 @@ inline int64_t insertTestProduct(
 }
 
 // =============================================================================
+// Membership (composite key) helpers
+// =============================================================================
+
+inline void insertTestMembership(
+    int64_t user_id,
+    int64_t group_id,
+    const std::string& role = ""
+) {
+    execQueryArgs(
+        "INSERT INTO relais_test_memberships (user_id, group_id, role) "
+        "VALUES ($1, $2, $3)",
+        user_id, group_id, role
+    );
+}
+
+// =============================================================================
 // Cache Testing Utilities
 // =============================================================================
 
@@ -603,7 +639,7 @@ void forcePurge() {
 
 template<typename Repo>
 void trySweep() {
-    Repo::trySweep();
+    jcailloux::relais::cache::GDSFPolicy::instance().sweep();
 }
 
 } // namespace relais_test
