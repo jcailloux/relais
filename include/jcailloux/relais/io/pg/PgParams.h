@@ -5,7 +5,10 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <vector>
+
+#include "jcailloux/relais/TypeTraits.h"
 
 namespace jcailloux::relais::io {
 
@@ -80,6 +83,12 @@ private:
 
     std::string value_;
     bool null_ = true;
+
+    friend bool operator==(const PgParam& a, const PgParam& b) noexcept {
+        if (a.null_ != b.null_) return false;
+        if (a.null_) return true;
+        return a.value_ == b.value_;
+    }
 };
 
 // PgParams — helper to build parameter arrays for PQsendQueryParams
@@ -140,6 +149,101 @@ struct PgParams {
 
     void pushNull() { params.push_back(PgParam::null()); }
 
+    /// Build params from a key (expands tuples into individual params).
+    template<typename Key>
+    static PgParams fromKey(const Key& key) {
+        if constexpr (is_tuple_v<Key>) {
+            PgParams r;
+            std::apply([&](const auto&... a) {
+                r.params.reserve(sizeof...(a));
+                (r.params.push_back(toParam(a)), ...);
+            }, key);
+            return r;
+        } else {
+            return make(key);
+        }
+    }
+
+    /// Number of params a key expands to (compile-time).
+    template<typename Key>
+    static constexpr size_t keyParamCount() {
+        if constexpr (is_tuple_v<Key>) {
+            return std::tuple_size_v<Key>;
+        } else {
+            return 1;
+        }
+    }
+
+    /// Build PG array literals from a vector of PgParams (one per key).
+    /// Returns N PgParams objects, one per key column, each containing the
+    /// PG array literal: {val1,val2,...}
+    ///
+    /// For simple keys (1 param each): returns a single PgParams with one array.
+    /// For composite keys (N params each): returns a single PgParams with N arrays.
+    ///
+    /// Example: keys [PgParams({1}), PgParams({2}), PgParams({3})]
+    ///   → PgParams with one param: "{1,2,3}"
+    ///
+    /// Example: composite keys [PgParams({1,"a"}), PgParams({2,"b"})]
+    ///   → PgParams with two params: "{1,2}" and "{a,b}"
+    static PgParams buildArrayLiteral(const std::vector<PgParams>& keys) {
+        if (keys.empty()) return {};
+
+        size_t n_cols = keys[0].params.size();
+        PgParams result;
+        result.params.reserve(n_cols);
+
+        for (size_t col = 0; col < n_cols; ++col) {
+            std::string arr = "{";
+            for (size_t i = 0; i < keys.size(); ++i) {
+                if (i > 0) arr += ',';
+                const auto& p = keys[i].params[col];
+                if (p.isNull()) {
+                    arr += "NULL";
+                } else {
+                    // Escape values: quote if they contain special chars
+                    std::string_view val(p.data(),
+                        static_cast<size_t>(p.length()));
+                    bool needs_quoting = val.empty();
+                    if (!needs_quoting) {
+                        for (char c : val) {
+                            if (c == ',' || c == '{' || c == '}' || c == '"'
+                                || c == '\\' || c == ' ') {
+                                needs_quoting = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (needs_quoting) {
+                        arr += '"';
+                        for (char c : val) {
+                            if (c == '"' || c == '\\') arr += '\\';
+                            arr += c;
+                        }
+                        arr += '"';
+                    } else {
+                        arr += val;
+                    }
+                }
+            }
+            arr += '}';
+            result.params.push_back(PgParam(std::move(arr)));
+        }
+
+        return result;
+    }
+
+    /// Extract key column values as strings from a PgParams (for result matching).
+    [[nodiscard]] std::vector<std::string> keyValues() const {
+        std::vector<std::string> vals;
+        vals.reserve(params.size());
+        for (const auto& p : params) {
+            vals.emplace_back(p.isNull() ? "" : std::string(p.data(),
+                static_cast<size_t>(p.length())));
+        }
+        return vals;
+    }
+
 private:
     static PgParam toParam(PgParam p) { return p; }
     static PgParam toParam(int32_t v) { return PgParam::integer(v); }
@@ -154,6 +258,10 @@ private:
     template<typename T>
     static PgParam toParam(const std::optional<T>& v) {
         return PgParam::fromOptional(v);
+    }
+
+    friend bool operator==(const PgParams& a, const PgParams& b) noexcept {
+        return a.params == b.params;
     }
 };
 

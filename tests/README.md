@@ -59,15 +59,15 @@ tests/
 │   │   ├── TestArticleMapping.h     # + ListDescriptor
 │   │   ├── TestPurchaseMapping.h    # + ListDescriptor
 │   │   ├── TestOrderMapping.h
-│   │   └── TestEventWrapper.h       # Partition key wrapper (Key + partition hint)
-│   ├── test_helper.h        # DbProvider init, TransactionGuard, sync helpers
+│   │   └── TestEventEntity.h        # Partition key entity (Key + partition hint)
+│   ├── test_helper.h        # PgProvider init, TransactionGuard, sync helpers
 │   ├── TestItem.h            # Pure data struct with @relais annotations
 │   ├── TestUser.h            # ...
 │   ├── TestArticle.h
 │   ├── TestPurchase.h
 │   ├── TestOrder.h           # Complex struct (nested, enum, vectors, raw JSON)
 │   ├── TestEvent.h           # Pure data struct for partitioned table
-│   ├── TestEntities.h       # EntityWrapper<Struct, Mapping> type aliases
+│   ├── TestEntities.h       # Entity<Struct, Mapping> type aliases
 │   └── TestRepositories.h   # Repo classes with 4+ cache configs
 ├── migrations/
 │   ├── 000001_create_test_items.sql
@@ -76,10 +76,10 @@ tests/
 ├── config/
 │   ├── test_l1_config.cpp          # Exhaustive L1 config parameter tests (TTL, refresh, cleanup)
 │   └── test_l2_config.cpp          # Exhaustive L2 config parameter tests (TTL, refresh, strategy)
-├── test_generated_wrapper.cpp      # Unit tests for struct + EntityWrapper + ListWrapper
-├── test_base_repository.cpp        # Tests for BaseRepo (no cache) + patch
-├── test_redis_repository.cpp       # Tests for RedisRepo (L2 cache)
-├── test_cached_repository.cpp      # Tests for CachedRepo (L1 cache)
+├── test_generated_entity.cpp       # Unit tests for struct + Entity + ListWrapper
+├── test_pg_repo.cpp                # Tests for PgRepo (no cache) + patch
+├── test_redis_repo.cpp             # Tests for RedisRepo (L2 cache)
+├── test_local_repo.cpp             # Tests for LocalRepo (L1 cache)
 ├── test_full_cache.cpp             # Tests for L1+L2 (Both) cache hierarchy interaction
 ├── test_decl_list_cache.cpp        # Tests for ListMixin (L1 list cache)
 ├── test_decl_list_redis.cpp        # Tests for declarative list caching at L2 (Redis)
@@ -110,7 +110,7 @@ ctest -L integration --output-on-failure
 
 ### Specific Test Case
 ```bash
-./test_relais_base "[BaseRepo] CRUD Operations"
+./test_relais_base "[PgRepo] CRUD Operations"
 ```
 
 ### With Verbose Output
@@ -141,7 +141,7 @@ This ensures complete isolation between tests without leaving data behind.
 
 ## patch Tests
 
-`test_base_repository.cpp` includes tests for partial field updates via `patch`:
+`test_pg_repo.cpp` includes tests for partial field updates via `patch`:
 
 - **Single field update**: Modifies only one column, verifies other columns are unchanged
 - **Multiple field update**: Modifies several columns in a single call

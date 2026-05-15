@@ -21,13 +21,13 @@
 #include "fixtures/RelaisTestAccessors.h"
 using namespace relais_test;
 
-namespace decl = jcailloux::relais::cache::list::decl;
+namespace decl = jcailloux::relais::list::spec;
 
 // =============================================================================
-// Helper: build a TestArticleWrapper from raw values (no DB round-trip)
+// Helper: build a TestArticleEntity from raw values (no DB round-trip)
 // =============================================================================
 
-std::shared_ptr<const TestArticleWrapper> makeArticle(
+TestArticleEntity makeArticle(
     int64_t id,
     const std::string& category,
     int64_t author_id,
@@ -49,16 +49,15 @@ TestListQuery makeViewCountQuery(std::string_view category, uint16_t limit) {
     TestListQuery q;
     q.limit = limit;
 
-    // Filter index 0 = category (string_view — must point to stable storage)
-    q.filters.get<0>() = category;
+    // Filter index 1 = category (alphabetical: author_id=0, category=1)
+    q.filters.get<1>() = category;
 
     // Sort index 1 = view_count, DESC
-    q.sort = jcailloux::relais::cache::list::SortSpec<size_t>{1, jcailloux::relais::cache::list::SortDirection::Desc};
+    q.sort = jcailloux::relais::list::SortSpec<size_t>{1, jcailloux::relais::list::SortDirection::Desc};
 
-    // Unique hash per (category, limit, sort)
-    q.query_hash = std::hash<std::string_view>{}(category)
-                 ^ (static_cast<size_t>(limit) * 0x9e3779b9)
-                 ^ 0xDEAD;  // salt to avoid collision with other tests
+    // Canonical cache keys
+    q.group_key = decl::groupCacheKey<TestDecl>(q);
+    q.cache_key = decl::cacheKey<TestDecl>(q);
     return q;
 }
 
@@ -500,51 +499,50 @@ TEST_CASE("[DeclListRepo] ModificationTracker cleanup",
         insertTestArticle("tech", alice_id, "cleanup_" + std::to_string(vc), vc);
     }
 
-    SECTION("[tracker-cleanup] old modifications are removed after enough cleanup cycles") {
+    SECTION("[tracker-cleanup] modifications are removed after draining all chunks") {
         // Build entity manually (no DB round-trip needed for notification)
         auto entity1 = makeArticle(9001, "tech", alice_id, "cleanup_new", 35);
         TestArticleListRepo::notifyCreated(entity1);
         CHECK(TestInternals::pendingModificationCount<TestArticleListRepo>() == 1);
 
-        // ModificationTracker uses a bitmap with ShardCount bits (one per shard).
-        // Each cleanup cycle clears one shard's bit. After ShardCount cycles,
-        // all bits are cleared → bitmap=0 → modification removed.
-        constexpr auto N = TestInternals::listCacheShardCount<TestArticleListRepo>();
-        for (size_t i = 0; i < N; ++i) {
-            TestInternals::forceModificationTrackerCleanup<TestArticleListRepo>();
-        }
+        // ModificationTracker uses a bitmap with ChunkCount bits (one per chunk).
+        // Draining every chunk clears the bitmap → modification removed.
+        auto cutoff = TestInternals::listCacheGeneration<TestArticleListRepo>();
+        TestInternals::drainAllModificationChunks<TestArticleListRepo>(cutoff);
 
         CHECK(TestInternals::pendingModificationCount<TestArticleListRepo>() == 0);
     }
 
-    SECTION("[tracker-cleanup] recent modifications survive cleanup") {
-        constexpr auto N = TestInternals::listCacheShardCount<TestArticleListRepo>();
+    SECTION("[tracker-cleanup] recent modifications survive partial drain") {
+        constexpr auto N = TestInternals::listCacheChunkCount<TestArticleListRepo>();
 
         // Build entities manually
         auto entity1 = makeArticle(9001, "tech", alice_id, "cleanup_a", 15);
         TestArticleListRepo::notifyCreated(entity1);
+        auto cutoff1 = TestInternals::listCacheGeneration<TestArticleListRepo>();
         CHECK(TestInternals::pendingModificationCount<TestArticleListRepo>() == 1);
 
-        // Run 1 cleanup cycle
-        TestInternals::forceModificationTrackerCleanup<TestArticleListRepo>();
-        CHECK(TestInternals::pendingModificationCount<TestArticleListRepo>() == 1);  // Still there
+        // Drain chunk 0 → entity1 has N-1 bits remaining
+        TestInternals::cleanupModificationsWithCutoff<TestArticleListRepo>(cutoff1, 0);
+        CHECK(TestInternals::pendingModificationCount<TestArticleListRepo>() == 1);
 
         // Notify second creation
         auto entity2 = makeArticle(9002, "tech", alice_id, "cleanup_b", 25);
         TestArticleListRepo::notifyCreated(entity2);
+        auto cutoff2 = TestInternals::listCacheGeneration<TestArticleListRepo>();
         CHECK(TestInternals::pendingModificationCount<TestArticleListRepo>() == 2);
 
-        // Run N-1 more cycles — entity1 has seen N total shards, entity2 has seen N-1
-        for (size_t i = 0; i < N - 1; ++i) {
-            TestInternals::forceModificationTrackerCleanup<TestArticleListRepo>();
+        // Drain chunks 1..N-1 with cutoff2 → affects both entity1 and entity2
+        for (uint8_t c = 1; c < N; ++c) {
+            TestInternals::cleanupModificationsWithCutoff<TestArticleListRepo>(cutoff2, c);
         }
 
-        // entity1: 1 + (N-1) = N bits cleared → bitmap=0 → REMOVED
-        // entity2: 0 + (N-1) = N-1 bits cleared → 1 bit remaining → KEPT
+        // entity1: chunks 0,1,...,N-1 all cleared → bitmap=0 → REMOVED
+        // entity2: chunks 1,...,N-1 cleared (N-1 bits), chunk 0 still set → KEPT
         CHECK(TestInternals::pendingModificationCount<TestArticleListRepo>() == 1);
 
-        // One more cycle removes entity2
-        TestInternals::forceModificationTrackerCleanup<TestArticleListRepo>();
+        // Drain chunk 0 with cutoff2 → entity2 removed
+        TestInternals::cleanupModificationsWithCutoff<TestArticleListRepo>(cutoff2, 0);
         CHECK(TestInternals::pendingModificationCount<TestArticleListRepo>() == 0);
     }
 
@@ -598,9 +596,8 @@ TEST_CASE("[DeclListRepo] Modification cutoff safety",
         auto entity1 = makeArticle(9001, "tech", alice_id, "before_cutoff", 10);
         TestArticleListRepo::notifyCreated(entity1);
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
-        auto cutoff = std::chrono::steady_clock::now();
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        // Capture generation after M1 as cutoff
+        auto cutoff = TestInternals::listCacheGeneration<TestArticleListRepo>();
 
         // M2: after cutoff
         auto entity2 = makeArticle(9002, "tech", alice_id, "after_cutoff", 20);
@@ -610,7 +607,7 @@ TEST_CASE("[DeclListRepo] Modification cutoff safety",
 
         // Run ShardCount cleanup cycles with the cutoff, one per shard identity.
         // Only M1 (before cutoff) has its bits cleared. M2 (after cutoff) is skipped.
-        constexpr auto N = TestInternals::listCacheShardCount<TestArticleListRepo>();
+        constexpr auto N = TestInternals::listCacheChunkCount<TestArticleListRepo>();
         for (uint8_t i = 0; i < static_cast<uint8_t>(N); ++i) {
             TestInternals::cleanupModificationsWithCutoff<TestArticleListRepo>(cutoff, i);
         }
@@ -623,16 +620,15 @@ TEST_CASE("[DeclListRepo] Modification cutoff safety",
         auto entity1 = makeArticle(9001, "tech", alice_id, "before_drain", 10);
         TestArticleListRepo::notifyCreated(entity1);
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
-        auto cutoff = std::chrono::steady_clock::now();
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        // Capture generation after M1 as cutoff
+        auto cutoff = TestInternals::listCacheGeneration<TestArticleListRepo>();
 
         auto entity2 = makeArticle(9002, "tech", alice_id, "after_drain", 20);
         TestArticleListRepo::notifyCreated(entity2);
 
         CHECK(TestInternals::pendingModificationCount<TestArticleListRepo>() == 2);
 
-        // Drain only modifications before cutoff
+        // Drain only modifications at or before cutoff generation
         TestInternals::drainModificationsWithCutoff<TestArticleListRepo>(cutoff);
 
         // M1: drained.  M2: still present
@@ -654,14 +650,12 @@ TEST_CASE("[DeclListRepo] Modification cutoff safety",
         auto entity1 = makeArticle(9001, "tech", alice_id, "cutoff_old", 25);
         TestArticleListRepo::notifyCreated(entity1);
 
-        // Re-query to absorb M1's invalidation and re-cache with fresh timestamp
+        // Re-query to absorb M1's invalidation and re-cache with fresh generation
         auto r2 = sync(TestArticleListRepo::query(q));
         REQUIRE(r2->size() == 5);  // DB still has 5 (entity1 not in DB)
 
-        // 3. Cutoff between M1 and M2
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
-        auto cutoff = std::chrono::steady_clock::now();
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        // 3. Capture generation as cutoff between M1 and M2
+        auto cutoff = TestInternals::listCacheGeneration<TestArticleListRepo>();
 
         // 4. M2 (after cutoff) — insert into DB + notify
         insertTestArticle("tech", alice_id, "cutoff_new", 35);
@@ -708,11 +702,11 @@ TEST_CASE("[DeclListRepo] Bitmap skip optimization",
         REQUIRE(r1->size() == 5);
         CHECK(TestArticleListRepo::listSize() == 1);
 
-        // 2. Read the shard_id assigned to this cache entry
-        auto shard_id_opt = TestInternals::getListEntryShardId<TestArticleListRepo>(
-            q.query_hash);
-        REQUIRE(shard_id_opt.has_value());
-        uint8_t shard_id = *shard_id_opt;
+        // 2. Read the chunk_id assigned to this cache entry
+        auto chunk_id_opt = TestInternals::getListEntryChunkId<TestArticleListRepo>(
+            q.cache_key);
+        REQUIRE(chunk_id_opt.has_value());
+        uint8_t chunk_id = *chunk_id_opt;
 
         // 3. Insert a new article in DB AND notify the list cache.
         //    This modification would normally invalidate Q:
@@ -722,16 +716,16 @@ TEST_CASE("[DeclListRepo] Bitmap skip optimization",
         TestArticleListRepo::notifyCreated(entity);
         CHECK(TestInternals::pendingModificationCount<TestArticleListRepo>() == 1);
 
-        // 4. Clear ONLY the bit for the entry's shard identity in the ModificationTracker.
-        //    The modification still exists (other bits remain set), but bit shard_id = 0.
-        auto cutoff = std::chrono::steady_clock::now();
+        // 4. Clear ONLY the bit for the entry's chunk identity in the ModificationTracker.
+        //    The modification still exists (other bits remain set), but bit chunk_id = 0.
+        auto cutoff = TestInternals::listCacheGeneration<TestArticleListRepo>();
         TestInternals::cleanupModificationsWithCutoff<TestArticleListRepo>(
-            cutoff, shard_id);
+            cutoff, chunk_id);
         // M still in tracker (other bits remain)
         CHECK(TestInternals::pendingModificationCount<TestArticleListRepo>() == 1);
 
         // 5. Re-query: lazy validation in get() checks modification M.
-        //    pending_segments & (1 << shard_id) == 0 → SKIP M → entry not affected → cache HIT.
+        //    pending_segments & (1 << chunk_id) == 0 → SKIP M → entry not affected → cache HIT.
         //    Cache HIT returns 5 (stale). Cache MISS would return 6 (DB has new article).
         auto r2 = sync(TestArticleListRepo::query(q));
         CHECK(r2->size() == 5);  // Cache HIT — bitmap skip prevented invalidation

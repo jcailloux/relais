@@ -10,62 +10,62 @@
 
 #include "jcailloux/relais/io/Task.h"
 #include "jcailloux/relais/io/redis/RedisResult.h"
-#include "jcailloux/relais/DbProvider.h"
+#include "jcailloux/relais/PgProvider.h"
 #include "jcailloux/relais/Log.h"
 
 #include <glaze/glaze.hpp>
 #include <jcailloux/relais/list/ListCache.h>
+#include "jcailloux/relais/entity/SerializationTraits.h"
 
 namespace jcailloux::relais::cache {
 
     /**
      * Async Redis cache wrapper for L2 caching.
-     * Entity must implement json() and fromJson().
+     * E must implement json() and fromJson().
      *
-     * All Redis operations go through DbProvider::redis() which wraps
+     * All Redis operations go through PgProvider::redis() which wraps
      * io::RedisClient via type-erased std::function.
      */
     class RedisCache {
         public:
 
-            template<typename Entity>
-            static io::Task<std::optional<Entity>> get(const std::string& key) {
-                if (!DbProvider::hasRedis()) {
+            template<typename E>
+            static io::Task<std::optional<E>> get(const std::string& key) {
+                if (!PgProvider::hasRedis()) {
                     co_return std::nullopt;
                 }
 
                 try {
-                    auto result = co_await DbProvider::redis("GET", key);
+                    auto result = co_await PgProvider::redis("GET", key);
                     if (result.isNil()) {
                         co_return std::nullopt;
                     }
-                    co_return Entity::fromJson(result.asStringView());
+                    co_return E::fromJson(result.asStringView());
                 } catch (const std::exception& e) {
                     RELAIS_LOG_WARN << "RedisCache GET error: " << e.what();
                     co_return std::nullopt;
                 }
             }
 
-            template<typename Entity, typename Rep, typename Period>
-            static io::Task<std::optional<Entity>> getEx(const std::string& key,
+            template<typename E, typename Rep, typename Period>
+            static io::Task<std::optional<E>> getEx(const std::string& key,
                                                               std::chrono::duration<Rep, Period> ttl) {
                 if (auto json = co_await getRawEx(key, ttl)) {
-                    co_return Entity::fromJson(*json);
+                    co_return E::fromJson(*json);
                 }
                 co_return std::nullopt;
             }
 
-            template<typename Entity, typename Rep, typename Period>
-            static io::Task<bool> set(const std::string& key, const Entity& entity, std::chrono::duration<Rep, Period> ttl) {
-                if (!DbProvider::hasRedis()) {
+            template<typename E, typename Rep, typename Period>
+            static io::Task<bool> set(const std::string& key, const E& entity, std::chrono::duration<Rep, Period> ttl) {
+                if (!PgProvider::hasRedis()) {
                     co_return false;
                 }
 
                 try {
                     auto ttl_seconds = std::chrono::duration_cast<std::chrono::seconds>(ttl).count();
-                    auto json = entity.json();
-                    co_await DbProvider::redis("SETEX", key,
-                        ttl_seconds, *json);
+                    co_await PgProvider::redis("SETEX", key,
+                        ttl_seconds, entity.json());
                     co_return true;
                 } catch (const std::exception& e) {
                     RELAIS_LOG_WARN << "RedisCache SET error: " << e.what();
@@ -73,40 +73,40 @@ namespace jcailloux::relais::cache {
                 }
             }
 
-            template<typename Entity>
-            static io::Task<std::optional<std::vector<Entity>>> getList(const std::string& key) {
-                if (!DbProvider::hasRedis()) {
+            template<typename E>
+            static io::Task<std::optional<std::vector<E>>> getList(const std::string& key) {
+                if (!PgProvider::hasRedis()) {
                     co_return std::nullopt;
                 }
 
                 try {
-                    auto result = co_await DbProvider::redis("GET", key);
+                    auto result = co_await PgProvider::redis("GET", key);
                     if (result.isNil()) {
                         co_return std::nullopt;
                     }
                     auto raw = result.asStringView();
-                    co_return parseListWithHeader<Entity>(raw);
+                    co_return parseListWithHeader<E>(raw);
                 } catch (const std::exception& e) {
                     RELAIS_LOG_WARN << "RedisCache GET list error: " << e.what();
                     co_return std::nullopt;
                 }
             }
 
-            template<typename Entity, typename Rep, typename Period>
-            static io::Task<std::optional<std::vector<Entity>>> getListEx(const std::string& key,
+            template<typename E, typename Rep, typename Period>
+            static io::Task<std::optional<std::vector<E>>> getListEx(const std::string& key,
                                                                                std::chrono::duration<Rep, Period> ttl) {
                 if (auto raw = co_await getRawEx(key, ttl)) {
-                    co_return parseListWithHeader<Entity>(*raw);
+                    co_return parseListWithHeader<E>(*raw);
                 }
                 co_return std::nullopt;
             }
 
-            template<typename Entity, typename Rep, typename Period>
+            template<typename E, typename Rep, typename Period>
             static io::Task<bool> setList(const std::string& key,
-                                               const std::vector<Entity>& entities,
+                                               const std::vector<E>& entities,
                                                std::chrono::duration<Rep, Period> ttl,
                                                std::optional<list::ListBoundsHeader> header = std::nullopt) {
-                if (!DbProvider::hasRedis()) {
+                if (!PgProvider::hasRedis()) {
                     co_return false;
                 }
 
@@ -120,11 +120,11 @@ namespace jcailloux::relais::cache {
                         header->writeTo(reinterpret_cast<uint8_t*>(prefixed.data()));
                         std::memcpy(prefixed.data() + list::kListBoundsHeaderSize,
                                     json.data(), json.size());
-                        co_await DbProvider::redis("SETEX", key,
+                        co_await PgProvider::redis("SETEX", key,
                             ttl_seconds,
                             std::string_view(prefixed.data(), prefixed.size()));
                     } else {
-                        co_await DbProvider::redis("SETEX", key,
+                        co_await PgProvider::redis("SETEX", key,
                             ttl_seconds, json);
                     }
                     co_return true;
@@ -134,14 +134,54 @@ namespace jcailloux::relais::cache {
                 }
             }
 
+            // =================================================================
+            // List BEVE Methods (vector<E> via glz::write_beve/read_beve)
+            // =================================================================
+
+            template<typename E>
+            static io::Task<std::optional<std::vector<E>>> getListBeve(const std::string& key) {
+                auto data = co_await getRawBinary(key);
+                if (!data) co_return std::nullopt;
+                co_return parseListBeveWithHeader<E>(*data);
+            }
+
+            template<typename E, typename Rep, typename Period>
+            static io::Task<std::optional<std::vector<E>>> getListBeveEx(
+                const std::string& key,
+                std::chrono::duration<Rep, Period> ttl)
+            {
+                auto data = co_await getRawBinaryEx(key, ttl);
+                if (!data) co_return std::nullopt;
+                co_return parseListBeveWithHeader<E>(*data);
+            }
+
+            template<typename E, typename Rep, typename Period>
+            static io::Task<bool> setListBeve(const std::string& key,
+                                                   const std::vector<E>& entities,
+                                                   std::chrono::duration<Rep, Period> ttl,
+                                                   std::optional<list::ListBoundsHeader> header = std::nullopt) {
+                auto beve = serializeListBeve(entities);
+                if (beve.empty() && !entities.empty()) co_return false;
+
+                if (header) {
+                    std::vector<uint8_t> prefixed(list::kListBoundsHeaderSize + beve.size());
+                    header->writeTo(prefixed.data());
+                    std::memcpy(prefixed.data() + list::kListBoundsHeaderSize,
+                                beve.data(), beve.size());
+                    co_return co_await setRawBinary(key, prefixed, ttl);
+                } else {
+                    co_return co_await setRawBinary(key, beve, ttl);
+                }
+            }
+
             /// Get raw JSON string without deserialization.
             static io::Task<std::optional<std::string>> getRaw(const std::string& key) {
-                if (!DbProvider::hasRedis()) {
+                if (!PgProvider::hasRedis()) {
                     co_return std::nullopt;
                 }
 
                 try {
-                    auto result = co_await DbProvider::redis("GET", key);
+                    auto result = co_await PgProvider::redis("GET", key);
                     if (result.isNil()) {
                         co_return std::nullopt;
                     }
@@ -155,13 +195,13 @@ namespace jcailloux::relais::cache {
             template<typename Rep, typename Period>
             static io::Task<std::optional<std::string>> getRawEx(const std::string& key,
                                                                       std::chrono::duration<Rep, Period> ttl) {
-                if (!DbProvider::hasRedis()) {
+                if (!PgProvider::hasRedis()) {
                     co_return std::nullopt;
                 }
 
                 try {
                     auto ttl_seconds = std::chrono::duration_cast<std::chrono::seconds>(ttl).count();
-                    auto result = co_await DbProvider::redis("GETEX", key,
+                    auto result = co_await PgProvider::redis("GETEX", key,
                         "EX", ttl_seconds);
                     if (result.isNil()) {
                         co_return std::nullopt;
@@ -178,13 +218,13 @@ namespace jcailloux::relais::cache {
             static io::Task<bool> setRaw(const std::string& key,
                                               const std::string_view json,
                                               std::chrono::duration<Rep, Period> ttl) {
-                if (!DbProvider::hasRedis()) {
+                if (!PgProvider::hasRedis()) {
                     co_return false;
                 }
 
                 try {
                     auto ttl_seconds = std::chrono::duration_cast<std::chrono::seconds>(ttl).count();
-                    co_await DbProvider::redis("SETEX", key,
+                    co_await PgProvider::redis("SETEX", key,
                         ttl_seconds,
                         std::string_view(json.data(), json.size()));
                     co_return true;
@@ -207,12 +247,12 @@ namespace jcailloux::relais::cache {
 
             /// Get raw binary data (for BEVE or other binary formats).
             static io::Task<std::optional<std::vector<uint8_t>>> getRawBinary(const std::string& key) {
-                if (!DbProvider::hasRedis()) {
+                if (!PgProvider::hasRedis()) {
                     co_return std::nullopt;
                 }
 
                 try {
-                    auto result = co_await DbProvider::redis("GET", key);
+                    auto result = co_await PgProvider::redis("GET", key);
                     if (result.isNil()) {
                         co_return std::nullopt;
                     }
@@ -231,13 +271,13 @@ namespace jcailloux::relais::cache {
             static io::Task<std::optional<std::vector<uint8_t>>> getRawBinaryEx(
                 const std::string& key,
                 std::chrono::duration<Rep, Period> ttl) {
-                if (!DbProvider::hasRedis()) {
+                if (!PgProvider::hasRedis()) {
                     co_return std::nullopt;
                 }
 
                 try {
                     auto ttl_seconds = std::chrono::duration_cast<std::chrono::seconds>(ttl).count();
-                    auto result = co_await DbProvider::redis("GETEX", key,
+                    auto result = co_await PgProvider::redis("GETEX", key,
                         "EX", ttl_seconds);
                     if (result.isNil()) {
                         co_return std::nullopt;
@@ -257,13 +297,13 @@ namespace jcailloux::relais::cache {
             static io::Task<bool> setRawBinary(const std::string& key,
                                                     const std::vector<uint8_t>& data,
                                                     std::chrono::duration<Rep, Period> ttl) {
-                if (!DbProvider::hasRedis()) {
+                if (!PgProvider::hasRedis()) {
                     co_return false;
                 }
 
                 try {
                     auto ttl_seconds = std::chrono::duration_cast<std::chrono::seconds>(ttl).count();
-                    co_await DbProvider::redis("SETEX", key,
+                    co_await PgProvider::redis("SETEX", key,
                         ttl_seconds,
                         std::string_view(reinterpret_cast<const char*>(data.data()), data.size()));
                     co_return true;
@@ -274,7 +314,7 @@ namespace jcailloux::relais::cache {
             }
 
             // =================================================================
-            // List Entity Binary Methods
+            // List E Binary Methods
             // =================================================================
 
             /// Get a list entity from binary cache.
@@ -328,32 +368,30 @@ namespace jcailloux::relais::cache {
                 const ListEntity& listEntity,
                 std::chrono::duration<Rep, Period> ttl,
                 std::optional<list::ListBoundsHeader> header = std::nullopt)
-                requires requires(const ListEntity& l) {
-                    { l.binary() } -> std::convertible_to<std::shared_ptr<const std::vector<uint8_t>>>;
-                }
+                requires HasBinarySerialization<ListEntity>
             {
                 auto binary = listEntity.binary();
                 if (header) {
-                    std::vector<uint8_t> prefixed(list::kListBoundsHeaderSize + binary->size());
+                    std::vector<uint8_t> prefixed(list::kListBoundsHeaderSize + binary.size());
                     header->writeTo(prefixed.data());
                     std::memcpy(prefixed.data() + list::kListBoundsHeaderSize,
-                                binary->data(), binary->size());
+                                binary.data(), binary.size());
                     co_return co_await setRawBinary(key, prefixed, ttl);
                 }
-                co_return co_await setRawBinary(key, *binary, ttl);
+                co_return co_await setRawBinary(key, binary, ttl);
             }
 
             /// Refresh TTL without modifying the value.
             template<typename Rep, typename Period>
             static io::Task<bool> expire(const std::string& key,
                                               std::chrono::duration<Rep, Period> ttl) {
-                if (!DbProvider::hasRedis()) {
+                if (!PgProvider::hasRedis()) {
                     co_return false;
                 }
 
                 try {
                     auto ttl_seconds = std::chrono::duration_cast<std::chrono::seconds>(ttl).count();
-                    auto result = co_await DbProvider::redis("EXPIRE", key,
+                    auto result = co_await PgProvider::redis("EXPIRE", key,
                         ttl_seconds);
                     co_return result.asInteger() == 1;
                 } catch (const std::exception& e) {
@@ -363,15 +401,15 @@ namespace jcailloux::relais::cache {
             }
 
             static io::Task<bool> invalidate(const std::string& key) {
-                if (!DbProvider::hasRedis()) {
+                if (!PgProvider::hasRedis()) {
                     co_return false;
                 }
 
                 try {
-                    co_await DbProvider::redis("DEL", key);
+                    co_await PgProvider::redis("UNLINK", key);
                     co_return true;
                 } catch (const std::exception& e) {
-                    RELAIS_LOG_WARN << "RedisCache DEL error: " << e.what();
+                    RELAIS_LOG_WARN << "RedisCache UNLINK error: " << e.what();
                     co_return false;
                 }
             }
@@ -380,7 +418,7 @@ namespace jcailloux::relais::cache {
             /// Safer than KEYS for production use.
             static io::Task<size_t> invalidatePatternSafe(const std::string& pattern,
                                                                size_t batch_size = 100) {
-                if (!DbProvider::hasRedis()) {
+                if (!PgProvider::hasRedis()) {
                     co_return 0;
                 }
 
@@ -391,7 +429,7 @@ namespace jcailloux::relais::cache {
                     do {
                         std::vector<std::string> batch_keys;
 
-                        auto result = co_await DbProvider::redis(
+                        auto result = co_await PgProvider::redis(
                             "SCAN", cursor, "MATCH", pattern, "COUNT", batch_size);
 
                         if (result.isNil() || !result.isArray()) {
@@ -416,7 +454,7 @@ namespace jcailloux::relais::cache {
 
                         for (const auto& k : batch_keys) {
                             try {
-                                co_await DbProvider::redis("DEL", k);
+                                co_await PgProvider::redis("UNLINK", k);
                                 ++count;
                             } catch (...) {}
                         }
@@ -438,7 +476,7 @@ namespace jcailloux::relais::cache {
             static io::Task<bool> trackListKey(const std::string& groupKey,
                                                     const std::string& listKey,
                                                     std::chrono::duration<Rep, Period> ttl) {
-                if (!DbProvider::hasRedis()) {
+                if (!PgProvider::hasRedis()) {
                     co_return false;
                 }
 
@@ -447,10 +485,10 @@ namespace jcailloux::relais::cache {
                     auto ttl_seconds = std::chrono::duration_cast<std::chrono::seconds>(ttl).count();
 
                     // Add to tracking set (binary-safe via argvlen)
-                    co_await DbProvider::redis("SADD", trackingKey, listKey);
+                    co_await PgProvider::redis("SADD", trackingKey, listKey);
 
                     // Set TTL on tracking set only if none exists (NX = don't renew)
-                    co_await DbProvider::redis("EXPIRE", trackingKey,
+                    co_await PgProvider::redis("EXPIRE", trackingKey,
                         ttl_seconds, "NX");
 
                     co_return true;
@@ -463,7 +501,7 @@ namespace jcailloux::relais::cache {
             /// Invalidate all list cache keys in a group.
             /// O(M) where M is the number of cached pages (typically small).
             static io::Task<size_t> invalidateListGroup(const std::string& groupKey) {
-                if (!DbProvider::hasRedis()) {
+                if (!PgProvider::hasRedis()) {
                     co_return 0;
                 }
 
@@ -475,14 +513,14 @@ namespace jcailloux::relais::cache {
                         local keys = redis.call('SMEMBERS', KEYS[1])
                         local count = 0
                         for _, key in ipairs(keys) do
-                            redis.call('DEL', key)
+                            redis.call('UNLINK', key)
                             count = count + 1
                         end
-                        redis.call('DEL', KEYS[1])
+                        redis.call('UNLINK', KEYS[1])
                         return count
                     )";
 
-                    auto result = co_await DbProvider::redis(
+                    auto result = co_await PgProvider::redis(
                         "EVAL", lua, "1", trackingKey);
 
                     co_return result.isNil() ? 0 : static_cast<size_t>(result.asInteger());
@@ -501,7 +539,7 @@ namespace jcailloux::relais::cache {
                 const std::string& groupKey,
                 int64_t entity_sort_val)
             {
-                if (!DbProvider::hasRedis()) {
+                if (!PgProvider::hasRedis()) {
                     co_return 0;
                 }
 
@@ -574,11 +612,11 @@ for _, page_key in ipairs(keys) do
     end
 end
 
-if count == #keys then redis.call('DEL', KEYS[1]) end
+if count == #keys then redis.call('UNLINK', KEYS[1]) end
 return count
 )";
 
-                    auto result = co_await DbProvider::redis(
+                    auto result = co_await PgProvider::redis(
                         "EVAL", lua, "1", trackingKey,
                         entity_sort_val,
                         static_cast<int>(list::kListBoundsHeaderSize));
@@ -597,7 +635,7 @@ return count
                 int64_t old_sort_val,
                 int64_t new_sort_val)
             {
-                if (!DbProvider::hasRedis()) {
+                if (!PgProvider::hasRedis()) {
                     co_return 0;
                 }
 
@@ -667,11 +705,11 @@ for _, page_key in ipairs(keys) do
     end
 end
 
-if count == #keys then redis.call('DEL', KEYS[1]) end
+if count == #keys then redis.call('UNLINK', KEYS[1]) end
 return count
 )";
 
-                    auto result = co_await DbProvider::redis(
+                    auto result = co_await PgProvider::redis(
                         "EVAL", lua, "1", trackingKey,
                         old_sort_val, new_sort_val,
                         static_cast<int>(list::kListBoundsHeaderSize));
@@ -683,9 +721,418 @@ return count
                 }
             }
 
+            // =================================================================
+            // All-in-one List Group Invalidation (single Lua EVAL, 1 RTT)
+            // =================================================================
+
+            /// Invalidate all matching list groups for a single entity (create/delete).
+            /// Lua does: HGETALL master → filter match → SortBounds → DEL pages.
+            static io::Task<size_t> invalidateListGroupsSelective(
+                const std::string& masterKey,
+                size_t prefixLen,
+                const std::string& filterSchema,
+                const std::string& entityBlob,
+                const std::string& sortValues)
+            {
+                if (!PgProvider::hasRedis()) co_return 0;
+
+                try {
+                    static constexpr std::string_view lua = R"(
+local master = KEYS[1]
+local prefix_len = tonumber(ARGV[1])
+local hdr_size = tonumber(ARGV[2])
+local schema = ARGV[3]
+local eblob = ARGV[4]
+local sort_csv = ARGV[5]
+
+local sort_vals = {}
+for v in string.gmatch(sort_csv, '([^,]+)') do
+    sort_vals[#sort_vals + 1] = tonumber(v)
+end
+local n_filters = #schema / 2
+local total = 0
+
+local function u32(s, p)
+    local b1,b2,b3,b4 = string.byte(s, p, p+3)
+    if not b4 then return 0 end
+    return b1 + b2*256 + b3*65536 + b4*16777216
+end
+
+local function i64(s, p)
+    local b1,b2,b3,b4,b5,b6,b7,b8 = string.byte(s, p, p+7)
+    if not b8 then return 0 end
+    local val = b1 + b2*256 + b3*65536 + b4*16777216
+              + b5*4294967296 + b6*1099511627776
+              + b7*281474976710656 + b8*72057594037927936
+    if val >= 2^63 then val = val - 2^64 end
+    return val
+end
+
+local function skip(s, pos, ft)
+    if ft == 115 then return pos + 4 + u32(s, pos)
+    elseif ft == 56 then return pos + 8
+    elseif ft == 52 then return pos + 4
+    else return pos + 1 end
+end
+
+local function cmp(bin, gp, blob, ep, ft, fo)
+    if ft == 115 then
+        local gl = u32(bin, gp); local el = u32(blob, ep)
+        if fo == 61 then
+            return gl == el and (gl == 0 or string.sub(bin, gp+4, gp+3+gl) == string.sub(blob, ep+4, ep+3+el))
+        elseif fo == 33 then
+            return gl ~= el or (gl > 0 and string.sub(bin, gp+4, gp+3+gl) ~= string.sub(blob, ep+4, ep+3+el))
+        end
+        return true
+    elseif ft == 56 then
+        if fo == 61 then return string.sub(bin, gp, gp+7) == string.sub(blob, ep, ep+7)
+        elseif fo == 33 then return string.sub(bin, gp, gp+7) ~= string.sub(blob, ep, ep+7)
+        else
+            local gv = i64(bin, gp); local ev = i64(blob, ep)
+            if fo == 62 then return ev > gv
+            elseif fo == 71 then return ev >= gv
+            elseif fo == 60 then return ev < gv
+            elseif fo == 76 then return ev <= gv end
+        end
+    elseif ft == 52 then
+        if fo == 61 then return string.sub(bin, gp, gp+3) == string.sub(blob, ep, ep+3)
+        elseif fo == 33 then return string.sub(bin, gp, gp+3) ~= string.sub(blob, ep, ep+3)
+        else
+            local function r32(s, p)
+                local a,b,c,d = string.byte(s, p, p+3)
+                if not d then return 0 end
+                local v = a + b*256 + c*65536 + d*16777216
+                if v >= 2^31 then v = v - 2^32 end; return v
+            end
+            local gv = r32(bin, gp); local ev = r32(blob, ep)
+            if fo == 62 then return ev > gv
+            elseif fo == 71 then return ev >= gv
+            elseif fo == 60 then return ev < gv
+            elseif fo == 76 then return ev <= gv end
+        end
+    else
+        local gv = string.byte(bin, gp); local ev = string.byte(blob, ep)
+        if fo == 61 then return gv == ev
+        elseif fo == 33 then return gv ~= ev end
+        return true
+    end
+    return true
+end
+
+local function fmatch(bin, blob)
+    local gp = 1; local ep = 1
+    for f = 0, n_filters - 1 do
+        local ft = string.byte(schema, f*2+1)
+        local fo = string.byte(schema, f*2+2)
+        if gp > #bin or ep > #blob then break end
+        local gx = string.byte(bin, gp); local ex = string.byte(blob, ep)
+        gp = gp + 1; ep = ep + 1
+        if gx == 0 then
+            if ex == 1 then ep = skip(blob, ep, ft) end
+        elseif ex == 0 then
+            gp = skip(bin, gp, ft)
+            if fo == 61 then return false end
+        else
+            if not cmp(bin, gp, blob, ep, ft, fo) then return false end
+            gp = skip(bin, gp, ft); ep = skip(blob, ep, ft)
+        end
+    end
+    return true
+end
+
+local function chk(pk, ev)
+    local hdr = redis.call('GETRANGE', pk, 0, hdr_size - 1)
+    if #hdr < hdr_size or string.byte(hdr, 1) ~= 0x53 or string.byte(hdr, 2) ~= 0x52 then
+        return true
+    end
+    local first = i64(hdr, 3); local last = i64(hdr, 11)
+    local fl = string.byte(hdr, 19)
+    local desc = (fl % 2) == 1
+    local fp = (math.floor(fl / 2) % 2) == 1
+    local inc = (math.floor(fl / 4) % 2) == 1
+    local off = (math.floor(fl / 8) % 2) == 0
+    if off then
+        if inc then return true end
+        if desc then return ev >= last else return ev <= last end
+    else
+        if fp or inc then return true end
+        if desc then
+            return ev <= first and ev >= last
+        else
+            return ev >= first and ev <= last
+        end
+    end
+end
+
+local groups = redis.call('HGETALL', master)
+if not groups or #groups == 0 then return 0 end
+
+for gi = 1, #groups, 2 do
+    local gk = groups[gi]
+    local si = tonumber(groups[gi + 1])
+    local bin = string.sub(gk, prefix_len + 1)
+    if fmatch(bin, eblob) then
+        local ev = sort_vals[si + 1] or 0
+        local tk = gk .. ':_keys'
+        local pages = redis.call('SMEMBERS', tk)
+        if pages and #pages > 0 then
+            local c = 0
+            for _, pk in ipairs(pages) do
+                if chk(pk, ev) then
+                    redis.call('DEL', pk)
+                    redis.call('SREM', tk, pk)
+                    c = c + 1
+                end
+            end
+            if c == #pages then redis.call('UNLINK', tk) end
+            total = total + c
+        end
+    end
+end
+return total
+)";
+
+                    auto result = co_await PgProvider::redis(
+                        "EVAL", lua, "1", masterKey,
+                        std::to_string(prefixLen),
+                        static_cast<int>(list::kListBoundsHeaderSize),
+                        filterSchema,
+                        entityBlob,
+                        sortValues);
+
+                    co_return result.isNil() ? 0 : static_cast<size_t>(result.asInteger());
+                } catch (const std::exception& e) {
+                    RELAIS_LOG_WARN << "RedisCache invalidateListGroupsSelective error: " << e.what();
+                    co_return 0;
+                }
+            }
+
+            /// Invalidate all matching list groups for an update (two entities).
+            /// Lua does: HGETALL master → filter match old+new → SortBounds → DEL pages.
+            static io::Task<size_t> invalidateListGroupsSelectiveUpdate(
+                const std::string& masterKey,
+                size_t prefixLen,
+                const std::string& filterSchema,
+                const std::string& newEntityBlob,
+                const std::string& newSortValues,
+                const std::string& oldEntityBlob,
+                const std::string& oldSortValues)
+            {
+                if (!PgProvider::hasRedis()) co_return 0;
+
+                try {
+                    static constexpr std::string_view lua = R"(
+local master = KEYS[1]
+local prefix_len = tonumber(ARGV[1])
+local hdr_size = tonumber(ARGV[2])
+local schema = ARGV[3]
+local new_blob = ARGV[4]
+local new_csv = ARGV[5]
+local old_blob = ARGV[6]
+local old_csv = ARGV[7]
+
+local new_sv = {}
+for v in string.gmatch(new_csv, '([^,]+)') do new_sv[#new_sv+1] = tonumber(v) end
+local old_sv = {}
+for v in string.gmatch(old_csv, '([^,]+)') do old_sv[#old_sv+1] = tonumber(v) end
+local n_filters = #schema / 2
+local total = 0
+
+local function u32(s, p)
+    local b1,b2,b3,b4 = string.byte(s, p, p+3)
+    if not b4 then return 0 end
+    return b1 + b2*256 + b3*65536 + b4*16777216
+end
+
+local function i64(s, p)
+    local b1,b2,b3,b4,b5,b6,b7,b8 = string.byte(s, p, p+7)
+    if not b8 then return 0 end
+    local val = b1 + b2*256 + b3*65536 + b4*16777216
+              + b5*4294967296 + b6*1099511627776
+              + b7*281474976710656 + b8*72057594037927936
+    if val >= 2^63 then val = val - 2^64 end
+    return val
+end
+
+local function skip(s, pos, ft)
+    if ft == 115 then return pos + 4 + u32(s, pos)
+    elseif ft == 56 then return pos + 8
+    elseif ft == 52 then return pos + 4
+    else return pos + 1 end
+end
+
+local function cmp(bin, gp, blob, ep, ft, fo)
+    if ft == 115 then
+        local gl = u32(bin, gp); local el = u32(blob, ep)
+        if fo == 61 then
+            return gl == el and (gl == 0 or string.sub(bin, gp+4, gp+3+gl) == string.sub(blob, ep+4, ep+3+el))
+        elseif fo == 33 then
+            return gl ~= el or (gl > 0 and string.sub(bin, gp+4, gp+3+gl) ~= string.sub(blob, ep+4, ep+3+el))
+        end
+        return true
+    elseif ft == 56 then
+        if fo == 61 then return string.sub(bin, gp, gp+7) == string.sub(blob, ep, ep+7)
+        elseif fo == 33 then return string.sub(bin, gp, gp+7) ~= string.sub(blob, ep, ep+7)
+        else
+            local gv = i64(bin, gp); local ev = i64(blob, ep)
+            if fo == 62 then return ev > gv
+            elseif fo == 71 then return ev >= gv
+            elseif fo == 60 then return ev < gv
+            elseif fo == 76 then return ev <= gv end
+        end
+    elseif ft == 52 then
+        if fo == 61 then return string.sub(bin, gp, gp+3) == string.sub(blob, ep, ep+3)
+        elseif fo == 33 then return string.sub(bin, gp, gp+3) ~= string.sub(blob, ep, ep+3)
+        else
+            local function r32(s, p)
+                local a,b,c,d = string.byte(s, p, p+3)
+                if not d then return 0 end
+                local v = a + b*256 + c*65536 + d*16777216
+                if v >= 2^31 then v = v - 2^32 end; return v
+            end
+            local gv = r32(bin, gp); local ev = r32(blob, ep)
+            if fo == 62 then return ev > gv
+            elseif fo == 71 then return ev >= gv
+            elseif fo == 60 then return ev < gv
+            elseif fo == 76 then return ev <= gv end
+        end
+    else
+        local gv = string.byte(bin, gp); local ev = string.byte(blob, ep)
+        if fo == 61 then return gv == ev
+        elseif fo == 33 then return gv ~= ev end
+        return true
+    end
+    return true
+end
+
+local function fmatch(bin, blob)
+    local gp = 1; local ep = 1
+    for f = 0, n_filters - 1 do
+        local ft = string.byte(schema, f*2+1)
+        local fo = string.byte(schema, f*2+2)
+        if gp > #bin or ep > #blob then break end
+        local gx = string.byte(bin, gp); local ex = string.byte(blob, ep)
+        gp = gp + 1; ep = ep + 1
+        if gx == 0 then
+            if ex == 1 then ep = skip(blob, ep, ft) end
+        elseif ex == 0 then
+            gp = skip(bin, gp, ft)
+            if fo == 61 then return false end
+        else
+            if not cmp(bin, gp, blob, ep, ft, fo) then return false end
+            gp = skip(bin, gp, ft); ep = skip(blob, ep, ft)
+        end
+    end
+    return true
+end
+
+local function chk_single(pk, ev)
+    local hdr = redis.call('GETRANGE', pk, 0, hdr_size - 1)
+    if #hdr < hdr_size or string.byte(hdr, 1) ~= 0x53 or string.byte(hdr, 2) ~= 0x52 then
+        return true
+    end
+    local first = i64(hdr, 3); local last = i64(hdr, 11)
+    local fl = string.byte(hdr, 19)
+    local desc = (fl % 2) == 1
+    local fp = (math.floor(fl / 2) % 2) == 1
+    local inc = (math.floor(fl / 4) % 2) == 1
+    local off = (math.floor(fl / 8) % 2) == 0
+    if off then
+        if inc then return true end
+        if desc then return ev >= last else return ev <= last end
+    else
+        if fp or inc then return true end
+        if desc then
+            return ev <= first and ev >= last
+        else
+            return ev >= first and ev <= last
+        end
+    end
+end
+
+local function chk_range(pk, v1, v2)
+    local hdr = redis.call('GETRANGE', pk, 0, hdr_size - 1)
+    if #hdr < hdr_size or string.byte(hdr, 1) ~= 0x53 or string.byte(hdr, 2) ~= 0x52 then
+        return true
+    end
+    local first = i64(hdr, 3); local last = i64(hdr, 11)
+    local fl = string.byte(hdr, 19)
+    local desc = (fl % 2) == 1
+    local fp = (math.floor(fl / 2) % 2) == 1
+    local inc = (math.floor(fl / 4) % 2) == 1
+    local off = (math.floor(fl / 8) % 2) == 0
+    local rmin = math.min(v1, v2)
+    local rmax = math.max(v1, v2)
+    if off then
+        local pmin = desc and last or first
+        local pmax = desc and first or last
+        if inc then return pmin <= rmax end
+        return (pmin <= rmax) and (rmin <= pmax)
+    else
+        local function inr(val)
+            if fp or inc then return true end
+            if desc then return val <= first and val >= last
+            else return val >= first and val <= last end
+        end
+        return inr(v1) or inr(v2)
+    end
+end
+
+local groups = redis.call('HGETALL', master)
+if not groups or #groups == 0 then return 0 end
+
+for gi = 1, #groups, 2 do
+    local gk = groups[gi]
+    local si = tonumber(groups[gi + 1])
+    local bin = string.sub(gk, prefix_len + 1)
+    local nm = fmatch(bin, new_blob)
+    local om = fmatch(bin, old_blob)
+    if nm or om then
+        local nv = new_sv[si + 1] or 0
+        local ov = old_sv[si + 1] or 0
+        local tk = gk .. ':_keys'
+        local pages = redis.call('SMEMBERS', tk)
+        if pages and #pages > 0 then
+            local c = 0
+            for _, pk in ipairs(pages) do
+                local del = false
+                if nm and om then
+                    if nv == ov then del = chk_single(pk, nv)
+                    else del = chk_range(pk, ov, nv) end
+                elseif nm then del = chk_single(pk, nv)
+                else del = chk_single(pk, ov) end
+                if del then
+                    redis.call('DEL', pk)
+                    redis.call('SREM', tk, pk)
+                    c = c + 1
+                end
+            end
+            if c == #pages then redis.call('UNLINK', tk) end
+            total = total + c
+        end
+    end
+end
+return total
+)";
+
+                    auto result = co_await PgProvider::redis(
+                        "EVAL", lua, "1", masterKey,
+                        std::to_string(prefixLen),
+                        static_cast<int>(list::kListBoundsHeaderSize),
+                        filterSchema,
+                        newEntityBlob, newSortValues,
+                        oldEntityBlob, oldSortValues);
+
+                    co_return result.isNil() ? 0 : static_cast<size_t>(result.asInteger());
+                } catch (const std::exception& e) {
+                    RELAIS_LOG_WARN << "RedisCache invalidateListGroupsSelectiveUpdate error: " << e.what();
+                    co_return 0;
+                }
+            }
+
         private:
-            template<typename Entity>
-            static std::string serializeList(const std::vector<Entity>& entities) {
+            template<typename E>
+            static std::string serializeList(const std::vector<E>& entities) {
                 std::string buffer;
                 if (glz::write_json(entities, buffer)) {
                     return "[]";
@@ -693,9 +1140,9 @@ return count
                 return buffer;
             }
 
-            template<typename Entity>
-            static std::optional<std::vector<Entity>> parseList(const std::string_view json) {
-                std::vector<Entity> result;
+            template<typename E>
+            static std::optional<std::vector<E>> parseList(const std::string_view json) {
+                std::vector<E> result;
                 if (auto ec = glz::read_json(result, json)) {
                     RELAIS_LOG_WARN << "RedisCache parseList error: " << glz::format_error(ec, json);
                     return std::nullopt;
@@ -704,15 +1151,49 @@ return count
             }
 
             /// Parse a list value that may be prefixed with a ListBoundsHeader.
-            template<typename Entity>
-            static std::optional<std::vector<Entity>> parseListWithHeader(const std::string_view raw) {
+            template<typename E>
+            static std::optional<std::vector<E>> parseListWithHeader(const std::string_view raw) {
                 std::string_view data = raw;
                 if (data.size() >= list::kListBoundsHeaderSize
                     && static_cast<uint8_t>(data[0]) == list::kListBoundsHeaderMagic[0]
                     && static_cast<uint8_t>(data[1]) == list::kListBoundsHeaderMagic[1]) {
                     data.remove_prefix(list::kListBoundsHeaderSize);
                 }
-                return parseList<Entity>(data);
+                return parseList<E>(data);
+            }
+
+            // ----- BEVE list helpers -----
+
+            template<typename E>
+            static std::vector<uint8_t> serializeListBeve(const std::vector<E>& entities) {
+                std::vector<uint8_t> buffer;
+                if (glz::write_beve(entities, buffer)) {
+                    buffer.clear();
+                }
+                return buffer;
+            }
+
+            template<typename E>
+            static std::optional<std::vector<E>> parseListBeve(std::span<const uint8_t> data) {
+                if (data.empty()) return std::nullopt;
+                std::vector<E> result;
+                if (glz::read_beve(result, std::string_view{
+                        reinterpret_cast<const char*>(data.data()), data.size()})) {
+                    return std::nullopt;
+                }
+                return result;
+            }
+
+            template<typename E>
+            static std::optional<std::vector<E>> parseListBeveWithHeader(
+                    const std::vector<uint8_t>& raw) {
+                std::span<const uint8_t> data(raw);
+                if (data.size() >= list::kListBoundsHeaderSize
+                    && data[0] == list::kListBoundsHeaderMagic[0]
+                    && data[1] == list::kListBoundsHeaderMagic[1]) {
+                    data = data.subspan(list::kListBoundsHeaderSize);
+                }
+                return parseListBeve<E>(data);
             }
     };
 

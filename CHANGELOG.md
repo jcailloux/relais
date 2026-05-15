@@ -1,5 +1,61 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- **Lock-free L1 cache** — ParlayHash-backed `ChunkMap` with epoch-based reclamation; `find`/`insert`/`patch` return lightweight `EntityView` instead of `shared_ptr`
+- **GDSF eviction** — size-aware L1 eviction via `RELAIS_GDSF_ENABLED` CMake option + runtime `RELAIS_L1_MAX_MEMORY` env var; score = access_count × avg_cost / memoryUsage; histogram-based threshold with three-zone eviction curve; inline decay during cleanup; access count persistence across upserts; ghost admission control under memory pressure (≥ 50%); cross-repo sweep coordination; zero overhead when disabled
+- **Zero-copy RowView serialization** — `findJson()`/`findBinary()`/`queryJson()`/`queryBinary()` serialize directly from PgResult rows, skipping entity construction
+- **Configurable L2 format** — `CacheConfig::l2_format`: `Binary` (BEVE, default) or `Json` for non-C++ interop
+- **Composite primary keys** — `std::tuple`-based keys from multiple `@relais primary_key` fields with full CRUD and caching support
+- **L2 declarative list caching** — Redis-backed list pages with selective Lua-based invalidation
+- **Offset pagination** — `ListDescriptorQuery::offset`, mutually exclusive with cursor
+- **Deterministic keyset cursor** — null-safe COALESCE sort with PK tiebreaker
+- **Adaptive I/O batching** — `BatchScheduler` with Nagle-like strategy: first query immediate, subsequent batched during RTT
+- **PostgreSQL pipeline mode** — batched reads via `ANY()` arrays, pipelined writes with sync-point error isolation
+- **Redis command pipelining** — `RedisClient::pipelineExec()` queues N commands, single flush/read cycle
+- **Write coalescing** — identical concurrent writes share a single DB round-trip; `WriteOutcome::coalesced` flag
+- **Multi-worker I/O pool** — `IoPool` with per-worker event loop, connection pools, and batch scheduler; optional core pinning
+- **`RedisPool`** — fixed-size connection pool with atomic round-robin dispatch
+- **`EpollIoContext`** — production epoll event loop with timers and thread-safe `post()`
+- **`TimingEstimator`** — adaptive RTT profiling for batch readiness heuristics (EMA, bootstrap, staleness detection)
+- `ConcurrencyGate` coroutine semaphore for shared PG+Redis I/O budget
+- `DetachedTask` coroutine type for fire-and-forget async work
+- `Task::fromValue(T)` / `Task<void>::ready()` for pre-resolved coroutines
+- `Immediate<T>` coroutine type — zero-allocation synchronous fast path for L1 cache hits; thread-local coroutine frame pool for the async path
+
+### Fixed
+
+- Use-after-free in async I/O callbacks: coroutine handle saved before `removeCurrentWatch()` destroys the enclosing lambda (PgConnection, RedisConnection)
+- Inaccurate L1 memory accounting: ParlayHash internal allocations now charged to GDSF budget
+
+### Changed (Breaking)
+
+- **Return types**: `find`/`insert`/`patch` return `EntityView<Entity>` instead of `shared_ptr<const Entity>`
+- **Serialization accessors**: `json()` returns `const std::string*`, `binary()` returns `const std::vector<uint8_t>*`; lazy init via atomic CAS
+- **L1 backend**: ShardMap → lock-free ChunkMap; `l1_shard_count_log2` → `l1_chunk_count_log2`
+- **Insert/update signatures**: take `const Entity&` instead of `shared_ptr<const Entity>`
+- **`DbProvider::execute()`** returns `std::pair<int, bool>` (row count + coalesced flag)
+- **`DbProvider::init()`** now requires an `io` context parameter
+- **Composite keys**: `key()` returns `std::tuple`, SQL uses multi-column WHERE clauses
+- **Partition key concept**: `HasPartitionKey` → `HasPartitionHint`
+- **GDSF config**: `RELAIS_L1_MAX_MEMORY` CMake option → `RELAIS_GDSF_ENABLED` (compile-time toggle) + `GDSFConfig::max_memory` / `RELAIS_L1_MAX_MEMORY` env var (runtime budget); `GDSFPolicy::kMaxMemory` → `GDSFPolicy::enabled` + `GDSFPolicy::maxMemory()`
+- **GDSF internals**: `GDSFScoreData` stores `atomic<uint32_t> access_count` (4 B) instead of `atomic<float> score` + `atomic<uint32_t> last_generation` (8 B); `GDSFConfig::correction_alpha` → `histogram_alpha`; `RepoRegistryEntry::repo_score_fn` removed
+- **List cache keys**: canonical binary buffers replace XXH3 hashes (`query_hash` → `cache_key`)
+- `InvalidationData`: `optional<shared_ptr<const T>>` → `shared_ptr<const T>`
+- `Keyed`/`CreatableEntity` concepts no longer default `Key` to `int64_t`
+
+### Removed
+
+- `QueryCacheKey.h`, `QueryParser.h`
+- `EntityWrapper::releaseCaches()`
+- `CacheConfig::l1_cleanup_every_n_gets` / `l1_cleanup_min_interval`
+- `shardmap` dependency (replaced by vendored ParlayHash)
+- `GDSFPolicy::decay()`, `decayFactor()`, `generation()`, `tick()`, `correction()`, `updateCorrection()`, `pressureFactor()`
+- `CachedRepo::repoScore()`, `CachedRepo::postCleanup()`
+- `ListCacheConfig::cleanup_every_n_gets`
+
 ## [0.4.0] - 2026-02-17
 
 ### Added
