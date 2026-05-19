@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+## [0.5.0-alpha.1] - 2026-05-19
+
+**Alpha release — API may change. Not recommended for production.**
+
 ### Added
 
 - **Lock-free L1 cache** — ParlayHash-backed `ChunkMap` with epoch-based reclamation; `find`/`insert`/`patch` return lightweight `EntityView` instead of `shared_ptr`
