@@ -32,6 +32,26 @@ constexpr IoEvent& operator|=(IoEvent& a, IoEvent b) noexcept {
     return (set & flag) != IoEvent::None;
 }
 
+// IoContext — the event-loop extension point relais binds I/O onto.
+//
+// EpollIoContext is the bundled model, but PgPool/RedisPool and the awaiter
+// machinery are generic over this concept: any epoll-family loop (e.g. a
+// trantor::EventLoop shim to run relais inline on Drogon's threads) can satisfy
+// it. The concept fixes only the signatures below; the *semantic* contract an
+// adapter must honor is:
+//
+//   - addWatch(fd, mask, cb): cb runs ON THE LOOP THREAD whenever fd is ready
+//     for an event in `mask`, with the matching IoEvent bits set. Returns a
+//     handle for later update/remove.
+//   - updateWatch(handle, mask): changes the active mask on that handle.
+//   - removeWatch(handle): no further callbacks for that handle.
+//   - post(cb): runs cb exactly once, on the loop thread, FIFO with other posts;
+//     thread-safe AND wakes a blocked loop promptly when called from another
+//     thread. The loop's wait must be bounded so posts cannot stall.
+//
+// These rules are encoded as runnable checks in
+// testing/IoContextConformance.h — instantiate the harness against any adapter
+// to verify it before wiring relais pools onto it.
 template<typename T>
 concept IoContext = requires(
     T& ctx,
