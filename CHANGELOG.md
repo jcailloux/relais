@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Added
+
+- **`spawnOn`** (`runtime/Spawn.h`) — drive a lazy `Task` to completion on an event-loop thread from another thread; result delivered as `Outcome<T>` (`expected<T, exception_ptr>`). Single coroutine-frame allocation, move-only callbacks. Used to bootstrap co-located pools (e.g. block until `PgPool::create()` finishes on a Drogon loop)
+- **`IoContext` conformance harness** — `testing/IoContextConformance.h`, a framework-agnostic executable contract (post FIFO/single-exec/wakeup, watch Read/Write masks, update/remove, cross-thread post) that adapter authors run against a custom `IoContext` (e.g. a trantor/Drogon shim) before wiring relais pools onto it
+- Adapter authoring guide (`docs/io-context-adapters.md`) and a documented semantic contract on the `IoContext` concept
+
 ## [0.5.0-alpha.1] - 2026-05-19
 
 **Alpha release — API may change. Not recommended for production.**

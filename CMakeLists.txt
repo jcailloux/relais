@@ -210,6 +210,8 @@ if(RELAIS_BUILD_TESTS)
     relais_add_test(test_io_resp2         tests/io/test_io_resp2.cpp              LABELS "io")
     relais_add_test(test_epoll_io_context tests/io/test_epoll_io_context.cpp    LABELS "io;epoll")
     relais_add_test(test_batch_scheduler  tests/io/test_batch_scheduler.cpp     LABELS "io;batch")
+    relais_add_test(test_io_spawn         tests/io/test_spawn.cpp               LABELS "io;spawn")
+    relais_add_test(test_io_context_conformance tests/io/test_io_context_conformance.cpp LABELS "io;conformance")
 
     # -------------------------------------------------------------------------
     # Integration tests (require PostgreSQL + Redis)
