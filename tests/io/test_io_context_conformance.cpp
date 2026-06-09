@@ -50,6 +50,16 @@ TEST_CASE("IoContext conformance: cross-thread post on loop thread", "[io][confo
     REQUIRE_NOTHROW(IoContextConformance::checkCrossThreadPost(io, drive));
 }
 
+TEST_CASE("IoContext conformance: postDelayed fires once", "[io][conformance]") {
+    EpollIoContext io;
+    REQUIRE_NOTHROW(IoContextConformance::checkPostDelayedFires(io, drive));
+}
+
+TEST_CASE("IoContext conformance: cancelTimer stops a pending timer", "[io][conformance]") {
+    EpollIoContext io;
+    REQUIRE_NOTHROW(IoContextConformance::checkCancelTimer(io, drive));
+}
+
 TEST_CASE("IoContext conformance: full suite", "[io][conformance]") {
     EpollIoContext io;
     REQUIRE_NOTHROW(IoContextConformance::runAll(io, drive));

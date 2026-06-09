@@ -3,6 +3,8 @@
 #include <jcailloux/relais/io/redis/RedisResult.h>
 #include <jcailloux/relais/io/redis/RedisClient.h>
 #include <jcailloux/relais/io/IoContext.h>
+#include <chrono>
+#include <cstdint>
 #include <functional>
 
 using namespace jcailloux::relais::io;
@@ -10,12 +12,17 @@ using namespace jcailloux::relais::io;
 // Mock IoContext
 struct TestIo {
     using WatchHandle = int;
+    using TimerToken = uint64_t;
     int next_handle = 1;
+    TimerToken next_token = 1;
 
     WatchHandle addWatch(int, IoEvent, std::function<void(IoEvent)>) { return next_handle++; }
     void removeWatch(WatchHandle) {}
     void updateWatch(WatchHandle, IoEvent) {}
     void post(std::function<void()>) {}
+    template<typename Rep, typename Period>
+    TimerToken postDelayed(std::chrono::duration<Rep, Period>, std::function<void()>) { return next_token++; }
+    void cancelTimer(TimerToken) {}
 };
 
 static_assert(IoContext<TestIo>);

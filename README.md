@@ -195,7 +195,29 @@ using EventRepo = relais::Repo<EventEntity, "Event", config::Both>;
 // HasPartitionKey auto-detected from Mapping
 ```
 
-### 3. Use the repository
+### 3. Stand up the runtime
+
+Repository calls run on an **event loop** and route through per-loop connection
+pools — you must start that runtime before using a repo. The built-in `IoPool`
+is the easy path (N epoll loops, one per core, auto-bound):
+
+```cpp
+#include <jcailloux/relais/io/IoPool.h>
+using namespace jcailloux::relais;
+
+io::IoPoolConfig cfg;
+cfg.num_workers = 4;                  // N loops; 1 = single-loop
+cfg.pg_conninfo = "host=localhost dbname=app user=app";  // empty → libpq PG* env
+auto pool = io::IoPool::create(cfg);  // blocks until connected + bound
+```
+
+Repo calls must run **on a loop thread** (e.g. a coroutine posted to
+`pool->workerIo(i)`, or a web-framework handler if you co-locate relais on its
+loops). See **[docs/runtime-and-threading.md](docs/runtime-and-threading.md)**
+for the threading contract, N-loop scaling, and running relais directly on a
+foreign loop (Drogon/asio/…).
+
+### 4. Use the repository
 
 ```cpp
 io::Task<void> example() {
