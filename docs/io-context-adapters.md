@@ -204,3 +204,16 @@ sizing pools, remember total connections = N × per-loop max; keep it under the
 database's `max_connections`. (relais ships `io::IoPool` as a reference N-loop
 runtime for its own `EpollIoContext`; external routers follow the same
 init-per-loop-thread contract shown above.)
+
+## The background runtime thread (you don't wire it)
+
+A legitimate worry when co-locating: *"my framework drives the event loops — but
+who ticks relais's cached clock and L1 memory budget?"* Nothing you write.
+
+relais owns a single `RuntimeThread` — one `jthread`, a 100 ms tick that
+refreshes `CachedClock`, `CachedMemory`, and the GDSF heap accounting. The first
+L1-caching `CacheTier` to come alive calls `RuntimeThread::ensureStarted()` in
+its constructor; it's idempotent (`std::call_once`), so it spins up exactly once
+per process regardless of how many loops or repos you have. It is **independent
+of your event loops** — co-located or not, single-loop or N-loop, the clocks and
+budget keep ticking. You don't start it, bind it, or tick it from your loop.
