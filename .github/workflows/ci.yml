@@ -65,6 +65,7 @@ jobs:
           -DCMAKE_CXX_COMPILER=g++-14
           -DRELAIS_BUILD_TESTS=ON
           -DRELAIS_BUILD_BENCHMARKS=OFF
+          -DRELAIS_BUILD_EXAMPLES=ON
 
       - name: Build
         run: cmake --build build -j$(nproc)

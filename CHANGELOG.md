@@ -7,7 +7,7 @@
 - **Shared-nothing N-loop scaling** — run one event loop per core, each with its own pools; a request stays on its loop end to end. Throughput scales ~linearly with cores at unchanged per-request latency (single-loop is N=1). See `docs/runtime-and-threading.md`
 - **`spawnOn`** (`runtime/Spawn.h`) — drive a lazy `Task` to completion on an event-loop thread from another thread (`Outcome<T>` result). Used to bootstrap pools from a startup thread
 - **Run relais on a foreign event loop** — `IoContext` conformance harness (`testing/IoContextConformance.h`) + authoring guide (`docs/io-context-adapters.md`) to write and verify an adapter (e.g. Drogon/trantor), so relais co-locates on your framework's loops
-- **Runtime & threading guide** (`docs/runtime-and-threading.md`) and a Quick Start runtime section
+- **Runtime & threading guide** (`docs/runtime-and-threading.md`), a Quick Start runtime section, and runnable `examples/` (CI-compiled: `event_loop_basics`, `iopool_nloop`)
 
 ### Changed (Breaking)
 
