@@ -1,5 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <jcailloux/relais/io/IoContext.h>
+#include <chrono>
+#include <cstdint>
 #include <functional>
 #include <vector>
 
@@ -11,6 +13,7 @@ using namespace jcailloux::relais::io;
 
 struct MockIoContext {
     using WatchHandle = int;
+    using TimerToken = uint64_t;
 
     struct WatchEntry {
         int fd;
@@ -21,6 +24,7 @@ struct MockIoContext {
     std::vector<WatchEntry> watches;
     std::vector<std::function<void()>> posted;
     int next_handle = 1;
+    TimerToken next_token = 1;
 
     WatchHandle addWatch(int fd, IoEvent events, std::function<void(IoEvent)> cb) {
         watches.push_back({fd, events, std::move(cb)});
@@ -34,6 +38,15 @@ struct MockIoContext {
     void post(std::function<void()> cb) {
         posted.push_back(std::move(cb));
     }
+
+    template<typename Rep, typename Period>
+    TimerToken postDelayed(std::chrono::duration<Rep, Period> /*delay*/,
+                           std::function<void()> cb) {
+        posted.push_back(std::move(cb));
+        return next_token++;
+    }
+
+    void cancelTimer(TimerToken /*token*/) {}
 };
 
 // Compile-time verification that MockIoContext satisfies the concept

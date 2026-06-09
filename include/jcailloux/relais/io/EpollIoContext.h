@@ -13,6 +13,7 @@
 #include <queue>
 #include <set>
 #include <stdexcept>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -183,8 +184,15 @@ public:
         [[maybe_unused]] auto _ = ::write(pipe_write_, &byte, 1);
     }
 
+    /// True if called from the thread currently driving the loop. Lets callers
+    /// (e.g. PgProvider::init) assert thread-affinity invariants in debug.
+    [[nodiscard]] bool isInLoopThread() const noexcept {
+        return loop_thread_.load(std::memory_order_relaxed) == std::this_thread::get_id();
+    }
+
     /// Run one iteration of the event loop.
     void runOnce(int timeout_ms = 0) {
+        loop_thread_.store(std::this_thread::get_id(), std::memory_order_relaxed);
         drainPosted();
         fireExpiredTimers();
 
@@ -330,6 +338,7 @@ private:
     std::set<TimerToken> cancelled_tokens_;
     std::atomic<uint64_t> next_timer_token_{1};
     std::atomic<bool> stopped_{false};
+    std::atomic<std::thread::id> loop_thread_{};
 };
 
 static_assert(IoContext<EpollIoContext>);
