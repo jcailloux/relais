@@ -236,6 +236,37 @@ struct IoContextConformance {
             "post() from another thread: callback must run on the loop thread");
     }
 
+    // -- timers -------------------------------------------------------------
+
+    // C8: postDelayed(delay, cb) runs cb exactly once, after the delay. (The
+    // BatchScheduler uses this to flush a batch on an adaptive deadline.)
+    template<io::IoContext Io, typename Drive>
+    static void checkPostDelayedFires(Io& io, Drive drive) {
+        int calls = 0;
+        io.postDelayed(std::chrono::milliseconds(1), [&] { ++calls; });
+        drive(io, [&] { return calls > 0; });
+        detail::pump(io, drive, 2);  // a duplicate would surface here
+        detail::require(calls == 1,
+            "postDelayed(): timer must fire exactly once, observed "
+            + std::to_string(calls));
+    }
+
+    // C9: cancelTimer(token) stops a pending timer. A later, uncancelled "fence"
+    // timer bounds the wait: once it fires, the cancelled timer's earlier
+    // deadline has passed, so any firing means cancel failed.
+    template<io::IoContext Io, typename Drive>
+    static void checkCancelTimer(Io& io, Drive drive) {
+        int cancelled = 0;
+        bool fence = false;
+        auto token = io.postDelayed(std::chrono::milliseconds(1), [&] { ++cancelled; });
+        io.cancelTimer(token);
+        io.postDelayed(std::chrono::milliseconds(3), [&] { fence = true; });
+        drive(io, [&] { return fence; });
+        detail::require(cancelled == 0,
+            "cancelTimer(): a cancelled timer must not fire, observed "
+            + std::to_string(cancelled));
+    }
+
     // -- aggregate ----------------------------------------------------------
 
     template<io::IoContext Io, typename Drive>
@@ -247,6 +278,8 @@ struct IoContextConformance {
         checkUpdateWatch(io, drive);
         checkRemoveWatch(io, drive);
         checkCrossThreadPost(io, drive);
+        checkPostDelayedFires(io, drive);
+        checkCancelTimer(io, drive);
     }
 };
 

@@ -14,7 +14,7 @@
 #include <vector>
 
 #include "jcailloux/relais/io/Task.h"
-#include "jcailloux/relais/io/EpollIoContext.h"
+#include "jcailloux/relais/io/IoContext.h"
 #include "jcailloux/relais/io/pg/PgPool.h"
 #include "jcailloux/relais/io/pg/PgResult.h"
 #include "jcailloux/relais/io/pg/PgParams.h"
@@ -46,7 +46,7 @@ namespace jcailloux::relais::io::batch {
 template<IoContext Io>
 class BatchScheduler {
     using Clock = std::chrono::steady_clock;
-    using TimerToken = typename EpollIoContext::TimerToken;
+    using TimerToken = typename Io::TimerToken;
 
 public:
     BatchScheduler(Io& io,
@@ -588,7 +588,7 @@ private:
         if (delay_ns <= 0) delay_ns = 100'000; // 100us minimum
         auto delay = std::chrono::nanoseconds(delay_ns);
 
-        pg_read_batch_.timer = static_cast<EpollIoContext&>(io_).postDelayed(delay, [this] {
+        pg_read_batch_.timer = io_.postDelayed(delay, [this] {
             pg_read_batch_.timer_active = false;
             firePgReadBatchNow();
         });
@@ -600,7 +600,7 @@ private:
         if (delay_ns <= 0) delay_ns = 100'000;
         auto delay = std::chrono::nanoseconds(delay_ns);
 
-        pg_write_batch_.timer = static_cast<EpollIoContext&>(io_).postDelayed(delay, [this] {
+        pg_write_batch_.timer = io_.postDelayed(delay, [this] {
             pg_write_batch_.timer_active = false;
             firePgWriteBatchNow();
         });
@@ -612,7 +612,7 @@ private:
         if (delay_ns <= 0) delay_ns = 50'000; // 50us minimum
         auto delay = std::chrono::nanoseconds(delay_ns);
 
-        redis_batch_.timer = static_cast<EpollIoContext&>(io_).postDelayed(delay, [this] {
+        redis_batch_.timer = io_.postDelayed(delay, [this] {
             redis_batch_.timer_active = false;
             fireRedisBatchNow();
         });
@@ -628,7 +628,7 @@ private:
 
         // Cancel timer if still active
         if (pg_read_batch_.timer_active) {
-            static_cast<EpollIoContext&>(io_).cancelTimer(pg_read_batch_.timer);
+            io_.cancelTimer(pg_read_batch_.timer);
             pg_read_batch_.timer_active = false;
         }
 
@@ -644,7 +644,7 @@ private:
         if (pg_write_batch_.entries.empty()) return;
 
         if (pg_write_batch_.timer_active) {
-            static_cast<EpollIoContext&>(io_).cancelTimer(pg_write_batch_.timer);
+            io_.cancelTimer(pg_write_batch_.timer);
             pg_write_batch_.timer_active = false;
         }
 
@@ -658,7 +658,7 @@ private:
         if (redis_batch_.entries.empty()) return;
 
         if (redis_batch_.timer_active) {
-            static_cast<EpollIoContext&>(io_).cancelTimer(redis_batch_.timer);
+            io_.cancelTimer(redis_batch_.timer);
             redis_batch_.timer_active = false;
         }
 

@@ -1,5 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <jcailloux/relais/io/pg/PgPool.h>
+#include <chrono>
+#include <cstdint>
 #include <functional>
 
 using namespace jcailloux::relais::io;
@@ -7,7 +9,9 @@ using namespace jcailloux::relais::io;
 // Mock IoContext for compilation testing
 struct TestIo {
     using WatchHandle = int;
+    using TimerToken = uint64_t;
     int next_handle = 1;
+    TimerToken next_token = 1;
 
     WatchHandle addWatch(int, IoEvent, std::function<void(IoEvent)>) {
         return next_handle++;
@@ -15,6 +19,11 @@ struct TestIo {
     void removeWatch(WatchHandle) {}
     void updateWatch(WatchHandle, IoEvent) {}
     void post(std::function<void()>) {}
+    template<typename Rep, typename Period>
+    TimerToken postDelayed(std::chrono::duration<Rep, Period>, std::function<void()>) {
+        return next_token++;
+    }
+    void cancelTimer(TimerToken) {}
 };
 
 static_assert(IoContext<TestIo>);

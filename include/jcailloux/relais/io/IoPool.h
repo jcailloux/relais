@@ -2,8 +2,10 @@
 #define JCX_RELAIS_IO_POOL_H
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -55,9 +57,11 @@ struct IoPoolConfig {
 // - A BatchScheduler (adaptive batching)
 // - A std::jthread (the actual OS thread)
 //
-// The IoPool configures PgProvider with thread_local dispatch so that
-// coroutines running on a worker thread automatically route to that
-// worker's BatchScheduler.
+// Each worker binds PgProvider's thread_local providers to its OWN
+// BatchScheduler, on its own thread, during create(). A coroutine running on a
+// worker thus routes to that worker's resources with no cross-thread hop
+// (shared-nothing). This is the same per-loop-thread init() contract any
+// external router (e.g. a Drogon/trantor adapter) uses.
 
 class IoPool {
 public:
@@ -89,13 +93,9 @@ public:
             w.io = std::make_unique<Io>();
             w.worker_id = i;
 
-            w.thread = std::jthread([&pool, &w, &config, &ready_count,
+            w.thread = std::jthread([&w, &config, &ready_count,
                                      &ready_mutex, &ready_cv, i]
                                     (std::stop_token stop) {
-                // Set thread_local worker ID
-                tl_worker_id_ = i;
-                tl_pool_ = pool.get();
-
                 // Pin to core
                 if (config.pin_to_cores) {
                     int core = config.first_core + i;
@@ -127,13 +127,22 @@ public:
                                 config.redis_conns_per_worker));
                     }
 
-                    // Batch scheduler
-                    w.batcher = std::make_unique<batch::BatchScheduler<Io>>(
+                    // Batch scheduler — owned per worker (shared so the
+                    // thread_local providers can co-own it).
+                    w.batcher = std::make_shared<batch::BatchScheduler<Io>>(
                         *w.io, w.pg_pool, w.redis_pool,
                         config.max_concurrent_per_worker);
 
-                    // Signal ready
-                    ready_count.fetch_add(1, std::memory_order_release);
+                    // Bind THIS worker thread's providers to its own batcher.
+                    PgProvider::bindBatcher<Io>(w.batcher, w.redis_pool != nullptr);
+
+                    // Signal ready — increment UNDER the lock so the waiter
+                    // can't miss the wakeup (it holds the lock while evaluating
+                    // the predicate in wait()).
+                    {
+                        std::lock_guard lock(ready_mutex);
+                        ready_count.fetch_add(1, std::memory_order_release);
+                    }
                     ready_cv.notify_one();
                 };
 
@@ -155,73 +164,6 @@ public:
         }
 
         return pool;
-    }
-
-    /// Register this IoPool as the PgProvider backend.
-    /// After this call, PgProvider::queryParams() etc. route through the
-    /// BatchScheduler of the calling thread's worker.
-    void registerAsProvider() {
-        // PG query (simple)
-        PgProvider::pg_query_ = [this](const char* sql) -> Task<PgResult> {
-            auto* batcher = getBatcher();
-            if (batcher) {
-                co_return co_await batcher->directQuery(sql);
-            }
-            // Fallback: post to worker 0
-            // TODO: implement cross-thread dispatch
-            co_return co_await workers_[0].batcher->directQuery(sql);
-        };
-
-        // PG queryParams
-        PgProvider::pg_query_params_ = [this](const char* sql,
-                                               const PgParams& params)
-            -> Task<PgResult>
-        {
-            auto* batcher = getBatcher();
-            if (batcher) {
-                co_return co_await batcher->submitQueryRead(sql, PgParams{params});
-            }
-            co_return co_await workers_[0].batcher->submitQueryRead(sql, PgParams{params});
-        };
-
-        // PG entityQueryParams (entity reads routed to submitEntityRead)
-        PgProvider::pg_entity_query_ = [this](const char* batch_sql,
-                                               const char* single_sql,
-                                               const PgParams& params)
-            -> Task<PgResult>
-        {
-            auto* batcher = getBatcher();
-            if (batcher) {
-                co_return co_await batcher->submitEntityRead(
-                    batch_sql, single_sql, PgParams{params});
-            }
-            co_return co_await workers_[0].batcher->submitEntityRead(
-                batch_sql, single_sql, PgParams{params});
-        };
-
-        // PG execute
-        PgProvider::pg_execute_ = [this](const char* sql,
-                                          const PgParams& params)
-            -> Task<std::pair<int, bool>>
-        {
-            auto* batcher = getBatcher();
-            if (batcher) {
-                co_return co_await batcher->submitPgExecute(sql, PgParams{params});
-            }
-            co_return co_await workers_[0].batcher->submitPgExecute(sql, PgParams{params});
-        };
-
-        // Redis
-        PgProvider::redis_exec_ = [this](int argc, const char** argv,
-                                          const size_t* argvlen)
-            -> Task<RedisResult>
-        {
-            auto* batcher = getBatcher();
-            if (batcher) {
-                co_return co_await batcher->submitRedis(argc, argv, argvlen);
-            }
-            co_return co_await workers_[0].batcher->submitRedis(argc, argv, argvlen);
-        };
     }
 
     /// Stop all workers.
@@ -250,27 +192,13 @@ private:
         std::unique_ptr<Io> io;
         std::shared_ptr<PgPool<Io>> pg_pool;
         std::shared_ptr<RedisPool<Io>> redis_pool;
-        std::unique_ptr<batch::BatchScheduler<Io>> batcher;
+        std::shared_ptr<batch::BatchScheduler<Io>> batcher;
         std::jthread thread;
         int worker_id = 0;
     };
 
-    /// Get the BatchScheduler for the current thread (nullptr if not a worker thread).
-    [[nodiscard]] batch::BatchScheduler<Io>* getBatcher() const noexcept {
-        if (tl_pool_ != this) return nullptr;
-        int id = tl_worker_id_;
-        if (id < 0 || id >= static_cast<int>(workers_.size())) return nullptr;
-        return workers_[id].batcher.get();
-    }
-
     IoPoolConfig config_;
     std::vector<Worker> workers_;
-
-    static inline thread_local int tl_worker_id_ = -1;
-    static inline thread_local IoPool* tl_pool_ = nullptr;
-
-    // PgProvider needs access to the static function members
-    friend class jcailloux::relais::PgProvider;
 };
 
 } // namespace jcailloux::relais::io

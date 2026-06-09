@@ -1,6 +1,7 @@
 #ifndef JCX_RELAIS_IO_CONTEXT_H
 #define JCX_RELAIS_IO_CONTEXT_H
 
+#include <chrono>
 #include <concepts>
 #include <cstdint>
 #include <functional>
@@ -48,6 +49,12 @@ constexpr IoEvent& operator|=(IoEvent& a, IoEvent b) noexcept {
 //   - post(cb): runs cb exactly once, on the loop thread, FIFO with other posts;
 //     thread-safe AND wakes a blocked loop promptly when called from another
 //     thread. The loop's wait must be bounded so posts cannot stall.
+//   - postDelayed(delay, cb): runs cb once on the loop thread after `delay`;
+//     returns a TimerToken. Thread-safe. (Used by BatchScheduler to flush a
+//     batch after an adaptive deadline.)
+//   - cancelTimer(token): cancels a pending postDelayed; no-op if it already
+//     fired or the token is unknown. (Used to cancel the flush timer when a
+//     batch departs early because it filled up.)
 //
 // These rules are encoded as runnable checks in
 // testing/IoContextConformance.h — instantiate the harness against any adapter
@@ -59,12 +66,16 @@ concept IoContext = requires(
     IoEvent events,
     std::function<void(IoEvent)> io_cb,
     std::function<void()> cb,
-    typename T::WatchHandle handle
+    typename T::WatchHandle handle,
+    typename T::TimerToken token,
+    std::chrono::nanoseconds delay
 ) {
     { ctx.addWatch(fd, events, std::move(io_cb)) } -> std::same_as<typename T::WatchHandle>;
     { ctx.removeWatch(handle) } -> std::same_as<void>;
     { ctx.updateWatch(handle, events) } -> std::same_as<void>;
     { ctx.post(std::move(cb)) } -> std::same_as<void>;
+    { ctx.postDelayed(delay, std::move(cb)) } -> std::same_as<typename T::TimerToken>;
+    { ctx.cancelTimer(token) } -> std::same_as<void>;
 };
 
 } // namespace jcailloux::relais::io

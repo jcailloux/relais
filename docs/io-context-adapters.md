@@ -34,8 +34,9 @@ at the concept and the conformance harness below.
 
 ## The contract
 
-Satisfy four methods. The semantic rules (the part a concept can't express) are
-documented on the concept and enforced by the harness:
+Satisfy six methods (plus the `WatchHandle` and `TimerToken` member types). The
+semantic rules (the part a concept can't express) are documented on the concept
+and enforced by the harness:
 
 | relais method | what it must do |
 |---|---|
@@ -43,6 +44,8 @@ documented on the concept and enforced by the harness:
 | `void updateWatch(WatchHandle, IoEvent mask)` | change the active mask on that handle |
 | `void removeWatch(WatchHandle)` | stop all callbacks for that handle |
 | `void post(std::function<void()>)` | run once, on the loop thread, FIFO; thread-safe; **wake a blocked loop promptly** |
+| `TimerToken postDelayed(duration, cb)` | run `cb` once, on the loop thread, after the delay; return a cancellable token. Used to flush a batch on an adaptive deadline |
+| `void cancelTimer(TimerToken)` | cancel a pending `postDelayed`; no-op if already fired or unknown |
 
 ## Sketch: trantor (Drogon)
 
@@ -154,32 +157,50 @@ Once `runAll` passes, construct `PgPool<TrantorIoContext>` /
 `RedisPool<TrantorIoContext>` on each loop and `co_await` relais `Task`s
 directly inside your coroutine handlers — no thread hop.
 
-## Bootstrapping the pools
+## Bootstrapping the pools (and scaling to N loops)
 
-There is one unavoidable cross-thread moment: `PgPool::create()` is a *lazy*
-coroutine that does its connection I/O **on the loop thread**, but you kick it
-off at startup from another thread (the loop is already running and you must not
-block it). [`spawnOn`](../include/jcailloux/relais/runtime/Spawn.h) drives the
-lazy Task to completion on the loop and hands the result back, which you turn
-into a blocking wait with a `std::promise`:
+`PgProvider`'s providers are **`thread_local`**: each loop thread binds its OWN
+pool/batcher by calling `PgProvider::init(io, pool)` **on that loop thread**. A
+Task co_awaited on loop K then routes to loop K's pool — shared-nothing, no
+cross-thread hop. Mono-loop is N=1; for N loops you run this once per loop and
+throughput scales ~linearly.
+
+There is one unavoidable cross-thread moment per loop: `PgPool::create()` is a
+*lazy* coroutine that does its connection I/O **on the loop thread**, but you
+kick it off at startup from another thread (the loop is already running and you
+must not block it). [`spawnOn`](../include/jcailloux/relais/runtime/Spawn.h)
+drives it on the loop, and its completion callback — which runs **on the loop
+thread** — is exactly where `init()` must bind the thread_local providers:
 
 ```cpp
 #include <jcailloux/relais/runtime/Spawn.h>
 
-// Called from a thread OTHER than the loop's (else you'd block the loop on work
-// posted to itself — deadlock).
-auto io = std::make_unique<TrantorIoContext>(loop);
-std::promise<std::shared_ptr<PgPool<TrantorIoContext>>> ready;
-auto fut = ready.get_future();
+// Run this once per loop, each from a thread OTHER than that loop's (else you'd
+// block the loop on work posted to itself — deadlock). e.g. from Drogon's
+// registerBeginningAdvice over getIOLoop(0..N-1).
+void initRelaisOnLoop(trantor::EventLoop* loop, const char* conninfo,
+                      size_t min, size_t max) {
+    auto io = std::make_unique<TrantorIoContext>(loop);  // kept alive program-long
+    auto* io_ptr = io.get();
+    std::promise<std::shared_ptr<PgPool<TrantorIoContext>>> ready;
+    auto fut = ready.get_future();
 
-relais::spawnOn(*io, PgPool<TrantorIoContext>::create(*io, conninfo, min, max),
-    [&ready](relais::Outcome<std::shared_ptr<PgPool<TrantorIoContext>>> r) {
-        if (r) ready.set_value(*r); else ready.set_exception(r.error());
-    });
+    relais::spawnOn(*io_ptr,
+        PgPool<TrantorIoContext>::create(*io_ptr, conninfo, min, max),
+        [&ready, io_ptr](relais::Outcome<std::shared_ptr<PgPool<TrantorIoContext>>> r) {
+            // ON the loop thread: bind THIS loop's thread_local providers.
+            if (r) { relais::PgProvider::init(*io_ptr, *r); ready.set_value(*r); }
+            else   { ready.set_exception(r.error()); }
+        });
 
-auto pool = fut.get();              // blocks until connected (or throws)
-relais::PgProvider::init(*io, pool);  // route relais Tasks to this pool
+    auto pool = fut.get();  // blocks until connected + bound (or throws)
+    keepAlive(std::move(io), pool);  // store per-loop runtime for the process
+}
 ```
 
-This is the *only* place spawnOn is needed in the co-located model: a one-time
-startup kick. Per-request reads stay inline — no spawnOn, no hop.
+`spawnOn` is the *only* place it's needed in the co-located model: a one-time
+startup kick per loop. Per-request reads stay inline — no spawnOn, no hop. When
+sizing pools, remember total connections = N × per-loop max; keep it under the
+database's `max_connections`. (relais ships `io::IoPool` as a reference N-loop
+runtime for its own `EpollIoContext`; external routers follow the same
+init-per-loop-thread contract shown above.)

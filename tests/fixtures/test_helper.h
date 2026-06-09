@@ -323,10 +323,19 @@ inline void initTest() {
     }
     detail::testRedis() = redis;
 
-    jcailloux::relais::PgProvider::init(io, pool, redis, pg_max);
-
     // Phase 2: Start background event loop thread
     detail::testLoop().start();
+
+    // Phase 3: bind PgProvider ON the loop thread. Providers are thread_local
+    // (shared-nothing): sync() runs Tasks on the loop thread, so init — which
+    // also builds the BatchScheduler against `io` — must happen there.
+    std::promise<void> bound;
+    auto bound_fut = bound.get_future();
+    detail::testLoop().dispatch([&io, pool, redis, pg_max, &bound]() mutable {
+        jcailloux::relais::PgProvider::init(io, pool, redis, pg_max);
+        bound.set_value();
+    });
+    bound_fut.get();
 }
 
 /**
@@ -375,7 +384,9 @@ public:
 
 private:
     static void cleanup() {
-        if (!jcailloux::relais::PgProvider::initialized()) {
+        // Providers are thread_local now; check the harness's own init flag
+        // instead of PgProvider::initialized() (which is false off the loop thread).
+        if (!detail::isInitialized().load()) {
             return;
         }
         flushRedis();
