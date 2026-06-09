@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+## [0.5.0-alpha.2] - 2026-06-09
+
+**Alpha release — API may change. Not recommended for production.**
+
 ### Added
 
 - **Shared-nothing N-loop scaling** — run one event loop per core, each with its own pools; a request stays on its loop end to end. Throughput scales ~linearly with cores at unchanged per-request latency (single-loop is N=1). See `docs/runtime-and-threading.md`
@@ -18,6 +22,13 @@
 
 - **`IoPool` is now functional.** Announced in 0.5.0-alpha.1, it never compiled (missing `<condition_variable>`/`<mutex>` includes) and had a startup lost-wakeup; both fixed, and `BatchScheduler` no longer relied on an unsound `static_cast<EpollIoContext&>` (undefined behavior on any non-Epoll loop). Covered by `test_io_pool_integration`
 - `PgProvider::init`: passing an explicit `nullptr` Redis argument no longer breaks template deduction
+
+### Documentation
+
+- README is now a concise hub pointing to topical guides under `docs/`; the generator/caching/invalidation/list manuals moved out of the monolithic README
+- Clarified the generator's `entity::generated` namespace, the FetchContent `CMAKE_MODULE_PATH` step, the `glz::meta` ODR rule, and the relative-include path constraint
+- Documented L1 bounds: `l1_ttl` is a staleness ceiling, GDSF only evicts when `RELAIS_L1_MAX_MEMORY` is set — `with_l1_ttl(0s)` without a budget is unbounded
+- Corrected stale references (`DbProvider`→`PgProvider`, `list/decl`→`list/spec`, `--scan`/`--files`→`--sources`) and dropped the non-functional `@relais output=` annotation from docs
 
 ## [0.5.0-alpha.1] - 2026-05-19
 
