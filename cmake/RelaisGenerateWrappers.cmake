@@ -15,6 +15,31 @@ Usage::
 
     add_dependencies(my_app relais_generate_wrappers)
 
+FetchContent
+^^^^^^^^^^^^
+
+``include(RelaisGenerateWrappers)`` only resolves once relais's ``cmake/``
+directory is on ``CMAKE_MODULE_PATH``. With FetchContent this is NOT automatic
+-- add it explicitly after ``FetchContent_MakeAvailable(relais)``::
+
+    FetchContent_MakeAvailable(relais)
+    list(APPEND CMAKE_MODULE_PATH "${relais_SOURCE_DIR}/cmake")
+    include(RelaisGenerateWrappers)
+
+(``relais_SOURCE_DIR`` is set by FetchContent, lowercase.) When relais was
+``install()``-ed, the package config already puts the module on the path and
+this extra line is unnecessary.
+
+Path constraint
+^^^^^^^^^^^^^^^^
+
+Each entity is written to ``{ClassName}Entity.h`` under ``OUTPUT_DIR`` -- there
+is no per-entity output annotation. The generated header re-includes its source
+struct with a path computed *relative* to ``OUTPUT_DIR``, so keep ``SOURCES``
+and ``OUTPUT_DIR`` in a stable directory relationship (e.g. a ``generated/``
+subfolder beside the sources). Generating into an unrelated tree produces a
+broken ``../../...`` include.
+
 #]=======================================================================]
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
