@@ -8,6 +8,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <vector>
 
 #include "jcailloux/relais/io/Task.h"
@@ -55,7 +56,7 @@ public:
     /// Execute a simple SQL query (no parameters).
     /// @note sql must remain valid until the co_await completes.
     static io::Task<io::PgResult> query(const char* sql) {
-        assert(pg_query_ && "PgProvider::query() called before init()");
+        assert(pg_query_ && "PgProvider::query() called before init() on this thread (providers are thread_local — init() must run on each loop thread)");
         return pg_query_(sql);
     }
 
@@ -64,7 +65,7 @@ public:
     static io::Task<io::PgResult> queryParams(
         const char* sql, const io::PgParams& params)
     {
-        assert(pg_query_params_ && "PgProvider::queryParams() called before init()");
+        assert(pg_query_params_ && "PgProvider::queryParams() called before init() on this thread (providers are thread_local — init() must run on each loop thread)");
         return pg_query_params_(sql, params);
     }
 
@@ -75,7 +76,7 @@ public:
         const char* batch_sql, const char* single_sql,
         const io::PgParams& params)
     {
-        assert(pg_entity_query_ && "PgProvider::entityQueryParams() called before init()");
+        assert(pg_entity_query_ && "PgProvider::entityQueryParams() called before init() on this thread (providers are thread_local — init() must run on each loop thread)");
         return pg_entity_query_(batch_sql, single_sql, params);
     }
 
@@ -86,7 +87,7 @@ public:
     static io::Task<std::pair<int, bool>> execute(
         const char* sql, const io::PgParams& params)
     {
-        assert(pg_execute_ && "PgProvider::execute() called before init()");
+        assert(pg_execute_ && "PgProvider::execute() called before init() on this thread (providers are thread_local — init() must run on each loop thread)");
         return pg_execute_(sql, params);
     }
 
@@ -154,19 +155,37 @@ public:
     }
 
     // =========================================================================
-    // Initialization (call once at startup)
+    // Initialization (call once PER LOOP THREAD at startup)
     // =========================================================================
 
-    /// Initialize with a BatchScheduler (PG pipelining + Redis pipelining).
-    /// The IoContext type is erased — callers don't need to know it.
-    /// Redis commands are routed through the BatchScheduler for pipelining.
+    /// Bind this thread's providers to a freshly built BatchScheduler (PG +
+    /// Redis pipelining). The IoContext type is erased — callers don't need to
+    /// know it.
+    ///
+    /// Thread affinity: the providers are thread_local. Call init() ON the loop
+    /// thread whose pool you pass — mono-loop: once on that loop; N-loop: once
+    /// per loop, each with that loop's own pool. Building the BatchScheduler also
+    /// touches `io` (timers), which must happen on the loop thread.
     template<typename Io>
     static void init(
         Io& io,
         std::shared_ptr<io::PgPool<Io>> pool,
-        std::shared_ptr<io::RedisClient<Io>> redisClient = nullptr,
+        // type_identity_t → non-deduced: Io comes from io/pool only, so passing
+        // an explicit `nullptr` here doesn't break deduction.
+        std::type_identity_t<std::shared_ptr<io::RedisClient<Io>>> redisClient = nullptr,
         int max_concurrent = 8)
     {
+        // Debug guard: providers are thread_local, so init() MUST run on the loop
+        // thread whose pool it binds. Adapters exposing isInLoopThread() (e.g.
+        // EpollIoContext, a trantor shim) get this checked; others opt out.
+        if constexpr (requires(Io& i) {
+                          { i.isInLoopThread() } -> std::convertible_to<bool>;
+                      }) {
+            assert(io.isInLoopThread() &&
+                "PgProvider::init must run ON the loop thread (providers are "
+                "thread_local — call it once per loop thread for N-loop)");
+        }
+
         // Wrap single RedisClient into a RedisPool for the BatchScheduler
         std::shared_ptr<io::RedisPool<Io>> redis_pool;
         if (redisClient) {
@@ -177,6 +196,18 @@ public:
         auto batcher = std::make_shared<io::batch::BatchScheduler<Io>>(
             io, std::move(pool), redis_pool, max_concurrent);
 
+        bindBatcher<Io>(std::move(batcher), redis_pool != nullptr);
+    }
+
+    /// Bind the calling thread's providers to an already-built BatchScheduler.
+    /// Used by init() and by IoPool (which builds one batcher per worker). MUST
+    /// run on the loop thread that owns `batcher`. The thread_local function
+    /// objects co-own `batcher` via shared_ptr — it lives until reset() or the
+    /// thread exits.
+    template<typename Io>
+    static void bindBatcher(
+        std::shared_ptr<io::batch::BatchScheduler<Io>> batcher, bool with_redis)
+    {
         pg_query_ = [batcher](const char* sql) {
             return batcher->directQuery(sql);
         };
@@ -198,7 +229,7 @@ public:
             co_return co_await batcher->submitPgExecute(sql, io::PgParams{params});
         };
 
-        if (redis_pool) {
+        if (with_redis) {
             // Route Redis through the BatchScheduler for pipelining.
             // The batcher owns the redis_pool via shared_ptr.
             redis_exec_ = [batcher](
@@ -234,11 +265,15 @@ public:
     using RedisExecFn = std::function<io::Task<io::RedisResult>(
         int, const char**, const size_t*)>;
 
-    static inline PgQueryFn pg_query_;
-    static inline PgQueryParamsFn pg_query_params_;
-    static inline PgEntityQueryFn pg_entity_query_;
-    static inline PgExecuteFn pg_execute_;
-    static inline RedisExecFn redis_exec_;
+    // thread_local: each event-loop thread binds its OWN pool/batcher by calling
+    // init() on that thread (shared-nothing). A Task co_awaited on loop K then
+    // dispatches to loop K's batcher with no cross-thread hop. Mono-loop is N=1;
+    // N-loop scales throughput by calling init() once per loop thread.
+    static inline thread_local PgQueryFn pg_query_;
+    static inline thread_local PgQueryParamsFn pg_query_params_;
+    static inline thread_local PgEntityQueryFn pg_entity_query_;
+    static inline thread_local PgExecuteFn pg_execute_;
+    static inline thread_local RedisExecFn redis_exec_;
 
     // IoPool needs to set these directly
     friend class io::IoPool;

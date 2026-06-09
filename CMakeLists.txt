@@ -210,6 +210,8 @@ if(RELAIS_BUILD_TESTS)
     relais_add_test(test_io_resp2         tests/io/test_io_resp2.cpp              LABELS "io")
     relais_add_test(test_epoll_io_context tests/io/test_epoll_io_context.cpp    LABELS "io;epoll")
     relais_add_test(test_batch_scheduler  tests/io/test_batch_scheduler.cpp     LABELS "io;batch")
+    relais_add_test(test_io_spawn         tests/io/test_spawn.cpp               LABELS "io;spawn")
+    relais_add_test(test_io_context_conformance tests/io/test_io_context_conformance.cpp LABELS "io;conformance")
 
     # -------------------------------------------------------------------------
     # Integration tests (require PostgreSQL + Redis)
@@ -219,6 +221,7 @@ if(RELAIS_BUILD_TESTS)
     relais_add_test(test_io_pg_pipeline       tests/io/test_pg_pipeline.cpp          LABELS "io;integration;pipeline" RESOURCE_LOCK)
     relais_add_test(test_io_redis_pool        tests/io/test_redis_pool.cpp           LABELS "io;integration;redis-pool" RESOURCE_LOCK)
     relais_add_test(test_batch_scheduler_integration tests/io/test_batch_scheduler_integration.cpp LABELS "io;integration;batch" RESOURCE_LOCK)
+    relais_add_test(test_io_pool_integration  tests/io/test_io_pool_integration.cpp   LABELS "io;integration;iopool" RESOURCE_LOCK)
 
     relais_add_test(test_relais_base            tests/relais/test_pg_repo.cpp      DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db"                 RESOURCE_LOCK)
     relais_add_test(test_relais_redis           tests/relais/test_redis_repo.cpp     DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;redis"            RESOURCE_LOCK)
@@ -346,4 +349,20 @@ if(RELAIS_BUILD_BENCHMARKS)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests)
     target_compile_definitions(bench_gdsf PRIVATE RELAIS_BUILDING_TESTS RELAIS_GDSF_ENABLED=1 RELAIS_ENABLE_METRICS=1)
     target_link_libraries(bench_gdsf PRIVATE jcailloux::relais Catch2::Catch2WithMain)
+endif()
+
+# =============================================================================
+# Examples
+# =============================================================================
+
+option(RELAIS_BUILD_EXAMPLES "Build relais examples" OFF)
+
+if(RELAIS_BUILD_EXAMPLES)
+    # Self-contained — no database required.
+    add_executable(example_event_loop_basics examples/event_loop_basics.cpp)
+    target_link_libraries(example_event_loop_basics PRIVATE jcailloux::relais)
+
+    # Requires PostgreSQL + Redis reachable at runtime.
+    add_executable(example_iopool_nloop examples/iopool_nloop.cpp)
+    target_link_libraries(example_iopool_nloop PRIVATE jcailloux::relais)
 endif()

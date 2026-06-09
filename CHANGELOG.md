@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+### Added
+
+- **Shared-nothing N-loop scaling** — run one event loop per core, each with its own pools; a request stays on its loop end to end. Throughput scales ~linearly with cores at unchanged per-request latency (single-loop is N=1). See `docs/runtime-and-threading.md`
+- **`spawnOn`** (`runtime/Spawn.h`) — drive a lazy `Task` to completion on an event-loop thread from another thread (`Outcome<T>` result). Used to bootstrap pools from a startup thread
+- **Run relais on a foreign event loop** — `IoContext` conformance harness (`testing/IoContextConformance.h`) + authoring guide (`docs/io-context-adapters.md`) to write and verify an adapter (e.g. Drogon/trantor), so relais co-locates on your framework's loops
+- **Runtime & threading guide** (`docs/runtime-and-threading.md`), a Quick Start runtime section, and runnable `examples/` (CI-compiled: `event_loop_basics`, `iopool_nloop`)
+
+### Changed (Breaking)
+
+- **`PgProvider::init` must be called on the event-loop thread it serves** (providers are now `thread_local`, was process-global). Single-loop: call it on the loop thread; N-loop: once per loop. Debug builds assert this for adapters exposing `isInLoopThread()`
+- **Custom `IoContext` implementations must add `postDelayed`/`cancelTimer`/`TimerToken`** — the concept now requires timer support (used by `BatchScheduler` for adaptive batch flushing). The bundled `EpollIoContext` already satisfies it
+
+### Fixed
+
+- **`IoPool` is now functional.** Announced in 0.5.0-alpha.1, it never compiled (missing `<condition_variable>`/`<mutex>` includes) and had a startup lost-wakeup; both fixed, and `BatchScheduler` no longer relied on an unsound `static_cast<EpollIoContext&>` (undefined behavior on any non-Epoll loop). Covered by `test_io_pool_integration`
+- `PgProvider::init`: passing an explicit `nullptr` Redis argument no longer breaks template deduction
+
 ## [0.5.0-alpha.1] - 2026-05-19
 
 **Alpha release — API may change. Not recommended for production.**

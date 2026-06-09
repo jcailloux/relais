@@ -448,7 +448,7 @@ static void notifyDeleted(EntityPtr entity);
 
 ### DB Query Path
 
-`queryFromDb` returns rows from PostgreSQL via `DbProvider::queryParams`. Sort bounds are extracted from the entities built from these rows:
+`queryFromDb` returns rows from PostgreSQL via `PgProvider::queryParams`. Sort bounds are extracted from the entities built from these rows:
 
 ```cpp
 auto entities = co_await queryFromDb(query);
@@ -995,7 +995,7 @@ PgRepo::patch(id, set<F>(v)...)
     |-- Build dynamic SQL: UPDATE table SET "col1"=$1, "col2"=$2 WHERE "pk"=$3 RETURNING *
     |     columns = { fieldColumnName<Traits>(updates)... }
     |     values = { fieldValue<Traits>(updates)... }
-    |     co_await DbProvider::queryParams(sql, params)
+    |     co_await PgProvider::queryParams(sql, params)
     |
     |-- Build entity from RETURNING row
     |-- co_return re-fetched entity
@@ -1140,9 +1140,7 @@ Test entities are pure C++ structs in `tests/fixtures/` with `@relais` annotatio
 ### Usage
 
 ```bash
-# Scan directory for @relais annotations
-python scripts/generate_entities.py --scan src/entities/ --output-dir src/
-
-# Or specific files
-python scripts/generate_entities.py --files src/entities/User.h --output-dir src/
+# Scan directories and/or pass explicit files (both go to --sources)
+python scripts/generate_entities.py --sources src/entities/ --output-dir src/generated/
+python scripts/generate_entities.py --sources src/entities/User.h --output-dir src/generated/
 ```
