@@ -350,3 +350,19 @@ if(RELAIS_BUILD_BENCHMARKS)
     target_compile_definitions(bench_gdsf PRIVATE RELAIS_BUILDING_TESTS RELAIS_GDSF_ENABLED=1 RELAIS_ENABLE_METRICS=1)
     target_link_libraries(bench_gdsf PRIVATE jcailloux::relais Catch2::Catch2WithMain)
 endif()
+
+# =============================================================================
+# Examples
+# =============================================================================
+
+option(RELAIS_BUILD_EXAMPLES "Build relais examples" OFF)
+
+if(RELAIS_BUILD_EXAMPLES)
+    # Self-contained — no database required.
+    add_executable(example_event_loop_basics examples/event_loop_basics.cpp)
+    target_link_libraries(example_event_loop_basics PRIVATE jcailloux::relais)
+
+    # Requires PostgreSQL + Redis reachable at runtime.
+    add_executable(example_iopool_nloop examples/iopool_nloop.cpp)
+    target_link_libraries(example_iopool_nloop PRIVATE jcailloux::relais)
+endif()
