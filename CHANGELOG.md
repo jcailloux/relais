@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.5.0-alpha.3] - 2026-06-10
+
 ### Fixed
 
 - **Silent corruption on `update()` of a simple, caller-assigned primary key.** `updateOutcome` built UPDATE params from `toInsertParams` for non-tuple keys, which leads with the PK column, shifting every `SET` value by one slot against the generated `SET <non-pk>=$2.. WHERE <pk>=$1` layout. The first row written looked correct; later updates either failed silently or wrote the PK value into the adjacent column. Simple keys now use `toUpdateParams` unconditionally (same path as composite keys). `db_managed` PKs (e.g. `BIGSERIAL` ids) were unaffected — their PK is excluded from insert params too, so the two param sets coincided, which is why the suite never caught it. Regression coverage added via a non-`db_managed` single-key fixture (`tests/relais/test_simple_assigned_key.cpp`)
