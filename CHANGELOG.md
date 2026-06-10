@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **Silent corruption on `update()` of a simple, caller-assigned primary key.** `updateOutcome` built UPDATE params from `toInsertParams` for non-tuple keys, which leads with the PK column, shifting every `SET` value by one slot against the generated `SET <non-pk>=$2.. WHERE <pk>=$1` layout. The first row written looked correct; later updates either failed silently or wrote the PK value into the adjacent column. Simple keys now use `toUpdateParams` unconditionally (same path as composite keys). `db_managed` PKs (e.g. `BIGSERIAL` ids) were unaffected — their PK is excluded from insert params too, so the two param sets coincided, which is why the suite never caught it. Regression coverage added via a non-`db_managed` single-key fixture (`tests/relais/test_simple_assigned_key.cpp`)
+- **Generator dropped a field whose declaration carried a `(` in its trailing comment.** `_parse_members` excluded methods by testing the whole line for `(`; a field like `int64_t x = 0; // ... (idle)` was silently removed from the mapping (absent from INSERT, `fromRow`, …). The method/parenthesis test now runs on the code portion only (line truncated before `//` and `/*`); `@relais` tags are still read from the full line
+
 ## [0.5.0-alpha.2] - 2026-06-09
 
 **Alpha release — API may change. Not recommended for production.**

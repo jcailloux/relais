@@ -390,12 +390,7 @@ protected:
     {
         try {
             auto keyParams = io::PgParams::fromKey(id);
-            io::PgParams fieldParams;
-            if constexpr (is_tuple_v<Key>) {
-                fieldParams = E::toUpdateParams(entity);
-            } else {
-                fieldParams = E::toInsertParams(entity);
-            }
+            io::PgParams fieldParams = E::toUpdateParams(entity);
             io::PgParams params;
             params.params.reserve(keyParams.params.size() + fieldParams.params.size());
             for (auto& p : keyParams.params)

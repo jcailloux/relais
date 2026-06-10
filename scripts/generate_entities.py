@@ -401,7 +401,12 @@ class StructParser:
             if not in_public:
                 continue
 
-            if "[[nodiscard]]" in stripped or "(" in stripped:
+            code_part = stripped
+            for _marker in ("//", "/*"):
+                _pos = code_part.find(_marker)
+                if _pos != -1:
+                    code_part = code_part[:_pos]
+            if "[[nodiscard]]" in code_part or "(" in code_part:
                 continue
             if stripped.startswith("//") or stripped.startswith("using "):
                 continue
@@ -661,8 +666,8 @@ class MappingGenerator:
             lines.append("")
             lines.extend(self._generate_to_insert_params(entity))
 
-        # toUpdateParams (skip for read-only; only generated for composite keys)
-        if not a.read_only and a.is_composite:
+        # toUpdateParams (skip for read-only). Non-PK SET fields only — the exact
+        if not a.read_only:
             lines.append("")
             lines.extend(self._generate_to_update_params(entity))
 
@@ -928,14 +933,15 @@ class MappingGenerator:
     # =========================================================================
 
     def _generate_to_update_params(self, entity: ParsedEntity) -> list[str]:
-        """Generate toUpdateParams for composite key entities.
+        """Generate toUpdateParams for any writable entity (simple or composite key).
 
         Unlike toInsertParams (which includes PK fields), this returns only
-        the SET fields used in UPDATE statements. The caller (PgRepo) prepends
-        the key params separately.
+        the SET fields used in UPDATE statements, in column order. The caller
+        (PgRepo::updateOutcome) prepends the key params separately, matching the
+        generated ``UPDATE … SET <non-pk>=$2.. WHERE <pk>=$1`` layout.
         """
         a = entity.annotation
-        pk_set = set(a.primary_keys)
+        pk_set = set(a.primary_keys) if a.primary_keys else {"id"}
 
         # Fields for SET: not PK, not db_managed
         update_members = [

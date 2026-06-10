@@ -20,6 +20,7 @@
 #include "generated/TestEventEntity.h"
 #include "generated/TestProductEntity.h"
 #include "generated/TestMembershipEntity.h"
+#include "generated/TestAssignedKeyEntity.h"
 
 namespace relais_test {
 
@@ -43,6 +44,7 @@ using TestPurchaseList = entity::generated::TestPurchaseListWrapper;
 using entity::generated::TestEventEntity;
 using entity::generated::TestProductEntity;
 using entity::generated::TestMembershipEntity;
+using entity::generated::TestAssignedKeyEntity;
 
 // Cross-invalidation key extractors
 inline constexpr auto purchaseUserId = [](const auto& p) -> int64_t { return p.user_id; };
@@ -296,6 +298,26 @@ inline TestMembershipEntity makeTestMembership(
     entity.user_id = user_id;
     entity.group_id = group_id;
     entity.role = role;
+    return entity;
+}
+
+// =============================================================================
+// AssignedKey Repositories (simple PK, assigned by caller — not db_managed)
+// =============================================================================
+
+using UncachedTestAssignedKeyRepo = Repo<TestAssignedKeyEntity, "test:akey:uncached", cfg::Uncached>;
+using L1TestAssignedKeyRepo = Repo<TestAssignedKeyEntity, "test:akey:l1">;
+using FullCacheTestAssignedKeyRepo = Repo<TestAssignedKeyEntity, "test:akey:both", cfg::Both>;
+
+inline TestAssignedKeyEntity makeTestAssignedKey(
+    int64_t key_id,
+    int64_t payload = 0,
+    const std::string& note = ""
+) {
+    TestAssignedKeyEntity entity;
+    entity.key_id = key_id;
+    entity.payload = payload;
+    entity.note = note;
     return entity;
 }
 
