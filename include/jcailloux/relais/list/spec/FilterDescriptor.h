@@ -5,9 +5,12 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <type_traits>
+#include <utility>
 
 #include "jcailloux/relais/config/FixedString.h"
+#include "jcailloux/relais/TypeTraits.h"
 
 namespace jcailloux::relais::list::spec {
 
@@ -179,6 +182,41 @@ template<typename E>
         return entity.id();
     } else {
         return entity.id;
+    }
+}
+
+// =============================================================================
+// Primary-key components — generalize the keyset tiebreaker to composite keys.
+// A scalar key is one component (byte-identical to the old single-id cursor);
+// a tuple key is its N components, in key()/primary_key_columns order.
+// =============================================================================
+
+/// Number of int64 primary-key components in a keyset cursor.
+template<typename E>
+inline constexpr size_t keyComponentCount = [] {
+    using K = std::remove_cvref_t<decltype(E::MappingType::key(std::declval<const E&>()))>;
+    if constexpr (jcailloux::relais::is_tuple_v<K>) {
+        return std::tuple_size_v<K>;
+    } else {
+        return size_t{1};
+    }
+}();
+
+/// Write the entity's primary-key components as int64 into out[0..N).
+template<typename E>
+void extractKeyComponents(const E& entity, int64_t* out) noexcept {
+    auto k = E::MappingType::key(entity);
+    if constexpr (jcailloux::relais::is_tuple_v<decltype(k)>) {
+        std::apply([&](auto const&... xs) {
+            static_assert((std::is_integral_v<std::remove_cvref_t<decltype(xs)>> && ...),
+                "list keyset pagination requires integer primary-key components");
+            size_t i = 0;
+            ((out[i++] = static_cast<int64_t>(xs)), ...);
+        }, k);
+    } else {
+        static_assert(std::is_integral_v<std::remove_cvref_t<decltype(k)>>,
+            "list keyset pagination requires an integer primary key");
+        out[0] = static_cast<int64_t>(k);
     }
 }
 

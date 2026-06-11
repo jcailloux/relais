@@ -130,6 +130,9 @@ to stay immune to this.
   `ListDescriptor` if *any* of `filterable`/`sortable`/`limits` is present, but
   `ValidListDescriptor` requires `HasSorts ≥ 1` (cursor pagination needs a
   deterministic order). `filterable` alone won't compile a usable list.
+- **Composite keys are supported.** The keyset cursor spans every primary-key
+  column, so an entity with a composite key (including an all-PK junction) can
+  carry a `@relais_list`. Key components must be integers.
 
 ## CRUD → list notification (automatic)
 
