@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **Entities with no updatable column failed to compile** (`no type named 'Field'`). A pure all-primary-key junction (e.g. `MemberRole(user_id, role_id)`) and a `@relais read_only` view have no fields to update, so the generator skipped the `Field` enum entirely — but `Entity<>` aliases `TraitsType::Field` unconditionally, so the entity could not be instantiated. The generator now always emits the enum, empty when nothing is updatable. Regression coverage: `tests/relais/test_repo_compile.cpp` (`[junction]`/`[readonly]`) with `TestAllPkJunction`/`TestReadOnlyView` fixtures
+- **Malformed `SQL::update` for all-PK junctions.** With every column in the primary key, the `SET` clause was empty (`UPDATE t SET  WHERE …`) — a valid string literal that only fails when sent to PostgreSQL. `SQL::update`/`toUpdateParams` are now emitted only when a non-PK, non-`db_managed` column exists
+
+### Changed
+
+- **Full-update methods are gated on a new `HasFullUpdate` concept.** `update`, `updateOutcome`, `updateWithContext`, `updateJson`, and `updateBinary` are now absent (across every mixin layer) for entities with no updatable column, rather than failing to instantiate at the call site. `insert()`/`erase()` are unaffected; entities with updatable columns are unchanged
+
 ## [0.5.0-alpha.3] - 2026-06-10
 
 ### Fixed

@@ -338,7 +338,7 @@ public:
 
     /// Update entity and invalidate list caches.
     static io::Task<bool> update(const Key& id, const Entity& entity)
-        requires MutableEntity<Entity> && (!Base::config.read_only)
+        requires MutableEntity<Entity> && HasFullUpdate<Entity> && (!Base::config.read_only)
     {
         std::optional<Entity> old;
         {
@@ -458,7 +458,7 @@ protected:
 
     static io::Task<bool> updateWithContext(
         const Key& id, const Entity& entity, const Entity* old_entity)
-        requires MutableEntity<Entity> && (!Base::config.read_only)
+        requires MutableEntity<Entity> && HasFullUpdate<Entity> && (!Base::config.read_only)
     {
         bool ok = co_await Base::update(id, entity);
         if (ok) {

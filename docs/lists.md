@@ -77,6 +77,60 @@ io::Task<std::string> handleAuditLogList(
 `unordered_map<string, string>`) and validates every parameter against the
 descriptor.
 
+## Query from C++ code (no HTTP)
+
+To query from C++ and get **structs back** — not JSON, not `shared_ptr` —
+build the `ListQuery` directly. `Repo::ListQuery` is
+`list::spec::ListDescriptorQuery<Descriptor>`; its fields are `filters`,
+`sort`, `limit` (default 20), `cursor`, `offset`, `group_key`, `cache_key`.
+
+```cpp
+#include <jcailloux/relais/list/spec/HttpQueryParser.h>  // groupCacheKey / cacheKey live here
+namespace ld = jcailloux::relais::list::spec;
+
+AuditLogRepo::ListQuery q;
+q.limit = 200;
+q.filters.get<"user_id">() = uid;       // by name; value type is the field T
+
+// MANDATORY: derive the cache keys before query(). Skipping this is a silent
+// footgun — both keys stay empty, every call collides on the same key, and the
+// cache returns stale/wrong pages with no error.
+using Desc = AuditLogRepo::ListDescriptorType;
+q.group_key = ld::groupCacheKey<Desc>(q);
+q.cache_key = ld::cacheKey<Desc>(q);
+
+auto view = co_await AuditLogRepo::query(q);   // CacheView<ListWrapper<Entity>>
+for (const auto& e : view->items)              // items is std::vector<Entity>, BY VALUE
+    use(e.user_id);                            // struct fields accessed directly
+// view->size(), view->total_count, view->cursor() also available.
+```
+
+`items` is a `std::vector<Entity>` (by value). The `std::vector<EntityPtr>`
+inside `CachedListResult` is the internal L2/Redis representation — not the
+public `query()` API.
+
+### Filter object model
+
+Generated filters are `std::optional<T>` — **active** means `has_value()`.
+Two accessors: `get<"field">()` (compile-time, by param name) and `get<N>()`
+(by index). **Gotcha:** `get<N>()` indices follow the **alphabetical order of
+param names** (the generator sorts filters for deterministic cache keys —
+`generate_entities.py:1269`), *not* declaration order. Prefer `get<"name">()`
+to stay immune to this.
+
+### Behavior & gotchas
+
+- **No active filter → the whole table** (paginated by `limit`). Relied on for
+  "load this small table" — no `WHERE` clause is emitted when no filter is set.
+- **`limit` is not clamped on the code path.** `parseListQueryStrict` *rejects*
+  an out-of-range limit (HTTP), but a hand-built `ListQuery` passes `limit`
+  straight into SQL. For "load everything", set `limit` above the row count
+  yourself — exceeding `maxLimit` silently yields a truncated page, no error.
+- **At least one `sortable` field is required.** The generator emits a
+  `ListDescriptor` if *any* of `filterable`/`sortable`/`limits` is present, but
+  `ValidListDescriptor` requires `HasSorts ≥ 1` (cursor pagination needs a
+  deterministic order). `filterable` alone won't compile a usable list.
+
 ## CRUD → list notification (automatic)
 
 ListMixin intercepts `insert`, `update`, `erase`, and `patch` to notify the list
@@ -92,7 +146,10 @@ listCache().onEntityDeleted(entity);
 ```
 
 The tracker uses a monotonic generation counter (not timestamps); pages affected
-by recent modifications are dropped on `get()`.
+by recent modifications are dropped on `get()`. "Affected" is decided by
+`matchesFilters`: a cached page is dropped only if the changed entity matches
+its active filter values. So `insert(uid, role)` drops the
+`discord_user_id=uid` page but leaves `discord_user_id=other` pages intact.
 
 For cross-repo list invalidation (a change in one table dropping another table's
 list pages), see [`InvalidateListVia`](invalidation.md#selective-list-invalidation-via-invalidatelistvia).

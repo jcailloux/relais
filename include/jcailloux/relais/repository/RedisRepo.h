@@ -137,7 +137,7 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
         /// Update entity in database with L2 cache handling.
         /// Returns true on success, false on error.
         static io::Task<bool> update(const Key& id, const E& entity)
-            requires MutableEntity<E> && (!Cfg.read_only)
+            requires MutableEntity<E> && HasFullUpdate<E> && (!Cfg.read_only)
         {
             auto outcome = co_await updateOutcome(id, entity);
             co_return outcome.success;
@@ -169,7 +169,7 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
 
         /// Update returning full outcome. Skips L2 ops when coalesced.
         static io::Task<WriteOutcome> updateOutcome(const Key& id, const E& entity)
-            requires MutableEntity<E> && (!Cfg.read_only)
+            requires MutableEntity<E> && HasFullUpdate<E> && (!Cfg.read_only)
         {
             using enum config::UpdateStrategy;
 

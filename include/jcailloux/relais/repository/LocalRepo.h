@@ -139,7 +139,7 @@ public:
 
     /// Update entity in database with L1 cache handling.
     static io::Task<bool> update(const Key& id, const E& entity)
-        requires MutableEntity<E> && (!Cfg.read_only)
+        requires MutableEntity<E> && HasFullUpdate<E> && (!Cfg.read_only)
     {
         using enum config::UpdateStrategy;
 

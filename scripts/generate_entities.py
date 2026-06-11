@@ -666,8 +666,9 @@ class MappingGenerator:
             lines.append("")
             lines.extend(self._generate_to_insert_params(entity))
 
-        # toUpdateParams (skip for read-only). Non-PK SET fields only — the exact
-        if not a.read_only:
+        # toUpdateParams (skip for read-only, and for all-PK entities with no
+        # SET columns — see _has_update_columns). Non-PK SET fields only.
+        if not a.read_only and self._has_update_columns(entity):
             lines.append("")
             lines.extend(self._generate_to_update_params(entity))
 
@@ -732,7 +733,7 @@ class MappingGenerator:
             f'VALUES ({insert_params}) RETURNING {all_cols_str}";',
         ]
 
-        if not a.read_only:
+        if not a.read_only and self._has_update_columns(entity):
             lines.append(f"        static constexpr const char* update =")
             lines.append(
                 f'            "UPDATE {table_name} SET {update_set} '
@@ -782,14 +783,20 @@ class MappingGenerator:
             "    struct TraitsType {",
         ]
 
-        if updateable and not a.read_only:
-            lines.append("        enum class Field : uint8_t {")
-            for i, m in enumerate(updateable):
-                comma = "," if i < len(updateable) - 1 else ""
-                lines.append(f"            {m.name}{comma}")
-            lines.append("        };")
-            lines.append("")
-            lines.append("        template<Field> struct FieldInfo;")
+        # Always emit the Field enum — Entity<> unconditionally aliases
+        # TraitsType::Field, so every entity needs it to instantiate. All-PK
+        # junctions and read-only views get an EMPTY enum: valid C++, and with
+        # no enumerators the patch/update method templates are uninstantiable
+        # (no Field::x to pass), so the forward-declared FieldInfo<> stays
+        # harmlessly undefined.
+        emitted = self._get_field_members(entity, updateable)
+        lines.append("        enum class Field : uint8_t {")
+        for i, m in enumerate(emitted):
+            comma = "," if i < len(emitted) - 1 else ""
+            lines.append(f"            {m.name}{comma}")
+        lines.append("        };")
+        lines.append("")
+        lines.append("        template<Field> struct FieldInfo;")
 
         lines.append("    };")
         return lines
@@ -1309,12 +1316,13 @@ class MappingGenerator:
     def _generate_field_info(self, entity: ParsedEntity, mapping_name: str,
                               updateable: list[DataMember]) -> list[str]:
         a = entity.annotation
-        if not updateable or a.read_only:
+        members = self._get_field_members(entity, updateable)
+        if not members:
             return []
 
         traits_path = f"{mapping_name}::TraitsType"
         lines = []
-        for m in updateable:
+        for m in members:
             is_timestamp = m.name in a.timestamps
             is_nullable = m.is_optional
             enum_mapping = self._find_enum_mapping(a, m.name)
@@ -1459,6 +1467,33 @@ class MappingGenerator:
                 continue
             result.append(m)
         return result
+
+    def _get_field_members(self, entity: ParsedEntity,
+                            updateable: list[DataMember]) -> list[DataMember]:
+        """The members that become TraitsType::Field enumerators.
+
+        Single source of truth shared by the Field enum and its FieldInfo<>
+        specializations — they MUST stay in lockstep, or a Field::X without a
+        matching FieldInfo<Field::X> (or vice versa) breaks patch instantiation.
+        Read-only entities contribute none (an empty enum is still emitted so
+        Entity<> can alias TraitsType::Field).
+        """
+        return [] if entity.annotation.read_only else updateable
+
+    def _has_update_columns(self, entity: ParsedEntity) -> bool:
+        """True if the entity has any non-PK, non-db_managed column — i.e. the
+        UPDATE ... SET clause would be non-empty.
+
+        False for pure all-PK junctions: emitting SQL::update there yields a
+        malformed "UPDATE t SET  WHERE ..." (empty SET) that compiles as a string
+        literal but fails at runtime. Gates SQL::update and toUpdateParams
+        together so update() is simply unavailable rather than silently broken.
+        Read-only entities are gated separately (no writes at all).
+        """
+        a = entity.annotation
+        pk_set = set(a.primary_keys) if a.primary_keys else {"id"}
+        return any(m.name not in pk_set and m.name not in a.db_managed
+                   for m in entity.members)
 
     def _find_enum_mapping(self, a: EntityAnnotation, field_name: str) -> Optional[EnumMapping]:
         for em in a.enums:

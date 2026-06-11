@@ -32,7 +32,7 @@ struct UserToGuildsResolver {
         auto result = co_await PgProvider::queryArgs(
             "SELECT guild_id FROM guild_members WHERE user_id = $1", user_id);
         std::vector<int64_t> guild_ids;
-        for (size_t i = 0; i < result.size(); ++i)
+        for (int i = 0; i < result.rows(); ++i)
             guild_ids.push_back(result[i].get<int64_t>(0));
         co_return guild_ids;
     }
@@ -46,6 +46,30 @@ using UserRepo = Repo<UserEntity, "User", config::Local,
 
 The resolver returns `Task<iterable<Key>>` (e.g. `Task<std::vector<int64_t>>`).
 If the target cache has its own `Invalidations...`, those cascade automatically.
+
+### Raw queries — `PgProvider` / `PgResult` contract
+
+A resolver is the canonical escape hatch for a direct SQL query the declarative
+layer can't express. The contract:
+
+- **`PgProvider::queryArgs(sql, args...)`** — parameterized query, builds and
+  keeps `PgParams` alive in the coroutine frame. Use `queryParams(sql, params)`
+  for a pre-built `PgParams`, `query(sql)` for no params. All return
+  `io::Task<io::PgResult>`. `sql`/`params` must outlive the `co_await`.
+- **Row count is `result.rows()`** (returns `int`), **not** `size()` — there is
+  no `size()`. Also `empty()`, `ok()` (command succeeded), `affectedRows()`.
+- **`result[i]`** → a `Row`. **`row.get<T>(col)`** reads column index `col`
+  (0-based `int`); specialized for `int64_t`, `int32_t`, `double`, `bool`,
+  `std::string`, `std::string_view`. Use `row.getOpt<T>(col)` / `row.isNull(col)`
+  for nullable columns. `get<T>` throws `PgError` on a parse failure.
+
+```cpp
+auto r = co_await PgProvider::queryArgs(
+    "SELECT role_id FROM member_roles WHERE discord_user_id = $1", uid);
+std::vector<int64_t> ids;
+for (int i = 0; i < r.rows(); ++i)        // rows(), not size()
+    ids.push_back(r[i].get<int64_t>(0));
+```
 
 ## Selective list invalidation via `InvalidateListVia`
 
@@ -63,7 +87,7 @@ struct PurchaseToArticleResolver {
         auto result = co_await PgProvider::queryArgs(
             "SELECT category, view_count FROM articles WHERE author_id = $1", user_id);
         std::vector<Target> targets;
-        for (size_t i = 0; i < result.size(); ++i) {
+        for (int i = 0; i < result.rows(); ++i) {
             Target t;
             t.filters.category = result[i].get<std::string>(0);
             t.sort_value = result[i].get<int64_t>(1);
