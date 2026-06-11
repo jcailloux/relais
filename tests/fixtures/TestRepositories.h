@@ -23,6 +23,7 @@
 #include "generated/TestAssignedKeyEntity.h"
 #include "generated/TestAllPkJunctionEntity.h"
 #include "generated/TestReadOnlyViewEntity.h"
+#include "generated/TestCompositeKeyListEntity.h"
 
 namespace relais_test {
 
@@ -49,6 +50,7 @@ using entity::generated::TestMembershipEntity;
 using entity::generated::TestAssignedKeyEntity;
 using entity::generated::TestAllPkJunctionEntity;
 using entity::generated::TestReadOnlyViewEntity;
+using entity::generated::TestCompositeKeyListEntity;
 
 // Cross-invalidation key extractors
 inline constexpr auto purchaseUserId = [](const auto& p) -> int64_t { return p.user_id; };
@@ -340,5 +342,11 @@ using FullCacheTestAllPkJunctionRepo = Repo<TestAllPkJunctionEntity, "test:junct
 
 using UncachedTestReadOnlyViewRepo = Repo<TestReadOnlyViewEntity, "test:roview:uncached", test_config::ReadOnlyUncached>;
 using L2TestReadOnlyViewRepo = Repo<TestReadOnlyViewEntity, "test:roview:l2", test_config::ReadOnlyL2>;
+
+// =============================================================================
+// Composite-key LIST repository (keyset cursor over a composite primary key)
+// =============================================================================
+
+using L1TestCompositeKeyListRepo = Repo<TestCompositeKeyListEntity, "test:complist:l1">;
 
 } // namespace relais_test

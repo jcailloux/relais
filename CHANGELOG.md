@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- **Composite-key list pagination.** The keyset cursor now spans every primary-key column instead of a single scalar `id`: the cursor encodes `sort_value` plus N key components, and the SQL keyset / `ORDER BY` use a row-value comparison over `primary_key_columns`. Lets an entity with a composite primary key (e.g. an all-PK junction) carry a `@relais_list`. Scalar-key cursors are unchanged (byte-identical, one component). Key components must be integers — a `static_assert` rejects non-integer composite keys. Automatic same-repo list invalidation (insert/erase) works unchanged, matched by filter value rather than key. Covered by `tests/relais/test_decl_list_composite.cpp` (pagination, filter, CRUD invalidation)
+
 ## [0.5.0-alpha.4] - 2026-06-11
 
 ### Fixed

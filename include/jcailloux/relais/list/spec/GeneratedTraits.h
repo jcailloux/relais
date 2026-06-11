@@ -153,8 +153,9 @@ template<typename Descriptor>
     const typename Descriptor::Entity& entity,
     const SortSpec<Descriptor>& sort
 ) noexcept {
+    constexpr size_t N = detail::keyComponentCount<typename Descriptor::Entity>;
     Cursor cursor;
-    cursor.data.resize(sizeof(int64_t) * 2);  // sort_value + id
+    cursor.data.resize(sizeof(int64_t) * (1 + N));  // sort_value + N key components
 
     int64_t sort_value = 0;
 
@@ -167,10 +168,15 @@ template<typename Descriptor>
         }() : false) || ...);
     }(std::make_index_sequence<sort_count<Descriptor>>{});
 
-    // Encode: sort_value, then entity id (supports both member and method)
+    // Encode: sort_value, then the entity's primary-key components (one for a
+    // scalar key — byte-identical to the legacy id cursor — N for a tuple key).
     std::memcpy(cursor.data.data(), &sort_value, sizeof(sort_value));
-    int64_t id = detail::extractEntityId(entity);
-    std::memcpy(cursor.data.data() + sizeof(sort_value), &id, sizeof(id));
+    int64_t keys[N];
+    detail::extractKeyComponents(entity, keys);
+    for (size_t i = 0; i < N; ++i) {
+        std::memcpy(cursor.data.data() + sizeof(int64_t) * (1 + i),
+                    &keys[i], sizeof(int64_t));
+    }
 
     return cursor;
 }
@@ -183,14 +189,18 @@ template<typename Descriptor>
     const Cursor& cursor,
     const SortSpec<Descriptor>& sort
 ) noexcept {
+    constexpr size_t N = detail::keyComponentCount<typename Descriptor::Entity>;
     if (cursor.empty()) return true;
-    if (cursor.data.size() < sizeof(int64_t) * 2) return true;
+    if (cursor.data.size() < sizeof(int64_t) * (1 + N)) return true;
 
-    // Decode cursor
+    // Decode cursor: sort_value + N key components
     int64_t cursor_sort_value = 0;
-    int64_t cursor_id = 0;
     std::memcpy(&cursor_sort_value, cursor.data.data(), sizeof(cursor_sort_value));
-    std::memcpy(&cursor_id, cursor.data.data() + sizeof(cursor_sort_value), sizeof(cursor_id));
+    int64_t cursor_keys[N];
+    for (size_t i = 0; i < N; ++i) {
+        std::memcpy(&cursor_keys[i], cursor.data.data() + sizeof(int64_t) * (1 + i),
+                    sizeof(int64_t));
+    }
 
     // Get entity sort value
     int64_t entity_sort_value = 0;
@@ -204,18 +214,24 @@ template<typename Descriptor>
         }() : false) || ...);
     }(std::make_index_sequence<sort_count<Descriptor>>{});
 
-    // Get entity id (supports both member and method)
-    int64_t entity_id = detail::extractEntityId(entity);
+    // Lexicographic tiebreak over the key components (one for a scalar key)
+    int64_t entity_keys[N];
+    detail::extractKeyComponents(entity, entity_keys);
+    int kcmp = 0;
+    for (size_t i = 0; i < N && kcmp == 0; ++i) {
+        kcmp = (entity_keys[i] < cursor_keys[i]) ? -1
+             : (entity_keys[i] > cursor_keys[i]) ? 1 : 0;
+    }
 
     // Compare based on direction
     if (sort.direction == SortDirection::Desc) {
         if (entity_sort_value > cursor_sort_value) return true;
         if (entity_sort_value < cursor_sort_value) return false;
-        return entity_id >= cursor_id;
+        return kcmp >= 0;
     } else {
         if (entity_sort_value < cursor_sort_value) return true;
         if (entity_sort_value > cursor_sort_value) return false;
-        return entity_id <= cursor_id;
+        return kcmp <= 0;
     }
 }
 

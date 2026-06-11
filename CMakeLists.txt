@@ -231,6 +231,7 @@ if(RELAIS_BUILD_TESTS)
     relais_add_test(test_relais_full_cache      tests/relais/test_full_cache.cpp           DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;full-cache"       RESOURCE_LOCK)
     relais_add_test(test_relais_decl_list_redis tests/relais/test_decl_list_redis.cpp      DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;redis;list"       RESOURCE_LOCK)
     relais_add_test(test_relais_decl_list_full  tests/relais/test_decl_list_full.cpp       DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;full-cache;list"  RESOURCE_LOCK)
+    relais_add_test(test_relais_decl_list_composite tests/relais/test_decl_list_composite.cpp DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;list;composite"   RESOURCE_LOCK)
     relais_add_test(test_relais_warmup          tests/relais/test_warmup.cpp               DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;warmup"           RESOURCE_LOCK)
     relais_add_test(test_relais_l1_config       tests/relais/config/test_l1_config.cpp     DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;config"           RESOURCE_LOCK)
     relais_add_test(test_relais_l2_config       tests/relais/config/test_l2_config.cpp     DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;redis;config"     RESOURCE_LOCK)
@@ -265,6 +266,7 @@ if(RELAIS_BUILD_TESTS)
             test_relais_full_cache
             test_relais_decl_list_redis
             test_relais_decl_list_full
+            test_relais_decl_list_composite
             test_relais_warmup
             test_relais_l1_config
             test_relais_l2_config
@@ -290,6 +292,7 @@ if(RELAIS_BUILD_TESTS)
         tests/relais/test_full_cache.cpp
         tests/relais/test_decl_list_redis.cpp
         tests/relais/test_decl_list_full.cpp
+        tests/relais/test_decl_list_composite.cpp
         tests/relais/test_warmup.cpp
         tests/relais/config/test_l1_config.cpp
         tests/relais/config/test_l2_config.cpp
