@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.5.0-alpha.5] - 2026-06-11
+
 ### Added
 
 - **Array column mapping (`T[]` ↔ `std::vector<T>`).** PostgreSQL array columns map to `std::vector<T>` for scalar `T` (`int*`, `double`, `bool`, `std::string`), read and write, with `text[]` quoting handled both ways. Unquoted `NULL` elements are rejected; arrays of structs stay on the `json_field` path. Unblocks `array_agg` read-only views as point-lookup entities.
