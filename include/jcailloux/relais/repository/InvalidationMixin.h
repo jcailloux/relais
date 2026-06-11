@@ -57,7 +57,7 @@ public:
     /// When Base is ListMixin, reuses the pre-fetched old entity via WithContext
     /// to avoid a redundant L1 lookup.
     static io::Task<bool> update(const Key& id, const Entity& entity)
-        requires MutableEntity<Entity> && (!Base::config.read_only)
+        requires MutableEntity<Entity> && HasFullUpdate<Entity> && (!Base::config.read_only)
     {
         std::optional<Entity> old;
         {

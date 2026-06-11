@@ -118,7 +118,7 @@ The generator also emits, **at global scope** (outside `entity::generated`):
 | Annotation | Effect |
 |---|---|
 | `@relais table=users` | PostgreSQL table name (required; otherwise derived from the class name with a warning). |
-| `@relais read_only` | Marks the entity read-only — no `toInsertParams`, no `update`, no `Field` enum. |
+| `@relais read_only` | Marks the entity read-only — no `toInsertParams`, no `update`/`patch`. Still emits an (empty) `Field` enum (see [below](#the-traitstypefield-contract)). |
 | `@relais_list limits=10,25,50` | Pagination limits for a list entity. First = `defaultLimit`, last = `maxLimit`. |
 
 ### Field-level
@@ -230,4 +230,22 @@ For each entity the generator produces, inside `entity::generated`:
   `makePartitionHintParams()`.
 - **List entities** — an embedded `ListDescriptor` (auto-detected by ListMixin)
   and a `{Class}ListWrapper` alias.
+
+## The `TraitsType::Field` contract
+
+`Entity<Struct, Mapping>` aliases `TraitsType::Field` unconditionally, so the
+generator emits a `Field` enum for every entity. Two cases have no updatable
+column and receive an empty `enum class Field : uint8_t {}`:
+
+- a pure all-primary-key junction (e.g. `MemberRole(discord_user_id, role_id)`),
+- a `read_only` view.
+
+An entity with no non-key, non-`db_managed` column has no `UPDATE ... SET` to
+generate. For such entities the generator omits `SQL::update`/`toUpdateParams`,
+and the repository gates the full-update path (`update`, `updateOutcome`,
+`updateWithContext`, `updateJson`, `updateBinary`) on the `HasFullUpdate`
+concept:
+
+- `update()` and `patch()` are absent from the repository type.
+- `insert()` and `erase()` remain available.
 </content>

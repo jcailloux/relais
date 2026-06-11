@@ -19,10 +19,29 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include <type_traits>
+#include <tuple>
 
 #include "fixtures/TestRepositories.h"
 
 using namespace relais_test;
+
+// Detects whether a full UPDATE ... SET is generated for an entity. The
+// generator suppresses toUpdateParams (and SQL::update) when there is no
+// updatable column, so this is false for read-only views and all-PK junctions.
+template<typename E>
+concept HasToUpdateParams = requires(const E& e) {
+    { E::toUpdateParams(e) }
+        -> std::convertible_to<jcailloux::relais::io::PgParams>;
+};
+
+// Detects whether the full Repo chain exposes update(). Gated on HasFullUpdate
+// across every mixin layer, so it disappears for entities with no updatable
+// column rather than failing to instantiate at the call site.
+template<typename Repo>
+concept RepoHasUpdate = requires(const typename Repo::KeyType& k,
+                                 const typename Repo::EntityType& e) {
+    Repo::update(k, e);
+};
 
 // =============================================================================
 // Verify Repo instantiation compiles for all cache levels
@@ -186,6 +205,71 @@ TEST_CASE("Read-only repositories", "[repository][compile][readonly]") {
         constexpr auto cfg = ReadOnlyL2TestItemRepo::config;
         STATIC_REQUIRE(cfg.read_only);
         STATIC_REQUIRE(cfg.cache_level == jcailloux::relais::config::CacheLevel::L2);
+    }
+}
+
+// =============================================================================
+// All-PK junction: every column is part of the composite key, so there is no
+// updatable column. Regression for the empty TraitsType::Field path (Entity<>
+// must still instantiate) and suppressed SQL::update/toUpdateParams.
+// =============================================================================
+
+TEST_CASE("All-PK junction entity", "[repository][compile][junction]") {
+    using Entity = entity::generated::TestAllPkJunctionEntity;
+
+    SECTION("Entity<> instantiates with an empty Field enum") {
+        using Field = Entity::TraitsType::Field;   // would fail to compile if absent
+        STATIC_REQUIRE(std::is_enum_v<Field>);
+    }
+
+    SECTION("composite key type") {
+        STATIC_REQUIRE(std::is_same_v<UncachedTestAllPkJunctionRepo::KeyType,
+                                       std::tuple<int64_t, int64_t>>);
+    }
+
+    SECTION("no toUpdateParams generated (no updatable column)") {
+        STATIC_REQUIRE(!HasToUpdateParams<Entity>);
+        // sanity: a normal entity DOES expose it
+        STATIC_REQUIRE(HasToUpdateParams<entity::generated::TestItemEntity>);
+    }
+
+    SECTION("update() is cleanly absent from the whole chain") {
+        STATIC_REQUIRE(!RepoHasUpdate<FullCacheTestAllPkJunctionRepo>);
+        STATIC_REQUIRE(!RepoHasUpdate<L1TestAllPkJunctionRepo>);
+        STATIC_REQUIRE(!RepoHasUpdate<UncachedTestAllPkJunctionRepo>);
+        // sanity: a normal entity's repo keeps update()
+        STATIC_REQUIRE(RepoHasUpdate<FullCacheTestItemRepo>);
+    }
+
+    SECTION("full mixin chain instantiates (L1+L2)") {
+        STATIC_REQUIRE(std::is_same_v<FullCacheTestAllPkJunctionRepo::EntityType, Entity>);
+        REQUIRE(FullCacheTestAllPkJunctionRepo::size() == 0);
+        REQUIRE(std::string(UncachedTestAllPkJunctionRepo::name()) == "test:junction:uncached");
+    }
+}
+
+// =============================================================================
+// Read-only view (@relais read_only): no writes, empty Field enum.
+// =============================================================================
+
+TEST_CASE("Read-only view entity", "[repository][compile][readonly]") {
+    using Entity = entity::generated::TestReadOnlyViewEntity;
+
+    SECTION("mapping is read-only and Entity<> instantiates") {
+        STATIC_REQUIRE(Entity::read_only);
+        using Field = Entity::TraitsType::Field;
+        STATIC_REQUIRE(std::is_enum_v<Field>);
+    }
+
+    SECTION("no toUpdateParams generated") {
+        STATIC_REQUIRE(!HasToUpdateParams<Entity>);
+    }
+
+    SECTION("read-only repo chain instantiates") {
+        STATIC_REQUIRE(UncachedTestReadOnlyViewRepo::config.read_only);
+        STATIC_REQUIRE(L2TestReadOnlyViewRepo::config.read_only);
+        STATIC_REQUIRE(std::is_same_v<UncachedTestReadOnlyViewRepo::KeyType, int64_t>);
+        REQUIRE(std::string(UncachedTestReadOnlyViewRepo::name()) == "test:roview:uncached");
     }
 }
 

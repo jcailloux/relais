@@ -32,6 +32,16 @@ concept HasFieldUpdate = requires {
     typename E::TraitsType::Field;
 };
 
+/// E supports a full-row UPDATE: it has at least one updatable column, so the
+/// generator emitted toUpdateParams (+ SQL::update). False for pure all-PK
+/// junctions, where update() would reference a suppressed SQL::update. Gates
+/// every update path so the method is cleanly absent rather than failing to
+/// instantiate at the call site.
+template<typename E>
+concept HasFullUpdate = requires(const E& e) {
+    E::toUpdateParams(e);
+};
+
 // =========================================================================
 // SQL helper for UPDATE ... RETURNING
 // =========================================================================
@@ -198,7 +208,7 @@ public:
 
     /// Full update of entity in database. Returns true on success.
     static io::Task<bool> update(const Key& id, const E& entity)
-        requires MutableEntity<E> && (!Cfg.read_only)
+        requires MutableEntity<E> && HasFullUpdate<E> && (!Cfg.read_only)
     {
         auto outcome = co_await updateOutcome(id, entity);
         co_return outcome.success;
@@ -386,7 +396,7 @@ protected:
 
     /// Update returning full outcome (success + coalesced flag).
     static io::Task<WriteOutcome> updateOutcome(const Key& id, const E& entity)
-        requires MutableEntity<E> && (!Cfg.read_only)
+        requires MutableEntity<E> && HasFullUpdate<E> && (!Cfg.read_only)
     {
         try {
             auto keyParams = io::PgParams::fromKey(id);

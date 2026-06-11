@@ -21,6 +21,8 @@
 #include "generated/TestProductEntity.h"
 #include "generated/TestMembershipEntity.h"
 #include "generated/TestAssignedKeyEntity.h"
+#include "generated/TestAllPkJunctionEntity.h"
+#include "generated/TestReadOnlyViewEntity.h"
 
 namespace relais_test {
 
@@ -45,6 +47,8 @@ using entity::generated::TestEventEntity;
 using entity::generated::TestProductEntity;
 using entity::generated::TestMembershipEntity;
 using entity::generated::TestAssignedKeyEntity;
+using entity::generated::TestAllPkJunctionEntity;
+using entity::generated::TestReadOnlyViewEntity;
 
 // Cross-invalidation key extractors
 inline constexpr auto purchaseUserId = [](const auto& p) -> int64_t { return p.user_id; };
@@ -320,5 +324,21 @@ inline TestAssignedKeyEntity makeTestAssignedKey(
     entity.note = note;
     return entity;
 }
+
+// =============================================================================
+// All-PK junction Repositories (composite key, NO updatable column)
+// Exercises the empty TraitsType::Field path + suppressed SQL::update.
+// =============================================================================
+
+using UncachedTestAllPkJunctionRepo = Repo<TestAllPkJunctionEntity, "test:junction:uncached", cfg::Uncached>;
+using L1TestAllPkJunctionRepo = Repo<TestAllPkJunctionEntity, "test:junction:l1">;
+using FullCacheTestAllPkJunctionRepo = Repo<TestAllPkJunctionEntity, "test:junction:both", cfg::Both>;
+
+// =============================================================================
+// Read-only view Repositories (@relais read_only — no writes, empty Field enum)
+// =============================================================================
+
+using UncachedTestReadOnlyViewRepo = Repo<TestReadOnlyViewEntity, "test:roview:uncached", test_config::ReadOnlyUncached>;
+using L2TestReadOnlyViewRepo = Repo<TestReadOnlyViewEntity, "test:roview:l2", test_config::ReadOnlyL2>;
 
 } // namespace relais_test
