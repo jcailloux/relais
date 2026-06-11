@@ -23,6 +23,8 @@
 #include "generated/TestAssignedKeyEntity.h"
 #include "generated/TestAllPkJunctionEntity.h"
 #include "generated/TestReadOnlyViewEntity.h"
+#include "generated/TestArrayViewEntity.h"
+#include "generated/TestArrayRwEntity.h"
 #include "generated/TestCompositeKeyListEntity.h"
 
 namespace relais_test {
@@ -50,6 +52,8 @@ using entity::generated::TestMembershipEntity;
 using entity::generated::TestAssignedKeyEntity;
 using entity::generated::TestAllPkJunctionEntity;
 using entity::generated::TestReadOnlyViewEntity;
+using entity::generated::TestArrayViewEntity;
+using entity::generated::TestArrayRwEntity;
 using entity::generated::TestCompositeKeyListEntity;
 
 // Cross-invalidation key extractors
@@ -342,6 +346,17 @@ using FullCacheTestAllPkJunctionRepo = Repo<TestAllPkJunctionEntity, "test:junct
 
 using UncachedTestReadOnlyViewRepo = Repo<TestReadOnlyViewEntity, "test:roview:uncached", test_config::ReadOnlyUncached>;
 using L2TestReadOnlyViewRepo = Repo<TestReadOnlyViewEntity, "test:roview:l2", test_config::ReadOnlyL2>;
+
+// =============================================================================
+// Read-only aggregated view with array columns (int8[]/text[] -> std::vector)
+// =============================================================================
+
+using UncachedTestArrayViewRepo = Repo<TestArrayViewEntity, "test:arrview:uncached", test_config::ReadOnlyUncached>;
+using L1TestArrayViewRepo = Repo<TestArrayViewEntity, "test:arrview:l1", cfg::Local.with_read_only()>;
+
+// Writable array columns (int8[]/text[]) — exercises the array WRITE path.
+using UncachedTestArrayRwRepo = Repo<TestArrayRwEntity, "test:arrrw:uncached", cfg::Uncached>;
+using L1TestArrayRwRepo = Repo<TestArrayRwEntity, "test:arrrw:l1">;
 
 // =============================================================================
 // Composite-key LIST repository (keyset cursor over a composite primary key)
