@@ -131,12 +131,36 @@ The generator also emits, **at global scope** (outside `entity::generated`):
 | `nullable` | `std::optional<T>` handling, `setNull` support in `patch`. |
 | `column=db_name` | Override the DB column name (defaults to the field name). |
 | `raw_json` | `glz::raw_json_t` — stored verbatim as a string column. |
-| `json_field` | Struct/vector serialized to/from a JSON column. |
+| `json_field` | Struct (or `vector<Struct>`) serialized to/from a JSON column. For arrays of *scalars*, use a native array column instead — see [Array columns](#array-columns). |
 | `enum` | Auto-resolve the DB↔enum mapping from `glz::meta<EnumType>` in the source header. |
 | `enum=db1:Variant1,db2:Variant2` | Explicit DB↔enum mapping (overrides `glz::meta`). |
 | `partition_key` | Partition column — enables single-partition DELETE pruning (see [caching.md](caching.md#partition-key-repositories)). |
 | `filterable[...]` | List filter — see [lists.md](lists.md). |
 | `sortable[...]` | List sort — see [lists.md](lists.md). |
+
+## Array columns
+
+A field typed `std::vector<T>` for scalar `T` (`int32_t`, `int64_t`, `double`,
+`bool`, `std::string`) maps to a native SQL array column (`int8[]`, `text[]`, …),
+read **and** write — no annotation. `text[]` quoting is handled both ways. Array
+elements are never null: a `NULL` element on read is an error, so model the column
+`NOT NULL` (or aggregate over a `NOT NULL` source). For arrays of *structs*, use
+[`json_field`](#field-level) instead — objects go through a JSON column.
+
+The typical use is an aggregated view exposed as a point-lookup entity:
+
+```cpp
+// CREATE VIEW member_role_set AS
+//   SELECT owner_id, array_agg(role_id) AS role_ids
+//   FROM member_roles GROUP BY owner_id;
+
+// @relais table=member_role_set read_only
+struct MemberRoleSet {
+    int64_t owner_id = 0;            // @relais primary_key
+    std::vector<int64_t> role_ids;
+};
+// MemberRoleSetRepo::find(owner_id) -> { owner_id, role_ids }
+```
 
 ## Custom JSON field names
 
