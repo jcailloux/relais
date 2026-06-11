@@ -197,34 +197,7 @@ struct PgParams {
             std::string arr = "{";
             for (size_t i = 0; i < keys.size(); ++i) {
                 if (i > 0) arr += ',';
-                const auto& p = keys[i].params[col];
-                if (p.isNull()) {
-                    arr += "NULL";
-                } else {
-                    // Escape values: quote if they contain special chars
-                    std::string_view val(p.data(),
-                        static_cast<size_t>(p.length()));
-                    bool needs_quoting = val.empty();
-                    if (!needs_quoting) {
-                        for (char c : val) {
-                            if (c == ',' || c == '{' || c == '}' || c == '"'
-                                || c == '\\' || c == ' ') {
-                                needs_quoting = true;
-                                break;
-                            }
-                        }
-                    }
-                    if (needs_quoting) {
-                        arr += '"';
-                        for (char c : val) {
-                            if (c == '"' || c == '\\') arr += '\\';
-                            arr += c;
-                        }
-                        arr += '"';
-                    } else {
-                        arr += val;
-                    }
-                }
+                appendArrayElement(arr, keys[i].params[col]);
             }
             arr += '}';
             result.params.push_back(PgParam(std::move(arr)));
@@ -258,6 +231,48 @@ private:
     template<typename T>
     static PgParam toParam(const std::optional<T>& v) {
         return PgParam::fromOptional(v);
+    }
+
+    // Array column: serialize a vector into a PostgreSQL text-format array literal
+    // {e1,e2,...}. Each element reuses the scalar toParam (so numeric elements are
+    // never quoted) and is quoted/escaped when it contains a delimiter — the inverse
+    // of PgResult::Row::get<std::vector<T>>'s parser.
+    template<typename T>
+    static PgParam toParam(const std::vector<T>& v) {
+        std::string arr = "{";
+        for (size_t i = 0; i < v.size(); ++i) {
+            if (i > 0) arr += ',';
+            appendArrayElement(arr, toParam(v[i]));
+        }
+        arr += '}';
+        return PgParam(std::move(arr));
+    }
+
+    // Append one already-serialized scalar param as an array element, quoting and
+    // backslash-escaping it when it contains a PG array delimiter.
+    static void appendArrayElement(std::string& arr, const PgParam& p) {
+        if (p.isNull()) { arr += "NULL"; return; }
+        std::string_view val(p.data(), static_cast<size_t>(p.length()));
+        bool needs_quoting = val.empty();
+        if (!needs_quoting) {
+            for (char c : val) {
+                if (c == ',' || c == '{' || c == '}' || c == '"'
+                    || c == '\\' || c == ' ') {
+                    needs_quoting = true;
+                    break;
+                }
+            }
+        }
+        if (needs_quoting) {
+            arr += '"';
+            for (char c : val) {
+                if (c == '"' || c == '\\') arr += '\\';
+                arr += c;
+            }
+            arr += '"';
+        } else {
+            arr += val;
+        }
     }
 
     friend bool operator==(const PgParams& a, const PgParams& b) noexcept {

@@ -4,7 +4,9 @@
 
 ### Added
 
-- **Composite-key list pagination.** The keyset cursor now spans every primary-key column instead of a single scalar `id`: the cursor encodes `sort_value` plus N key components, and the SQL keyset / `ORDER BY` use a row-value comparison over `primary_key_columns`. Lets an entity with a composite primary key (e.g. an all-PK junction) carry a `@relais_list`. Scalar-key cursors are unchanged (byte-identical, one component). Key components must be integers — a `static_assert` rejects non-integer composite keys. Automatic same-repo list invalidation (insert/erase) works unchanged, matched by filter value rather than key. Covered by `tests/relais/test_decl_list_composite.cpp` (pagination, filter, CRUD invalidation)
+- **Array column mapping (`T[]` ↔ `std::vector<T>`).** PostgreSQL array columns map to `std::vector<T>` for scalar `T` (`int*`, `double`, `bool`, `std::string`), read and write, with `text[]` quoting handled both ways. Unquoted `NULL` elements are rejected; arrays of structs stay on the `json_field` path. Unblocks `array_agg` read-only views as point-lookup entities.
+
+- **Composite-key list pagination.** The keyset cursor spans every primary-key column, so an entity with a composite key (e.g. an all-PK junction) can carry a `@relais_list`. Key components must be integers; scalar-key cursors are unchanged.
 
 ## [0.5.0-alpha.4] - 2026-06-11
 

@@ -570,12 +570,12 @@ class MappingGenerator:
         if a.json_fields:
             lines.append("#include <glaze/glaze.hpp>")
 
-        # vector<char> for bytea fields
-        has_vector_char = any(
-            m.cpp_type == "std::vector<char>" or m.inner_type == "std::vector<char>"
+        # <vector> for bytea (vector<char>) and array columns (vector<T>)
+        has_vector = any(
+            m.cpp_type.startswith("std::vector<") or m.inner_type.startswith("std::vector<")
             for m in entity.members
         )
-        if has_vector_char:
+        if has_vector:
             lines.append("#include <vector>")
 
         # Entity (always needed)
@@ -1026,14 +1026,21 @@ class MappingGenerator:
         # Collect fields with dynamic heap allocations
         dynamic_fields = []
         for m in entity.members:
+            # json_field members are glaze-serialized (their heap is not tracked here,
+            # matching prior behavior) — skip before the generic std::vector<> branch,
+            # which is for native array columns (bytea, T[]) only.
+            if m.name in a.json_fields:
+                continue
             if m.cpp_type == "std::string":
                 dynamic_fields.append(f"{hc}(s.{m.name})")
             elif m.cpp_type == "std::optional<std::string>":
                 dynamic_fields.append(f"(s.{m.name} ? {hc}(*s.{m.name}) : 0)")
-            elif m.cpp_type == "std::vector<char>":
-                dynamic_fields.append(f"s.{m.name}.capacity()")
-            elif m.cpp_type == "std::optional<std::vector<char>>":
-                dynamic_fields.append(f"(s.{m.name} ? s.{m.name}->capacity() : 0)")
+            elif m.cpp_type.startswith("std::vector<"):
+                elem = self._qualify_cpp_type(m.cpp_type[len("std::vector<"):-1].strip(), entity)
+                dynamic_fields.append(f"s.{m.name}.capacity() * sizeof({elem})")
+            elif m.is_optional and m.inner_type.startswith("std::vector<"):
+                elem = self._qualify_cpp_type(m.inner_type[len("std::vector<"):-1].strip(), entity)
+                dynamic_fields.append(f"(s.{m.name} ? s.{m.name}->capacity() * sizeof({elem}) : 0)")
             elif m.is_raw_json:
                 dynamic_fields.append(f"{hc}(s.{m.name}.str)")
 
