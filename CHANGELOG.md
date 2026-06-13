@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- **glaze dependency bumped to v7.8.1** (from v7.0.2). `FIND_PACKAGE_ARGS` now requires a system glaze ≥ 7.8.
+
 ### Fixed
 
 - **`EpollIoContext` use-after-free on watch self-removal.** A watch callback that calls `removeWatch(fd)` on its own handle — which relais does on connection EOF/error — erased the map node holding the `std::function` being invoked, freeing its captured state mid-call. The dispatcher now copies the callback onto the stack before invoking, keeping the target alive across self-removal.
