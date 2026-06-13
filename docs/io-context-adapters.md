@@ -42,7 +42,7 @@ and enforced by the harness:
 |---|---|
 | `WatchHandle addWatch(int fd, IoEvent mask, cb)` | register `fd`; call `cb(events)` on the loop thread when ready, with matching `IoEvent` bits |
 | `void updateWatch(WatchHandle, IoEvent mask)` | change the active mask on that handle |
-| `void removeWatch(WatchHandle)` | stop all callbacks for that handle |
+| `void removeWatch(WatchHandle)` | stop all callbacks for that handle; **must be safe to call from inside that handle's own callback** — defer teardown of loop-owned state |
 | `void post(std::function<void()>)` | run once, on the loop thread, FIFO; thread-safe; **wake a blocked loop promptly** |
 | `TimerToken postDelayed(duration, cb)` | run `cb` once, on the loop thread, after the delay; return a cancellable token. Used to flush a batch on an adaptive deadline |
 | `void cancelTimer(TimerToken)` | cancel a pending `postDelayed`; no-op if already fired or unknown |
@@ -88,8 +88,17 @@ public:
     void removeWatch(WatchHandle fd) {
         if (auto it = channels_.find(fd); it != channels_.end()) {
             it->second->disableAll();
-            it->second->remove();
+            it->second->remove();   // detach from the poller (loop thread)
+            // removeWatch is often called FROM the Channel's own callback (relais
+            // drops its watch when I/O state changes, e.g. EOF — permitted by the
+            // concept). Destroying the Channel here is a use-after-free: trantor
+            // regains control in handleEventSafely() after the callback and still
+            // writes into it. Erase the map entry now (the fd is reusable again)
+            // but DEFER destruction to queueInLoop — it runs after this turn's
+            // events are processed, when nothing touches the Channel anymore.
+            trantor::Channel* dying = it->second.release();
             channels_.erase(it);
+            loop_->queueInLoop([dying] { delete dying; });
         }
     }
 
@@ -114,6 +123,17 @@ static_assert(relais::io::IoContext<TrantorIoContext>);
 > Pinned to a specific trantor API — **validate it with the harness** before
 > trusting it. The version above is the shape an adapter that passes `runAll`
 > converges to.
+
+> **Self-removal is the trap.** relais calls `removeWatch(h)` from inside watch
+> `h`'s own callback (a connection drops its watch on EOF/error). The loop is
+> still mid-dispatch and resumes after the callback returns, so freeing the
+> watch's loop-owned state — the `trantor::Channel`, or even the `std::function`
+> you are invoking through — synchronously inside `removeWatch` is a
+> use-after-free. Defer the free past the current event: `queueInLoop(delete)`
+> for trantor; copy the callback onto the stack before invoking for a raw epoll
+> loop (see `EpollIoContext::runOnce`). The harness exercises this directly (C10),
+> so a synchronous-teardown adapter fails `runAll` under ASan instead of
+> corrupting memory in production.
 
 ## Verify it
 

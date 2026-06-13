@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **`EpollIoContext` use-after-free on watch self-removal.** A watch callback that calls `removeWatch(fd)` on its own handle — which relais does on connection EOF/error — erased the map node holding the `std::function` being invoked, freeing its captured state mid-call. The dispatcher now copies the callback onto the stack before invoking, keeping the target alive across self-removal.
+
+### Added
+
+- **`IoContext` conformance check C10 (`checkRemoveWatchReentrant`).** `removeWatch` must be safe to call from inside its own watch callback. Adapters that tear down loop-owned watch state synchronously fail `runAll` under ASan instead of corrupting memory; the rule is documented on the concept and in `docs/io-context-adapters.md`.
+
 ## [0.5.0-alpha.5] - 2026-06-11
 
 ### Added

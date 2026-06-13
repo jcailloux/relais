@@ -45,6 +45,11 @@ TEST_CASE("IoContext conformance: removeWatch stops delivery", "[io][conformance
     REQUIRE_NOTHROW(IoContextConformance::checkRemoveWatch(io, drive));
 }
 
+TEST_CASE("IoContext conformance: removeWatch is reentrant from its callback", "[io][conformance]") {
+    EpollIoContext io;
+    REQUIRE_NOTHROW(IoContextConformance::checkRemoveWatchReentrant(io, drive));
+}
+
 TEST_CASE("IoContext conformance: cross-thread post on loop thread", "[io][conformance]") {
     EpollIoContext io;
     REQUIRE_NOTHROW(IoContextConformance::checkCrossThreadPost(io, drive));

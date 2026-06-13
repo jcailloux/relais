@@ -222,7 +222,16 @@ public:
             auto it = watches_.find(fd);
             if (it != watches_.end()) {
                 auto io_events = fromEpoll(events[i].events);
-                it->second.callback(io_events);
+                // Copy the callback out before invoking: relais legitimately
+                // calls removeWatch(fd) from inside its own callback (e.g. a
+                // connection self-removes on EOF), which erases this map node and
+                // would free the std::function — and its captured state — while
+                // it executes. The stack-local copy keeps the target alive for
+                // the whole call regardless of self-removal. Small captures hit
+                // std::function's SBO (no heap alloc), and this is the I/O event
+                // path, never the L1-hit hot path.
+                auto cb = it->second.callback;
+                cb(io_events);
             }
         }
 

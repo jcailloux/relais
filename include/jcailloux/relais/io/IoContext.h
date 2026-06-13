@@ -45,7 +45,12 @@ constexpr IoEvent& operator|=(IoEvent& a, IoEvent b) noexcept {
 //     for an event in `mask`, with the matching IoEvent bits set. Returns a
 //     handle for later update/remove.
 //   - updateWatch(handle, mask): changes the active mask on that handle.
-//   - removeWatch(handle): no further callbacks for that handle.
+//   - removeWatch(handle): no further callbacks for that handle. MUST be safe to
+//     call FROM INSIDE that handle's own callback — relais self-removes a watch
+//     from its I/O callback when a connection's interest changes (e.g. EOF). The
+//     loop resumes after the callback returns, so the adapter must not destroy
+//     loop-owned watch state (nor the callback it is mid-invocation through)
+//     synchronously here; defer teardown until the event is fully processed.
 //   - post(cb): runs cb exactly once, on the loop thread, FIFO with other posts;
 //     thread-safe AND wakes a blocked loop promptly when called from another
 //     thread. The loop's wait must be bounded so posts cannot stall.
