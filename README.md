@@ -166,6 +166,29 @@ and running relais on a foreign loop (Drogon/asio/…) are in
 Start from a preset and override with `.with_*()` chaining. Read path:
 `L1 → L2 → DB`, back-filling each tier on the way up.
 
+## Performance — three levels
+
+Speed comes from three independent choices, in order of impact. The first two are
+the built-in path; the third is an advanced opt-in.
+
+1. **The right cache preset.** An L1 hit is a `thread_local` shardmap lookup
+   (~50 ns, no syscall, no I/O); only real L2/L3 misses do async I/O. Choosing the
+   tier per entity (`Local`/`Both` for hot reads) is the largest lever.
+2. **The shared-nothing runtime (`IoPool`).** N epoll loops, one per core, each
+   with its own pools — a request stays on its loop end to end, no cross-thread
+   hop. Throughput scales ~linearly with cores at unchanged latency. This is the
+   built-in runtime and reaches the L1-hit latency above on its own.
+3. **Co-location on a foreign loop *(optional)*.** Relevant only when a web
+   framework (Drogon/asio/libuv) already owns the loops your requests run on:
+   bridging each call to `IoPool` then costs a ~3 µs thread hop, even on an L1
+   hit. Running relais inline on those existing loops removes it, via a small
+   [`IoContext` adapter](docs/io-context-adapters.md). If relais drives your
+   runtime, you do not need this.
+
+New to coroutines and event loops? `examples/event_loop_basics.cpp` drives a
+coroutine on a single loop **without a database** — the event-loop machinery every
+runtime is built from, in the smallest thing that compiles and runs.
+
 ## Documentation
 
 | Topic | Doc |
@@ -175,7 +198,7 @@ Start from a preset and override with `.with_*()` chaining. Read path:
 | **Cross-invalidation** — the four `Invalidate*` mechanisms, resolvers, selective list pages | [docs/invalidation.md](docs/invalidation.md) |
 | **List cache** — `filterable`/`sortable`, paginated `query()`, modification tracking | [docs/lists.md](docs/lists.md) |
 | **Runtime & threading** — `IoPool`, N-loop scaling, the one threading rule | [docs/runtime-and-threading.md](docs/runtime-and-threading.md) |
-| **Foreign event loops** — writing an `IoContext` adapter (Drogon/asio/libuv) | [docs/io-context-adapters.md](docs/io-context-adapters.md) |
+| **Foreign event loops** *(advanced, optional)* — co-locate on an existing framework loop via an `IoContext` adapter; only when a measured bridge cost justifies it — `IoPool` suffices otherwise | [docs/io-context-adapters.md](docs/io-context-adapters.md) |
 | **Runnable examples** — CI-compiled counterparts to the runtime snippets | [examples/](examples/README.md) |
 | **Internals** — mixin chain, cache tier, contribution guide | [INTERNALS.md](INTERNALS.md) |
 
