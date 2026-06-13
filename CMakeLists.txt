@@ -66,8 +66,8 @@ include(FetchContent)
 FetchContent_Declare(
     glaze
     GIT_REPOSITORY https://github.com/stephenberry/glaze.git
-    GIT_TAG        v7.0.2
-    FIND_PACKAGE_ARGS 7.0
+    GIT_TAG        v7.8.1
+    FIND_PACKAGE_ARGS 7.8
 )
 FetchContent_MakeAvailable(glaze)
 
