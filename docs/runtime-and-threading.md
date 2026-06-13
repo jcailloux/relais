@@ -64,6 +64,12 @@ calls only work **inside a coroutine running on a worker loop** (here, posted to
 
 ## Bring your own loop (Drogon, asio, libuv, …)
 
+**Do you need this?** Only if a web framework already owns the event loops your
+requests run on. Bridging each call from a framework thread to `IoPool` then costs
+a thread hop (~3 µs, two syscalls) — even on an L1 hit — and co-locating relais on
+those existing loops removes it. If relais drives your runtime (jobs, or a server
+built on `IoPool`), skip this section: no adapter needed.
+
 If your framework already runs one epoll loop per core, run relais **inline on
 those loops** instead — an L1 cache hit is then a pure `thread_local` lookup
 (~50 ns, zero hops). Write a small `IoContext` adapter for your loop, verify it

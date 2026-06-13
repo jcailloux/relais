@@ -6,6 +6,12 @@ concept. `EpollIoContext` is the bundled implementation, but `PgPool<Io>`,
 satisfies the concept. This lets you run relais **inline on another framework's
 event loop** instead of bridging across threads.
 
+> **Most users don't need this.** The built-in `IoPool` runtime already delivers
+> the shared-nothing N-loop model and ~50 ns L1 hits. Write an adapter only when a
+> web framework already owns the loops your requests run on, and the per-request
+> bridge to `IoPool` (~3 µs) is a measured cost worth removing. Read
+> [runtime-and-threading.md](runtime-and-threading.md) first.
+
 ## Why you'd want this
 
 If your HTTP framework already runs one epoll loop per core (Drogon/trantor,
