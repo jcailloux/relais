@@ -200,6 +200,43 @@ struct IoContextConformance {
         efd.clear();
     }
 
+    // C10: removeWatch() called FROM INSIDE the watch's own callback must be
+    // safe (no use-after-free) and stop further delivery. This is not a corner
+    // case: relais self-removes a watch from its I/O callback whenever the
+    // connection's interest changes (e.g. EOF / error on a PgConnection), so the
+    // loop regains control AFTER the callback returns and must not touch any
+    // per-watch state the callback just tore down. An adapter that destroys
+    // loop-owned watch state — or invokes the callback through storage it then
+    // frees — synchronously inside removeWatch corrupts memory here. The fix is
+    // to defer teardown: invoke through a copy/stable reference, and free the
+    // watch's resources after the current event has been fully processed (e.g.
+    // trantor: queueInLoop(delete), epoll: copy the callback out before calling).
+    template<io::IoContext Io, typename Drive>
+    static void checkRemoveWatchReentrant(Io& io, Drive drive) {
+        detail::EventFd efd;
+        int fired = 0;
+        typename Io::WatchHandle h{};
+        h = io.addWatch(efd.fd, IoEvent::Read, [&](IoEvent) {
+            io.removeWatch(h);  // self-removal from within the watch callback
+            // Touch a captured reference AFTER self-removal: if the adapter
+            // invoked us through storage it just freed (the erased watch entry),
+            // this read is a use-after-free that ASan flags. A conforming adapter
+            // keeps the callback alive for the whole call (copy/deferred free).
+            ++fired;
+        });
+        efd.signal();
+        drive(io, [&] { return fired > 0; });
+        efd.clear();
+
+        // The watch is gone; renewed readiness must neither refire nor crash.
+        efd.signal();
+        detail::pump(io, drive, 3);
+        detail::require(fired == 1,
+            "removeWatch() from within the watch callback: must remove cleanly "
+            "and not refire, observed " + std::to_string(fired) + " calls");
+        efd.clear();
+    }
+
     // -- cross-thread -------------------------------------------------------
 
     // C7: post() from another thread runs the callback ON the loop thread and
@@ -277,6 +314,7 @@ struct IoContextConformance {
         checkWatchReadable(io, drive);
         checkUpdateWatch(io, drive);
         checkRemoveWatch(io, drive);
+        checkRemoveWatchReentrant(io, drive);
         checkCrossThreadPost(io, drive);
         checkPostDelayedFires(io, drive);
         checkCancelTimer(io, drive);
