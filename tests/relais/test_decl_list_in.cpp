@@ -23,9 +23,12 @@
 #include <string>
 #include <vector>
 
+#include <unordered_map>
+
 #include "fixtures/generated/TestArticleEntity.h"
 #include <jcailloux/relais/list/spec/GeneratedTraits.h>
 #include <jcailloux/relais/list/spec/GeneratedCriteria.h>
+#include <jcailloux/relais/list/spec/HttpQueryParser.h>
 #include <jcailloux/relais/list/spec/SortDescriptor.h>
 
 namespace decl = jcailloux::relais::list::spec;
@@ -329,5 +332,125 @@ TEST_CASE("[DeclListIn] SQL: EQ + IN + range $n numbering", "[list][in][unit][sq
         CHECK(wc2.sql == "\"category\" = ANY($1)");
         REQUIRE(wc2.params.params.size() == 1);
         CHECK(wc2.next_param == 2);
+    }
+}
+
+// =============================================================================
+// Binary group key (§7.1) — groupCacheKey IN canonicalization, transport-free.
+// The group_key is the cache identity of a filtered list: {a,b}, {b,a}, {a,a,b}
+// MUST produce byte-identical keys or the cache fragments and the master hash
+// bloats. Canonicalization (sort+unique) lives in groupCacheKey itself so even
+// programmatically-built filters hash stably.
+// =============================================================================
+
+namespace {
+
+template<typename Desc, typename Vec>
+std::string groupKeyForSet(Vec v) {
+    decl::ListDescriptorQuery<Desc> q;
+    q.filters.template get<0>() = std::move(v);
+    return decl::groupCacheKey<Desc>(q);
+}
+
+}  // namespace
+
+TEST_CASE("[DeclListIn] binary: group key is canonical under order/dups",
+          "[list][in][unit][binary]") {
+    using V = std::vector<std::string>;
+    const std::string ab  = groupKeyForSet<DescInString>(V{"a", "b"});
+    const std::string ba  = groupKeyForSet<DescInString>(V{"b", "a"});
+    const std::string aab = groupKeyForSet<DescInString>(V{"a", "a", "b"});
+
+    CHECK(ab == ba);   // order-independent
+    CHECK(ab == aab);  // duplicate-independent
+}
+
+TEST_CASE("[DeclListIn] binary: int64 set canonicalization", "[list][in][unit][binary]") {
+    using V = std::vector<int64_t>;
+    CHECK(groupKeyForSet<DescInInt64>(V{1, 2, 3})
+          == groupKeyForSet<DescInInt64>(V{3, 1, 2, 1}));
+    // A different set must NOT collide.
+    CHECK(groupKeyForSet<DescInInt64>(V{1, 2, 3})
+          != groupKeyForSet<DescInInt64>(V{1, 2, 4}));
+}
+
+TEST_CASE("[DeclListIn] binary: presence byte and count layout", "[list][in][unit][binary]") {
+    // Inactive filter: a single 0x00 presence byte, no count, no elements.
+    decl::ListDescriptorQuery<DescInInt64> q_inactive;
+    const std::string key_inactive = decl::groupCacheKey<DescInInt64>(q_inactive);
+
+    // Present-but-empty: presence 0x01 + count 0 (4 bytes) + no elements.
+    const std::string key_empty = groupKeyForSet<DescInInt64>(std::vector<int64_t>{});
+
+    // Singleton: presence 0x01 + count 1 + 8-byte element.
+    const std::string key_one = groupKeyForSet<DescInInt64>(std::vector<int64_t>{7});
+
+    CHECK(key_inactive != key_empty);  // absent ≠ present-but-empty
+    CHECK(key_empty != key_one);
+    CHECK(key_empty.size() < key_one.size());  // empty set carries no element bytes
+}
+
+// =============================================================================
+// HTTP parsing (§7.2) — parseListQuery / parseListQueryStrict IN branch.
+// =============================================================================
+
+namespace {
+
+using Params = std::unordered_map<std::string, std::string>;
+
+}  // namespace
+
+TEST_CASE("[DeclListIn] parse: CSV set, sorted and deduped", "[list][in][unit][parse]") {
+    auto q = decl::parseListQuery<DescInString>(Params{{"category", "tech,science"}});
+    REQUIRE(q.filters.get<0>().has_value());
+    CHECK(*q.filters.get<0>() == std::vector<std::string>{"science", "tech"});  // sorted
+}
+
+TEST_CASE("[DeclListIn] parse: duplicates collapse", "[list][in][unit][parse]") {
+    auto q = decl::parseListQuery<DescInString>(Params{{"category", "tech,tech,tech"}});
+    REQUIRE(q.filters.get<0>().has_value());
+    CHECK(*q.filters.get<0>() == std::vector<std::string>{"tech"});
+}
+
+TEST_CASE("[DeclListIn] parse: order-independent group key", "[list][in][unit][parse]") {
+    auto a = decl::parseListQuery<DescInString>(Params{{"category", "science,tech"}});
+    auto b = decl::parseListQuery<DescInString>(Params{{"category", "tech,science"}});
+    CHECK(a.group_key == b.group_key);
+}
+
+TEST_CASE("[DeclListIn] parse: invalid int elements are dropped", "[list][in][unit][parse]") {
+    auto q = decl::parseListQuery<DescInInt64>(Params{{"author_id", "1,abc,3"}});
+    REQUIRE(q.filters.get<0>().has_value());
+    CHECK(*q.filters.get<0>() == std::vector<int64_t>{1, 3});
+}
+
+TEST_CASE("[DeclListIn] parse: no valid element leaves filter inactive (no HTTP empty set)",
+          "[list][in][unit][parse]") {
+    auto q = decl::parseListQuery<DescInInt64>(Params{{"author_id", "abc,xyz"}});
+    CHECK_FALSE(q.filters.get<0>().has_value());  // unfiltered, not empty-set
+}
+
+TEST_CASE("[DeclListIn] parse: element count capped at 256", "[list][in][unit][parse]") {
+    std::string csv;
+    for (int i = 0; i < 300; ++i) {
+        if (i) csv += ',';
+        csv += std::to_string(i);
+    }
+    auto q = decl::parseListQuery<DescInInt64>(Params{{"author_id", csv}});
+    REQUIRE(q.filters.get<0>().has_value());
+    CHECK(q.filters.get<0>()->size() == 256);
+}
+
+TEST_CASE("[DeclListIn] parse: strict rejects undeclared filter, accepts IN",
+          "[list][in][unit][parse]") {
+    SECTION("undeclared param → error") {
+        auto r = decl::parseListQueryStrict<DescInString>(Params{{"bogus", "x"}});
+        REQUIRE_FALSE(r.has_value());
+    }
+    SECTION("well-formed IN → ok, canonical set") {
+        auto r = decl::parseListQueryStrict<DescInString>(Params{{"category", "tech,science,tech"}});
+        REQUIRE(r.has_value());
+        REQUIRE(r->filters.get<0>().has_value());
+        CHECK(*r->filters.get<0>() == std::vector<std::string>{"science", "tech"});
     }
 }

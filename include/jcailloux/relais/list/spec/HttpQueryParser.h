@@ -1,10 +1,14 @@
 #ifndef JCX_RELAIS_LIST_SPEC_HTTPQUERYPARSER_H
 #define JCX_RELAIS_LIST_SPEC_HTTPQUERYPARSER_H
 
+#include <algorithm>
+#include <charconv>
 #include <expected>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <unordered_map>
+#include <vector>
 
 #include "FilterDescriptor.h"
 #include "SortDescriptor.h"
@@ -70,6 +74,55 @@ std::optional<T> parseValue(const std::string& str) {
     }
 }
 
+/// Hard cap on IN-set cardinality parsed from a query string (abuse mitigation).
+inline constexpr size_t kMaxInListElements = 256;
+
+/// Parse one IN-set element with STRICT validation. Unlike scalar parseValue
+/// (which maps a malformed int to 0 via parse::toInt64), an integral element is
+/// accepted only if from_chars consumes the whole token — otherwise a junk token
+/// like "abc" would pollute the set with a spurious 0. Non-integral types fall
+/// back to parseValue (string length check). bool is unsupported (no parser).
+template<typename T>
+std::optional<T> parseInElement(const std::string& str) {
+    if constexpr (std::is_integral_v<T> && !std::is_same_v<T, bool>) {
+        T result{};
+        const char* first = str.data();
+        const char* last = first + str.size();
+        auto [ptr, ec] = std::from_chars(first, last, result);
+        if (ec != std::errc{} || ptr != last) return std::nullopt;
+        return result;
+    } else {
+        return parseValue<T>(str);
+    }
+}
+
+/// Parse a comma-separated query value into a canonical set for an IN filter:
+/// split on ',' → parseInElement<T> per element (silently dropping invalid ones)
+/// → sort → unique → truncate to kMaxInListElements. The truncation happens AFTER
+/// sort+unique so the resulting group key is deterministic regardless of the
+/// arrival order or duplicate count — `tech,science` and `science,tech,tech`
+/// yield byte-identical keys.
+template<typename T>
+std::vector<T> parseInList(const std::string& str) {
+    std::vector<T> out;
+    size_t start = 0;
+    while (true) {
+        size_t comma = str.find(',', start);
+        size_t end = (comma == std::string::npos) ? str.size() : comma;
+        if (auto val = parseInElement<T>(str.substr(start, end - start))) {
+            out.push_back(std::move(*val));
+        }
+        if (comma == std::string::npos) break;
+        start = comma + 1;
+    }
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    if (out.size() > kMaxInListElements) {
+        out.erase(out.begin() + kMaxInListElements, out.end());
+    }
+    return out;
+}
+
 }  // namespace detail
 
 // =============================================================================
@@ -87,8 +140,23 @@ std::string groupCacheKey(const ListDescriptorQuery<Descriptor>& query) {
     // Filters in declaration order (alphabetically sorted by generator)
     [&]<size_t... Is>(std::index_sequence<Is...>) {
         ([&] {
+            using FilterType = filter_at<Descriptor, Is>;
             const auto& filter_value = query.filters.template get<Is>();
-            detail::appendOptional(buf, filter_value);
+            if constexpr (FilterType::op == Op::IN) {
+                // IN set: [presence][count:u32][elem×count]. Canonicalize (sort+
+                // unique) defensively here, not only in the parser, so filters
+                // built programmatically also hash to a stable group_key.
+                buf.push_back(filter_value.has_value() ? 1 : 0);
+                if (filter_value) {
+                    auto sorted = *filter_value;
+                    std::sort(sorted.begin(), sorted.end());
+                    sorted.erase(std::unique(sorted.begin(), sorted.end()), sorted.end());
+                    detail::appendToBuffer(buf, static_cast<uint32_t>(sorted.size()));
+                    for (const auto& e : sorted) detail::appendToBuffer(buf, e);
+                }
+            } else {
+                detail::appendOptional(buf, filter_value);
+            }
         }(), ...);
     }(std::make_index_sequence<filter_count<Descriptor>>{});
 
@@ -171,7 +239,7 @@ std::string encodeEntityFilterBlob(const typename Descriptor::Entity& entity) {
 /// Generate a compact filter schema string for Lua binary parsing.
 /// 2 characters per filter: type char + operator char.
 /// Type: 's'=string, '8'=int64_t, '4'=int32_t, '1'=bool/uint8_t.
-/// Operator: '='=EQ, '!'=NE, '>'=GT, 'G'=GE, '<'=LT, 'L'=LE.
+/// Operator: '='=EQ, '!'=NE, '>'=GT, 'G'=GE, '<'=LT, 'L'=LE, '@'=IN.
 template<typename Descriptor>
     requires ValidListDescriptor<Descriptor>
 std::string filterSchema() {
@@ -196,6 +264,7 @@ std::string filterSchema() {
             else if constexpr (op == Op::GE) schema += 'G';
             else if constexpr (op == Op::LT) schema += '<';
             else if constexpr (op == Op::LE) schema += 'L';
+            else if constexpr (op == Op::IN) schema += '@';
         }(), ...);
     }(std::make_index_sequence<filter_count<Descriptor>>{});
 
@@ -221,9 +290,18 @@ ListDescriptorQuery<Descriptor> parseListQuery(const Map& params) {
             auto name = std::string(FilterType::name.view());
 
             if (auto it = params.find(name); it != params.end()) {
-                using ValueType = typename FilterType::value_type;
-                if (auto val = detail::parseValue<ValueType>(it->second)) {
-                    query.filters.template get<Is>() = std::move(*val);
+                if constexpr (FilterType::op == Op::IN) {
+                    // IN: comma-separated set; empty (no valid element) leaves the
+                    // filter inactive → list stays unfiltered (no HTTP empty-set).
+                    auto vals = detail::parseInList<typename FilterType::element_type>(it->second);
+                    if (!vals.empty()) {
+                        query.filters.template get<Is>() = std::move(vals);
+                    }
+                } else {
+                    using ValueType = typename FilterType::value_type;
+                    if (auto val = detail::parseValue<ValueType>(it->second)) {
+                        query.filters.template get<Is>() = std::move(*val);
+                    }
                 }
             }
         }(), ...);
@@ -325,9 +403,16 @@ std::expected<ListDescriptorQuery<Descriptor>, QueryValidationError> parseListQu
             auto name = std::string(FilterType::name.view());
 
             if (auto it = params.find(name); it != params.end()) {
-                using ValueType = typename FilterType::value_type;
-                if (auto val = detail::parseValue<ValueType>(it->second)) {
-                    query.filters.template get<Is>() = std::move(*val);
+                if constexpr (FilterType::op == Op::IN) {
+                    auto vals = detail::parseInList<typename FilterType::element_type>(it->second);
+                    if (!vals.empty()) {
+                        query.filters.template get<Is>() = std::move(vals);
+                    }
+                } else {
+                    using ValueType = typename FilterType::value_type;
+                    if (auto val = detail::parseValue<ValueType>(it->second)) {
+                        query.filters.template get<Is>() = std::move(*val);
+                    }
                 }
             }
         }(), ...);
