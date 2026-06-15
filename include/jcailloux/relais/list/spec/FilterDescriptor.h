@@ -8,6 +8,7 @@
 #include <tuple>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 #include "jcailloux/relais/config/FixedString.h"
 #include "jcailloux/relais/TypeTraits.h"
@@ -26,7 +27,8 @@ enum class Op : uint8_t {
     GT,  // Greater than
     GE,  // Greater than or equal
     LT,  // Less than
-    LE   // Less than or equal
+    LE,  // Less than or equal
+    IN   // Membership in a set (entity value ∈ {v1, v2, ...}); SQL = ANY($n)
 };
 
 // =============================================================================
@@ -44,6 +46,7 @@ constexpr InvalidationStrategy defaultInvalidationStrategy(Op op) noexcept {
     switch (op) {
         case Op::EQ:
         case Op::NE:
+        case Op::IN:
             return InvalidationStrategy::PreComputed;
         case Op::GT:
         case Op::GE:
@@ -275,11 +278,34 @@ struct Filter {
     /// The raw member type from the entity
     using member_type = detail::member_pointer_type_t<decltype(EntityMemberPtr)>;
 
-    /// The unwrapped type (optional<T> -> T)
-    using value_type = detail::unwrap_optional_t<member_type>;
+    /// The unwrapped scalar element type (optional<T> -> T). For IN, this is the
+    /// type of a single set element; the schema element-type char is derived from it.
+    using element_type = detail::unwrap_optional_t<member_type>;
 
-    /// The filter value type (always optional for filter activation check)
-    using filter_type = std::optional<value_type>;
+    /// The unwrapped type (optional<T> -> T). Kept as an alias of element_type for
+    /// backward compatibility — all existing consumers use it as the scalar type.
+    using value_type = element_type;
+
+    /// The filter value type (always optional for filter activation check).
+    /// For IN, the active value is a set of elements; otherwise a single scalar.
+    using filter_type = std::conditional_t<
+        Operator == Op::IN,
+        std::optional<std::vector<element_type>>,
+        std::optional<element_type>>;
+
+    /// The entity-side tag type — always a scalar optional, even for IN (an entity
+    /// holds one value, matched against the cached group's set). Decouples FilterTags
+    /// storage from filter_type so IN's vector slot does not leak into tag extraction.
+    using tag_type = std::optional<element_type>;
+
+    // --- v1 IN guard-rails: a converter or a mis-sized element silently desyncs the
+    // binary blob (group set vs entity scalar), so reject them at compile time. ---
+    static_assert(!(Operator == Op::IN && std::is_enum_v<element_type>),
+        "IN filter: enum element type not supported in v1");
+    static_assert(!(Operator == Op::IN && !std::is_same_v<Converter, NoConvert>),
+        "IN filter: value converter (e.g. AsString) not supported in v1");
+    static_assert(sizeof(bool) == 1,
+        "IN filter: schema assumes 1-byte bool encoding");
 
     /// Whether the entity member is optional
     static constexpr bool is_optional_member = detail::is_optional_v<member_type>;
