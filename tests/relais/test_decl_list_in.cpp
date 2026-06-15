@@ -25,6 +25,7 @@
 
 #include "fixtures/generated/TestArticleEntity.h"
 #include <jcailloux/relais/list/spec/GeneratedTraits.h>
+#include <jcailloux/relais/list/spec/GeneratedCriteria.h>
 #include <jcailloux/relais/list/spec/SortDescriptor.h>
 
 namespace decl = jcailloux::relais::list::spec;
@@ -230,5 +231,103 @@ TEST_CASE("[DeclListIn] EQ + IN + range combination", "[list][in][unit]") {
         g.get<1>() = std::vector<std::string>{"tech"};
         CHECK(decl::matchesFilters<DescCombo>(makeArticle(7, "tech", 999, std::nullopt), g));
         CHECK_FALSE(decl::matchesFilters<DescCombo>(makeArticle(8, "other", 999, std::nullopt), g));
+    }
+}
+
+// =============================================================================
+// L3 SQL generation — buildWhereClause IN branch (§7.3, transport-free).
+// Validates the `= ANY($n)` clause, the single-array-param invariant, $n
+// numbering when combined with EQ/range, empty-set literal, and escaping.
+// (Live-DB round-trip + cursor/offset coverage lands with the IN fixtures.)
+// =============================================================================
+
+namespace {
+
+std::string paramStr(const jcailloux::relais::io::PgParam& p) {
+    return p.isNull() ? std::string("<null>")
+                      : std::string(p.data(), static_cast<size_t>(p.length()));
+}
+
+}  // namespace
+
+TEST_CASE("[DeclListIn] SQL: IN emits = ANY with one array param", "[list][in][unit][sql]") {
+    decl::Filters<DescInString> f;
+    f.get<0>() = std::vector<std::string>{"science", "tech"};
+
+    auto wc = decl::buildWhereClause<DescInString>(f);
+    CHECK(wc.sql == "\"category\" = ANY($1)");
+    REQUIRE(wc.params.params.size() == 1);          // exactly one param — the array
+    CHECK(paramStr(wc.params.params[0]) == "{science,tech}");  // order preserved here
+    CHECK(wc.next_param == 2);
+}
+
+TEST_CASE("[DeclListIn] SQL: IN int64 array literal", "[list][in][unit][sql]") {
+    decl::Filters<DescInInt64> f;
+    f.get<0>() = std::vector<int64_t>{1, 2, 3};
+
+    auto wc = decl::buildWhereClause<DescInInt64>(f);
+    CHECK(wc.sql == "\"author_id\" = ANY($1)");
+    REQUIRE(wc.params.params.size() == 1);
+    CHECK(paramStr(wc.params.params[0]) == "{1,2,3}");
+
+    SECTION("negatives are not quoted") {
+        f.get<0>() = std::vector<int64_t>{-2, -1, 0};
+        auto wc2 = decl::buildWhereClause<DescInInt64>(f);
+        CHECK(paramStr(wc2.params.params[0]) == "{-2,-1,0}");
+    }
+}
+
+TEST_CASE("[DeclListIn] SQL: singleton set", "[list][in][unit][sql]") {
+    decl::Filters<DescInString> f;
+    f.get<0>() = std::vector<std::string>{"tech"};
+
+    auto wc = decl::buildWhereClause<DescInString>(f);
+    CHECK(wc.sql == "\"category\" = ANY($1)");
+    CHECK(paramStr(wc.params.params[0]) == "{tech}");
+}
+
+TEST_CASE("[DeclListIn] SQL: empty set yields = ANY('{}')", "[list][in][unit][sql]") {
+    decl::Filters<DescInString> f;
+    f.get<0>() = std::vector<std::string>{};  // present-but-empty
+    REQUIRE(f.get<0>().has_value());
+
+    auto wc = decl::buildWhereClause<DescInString>(f);
+    CHECK(wc.sql == "\"category\" = ANY($1)");
+    REQUIRE(wc.params.params.size() == 1);
+    CHECK(paramStr(wc.params.params[0]) == "{}");  // ANY('{}') → zero rows
+}
+
+TEST_CASE("[DeclListIn] SQL: strings with array delimiters are quoted/escaped",
+          "[list][in][unit][sql]") {
+    decl::Filters<DescInString> f;
+    f.get<0>() = std::vector<std::string>{"a,b", "x{y}", "q\"z", ""};
+
+    auto wc = decl::buildWhereClause<DescInString>(f);
+    // Each special element is quoted; embedded quote is backslash-escaped; empty
+    // string is quoted. Plain elements would stay bare (none here).
+    CHECK(paramStr(wc.params.params[0]) == R"({"a,b","x{y}","q\"z",""})");
+}
+
+TEST_CASE("[DeclListIn] SQL: EQ + IN + range $n numbering", "[list][in][unit][sql]") {
+    decl::Filters<DescCombo> f;
+    f.get<0>() = int64_t{42};                               // EQ author_id
+    f.get<1>() = std::vector<std::string>{"news", "tech"};  // IN category
+    f.get<2>() = int32_t{10};                               // GE view_count
+
+    auto wc = decl::buildWhereClause<DescCombo>(f);
+    CHECK(wc.sql == "\"author_id\"=$1 AND \"category\" = ANY($2) AND \"view_count\">=$3");
+    REQUIRE(wc.params.params.size() == 3);     // IN contributes exactly one param
+    CHECK(paramStr(wc.params.params[0]) == "42");
+    CHECK(paramStr(wc.params.params[1]) == "{news,tech}");
+    CHECK(paramStr(wc.params.params[2]) == "10");
+    CHECK(wc.next_param == 4);                  // cursor/offset params would start at $4
+
+    SECTION("only IN active — EQ/range skipped, IN takes $1") {
+        decl::Filters<DescCombo> g;
+        g.get<1>() = std::vector<std::string>{"tech"};
+        auto wc2 = decl::buildWhereClause<DescCombo>(g);
+        CHECK(wc2.sql == "\"category\" = ANY($1)");
+        REQUIRE(wc2.params.params.size() == 1);
+        CHECK(wc2.next_param == 2);
     }
 }

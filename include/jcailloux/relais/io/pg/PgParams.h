@@ -206,6 +206,15 @@ struct PgParams {
         return result;
     }
 
+    /// Build a single PG text-format array literal "{e1,e2,...}" from a vector,
+    /// reusing the scalar element escaping. Exposes the private array path for
+    /// `= ANY($n)` callers (e.g. list IN filters); numeric elements stay unquoted,
+    /// strings are quoted/escaped when they contain a delimiter.
+    template<typename T>
+    static PgParam arrayLiteral(const std::vector<T>& v) {
+        return toParam(v);
+    }
+
     /// Extract key column values as strings from a PgParams (for result matching).
     [[nodiscard]] std::vector<std::string> keyValues() const {
         std::vector<std::string> vals;

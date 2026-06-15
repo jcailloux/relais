@@ -4,6 +4,7 @@
 #include <string>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 #include "jcailloux/relais/io/pg/PgParams.h"
 
@@ -58,6 +59,16 @@ void addParamForDb(io::PgParams& params, const T& value) {
     }
 }
 
+/// Push exactly ONE PgParam — the PG array literal "{e1,e2,...}" — for an IN
+/// filter's set, consumed by SQL `= ANY($n)`. Pushing exactly one param is the
+/// critical invariant: 0 or N would shift every subsequent $n ↔ cursor/offset
+/// binding. Element escaping is reused from PgParams (numeric unquoted, strings
+/// quoted on delimiters). An empty set yields `{}` → `= ANY('{}')` → zero rows.
+template<typename FilterType, typename T>
+void addArrayParamForDb(io::PgParams& params, const std::vector<T>& values) {
+    params.params.push_back(io::PgParams::arrayLiteral(values));
+}
+
 }  // namespace detail
 
 // =============================================================================
@@ -94,11 +105,19 @@ template<typename Descriptor>
                 result.sql += "\"";
                 result.sql += FilterType::column();
                 result.sql += "\"";
-                result.sql += opToSql(FilterType::op);
-                result.sql += "$";
-                result.sql += std::to_string(result.next_param++);
 
-                detail::addParamForDb<FilterType>(result.params, *filter_value);
+                if constexpr (FilterType::op == Op::IN) {
+                    // entity ∈ set → "col" = ANY($n); one array param (see invariant).
+                    result.sql += " = ANY($";
+                    result.sql += std::to_string(result.next_param++);
+                    result.sql += ")";
+                    detail::addArrayParamForDb<FilterType>(result.params, *filter_value);
+                } else {
+                    result.sql += opToSql(FilterType::op);
+                    result.sql += "$";
+                    result.sql += std::to_string(result.next_param++);
+                    detail::addParamForDb<FilterType>(result.params, *filter_value);
+                }
             }
         }(), ...);
     }(std::make_index_sequence<filter_count<Descriptor>>{});
