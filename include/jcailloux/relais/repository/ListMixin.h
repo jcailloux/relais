@@ -84,7 +84,7 @@ class ListMixin : public Base {
     struct Traits {
         using Filters = DescriptorFilters;
         using SortField = size_t;
-        using FilterTags = Filters;
+        using FilterTags = list::spec::FilterTags<Descriptor>;
 
         static bool matchesFilters(const Entity& e, const Filters& f) {
             return list::spec::matchesFilters<Descriptor>(e, f);
