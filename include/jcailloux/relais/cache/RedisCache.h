@@ -775,6 +775,34 @@ local function skip(s, pos, ft)
     else return pos + 1 end
 end
 
+-- Skip a group-side IN set: [count:u32][elem×count]. gp points at the count.
+local function skipset(s, pos, ft)
+    local n = u32(s, pos); pos = pos + 4
+    for i = 1, n do pos = skip(s, pos, ft) end
+    return pos
+end
+
+-- Equality of one group element (at gp) against the scalar entity value (at ep).
+local function eqval(bin, gp, blob, ep, ft)
+    if ft == 115 then
+        local gl = u32(bin, gp); local el = u32(blob, ep)
+        return gl == el and (gl == 0 or string.sub(bin, gp+4, gp+3+gl) == string.sub(blob, ep+4, ep+3+el))
+    elseif ft == 56 then return string.sub(bin, gp, gp+7) == string.sub(blob, ep, ep+7)
+    elseif ft == 52 then return string.sub(bin, gp, gp+3) == string.sub(blob, ep, ep+3)
+    else return string.byte(bin, gp) == string.byte(blob, ep) end
+end
+
+-- IN membership: entity scalar (at ep) ∈ group set (at gp = count). Mirrors the
+-- L3 `= ANY` / L1 ranges::find verdict on the canonicalized set.
+local function cmpin(bin, gp, blob, ep, ft)
+    local n = u32(bin, gp); gp = gp + 4
+    for i = 1, n do
+        if eqval(bin, gp, blob, ep, ft) then return true end
+        gp = skip(bin, gp, ft)
+    end
+    return false
+end
+
 local function cmp(bin, gp, blob, ep, ft, fo)
     if ft == 115 then
         local gl = u32(bin, gp); local el = u32(blob, ep)
@@ -830,8 +858,12 @@ local function fmatch(bin, blob)
         if gx == 0 then
             if ex == 1 then ep = skip(blob, ep, ft) end
         elseif ex == 0 then
-            gp = skip(bin, gp, ft)
-            if fo == 61 then return false end
+            if fo == 64 then gp = skipset(bin, gp, ft) else gp = skip(bin, gp, ft) end
+            -- null entity matches neither EQ nor IN (no NULL member in a set)
+            if fo == 61 or fo == 64 then return false end
+        elseif fo == 64 then
+            if not cmpin(bin, gp, blob, ep, ft) then return false end
+            gp = skipset(bin, gp, ft); ep = skip(blob, ep, ft)
         else
             if not cmp(bin, gp, blob, ep, ft, fo) then return false end
             gp = skip(bin, gp, ft); ep = skip(blob, ep, ft)
@@ -961,6 +993,34 @@ local function skip(s, pos, ft)
     else return pos + 1 end
 end
 
+-- Skip a group-side IN set: [count:u32][elem×count]. gp points at the count.
+local function skipset(s, pos, ft)
+    local n = u32(s, pos); pos = pos + 4
+    for i = 1, n do pos = skip(s, pos, ft) end
+    return pos
+end
+
+-- Equality of one group element (at gp) against the scalar entity value (at ep).
+local function eqval(bin, gp, blob, ep, ft)
+    if ft == 115 then
+        local gl = u32(bin, gp); local el = u32(blob, ep)
+        return gl == el and (gl == 0 or string.sub(bin, gp+4, gp+3+gl) == string.sub(blob, ep+4, ep+3+el))
+    elseif ft == 56 then return string.sub(bin, gp, gp+7) == string.sub(blob, ep, ep+7)
+    elseif ft == 52 then return string.sub(bin, gp, gp+3) == string.sub(blob, ep, ep+3)
+    else return string.byte(bin, gp) == string.byte(blob, ep) end
+end
+
+-- IN membership: entity scalar (at ep) ∈ group set (at gp = count). Mirrors the
+-- L3 `= ANY` / L1 ranges::find verdict on the canonicalized set.
+local function cmpin(bin, gp, blob, ep, ft)
+    local n = u32(bin, gp); gp = gp + 4
+    for i = 1, n do
+        if eqval(bin, gp, blob, ep, ft) then return true end
+        gp = skip(bin, gp, ft)
+    end
+    return false
+end
+
 local function cmp(bin, gp, blob, ep, ft, fo)
     if ft == 115 then
         local gl = u32(bin, gp); local el = u32(blob, ep)
@@ -1016,8 +1076,12 @@ local function fmatch(bin, blob)
         if gx == 0 then
             if ex == 1 then ep = skip(blob, ep, ft) end
         elseif ex == 0 then
-            gp = skip(bin, gp, ft)
-            if fo == 61 then return false end
+            if fo == 64 then gp = skipset(bin, gp, ft) else gp = skip(bin, gp, ft) end
+            -- null entity matches neither EQ nor IN (no NULL member in a set)
+            if fo == 61 or fo == 64 then return false end
+        elseif fo == 64 then
+            if not cmpin(bin, gp, blob, ep, ft) then return false end
+            gp = skipset(bin, gp, ft); ep = skip(blob, ep, ft)
         else
             if not cmp(bin, gp, blob, ep, ft, fo) then return false end
             gp = skip(bin, gp, ft); ep = skip(blob, ep, ft)

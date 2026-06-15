@@ -15,6 +15,13 @@
  * - empty set {} ⇒ no entity matches
  * - combinations EQ + IN + range
  * - optional member null ∉ any set
+ *
+ * Plus (commit 6) §7.4/§7.5 L2 selective invalidation via the Redis Lua scripts
+ * (`invalidateListGroupsSelective` + `...Update`): the new `skipset`/`cmpin`/
+ * `fmatch` IN path tested directly against Redis — a page stored without an SR
+ * SortBounds header makes `chk` unconditionally true, so the delete decision
+ * reduces to pure filter matching. Multi-filter alignment (IN in first/middle/
+ * last position) is the anti-regression for `skipset` cursor desync.
  */
 
 #include <catch2/catch_test_macros.hpp>
@@ -25,7 +32,9 @@
 
 #include <unordered_map>
 
+#include "fixtures/test_helper.h"
 #include "fixtures/generated/TestArticleEntity.h"
+#include <jcailloux/relais/cache/RedisCache.h>
 #include <jcailloux/relais/list/spec/GeneratedTraits.h>
 #include <jcailloux/relais/list/spec/GeneratedCriteria.h>
 #include <jcailloux/relais/list/spec/HttpQueryParser.h>
@@ -33,6 +42,8 @@
 
 namespace decl = jcailloux::relais::list::spec;
 using relais_test::TestArticle;
+using relais_test::sync;              // relais_test::sync, not POSIX ::sync from <unistd.h>
+using relais_test::TransactionGuard;
 using Entity = entity::generated::TestArticleEntity;
 
 // =============================================================================
@@ -453,4 +464,235 @@ TEST_CASE("[DeclListIn] parse: strict rejects undeclared filter, accepts IN",
         REQUIRE(r->filters.get<0>().has_value());
         CHECK(*r->filters.get<0>() == std::vector<std::string>{"science", "tech"});
     }
+}
+
+// =============================================================================
+// L2 selective invalidation (§7.4/§7.5) — the Redis Lua `skipset`/`cmpin`/
+// `fmatch` IN path, exercised directly. A group is registered by HSET-ing its
+// canonical key (prefix + groupCacheKey) into a master hash and SADD-ing one
+// page into `<group>:_keys`. The page value is shorter than the SortBounds
+// header, so the Lua `chk` short-circuits to "delete" — the surviving variable
+// is whether `fmatch` matched. Membership of the deleted page is read back via
+// EXISTS. Each TEST_CASE/SECTION starts on a flushed Redis (TransactionGuard).
+// =============================================================================
+
+namespace {
+
+// IN in FIRST position (EQ after it) — alignment: the filter following the set
+// must still read at the right cursor once skipset has consumed the set.
+struct DescInFirst {
+    using Entity = ::Entity;
+    static constexpr auto filters = std::tuple{
+        decl::Filter<"category", &TestArticle::category, "category", decl::Op::IN>{},
+        decl::Filter<"author_id", &TestArticle::author_id, "author_id", decl::Op::EQ>{}
+    };
+    static constexpr auto sorts = std::tuple{
+        decl::Sort<"id", &TestArticle::id, "id", decl::SortDirection::Desc>{}
+    };
+};
+
+// IN in LAST position.
+struct DescInLast {
+    using Entity = ::Entity;
+    static constexpr auto filters = std::tuple{
+        decl::Filter<"author_id", &TestArticle::author_id, "author_id", decl::Op::EQ>{},
+        decl::Filter<"category", &TestArticle::category, "category", decl::Op::IN>{}
+    };
+    static constexpr auto sorts = std::tuple{
+        decl::Sort<"id", &TestArticle::id, "id", decl::SortDirection::Desc>{}
+    };
+};
+
+namespace cache_ns = jcailloux::relais::cache;
+using jcailloux::relais::PgProvider;
+
+// Any prefix works — the Lua only strips prefixLen bytes; the suffix must equal
+// groupCacheKey's canonical blob. Mirror ListMixin's "<name>:dlist:g:" shape.
+constexpr std::string_view kInPrefix = "T:dlist:g:";  // 10 bytes
+constexpr size_t kInPrefixLen = 10;
+const std::string kInMaster = "test:in:l2:master";
+
+template<typename Desc>
+std::string registerInGroup(const decl::ListDescriptorQuery<Desc>& q) {
+    std::string groupKey = std::string(kInPrefix) + decl::groupCacheKey<Desc>(q);
+    std::string pageKey = groupKey + ":p";
+    sync(PgProvider::redis("SET", pageKey, "x"));               // < header → chk true
+    sync(PgProvider::redis("SADD", groupKey + ":_keys", pageKey));
+    sync(PgProvider::redis("HSET", kInMaster, groupKey, "0"));  // sort field index 0
+    return pageKey;
+}
+
+bool alive(const std::string& pageKey) {
+    return sync(PgProvider::redis("EXISTS", pageKey)).asInteger() == 1;
+}
+
+template<typename Desc>
+size_t fireCreate(const Entity& e) {
+    return sync(cache_ns::RedisCache::invalidateListGroupsSelective(
+        kInMaster, kInPrefixLen, decl::filterSchema<Desc>(),
+        decl::encodeEntityFilterBlob<Desc>(e), "0"));
+}
+
+template<typename Desc>
+size_t fireUpdate(const Entity& oldE, const Entity& newE) {
+    return sync(cache_ns::RedisCache::invalidateListGroupsSelectiveUpdate(
+        kInMaster, kInPrefixLen, decl::filterSchema<Desc>(),
+        decl::encodeEntityFilterBlob<Desc>(newE), "0",
+        decl::encodeEntityFilterBlob<Desc>(oldE), "0"));
+}
+
+}  // namespace
+
+TEST_CASE("[DeclListIn][L2] create invalidates only groups whose set contains the value",
+          "[integration][db][redis][list][in][l2]") {
+    TransactionGuard tx;
+
+    auto mk = [](std::vector<std::string> set) {
+        decl::ListDescriptorQuery<DescInString> q;
+        q.filters.get<0>() = std::move(set);
+        return registerInGroup<DescInString>(q);
+    };
+    auto g_ts = mk({"science", "tech"});
+    auto g_t  = mk({"tech"});
+    auto g_ns = mk({"news", "sports"});
+
+    SECTION("category=tech") {
+        fireCreate<DescInString>(makeArticle(1, "tech", 0));
+        CHECK_FALSE(alive(g_ts));  // tech ∈ {science,tech}
+        CHECK_FALSE(alive(g_t));   // tech ∈ {tech}
+        CHECK(alive(g_ns));        // tech ∉ {news,sports}
+    }
+    SECTION("category=science") {
+        fireCreate<DescInString>(makeArticle(2, "science", 0));
+        CHECK_FALSE(alive(g_ts));  // science ∈ {science,tech}
+        CHECK(alive(g_t));         // science ∉ {tech}
+        CHECK(alive(g_ns));
+    }
+}
+
+TEST_CASE("[DeclListIn][L2] alignment — IN in middle position (create)",
+          "[integration][db][redis][list][in][l2]") {
+    TransactionGuard tx;
+    // DescCombo: [EQ author_id][IN category][GE view_count]
+    auto mk = [](int64_t author, std::vector<std::string> cats, int32_t viewGe) {
+        decl::ListDescriptorQuery<DescCombo> q;
+        q.filters.get<0>() = author;
+        q.filters.get<1>() = std::move(cats);
+        q.filters.get<2>() = viewGe;
+        return registerInGroup<DescCombo>(q);
+    };
+    auto gAll  = mk(42, {"news", "tech"}, 10);   // EQ ok, IN ok, range ok
+    auto gIn   = mk(42, {"sports"},       10);   // IN fails
+    auto gRng  = mk(42, {"tech"},         100);  // range AFTER the set fails
+    auto gEq   = mk(99, {"tech"},         10);   // EQ BEFORE the set fails
+
+    fireCreate<DescCombo>(makeArticle(1, "tech", 42, 50));
+    CHECK_FALSE(alive(gAll));
+    CHECK(alive(gIn));   // sports ∌ tech
+    CHECK(alive(gRng));  // 50 < 100 — proves skipset left view_count aligned
+    CHECK(alive(gEq));   // author 42 ≠ 99
+}
+
+TEST_CASE("[DeclListIn][L2] alignment — IN in first position (create)",
+          "[integration][db][redis][list][in][l2]") {
+    TransactionGuard tx;
+    // DescInFirst: [IN category][EQ author_id]
+    auto mk = [](std::vector<std::string> cats, int64_t author) {
+        decl::ListDescriptorQuery<DescInFirst> q;
+        q.filters.get<0>() = std::move(cats);
+        q.filters.get<1>() = author;
+        return registerInGroup<DescInFirst>(q);
+    };
+    auto gMatch = mk({"news", "tech"}, 42);  // IN ok + EQ ok
+    auto gEqFail = mk({"tech"},        99);  // EQ AFTER the set fails
+
+    fireCreate<DescInFirst>(makeArticle(1, "tech", 42));
+    CHECK_FALSE(alive(gMatch));
+    CHECK(alive(gEqFail));  // author after the set correctly mismatched
+}
+
+TEST_CASE("[DeclListIn][L2] alignment — IN in last position (create)",
+          "[integration][db][redis][list][in][l2]") {
+    TransactionGuard tx;
+    // DescInLast: [EQ author_id][IN category]
+    auto mk = [](int64_t author, std::vector<std::string> cats) {
+        decl::ListDescriptorQuery<DescInLast> q;
+        q.filters.get<0>() = author;
+        q.filters.get<1>() = std::move(cats);
+        return registerInGroup<DescInLast>(q);
+    };
+    auto gMatch  = mk(42, {"tech"});
+    auto gInFail = mk(42, {"news"});
+    auto gEqFail = mk(99, {"tech"});
+
+    fireCreate<DescInLast>(makeArticle(1, "tech", 42));
+    CHECK_FALSE(alive(gMatch));
+    CHECK(alive(gInFail));   // news ∌ tech
+    CHECK(alive(gEqFail));   // author 42 ≠ 99
+}
+
+TEST_CASE("[DeclListIn][L2] optional-null entity and empty-set group never match (create)",
+          "[integration][db][redis][list][in][l2]") {
+    TransactionGuard tx;
+    // DescInOptInt32: [IN view_count] on a std::optional<int32_t> member.
+    auto mk = [](std::optional<std::vector<int32_t>> set) {
+        decl::ListDescriptorQuery<DescInOptInt32> q;
+        if (set) q.filters.get<0>() = std::move(*set);
+        return registerInGroup<DescInOptInt32>(q);
+    };
+    auto gSet   = mk(std::vector<int32_t>{10, 20});
+    auto gEmpty = mk(std::vector<int32_t>{});  // present-but-empty set
+
+    SECTION("matching value invalidates the set group, never the empty one") {
+        fireCreate<DescInOptInt32>(makeArticle(1, "x", 0, 20));
+        CHECK_FALSE(alive(gSet));  // 20 ∈ {10,20}
+        CHECK(alive(gEmpty));      // 20 ∉ ∅
+    }
+    SECTION("null IN member matches no set") {
+        fireCreate<DescInOptInt32>(makeArticle(2, "x", 0, std::nullopt));
+        CHECK(alive(gSet));    // null ∉ {10,20}
+        CHECK(alive(gEmpty));
+    }
+}
+
+TEST_CASE("[DeclListIn][L2] update invalidates groups whose set holds old OR new value",
+          "[integration][db][redis][list][in][l2]") {
+    TransactionGuard tx;
+    auto mk = [](std::vector<std::string> set) {
+        decl::ListDescriptorQuery<DescInString> q;
+        q.filters.get<0>() = std::move(set);
+        return registerInGroup<DescInString>(q);
+    };
+    auto gOld   = mk({"news", "tech"});       // holds old=tech
+    auto gNew   = mk({"science", "sports"});  // holds new=science
+    auto gBoth  = mk({"science", "tech"});    // holds both
+    auto gOther = mk({"games", "music"});     // neither
+
+    fireUpdate<DescInString>(makeArticle(1, "tech", 0), makeArticle(1, "science", 0));
+    CHECK_FALSE(alive(gOld));   // old=tech matched
+    CHECK_FALSE(alive(gNew));   // new=science matched
+    CHECK_FALSE(alive(gBoth));  // both matched (invalidated once)
+    CHECK(alive(gOther));       // neither value in the set
+}
+
+TEST_CASE("[DeclListIn][L2] alignment — IN in middle position (update, revue C8)",
+          "[integration][db][redis][list][in][l2]") {
+    TransactionGuard tx;
+    // Replays the IN-middle alignment against the SECOND, duplicated Lua script
+    // (`...Update`) to catch any copy-paste divergence from the create path.
+    auto mk = [](int64_t author, std::vector<std::string> cats, int32_t viewGe) {
+        decl::ListDescriptorQuery<DescCombo> q;
+        q.filters.get<0>() = author;
+        q.filters.get<1>() = std::move(cats);
+        q.filters.get<2>() = viewGe;
+        return registerInGroup<DescCombo>(q);
+    };
+    auto gAll = mk(42, {"tech"}, 10);   // both old/new match
+    auto gRng = mk(42, {"tech"}, 100);  // range AFTER the set fails for both
+    auto gEq  = mk(99, {"tech"}, 10);   // EQ BEFORE the set fails
+
+    fireUpdate<DescCombo>(makeArticle(1, "tech", 42, 50), makeArticle(1, "tech", 42, 60));
+    CHECK_FALSE(alive(gAll));
+    CHECK(alive(gRng));  // 50,60 both < 100 — UPDATE skipset matches CREATE skipset
+    CHECK(alive(gEq));   // author 42 ≠ 99
 }
