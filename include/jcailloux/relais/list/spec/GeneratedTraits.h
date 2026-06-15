@@ -1,6 +1,7 @@
 #ifndef JCX_RELAIS_LIST_SPEC_GENERATEDTRAITS_H
 #define JCX_RELAIS_LIST_SPEC_GENERATEDTRAITS_H
 
+#include <algorithm>
 #include <array>
 #include <concepts>
 #include <cstdint>
@@ -63,8 +64,17 @@ template<typename Descriptor>
             // Get entity value (supports both data members and member functions)
             const auto entity_value = detail::extractMemberValue<FilterType::entity_ptr>(entity);
 
-            // Handle optional entity members
-            if constexpr (FilterType::is_optional_member) {
+            if constexpr (FilterType::op == Op::IN) {
+                // IN: entity scalar ∈ query set. filter_value is optional<vector>,
+                // *filter_value the set. compareWithOp is never instantiated here.
+                if constexpr (FilterType::is_optional_member) {
+                    if (!entity_value.has_value()) return false;  // null ∉ any set
+                    return std::ranges::find(*filter_value, *entity_value) != filter_value->end();
+                } else {
+                    return std::ranges::find(*filter_value, entity_value) != filter_value->end();
+                }
+            } else if constexpr (FilterType::is_optional_member) {
+                // Handle optional entity members
                 if (!entity_value.has_value()) {
                     return FilterType::op == Op::NE;
                 }
