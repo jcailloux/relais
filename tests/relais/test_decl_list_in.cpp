@@ -22,11 +22,20 @@
  * SortBounds header makes `chk` unconditionally true, so the delete decision
  * reduces to pure filter matching. Multi-filter alignment (IN in first/middle/
  * last position) is the anti-regression for `skipset` cursor desync.
+ *
+ * Plus (commit 7) §7.7 cross-tier consistency: a deterministic property test
+ * (fixed seed) forces all three tiers — L1 `matchesFilters`, L2 Lua `cmpin`,
+ * L3 real PostgreSQL `= ANY` — through the same (entity, set) pairs and asserts
+ * the verdicts are identical, per the §1 invariant. Covers all four element
+ * encodings (string/int64/int32-optional/bool), negatives/extremes, empty sets,
+ * null members, and array-literal escaping that round-trips through PG.
  */
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <optional>
+#include <random>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -695,4 +704,158 @@ TEST_CASE("[DeclListIn][L2] alignment — IN in middle position (update, revue C
     CHECK_FALSE(alive(gAll));
     CHECK(alive(gRng));  // 50,60 both < 100 — UPDATE skipset matches CREATE skipset
     CHECK(alive(gEq));   // author 42 ≠ 99
+}
+
+// =============================================================================
+// Cross-tier consistency (§7.7) — the §1 invariant under load.
+//
+// For each (entity, set) pair the three tiers must agree on "entity scalar ∈
+// set": L1 `matchesFilters` (pure C++), L3 PostgreSQL `= ANY` (the real array
+// parser, fed buildWhereClause's array literal so escaping round-trips through
+// PG), and L2 Lua `cmpin` (page deleted ⇔ matched). All groups for one entity
+// are registered into the master hash at once, then a single create fires and
+// the Lua scans them — exercising the same multi-group selective scan used in
+// production. Data is generated from a fixed seed (deterministic, reproducible).
+// =============================================================================
+
+namespace {
+
+// Real PostgreSQL membership verdict. `cast` is the element's pg type; the array
+// literal is exactly what buildWhereClause emits, so PG's array parser sees the
+// production escaping. CASE collapses NULL/false to 0 (null member ∉ any set).
+template<typename V>
+bool sqlAnyVerdict(const V& val, const std::string& arrayLiteral, const char* cast) {
+    std::string sql = "SELECT CASE WHEN $1::";
+    sql += cast; sql += " = ANY($2::"; sql += cast; sql += "[]) THEN 1 ELSE 0 END";
+    auto r = relais_test::execQueryArgs(sql.c_str(), val, arrayLiteral);
+    return r[0].template get<int32_t>(0) == 1;
+}
+
+// getField : Entity -> std::optional<Elem> (null for an absent optional member).
+template<typename Desc, typename Elem, typename Getter>
+void crossTierProperty(const std::vector<Entity>& entities,
+                       const std::vector<std::vector<Elem>>& sets,
+                       const char* cast, Getter getField) {
+    for (const auto& e : entities) {
+        relais_test::flushRedis();
+        std::vector<std::string> pages;
+        pages.reserve(sets.size());
+        for (const auto& s : sets) {
+            decl::ListDescriptorQuery<Desc> q;
+            q.filters.template get<0>() = s;
+            pages.push_back(registerInGroup<Desc>(q));
+        }
+        fireCreate<Desc>(e);  // one create, Lua scans every registered group
+
+        for (size_t i = 0; i < sets.size(); ++i) {
+            decl::Filters<Desc> f;
+            f.template get<0>() = sets[i];
+
+            const bool l1 = decl::matchesFilters<Desc>(e, f);
+            const bool l2 = !alive(pages[i]);              // deleted ⇔ matched
+
+            auto wc = decl::buildWhereClause<Desc>(f);
+            const std::string arr = paramStr(wc.params.params[0]);
+            const auto fld = getField(e);
+            const bool l3 = fld.has_value() && sqlAnyVerdict(*fld, arr, cast);
+
+            CAPTURE(e.id, i, arr, l1, l2, l3);
+            CHECK(l1 == l2);   // L1 vs L2 Lua
+            CHECK(l1 == l3);   // L1 vs L3 SQL
+        }
+    }
+}
+
+// Distinct sets (size 0..5) sampled from `pool`; built via std::set so each set
+// is sorted+unique, then deduped across sets to avoid group-key collisions. The
+// empty set (size 0) is reachable and exercises the present-but-empty group.
+template<typename Elem>
+std::vector<std::vector<Elem>> makeSets(std::mt19937& gen,
+                                        const std::vector<Elem>& pool, size_t want) {
+    std::set<std::vector<Elem>> uniq;
+    for (int guard = 0; uniq.size() < want && guard < 2000; ++guard) {
+        size_t sz = gen() % 6;
+        std::set<Elem> s;
+        for (size_t k = 0; k < sz; ++k) s.insert(pool[gen() % pool.size()]);
+        uniq.emplace(s.begin(), s.end());
+    }
+    return {uniq.begin(), uniq.end()};
+}
+
+constexpr size_t kXtEntities = 25;
+constexpr size_t kXtSets = 10;
+
+const std::vector<std::string> kCatPool = {
+    "tech", "science", "news", "sports", "games", "music",
+    "", "a,b", "x{y}", "q\"z"  // array-literal escaping must round-trip through PG
+};
+const std::vector<int64_t> kAuthorPool = {
+    INT64_MIN, -1000, -1, 0, 1, 42, 1000, INT64_MAX
+};
+const std::vector<int32_t> kViewPool = {
+    INT32_MIN, -5, 0, 10, 20, INT32_MAX
+};
+
+std::vector<Entity> makeEntities(std::mt19937& gen, size_t n) {
+    std::vector<Entity> out;
+    out.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        std::optional<int32_t> vc;
+        if (gen() % 5 != 0)  // ~20% null view_count
+            vc = kViewPool[gen() % kViewPool.size()];
+        out.push_back(makeArticle(
+            static_cast<int64_t>(i + 1),
+            kCatPool[gen() % kCatPool.size()],
+            kAuthorPool[gen() % kAuthorPool.size()],
+            vc,
+            (gen() % 2) == 0));
+    }
+    return out;
+}
+
+}  // namespace
+
+TEST_CASE("[DeclListIn][xtier] L1/L2/L3 agree on string membership",
+          "[integration][db][redis][list][in][xtier]") {
+    TransactionGuard tx;
+    std::mt19937 gen(0xC0FFEE01);
+    auto entities = makeEntities(gen, kXtEntities);
+    auto sets = makeSets<std::string>(gen, kCatPool, kXtSets);
+    crossTierProperty<DescInString, std::string>(
+        entities, sets, "text",
+        [](const Entity& e) { return std::optional<std::string>(e.category); });
+}
+
+TEST_CASE("[DeclListIn][xtier] L1/L2/L3 agree on int64 membership",
+          "[integration][db][redis][list][in][xtier]") {
+    TransactionGuard tx;
+    std::mt19937 gen(0xC0FFEE02);
+    auto entities = makeEntities(gen, kXtEntities);
+    auto sets = makeSets<int64_t>(gen, kAuthorPool, kXtSets);
+    crossTierProperty<DescInInt64, int64_t>(
+        entities, sets, "int8",
+        [](const Entity& e) { return std::optional<int64_t>(e.author_id); });
+}
+
+TEST_CASE("[DeclListIn][xtier] L1/L2/L3 agree on int32 optional membership",
+          "[integration][db][redis][list][in][xtier]") {
+    TransactionGuard tx;
+    std::mt19937 gen(0xC0FFEE03);
+    auto entities = makeEntities(gen, kXtEntities);
+    auto sets = makeSets<int32_t>(gen, kViewPool, kXtSets);
+    // view_count is std::optional<int32_t> — null members must read false in all tiers.
+    crossTierProperty<DescInOptInt32, int32_t>(
+        entities, sets, "int4",
+        [](const Entity& e) { return e.view_count; });
+}
+
+TEST_CASE("[DeclListIn][xtier] L1/L2/L3 agree on bool membership",
+          "[integration][db][redis][list][in][xtier]") {
+    TransactionGuard tx;
+    std::mt19937 gen(0xC0FFEE04);
+    auto entities = makeEntities(gen, kXtEntities);
+    auto sets = makeSets<bool>(gen, std::vector<bool>{false, true}, kXtSets);
+    crossTierProperty<DescInBool, bool>(
+        entities, sets, "bool",
+        [](const Entity& e) { return std::optional<bool>(e.is_published); });
 }

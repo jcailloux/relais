@@ -152,7 +152,13 @@ std::string groupCacheKey(const ListDescriptorQuery<Descriptor>& query) {
                     std::sort(sorted.begin(), sorted.end());
                     sorted.erase(std::unique(sorted.begin(), sorted.end()), sorted.end());
                     detail::appendToBuffer(buf, static_cast<uint32_t>(sorted.size()));
-                    for (const auto& e : sorted) detail::appendToBuffer(buf, e);
+                    // Pin the element type: iterating std::vector<bool> yields a
+                    // proxy reference, not bool — appendToBuffer would deduce the
+                    // proxy, match no branch and emit zero bytes, desyncing the
+                    // group set from the (scalar) entity blob. Explicit T forces
+                    // the proxy to materialize and keeps strings copy-free.
+                    using ElemT = typename std::decay_t<decltype(sorted)>::value_type;
+                    for (const auto& e : sorted) detail::appendToBuffer<ElemT>(buf, e);
                 }
             } else {
                 detail::appendOptional(buf, filter_value);
