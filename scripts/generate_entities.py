@@ -322,8 +322,13 @@ class StructParser:
             filterable:custom_name  -> EQ with custom HTTP param
             filterable:ge           -> GE operator (known op) on field_name
             filterable:date_from:ge -> custom param + GE operator
+            filterable:in           -> IN operator on field_name
+            filterable:cats:in      -> custom param + IN operator
         """
-        KNOWN_OPS = {"eq", "ne", "gt", "ge", "lt", "le", "gte", "lte"}
+        # "in" must be a known op so the short form `filterable:in` is parsed as
+        # the IN operator. Without it, `:in` falls through to the custom-param
+        # branch and silently becomes an EQ filter on an HTTP param named "in".
+        KNOWN_OPS = {"eq", "ne", "gt", "ge", "lt", "le", "gte", "lte", "in"}
         parts = tag.split(":")
         if len(parts) == 1:
             return FilterConfig(param=field_name, field=field_name)
