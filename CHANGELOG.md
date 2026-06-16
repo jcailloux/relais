@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.5.0-alpha.7] - 2026-06-16
+
 ### Added
 
 - **Per-model list page-size grids (`@relais_list limits=…`).** The grid is honored end-to-end at arbitrary length: the generator sorts and deduplicates it and emits `allowedLimits`/`defaultLimit`/`maxLimit` on the `ListDescriptor`, driving limit normalization (tolerant: round up, cap at `maxLimit`; strict: exact membership → `InvalidLimit`) and the canonical cache key. Omitting `limits=` yields `{10,25,50}`.
