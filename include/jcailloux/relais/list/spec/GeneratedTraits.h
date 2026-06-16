@@ -332,6 +332,24 @@ template<typename Descriptor>
     }
 }
 
+template<typename Descriptor>
+concept HasDefaultLimit = requires {
+    { Descriptor::defaultLimit } -> std::convertible_to<uint16_t>;
+};
+
+/// Default page size when a request omits the `limit` param: the descriptor's
+/// declared default (allowedLimits.front(), emitted by the generator), else 20 —
+/// the ListQuery struct default (ListQuery.h) — for hand-written descriptors
+/// without a `limits=` grid.
+template<typename Descriptor>
+[[nodiscard]] constexpr uint16_t defaultLimit() noexcept {
+    if constexpr (HasDefaultLimit<Descriptor>) {
+        return Descriptor::defaultLimit;
+    } else {
+        return 20;
+    }
+}
+
 // =============================================================================
 // extractSortValue - Extract sort field value from entity
 // =============================================================================

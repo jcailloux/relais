@@ -12,6 +12,7 @@
 
 #include <array>
 #include <cstdint>
+#include <unordered_map>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -21,6 +22,7 @@
 #include "fixtures/generated/TestLimitsMessyEntity.h"
 
 #include "jcailloux/relais/list/spec/GeneratedTraits.h"
+#include "jcailloux/relais/list/spec/HttpQueryParser.h"
 #include "jcailloux/relais/list/ListCacheTraits.h"
 #include "jcailloux/relais/config/CacheConfig.h"
 #include <jcailloux/relais/repository/Repo.h>
@@ -82,6 +84,15 @@ static_assert(FiveRepo::ListTraits::maxLimit == 100, "maxLimit == grid back");
 static_assert(SingleRepo::ListTraits::limitSteps == std::array<uint16_t, 1>{50},
               "single-value grid flows through to ListMixin Traits");
 static_assert(SingleRepo::ListTraits::maxLimit == 50);
+
+// --- defaultLimit<Descriptor> (Étape 4) -----------------------------------
+// The default page size (no `limit` param) is allowedLimits.front() for a
+// generated descriptor, falling back to the ListQuery struct default of 20 for
+// a hand-written descriptor without a grid.
+static_assert(defaultLimit<L5>() == 5, "default = grid front (5,10,20,50,100)");
+static_assert(defaultLimit<LM>() == 10, "default = grid front (10,25,50)");
+static_assert(defaultLimit<LC>() == 50, "default = grid front (single-value 50)");
+static_assert(defaultLimit<NoLimits>() == 20, "no grid -> ListQuery struct default 20");
 
 }  // namespace
 
@@ -168,4 +179,34 @@ TEST_CASE("descriptors without allowedLimits use the default grid", "[list][limi
 // held.
 TEST_CASE("limit config is size-agnostic and descriptor-derived", "[list][limits]") {
     SUCCEED();
+}
+
+// Étape 4: a request omitting `limit` falls back to the descriptor's declared
+// default page size, not the struct default of 20.
+TEST_CASE("parse without a limit param uses the descriptor default", "[list][limits]") {
+    // parseListQuery requires the augmented descriptor (Entity alias) exposed as
+    // Repo::ListDescriptorType, not the raw embedded ListDescriptor.
+    using FiveDesc   = FiveRepo::ListDescriptorType;    // grid {5,10,20,50,100}, default 5
+    using SingleDesc = SingleRepo::ListDescriptorType;  // grid {50}, default 50
+    const std::unordered_map<std::string, std::string> no_params;
+
+    SECTION("tolerant parser") {
+        CHECK(parseListQuery<FiveDesc>(no_params).limit == 5);
+        CHECK(parseListQuery<SingleDesc>(no_params).limit == 50);
+    }
+
+    SECTION("strict parser") {
+        auto q5 = parseListQueryStrict<FiveDesc>(no_params);
+        REQUIRE(q5.has_value());
+        CHECK(q5->limit == 5);
+
+        auto qc = parseListQueryStrict<SingleDesc>(no_params);
+        REQUIRE(qc.has_value());
+        CHECK(qc->limit == 50);
+    }
+
+    SECTION("an explicit limit still overrides the default") {
+        const std::unordered_map<std::string, std::string> with_limit{{"limit", "20"}};
+        CHECK(parseListQuery<FiveDesc>(with_limit).limit == 20);  // 20 ∈ {5,10,20,50,100}
+    }
 }
