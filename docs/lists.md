@@ -68,6 +68,32 @@ defaulting to `false`.
 
 Column names are derived from the field name (override with `column=`).
 
+### `limits` syntax
+
+`@relais_list limits=…` declares the page-size grid for the model — a
+class-level annotation, comma-separated, any length:
+
+```cpp
+// @relais_list limits=5,10,20,50,100
+```
+
+The generator sorts and deduplicates the grid, then emits three members on the
+`ListDescriptor`: `allowedLimits` (the array), `defaultLimit` (its front),
+`maxLimit` (its back). Omitting `limits=` yields the grid `{10,25,50}`.
+
+The grid is the source of truth for the page size and feeds the canonical cache
+key, so a model's accepted page sizes are fixed at compile time. The two parsers
+read it differently:
+
+| | absent `limit` param | out-of-grid `limit` |
+|---|---|---|
+| `parseListQuery` (tolerant) | `defaultLimit` | rounds up to the next step, caps at `maxLimit` |
+| `parseListQueryStrict` (strict) | `defaultLimit` | `InvalidLimit` error |
+
+A hand-written descriptor with no `allowedLimits` member falls back to the grid
+`{10,25,50,100}`, and to a default page size of `20` (the `ListQuery` struct
+default).
+
 ## Query
 
 ```cpp
