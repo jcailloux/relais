@@ -244,7 +244,7 @@ class StructParser:
             if is_list:
                 for token in tokens:
                     if token.startswith("limits="):
-                        annot.limits = [int(x) for x in token[7:].split(",")]
+                        annot.limits = self._parse_limits(token[7:])
                     elif token.startswith("entity="):
                         annot.entity_fqn = token[7:]
             else:
@@ -257,6 +257,33 @@ class StructParser:
                         annot.read_only = True
 
         return annot
+
+    def _parse_limits(self, spec: str) -> list[int]:
+        """Parse, validate, sort and dedup a `limits=` annotation value.
+
+        Each value must be an integer in [1, 65535] (uint16_t domain).
+        Returns the ascending, deduplicated list — a precondition of the
+        round-up semantics in normalizeLimit.
+        """
+        raw = [tok for tok in spec.split(",") if tok.strip() != ""]
+        if not raw:
+            print(f"error: empty limits= annotation", file=sys.stderr)
+            sys.exit(1)
+        values: set[int] = set()
+        for tok in raw:
+            tok = tok.strip()
+            try:
+                v = int(tok)
+            except ValueError:
+                print(f"error: invalid limits= value '{tok}' (not an integer)",
+                      file=sys.stderr)
+                sys.exit(1)
+            if v < 1 or v > 65535:
+                print(f"error: limits= value {v} out of range [1, 65535]",
+                      file=sys.stderr)
+                sys.exit(1)
+            values.add(v)
+        return sorted(values)
 
     def _tokenize_annotation(self, text: str) -> list[str]:
         """Split annotation text by spaces, but keep enum=... together."""
@@ -592,6 +619,8 @@ class MappingGenerator:
 
         # List includes
         if a.has_list:
+            if not a.is_composite:  # composite already added <array>
+                lines.append("#include <array>")
             lines.append("#include <jcailloux/relais/list/ListWrapper.h>")
             lines.append("#include <jcailloux/relais/list/spec/FilterDescriptor.h>")
             lines.append("#include <jcailloux/relais/list/spec/SortDescriptor.h>")
@@ -1271,6 +1300,7 @@ class MappingGenerator:
         limits = a.limits if a.limits else [10, 25, 50]
         default_limit = limits[0]
         max_limit = limits[-1]
+        limits_str = ", ".join(str(v) for v in limits)
 
         lines = [
             "    // Embedded ListDescriptor — auto-detected by ListMixin",
@@ -1315,6 +1345,9 @@ class MappingGenerator:
             lines.append("        };")
 
         lines.append("")
+        lines.append(
+            f"        static constexpr std::array<uint16_t, {len(limits)}> "
+            f"allowedLimits = {{{limits_str}}};")
         lines.append(f"        static constexpr uint16_t defaultLimit = {default_limit};")
         lines.append(f"        static constexpr uint16_t maxLimit = {max_limit};")
         lines.append("    };")
