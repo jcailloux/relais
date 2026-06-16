@@ -32,14 +32,30 @@ struct AuditLog {
 | `filterable:custom_name` | `custom_name` | EQ |
 | `filterable:ge` | field name | GE (known operator) |
 | `filterable:date_from:ge` | `date_from` | GE |
+| `filterable:in` | field name | IN (set membership) |
+| `filterable:authors:in` | `authors` | IN |
 
-Known operators: `eq`, `ne`, `gt`, `ge`/`gte`, `lt`, `le`/`lte`.
+Known operators: `eq`, `ne`, `gt`, `ge`/`gte`, `lt`, `le`/`lte`, `in`.
 
 Multiple filters on one field (range queries):
 
 ```cpp
 std::string created_at;  // @relais timestamp filterable:date_from:gte filterable:date_to:lte sortable:desc
 ```
+
+### `in` operator (set membership)
+
+`filterable:in` matches a column against a set of values. The HTTP param is a
+comma-separated list (`?authors=1,2,3`); the set is canonicalized
+(deduplicated, sorted) before use. Element types are `int64`, `int32`,
+`std::string`, and `bool`; `enum` and field converters are rejected at compile
+time. An empty or all-invalid set leaves the filter inactive. The set is bounded
+at 256 elements.
+
+Boolean filter values — for `in` and scalar `eq` alike — accept the standard
+HTTP / HTML-form conventions, case-insensitively: `true/1/t/yes/y/on` and
+`false/0/f/no/n/off`. Any other token leaves the filter inactive rather than
+defaulting to `false`.
 
 ### `sortable` syntax
 

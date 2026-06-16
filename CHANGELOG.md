@@ -12,6 +12,10 @@
 
 ### Added
 
+- **`in` list filter operator (set membership).** `filterable:in` matches a column against a comma-separated value set (`?authors=1,2,3`), canonicalized (deduplicated, sorted) before use. Element types are `int64`, `int32`, `std::string`, and `bool`; `enum` and field converters are rejected at compile time. The set is bounded at 256 elements; an empty or all-invalid set leaves the filter inactive. SQL uses `= ANY($n)` with a single array param, kept consistent with the L1 and L2 membership paths.
+
+- **Boolean parsing for HTTP list filters.** Boolean filter values — for `in` and scalar `eq` — accept the standard HTTP / HTML-form conventions case-insensitively (`true/1/t/yes/y/on`, `false/0/f/no/n/off`). Any other token leaves the filter inactive instead of defaulting to `false`; previously a `filterable` bool could never activate via HTTP.
+
 - **`IoContext` conformance check C10 (`checkRemoveWatchReentrant`).** `removeWatch` must be safe to call from inside its own watch callback. Adapters that tear down loop-owned watch state synchronously fail `runAll` under ASan instead of corrupting memory; the rule is documented on the concept and in `docs/io-context-adapters.md`.
 
 ## [0.5.0-alpha.5] - 2026-06-11
