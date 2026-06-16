@@ -21,6 +21,9 @@
 #include "fixtures/generated/TestLimitsMessyEntity.h"
 
 #include "jcailloux/relais/list/spec/GeneratedTraits.h"
+#include "jcailloux/relais/list/ListCacheTraits.h"
+#include "jcailloux/relais/config/CacheConfig.h"
+#include <jcailloux/relais/repository/Repo.h>
 
 using namespace jcailloux::relais::list::spec;
 
@@ -40,6 +43,45 @@ using LC = Desc<entity::generated::TestCompositeKeyListEntity>;
 
 // Descriptor without allowedLimits — exercises the kDefaultLimits fallback.
 struct NoLimits {};
+
+// --- HasLimitConfig size-agnostic contract (Étape 3) ----------------------
+// A Traits surface exposing a uint16_t grid of arbitrary length must satisfy
+// HasLimitConfig — no fixed-size-4 assumption.
+
+template<size_t N>
+struct FakeTraits {
+    static constexpr std::array<uint16_t, N> limitSteps =
+        []{ std::array<uint16_t, N> a{}; for (size_t i = 0; i < N; ++i) a[i] = uint16_t(i + 1); return a; }();
+    static constexpr uint16_t maxLimit = limitSteps.back();
+    static uint16_t normalizeLimit(uint16_t r) { return r; }
+};
+
+// Missing limitSteps entirely — must NOT satisfy the concept.
+struct NoGrid {
+    static constexpr uint16_t maxLimit = 50;
+    static uint16_t normalizeLimit(uint16_t r) { return r; }
+};
+
+namespace lst = jcailloux::relais::list;
+static_assert(lst::HasLimitConfig<FakeTraits<1>, int>, "size-1 grid satisfies HasLimitConfig");
+static_assert(lst::HasLimitConfig<FakeTraits<3>, int>, "size-3 grid satisfies HasLimitConfig");
+static_assert(lst::HasLimitConfig<FakeTraits<4>, int>, "size-4 grid still satisfies HasLimitConfig");
+static_assert(lst::HasLimitConfig<FakeTraits<5>, int>, "size-5 grid satisfies HasLimitConfig");
+static_assert(!lst::HasLimitConfig<NoGrid, int>, "no grid -> not satisfied");
+
+// --- ListMixin::ListTraits derives its grid from the descriptor (Étape 3) -
+// limitSteps/maxLimit must mirror the model's allowedLimits, not a fixed
+// {10,25,50,100}. Type-only instantiation — no DB connection.
+namespace rel = jcailloux::relais;
+using FiveRepo   = rel::Repo<entity::generated::TestLimitsEntity, "test:limits:traits", rel::config::Both>;
+using SingleRepo = rel::Repo<entity::generated::TestCompositeKeyListEntity, "test:single:traits", rel::config::Both>;
+
+static_assert(FiveRepo::ListTraits::limitSteps == std::array<uint16_t, 5>{5, 10, 20, 50, 100},
+              "ListMixin Traits sources the 5-value grid from the descriptor");
+static_assert(FiveRepo::ListTraits::maxLimit == 100, "maxLimit == grid back");
+static_assert(SingleRepo::ListTraits::limitSteps == std::array<uint16_t, 1>{50},
+              "single-value grid flows through to ListMixin Traits");
+static_assert(SingleRepo::ListTraits::maxLimit == 50);
 
 }  // namespace
 
@@ -119,4 +161,11 @@ TEST_CASE("descriptors without allowedLimits use the default grid", "[list][limi
     CHECK(isLimitAllowed<NoLimits>(25));
     CHECK_FALSE(isLimitAllowed<NoLimits>(20));
     CHECK(getAllowedLimitsString<NoLimits>() == "10, 25, 50, 100");
+}
+
+// All Étape 3 checks (HasLimitConfig size-agnosticism, ListMixin Traits grid
+// derivation) are compile-time static_asserts above — reaching here means they
+// held.
+TEST_CASE("limit config is size-agnostic and descriptor-derived", "[list][limits]") {
+    SUCCEED();
 }

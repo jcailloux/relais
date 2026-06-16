@@ -129,9 +129,20 @@ class ListMixin : public Base {
             return list::spec::sortFieldName<Descriptor>(field_index);
         }
 
-        // Bucketed page sizes for cache key normalization
-        static constexpr std::array<uint16_t, 4> limitSteps = {10, 25, 50, 100};
-        static constexpr uint16_t maxLimit = 100;
+        // Bucketed page sizes for cache key normalization. Sourced from the
+        // descriptor's allowedLimits grid (the generator's single point of
+        // truth, exposed under the `limitSteps` name at this Traits layer for
+        // external consumers — see per-model-limits plan #5) when the model
+        // declared a `limits=` annotation, else the shared kDefaultLimits
+        // fallback. Arbitrary length — no fixed-size-4 assumption.
+        static constexpr auto limitSteps = [] {
+            if constexpr (list::spec::HasAllowedLimits<Descriptor>) {
+                return Descriptor::allowedLimits;
+            } else {
+                return list::spec::kDefaultLimits;
+            }
+        }();
+        static constexpr uint16_t maxLimit = limitSteps.back();
 
         static uint16_t normalizeLimit(uint16_t requested) {
             return list::spec::normalizeLimit<Descriptor>(requested);

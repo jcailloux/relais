@@ -2,6 +2,8 @@
 #define JCX_RELAIS_LIST_LISTCACHETRAITS_H
 
 #include <concepts>
+#include <cstdint>
+#include <span>
 
 #include "ListQuery.h"
 
@@ -42,7 +44,8 @@ concept HasDefaultSort = requires {
 
 template<typename Traits, typename E>
 concept HasLimitConfig = requires {
-    { Traits::limitSteps } -> std::convertible_to<const std::array<uint16_t, 4>&>;
+    // Size-agnostic: any contiguous uint16_t grid (std::array of any length).
+    { std::span<const uint16_t>(Traits::limitSteps) } -> std::same_as<std::span<const uint16_t>>;
     { Traits::maxLimit } -> std::convertible_to<uint16_t>;
     { Traits::normalizeLimit(uint16_t{}) } -> std::convertible_to<uint16_t>;
 };
@@ -203,11 +206,11 @@ struct ListCacheTraits<entity::MyEntity> {
         return {SortField::CreatedAt, SortDirection::Desc};
     }
 
-    // Allowed limit values (steps)
-    static constexpr std::array<uint16_t, 4> limitSteps = {5, 10, 20, 50};
-    static constexpr uint16_t maxLimit = 50;
+    // Allowed limit values (steps) — sorted ascending, any length.
+    static constexpr std::array<uint16_t, 5> limitSteps = {5, 10, 20, 50, 100};
+    static constexpr uint16_t maxLimit = limitSteps.back();
 
-    // Normalize requested limit to nearest allowed step
+    // Normalize requested limit to nearest allowed step (round up; clamp to max)
     static uint16_t normalizeLimit(uint16_t requested) {
         for (auto step : limitSteps) {
             if (requested <= step) return step;
