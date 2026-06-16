@@ -304,17 +304,32 @@ template<typename Descriptor>
 // Limit normalization
 // =============================================================================
 
-/// Normalize requested limit to allowed step
+/// Fallback page-size grid for descriptors without a `limits=` annotation.
+inline constexpr std::array<uint16_t, 4> kDefaultLimits = {10, 25, 50, 100};
+
 template<typename Descriptor>
-[[nodiscard]] constexpr uint16_t normalizeLimit(
-    uint16_t requested,
-    const std::array<uint16_t, 4>& steps = {10, 25, 50, 100},
-    uint16_t max_limit = 100
-) noexcept {
-    for (auto step : steps) {
-        if (requested <= step) return step;
+concept HasAllowedLimits = requires {
+    { Descriptor::allowedLimits } -> std::convertible_to<decltype(Descriptor::allowedLimits)>;
+};
+
+/// Round a requested limit up to the first allowed page size; the largest
+/// allowed size if it exceeds the grid. Reads the descriptor's `allowedLimits`
+/// (sorted ascending by the generator) when present, else falls back to
+/// kDefaultLimits. The grid drives the canonical cache key, so this must stay
+/// deterministic per descriptor.
+template<typename Descriptor>
+[[nodiscard]] constexpr uint16_t normalizeLimit(uint16_t requested) noexcept {
+    if constexpr (HasAllowedLimits<Descriptor>) {
+        for (auto step : Descriptor::allowedLimits) {
+            if (requested <= step) return step;
+        }
+        return Descriptor::allowedLimits.back();
+    } else {
+        for (auto step : kDefaultLimits) {
+            if (requested <= step) return step;
+        }
+        return kDefaultLimits.back();
     }
-    return max_limit;
 }
 
 // =============================================================================
@@ -410,11 +425,6 @@ struct QueryValidationError {
 };
 
 template<typename Descriptor>
-concept HasAllowedLimits = requires {
-    { Descriptor::allowedLimits } -> std::convertible_to<decltype(Descriptor::allowedLimits)>;
-};
-
-template<typename Descriptor>
 [[nodiscard]] bool isLimitAllowed(uint16_t limit) noexcept {
     if constexpr (HasAllowedLimits<Descriptor>) {
         for (auto allowed : Descriptor::allowedLimits) {
@@ -422,8 +432,7 @@ template<typename Descriptor>
         }
         return false;
     } else {
-        constexpr std::array<uint16_t, 4> default_limits = {10, 25, 50, 100};
-        for (auto allowed : default_limits) {
+        for (auto allowed : kDefaultLimits) {
             if (limit == allowed) return true;
         }
         return false;
@@ -470,7 +479,10 @@ template<typename Descriptor>
             result += std::to_string(Descriptor::allowedLimits[i]);
         }
     } else {
-        result = "10, 25, 50, 100";
+        for (size_t i = 0; i < kDefaultLimits.size(); ++i) {
+            if (i > 0) result += ", ";
+            result += std::to_string(kDefaultLimits[i]);
+        }
     }
     return result;
 }
