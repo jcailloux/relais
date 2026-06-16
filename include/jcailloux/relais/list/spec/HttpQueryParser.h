@@ -336,6 +336,9 @@ ListDescriptorQuery<Descriptor> parseListQuery(const Map& params) {
     if (auto it = params.find("limit"); it != params.end()) {
         query.limit = normalizeLimit<Descriptor>(
             static_cast<uint16_t>(jcailloux::relais::list::spec::parse::toInt(it->second)));
+    } else {
+        // No limit param → the descriptor's declared default page size.
+        query.limit = defaultLimit<Descriptor>();
     }
 
     // Parse cursor
@@ -468,6 +471,9 @@ std::expected<ListDescriptorQuery<Descriptor>, QueryValidationError> parseListQu
         }
 
         query.limit = parsed_limit;
+    } else {
+        // No limit param → the descriptor's declared default page size.
+        query.limit = defaultLimit<Descriptor>();
     }
 
     // Parse cursor (no validation needed, just decoding)
