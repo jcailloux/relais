@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.5.0-alpha.6] - 2026-06-16
+
 ### Changed
 
 - **glaze dependency bumped to v7.8.1** (from v7.0.2). `FIND_PACKAGE_ARGS` now requires a system glaze ≥ 7.8.
