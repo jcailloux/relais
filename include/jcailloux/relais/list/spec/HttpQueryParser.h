@@ -61,6 +61,8 @@ std::optional<T> parseValue(const std::string& str) {
         return jcailloux::relais::list::spec::parse::toInt64(str);
     } else if constexpr (std::is_same_v<T, int32_t> || std::is_same_v<T, int>) {
         return jcailloux::relais::list::spec::parse::toInt(str);
+    } else if constexpr (std::is_same_v<T, bool>) {
+        return jcailloux::relais::list::spec::parse::toBool(str);
     } else if constexpr (std::is_same_v<T, std::string>) {
         if (jcailloux::relais::list::spec::parse::isSafeLength(str)) {
             return str;
@@ -81,7 +83,8 @@ inline constexpr size_t kMaxInListElements = 256;
 /// (which maps a malformed int to 0 via parse::toInt64), an integral element is
 /// accepted only if from_chars consumes the whole token — otherwise a junk token
 /// like "abc" would pollute the set with a spurious 0. Non-integral types fall
-/// back to parseValue (string length check). bool is unsupported (no parser).
+/// back to parseValue: bool via parse::toBool (true/1/t/yes/y/on vs false/0/f/
+/// no/n/off, case-insensitive), strings via the length check.
 template<typename T>
 std::optional<T> parseInElement(const std::string& str) {
     if constexpr (std::is_integral_v<T> && !std::is_same_v<T, bool>) {
