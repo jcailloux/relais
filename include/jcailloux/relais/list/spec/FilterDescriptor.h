@@ -28,7 +28,8 @@ enum class Op : uint8_t {
     GE,  // Greater than or equal
     LT,  // Less than
     LE,  // Less than or equal
-    IN   // Membership in a set (entity value ∈ {v1, v2, ...}); SQL = ANY($n)
+    IN,  // Membership in a set (entity value ∈ {v1, v2, ...}); SQL = ANY($n)
+    NIN  // Anti-membership (entity value ∉ {v1, v2, ...}); SQL != ALL($n)
 };
 
 // =============================================================================
@@ -47,6 +48,7 @@ constexpr InvalidationStrategy defaultInvalidationStrategy(Op op) noexcept {
         case Op::EQ:
         case Op::NE:
         case Op::IN:
+        case Op::NIN:
             return InvalidationStrategy::PreComputed;
         case Op::GT:
         case Op::GE:
@@ -264,6 +266,11 @@ struct Filter {
     /// Comparison operator
     static constexpr Op op = Operator;
 
+    /// Set-semantics operator (IN / NOT IN): the active value is a set of elements
+    /// and the binary blob format is identical. Single extension point for every
+    /// place that must treat IN and NIN alike (filter_type, schema, blob, SQL param).
+    static constexpr bool is_set_op = (Operator == Op::IN || Operator == Op::NIN);
+
     /// Invalidation strategy
     static constexpr InvalidationStrategy invalidation = Invalidation;
 
@@ -287,9 +294,10 @@ struct Filter {
     using value_type = element_type;
 
     /// The filter value type (always optional for filter activation check).
-    /// For IN, the active value is a set of elements; otherwise a single scalar.
+    /// For set ops (IN / NOT IN), the active value is a set of elements; otherwise
+    /// a single scalar.
     using filter_type = std::conditional_t<
-        Operator == Op::IN,
+        is_set_op,
         std::optional<std::vector<element_type>>,
         std::optional<element_type>>;
 
@@ -298,14 +306,14 @@ struct Filter {
     /// storage from filter_type so IN's vector slot does not leak into tag extraction.
     using tag_type = std::optional<element_type>;
 
-    // --- v1 IN guard-rails: a converter or a mis-sized element silently desyncs the
-    // binary blob (group set vs entity scalar), so reject them at compile time. ---
-    static_assert(!(Operator == Op::IN && std::is_enum_v<element_type>),
-        "IN filter: enum element type not supported in v1");
-    static_assert(!(Operator == Op::IN && !std::is_same_v<Converter, NoConvert>),
-        "IN filter: value converter (e.g. AsString) not supported in v1");
+    // --- v1 set-op guard-rails: a converter or a mis-sized element silently desyncs
+    // the binary blob (group set vs entity scalar), so reject them at compile time. ---
+    static_assert(!(is_set_op && std::is_enum_v<element_type>),
+        "IN/NOT IN filter: enum element type not supported in v1");
+    static_assert(!(is_set_op && !std::is_same_v<Converter, NoConvert>),
+        "IN/NOT IN filter: value converter (e.g. AsString) not supported in v1");
     static_assert(sizeof(bool) == 1,
-        "IN filter: schema assumes 1-byte bool encoding");
+        "IN/NOT IN filter: schema assumes 1-byte bool encoding");
 
     /// Whether the entity member is optional
     static constexpr bool is_optional_member = detail::is_optional_v<member_type>;
