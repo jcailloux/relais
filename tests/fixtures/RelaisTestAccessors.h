@@ -12,6 +12,7 @@
 
 #include <optional>
 #include <shared_mutex>
+#include <span>
 #include <jcailloux/relais/cache/GDSFPolicy.h>
 
 namespace relais_test {
@@ -90,6 +91,14 @@ struct TestInternals {
     template<typename Repo, typename Key>
     static auto getFromCache(const Key& key) {
         return Repo::getFromCache(key);
+    }
+
+    /// Reach the internal batched read (findManyRaw) — protected like findRaw,
+    /// PgRepo befriends TestInternals. The returned Task is lazy: `ids` must
+    /// outlive the sync() that drives it (a local test vector does).
+    template<typename Repo, typename Key>
+    static auto findManyRaw(std::span<const Key> ids) {
+        return Repo::findManyRaw(ids);
     }
 
     /// Direct L1 cache put — bypasses coroutine overhead.

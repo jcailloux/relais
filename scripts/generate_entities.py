@@ -778,8 +778,18 @@ class MappingGenerator:
             # Simple key: WHERE pk_col = ANY($1)
             batch_where = f"{pk_cols[0]} = ANY($1)"
         else:
-            # Composite key: WHERE (k1, k2) IN (SELECT unnest($1::type[]), unnest($2::type[]))
-            unnest_parts = ", ".join(f"unnest(${i+1})" for i in range(pk_count))
+            # Composite key: WHERE (k1, k2) IN (SELECT unnest($1::t1[]), unnest($2::t2[]))
+            # The per-column ::type[] cast is mandatory: a bare unnest($n) on an
+            # untyped text array param is ambiguous (function unnest(unknown) is
+            # not unique). ANY($1) infers its type from the comparison; unnest
+            # does not, so the array element type must be spelled out.
+            member_by_name = {m.name: m for m in entity.members}
+            pk_pg_types = [
+                self._pg_array_elem_type(member_by_name[pk].cpp_type)
+                for pk in a.primary_keys
+            ]
+            unnest_parts = ", ".join(
+                f"unnest(${i+1}::{pk_pg_types[i]}[])" for i in range(pk_count))
             key_tuple = ", ".join(pk_cols)
             batch_where = f"({key_tuple}) IN (SELECT {unnest_parts})"
         lines.append(f"        static constexpr const char* select_by_pk_batch =")
@@ -1553,6 +1563,24 @@ class MappingGenerator:
             if m.name == field_name:
                 return m.col_name
         return field_name
+
+    @staticmethod
+    def _pg_array_elem_type(cpp_type: str) -> str:
+        """Map a C++ scalar type to its PostgreSQL element type, for the
+        `unnest($n::type[])` cast in composite-key batch reads. Composite PK
+        columns are scalar (int/text); unknown types fall back to bigint."""
+        t = cpp_type.strip()
+        if t.startswith("std::optional<") and t.endswith(">"):
+            t = t[len("std::optional<"):-1].strip()
+        return {
+            "int64_t": "bigint",
+            "int32_t": "integer",
+            "int16_t": "smallint",
+            "std::string": "text",
+            "bool": "boolean",
+            "double": "double precision",
+            "float": "real",
+        }.get(t, "bigint")
 
     @staticmethod
     def _qualify_type(entity: ParsedEntity, cpp_type: str) -> str:

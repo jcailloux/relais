@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -18,6 +19,8 @@
 #include "jcailloux/relais/entity/EntityConcepts.h"
 #include "jcailloux/relais/cache/CacheView.h"
 #include "jcailloux/relais/entity/FieldUpdate.h"
+
+namespace relais_test { struct TestInternals; }
 
 namespace jcailloux::relais {
 
@@ -316,6 +319,47 @@ protected:
         }
     }
 
+    /// Batched find by IDs via WHERE pk = ANY($1). Returns one optional<E> per
+    /// id, aligned on request order (nullopt for absent ids). Emits one direct
+    /// ANY query — bypasses the per-find Nagle coalescing of entityQueryParams.
+    /// Precondition: ids already deduplicated (dedup lives at the public entry,
+    /// LocalRepo::findMany); no re-dedup here.
+    static io::Task<std::vector<std::optional<E>>> findManyRaw(std::span<const Key> ids) {
+        std::vector<std::optional<E>> out(ids.size());
+        if (ids.empty()) co_return out;
+        try {
+            // One PG array literal per key column, built from the requested ids.
+            std::vector<io::PgParams> keyParams;
+            keyParams.reserve(ids.size());
+            for (const auto& id : ids)
+                keyParams.push_back(io::PgParams::fromKey(id));
+            auto arrayParams = io::PgParams::buildArrayLiteral(keyParams);
+
+            auto result = co_await PgProvider::queryParams(
+                Mapping::SQL::select_by_pk_batch, arrayParams);
+
+            // ANY returns rows unordered and omits absent ids — match each row
+            // back to its requested position by primary key (mirrors
+            // distributeAnyResults). Linear match: N is small (cf. plan #6).
+            const int n = result.rows();
+            for (int r = 0; r < n; ++r) {
+                auto entity = E::fromRow(result[r]);
+                if (!entity) continue;
+                auto k = entity->key();
+                for (size_t i = 0; i < ids.size(); ++i) {
+                    if (!out[i] && ids[i] == k) {
+                        out[i] = std::move(entity);
+                        break;
+                    }
+                }
+            }
+            co_return out;
+        } catch (const io::PgError& e) {
+            RELAIS_LOG_ERROR << name() << ": findManyRaw DB error - " << e.what();
+            co_return std::vector<std::optional<E>>(ids.size());
+        }
+    }
+
     /// Insert entity in database, returning entity by value.
     static io::Task<std::optional<E>> insertRaw(const E& entity)
         requires MutableEntity<E> && (!Cfg.read_only)
@@ -565,6 +609,8 @@ protected:
             return std::string(value);
         }
     }
+
+    friend struct ::relais_test::TestInternals;
 };
 
 }  // namespace jcailloux::relais
