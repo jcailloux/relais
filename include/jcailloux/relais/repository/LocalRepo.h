@@ -352,7 +352,9 @@ protected:
     /// Hot path: single pointer check (no guard variable, no function call).
     /// First call delegates to tier_init_slow() which constructs and registers.
     static Tier& tier() {
-        auto* p = tier_ptr_;
+        // Acquire: pairs with the release stores in tier_init_slow() so a reader
+        // that observes the published pointer also observes the enrolled Tier.
+        auto* p = tier_ptr_.load(std::memory_order_acquire);
         if (p) [[likely]] return *p;
         return tier_init_slow();
     }
@@ -362,7 +364,7 @@ private:
     // CacheTier singleton
     // =========================================================================
 
-    static inline Tier* tier_ptr_{nullptr};
+    static inline std::atomic<Tier*> tier_ptr_{nullptr};
 
     /// Cold path: construct CacheTier, register with GDSFPolicy, cache pointer.
     [[gnu::noinline]] static Tier& tier_init_slow() {
@@ -378,11 +380,13 @@ private:
                     },
                     .name = static_cast<const char*>(Name)
                 });
-                tier_ptr_ = &instance;
+                // Release: publish only after the Tier is fully enrolled.
+                tier_ptr_.store(&instance, std::memory_order_release);
             }
         };
         static Holder h;
-        tier_ptr_ = &h.instance;  // also set here for safety (after static init)
+        // Redundant publish after the thread-safe static guard completes.
+        tier_ptr_.store(&h.instance, std::memory_order_release);
         return h.instance;
     }
 
