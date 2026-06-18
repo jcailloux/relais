@@ -133,6 +133,18 @@ auto findManyRawSync(std::span<const Key> ids) {
     return sync(relais_test::TestInternals::findManyRaw<Repo>(ids));
 }
 
+// Drive the loop until a detached L2 fill becomes visible (bounded). The
+// warm-fill SET is fire-and-forget — not ordered against a later MGET across
+// pooled connections — so a single re-read races it. Polling converges once
+// Redis has processed the SET, with a bound so a genuine failure still fails.
+std::optional<std::string> awaitL2Key(const std::string& key) {
+    for (int i = 0; i < 200; ++i) {
+        auto r = sync(mgetRawKeys({key}));
+        if (r[0]) return r[0];
+    }
+    return std::nullopt;
+}
+
 }  // namespace
 
 TEST_CASE("findManyRaw simple key: subset / all / none / single", "[findmany][pg]") {
@@ -264,4 +276,110 @@ TEST_CASE("findManyRaw partition key: cross-partition ANY", "[findmany][partitio
     REQUIRE(out[1].has_value());
     REQUIRE(out[1]->title == "euro");
     REQUIRE(out[1]->region == "eu");
+}
+
+// ---------------------------------------------------------------------------
+// Étape 3 — RedisRepo::findManyRaw : MGET L2 → fallback L3 (ANY) + fill détaché
+// L2* repos (config Redis). Negative ids never collide with serial DB rows, so
+// an L2-only entry under a negative key proves the MGET path (no DB row to fall
+// back to). makeRedisKey is public on the repo; setInCache via TestInternals.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("findManyRaw L2: served from MGET, no DB row", "[findmany][l2]") {
+    TransactionGuard guard;
+
+    auto a = makeTestUser("l2_a", "l2a@x", 11, -101);
+    auto b = makeTestUser("l2_b", "l2b@x", 22, -102);
+    sync(relais_test::TestInternals::setInCache<L2TestUserRepo>(int64_t{-101}, a));
+    sync(relais_test::TestInternals::setInCache<L2TestUserRepo>(int64_t{-102}, b));
+
+    // Negative ids have no DB row → a present value can only come from L2.
+    std::vector<int64_t> ids = {-102, -101};
+    auto out = findManyRawSync<L2TestUserRepo, int64_t>(ids);
+    REQUIRE(out.size() == 2);
+    REQUIRE(out[0].has_value());  REQUIRE(out[0]->username == "l2_b");
+    REQUIRE(out[1].has_value());  REQUIRE(out[1]->username == "l2_a");
+}
+
+TEST_CASE("findManyRaw L2 miss falls back to L3 (ANY)", "[findmany][l2]") {
+    TransactionGuard guard;
+
+    auto u1 = insertTestUser("l2miss1", "m1@x", 5);  // DB only, L2 cold
+    auto u2 = insertTestUser("l2miss2", "m2@x", 6);
+
+    std::vector<int64_t> ids = {u2, u1};
+    auto out = findManyRawSync<L2TestUserRepo, int64_t>(ids);
+    REQUIRE(out.size() == 2);
+    REQUIRE(out[0].has_value());  REQUIRE(out[0]->username == "l2miss2");
+    REQUIRE(out[1].has_value());  REQUIRE(out[1]->username == "l2miss1");
+}
+
+TEST_CASE("findManyRaw L2/L3 mixed merges in request order", "[findmany][l2]") {
+    TransactionGuard guard;
+
+    auto inL2 = makeTestUser("only_l2", "ol2@x", 1, -201);
+    sync(relais_test::TestInternals::setInCache<L2TestUserRepo>(int64_t{-201}, inL2));
+    auto inDb = insertTestUser("only_db", "odb@x", 2);  // DB only
+
+    std::vector<int64_t> ids = {inDb, -201, -999};  // L3, L2, absent
+    auto out = findManyRawSync<L2TestUserRepo, int64_t>(ids);
+    REQUIRE(out.size() == 3);
+    REQUIRE(out[0].has_value());  REQUIRE(out[0]->username == "only_db");
+    REQUIRE(out[1].has_value());  REQUIRE(out[1]->username == "only_l2");
+    REQUIRE(out[2] == std::nullopt);
+}
+
+TEST_CASE("findManyRaw warms L2 via detached fill", "[findmany][l2]") {
+    TransactionGuard guard;
+
+    auto uid = insertTestUser("warm", "warm@x", 9);  // DB only
+    auto key = L2TestUserRepo::makeRedisKey(uid);
+
+    auto before = sync(mgetRawKeys({key}));
+    REQUIRE(before[0] == std::nullopt);   // L2 cold for this key
+
+    // Miss → L3 fetch. The return does not await the detached SET; the SET is
+    // already in flight to Redis once findManyRaw resolves.
+    std::vector<int64_t> ids = {uid};
+    auto out = findManyRawSync<L2TestUserRepo, int64_t>(ids);
+    REQUIRE(out.size() == 1);
+    REQUIRE(out[0].has_value());  REQUIRE(out[0]->username == "warm");
+
+    // The detached fill lands on a later loop turn → L2 becomes warm.
+    REQUIRE(awaitL2Key(key).has_value());
+}
+
+TEST_CASE("findManyRaw L2 absent ids → nullopt holes", "[findmany][l2]") {
+    TransactionGuard guard;
+
+    auto present = makeTestUser("l2_present", "p@x", 7, -301);
+    sync(relais_test::TestInternals::setInCache<L2TestUserRepo>(int64_t{-301}, present));
+
+    std::vector<int64_t> ids = {-999, -301, -998};  // absent, L2, absent
+    auto out = findManyRawSync<L2TestUserRepo, int64_t>(ids);
+    REQUIRE(out.size() == 3);
+    REQUIRE(out[0] == std::nullopt);
+    REQUIRE(out[1].has_value());  REQUIRE(out[1]->username == "l2_present");
+    REQUIRE(out[2] == std::nullopt);
+}
+
+TEST_CASE("findManyRaw composite key over L2 (miss→L3→warm)", "[findmany][l2][composite-key]") {
+    TransactionGuard guard;
+    using MemKey = std::tuple<int64_t, int64_t>;
+
+    insertTestMembership(1, 2, "cl2_a");  // DB only
+    insertTestMembership(2, 1, "cl2_b");
+
+    // Transposed keys must not be confused; L2 cold → L3 ANY fallback.
+    std::vector<MemKey> ids;
+    ids.emplace_back(2, 1);
+    ids.emplace_back(1, 2);
+    auto out = findManyRawSync<L2TestMembershipRepo, MemKey>(ids);
+    REQUIRE(out.size() == 2);
+    REQUIRE(out[0].has_value());  REQUIRE(out[0]->role == "cl2_b");
+    REQUIRE(out[1].has_value());  REQUIRE(out[1]->role == "cl2_a");
+
+    // The composite Redis key round-trips through the detached warm fill.
+    auto key = L2TestMembershipRepo::makeRedisKey(MemKey{1, 2});
+    REQUIRE(awaitL2Key(key).has_value());
 }

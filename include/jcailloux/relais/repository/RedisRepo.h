@@ -298,6 +298,61 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
             co_return entity;
         }
 
+        /// Batched find with L2 (Redis) MGET -> L3 (DB) fallback. One MGET over
+        /// all ids; present slots deserialized in the configured format; the L2
+        /// misses are delegated to Base::findManyRaw (one ANY) and realigned on
+        /// request order. The L3-fetched misses are warmed back into L2 by a
+        /// detached pipeline (fire-and-forget — the return does NOT await the
+        /// SETs, one RTT off the miss path). MGET does not refresh per-key TTL
+        /// (no batched GETEX); the detached fill resets TTL on the warmed misses.
+        /// Precondition: ids deduplicated (dedup lives at the public entry,
+        /// LocalRepo::findMany); no re-dedup here.
+        static io::Task<std::vector<std::optional<E>>> findManyRaw(std::span<const Key> ids) {
+            std::vector<std::optional<E>> out(ids.size());
+            if (ids.empty()) co_return out;
+
+            std::vector<std::string> redisKeys;
+            redisKeys.reserve(ids.size());
+            for (const auto& id : ids) redisKeys.push_back(makeRedisKey(id));
+
+            auto cached = co_await mgetFromCache(redisKeys);
+
+            // Partition: L2 hits land in out directly; misses keep their origin
+            // position so the L3 result realigns on request order.
+            std::vector<Key> missIds;
+            std::vector<size_t> missPos;
+            for (size_t i = 0; i < ids.size(); ++i) {
+                if (cached[i]) {
+                    RELAIS_METRICS_INC(l2_counters_.hits);
+                    out[i] = std::move(cached[i]);
+                } else {
+                    RELAIS_METRICS_INC(l2_counters_.misses);
+                    missIds.push_back(ids[i]);
+                    missPos.push_back(i);
+                }
+            }
+
+            if (missIds.empty()) co_return out;
+
+            auto fetched = co_await Base::findManyRaw(missIds);
+
+            // Merge the L3 hits back into request order and collect them (one
+            // owned copy each) for the detached L2 warming.
+            std::vector<std::pair<std::string, E>> toFill;
+            toFill.reserve(missPos.size());
+            for (size_t j = 0; j < missPos.size(); ++j) {
+                if (fetched[j]) {
+                    toFill.emplace_back(std::move(redisKeys[missPos[j]]), *fetched[j]);
+                    out[missPos[j]] = std::move(fetched[j]);
+                }
+            }
+
+            if (!toFill.empty()) {
+                fillL2Detached(std::move(toFill));
+            }
+            co_return out;
+        }
+
         /// Insert with L2 cache population, returning entity by value.
         static io::Task<std::optional<E>> insertRaw(const E& entity)
             requires CreatableEntity<E, Key> && (!Cfg.read_only)
@@ -352,6 +407,41 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
             } else {
                 co_return co_await cache::RedisCache::set(key, entity, l2Ttl());
             }
+        }
+
+        /// Batched get: one MGET, each present slot deserialized in the
+        /// configured L2 format (BEVE or JSON). Mirror of getFromCache for the
+        /// multi-key case. MGET cannot refresh TTL — no GETEX batch variant.
+        static io::Task<std::vector<std::optional<E>>> mgetFromCache(
+            std::span<const std::string> keys)
+        {
+            if constexpr (useL2Binary) {
+                auto raws = co_await cache::RedisCache::mgetRaw(keys);
+                std::vector<std::optional<E>> out;
+                out.reserve(raws.size());
+                for (const auto& r : raws) {
+                    if (r) {
+                        out.push_back(E::fromBinary(std::span<const uint8_t>(
+                            reinterpret_cast<const uint8_t*>(r->data()), r->size())));
+                    } else {
+                        out.emplace_back(std::nullopt);
+                    }
+                }
+                co_return out;
+            } else {
+                co_return co_await cache::RedisCache::mget<E>(keys);
+            }
+        }
+
+        /// Fire-and-forget L2 warming for a batch of fetched entities. Mirrors
+        /// setInCache but off the return path (DetachedTask), so the caller
+        /// never blocks on the SET RTT. Owns its arguments by value.
+        static io::DetachedTask fillL2Detached(std::vector<std::pair<std::string, E>> entries) {
+            try {
+                for (const auto& [key, entity] : entries) {
+                    co_await setInCache(key, entity);
+                }
+            } catch (...) {}
         }
 
         static io::Task<std::optional<std::vector<E>>> getListFromRedis(const std::string& key) {
@@ -588,6 +678,11 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
 
             co_return listEntity;
         }
+
+#ifdef RELAIS_BUILDING_TESTS
+    public:
+        friend struct ::relais_test::TestInternals;
+#endif
 };
 
 }  // namespace jcailloux::relais
