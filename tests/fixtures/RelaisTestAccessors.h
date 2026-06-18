@@ -101,6 +101,17 @@ struct TestInternals {
         return Repo::findManyRaw(ids);
     }
 
+    /// Populate L2 directly in the repo's configured format (BEVE/JSON) under
+    /// its real Redis key — lets a test stage an L2-only entry (no DB row) to
+    /// prove the MGET path. setInCache is protected; RedisRepo befriends us.
+    template<typename Repo, typename Key, typename Ent>
+    static jcailloux::relais::io::Task<bool> setInCache(const Key& id, const Ent& entity) {
+        // Own the key in this frame: setInCache binds key by const-ref and is
+        // lazy, so a makeRedisKey() temporary would dangle before sync() drives it.
+        std::string key = Repo::makeRedisKey(id);
+        co_return co_await Repo::setInCache(key, entity);
+    }
+
     /// Direct L1 cache put — bypasses coroutine overhead.
     template<typename Repo, typename Key>
     static void putInCache(const Key& key, const typename Repo::EntityType& entity) {
