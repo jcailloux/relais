@@ -17,8 +17,14 @@
  *   §1.2 empty set: NOT IN {} = universe (everything matches), the exact
  *        opposite of IN {} = ∅.
  *
- * The L3 SQL `!= ALL`, L2 Lua, HTTP parsing/canonicalization, and cross-tier
- * dualité tests land in later commits (§7.2–§7.7).
+ * Commit 3 adds the L3 SQL generation block (§7.3, transport-free): the
+ * `buildWhereClause` NIN branch emits `!= ALL($n)` (mirror of IN's `= ANY($n)`)
+ * with exactly one array param, preserving the $n numbering invariant — verified
+ * against EQ/range combinations and IN+NIN coexistence. Live-DB round-trip and
+ * cross-tier dualité land with the cross-tier suite (§7.7).
+ *
+ * The L2 Lua and HTTP parsing/canonicalization tests land in later commits
+ * (§7.2, §7.4, §7.5).
  */
 
 #include <catch2/catch_test_macros.hpp>
@@ -30,6 +36,7 @@
 #include "fixtures/generated/TestArticleEntity.h"
 #include <jcailloux/relais/list/spec/GeneratedTraits.h>
 #include <jcailloux/relais/list/spec/GeneratedFilters.h>
+#include <jcailloux/relais/list/spec/GeneratedCriteria.h>
 #include <jcailloux/relais/list/spec/SortDescriptor.h>
 
 namespace decl = jcailloux::relais::list::spec;
@@ -295,4 +302,102 @@ TEST_CASE("[DeclListNin] IN and NIN coexist on distinct columns", "[list][nin][u
     CHECK_FALSE(l1Match<DescInNin>(makeArticle(4, "spam", 1), f));
     // both fail
     CHECK_FALSE(l1Match<DescInNin>(makeArticle(5, "draft", 9), f));
+}
+
+// =============================================================================
+// L3 SQL generation — buildWhereClause NIN branch (§7.3, transport-free).
+// Validates `!= ALL($n)` (mirror of IN's `= ANY($n)`), the single-array-param
+// invariant (NIN contributes exactly one $n like IN), $n numbering with EQ/range,
+// the empty-set literal (`!= ALL('{}')` → universe, §1.2), and IN+NIN coexistence
+// with two array params. Live-DB round-trip lands with the cross-tier suite.
+// =============================================================================
+
+namespace {
+
+std::string paramStr(const jcailloux::relais::io::PgParam& p) {
+    return p.isNull() ? std::string("<null>")
+                      : std::string(p.data(), static_cast<size_t>(p.length()));
+}
+
+}  // namespace
+
+TEST_CASE("[DeclListNin] SQL: NIN emits != ALL with one array param",
+          "[list][nin][unit][sql]") {
+    decl::Filters<DescNinString> f;
+    f.get<0>() = std::vector<std::string>{"science", "tech"};
+
+    auto wc = decl::buildWhereClause<DescNinString>(f);
+    CHECK(wc.sql == "\"category\" != ALL($1)");
+    REQUIRE(wc.params.params.size() == 1);          // exactly one param — the array
+    CHECK(paramStr(wc.params.params[0]) == "{science,tech}");
+    CHECK(wc.next_param == 2);
+}
+
+TEST_CASE("[DeclListNin] SQL: NIN int64 array literal", "[list][nin][unit][sql]") {
+    decl::Filters<DescNinInt64> f;
+    f.get<0>() = std::vector<int64_t>{1, 2, 3};
+
+    auto wc = decl::buildWhereClause<DescNinInt64>(f);
+    CHECK(wc.sql == "\"author_id\" != ALL($1)");
+    REQUIRE(wc.params.params.size() == 1);
+    CHECK(paramStr(wc.params.params[0]) == "{1,2,3}");
+}
+
+TEST_CASE("[DeclListNin] SQL: singleton NIN behaves like != x", "[list][nin][unit][sql]") {
+    decl::Filters<DescNinString> f;
+    f.get<0>() = std::vector<std::string>{"tech"};
+
+    auto wc = decl::buildWhereClause<DescNinString>(f);
+    CHECK(wc.sql == "\"category\" != ALL($1)");      // != ALL('{tech}') ≡ != 'tech'
+    CHECK(paramStr(wc.params.params[0]) == "{tech}");
+}
+
+TEST_CASE("[DeclListNin] SQL: empty set yields != ALL('{}') (universe, §1.2)",
+          "[list][nin][unit][sql]") {
+    decl::Filters<DescNinString> f;
+    f.get<0>() = std::vector<std::string>{};  // present-but-empty
+    REQUIRE(f.get<0>().has_value());
+
+    auto wc = decl::buildWhereClause<DescNinString>(f);
+    CHECK(wc.sql == "\"category\" != ALL($1)");
+    REQUIRE(wc.params.params.size() == 1);
+    CHECK(paramStr(wc.params.params[0]) == "{}");    // != ALL('{}') → TRUE → all rows
+}
+
+TEST_CASE("[DeclListNin] SQL: EQ + NIN + range $n numbering", "[list][nin][unit][sql]") {
+    decl::Filters<DescCombo> f;
+    f.get<0>() = int64_t{42};                                  // EQ author_id
+    f.get<1>() = std::vector<std::string>{"news", "spam"};     // NIN category
+    f.get<2>() = int32_t{10};                                  // GE view_count
+
+    auto wc = decl::buildWhereClause<DescCombo>(f);
+    CHECK(wc.sql == "\"author_id\"=$1 AND \"category\" != ALL($2) AND \"view_count\">=$3");
+    REQUIRE(wc.params.params.size() == 3);     // NIN contributes exactly one param
+    CHECK(paramStr(wc.params.params[0]) == "42");
+    CHECK(paramStr(wc.params.params[1]) == "{news,spam}");
+    CHECK(paramStr(wc.params.params[2]) == "10");
+    CHECK(wc.next_param == 4);                  // cursor/offset params would start at $4
+
+    SECTION("only NIN active — EQ/range skipped, NIN takes $1") {
+        decl::Filters<DescCombo> g;
+        g.get<1>() = std::vector<std::string>{"spam"};
+        auto wc2 = decl::buildWhereClause<DescCombo>(g);
+        CHECK(wc2.sql == "\"category\" != ALL($1)");
+        REQUIRE(wc2.params.params.size() == 1);
+        CHECK(wc2.next_param == 2);
+    }
+}
+
+TEST_CASE("[DeclListNin] SQL: IN and NIN coexist — two array params, $n correct",
+          "[list][nin][unit][sql]") {
+    decl::Filters<DescInNin> f;
+    f.get<0>() = std::vector<int64_t>{1, 2};                   // author_id IN {1,2}
+    f.get<1>() = std::vector<std::string>{"spam", "draft"};    // category NOT IN {spam,draft}
+
+    auto wc = decl::buildWhereClause<DescInNin>(f);
+    CHECK(wc.sql == "\"author_id\" = ANY($1) AND \"category\" != ALL($2)");
+    REQUIRE(wc.params.params.size() == 2);     // each set op contributes one array param
+    CHECK(paramStr(wc.params.params[0]) == "{1,2}");
+    CHECK(paramStr(wc.params.params[1]) == "{spam,draft}");  // raw order — canonicalization is groupCacheKey's job, not the WHERE clause
+    CHECK(wc.next_param == 3);
 }

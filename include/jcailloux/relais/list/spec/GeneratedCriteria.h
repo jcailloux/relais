@@ -106,9 +106,11 @@ template<typename Descriptor>
                 result.sql += FilterType::column();
                 result.sql += "\"";
 
-                if constexpr (FilterType::op == Op::IN) {
-                    // entity ∈ set → "col" = ANY($n); one array param (see invariant).
-                    result.sql += " = ANY($";
+                if constexpr (FilterType::is_set_op) {
+                    // Set op → "col" = ANY($n) (IN) | "col" != ALL($n) (NIN). One
+                    // array param either way — the $n numbering invariant holds for
+                    // both (0 or N params would shift every later cursor binding).
+                    result.sql += (FilterType::op == Op::IN) ? " = ANY($" : " != ALL($";
                     result.sql += std::to_string(result.next_param++);
                     result.sql += ")";
                     detail::addArrayParamForDb<FilterType>(result.params, *filter_value);
