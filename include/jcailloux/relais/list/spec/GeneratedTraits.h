@@ -73,6 +73,15 @@ template<typename Descriptor>
                 } else {
                     return std::ranges::find(*filter_value, entity_value) != filter_value->end();
                 }
+            } else if constexpr (FilterType::op == Op::NIN) {
+                // NIN: entity scalar ∉ query set. Dedicated branch — never falls
+                // through to compareWithOp (whose `else return true` would match all).
+                if constexpr (FilterType::is_optional_member) {
+                    if (!entity_value.has_value()) return false;  // null excluded (NOT the negation of IN, §1.1)
+                    return std::ranges::find(*filter_value, *entity_value) == filter_value->end();
+                } else {
+                    return std::ranges::find(*filter_value, entity_value) == filter_value->end();
+                }
             } else if constexpr (FilterType::is_optional_member) {
                 // Handle optional entity members
                 if (!entity_value.has_value()) {
