@@ -73,6 +73,66 @@ namespace jcailloux::relais::cache {
                 }
             }
 
+            // =================================================================
+            // Multi-key reads (MGET) — one round-trip for N keys
+            // =================================================================
+
+            /// MGET over N keys, format-agnostic. Returns one slot per key in
+            /// request order: nullopt for a nil (absent) reply, otherwise the
+            /// raw bulk payload (binary-safe — holds BEVE bytes or JSON text).
+            /// Deserialization is the caller's responsibility (RedisRepo picks
+            /// the format). Empty keys → empty result, no I/O.
+            static io::Task<std::vector<std::optional<std::string>>> mgetRaw(
+                std::span<const std::string> keys)
+            {
+                std::vector<std::optional<std::string>> out(keys.size());
+                if (keys.empty() || !PgProvider::hasRedis()) {
+                    co_return out;
+                }
+
+                std::vector<std::string> args;
+                args.reserve(keys.size() + 1);
+                args.emplace_back("MGET");
+                for (const auto& k : keys) {
+                    args.push_back(k);
+                }
+
+                try {
+                    auto result = co_await PgProvider::redisDynamic(std::move(args));
+                    if (result.isArray()) {
+                        const size_t n = result.arraySize();
+                        for (size_t i = 0; i < keys.size() && i < n; ++i) {
+                            auto elem = result.at(i);
+                            if (elem.isString()) {
+                                out[i] = elem.asString();
+                            }
+                        }
+                    }
+                } catch (const std::exception& e) {
+                    RELAIS_LOG_WARN << "RedisCache MGET error: " << e.what();
+                }
+                co_return out;
+            }
+
+            /// Typed MGET deserializing each present slot as JSON (mirror of
+            /// get<E>). For BEVE consumers, use mgetRaw + E::fromBinary.
+            template<typename E>
+            static io::Task<std::vector<std::optional<E>>> mget(
+                std::span<const std::string> keys)
+            {
+                auto raws = co_await mgetRaw(keys);
+                std::vector<std::optional<E>> out;
+                out.reserve(raws.size());
+                for (const auto& r : raws) {
+                    if (r) {
+                        out.push_back(E::fromJson(*r));
+                    } else {
+                        out.emplace_back(std::nullopt);
+                    }
+                }
+                co_return out;
+            }
+
             template<typename E>
             static io::Task<std::optional<std::vector<E>>> getList(const std::string& key) {
                 if (!PgProvider::hasRedis()) {

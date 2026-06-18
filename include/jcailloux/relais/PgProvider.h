@@ -144,6 +144,25 @@ public:
             static_cast<int>(argv.size()), argv.data(), argvlen.data());
     }
 
+    /// Execute a Redis command whose argument list is sized at runtime
+    /// (e.g. MGET over N keys). `args` is the full argv — verb first — taken by
+    /// value and kept alive in the coroutine frame. Binary-safe (length-prefixed).
+    static io::Task<io::RedisResult> redisDynamic(std::vector<std::string> args) {
+        assert(redis_exec_ && "PgProvider::redisDynamic() called before init() or Redis not configured");
+
+        std::vector<const char*> argv;
+        std::vector<size_t> argvlen;
+        argv.reserve(args.size());
+        argvlen.reserve(args.size());
+        for (const auto& s : args) {
+            argv.push_back(s.data());
+            argvlen.push_back(s.size());
+        }
+
+        co_return co_await redis_exec_(
+            static_cast<int>(argv.size()), argv.data(), argvlen.data());
+    }
+
     /// Check if Redis is configured.
     [[nodiscard]] static bool hasRedis() noexcept {
         return redis_exec_ != nullptr;
