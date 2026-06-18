@@ -147,6 +147,9 @@ private:
         if constexpr (op == Op::IN) {
             // Membership: entity scalar ∈ query set
             return std::ranges::find(*filter_value, *tag_value) != filter_value->end();
+        } else if constexpr (op == Op::NIN) {
+            // Anti-membership: entity scalar ∉ query set (null already rejected above)
+            return std::ranges::find(*filter_value, *tag_value) == filter_value->end();
         } else if constexpr (op == Op::EQ) {
             return *tag_value == *filter_value;
         } else if constexpr (op == Op::NE) {
