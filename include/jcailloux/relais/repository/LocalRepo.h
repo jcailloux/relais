@@ -5,7 +5,10 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <span>
 #include <type_traits>
+#include <utility>
+#include <vector>
 
 #include "jcailloux/relais/io/Task.h"
 #include "jcailloux/relais/repository/RedisRepo.h"
@@ -13,6 +16,7 @@
 #include "jcailloux/relais/cache/CacheTier.h"
 #include "jcailloux/relais/cache/CacheMetadata.h"
 #include "jcailloux/relais/cache/CacheView.h"
+#include "jcailloux/relais/cache/MultiView.h"
 #include "jcailloux/relais/config/CacheConfig.h"
 #include "jcailloux/relais/runtime/CachedClock.h"
 #include "jcailloux/relais/cache/Metrics.h"
@@ -95,6 +99,65 @@ public:
         }
         RELAIS_METRICS_INC(l1_counters_.misses);
         return findSlow(id);
+    }
+
+    /// Batched multi-id read. Probes L1 for every (deduplicated) id under a
+    /// single batch EpochGuard, then issues one MGET (L2) + one ANY (L3) over
+    /// the L1 misses via the lower tiers. Returns a guarded MultiView<E>:
+    /// view[i] maps to ids[i] (nullptr = absent in every tier), L1 hits are
+    /// zero-copy slot pointers kept alive by the batch guard.
+    ///
+    /// Duplicate ids collapse to one key downstream; their positions share one
+    /// entry. Empty ids → empty view (no guard, no I/O, no frame). All-L1-hit →
+    /// synchronous Immediate (no coroutine frame). The detached L2 warm-fill of
+    /// the L3 misses is handled one layer down (RedisRepo::findManyRaw).
+    static io::Immediate<cache::MultiView<E>> findMany(std::span<const Key> ids) {
+        const size_t n = ids.size();
+        if (n == 0) return cache::MultiView<E>{};
+
+        // Dedup (small-N linear scan, the dominant case): unique[] holds the
+        // distinct ids in first-seen order, slot[i] maps ids[i] -> unique index.
+        std::vector<Key> unique;
+        unique.reserve(n);
+        std::vector<size_t> slot(n);
+        for (size_t i = 0; i < n; ++i) {
+            size_t u = unique.size();
+            for (size_t k = 0; k < unique.size(); ++k) {
+                if (unique[k] == ids[i]) { u = k; break; }
+            }
+            if (u == unique.size()) unique.push_back(ids[i]);
+            slot[i] = u;
+        }
+
+        // One batch EpochGuard pins the global epoch for every L1-slot pointer
+        // taken below — per-Hit guards are dropped, one ticket covers the N.
+        // Acquired before the first probe so any entry read here stays unfreed
+        // even if evicted later (held across the await on the miss path).
+        auto guard = epoch::EpochGuard::acquire();
+
+        std::vector<const E*> uniqueHit(unique.size(), nullptr);
+        std::vector<size_t> missU;
+        for (size_t k = 0; k < unique.size(); ++k) {
+            auto hit = tier().find(unique[k]);
+            if (hit) {
+                RELAIS_METRICS_INC(l1_counters_.hits);
+                uniqueHit[k] = static_cast<const E*>(hit.value);
+            } else {
+                RELAIS_METRICS_INC(l1_counters_.misses);
+                missU.push_back(k);
+            }
+        }
+
+        // Hot path: every distinct id hit L1 → zero-copy, synchronous, no frame.
+        if (missU.empty()) {
+            cache::MultiView<E> view(n);
+            view.setGuard(std::move(guard));
+            for (size_t i = 0; i < n; ++i) view.pointAt(i, uniqueHit[slot[i]]);
+            return view;
+        }
+
+        return findManySlow(std::move(guard), std::move(unique), std::move(slot),
+                            std::move(uniqueHit), std::move(missU));
     }
 
     /// Find by ID and return JSON string (empty if not found).
@@ -380,6 +443,39 @@ private:
         );
         if (hit) co_return hit.value->binary();
         co_return std::vector<uint8_t>{};
+    }
+
+    /// Miss path for findMany: fetch the L1 misses through the lower tiers (one
+    /// MGET + one ANY), force-insert each into L1 — same as the single-find
+    /// fetch path in the non-GDSF build — and point the view at the fresh slots.
+    /// The batch guard is held across the await so both the pre-await L1 hits
+    /// and the freshly stored misses stay valid. Absent ids keep their nullptr.
+    static io::Task<cache::MultiView<E>> findManySlow(
+        epoch::EpochGuard guard,
+        std::vector<Key> unique,
+        std::vector<size_t> slot,
+        std::vector<const E*> uniqueHit,
+        std::vector<size_t> missU)
+    {
+        std::vector<Key> missIds;
+        missIds.reserve(missU.size());
+        for (size_t k : missU) missIds.push_back(unique[k]);
+
+        auto fetched = co_await Base::findManyRaw(missIds);
+
+        for (size_t j = 0; j < missU.size(); ++j) {
+            if (fetched[j]) {
+                auto hit = tier().store(unique[missU[j]], std::move(*fetched[j]),
+                                        buildMetadata());
+                uniqueHit[missU[j]] = static_cast<const E*>(hit.value);
+            }
+        }
+
+        cache::MultiView<E> view(slot.size());
+        view.setGuard(std::move(guard));
+        for (size_t i = 0; i < slot.size(); ++i)
+            view.pointAt(i, uniqueHit[slot[i]]);
+        co_return view;
     }
 
     // =========================================================================

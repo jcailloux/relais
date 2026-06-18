@@ -22,6 +22,7 @@
 #include <vector>
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/catch_template_test_macros.hpp>
 
 #include "fixtures/test_helper.h"
 #include "fixtures/TestRepositories.h"
@@ -131,6 +132,12 @@ namespace {
 template<typename Repo, typename Key>
 auto findManyRawSync(std::span<const Key> ids) {
     return sync(relais_test::TestInternals::findManyRaw<Repo>(ids));
+}
+
+// Public findMany entry — returns a guarded MultiView<E>.
+template<typename Repo, typename Key>
+auto findManySync(std::span<const Key> ids) {
+    return sync(Repo::findMany(ids));
 }
 
 // Drive the loop until a detached L2 fill becomes visible (bounded). The
@@ -382,4 +389,213 @@ TEST_CASE("findManyRaw composite key over L2 (miss→L3→warm)", "[findmany][l2
     // The composite Redis key round-trips through the detached warm fill.
     auto key = L2TestMembershipRepo::makeRedisKey(MemKey{1, 2});
     REQUIRE(awaitL2Key(key).has_value());
+}
+
+// ---------------------------------------------------------------------------
+// Étape 4 — LocalRepo::findMany : public guarded MultiView<E>
+// L1-bearing repos (Local / Both). Hot path = zero-copy under one batch guard;
+// miss path = MGET (L2) + ANY (L3) through the lower tiers, force-insert L1.
+// findMany is public (inherited up the chain) — called directly on the repo.
+// ---------------------------------------------------------------------------
+
+TEMPLATE_TEST_CASE("findMany simple key: cold miss then zero-copy hot path",
+                   "[findmany][local]", L1TestUserRepo, FullCacheTestUserRepo) {
+    using Repo = TestType;
+    TransactionGuard guard;
+
+    auto u1 = insertTestUser("fm4_a", "fm4a@x", 1);
+    auto u2 = insertTestUser("fm4_b", "fm4b@x", 2);
+    auto u3 = insertTestUser("fm4_c", "fm4c@x", 3);
+
+    SECTION("all cold → fetched from lower tiers, request order with holes") {
+        std::vector<int64_t> ids = {u3, -1, u1, -2, u2};
+        auto v = findManySync<Repo, int64_t>(ids);
+        REQUIRE(v.size() == 5);
+        REQUIRE(v[0]);  REQUIRE(v[0]->username == "fm4_c");
+        REQUIRE(v[1] == nullptr);
+        REQUIRE(v[2]);  REQUIRE(v[2]->username == "fm4_a");
+        REQUIRE(v[3] == nullptr);
+        REQUIRE(v[4]);  REQUIRE(v[4]->username == "fm4_b");
+    }
+
+    SECTION("warm then all-L1-hit → synchronous, zero-copy") {
+        std::vector<int64_t> ids = {u1, u2, u3};
+        (void)findManySync<Repo, int64_t>(ids);   // prime L1
+
+        // Second pass: every distinct id is in L1 → Immediate resolves without
+        // a coroutine frame (await_ready), and slots are not copied.
+        auto imm = Repo::findMany(std::span<const int64_t>(ids));
+        REQUIRE(imm.await_ready());
+        auto v = sync(std::move(imm));
+        REQUIRE(v.size() == 3);
+        for (size_t i = 0; i < 3; ++i) REQUIRE(v[i]);
+
+        // Zero-copy: the view points at the exact L1 slot address.
+        auto slot = TestInternals::getFromCache<Repo>(u1);
+        REQUIRE(slot);
+        REQUIRE(v[0] == slot.get());
+    }
+}
+
+TEMPLATE_TEST_CASE("findMany oracle: findMany[i] equals find(ids[i])",
+                   "[findmany][local]", L1TestUserRepo, FullCacheTestUserRepo) {
+    using Repo = TestType;
+    TransactionGuard guard;
+
+    auto u1 = insertTestUser("orc_a", "orca@x", 7);
+    auto u2 = insertTestUser("orc_b", "orcb@x", 8);
+
+    // Varied set: present, absent, and a duplicate of a present id.
+    std::vector<int64_t> ids = {u2, -1, u1, u2};
+    auto v = findManySync<Repo, int64_t>(ids);
+    REQUIRE(v.size() == ids.size());
+
+    for (size_t i = 0; i < ids.size(); ++i) {
+        auto single = sync(Repo::find(ids[i]));
+        if (single) {
+            REQUIRE(v[i]);
+            REQUIRE(v[i]->username == single->username);
+            REQUIRE(v[i]->balance == single->balance);
+        } else {
+            REQUIRE(v[i] == nullptr);
+        }
+    }
+}
+
+TEMPLATE_TEST_CASE("findMany dedup: duplicate ids share one entry",
+                   "[findmany][local]", L1TestUserRepo, FullCacheTestUserRepo) {
+    using Repo = TestType;
+    TransactionGuard guard;
+
+    auto u1 = insertTestUser("dup_a", "dupa@x", 1);
+    auto u2 = insertTestUser("dup_b", "dupb@x", 2);
+
+    // Duplicate present (u1), duplicate absent (-5), and a singleton (u2).
+    std::vector<int64_t> ids = {u1, u1, -5, -5, u2};
+    auto v = findManySync<Repo, int64_t>(ids);
+    REQUIRE(v.size() == 5);
+    REQUIRE(v[0]);
+    REQUIRE(v[0] == v[1]);          // same slot pointer → one unique key downstream
+    REQUIRE(v[2] == nullptr);
+    REQUIRE(v[3] == nullptr);       // duplicate absent → nullptr everywhere
+    REQUIRE(v[4]);  REQUIRE(v[4]->username == "dup_b");
+}
+
+TEMPLATE_TEST_CASE("findMany warming: miss populates L1 (same slot on re-probe)",
+                   "[findmany][local]", L1TestUserRepo, FullCacheTestUserRepo) {
+    using Repo = TestType;
+    TransactionGuard guard;
+
+    auto u1 = insertTestUser("warm4", "warm4@x", 9);
+
+    std::vector<int64_t> ids = {u1};
+    auto v = findManySync<Repo, int64_t>(ids);   // miss → L3 → store L1
+    REQUIRE(v[0]);
+
+    auto slot = TestInternals::getFromCache<Repo>(u1);
+    REQUIRE(slot);
+    REQUIRE(slot.get() == v[0]);     // the miss force-inserted this exact slot
+}
+
+TEST_CASE("findMany edge cases", "[findmany][local]") {
+    TransactionGuard guard;
+
+    SECTION("empty ids → empty view, synchronous, no frame") {
+        std::vector<int64_t> ids;
+        auto imm = L1TestUserRepo::findMany(std::span<const int64_t>(ids));
+        REQUIRE(imm.await_ready());
+        auto v = sync(std::move(imm));
+        REQUIRE(v.empty());
+        REQUIRE(v.size() == 0);
+    }
+
+    SECTION("N=1 present / absent") {
+        auto u = insertTestUser("e1", "e1@x", 1);
+        std::vector<int64_t> present = {u};
+        auto vp = findManySync<L1TestUserRepo, int64_t>(present);
+        REQUIRE(vp.size() == 1);  REQUIRE(vp[0]);  REQUIRE(vp[0]->username == "e1");
+
+        std::vector<int64_t> absent = {-7};
+        auto va = findManySync<L1TestUserRepo, int64_t>(absent);
+        REQUIRE(va.size() == 1);  REQUIRE(va[0] == nullptr);
+    }
+
+    SECTION("all absent → all nullptr") {
+        std::vector<int64_t> ids = {-1, -2, -3};
+        auto v = findManySync<L1TestUserRepo, int64_t>(ids);
+        REQUIRE(v.size() == 3);
+        for (const auto* p : v) REQUIRE(p == nullptr);
+    }
+}
+
+TEST_CASE("findMany (Both) warms L1 inline and L2 detached", "[findmany][local][l2]") {
+    TransactionGuard guard;
+
+    auto uid = insertTestUser("fm4_warm", "fm4w@x", 4);
+    auto key = FullCacheTestUserRepo::makeRedisKey(uid);
+
+    auto before = sync(mgetRawKeys({key}));
+    REQUIRE(before[0] == std::nullopt);   // L2 cold
+
+    std::vector<int64_t> ids = {uid};
+    auto v = findManySync<FullCacheTestUserRepo, int64_t>(ids);
+    REQUIRE(v[0]);  REQUIRE(v[0]->username == "fm4_warm");
+
+    // L1 warmed inline (synchronous store on the miss path).
+    auto slot = TestInternals::getFromCache<FullCacheTestUserRepo>(uid);
+    REQUIRE(slot);
+    REQUIRE(slot.get() == v[0]);
+
+    // L2 warmed by the detached fill one layer down (RedisRepo::findManyRaw).
+    REQUIRE(awaitL2Key(key).has_value());
+}
+
+TEMPLATE_TEST_CASE("findMany composite key end-to-end",
+                   "[findmany][local][composite-key]",
+                   L1TestMembershipRepo, FullCacheTestMembershipRepo) {
+    using Repo = TestType;
+    using MemKey = std::tuple<int64_t, int64_t>;
+    TransactionGuard guard;
+
+    insertTestMembership(1, 2, "ca");
+    insertTestMembership(2, 1, "cb");
+    insertTestMembership(1, 20, "cc");
+
+    std::vector<MemKey> ids;
+    ids.emplace_back(2, 1);    // present (transposed)
+    ids.emplace_back(1, 2);    // present
+    ids.emplace_back(20, 1);   // absent — must not be confused with (1,20)
+    auto v = findManySync<Repo, MemKey>(ids);
+    REQUIRE(v.size() == 3);
+    REQUIRE(v[0]);  REQUIRE(v[0]->role == "cb");
+    REQUIRE(v[1]);  REQUIRE(v[1]->role == "ca");
+    REQUIRE(v[2] == nullptr);
+
+    // Second pass over the present keys only = zero-copy hot path (composite).
+    std::vector<MemKey> present;
+    present.emplace_back(2, 1);
+    present.emplace_back(1, 2);
+    auto imm = Repo::findMany(std::span<const MemKey>(present));
+    REQUIRE(imm.await_ready());
+    auto v2 = sync(std::move(imm));
+    REQUIRE(v2[0]);  REQUIRE(v2[0]->role == "cb");
+    REQUIRE(v2[1]);  REQUIRE(v2[1]->role == "ca");
+}
+
+TEMPLATE_TEST_CASE("findMany partition key cross-partition end-to-end",
+                   "[findmany][local][partition-key]",
+                   L1TestEventRepo, L1L2TestEventRepo) {
+    using Repo = TestType;
+    TransactionGuard guard;
+
+    auto uid = insertTestUser("fm4_evt", "fm4evt@x", 0);
+    auto e_eu = insertTestEvent("eu", uid, "euro", 1);
+    auto e_us = insertTestEvent("us", uid, "yankee", 2);
+
+    std::vector<int64_t> ids = {e_us, e_eu, -1};
+    auto v = findManySync<Repo, int64_t>(ids);
+    REQUIRE(v.size() == 3);
+    REQUIRE(v[0]);  REQUIRE(v[0]->title == "yankee");  REQUIRE(v[0]->region == "us");
+    REQUIRE(v[1]);  REQUIRE(v[1]->title == "euro");    REQUIRE(v[1]->region == "eu");
+    REQUIRE(v[2] == nullptr);
 }
