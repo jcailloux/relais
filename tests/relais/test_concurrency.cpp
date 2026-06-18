@@ -34,13 +34,52 @@
 #include "fixtures/TestQueryHelpers.h"
 #include "fixtures/RelaisTestAccessors.h"
 
+#include "jcailloux/relais/cache/RedisCache.h"
+
 #include <thread>
 #include <vector>
 #include <latch>
 #include <atomic>
 #include <random>
+#include <span>
+#include <optional>
+#include <unordered_map>
 
 using namespace relais_test;
+
+// #############################################################################
+//
+//  ThreadSanitizer suppressions (compiled into the binary)
+//
+//  parlayhash (third_party, CMU parlaylib) is a lock-free hash map: a reader
+//  snapshots a bucket `state` / `Entry` by value while a writer may be CAS-
+//  swapping the bucket head, then validates the snapshot against the live head
+//  and retries if it changed. The unsynchronized value copy is correct by
+//  construction — epoch reclamation keeps the memory live, a stale snapshot is
+//  discarded — but TSan cannot see the validate-and-retry, so it flags the copy
+//  (state::operator=, Entry::operator=, and the __tsan_memcpy they lower to).
+//  Embedding the suppressions here keeps both ctest and direct-exec runs clean
+//  without external TSAN_OPTIONS wiring. Scoped to parlayhash internals only —
+//  real races in relais code carry relais frames and are not matched.
+//
+// #############################################################################
+
+#if defined(__has_feature)
+#  if __has_feature(thread_sanitizer)
+#    define RELAIS_TSAN_BUILD 1
+#  endif
+#endif
+#if defined(__SANITIZE_THREAD__)
+#  define RELAIS_TSAN_BUILD 1
+#endif
+
+#ifdef RELAIS_TSAN_BUILD
+extern "C" const char* __tsan_default_suppressions() {
+    return
+        "race:parlay::parlay_hash\n"
+        "race:parlay::DirectEntries\n";
+}
+#endif
 
 // #############################################################################
 //
@@ -75,6 +114,30 @@ void parallel(int num_threads, Fn&& fn) {
 
     for (auto& t : threads) t.join();
     REQUIRE(errors.load() == 0);
+}
+
+/// Public findMany entry over a vector of simple int64 keys, returning the
+/// guarded MultiView<E>. The L1 probe + epoch acquire run on the calling
+/// (worker) thread; the slow path dispatches to the loop.
+template<typename Repo>
+auto findManyView(const std::vector<int64_t>& ids) {
+    return sync(Repo::findMany(std::span<const int64_t>(ids)));
+}
+
+/// Raw MGET against Redis — used to observe detached L2 warm-fills.
+inline io::Task<std::vector<std::optional<std::string>>>
+mgetRawKeys(std::vector<std::string> keys) {
+    co_return co_await cache::RedisCache::mgetRaw(keys);
+}
+
+/// Poll until a detached L2 fill becomes visible (bounded). Doubles as a drain:
+/// returning means the fire-and-forget SET landed, ordering it before teardown.
+inline std::optional<std::string> awaitL2Key(const std::string& key) {
+    for (int i = 0; i < 200; ++i) {
+        auto r = sync(mgetRawKeys({key}));
+        if (r[0]) return r[0];
+    }
+    return std::nullopt;
 }
 
 
@@ -814,5 +877,250 @@ TEST_CASE("Concurrency - progressive tracker reduction",
         // After concurrent cleanup, count should not have grown
         auto count_after = TestInternals::pendingModificationCount<TestArticleListRepo>();
         REQUIRE(count_after <= count_before);
+    }
+}
+
+
+// #############################################################################
+//
+//  12. Concurrent findMany — overlapping ids (zero-copy hits, race-free)
+//
+//  M threads issue findMany over overlapping windows into a shared pool of
+//  primed entities, plus one absent id per request.  The L1 probe + epoch
+//  acquire run concurrently on the worker threads, the store path on the loop.
+//  Values are stable (no writers), so the result is checked exactly: present
+//  ids → correct balance at the right slot, absent id → nullptr.
+//
+// #############################################################################
+
+template<typename Repo>
+static void runConcurrentOverlap(const std::vector<int64_t>& pool,
+                                 const std::unordered_map<int64_t, int32_t>& expected) {
+    std::atomic<int> mismatches{0};
+
+    parallel(NUM_THREADS, [&](int t) {
+        std::mt19937 rng(t * 101 + 3);
+        for (int j = 0; j < OPS_PER_THREAD; ++j) {
+            // Overlapping 4-wide window + one absent hole, ordered.
+            std::vector<int64_t> ids;
+            int base = rng() % (static_cast<int>(pool.size()) - 4);
+            for (int k = 0; k < 4; ++k) ids.push_back(pool[base + k]);
+            ids.push_back(-1);
+
+            auto view = findManyView<Repo>(ids);
+            if (view.size() != ids.size()) {
+                mismatches.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            for (size_t i = 0; i < ids.size(); ++i) {
+                const auto* u = view[i];
+                if (ids[i] == -1) {
+                    if (u != nullptr) mismatches.fetch_add(1, std::memory_order_relaxed);
+                } else if (!u || u->balance != expected.at(ids[i])) {
+                    mismatches.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        }
+    });
+
+    REQUIRE(mismatches.load() == 0);
+}
+
+TEST_CASE("Concurrency - findMany overlapping reads",
+          "[integration][db][concurrency][tsan][findmany]")
+{
+    TransactionGuard tx;
+
+    constexpr int POOL = 12;
+    std::vector<int64_t> pool;
+    std::unordered_map<int64_t, int32_t> expected;
+    for (int i = 0; i < POOL; ++i) {
+        auto id = insertTestUser("conc_fm_" + std::to_string(i),
+                                 "conc_fm_" + std::to_string(i) + "@x", i * 7);
+        pool.push_back(id);
+        expected.emplace(id, i * 7);
+    }
+
+    SECTION("[L1] overlapping windows, zero-copy hits") {
+        findManyView<L1TestUserRepo>(pool);          // prime L1
+        runConcurrentOverlap<L1TestUserRepo>(pool, expected);
+    }
+
+    SECTION("[L1+L2] overlapping windows, zero-copy hits") {
+        findManyView<FullCacheTestUserRepo>(pool);   // prime L1 (+ detached L2)
+        runConcurrentOverlap<FullCacheTestUserRepo>(pool, expected);
+    }
+}
+
+
+// #############################################################################
+//
+//  13. findMany vs concurrent writes
+//
+//  Readers batch-read a pool while writers update entities in it.  Mid-flight
+//  reads may transiently miss (the shared-transaction pg connection serialises
+//  interleaved L3 queries — the existing read+write test documents the same
+//  transient nullptr), so the invariant is robustness, not per-op values: the
+//  pinned pointers stay dereferenceable (UAF bait for TSan/ASan) and a settled
+//  batch read after the storm is complete. Covers the read → detached-L2 window.
+//
+// #############################################################################
+
+template<typename Repo>
+static void runFindManyVsWrites(const std::vector<int64_t>& pool) {
+    parallel(NUM_THREADS, [&](int t) {
+        std::mt19937 rng(t * 71 + 5);
+        for (int j = 0; j < OPS_PER_THREAD; ++j) {
+            if (t % 2 == 0) {
+                // Reader — touch every present slot under the guard.
+                auto view = findManyView<Repo>(pool);
+                volatile long sink = 0;
+                for (size_t i = 0; i < view.size(); ++i)
+                    if (view[i]) sink += view[i]->balance;
+                (void)sink;
+            } else {
+                // Writer — update a random pooled entity (invalidates its caches).
+                auto id = pool[rng() % pool.size()];
+                auto entity = makeTestUser("conc_w_" + std::to_string(t) + "_" + std::to_string(j),
+                                           "conc_w@x", static_cast<int32_t>(rng() % 1000), id);
+                sync(Repo::update(id, entity));
+            }
+        }
+    });
+
+    // Quiescent: every pooled id exists, so a settled batch read fills all slots.
+    auto view = findManyView<Repo>(pool);
+    int missing = 0;
+    for (size_t i = 0; i < view.size(); ++i) if (!view[i]) ++missing;
+    REQUIRE(missing == 0);
+}
+
+TEST_CASE("Concurrency - findMany vs concurrent writes",
+          "[integration][db][concurrency][tsan][findmany]")
+{
+    TransactionGuard tx;
+
+    constexpr int POOL = 10;
+    std::vector<int64_t> pool;
+    for (int i = 0; i < POOL; ++i) {
+        pool.push_back(insertTestUser("conc_fmw_" + std::to_string(i),
+                                      "conc_fmw_" + std::to_string(i) + "@x", i));
+    }
+
+    SECTION("[L1] readers vs writers") {
+        findManyView<L1TestUserRepo>(pool);
+        runFindManyVsWrites<L1TestUserRepo>(pool);
+    }
+
+    SECTION("[L1+L2] readers vs writers") {
+        findManyView<FullCacheTestUserRepo>(pool);
+        runFindManyVsWrites<FullCacheTestUserRepo>(pool);
+    }
+}
+
+
+// #############################################################################
+//
+//  14. findMany guard survives concurrent invalidation
+//
+//  A reader holds a MultiView (epoch guard live) and dereferences every slot in
+//  a tight loop while other threads invalidate + re-find the same ids, retiring
+//  the L1 entries the reader points at.  The batch guard defers the free, so the
+//  pointers stay readable — TSan/ASan must see no UAF, no data race.
+//
+// #############################################################################
+
+template<typename Repo>
+static void runGuardVsInvalidation(const std::vector<int64_t>& pool) {
+    parallel(NUM_THREADS, [&](int t) {
+        std::mt19937 rng(t * 53 + 1);
+        for (int j = 0; j < OPS_PER_THREAD; ++j) {
+            if (t % 2 == 0) {
+                // Reader — pin the view, then read every field repeatedly. The
+                // batch guard must keep pointers readable even as a concurrent
+                // invalidate retires the entries they point at (UAF bait).
+                auto view = findManyView<Repo>(pool);
+                volatile long sink = 0;
+                for (int r = 0; r < 32; ++r)
+                    for (size_t i = 0; i < view.size(); ++i)
+                        if (view[i]) sink += view[i]->balance;
+                (void)sink;
+            } else {
+                // Mutator — evict + re-store, retiring the entries under the guard.
+                auto id = pool[rng() % pool.size()];
+                sync(Repo::invalidate(id));
+                sync(Repo::find(id));
+            }
+        }
+    });
+
+    // Quiescent: invalidation only evicts caches, the DB rows remain.
+    auto view = findManyView<Repo>(pool);
+    int missing = 0;
+    for (size_t i = 0; i < view.size(); ++i) if (!view[i]) ++missing;
+    REQUIRE(missing == 0);
+}
+
+TEST_CASE("Concurrency - findMany guard survives invalidation",
+          "[integration][db][concurrency][tsan][findmany]")
+{
+    TransactionGuard tx;
+
+    constexpr int POOL = 8;
+    std::vector<int64_t> pool;
+    for (int i = 0; i < POOL; ++i) {
+        pool.push_back(insertTestUser("conc_fmi_" + std::to_string(i),
+                                      "conc_fmi_" + std::to_string(i) + "@x", i));
+    }
+
+    SECTION("[L1] guard pins pointers across invalidation") {
+        findManyView<L1TestUserRepo>(pool);
+        runGuardVsInvalidation<L1TestUserRepo>(pool);
+    }
+
+    SECTION("[L1+L2] guard pins pointers across invalidation") {
+        findManyView<FullCacheTestUserRepo>(pool);
+        runGuardVsInvalidation<FullCacheTestUserRepo>(pool);
+    }
+}
+
+
+// #############################################################################
+//
+//  15. findMany (Both) — detached L2 fill drains before teardown
+//
+//  Concurrent findMany over L2-cold ids fans out one detached SET per miss.
+//  Each fire-and-forget fill must land before the TransactionGuard flushes
+//  Redis — awaitL2Key polls it to completion, ordering the DetachedTask ahead
+//  of teardown so it never touches a flushed connection.
+//
+// #############################################################################
+
+TEST_CASE("Concurrency - findMany detached L2 fill drains before teardown",
+          "[integration][db][concurrency][tsan][findmany][l2]")
+{
+    TransactionGuard tx;
+
+    constexpr int POOL = 8;
+    std::vector<int64_t> pool;
+    std::vector<std::string> keys;
+    for (int i = 0; i < POOL; ++i) {
+        auto id = insertTestUser("conc_fml2_" + std::to_string(i),
+                                 "conc_fml2_" + std::to_string(i) + "@x", i);  // DB only, L2 cold
+        pool.push_back(id);
+        keys.push_back(FullCacheTestUserRepo::makeRedisKey(id));
+    }
+
+    // Concurrent batches → L1+L2 misses → L3 fetch + one detached L2 SET each.
+    parallel(NUM_THREADS, [&](int) {
+        for (int j = 0; j < OPS_PER_THREAD / 2; ++j) {
+            auto view = findManyView<FullCacheTestUserRepo>(pool);
+            for (size_t i = 0; i < view.size(); ++i) (void)view[i];
+        }
+    });
+
+    // Drain: every detached fill must be visible before TransactionGuard flush.
+    for (const auto& k : keys) {
+        REQUIRE(awaitL2Key(k).has_value());
     }
 }
