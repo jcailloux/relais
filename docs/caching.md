@@ -201,6 +201,41 @@ auto updated = co_await EventRepo::patch(eventId,
 // UPDATE events SET "title"=$1, "priority"=$2 WHERE "id"=$3 RETURNING *
 ```
 
+## Batched reads with `findMany`
+
+`findMany(ids)` reads many keys in one shot. It is available on L1-bearing repos
+(`Local`, `Both`) and returns a `MultiView<E>` — a guarded, read-only view where
+`view[i]` corresponds to `ids[i]`:
+
+```cpp
+std::vector<int64_t> ids = {7, 7, 4, -1};
+auto view = co_await repo.findMany(ids);   // MultiView<E>
+view.size();          // 4 — one slot per requested id
+view[0];              // const E*  (id 7)
+view[1];              // same pointer as view[0] — duplicate id, one entry
+view[2];              // const E*  (id 4)
+view[3];              // nullptr — absent in every tier
+```
+
+Contract:
+
+- **Order preserved, holes are absent.** `view[i]` maps positionally to `ids[i]`;
+  a `nullptr` slot means the id was found in no tier. Duplicate ids collapse to a
+  single downstream entry and share one pointer.
+- **One round-trip per tier.** The L1 misses are batched into a single `MGET`
+  (L2) and a single `WHERE pk = ANY($1)` (L3) — never N sequential lookups. The
+  saving scales with the miss count, not the request size.
+- **L1 hits are zero-copy.** Hits return the live L1 slot pointer; nothing is
+  copied or rehydrated.
+- **Lifetime is the view's guard.** All slot pointers are pinned by one batch
+  `EpochGuard` held inside the `MultiView`. They stay dereferenceable for as long
+  as the view is alive — and must not outlive it.
+- **Detached L2 warming.** On `Both`, L3 hits that missed L2 are written back to
+  Redis fire-and-forget; the view returns without waiting for the fill.
+- **Fast paths.** Empty `ids` → empty view, no guard, no I/O. All ids hitting L1
+  → synchronous resolution with no coroutine frame (still allocates the dedup and
+  view buffers — the batch wins on misses, not on the all-hit micro-path).
+
 ## API surface
 
 ### Core (all repos)
@@ -221,6 +256,7 @@ auto updated = co_await EventRepo::patch(eventId,
 
 | Method | Description |
 |---|---|
+| `findMany(ids)` | Batched multi-id read → guarded `MultiView<E>` (see above) |
 | `trySweep()` | Non-blocking cleanup of expired entries |
 | `purge()` | Force cleanup of all expired entries |
 | `size()` | Current L1 entry count |

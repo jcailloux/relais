@@ -29,6 +29,7 @@
 #include "fixtures/RelaisTestAccessors.h"
 
 #include <random>
+#include <span>
 
 using namespace relais_test;
 using namespace relais_bench;
@@ -1331,4 +1332,143 @@ TEST_CASE("Benchmark - production realism scaling", "[benchmark][realism]") {
     }
 
     WARN(std::string(74, '='));
+}
+
+
+// #############################################################################
+//
+//  12. findMany — batched multi-id read vs N × find
+//
+//  findMany(N) collapses N point lookups into one guarded MultiView:
+//    - all-L1-hit  → zero-copy, synchronous (await_ready), no coroutine frame
+//    - all-miss    → ONE batched round-trip per tier (L2 MGET, L3 ANY)
+//                    vs N sequential round-trips for N × find
+//    - mixed       → only the misses pay I/O, batched
+//
+//  The round-trip win is read directly off latency: N × find scales linearly
+//  with N (sequential RTTs), findMany stays ~flat (one batch). FullCache repo
+//  (L1+L2) exercises the multi-tier batch; L1-only isolates the hot path.
+//
+// #############################################################################
+
+namespace {
+
+// Drain detached L2 warm-fills so the next sample's setup starts from a known
+// state. invalidate() clears L1+L2 synchronously for the requested ids.
+template<typename Repo>
+void invalidateAll(const std::vector<int64_t>& ids) {
+    for (auto id : ids) sync(Repo::invalidate(id));
+}
+
+template<typename Repo>
+void primeAll(const std::vector<int64_t>& ids) {
+    for (auto id : ids) sync(Repo::find(id));
+}
+
+// findMany over the first N ids; returns the view so the caller can sink it.
+template<typename Repo>
+auto findManyN(const std::vector<int64_t>& ids, int n) {
+    return sync(Repo::findMany(std::span<const int64_t>(ids.data(), n)));
+}
+
+// N sequential point lookups — the baseline findMany replaces.
+template<typename Repo>
+void nFinds(const std::vector<int64_t>& ids, int n) {
+    for (int k = 0; k < n; ++k)
+        doNotOptimize(sync(Repo::find(ids[k])));
+}
+
+} // anonymous namespace
+
+TEST_CASE("Benchmark - findMany batched read", "[benchmark][findmany]") {
+    TransactionGuard tx;
+    WARN(gdsf_banner());
+
+    static constexpr int POOL = 128;
+    const std::vector<int> Ns = {1, 8, 32, 128};
+
+    std::vector<int64_t> ids;
+    ids.reserve(POOL);
+    for (int i = 0; i < POOL; ++i)
+        ids.push_back(insertTestUser(
+            "fm_bench_" + std::to_string(i),
+            "fmb" + std::to_string(i) + "@test.com", i));
+
+    // --- A. all-L1-hit fast path (ns-scale → duration-based) -----------------
+    // Prime L1, then confirm findMany(N) resolves synchronously (no frame pool
+    // churn) before measuring. Compares zero-copy batch vs N × find.
+    primeAll<L1TestUserRepo>(ids);
+    {
+        auto imm = L1TestUserRepo::findMany(std::span<const int64_t>(ids.data(), POOL));
+        REQUIRE(imm.await_ready());   // all-hit → synchronous, no coroutine frame
+        doNotOptimize(sync(std::move(imm)));
+    }
+
+    for (int n : Ns) {
+        auto fm = measureDuration(1, [&](int, std::atomic<bool>& running) -> int64_t {
+            int64_t ops = 0;
+            while (running.load(std::memory_order_relaxed)) {
+                doNotOptimize(findManyN<L1TestUserRepo>(ids, n));
+                ++ops;
+            }
+            return ops;
+        });
+        WARN(formatDurationThroughput(
+            "L1 hit  findMany(" + std::to_string(n) + ")", 1, fm));
+
+        auto nf = measureDuration(1, [&](int, std::atomic<bool>& running) -> int64_t {
+            int64_t ops = 0;
+            while (running.load(std::memory_order_relaxed)) {
+                nFinds<L1TestUserRepo>(ids, n);
+                ++ops;
+            }
+            return ops;
+        });
+        WARN(formatDurationThroughput(
+            "L1 hit  " + std::to_string(n) + " x find", 1, nf));
+    }
+
+    // --- B. all-miss cold path (μs/ms-scale → sample-based latency) ----------
+    // FullCache (L1+L2): findMany issues one MGET + one ANY; N × find issues N
+    // sequential round-trips. invalidate() between samples re-arms the miss.
+    {
+        std::vector<BenchResult> miss;
+        for (int n : Ns) {
+            miss.push_back(benchWithSetup(
+                "findMany(" + std::to_string(n) + ")",
+                [&]() { invalidateAll<FullCacheTestUserRepo>(ids); },
+                [&]() { doNotOptimize(findManyN<FullCacheTestUserRepo>(ids, n)); }));
+            miss.push_back(benchWithSetup(
+                std::to_string(n) + " x find",
+                [&]() { invalidateAll<FullCacheTestUserRepo>(ids); },
+                [&]() { nFinds<FullCacheTestUserRepo>(ids, n); }));
+        }
+        WARN(formatTable("findMany all-miss (L1+L2 cold, 1 batch vs N RTT)", miss));
+    }
+
+    // --- C. mixed path (half in L1, half cold) -------------------------------
+    // Only the misses pay I/O — batched into a single round-trip per tier.
+    {
+        std::vector<BenchResult> mixed;
+        for (int n : Ns) {
+            int half = n / 2;
+            mixed.push_back(benchWithSetup(
+                "findMany(" + std::to_string(n) + ")",
+                [&]() {
+                    invalidateAll<FullCacheTestUserRepo>(ids);
+                    for (int k = 0; k < half; ++k)
+                        sync(FullCacheTestUserRepo::find(ids[k]));   // warm half
+                },
+                [&]() { doNotOptimize(findManyN<FullCacheTestUserRepo>(ids, n)); }));
+            mixed.push_back(benchWithSetup(
+                std::to_string(n) + " x find",
+                [&]() {
+                    invalidateAll<FullCacheTestUserRepo>(ids);
+                    for (int k = 0; k < half; ++k)
+                        sync(FullCacheTestUserRepo::find(ids[k]));
+                },
+                [&]() { nFinds<FullCacheTestUserRepo>(ids, n); }));
+        }
+        WARN(formatTable("findMany mixed (50% L1 hit, misses batched)", mixed));
+    }
 }

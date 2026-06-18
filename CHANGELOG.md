@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- **`findMany(ids)` batched multi-id read** on L1-bearing repos (`Local`, `Both`). Returns a guarded `MultiView<E>` where `view[i]` maps positionally to `ids[i]` (`nullptr` = absent in every tier, duplicate ids collapse to one entry). L1 misses are batched into one `MGET` (L2) and one `WHERE pk = ANY($1)` (L3) — one round-trip per tier, not N. L1 hits are zero-copy slot pointers pinned by a single batch `EpochGuard` and must not outlive the view; L2 warm-fills of L3 hits are detached (fire-and-forget).
+
 ## [0.5.0-alpha.7] - 2026-06-16
 
 ### Added
