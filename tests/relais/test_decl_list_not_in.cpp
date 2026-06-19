@@ -37,12 +37,22 @@
  * collision; the update cases replay middle-alignment against the SECOND duplicated
  * Lua script. NULL and empty-set (§1.1/§1.2) verdicts are checked at the L2 tier.
  *
- * The cross-tier dualité property suite lands in commit 6 (§7.7).
+ * Commit 6 adds the cross-tier consistency + dualité property suite (§7.7): a
+ * deterministic (fixed-seed) sweep of ~25 entities (some with NULL members) ×
+ * ~10 varied sets per element type, asserting the §1 invariant. (1) Tri-tier:
+ * the NIN verdict from L1 `matchesFilters`, L2 Lua (page deleted ⇔ matched), and
+ * L3 PostgreSQL `!= ALL` is identical. (2) Dualité non-null: for a present member
+ * `NIN(S,v) == !IN(S,v)`. (3) Rupture sur NULL: for a null member BOTH
+ * `NIN(S,NULL)` and `IN(S,NULL)` are false — the dualité does NOT hold (§1.1),
+ * the single most natural implementer error (`NIN = !IN` everywhere). Requires
+ * DB+Redis.
  */
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <optional>
+#include <random>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -790,4 +800,200 @@ TEST_CASE("[DeclListNin][L2] alignment — NIN in middle position (update, 2nd L
     CHECK_FALSE(alive(gAll));
     CHECK(alive(gRng));  // 50,60 both < 100 — UPDATE skipset matches CREATE skipset
     CHECK(alive(gEq));   // author 42 ≠ 99
+}
+
+// =============================================================================
+// Cross-tier consistency + dualité (§7.7) — the §1 invariant under load.
+//
+// For each (entity, set) the three tiers must agree on the NIN verdict "entity
+// scalar ∉ set": L1 `matchesFilters` (pure C++), L3 PostgreSQL `!= ALL` (the real
+// array parser, fed buildWhereClause's literal so escaping round-trips through
+// PG), L2 Lua (page deleted ⇔ matched). Plus the two dualité properties:
+//   (2) non-null member: NIN(S,v) == !IN(S,v) — the negation holds;
+//   (3) NULL member: NIN(S,NULL) == false AND IN(S,NULL) == false — the negation
+//       BREAKS (SQL 3-valued logic excludes NULL from BOTH, §1.1).
+// All groups for one entity are registered into the master hash at once, then a
+// single create fires and the Lua scans them — the production multi-group scan.
+// Fixed seed (deterministic, no Math.random). IN verdict is the L1 reference.
+// =============================================================================
+
+namespace {
+
+// IN companions of the NIN descriptors, same column/type — the dualité reference.
+struct DualInString {
+    using Entity = ::Entity;
+    static constexpr auto filters = std::tuple{
+        decl::Filter<"category", &TestArticle::category, "category", decl::Op::IN>{}};
+    static constexpr auto sorts = std::tuple{
+        decl::Sort<"id", &TestArticle::id, "id", decl::SortDirection::Desc>{}};
+};
+struct DualInInt64 {
+    using Entity = ::Entity;
+    static constexpr auto filters = std::tuple{
+        decl::Filter<"author_id", &TestArticle::author_id, "author_id", decl::Op::IN>{}};
+    static constexpr auto sorts = std::tuple{
+        decl::Sort<"id", &TestArticle::id, "id", decl::SortDirection::Desc>{}};
+};
+struct DualInOptInt32 {
+    using Entity = ::Entity;
+    static constexpr auto filters = std::tuple{
+        decl::Filter<"view_count", &TestArticle::view_count, "view_count", decl::Op::IN>{}};
+    static constexpr auto sorts = std::tuple{
+        decl::Sort<"id", &TestArticle::id, "id", decl::SortDirection::Desc>{}};
+};
+struct DualInBool {
+    using Entity = ::Entity;
+    static constexpr auto filters = std::tuple{
+        decl::Filter<"is_published", &TestArticle::is_published, "is_published", decl::Op::IN>{}};
+    static constexpr auto sorts = std::tuple{
+        decl::Sort<"id", &TestArticle::id, "id", decl::SortDirection::Desc>{}};
+};
+
+// Real PostgreSQL NIN verdict: `$1 != ALL($2)`. Only called for a present member
+// (the null break is handled in C++ via has_value()), so 3-valued NULL never
+// reaches PG here — `!= ALL('{}')` correctly yields TRUE (universe, §1.2).
+template<typename V>
+bool sqlAllVerdict(const V& val, const std::string& arrayLiteral, const char* cast) {
+    std::string sql = "SELECT CASE WHEN $1::";
+    sql += cast; sql += " != ALL($2::"; sql += cast; sql += "[]) THEN 1 ELSE 0 END";
+    auto r = relais_test::execQueryArgs(sql.c_str(), val, arrayLiteral);
+    return r[0].template get<int32_t>(0) == 1;
+}
+
+// getField : Entity -> std::optional<Elem> (null for an absent optional member).
+template<typename DescNin, typename DescIn, typename Elem, typename Getter>
+void crossTierNinProperty(const std::vector<Entity>& entities,
+                          const std::vector<std::vector<Elem>>& sets,
+                          const char* cast, Getter getField) {
+    for (const auto& e : entities) {
+        relais_test::flushRedis();
+        std::vector<std::string> pages;
+        pages.reserve(sets.size());
+        for (const auto& s : sets) {
+            decl::ListDescriptorQuery<DescNin> q;
+            q.filters.template get<0>() = s;
+            pages.push_back(registerNinGroup<DescNin>(q));
+        }
+        fireCreate<DescNin>(e);  // one NIN create, Lua scans every registered group
+
+        for (size_t i = 0; i < sets.size(); ++i) {
+            decl::Filters<DescNin> fn;
+            fn.template get<0>() = sets[i];
+            const bool ninL1 = decl::matchesFilters<DescNin>(e, fn);
+            const bool ninL2 = !alive(pages[i]);           // deleted ⇔ matched
+
+            auto wc = decl::buildWhereClause<DescNin>(fn);
+            const std::string arr = paramStr(wc.params.params[0]);
+            const auto fld = getField(e);
+            const bool ninL3 = fld.has_value() && sqlAllVerdict(*fld, arr, cast);
+
+            decl::Filters<DescIn> fi;
+            fi.template get<0>() = sets[i];
+            const bool inL1 = decl::matchesFilters<DescIn>(e, fi);
+
+            CAPTURE(e.id, i, arr, ninL1, ninL2, ninL3, inL1, fld.has_value());
+            CHECK(ninL1 == ninL2);          // tri-tier: L1 == L2 Lua
+            CHECK(ninL1 == ninL3);          // tri-tier: L1 == L3 SQL
+            if (fld.has_value())
+                CHECK(ninL1 == !inL1);      // §7.7.2 dualité holds for a present member
+            else {
+                CHECK_FALSE(ninL1);         // §7.7.3 NIN(NULL) == false
+                CHECK_FALSE(inL1);          // §7.7.3 IN(NULL) == false — negation BREAKS
+            }
+        }
+    }
+}
+
+// Distinct sets (size 0..5) from `pool`, deduped so each group key is unique. The
+// empty set is reachable (NOT IN {} = universe, §1.2).
+template<typename Elem>
+std::vector<std::vector<Elem>> makeSets(std::mt19937& gen,
+                                        const std::vector<Elem>& pool, size_t want) {
+    std::set<std::vector<Elem>> uniq;
+    for (int guard = 0; uniq.size() < want && guard < 2000; ++guard) {
+        size_t sz = gen() % 6;
+        std::set<Elem> s;
+        for (size_t k = 0; k < sz; ++k) s.insert(pool[gen() % pool.size()]);
+        uniq.emplace(s.begin(), s.end());
+    }
+    return {uniq.begin(), uniq.end()};
+}
+
+constexpr size_t kXtEntities = 25;
+constexpr size_t kXtSets = 10;
+
+const std::vector<std::string> kCatPool = {
+    "tech", "science", "news", "sports", "games", "music",
+    "", "a,b", "x{y}", "q\"z"  // array-literal escaping must round-trip through PG
+};
+const std::vector<int64_t> kAuthorPool = {
+    INT64_MIN, -1000, -1, 0, 1, 42, 1000, INT64_MAX
+};
+const std::vector<int32_t> kViewPool = {
+    INT32_MIN, -5, 0, 10, 20, INT32_MAX
+};
+
+std::vector<Entity> makeEntities(std::mt19937& gen, size_t n) {
+    std::vector<Entity> out;
+    out.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        std::optional<int32_t> vc;
+        if (gen() % 5 != 0)  // ~20% null view_count → exercises the NULL break (§7.7.3)
+            vc = kViewPool[gen() % kViewPool.size()];
+        out.push_back(makeArticle(
+            static_cast<int64_t>(i + 1),
+            kCatPool[gen() % kCatPool.size()],
+            kAuthorPool[gen() % kAuthorPool.size()],
+            vc,
+            (gen() % 2) == 0));
+    }
+    return out;
+}
+
+}  // namespace
+
+TEST_CASE("[DeclListNin][xtier] L1/L2/L3 agree + dualité on string anti-membership",
+          "[integration][db][redis][list][nin][xtier]") {
+    TransactionGuard tx;
+    std::mt19937 gen(0xC0FFEE01);
+    auto entities = makeEntities(gen, kXtEntities);
+    auto sets = makeSets<std::string>(gen, kCatPool, kXtSets);
+    crossTierNinProperty<DescNinString, DualInString, std::string>(
+        entities, sets, "text",
+        [](const Entity& e) { return std::optional<std::string>(e.category); });
+}
+
+TEST_CASE("[DeclListNin][xtier] L1/L2/L3 agree + dualité on int64 anti-membership",
+          "[integration][db][redis][list][nin][xtier]") {
+    TransactionGuard tx;
+    std::mt19937 gen(0xC0FFEE02);
+    auto entities = makeEntities(gen, kXtEntities);
+    auto sets = makeSets<int64_t>(gen, kAuthorPool, kXtSets);
+    crossTierNinProperty<DescNinInt64, DualInInt64, int64_t>(
+        entities, sets, "int8",
+        [](const Entity& e) { return std::optional<int64_t>(e.author_id); });
+}
+
+TEST_CASE("[DeclListNin][xtier] L1/L2/L3 agree + NULL break on int32 optional anti-membership",
+          "[integration][db][redis][list][nin][xtier]") {
+    TransactionGuard tx;
+    std::mt19937 gen(0xC0FFEE03);
+    auto entities = makeEntities(gen, kXtEntities);
+    auto sets = makeSets<int32_t>(gen, kViewPool, kXtSets);
+    // view_count is std::optional<int32_t> — ~20% null entities drive §7.7.3: a null
+    // member matches NEITHER NIN nor IN, so the negation dualité does not hold.
+    crossTierNinProperty<DescNinOptInt32, DualInOptInt32, int32_t>(
+        entities, sets, "int4",
+        [](const Entity& e) { return e.view_count; });
+}
+
+TEST_CASE("[DeclListNin][xtier] L1/L2/L3 agree + dualité on bool anti-membership",
+          "[integration][db][redis][list][nin][xtier]") {
+    TransactionGuard tx;
+    std::mt19937 gen(0xC0FFEE04);
+    auto entities = makeEntities(gen, kXtEntities);
+    auto sets = makeSets<bool>(gen, std::vector<bool>{false, true}, kXtSets);
+    crossTierNinProperty<DescNinBool, DualInBool, bool>(
+        entities, sets, "bool",
+        [](const Entity& e) { return std::optional<bool>(e.is_published); });
 }
