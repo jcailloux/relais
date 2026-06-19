@@ -29,7 +29,15 @@
  * `filterSchema` emits '#' for NIN. Both parsers (`parseListQuery` and
  * `parseListQueryStrict`) are covered.
  *
- * The L2 Lua invalidation tests land in later commits (§7.4, §7.5).
+ * Commit 5 adds the L2 selective-invalidation tests (§7.4 create, §7.5 update),
+ * exercising the factored Lua `fmatch` (`is_set` shared cursor advance, NIN's only
+ * own line `(fo==35 and hit)`). These require DB+Redis (TransactionGuard). NIN
+ * placed first/middle/last proves `skipset` keeps the following filter aligned;
+ * IN+NIN coexistence proves both set ops route through `skipset` without cursor
+ * collision; the update cases replay middle-alignment against the SECOND duplicated
+ * Lua script. NULL and empty-set (§1.1/§1.2) verdicts are checked at the L2 tier.
+ *
+ * The cross-tier dualité property suite lands in commit 6 (§7.7).
  */
 
 #include <catch2/catch_test_macros.hpp>
@@ -38,7 +46,9 @@
 #include <string>
 #include <vector>
 
+#include "fixtures/test_helper.h"
 #include "fixtures/generated/TestArticleEntity.h"
+#include <jcailloux/relais/cache/RedisCache.h>
 #include <jcailloux/relais/list/spec/GeneratedTraits.h>
 #include <jcailloux/relais/list/spec/GeneratedFilters.h>
 #include <jcailloux/relais/list/spec/GeneratedCriteria.h>
@@ -49,6 +59,8 @@
 
 namespace decl = jcailloux::relais::list::spec;
 using relais_test::TestArticle;
+using relais_test::sync;              // relais_test::sync, not POSIX ::sync from <unistd.h>
+using relais_test::TransactionGuard;
 using Entity = entity::generated::TestArticleEntity;
 
 // =============================================================================
@@ -510,4 +522,272 @@ TEST_CASE("[DeclListNin] schema: NIN coexists with scalar and IN ops",
     CHECK(decl::filterSchema<DescCombo>() == "8=s#4G");
     // IN author_id(int64) '8@' | NIN category(string) 's#'
     CHECK(decl::filterSchema<DescInNin>() == "8@s#");
+}
+
+// =============================================================================
+// L2 selective invalidation (§7.4 create, §7.5 update) — the Lua `fmatch` factored
+// for IN(@=64)/NIN(#=35). A group's cached page is invalidated iff the created/
+// updated entity WOULD belong to that group's filter. For a NIN filter that means
+// the entity's scalar is NOT in the group's set (verdict inverted from IN).
+//
+// Each page is registered as a 1-byte value "x" — shorter than the bounds header,
+// so the Lua `chk*` short-circuits to "delete". The surviving variable is therefore
+// purely whether `fmatch` matched. Membership is read back via EXISTS. Each
+// TEST_CASE/SECTION starts on a flushed Redis (TransactionGuard).
+// =============================================================================
+
+namespace {
+
+// NIN in FIRST position (EQ after it) — alignment: the filter following the set
+// must read at the right cursor once skipset has consumed the set.
+struct DescNinFirst {
+    using Entity = ::Entity;
+    static constexpr auto filters = std::tuple{
+        decl::Filter<"category", &TestArticle::category, "category", decl::Op::NIN>{},
+        decl::Filter<"author_id", &TestArticle::author_id, "author_id", decl::Op::EQ>{}
+    };
+    static constexpr auto sorts = std::tuple{
+        decl::Sort<"id", &TestArticle::id, "id", decl::SortDirection::Desc>{}
+    };
+};
+
+// NIN in LAST position.
+struct DescNinLast {
+    using Entity = ::Entity;
+    static constexpr auto filters = std::tuple{
+        decl::Filter<"author_id", &TestArticle::author_id, "author_id", decl::Op::EQ>{},
+        decl::Filter<"category", &TestArticle::category, "category", decl::Op::NIN>{}
+    };
+    static constexpr auto sorts = std::tuple{
+        decl::Sort<"id", &TestArticle::id, "id", decl::SortDirection::Desc>{}
+    };
+};
+
+namespace cache_ns = jcailloux::relais::cache;
+using jcailloux::relais::PgProvider;
+
+// Any prefix works — the Lua only strips prefixLen bytes; the suffix must equal
+// groupCacheKey's canonical blob. Mirror ListMixin's "<name>:dlist:g:" shape.
+constexpr std::string_view kNinPrefix = "T:dlist:g:";  // 10 bytes
+constexpr size_t kNinPrefixLen = 10;
+const std::string kNinMaster = "test:nin:l2:master";
+
+template<typename Desc>
+std::string registerNinGroup(const decl::ListDescriptorQuery<Desc>& q) {
+    std::string groupKey = std::string(kNinPrefix) + decl::groupCacheKey<Desc>(q);
+    std::string pageKey = groupKey + ":p";
+    sync(PgProvider::redis("SET", pageKey, "x"));               // < header → chk true
+    sync(PgProvider::redis("SADD", groupKey + ":_keys", pageKey));
+    sync(PgProvider::redis("HSET", kNinMaster, groupKey, "0")); // sort field index 0
+    return pageKey;
+}
+
+bool alive(const std::string& pageKey) {
+    return sync(PgProvider::redis("EXISTS", pageKey)).asInteger() == 1;
+}
+
+template<typename Desc>
+size_t fireCreate(const Entity& e) {
+    return sync(cache_ns::RedisCache::invalidateListGroupsSelective(
+        kNinMaster, kNinPrefixLen, decl::filterSchema<Desc>(),
+        decl::encodeEntityFilterBlob<Desc>(e), "0"));
+}
+
+template<typename Desc>
+size_t fireUpdate(const Entity& oldE, const Entity& newE) {
+    return sync(cache_ns::RedisCache::invalidateListGroupsSelectiveUpdate(
+        kNinMaster, kNinPrefixLen, decl::filterSchema<Desc>(),
+        decl::encodeEntityFilterBlob<Desc>(newE), "0",
+        decl::encodeEntityFilterBlob<Desc>(oldE), "0"));
+}
+
+}  // namespace
+
+TEST_CASE("[DeclListNin][L2] create invalidates groups whose set EXCLUDES the value",
+          "[integration][db][redis][list][nin][l2]") {
+    TransactionGuard tx;
+
+    auto mk = [](std::vector<std::string> set) {
+        decl::ListDescriptorQuery<DescNinString> q;
+        q.filters.get<0>() = std::move(set);
+        return registerNinGroup<DescNinString>(q);
+    };
+    auto g_sd = mk({"spam", "draft"});
+    auto g_n  = mk({"news"});
+    auto g_ns = mk({"news", "sports"});
+
+    SECTION("category=news") {
+        fireCreate<DescNinString>(makeArticle(1, "news", 0));
+        CHECK_FALSE(alive(g_sd));  // news ∉ {spam,draft} → matches NOT IN → invalidated
+        CHECK(alive(g_n));         // news ∈ {news} → no match → kept
+        CHECK(alive(g_ns));        // news ∈ {news,sports} → no match → kept
+    }
+    SECTION("category=spam") {
+        fireCreate<DescNinString>(makeArticle(2, "spam", 0));
+        CHECK(alive(g_sd));        // spam ∈ {spam,draft} → no match → kept
+        CHECK_FALSE(alive(g_n));   // spam ∉ {news} → matches → invalidated
+        CHECK_FALSE(alive(g_ns));  // spam ∉ {news,sports} → matches → invalidated
+    }
+}
+
+TEST_CASE("[DeclListNin][L2] alignment — NIN in middle position (create)",
+          "[integration][db][redis][list][nin][l2]") {
+    TransactionGuard tx;
+    // DescCombo: [EQ author_id][NIN category][GE view_count]
+    auto mk = [](int64_t author, std::vector<std::string> cats, int32_t viewGe) {
+        decl::ListDescriptorQuery<DescCombo> q;
+        q.filters.get<0>() = author;
+        q.filters.get<1>() = std::move(cats);
+        q.filters.get<2>() = viewGe;
+        return registerNinGroup<DescCombo>(q);
+    };
+    auto gAll = mk(42, {"spam"},        10);   // EQ ok, NIN ok (science∉), range ok
+    auto gNin = mk(42, {"science"},     10);   // NIN fails (science∈set)
+    auto gRng = mk(42, {"spam"},        100);  // range AFTER the set fails
+    auto gEq  = mk(99, {"spam"},        10);   // EQ BEFORE the set fails
+
+    fireCreate<DescCombo>(makeArticle(1, "science", 42, 50));
+    CHECK_FALSE(alive(gAll));
+    CHECK(alive(gNin));  // science ∈ {science} → no NIN match
+    CHECK(alive(gRng));  // 50 < 100 — proves skipset left view_count aligned
+    CHECK(alive(gEq));   // author 42 ≠ 99
+}
+
+TEST_CASE("[DeclListNin][L2] alignment — NIN in first position (create)",
+          "[integration][db][redis][list][nin][l2]") {
+    TransactionGuard tx;
+    // DescNinFirst: [NIN category][EQ author_id]
+    auto mk = [](std::vector<std::string> cats, int64_t author) {
+        decl::ListDescriptorQuery<DescNinFirst> q;
+        q.filters.get<0>() = std::move(cats);
+        q.filters.get<1>() = author;
+        return registerNinGroup<DescNinFirst>(q);
+    };
+    auto gMatch  = mk({"spam"}, 42);  // NIN ok (tech∉) + EQ ok
+    auto gEqFail = mk({"spam"}, 99);  // EQ AFTER the set fails
+
+    fireCreate<DescNinFirst>(makeArticle(1, "tech", 42));
+    CHECK_FALSE(alive(gMatch));
+    CHECK(alive(gEqFail));  // author after the set correctly mismatched
+}
+
+TEST_CASE("[DeclListNin][L2] alignment — NIN in last position (create)",
+          "[integration][db][redis][list][nin][l2]") {
+    TransactionGuard tx;
+    // DescNinLast: [EQ author_id][NIN category]
+    auto mk = [](int64_t author, std::vector<std::string> cats) {
+        decl::ListDescriptorQuery<DescNinLast> q;
+        q.filters.get<0>() = author;
+        q.filters.get<1>() = std::move(cats);
+        return registerNinGroup<DescNinLast>(q);
+    };
+    auto gMatch   = mk(42, {"spam"});
+    auto gNinFail = mk(42, {"tech"});
+    auto gEqFail  = mk(99, {"spam"});
+
+    fireCreate<DescNinLast>(makeArticle(1, "tech", 42));
+    CHECK_FALSE(alive(gMatch));
+    CHECK(alive(gNinFail));  // tech ∈ {tech} → no NIN match
+    CHECK(alive(gEqFail));   // author 42 ≠ 99
+}
+
+TEST_CASE("[DeclListNin][L2] IN and NIN coexist — both route through skipset (create)",
+          "[integration][db][redis][list][nin][l2]") {
+    TransactionGuard tx;
+    // DescInNin: [IN author_id][NIN category]. Proves the two set ops both advance
+    // via skipset without colliding on the cursor.
+    auto mk = [](std::vector<int64_t> authors, std::vector<std::string> cats) {
+        decl::ListDescriptorQuery<DescInNin> q;
+        q.filters.get<0>() = std::move(authors);
+        q.filters.get<1>() = std::move(cats);
+        return registerNinGroup<DescInNin>(q);
+    };
+    auto gMatch  = mk({1, 2}, {"spam", "draft"});  // IN ok (1∈) AND NIN ok (tech∉)
+    auto gNinNo  = mk({1, 2}, {"tech", "news"});   // NIN fails (tech∈)
+    auto gInNo   = mk({8, 9}, {"spam"});           // IN fails (1∉) — NIN would pass
+
+    fireCreate<DescInNin>(makeArticle(1, "tech", 1));
+    CHECK_FALSE(alive(gMatch));
+    CHECK(alive(gNinNo));  // tech ∈ {tech,news} → NIN excludes
+    CHECK(alive(gInNo));   // author 1 ∉ {8,9} → IN excludes (and curseur still aligned to NIN)
+}
+
+TEST_CASE("[DeclListNin][L2] optional-null entity matches no NIN group; empty set = universe",
+          "[integration][db][redis][list][nin][l2]") {
+    TransactionGuard tx;
+    // DescNinOptInt32: [NIN view_count] on a std::optional<int32_t> member.
+    auto mk = [](std::optional<std::vector<int32_t>> set) {
+        decl::ListDescriptorQuery<DescNinOptInt32> q;
+        if (set) q.filters.get<0>() = std::move(*set);
+        return registerNinGroup<DescNinOptInt32>(q);
+    };
+    auto gSet   = mk(std::vector<int32_t>{10, 20});
+    auto gEmpty = mk(std::vector<int32_t>{});  // NOT IN {} = universe (§1.2)
+
+    SECTION("non-null value excluded from set matches NIN; empty set matches all") {
+        fireCreate<DescNinOptInt32>(makeArticle(1, "x", 0, 5));
+        CHECK_FALSE(alive(gSet));    // 5 ∉ {10,20} → matches → invalidated
+        CHECK_FALSE(alive(gEmpty));  // 5 ∉ {} → matches universe → invalidated
+    }
+    SECTION("null member matches no NIN group, empty included (§1.1 at L2)") {
+        fireCreate<DescNinOptInt32>(makeArticle(2, "x", 0, std::nullopt));
+        CHECK(alive(gSet));    // null excluded from every set result
+        CHECK(alive(gEmpty));  // null excluded even from NOT IN {} (guard wins)
+    }
+    SECTION("value IN the set does NOT match NIN") {
+        fireCreate<DescNinOptInt32>(makeArticle(3, "x", 0, 20));
+        CHECK(alive(gSet));          // 20 ∈ {10,20} → no NIN match → kept
+        CHECK_FALSE(alive(gEmpty));  // 20 ∉ {} → matches universe → invalidated
+    }
+}
+
+TEST_CASE("[DeclListNin][L2] update invalidates when old XOR new is excluded from the set",
+          "[integration][db][redis][list][nin][l2]") {
+    TransactionGuard tx;
+    auto mk = [](std::vector<std::string> set) {
+        decl::ListDescriptorQuery<DescNinString> q;
+        q.filters.get<0>() = std::move(set);
+        return registerNinGroup<DescNinString>(q);
+    };
+
+    SECTION("asymmetric: old ∈ set (absent), new ∉ set (enters) → invalidated") {
+        auto g = mk({"spam"});
+        // old=spam ∈ {spam} → NIN no-match; new=news ∉ {spam} → NIN match → nm true
+        fireUpdate<DescNinString>(makeArticle(1, "spam", 0), makeArticle(1, "news", 0));
+        CHECK_FALSE(alive(g));
+    }
+    SECTION("both ∉ set → entity stays in result, position may move → invalidated") {
+        auto g = mk({"spam"});
+        // old=news, new=tech: both ∉ {spam} → both NIN-match → invalidated via chk_range
+        fireUpdate<DescNinString>(makeArticle(1, "news", 0), makeArticle(1, "tech", 0));
+        CHECK_FALSE(alive(g));
+    }
+    SECTION("both ∈ set → entity out of result in both states → NOT invalidated") {
+        auto g = mk({"spam", "draft"});
+        // old=spam, new=draft: both ∈ {spam,draft} → neither NIN-matches → no over-invalidation
+        fireUpdate<DescNinString>(makeArticle(1, "spam", 0), makeArticle(1, "draft", 0));
+        CHECK(alive(g));
+    }
+}
+
+TEST_CASE("[DeclListNin][L2] alignment — NIN in middle position (update, 2nd Lua script)",
+          "[integration][db][redis][list][nin][l2]") {
+    TransactionGuard tx;
+    // Replays NIN-middle alignment against the SECOND, duplicated Lua script
+    // (`...Update`) to catch any copy-paste divergence from the create path.
+    auto mk = [](int64_t author, std::vector<std::string> cats, int32_t viewGe) {
+        decl::ListDescriptorQuery<DescCombo> q;
+        q.filters.get<0>() = author;
+        q.filters.get<1>() = std::move(cats);
+        q.filters.get<2>() = viewGe;
+        return registerNinGroup<DescCombo>(q);
+    };
+    auto gAll = mk(42, {"spam"}, 10);   // both old/new NIN-match (tech∉spam), range ok
+    auto gRng = mk(42, {"spam"}, 100);  // range AFTER the set fails for both
+    auto gEq  = mk(99, {"spam"}, 10);   // EQ BEFORE the set fails
+
+    fireUpdate<DescCombo>(makeArticle(1, "tech", 42, 50), makeArticle(1, "tech", 42, 60));
+    CHECK_FALSE(alive(gAll));
+    CHECK(alive(gRng));  // 50,60 both < 100 — UPDATE skipset matches CREATE skipset
+    CHECK(alive(gEq));   // author 42 ≠ 99
 }
