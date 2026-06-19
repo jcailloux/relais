@@ -915,14 +915,19 @@ local function fmatch(bin, blob)
         if gp > #bin or ep > #blob then break end
         local gx = string.byte(bin, gp); local ex = string.byte(blob, ep)
         gp = gp + 1; ep = ep + 1
+        local is_set = (fo == 64 or fo == 35)              -- IN (@) or NOT IN (#): same wire format
         if gx == 0 then
             if ex == 1 then ep = skip(blob, ep, ft) end
         elseif ex == 0 then
-            if fo == 64 then gp = skipset(bin, gp, ft) else gp = skip(bin, gp, ft) end
-            -- null entity matches neither EQ nor IN (no NULL member in a set)
-            if fo == 61 or fo == 64 then return false end
-        elseif fo == 64 then
-            if not cmpin(bin, gp, blob, ep, ft) then return false end
+            -- shared cursor advance: skipset for both set ops, skip otherwise.
+            -- IN and NIN cannot diverge on alignment (mitigates risk #1).
+            if is_set then gp = skipset(bin, gp, ft) else gp = skip(bin, gp, ft) end
+            -- null entity matches neither EQ nor IN nor NOT IN (SQL 3-valued logic)
+            if fo == 61 or is_set then return false end
+        elseif is_set then
+            local hit = cmpin(bin, gp, blob, ep, ft)        -- entity in the group's set?
+            -- IN rejects non-members; NIN rejects members (only NIN-specific line)
+            if (fo == 64 and not hit) or (fo == 35 and hit) then return false end
             gp = skipset(bin, gp, ft); ep = skip(blob, ep, ft)
         else
             if not cmp(bin, gp, blob, ep, ft, fo) then return false end
@@ -1133,14 +1138,19 @@ local function fmatch(bin, blob)
         if gp > #bin or ep > #blob then break end
         local gx = string.byte(bin, gp); local ex = string.byte(blob, ep)
         gp = gp + 1; ep = ep + 1
+        local is_set = (fo == 64 or fo == 35)              -- IN (@) or NOT IN (#): same wire format
         if gx == 0 then
             if ex == 1 then ep = skip(blob, ep, ft) end
         elseif ex == 0 then
-            if fo == 64 then gp = skipset(bin, gp, ft) else gp = skip(bin, gp, ft) end
-            -- null entity matches neither EQ nor IN (no NULL member in a set)
-            if fo == 61 or fo == 64 then return false end
-        elseif fo == 64 then
-            if not cmpin(bin, gp, blob, ep, ft) then return false end
+            -- shared cursor advance: skipset for both set ops, skip otherwise.
+            -- IN and NIN cannot diverge on alignment (mitigates risk #1).
+            if is_set then gp = skipset(bin, gp, ft) else gp = skip(bin, gp, ft) end
+            -- null entity matches neither EQ nor IN nor NOT IN (SQL 3-valued logic)
+            if fo == 61 or is_set then return false end
+        elseif is_set then
+            local hit = cmpin(bin, gp, blob, ep, ft)        -- entity in the group's set?
+            -- IN rejects non-members; NIN rejects members (only NIN-specific line)
+            if (fo == 64 and not hit) or (fo == 35 and hit) then return false end
             gp = skipset(bin, gp, ft); ep = skip(blob, ep, ft)
         else
             if not cmp(bin, gp, blob, ep, ft, fo) then return false end
