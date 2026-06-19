@@ -23,8 +23,13 @@
  * against EQ/range combinations and IN+NIN coexistence. Live-DB round-trip and
  * cross-tier dualité land with the cross-tier suite (§7.7).
  *
- * The L2 Lua and HTTP parsing/canonicalization tests land in later commits
- * (§7.2, §7.4, §7.5).
+ * Commit 4 adds HTTP parsing + canonical key + schema (§7.2, transport-free): the
+ * `is_set_op` switch routes NIN through the shared `parseInList`/`groupCacheKey`
+ * set path (byte-identical encoding to IN — only the verdict differs), and
+ * `filterSchema` emits '#' for NIN. Both parsers (`parseListQuery` and
+ * `parseListQueryStrict`) are covered.
+ *
+ * The L2 Lua invalidation tests land in later commits (§7.4, §7.5).
  */
 
 #include <catch2/catch_test_macros.hpp>
@@ -37,7 +42,10 @@
 #include <jcailloux/relais/list/spec/GeneratedTraits.h>
 #include <jcailloux/relais/list/spec/GeneratedFilters.h>
 #include <jcailloux/relais/list/spec/GeneratedCriteria.h>
+#include <jcailloux/relais/list/spec/HttpQueryParser.h>
 #include <jcailloux/relais/list/spec/SortDescriptor.h>
+
+#include <unordered_map>
 
 namespace decl = jcailloux::relais::list::spec;
 using relais_test::TestArticle;
@@ -400,4 +408,106 @@ TEST_CASE("[DeclListNin] SQL: IN and NIN coexist — two array params, $n correc
     CHECK(paramStr(wc.params.params[0]) == "{1,2}");
     CHECK(paramStr(wc.params.params[1]) == "{spam,draft}");  // raw order — canonicalization is groupCacheKey's job, not the WHERE clause
     CHECK(wc.next_param == 3);
+}
+
+// =============================================================================
+// HTTP parsing + canonical key + schema (§7.2, transport-free). NIN shares the
+// IN set path through `is_set_op`: same `parseInList` (CSV → sort → unique →
+// cap), same `groupCacheKey` byte layout. Only the schema char ('#') is NIN's.
+// We re-test it here because `is_set_op` is a new branch point — a missed
+// `== Op::IN` site would silently route NIN to the scalar `parseValue`.
+// =============================================================================
+
+namespace {
+
+using Params = std::unordered_map<std::string, std::string>;
+
+}  // namespace
+
+TEST_CASE("[DeclListNin] parse: CSV set sorted and deduped into NIN slot",
+          "[list][nin][unit][parse]") {
+    auto q = decl::parseListQuery<DescNinString>(Params{{"category", "spam,draft"}});
+    REQUIRE(q.filters.get<0>().has_value());
+    CHECK(*q.filters.get<0>() == std::vector<std::string>{"draft", "spam"});  // sorted
+}
+
+TEST_CASE("[DeclListNin] parse: order/dups → identical group key (shared canon)",
+          "[list][nin][unit][parse]") {
+    auto a = decl::parseListQuery<DescNinString>(Params{{"category", "draft,spam"}});
+    auto b = decl::parseListQuery<DescNinString>(Params{{"category", "spam,draft,spam"}});
+    CHECK(a.group_key == b.group_key);
+}
+
+TEST_CASE("[DeclListNin] parse: invalid int elements dropped", "[list][nin][unit][parse]") {
+    auto q = decl::parseListQuery<DescNinInt64>(Params{{"author_id", "1,abc,3"}});
+    REQUIRE(q.filters.get<0>().has_value());
+    CHECK(*q.filters.get<0>() == std::vector<int64_t>{1, 3});
+}
+
+TEST_CASE("[DeclListNin] parse: empty value leaves NIN inactive (≡ NOT IN {} = universe, §1.2)",
+          "[list][nin][unit][parse]") {
+    // No valid element → filter inactive. For NIN this is exactly the desired
+    // semantics: inactive ≡ unfiltered ≡ NOT IN {} = universe (unlike IN, where
+    // inactive is a compromise vs the empty-set = ∅).
+    auto q = decl::parseListQuery<DescNinInt64>(Params{{"author_id", "abc,xyz"}});
+    CHECK_FALSE(q.filters.get<0>().has_value());
+}
+
+TEST_CASE("[DeclListNin] parse: element count capped at 256", "[list][nin][unit][parse]") {
+    std::string csv;
+    for (int i = 0; i < 300; ++i) {
+        if (i) csv += ',';
+        csv += std::to_string(i);
+    }
+    auto q = decl::parseListQuery<DescNinInt64>(Params{{"author_id", csv}});
+    REQUIRE(q.filters.get<0>().has_value());
+    CHECK(q.filters.get<0>()->size() == 256);
+}
+
+TEST_CASE("[DeclListNin] parse: strict rejects undeclared, accepts well-formed NIN",
+          "[list][nin][unit][parse]") {
+    SECTION("undeclared param → error") {
+        auto r = decl::parseListQueryStrict<DescNinString>(Params{{"bogus", "x"}});
+        REQUIRE_FALSE(r.has_value());
+    }
+    SECTION("well-formed NIN → ok, canonical set in slot") {
+        auto r = decl::parseListQueryStrict<DescNinString>(
+            Params{{"category", "spam,draft,spam"}});
+        REQUIRE(r.has_value());
+        REQUIRE(r->filters.get<0>().has_value());
+        CHECK(*r->filters.get<0>() == std::vector<std::string>{"draft", "spam"});
+    }
+}
+
+TEST_CASE("[DeclListNin] parse: HTTP IN and NIN produce the same canonical set",
+          "[list][nin][unit][parse]") {
+    // Same CSV parsed under IN[0] vs NIN[1] of the coexistence descriptor: the
+    // set payload is byte-identical (encoding is shared); the ops differ only at
+    // verdict time. Here author_id is IN, category is NIN — parse both.
+    auto q = decl::parseListQuery<DescInNin>(
+        Params{{"author_id", "2,1,2"}, {"category", "spam,draft,spam"}});
+    REQUIRE(q.filters.get<0>().has_value());
+    REQUIRE(q.filters.get<1>().has_value());
+    CHECK(*q.filters.get<0>() == std::vector<int64_t>{1, 2});            // IN, canonical
+    CHECK(*q.filters.get<1>() == std::vector<std::string>{"draft", "spam"});  // NIN, canonical
+}
+
+// =============================================================================
+// Compact filter schema (§4.5) — NIN's operator char is '#' (ASCII 35), free of
+// every other op code (=61 !33 >62 G71 <60 L76 @64). Type char is the element
+// type, shared with IN. The schema drives the L2 Lua binary parser (commit 5).
+// =============================================================================
+
+TEST_CASE("[DeclListNin] schema: NIN operator char is '#'", "[list][nin][unit][parse]") {
+    CHECK(decl::filterSchema<DescNinString>() == "s#");   // string element, NIN
+    CHECK(decl::filterSchema<DescNinInt64>() == "8#");    // int64 element, NIN
+    CHECK(decl::filterSchema<DescNinBool>() == "1#");     // bool → '1'
+}
+
+TEST_CASE("[DeclListNin] schema: NIN coexists with scalar and IN ops",
+          "[list][nin][unit][parse]") {
+    // EQ author_id(int64) '8=' | NIN category(string) 's#' | GE view_count(int32) '4G'
+    CHECK(decl::filterSchema<DescCombo>() == "8=s#4G");
+    // IN author_id(int64) '8@' | NIN category(string) 's#'
+    CHECK(decl::filterSchema<DescInNin>() == "8@s#");
 }
