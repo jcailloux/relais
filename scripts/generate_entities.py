@@ -79,7 +79,7 @@ class EnumMapping:
 class FilterConfig:
     param: str      # HTTP query parameter name
     field: str      # Struct field name (→ &Entity::field)
-    op: str = "eq"  # Comparison operator: eq, ne, gt, ge, lt, le
+    op: str = "eq"  # Comparison operator: eq, ne, gt, ge, lt, le, in, nin
 
 
 @dataclass
@@ -351,23 +351,32 @@ class StructParser:
             filterable:date_from:ge -> custom param + GE operator
             filterable:in           -> IN operator on field_name
             filterable:cats:in      -> custom param + IN operator
+            filterable:nin          -> NIN operator on field_name
+            filterable:cats:not_in  -> custom param + NIN operator (alias)
         """
-        # "in" must be a known op so the short form `filterable:in` is parsed as
-        # the IN operator. Without it, `:in` falls through to the custom-param
-        # branch and silently becomes an EQ filter on an HTTP param named "in".
-        KNOWN_OPS = {"eq", "ne", "gt", "ge", "lt", "le", "gte", "lte", "in"}
+        # "in"/"nin" must be known ops so the short forms `filterable:in` and
+        # `filterable:nin` are parsed as set operators. Without it, `:in` falls
+        # through to the custom-param branch and silently becomes an EQ filter on
+        # an HTTP param named "in". `not_in` is a readable alias for `nin`.
+        KNOWN_OPS = {"eq", "ne", "gt", "ge", "lt", "le", "gte", "lte",
+                     "in", "nin", "not_in"}
+
+        def _norm(o: str) -> str:
+            return (o.replace("gte", "ge").replace("lte", "le")
+                     .replace("not_in", "nin"))
+
         parts = tag.split(":")
         if len(parts) == 1:
             return FilterConfig(param=field_name, field=field_name)
         elif len(parts) == 2:
             val = parts[1]
             if val in KNOWN_OPS:
-                op = val.replace("gte", "ge").replace("lte", "le")
-                return FilterConfig(param=field_name, field=field_name, op=op)
+                return FilterConfig(param=field_name, field=field_name,
+                                    op=_norm(val))
             return FilterConfig(param=val, field=field_name)
         else:
-            op = parts[2].replace("gte", "ge").replace("lte", "le")
-            return FilterConfig(param=parts[1], field=field_name, op=op)
+            return FilterConfig(param=parts[1], field=field_name,
+                                op=_norm(parts[2]))
 
     @staticmethod
     def _parse_sortable_tag(field_name: str, tag: str) -> SortConfig:
