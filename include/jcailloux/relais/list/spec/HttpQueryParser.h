@@ -145,10 +145,12 @@ std::string groupCacheKey(const ListDescriptorQuery<Descriptor>& query) {
         ([&] {
             using FilterType = filter_at<Descriptor, Is>;
             const auto& filter_value = query.filters.template get<Is>();
-            if constexpr (FilterType::op == Op::IN) {
-                // IN set: [presence][count:u32][elem×count]. Canonicalize (sort+
-                // unique) defensively here, not only in the parser, so filters
-                // built programmatically also hash to a stable group_key.
+            if constexpr (FilterType::is_set_op) {
+                // Set op (IN/NIN): [presence][count:u32][elem×count]. Encoding is
+                // byte-identical for both — only the match verdict differs (L1/L2/
+                // L3), never the key. Canonicalize (sort+unique) defensively here,
+                // not only in the parser, so filters built programmatically also
+                // hash to a stable group_key.
                 buf.push_back(filter_value.has_value() ? 1 : 0);
                 if (filter_value) {
                     auto sorted = *filter_value;
@@ -248,7 +250,7 @@ std::string encodeEntityFilterBlob(const typename Descriptor::Entity& entity) {
 /// Generate a compact filter schema string for Lua binary parsing.
 /// 2 characters per filter: type char + operator char.
 /// Type: 's'=string, '8'=int64_t, '4'=int32_t, '1'=bool/uint8_t.
-/// Operator: '='=EQ, '!'=NE, '>'=GT, 'G'=GE, '<'=LT, 'L'=LE, '@'=IN.
+/// Operator: '='=EQ, '!'=NE, '>'=GT, 'G'=GE, '<'=LT, 'L'=LE, '@'=IN, '#'=NIN.
 template<typename Descriptor>
     requires ValidListDescriptor<Descriptor>
 std::string filterSchema() {
@@ -274,6 +276,7 @@ std::string filterSchema() {
             else if constexpr (op == Op::LT) schema += '<';
             else if constexpr (op == Op::LE) schema += 'L';
             else if constexpr (op == Op::IN) schema += '@';
+            else if constexpr (op == Op::NIN) schema += '#';
         }(), ...);
     }(std::make_index_sequence<filter_count<Descriptor>>{});
 
@@ -299,9 +302,11 @@ ListDescriptorQuery<Descriptor> parseListQuery(const Map& params) {
             auto name = std::string(FilterType::name.view());
 
             if (auto it = params.find(name); it != params.end()) {
-                if constexpr (FilterType::op == Op::IN) {
-                    // IN: comma-separated set; empty (no valid element) leaves the
-                    // filter inactive → list stays unfiltered (no HTTP empty-set).
+                if constexpr (FilterType::is_set_op) {
+                    // Set op (IN/NIN): comma-separated set; empty (no valid element)
+                    // leaves the filter inactive → list stays unfiltered. For NIN
+                    // this coincides with the intended "NOT IN {} = universe"
+                    // (§1.2): inactive ≡ unfiltered ≡ universe. No HTTP empty-set.
                     auto vals = detail::parseInList<typename FilterType::element_type>(it->second);
                     if (!vals.empty()) {
                         query.filters.template get<Is>() = std::move(vals);
@@ -415,7 +420,7 @@ std::expected<ListDescriptorQuery<Descriptor>, QueryValidationError> parseListQu
             auto name = std::string(FilterType::name.view());
 
             if (auto it = params.find(name); it != params.end()) {
-                if constexpr (FilterType::op == Op::IN) {
+                if constexpr (FilterType::is_set_op) {
                     auto vals = detail::parseInList<typename FilterType::element_type>(it->second);
                     if (!vals.empty()) {
                         query.filters.template get<Is>() = std::move(vals);
