@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- **`nin` list filter operator (set anti-membership).** `filterable:nin` (alias `not_in`) is the logical inverse of `in`: it matches a column against *none* of a comma-separated value set, reusing the `in` parsing, canonicalization, binary format, and cache key. Element types, the 256 bound, and the compile-time `enum`/converter rejection are shared with `in`. SQL uses `!= ALL($n)` mirroring `= ANY($n)`. NULL column values match neither `in` nor `nin` (three-valued logic — `nin` is the negation of `in` only on non-NULL rows); the empty set is the universe (`nin {}` matches everything, opposite of `in {}`).
+
 ## [0.5.0-alpha.8] - 2026-06-18
 
 ### Added

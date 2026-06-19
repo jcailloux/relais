@@ -34,8 +34,11 @@ struct AuditLog {
 | `filterable:date_from:ge` | `date_from` | GE |
 | `filterable:in` | field name | IN (set membership) |
 | `filterable:authors:in` | `authors` | IN |
+| `filterable:nin` | field name | NIN (set anti-membership) |
+| `filterable:authors:not_in` | `authors` | NIN |
 
-Known operators: `eq`, `ne`, `gt`, `ge`/`gte`, `lt`, `le`/`lte`, `in`.
+Known operators: `eq`, `ne`, `gt`, `ge`/`gte`, `lt`, `le`/`lte`, `in`,
+`nin`/`not_in`.
 
 Multiple filters on one field (range queries):
 
@@ -56,6 +59,31 @@ Boolean filter values — for `in` and scalar `eq` alike — accept the standard
 HTTP / HTML-form conventions, case-insensitively: `true/1/t/yes/y/on` and
 `false/0/f/no/n/off`. Any other token leaves the filter inactive rather than
 defaulting to `false`.
+
+### `nin` operator (set anti-membership)
+
+`filterable:nin` (alias `not_in`) is the logical inverse of `in`: it matches a
+column whose value is in *none* of the set. It shares the `in` machinery
+end-to-end — same comma-separated HTTP param, same canonicalization (dedup +
+sort), same element types (`int64`, `int32`, `std::string`, `bool`), same 256
+bound, same compile-time rejection of `enum` and converters. SQL uses
+`!= ALL($n)` with a single array param, mirroring `in`'s `= ANY($n)`.
+
+Two semantics differ from `in`:
+
+- **NULL is excluded, not included.** A NULL column value matches neither `in`
+  nor `nin` — `value NOT IN (…)` is SQL three-valued NULL, so the row drops out.
+  `nin` is *not* the negation of `in` on NULL rows; it is on every non-NULL row.
+- **The empty set is the universe.** `nin {}` matches everything (`!= ALL('{}')`
+  is `TRUE`), the exact opposite of `in {}` matching nothing. As with `in`, an
+  empty set is unreachable over HTTP (an empty param leaves the filter inactive,
+  which coincides with "match everything"); it exists only by construction.
+
+Consumer note: `!= ALL($n)` is non-sargable on Postgres (anti-membership), so a
+`nin` filter is bounded by keyset pagination, not an index seek. Invalidation
+churn is higher than `in` — the complement is far less selective, so a write is
+more likely to fall inside a cached `nin` group and purge its page. Per-operation
+cost is identical to `in` (same `cmpin`/`skipset`, same Redis round-trip).
 
 ### `sortable` syntax
 
