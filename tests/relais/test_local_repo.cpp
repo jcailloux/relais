@@ -1078,8 +1078,11 @@ TEST_CASE("LocalRepo - findJson",
         auto result2 = sync(L1TestUserRepo::findJson(id));
         REQUIRE(!result2.empty());
         REQUIRE(result2.find("cache_json") != std::string::npos);
-        // Balance should still be 10 (stale from L1 cache)
-        REQUIRE(result2.find("999") == std::string::npos);
+        // Balance should still be 10 (stale from L1 cache). Match the keyed field,
+        // not a bare "999": the db_managed id comes from a never-rolled-back
+        // sequence and its decimal occasionally contains "999" → false positive.
+        REQUIRE(result2.find("\"balance\":10") != std::string::npos);
+        REQUIRE(result2.find("\"balance\":999") == std::string::npos);
     }
 }
 
