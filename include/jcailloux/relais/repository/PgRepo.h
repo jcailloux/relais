@@ -323,6 +323,22 @@ public:
 protected:
 
     // =====================================================================
+    // Batch invalidation common path (chemin commun)
+    // =====================================================================
+    //
+    // invalidateManyImpl(span<const E>) is the shared downstream of every
+    // batch op (invalidateMany/eraseMany/...): the affected set is resolved to
+    // a vector<E> upstream, then this cascades L1 evict + L2 UNLINK + list
+    // invalidation + deduplicated cross-inval through the mixin chain — exactly
+    // the per-tier work of the mono invalidate(id), batched. L3 (this layer)
+    // owns no entity cache, so the base is a no-op terminator.
+
+    static io::Task<void> invalidateManyImpl(
+        [[maybe_unused]] std::span<const E> entities) {
+        co_return;
+    }
+
+    // =====================================================================
     // Epoch memory pool for temporary entity allocations
     // =====================================================================
 

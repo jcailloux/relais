@@ -1,11 +1,37 @@
 #ifndef JCX_RELAIS_REPOSITORY_INVALIDATEON_H
 #define JCX_RELAIS_REPOSITORY_INVALIDATEON_H
 
+#include <algorithm>
 #include <optional>
+#include <span>
 #include <utility>
+#include <vector>
 #include "jcailloux/relais/io/Task.h"
 
 namespace jcailloux::relais {
+
+namespace detail {
+
+/// Sort + unique a key list by value. The result equals set(input): a distinct
+/// key is NEVER dropped (the dangerous failure mode — a stale survivor), and
+/// duplicates collapse idempotently. Pure (no I/O): the unit-testable core of
+/// batch cross-invalidation, where N source events fold to M ≤ N distinct
+/// target keys invalidated once each.
+template<typename K>
+[[nodiscard]] std::vector<K> dedupSorted(std::vector<K> keys) {
+    std::sort(keys.begin(), keys.end());
+    keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+    return keys;
+}
+
+/// Awaited value type of an awaitable expression (Task<T>/Immediate<T> → T).
+/// Lets a batch resolver deduce its result container without a real co_await.
+template<typename T> struct awaited { using type = T; };
+template<typename T> struct awaited<io::Task<T>> { using type = T; };
+template<typename T> struct awaited<io::Immediate<T>> { using type = T; };
+template<typename T> using awaited_t = typename awaited<std::decay_t<T>>::type;
+
+}  // namespace detail
 
 // =============================================================================
 // Cross-invalidation — choose based on use case:
@@ -92,6 +118,26 @@ struct Invalidate {
         }
     }
 
+    /// Pure: deduplicated target keys for a batch of deleted source entities.
+    /// No I/O — the unit-testable core (N entities → M ≤ N distinct keys).
+    template<typename E>
+    static auto targetKeysForDelete(std::span<const E> entities) {
+        using KeyT = decltype(extractKey(std::declval<E>()));
+        std::vector<KeyT> keys;
+        keys.reserve(entities.size());
+        for (const auto& e : entities) keys.push_back(extractKey(e));
+        return detail::dedupSorted(std::move(keys));
+    }
+
+    /// Batch delete cross-invalidation: one Cache::invalidate per *distinct*
+    /// target key. A set of N source entities sharing M targets costs M
+    /// invalidations, not N — the dedup win the per-entity fold can't get.
+    template<typename E>
+    static io::Task<void> invalidateManyForDelete(std::span<const E> entities) {
+        for (const auto& k : targetKeysForDelete<E>(entities))
+            co_await Cache::invalidate(k);
+    }
+
 private:
     template<typename E>
     static auto extractKey(const E& entity) {
@@ -168,6 +214,18 @@ struct InvalidateList {
             }
         }
     }
+
+    /// Batch delete: per-entity loop. A list cache has no scalar key to
+    /// deduplicate (the predicate/blob match is the unit of work); the foreign
+    /// list cache batches its own tracker internally. Correct, not yet
+    /// single-bump-collapsed.
+    template<typename E>
+    static io::Task<void> invalidateManyForDelete(std::span<const E> entities) {
+        for (const auto& e : entities) {
+            auto data = InvalidationData<E>::forDelete(e);
+            co_await invalidateWithData(data);
+        }
+    }
 };
 
 // =============================================================================
@@ -204,6 +262,35 @@ struct InvalidateVia {
         if (new_key && (!old_key || *new_key != *old_key)) {
             auto targets = co_await Resolver(*new_key);
             for (const auto& tk : targets)
+                co_await TargetCache::invalidate(tk);
+        }
+    }
+
+    /// Batch delete: dedup source keys, resolve, dedup target keys, invalidate
+    /// each target once. The resolver runs once per *distinct source* by
+    /// default; if it exposes a span overload (`Resolver(span<const KeyT>)`)
+    /// the N source lookups collapse into a single round-trip (opt-in batch).
+    template<typename E>
+    static io::Task<void> invalidateManyForDelete(std::span<const E> entities) {
+        using KeyT = decltype(extractKey(std::declval<E>()));
+        std::vector<KeyT> sources;
+        sources.reserve(entities.size());
+        for (const auto& e : entities) sources.push_back(extractKey(e));
+        sources = detail::dedupSorted(std::move(sources));
+
+        if constexpr (requires { Resolver(std::span<const KeyT>(sources)); }) {
+            // Opt-in batch resolver: one call collapses N source lookups.
+            auto targets = co_await Resolver(std::span<const KeyT>(sources));
+            for (const auto& tk : detail::dedupSorted(std::move(targets)))
+                co_await TargetCache::invalidate(tk);
+        } else {
+            using TargetVec = detail::awaited_t<decltype(Resolver(std::declval<KeyT>()))>;
+            TargetVec targets;
+            for (const auto& s : sources) {
+                auto resolved = co_await Resolver(s);
+                for (auto& t : resolved) targets.push_back(std::move(t));
+            }
+            for (const auto& tk : detail::dedupSorted(std::move(targets)))
                 co_await TargetCache::invalidate(tk);
         }
     }
@@ -261,11 +348,30 @@ struct InvalidateListVia {
             co_await resolveAndInvalidate(*new_key);
     }
 
+    /// Batch delete: dedup source keys (collapses resolver calls for entities
+    /// sharing a source), then resolve+invalidate. The resolver runs once per
+    /// distinct source by default; a `Resolver(span<const KeyT>)` overload
+    /// collapses them into a single round-trip (opt-in batch).
+    template<typename E>
+    static io::Task<void> invalidateManyForDelete(std::span<const E> entities) {
+        using KeyT = decltype(extractKey(std::declval<E>()));
+        std::vector<KeyT> sources;
+        sources.reserve(entities.size());
+        for (const auto& e : entities) sources.push_back(extractKey(e));
+        sources = detail::dedupSorted(std::move(sources));
+
+        if constexpr (requires { Resolver(std::span<const KeyT>(sources)); }) {
+            co_await invalidateResolved(co_await Resolver(std::span<const KeyT>(sources)));
+        } else {
+            for (const auto& s : sources)
+                co_await resolveAndInvalidate(s);
+        }
+    }
+
 private:
-    template<typename KeyT>
-    static io::Task<void> resolveAndInvalidate(const KeyT& key) {
-        auto resolved = co_await Resolver(key);
-        using ResolvedType = std::decay_t<decltype(resolved)>;
+    template<typename Resolved>
+    static io::Task<void> invalidateResolved(Resolved resolved) {
+        using ResolvedType = std::decay_t<Resolved>;
 
         if constexpr (detail::is_optional<ResolvedType>::value) {
             if (!resolved) {
@@ -278,6 +384,11 @@ private:
             for (const auto& target : resolved)
                 co_await ListRepo::invalidateByTarget(target.filters, target.sort_value);
         }
+    }
+
+    template<typename KeyT>
+    static io::Task<void> resolveAndInvalidate(const KeyT& key) {
+        co_await invalidateResolved(co_await Resolver(key));
     }
 
     template<typename E>
@@ -304,6 +415,13 @@ struct InvalidateOn {
     static io::Task<void> propagateWithData(const InvalidationData<E>& data) {
         (co_await Dependencies::template invalidateWithData<E>(data), ...);
     }
+
+    /// Batch delete propagation: each dependency folds its N source events into
+    /// a deduplicated invalidation (cf. per-variant invalidateManyForDelete).
+    template<typename E>
+    static io::Task<void> propagateDeleteMany(std::span<const E> entities) {
+        (co_await Dependencies::template invalidateManyForDelete<E>(entities), ...);
+    }
 };
 
 template<>
@@ -315,6 +433,11 @@ struct InvalidateOn<> {
 
     template<typename E>
     static io::Task<void> propagateWithData(const InvalidationData<E>&) {
+        co_return;
+    }
+
+    template<typename E>
+    static io::Task<void> propagateDeleteMany(std::span<const E>) {
         co_return;
     }
 };
@@ -344,6 +467,11 @@ template<typename E, typename InvalidatesType>
 io::Task<void> propagateDelete(const E& entity) {
     auto data = InvalidationData<E>::forDelete(entity);
     co_await propagateInvalidationsWithData<E, InvalidatesType>(data);
+}
+
+template<typename E, typename InvalidatesType>
+io::Task<void> propagateDeleteMany(std::span<const E> entities) {
+    co_await InvalidatesType::template propagateDeleteMany<E>(entities);
 }
 
 // =============================================================================
