@@ -584,7 +584,7 @@ const std::string kNinMaster = "test:nin:l2:master";
 
 template<typename Desc>
 std::string registerNinGroup(const decl::ListDescriptorQuery<Desc>& q) {
-    std::string groupKey = std::string(kNinPrefix) + decl::groupCacheKey<Desc>(q);
+    std::string groupKey = std::string(kNinPrefix) + decl::groupKey<Desc>(q.filters, q.sort);
     std::string pageKey = groupKey + ":p";
     sync(PgProvider::redis("SET", pageKey, "x"));               // < header → chk true
     sync(PgProvider::redis("SADD", groupKey + ":_keys", pageKey));
