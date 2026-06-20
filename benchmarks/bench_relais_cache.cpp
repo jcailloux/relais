@@ -1472,3 +1472,164 @@ TEST_CASE("Benchmark - findMany batched read", "[benchmark][findmany]") {
         WARN(formatTable("findMany mixed (50% L1 hit, misses batched)", mixed));
     }
 }
+
+
+// #############################################################################
+//
+//  13. eraseMany / invalidateMany — batched write vs N × mono
+//
+//  Both collapse N enumerated keys into one cascade:
+//    - eraseMany(N)      → ONE  DELETE WHERE pk = ANY($1) RETURNING  (L3, one
+//                          round-trip) + ONE batched UNLINK (L2), vs N sequential
+//                          DELETE + N UNLINK for N × erase.
+//    - invalidateMany(N) → ONE  variadic UNLINK sub-chunked at K_redis (L2), vs N
+//                          UNLINK for N × invalidate. Rows persist (evict only).
+//
+//  FullCache (L1+L2) exercises the multi-tier batch; the win is read directly off
+//  latency — N × mono scales linearly with N (sequential RTTs), batch stays flat.
+//
+// #############################################################################
+
+TEST_CASE("Benchmark - batch erase / invalidate", "[benchmark][batch]") {
+    TransactionGuard tx;
+    WARN(gdsf_banner());
+
+    static constexpr int POOL = 128;
+    const std::vector<int> Ns = {8, 32, 128};
+
+    // --- A. eraseMany(N) vs N × erase — FullCache cold (L1+L2 primed, deleted) --
+    // Rows are consumed each sample → re-insert + re-prime in setup (unmeasured).
+    {
+        std::vector<int64_t> live;
+        live.reserve(POOL);
+
+        auto reinsert = [&](int n) {
+            live.clear();
+            for (int i = 0; i < n; ++i) {
+                auto id = insertTestUser(
+                    "em_bench_" + std::to_string(i),
+                    "emb" + std::to_string(i) + "@test.com", i);
+                sync(FullCacheTestUserRepo::find(id));   // prime L1+L2
+                live.push_back(id);
+            }
+        };
+
+        std::vector<BenchResult> erase;
+        for (int n : Ns) {
+            erase.push_back(benchWithSetup(
+                "eraseMany(" + std::to_string(n) + ")",
+                [&, n]() { reinsert(n); },
+                [&]() { doNotOptimize(sync(FullCacheTestUserRepo::eraseMany(
+                            std::span<const int64_t>(live)))); }));
+            erase.push_back(benchWithSetup(
+                std::to_string(n) + " x erase",
+                [&, n]() { reinsert(n); },
+                [&]() {
+                    for (auto id : live)
+                        doNotOptimize(sync(FullCacheTestUserRepo::erase(id)));
+                }));
+        }
+        WARN(formatTable("eraseMany vs N x erase (L1+L2, 1 DELETE ANY vs N RTT)", erase));
+    }
+
+    // --- B. invalidateMany(N) vs N × invalidate — FullCache warm (rows persist) -
+    // invalidateMany batches the L2 UNLINK; rows are NOT deleted → fixed pool,
+    // re-prime L1+L2 in setup.
+    {
+        std::vector<int64_t> ids;
+        ids.reserve(POOL);
+        for (int i = 0; i < POOL; ++i)
+            ids.push_back(insertTestUser(
+                "im_bench_" + std::to_string(i),
+                "imb" + std::to_string(i) + "@test.com", i));
+
+        auto prime = [&](int n) {
+            for (int k = 0; k < n; ++k) sync(FullCacheTestUserRepo::find(ids[k]));
+        };
+
+        std::vector<BenchResult> inval;
+        for (int n : Ns) {
+            inval.push_back(benchWithSetup(
+                "invalidateMany(" + std::to_string(n) + ")",
+                [&, n]() { prime(n); },
+                [&, n]() { sync(FullCacheTestUserRepo::invalidateMany(
+                            std::span<const int64_t>(ids.data(), n))); }));
+            inval.push_back(benchWithSetup(
+                std::to_string(n) + " x invalidate",
+                [&, n]() { prime(n); },
+                [&, n]() {
+                    for (int k = 0; k < n; ++k)
+                        sync(FullCacheTestUserRepo::invalidate(ids[k]));
+                }));
+        }
+        WARN(formatTable("invalidateMany vs N x invalidate (L1+L2, batched UNLINK)", inval));
+    }
+}
+
+
+// #############################################################################
+//
+//  14. eraseWhere / invalidateWhere — predicate-driven batch
+//
+//  The predicate resolves its own affected set server-side, so the caller never
+//  enumerates ids:
+//    - invalidateWhere(P) → ONE SELECT WHERE P (resolve) + the same cascade
+//      invalidateMany runs over explicit ids. The delta vs invalidateMany(ids)
+//      is exactly the resolve round-trip — priced against not knowing the ids.
+//    - eraseWhere(P)      → ONE DELETE WHERE P RETURNING (resolve + delete fused)
+//      + ONE RangeModification (L1 own-list) + ONE predicate EVAL (L2 own-list),
+//      O(1)/O(groups), regardless of matched-set size.
+//
+// #############################################################################
+
+TEST_CASE("Benchmark - predicate erase / invalidate (where)", "[benchmark][where]") {
+    TransactionGuard tx;
+    TestInternals::resetListCacheState<TestArticleListRepo>();
+
+    static constexpr int M = 64;
+
+    // Author A — persistent set for invalidateWhere (no delete).
+    auto A = insertTestUser("where_bench_a", "where_bench_a@test.com", 0);
+    std::vector<int64_t> articleIds;
+    articleIds.reserve(M);
+    for (int i = 0; i < M; ++i)
+        articleIds.push_back(insertTestArticle(
+            "tech", A, "WB_" + std::to_string(i), i * 10));
+
+    // --- invalidateWhere vs invalidateMany(ids) — isolate the resolve cost ------
+    {
+        auto primeGroup = [&]() {
+            sync(TestArticleListRepo::query(makeArticleQuery(std::nullopt, A, 100)));
+            for (auto id : articleIds) sync(TestArticleListRepo::find(id));
+        };
+        std::vector<BenchResult> inval;
+        inval.push_back(benchWithSetup("invalidateWhere({author})",
+            primeGroup,
+            [&]() { sync(TestArticleListRepo::invalidateWhere({.author_id = A})); }));
+        inval.push_back(benchWithSetup("invalidateMany(ids)",
+            primeGroup,
+            [&]() { sync(TestArticleListRepo::invalidateMany(
+                        std::span<const int64_t>(articleIds))); }));
+        WARN(formatTable("invalidateWhere vs invalidateMany (resolve round-trip cost)", inval));
+    }
+
+    // --- eraseWhere absolute latency — author B, re-inserted each sample --------
+    {
+        auto B = insertTestUser("where_bench_b", "where_bench_b@test.com", 0);
+        std::vector<int64_t> live;
+        live.reserve(M);
+        auto reinsert = [&]() {
+            live.clear();
+            for (int i = 0; i < M; ++i)
+                live.push_back(insertTestArticle("tech", B, "EW_" + std::to_string(i), i * 10));
+            sync(TestArticleListRepo::query(makeArticleQuery(std::nullopt, B, 100)));
+            for (auto id : live) sync(TestArticleListRepo::find(id));
+        };
+        std::vector<BenchResult> erase;
+        erase.push_back(benchWithSetup(
+            "eraseWhere({author}) [" + std::to_string(M) + " rows]",
+            reinsert,
+            [&]() { doNotOptimize(sync(TestArticleListRepo::eraseWhere({.author_id = B}))); }));
+        WARN(formatTable("eraseWhere predicate delete (1 DELETE RETURNING + 1 RangeMod + 1 EVAL)", erase));
+    }
+}
