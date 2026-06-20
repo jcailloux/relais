@@ -810,6 +810,17 @@ class MappingGenerator:
         lines.append(
             f'            "DELETE FROM {table_name} WHERE {pk_where}";')
 
+        # Batch DELETE by enumerated keys — reuses the same `batch_where` shape as
+        # select_by_pk_batch (= ANY($1) for a scalar key, unnest-tuple for a
+        # composite). RETURNING projects every column: eraseMany gets the deleted
+        # entities back in one statement to feed downstream invalidation, exactly
+        # like the mono-key `old` capture. Partition pruning is intentionally
+        # absent — pk=ANY scans all partitions, acceptable for a batch purge.
+        lines.append(f"        static constexpr const char* delete_by_pk_batch =")
+        lines.append(
+            f'            "DELETE FROM {table_name} WHERE {batch_where} '
+            f'RETURNING {all_cols_str}";')
+
         # Partition-pruned DELETE (when partition_keys present, distinct from composite PK)
         if a.partition_keys:
             hint_where_parts = [f"{col} = ${i+1}" for i, col in enumerate(pk_cols)]
