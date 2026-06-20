@@ -1124,3 +1124,214 @@ TEST_CASE("Concurrency - findMany detached L2 fill drains before teardown",
         REQUIRE(awaitL2Key(k).has_value());
     }
 }
+
+
+// #############################################################################
+//
+//  §6 — Batch invalidation concurrency (plan erase-invalidate-batch)
+//
+//  The batch paths add new shared mutable state the mono paths never touched:
+//  the per-key generation bump driven from invalidateMany/eraseMany, and the
+//  ModificationTracker's second track (RangeModification) driven by eraseWhere.
+//  These cases race those exact surfaces. Worker threads only assert robustness
+//  (the `parallel` error counter); the metamorphic correctness lives in the
+//  post-quiescence main-thread checks, which are interleaving-independent
+//  (delete/evict are idempotent, so the settled state is deterministic).
+//
+// #############################################################################
+
+
+// -----------------------------------------------------------------------------
+//  §6.1+6.2 — invalidateMany (batch bumpGeneration) vs concurrent L1 fills
+//
+//  A reader re-fills L1 from L3 for the whole pool while a second thread runs
+//  invalidateMany over the same pool: each batched bump races an in-flight fill
+//  of the (now stale) entry. The bump must win — a stale fill must never resurrect
+//  past the invalidation. invalidate evicts caches only (rows stay in L3), so the
+//  settled read fills every slot; a survivor would mean a fill outran its bump.
+// -----------------------------------------------------------------------------
+
+template<typename Repo>
+static void runInvalidateManyVsFills(const std::vector<int64_t>& pool) {
+    parallel(NUM_THREADS, [&](int t) {
+        for (int j = 0; j < OPS_PER_THREAD; ++j) {
+            if (t % 2 == 0) {
+                // Reader — re-fill L1 from L3 for every pooled id, racing the bump.
+                for (auto id : pool) sync(Repo::find(id));
+            } else {
+                // Batch invalidator — one bumpGeneration per key, in one cascade.
+                sync(Repo::invalidateMany(std::span<const int64_t>(pool)));
+            }
+        }
+    });
+
+    // Quiescent: invalidate never deletes → every row resolves from L3.
+    auto view = findManyView<Repo>(pool);
+    int missing = 0;
+    for (size_t i = 0; i < view.size(); ++i) if (!view[i]) ++missing;
+    REQUIRE(missing == 0);
+}
+
+TEST_CASE("Concurrency - invalidateMany vs concurrent fills",
+          "[integration][db][concurrency][tsan][batch]")
+{
+    TransactionGuard tx;
+
+    constexpr int POOL = 10;
+    std::vector<int64_t> pool;
+    for (int i = 0; i < POOL; ++i) {
+        pool.push_back(insertTestUser("conc_im_" + std::to_string(i),
+                                      "conc_im_" + std::to_string(i) + "@x", i));
+    }
+
+    SECTION("[L1] batch bump vs fills") {
+        findManyView<L1TestUserRepo>(pool);
+        runInvalidateManyVsFills<L1TestUserRepo>(pool);
+    }
+
+    SECTION("[L1+L2] batch bump vs fills") {
+        findManyView<FullCacheTestUserRepo>(pool);
+        runInvalidateManyVsFills<FullCacheTestUserRepo>(pool);
+    }
+}
+
+
+// -----------------------------------------------------------------------------
+//  §6.3 — eraseMany vs mono erase on overlapping keys (idempotence)
+//
+//  Half the threads batch-erase the first 60% of the pool, the other half
+//  mono-erase the last 60% — the middle 20% is double-deleted from both paths
+//  concurrently. A double DELETE … RETURNING yields zero rows the second time;
+//  the eviction must stay idempotent (no crash, no ghost hit). After quiescence
+//  every targeted id is gone on all three tiers (no L1 phantom over a deleted row).
+// -----------------------------------------------------------------------------
+
+template<typename Repo>
+static void runEraseManyVsMono(const std::vector<int64_t>& ids) {
+    const size_t lo = ids.size() * 4 / 10;   // mono start (overlap begins)
+    const size_t hi = ids.size() * 6 / 10;   // batch end   (overlap ends)
+    std::vector<int64_t> batchSub(ids.begin(), ids.begin() + hi);
+
+    parallel(NUM_THREADS, [&](int t) {
+        for (int j = 0; j < 4; ++j) {
+            if (t % 2 == 0) {
+                sync(Repo::eraseMany(std::span<const int64_t>(batchSub)));
+            } else {
+                for (size_t i = lo; i < ids.size(); ++i) sync(Repo::erase(ids[i]));
+            }
+        }
+    });
+
+    // Idempotent convergence: every id deleted by one path or the other is gone.
+    for (auto id : ids) {
+        REQUIRE(sync(Repo::find(id)) == nullptr);
+    }
+}
+
+TEST_CASE("Concurrency - eraseMany vs mono erase overlapping keys",
+          "[integration][db][concurrency][tsan][batch][erase]")
+{
+    TransactionGuard tx;
+
+    constexpr int POOL = 20;
+
+    SECTION("[L1] batch and mono erase overlap") {
+        std::vector<int64_t> ids;
+        for (int i = 0; i < POOL; ++i)
+            ids.push_back(insertTestItem("conc_em_l1_" + std::to_string(i), i));
+        runEraseManyVsMono<L1TestItemRepo>(ids);
+    }
+
+    SECTION("[L1+L2] batch and mono erase overlap") {
+        std::vector<int64_t> ids;
+        for (int i = 0; i < POOL; ++i)
+            ids.push_back(insertTestItem("conc_em_both_" + std::to_string(i), i));
+        runEraseManyVsMono<FullCacheTestItemRepo>(ids);
+    }
+}
+
+
+// -----------------------------------------------------------------------------
+//  §6.4 — concurrent eraseWhere with overlapping predicates
+//
+//  {author = A} and {category = tech} both match A's tech articles. Two thread
+//  groups hammer the two predicates concurrently: each call appends a
+//  RangeModification (notifyRangeDeleted bumps the shared generation + flips the
+//  range bitmap) while the other deletes rows underneath. Convergence is
+//  interleaving-independent: everything matching either predicate is gone.
+// -----------------------------------------------------------------------------
+
+TEST_CASE("Concurrency - concurrent eraseWhere overlapping predicates",
+          "[integration][db][concurrency][tsan][batch][where]")
+{
+    TransactionGuard tx;
+    TestInternals::resetListCacheState<TestArticleListRepo>();
+
+    auto A = insertTestUser("conc_ew_a", "conc_ew_a@x", 0);
+    auto B = insertTestUser("conc_ew_b", "conc_ew_b@x", 0);
+    for (int i = 0; i < 8; ++i) {
+        insertTestArticle("tech", A, "TA_" + std::to_string(i), i);
+        insertTestArticle("news", A, "NA_" + std::to_string(i), i);
+        insertTestArticle("tech", B, "TB_" + std::to_string(i), i);
+    }
+
+    auto qA   = makeArticleQuery(std::nullopt, A, 50);
+    auto qTech = makeArticleQuery("tech", std::nullopt, 50);
+    REQUIRE(sync(TestArticleListRepo::query(qA))->size() == 16);     // warm: A's tech+news
+    REQUIRE(sync(TestArticleListRepo::query(qTech))->size() == 16);  // warm: A+B tech
+
+    parallel(NUM_THREADS, [&](int t) {
+        for (int j = 0; j < OPS_PER_THREAD / 8; ++j) {
+            if (t % 2 == 0) {
+                sync(TestArticleListRepo::eraseWhere({.author_id = A}));
+            } else {
+                sync(TestArticleListRepo::eraseWhere({.category = std::string("tech")}));
+            }
+        }
+    });
+
+    // Convergence: author A fully purged; every tech article (A's + B's) purged.
+    CHECK(sync(TestArticleListRepo::query(qA))->size() == 0);
+    CHECK(sync(TestArticleListRepo::query(qTech))->size() == 0);
+}
+
+
+// -----------------------------------------------------------------------------
+//  §6.5 — RangeModification production vs concurrent drainChunk / sweep
+//
+//  eraseWhere appends a RangeModification on every call (even at zero rows, the
+//  predicate fast-path still fires). Producers race a sweeper (drainChunk clears
+//  range bits under the two-phase lock) and a querier (forEachRangeWithBitmap
+//  consumes them lazily) — atomic_ref<BitmapType> on TrackedRange.pending_segments
+//  under TSan. A deterministic post-drain proves both tracks empty and reusable.
+// -----------------------------------------------------------------------------
+
+TEST_CASE("Concurrency - eraseWhere RangeModification vs concurrent sweep",
+          "[integration][db][concurrency][tsan][batch][where][tracker]")
+{
+    TransactionGuard tx;
+    TestInternals::resetListCacheState<TestArticleListRepo>();
+
+    auto A = insertTestUser("conc_rm_a", "conc_rm_a@x", 0);
+    for (int i = 0; i < 10; ++i)
+        insertTestArticle("tech", A, "RM_" + std::to_string(i), i * 10);
+
+    auto qA = makeArticleQuery(std::nullopt, A);
+
+    parallel(NUM_THREADS, [&](int t) {
+        for (int j = 0; j < OPS_PER_THREAD / 2; ++j) {
+            if (t == 0) {
+                trySweep<TestArticleListRepo>();                  // drainChunk (range track)
+            } else if (t == 1) {
+                sync(TestArticleListRepo::query(qA));             // lazy range consumption
+            } else {
+                sync(TestArticleListRepo::eraseWhere({.author_id = A}));  // RangeModification
+            }
+        }
+    });
+
+    // Deterministic drain (no concurrent writers) → both tracks empty, reusable.
+    TestInternals::forceFullListCleanup<TestArticleListRepo>();
+    REQUIRE(TestInternals::pendingRangeCount<TestArticleListRepo>() == 0);
+    REQUIRE(TestInternals::pendingModificationCount<TestArticleListRepo>() == 0);
+}
