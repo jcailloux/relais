@@ -39,7 +39,10 @@ namespace {
 
 template<typename Repo, typename Key>
 std::vector<typename Repo::EntityType> eraseManyRawSync(std::span<const Key> ids) {
-    return sync(TestInternals::eraseManyRaw<Repo>(ids));
+    // eraseManyRaw now returns optional (nullopt = DB error); these cases all
+    // expect success, so unwrap to the underlying vector.
+    auto r = sync(TestInternals::eraseManyRaw<Repo>(ids));
+    return r ? std::move(*r) : std::vector<typename Repo::EntityType>{};
 }
 
 // COUNT(*) over a table with an optional predicate appended (literal — test-only).

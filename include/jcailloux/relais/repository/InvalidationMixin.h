@@ -152,9 +152,10 @@ protected:
     /// distinct target keys invalidated once, materialized by value before any
     /// invalidation — the InvalidationData raw pointers never outlive this
     /// frame), then delegates the entity/list tiers down the chain.
+    template<bool WithLists = true>
     static io::Task<void> invalidateManyImpl(std::span<const Entity> entities) {
         co_await propagateDeleteMany<Entity, InvList>(entities);
-        co_await Base::invalidateManyImpl(entities);
+        co_await Base::template invalidateManyImpl<WithLists>(entities);
     }
 
     friend struct ::relais_test::TestInternals;

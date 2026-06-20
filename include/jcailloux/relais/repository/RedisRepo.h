@@ -284,13 +284,14 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
         /// Evict the whole affected set from L2 in one variadic UNLINK batch
         /// (sub-chunked at K_redis by RedisCache::invalidateMany), then delegate
         /// down the chain. ⌈N/K_redis⌉ round-trips instead of N evictRedis.
+        template<bool WithLists = true>
         static io::Task<void> invalidateManyImpl(std::span<const E> entities) {
             std::vector<std::string> keys;
             keys.reserve(entities.size());
             for (const auto& e : entities) keys.push_back(makeRedisKey(e.key()));
             co_await cache::RedisCache::invalidateMany(
                 std::span<const std::string>(keys));
-            co_await Base::invalidateManyImpl(entities);
+            co_await Base::template invalidateManyImpl<WithLists>(entities);
         }
 
         // =====================================================================

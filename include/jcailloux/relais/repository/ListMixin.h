@@ -467,16 +467,22 @@ protected:
     // WithContext variants — accept pre-fetched old entity from upper mixin
     // =========================================================================
 
-    /// Batch invalidation common path — list tier. Invalidates the list pages
-    /// touched by every affected entity (L1 tracker + L2 blob-array selective),
-    /// then delegates to the entity tiers. Per-entity loop for correctness; the
-    /// single-bump L1 + single-EVAL L2 collapse is a downstream optimization.
+    /// Batch invalidation common path — list tier. When WithLists (eraseMany),
+    /// invalidates the list pages touched by every affected entity (L1 tracker +
+    /// L2 blob-array selective) — the entity left the table, like mono erase.
+    /// When !WithLists (invalidateMany), the entity still exists so its lists are
+    /// left intact, matching mono invalidate (ListMixin::invalidate is a no-op on
+    /// lists). Per-entity loop for correctness; the single-bump L1 + single-EVAL
+    /// L2 collapse is a downstream optimization.
+    template<bool WithLists = true>
     static io::Task<void> invalidateManyImpl(std::span<const Entity> entities) {
-        for (const auto& e : entities) {
-            if constexpr (kHasL1) { listCache().onEntityDeleted(e); }
-            if constexpr (kHasL2) { co_await invalidateL2Deleted(e); }
+        if constexpr (WithLists) {
+            for (const auto& e : entities) {
+                if constexpr (kHasL1) { listCache().onEntityDeleted(e); }
+                if constexpr (kHasL2) { co_await invalidateL2Deleted(e); }
+            }
         }
-        co_await Base::invalidateManyImpl(entities);
+        co_await Base::template invalidateManyImpl<WithLists>(entities);
     }
 
     static io::Task<bool> updateWithContext(
