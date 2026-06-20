@@ -29,6 +29,7 @@
 #include "fixtures/test_helper.h"
 #include "fixtures/TestRepositories.h"
 #include "fixtures/RelaisTestAccessors.h"
+#include "fixtures/generated/TestFilterOnlyEntity.h"
 
 #include <jcailloux/relais/repository/InvalidateOn.h>
 
@@ -510,4 +511,166 @@ TEST_CASE("eraseMany propagates deduplicated cross-inval to the target repo",
     // Purchases deleted; both target users invalidated via deduped cross-inval.
     REQUIRE_FALSE(TestInternals::getFromCache<L1TestUserRepo>(u1));
     REQUIRE_FALSE(TestInternals::getFromCache<L1TestUserRepo>(u2));
+}
+
+// ===========================================================================
+// Étape 6 — public eraseWhere / invalidateWhere (predicate, HasFilterSet)
+// ===========================================================================
+
+// §1 — concept availability (compile-time). The decorrelation: a filters-only
+// entity exposes a FilterSet (→ where-variants) WITHOUT a ListDescriptor (so
+// ListMixin stays out of its chain); a list entity's ListDescriptor inherits
+// its FilterSet, so it satisfies both.
+static_assert(jcailloux::relais::HasFilterSet<
+                  entity::generated::TestFilterOnlyEntity>,
+    "filters-only entity must expose a FilterSet");
+static_assert(!jcailloux::relais::HasListDescriptor<
+                  entity::generated::TestFilterOnlyEntity>,
+    "filters-only entity must NOT carry a ListDescriptor");
+static_assert(jcailloux::relais::HasFilterSet<TestArticleEntity>,
+    "a list entity's ListDescriptor inherits its FilterSet");
+static_assert(jcailloux::relais::HasListDescriptor<TestArticleEntity>,
+    "TestArticle is a list entity");
+
+namespace {
+
+// Full-cache Article repo (L1+L2+L3 + own lists) for the where oracle.
+using WhereArticleRepo = jcailloux::relais::Repo<
+    TestArticleEntity, "test:article:where:both", cfg::Both>;
+
+using ArticlePred = jcailloux::relais::FilterSet<TestArticleEntity>;
+
+// The predicate's reference id set, resolved straight from L3.
+std::vector<int64_t> articleIdsByAuthor(int64_t author) {
+    auto r = execQueryArgs(
+        "SELECT id FROM relais_test_articles WHERE author_id = $1 ORDER BY id",
+        author);
+    std::vector<int64_t> ids;
+    for (int i = 0; i < r.rows(); ++i) ids.push_back(r[i].get<int64_t>(0));
+    return ids;
+}
+
+int64_t articleCount() {
+    return execQuery("SELECT COUNT(*) FROM relais_test_articles")[0]
+        .get<int64_t>(0);
+}
+
+int64_t articleCountByAuthor(int64_t author) {
+    return execQueryArgs(
+        "SELECT COUNT(*) FROM relais_test_articles WHERE author_id = $1",
+        author)[0].get<int64_t>(0);
+}
+
+}  // namespace
+
+// §5 — selectivity: the predicate deletes exactly its matched rows from L3,
+// returns their count, leaves the rest. Designated-init names the param.
+TEST_CASE("eraseWhere deletes exactly the predicate's rows from L3",
+          "[public][where][integration][db]") {
+    TransactionGuard tx;
+    auto author = insertTestUser("ew_a", "ew_a@x", 0);
+    auto other = insertTestUser("ew_b", "ew_b@x", 0);
+    insertTestArticle("tech", author, "A1", 10);
+    insertTestArticle("news", author, "A2", 20);
+    insertTestArticle("tech", author, "A3", 30);
+    insertTestArticle("tech", other, "B1", 40);
+    insertTestArticle("tech", other, "B2", 50);
+
+    auto n = sync(WhereArticleRepo::eraseWhere({.author_id = author}));
+    REQUIRE(n.has_value());
+    REQUIRE(*n == 3);
+    REQUIRE(articleCountByAuthor(author) == 0);
+    REQUIRE(articleCountByAuthor(other) == 2);  // untouched
+}
+
+// §2 — oracle: eraseWhere(P) ≡ eraseMany(SELECT pk WHERE P). Two symmetric
+// author sets; the predicate path and the resolved-id path must agree on count
+// and final state.
+TEST_CASE("eraseWhere ≡ eraseMany over the resolved id set",
+          "[public][where][oracle][integration][db]") {
+    TransactionGuard tx;
+    auto a = insertTestUser("ewo_a", "ewo_a@x", 0);
+    auto b = insertTestUser("ewo_b", "ewo_b@x", 0);
+    for (int i = 0; i < 3; ++i) {
+        insertTestArticle("tech", a, "A" + std::to_string(i), i);
+        insertTestArticle("tech", b, "B" + std::to_string(i), i);
+    }
+
+    auto idsB = articleIdsByAuthor(b);
+    auto nWhere = sync(WhereArticleRepo::eraseWhere({.author_id = a}));
+    auto nMany = sync(WhereArticleRepo::eraseMany(std::span<const int64_t>(idsB)));
+
+    REQUIRE(nWhere.has_value());
+    REQUIRE(nMany.has_value());
+    REQUIRE(*nWhere == *nMany);
+    REQUIRE(*nWhere == 3);
+    REQUIRE(articleCount() == 0);  // both authors' rows gone
+}
+
+// §3 — invalidateWhere evicts the cache for the matched rows but leaves L3
+// intact (the rows still exist → a later find refetches fresh). Proven by the
+// staleness trick: warm, mutate L3 directly, invalidate, observe the fresh value.
+TEST_CASE("invalidateWhere evicts cache by predicate, keeps L3",
+          "[public][where][integration][db][redis]") {
+    TransactionGuard tx;
+    auto author = insertTestUser("iw_a", "iw_a@x", 0);
+    auto id1 = insertTestArticle("tech", author, "T1", 10);
+    auto id2 = insertTestArticle("tech", author, "T2", 20);
+
+    sync(WhereArticleRepo::find(id1));  // warm L1+L2
+    sync(WhereArticleRepo::find(id2));
+
+    updateTestArticle(id1, "T1", 111);  // mutate L3 behind the cache
+    updateTestArticle(id2, "T2", 222);
+
+    sync(WhereArticleRepo::invalidateWhere({.author_id = author}));
+
+    auto v1 = sync(WhereArticleRepo::find(id1));
+    auto v2 = sync(WhereArticleRepo::find(id2));
+    REQUIRE(v1);
+    REQUIRE(v2);
+    REQUIRE((*v1).view_count == 111);  // refetched fresh, not the stale 10
+    REQUIRE((*v2).view_count == 222);
+    REQUIRE(articleCountByAuthor(author) == 2);  // still in L3
+}
+
+// §2 — oracle: invalidateWhere(P) ≡ invalidateMany(SELECT pk WHERE P). Both
+// leave L3 intact and evict the matched set; symmetric authors must agree.
+TEST_CASE("invalidateWhere ≡ invalidateMany over the resolved id set",
+          "[public][where][oracle][integration][db][redis]") {
+    TransactionGuard tx;
+    auto a = insertTestUser("iwo_a", "iwo_a@x", 0);
+    auto b = insertTestUser("iwo_b", "iwo_b@x", 0);
+    auto a1 = insertTestArticle("tech", a, "A1", 10);
+    auto b1 = insertTestArticle("tech", b, "B1", 10);
+
+    for (int64_t id : {a1, b1}) sync(WhereArticleRepo::find(id));
+    updateTestArticle(a1, "A1", 777);
+    updateTestArticle(b1, "B1", 777);
+
+    auto idsB = articleIdsByAuthor(b);
+    sync(WhereArticleRepo::invalidateWhere({.author_id = a}));
+    sync(WhereArticleRepo::invalidateMany(std::span<const int64_t>(idsB)));
+
+    auto va = sync(WhereArticleRepo::find(a1));
+    auto vb = sync(WhereArticleRepo::find(b1));
+    REQUIRE((*va).view_count == 777);  // both evicted → both fresh
+    REQUIRE((*vb).view_count == 777);
+    REQUIRE(articleCount() == 2);  // neither path deleted
+}
+
+// §5 — empty predicate is an unconditional purge of the table.
+TEST_CASE("eraseWhere with an empty predicate purges every row",
+          "[public][where][integration][db]") {
+    TransactionGuard tx;
+    auto a = insertTestUser("ewp_a", "ewp_a@x", 0);
+    insertTestArticle("tech", a, "P1", 1);
+    insertTestArticle("news", a, "P2", 2);
+    insertTestArticle("tech", a, "P3", 3);
+    REQUIRE(articleCount() == 3);
+
+    auto n = sync(WhereArticleRepo::eraseWhere(ArticlePred{}));
+    REQUIRE(n.has_value());
+    REQUIRE(*n == 3);
+    REQUIRE(articleCount() == 0);
 }
