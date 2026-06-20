@@ -115,6 +115,65 @@ Each cached Redis page carries a 19-byte binary header with sort-bounds
 metadata. For per-page granularity, a Lua script reads those headers atomically
 (`GETRANGE`) and deletes only the affected pages — one Redis round-trip.
 
+## Batch and predicate erase / invalidate
+
+Beyond the per-id `erase`/`invalidate`, four methods act on a set of rows in a
+single cascade. `eraseMany`/`invalidateMany` take an enumerated key set;
+`eraseWhere`/`invalidateWhere` take a predicate that resolves its own set
+server-side. `erase*` removes the rows from L3; `invalidate*` only evicts caches
+(rows persist, a later read repopulates).
+
+| Method | Input | L3 | Lists | Return |
+|---|---|---|---|---|
+| `eraseMany(span<const Key>)` | enumerated keys | `DELETE … WHERE pk = ANY` | dropped (rows gone) | `optional<size_t>` rows deleted |
+| `invalidateMany(span<const Key>)` | enumerated keys | untouched | kept (rows persist) | `void` |
+| `eraseWhere(pred)` | `FilterSet<E>` predicate | `DELETE … WHERE pred RETURNING` | dropped via predicate fast-path | `optional<size_t>` rows deleted |
+| `invalidateWhere(pred)` | `FilterSet<E>` predicate | untouched | kept | `void` |
+
+`optional<size_t>` mirrors mono `erase`: `nullopt` is a DB error, `0` a valid
+non-matching set. `eraseMany`/`invalidateMany` require an L1-bearing repo and a
+`Key`; `eraseWhere`/`invalidateWhere` require `HasFilterSet<E>`. `erase*`
+additionally requires a writable (`!read_only`) config.
+
+### Enumerated keys — `eraseMany` / `invalidateMany`
+
+```cpp
+std::vector<int64_t> ids = {1, 2, 3, 2};   // duplicates collapse by equality
+auto n = co_await UserRepo::eraseMany(ids); // *n == 3 (deduped, absent ids skip)
+
+co_await UserRepo::invalidateMany(ids);     // evict only, rows stay in L3
+```
+
+The input is `span<const Key>` — the zero-copy, caller-owned convention shared
+with `findMany`. Both dedup the input by equality first (composite/partition
+keys model `==` but not `<`). Across the hierarchy the cascade collapses to one
+round-trip per tier: `eraseMany` issues one `DELETE WHERE pk = ANY($1) RETURNING`
+(the `RETURNING` set is the affected-entity source — no extra read) and one
+batched `UNLINK`; `invalidateMany` issues one batched `UNLINK`, sub-chunked at
+`K_redis`. Cross-invalidation declared via `Invalidations...` is **deduplicated**
+across the whole set before propagating.
+
+### Predicate — `eraseWhere` / `invalidateWhere`
+
+The predicate is the generated named aggregate `FilterSet<E>`, built with
+designated initializers (field names match the entity's `filterable` columns):
+
+```cpp
+auto n = co_await ArticleRepo::eraseWhere({.author_id = 42});
+co_await ArticleRepo::eraseWhere({.category = std::string("tech")});
+
+co_await ArticleRepo::invalidateWhere({.author_id = 42});  // evict only
+```
+
+`eraseWhere` fuses resolve and delete in one `DELETE WHERE pred RETURNING`;
+`invalidateWhere` resolves via one `SELECT WHERE pred`, then evicts. The entity
+tier evicts per resolved row (L1 + L2 + deduped cross-inval). The **own-list**
+tier is driven by the predicate, not the resolved id set: `eraseWhere` emits
+exactly **one `RangeModification` (L1) + one predicate-driven `EVAL` (L2)** for
+the whole deleted set — O(1)/O(groups), filter-aware, never-miss — see
+[the predicate list fast-path](lists.md#predicate-erase-and-invalidate). The
+oracle holds: `invalidateWhere(P)` ≡ `invalidateMany(ids resolved by P)`.
+
 ## Propagation behavior
 
 **Modification ops** (`insert`, `update`, `erase`):

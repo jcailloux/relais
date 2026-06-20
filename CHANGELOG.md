@@ -4,6 +4,20 @@
 
 ### Added
 
+- **Batch and predicate erase / invalidate.** Four set-oriented methods beside
+  the per-id pair. `eraseMany(span<const Key>)` / `invalidateMany(span<const Key>)`
+  take an enumerated, deduped key set; `eraseWhere(pred)` / `invalidateWhere(pred)`
+  take a generated `FilterSet<E>` predicate (designated initializers) that resolves
+  its own set server-side. `erase*` deletes from L3 and returns `optional<size_t>`
+  rows deleted (`nullopt` = DB error, parité mono); `invalidate*` only evicts caches
+  (rows persist) and returns `void`. The cascade collapses to one round-trip per
+  tier — `eraseMany` is one `DELETE … WHERE pk = ANY RETURNING` + one batched
+  `UNLINK`; cross-invalidation is deduplicated across the whole set. `eraseWhere`'s
+  own-list invalidation is predicate-driven (one `RangeModification` L1 + one `EVAL`
+  L2, O(1)/O(groups), filter-aware, never-miss — never `purgeAll`), not the resolved
+  id set. `eraseMany`/`invalidateMany` need an L1-bearing repo and a `Key`;
+  `eraseWhere`/`invalidateWhere` need `HasFilterSet<E>`; `erase*` needs `!read_only`.
+
 - **`nin` list filter operator (set anti-membership).** `filterable:nin` (alias `not_in`) is the logical inverse of `in`: it matches a column against *none* of a comma-separated value set, reusing the `in` parsing, canonicalization, binary format, and cache key. Element types, the 256 bound, and the compile-time `enum`/converter rejection are shared with `in`. SQL uses `!= ALL($n)` mirroring `= ANY($n)`. NULL column values match neither `in` nor `nin` (three-valued logic — `nin` is the negation of `in` only on non-NULL rows); the empty set is the universe (`nin {}` matches everything, opposite of `in {}`).
 
 ## [0.5.0-alpha.8] - 2026-06-18
