@@ -73,6 +73,38 @@ struct SortBounds {
             return value >= first_value && value <= last_value;
         }
     }
+
+    /// Range generalization of isValueInRange: does the closed predicate range
+    /// [lo,hi] overlap this page's effective sort range? A page is invalidated by
+    /// a predicate delete iff some value it could hold falls in [lo,hi]. The page
+    /// extents mirror isValueInRange exactly (so the per-entity point check is the
+    /// degenerate lo==hi case), with the open-ended first/incomplete pages
+    /// extending to ±∞ on the unbounded side.
+    [[nodiscard]] bool isRangeInRange(
+        int64_t lo,
+        int64_t hi,
+        bool is_first_page,
+        bool is_incomplete,
+        bool is_descending
+    ) const noexcept {
+        if (!is_valid) {
+            return true;  // Empty page or no bounds - conservatively assume overlap
+        }
+
+        if (is_descending) {
+            // DESC page covers [last_value, first_value]; open ends to ±∞.
+            if (is_first_page && is_incomplete) return true;
+            if (is_first_page) return hi >= last_value;        // [last, +∞)
+            if (is_incomplete) return lo <= first_value;       // (-∞, first]
+            return lo <= first_value && hi >= last_value;      // [last, first]
+        } else {
+            // ASC page covers [first_value, last_value]; open ends to ±∞.
+            if (is_first_page && is_incomplete) return true;
+            if (is_first_page) return lo <= last_value;        // (-∞, last]
+            if (is_incomplete) return hi >= first_value;       // [first, +∞)
+            return lo <= last_value && hi >= first_value;      // [first, last]
+        }
+    }
 };
 
 // =============================================================================
@@ -285,8 +317,17 @@ public:
     using ResultView = jcailloux::relais::cache::CacheView<Result>;
     using Modification = EntityModification<E>;
 
-    using ModTracker = ModificationTracker<E, ChunkCount>;
+    // The tracker carries predicate range modifications (eraseWhere fast-path)
+    // as well as per-entity ones; the payload is a copy of the predicate filters.
+    using ModTracker = ModificationTracker<E, ChunkCount, FilterSet>;
     using BitmapType = typename ModTracker::BitmapType;
+
+    /// Whether Traits exposes the predicate fast-path hooks (only ListMixin's
+    /// adapter does). The range consumption path is compiled out otherwise.
+    static constexpr bool kHasPredicateTraits = requires(const FilterSet& p, size_t i) {
+        { Traits::predicateGroupCompatible(p, p) } -> std::convertible_to<bool>;
+        Traits::predicateSortRange(p, i);
+    };
 
 private:
     using CacheKey = std::string;
@@ -403,6 +444,16 @@ public:
         modifications_.notifyDeleted(entity, gen);
     }
 
+    /// Record a predicate range delete (eraseWhere fast-path): a single tracker
+    /// entry that invalidates every cached page a deleted row could have lived in,
+    /// instead of one entity modification per deleted row (O(1) vs O(N) tracker).
+    void onEntityRangeDeleted(const FilterSet& predicate) {
+        static_assert(kHasPredicateTraits,
+            "onEntityRangeDeleted requires Traits with predicate fast-path hooks");
+        uint32_t gen = generation_.fetch_add(1, std::memory_order_relaxed) + 1;
+        modifications_.notifyRangeDeleted(predicate, gen);
+    }
+
     /// Invalidate a specific query.
     void invalidate(const Query& query) {
         tier_.evict(query.cacheKey());
@@ -486,6 +537,17 @@ private:
                 }
             });
 
+        if constexpr (kHasPredicateTraits) {
+            modifications_.forEachRange(
+                [&](const FilterSet& predicate, uint32_t gen) {
+                    if (affected) return;
+                    if (gen <= stored_gen) return;
+                    if (isRangeAffecting(predicate, meta.query, meta.sort_bounds, result)) {
+                        affected = true;
+                    }
+                });
+        }
+
         return affected;
     }
 
@@ -514,7 +576,44 @@ private:
                 }
             });
 
+        if constexpr (kHasPredicateTraits) {
+            modifications_.forEachRangeWithBitmap(
+                [&](const FilterSet& predicate, uint32_t gen, BitmapType pending_chunks) {
+                    if (affected) return;
+                    if ((pending_chunks & (BitmapType{1} << chunk_id)) == 0) return;
+                    if (gen <= stored_gen) return;
+                    if (isRangeAffecting(predicate, meta.query, meta.sort_bounds, result)) {
+                        affected = true;
+                    }
+                });
+        }
+
         return affected;
+    }
+
+    /// Check if a predicate range delete affects a cached page. Two gates, both
+    /// never-miss: the page's group must be filter-compatible with the predicate
+    /// (else no deleted row lived here), and the predicate's value range on the
+    /// page's sort dimension must overlap the page's [first,last].
+    bool isRangeAffecting(const FilterSet& predicate,
+                          const Query& query,
+                          const SortBounds& bounds,
+                          const Result& result) const {
+        if constexpr (kHasPredicateTraits) {
+            if (!Traits::predicateGroupCompatible(predicate, query.filters)) {
+                return false;
+            }
+            const auto sort = query.sort.value_or(Traits::defaultSort());
+            const auto range = Traits::predicateSortRange(predicate, sort.field);
+            if (!bounds.is_valid) return true;
+            const bool is_first_page = query.cursor.empty();
+            const bool is_incomplete = result.items.size() < query.limit;
+            const bool is_descending = (sort.direction == SortDirection::Desc);
+            return bounds.isRangeInRange(range.lo, range.hi,
+                                         is_first_page, is_incomplete, is_descending);
+        } else {
+            return false;
+        }
     }
 
     /// Check if a single modification affects a cached page
