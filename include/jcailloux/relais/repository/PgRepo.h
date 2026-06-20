@@ -344,6 +344,15 @@ protected:
         co_return;
     }
 
+    /// Terminal no-op for the predicate list fast-path (eraseWhere). L3 has no
+    /// list cache; the real work lives in ListMixin when present. Always-present
+    /// bottom of the chain so the call resolves even without a ListDescriptor.
+    template<typename Desc>
+    static io::Task<void> invalidateWhereLists(
+        [[maybe_unused]] const list::spec::Filters<Desc>& predicate) {
+        co_return;
+    }
+
     // =====================================================================
     // Epoch memory pool for temporary entity allocations
     // =====================================================================
