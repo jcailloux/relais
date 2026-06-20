@@ -466,11 +466,15 @@ protected:
     /// caller drives chunk-by-chunk invalidation. The same statement re-runs each
     /// round: the ctid sub-select keeps matching the not-yet-deleted remainder, so
     /// the bound caps lock/WAL pressure per statement, never the total set.
-    /// Templated on the filter Descriptor (the entity-level HasFilterSet concept +
-    /// generator-emitted standalone FilterSet land in step 6).
+    ///
+    /// nullopt signals a DB error (parité mono erase / eraseManyRaw): a failure
+    /// mid-loop is indistinguishable from "nothing matched" otherwise. An empty
+    /// vector means the predicate matched no row. RETURNING projects all columns
+    /// (the `*`-equivalent, always valid); compile-time column projection is a
+    /// bandwidth optimisation deferred (never affects correctness).
     template<typename Descriptor>
         requires list::spec::ValidFilterSet<Descriptor> && (!Cfg.read_only)
-    static io::Task<std::vector<E>> eraseWhereRaw(
+    static io::Task<std::optional<std::vector<E>>> eraseWhereRaw(
         const list::spec::Filters<Descriptor>& filters)
     {
         std::vector<E> out;
@@ -497,7 +501,45 @@ protected:
             co_return out;
         } catch (const io::PgError& e) {
             RELAIS_LOG_ERROR << name() << ": eraseWhereRaw DB error - " << e.what();
-            co_return std::vector<E>{};
+            co_return std::nullopt;
+        }
+    }
+
+    /// Predicate select: the read-side twin of eraseWhereRaw. Resolves the rows
+    /// matching `filters` (SELECT <cols> FROM t WHERE pred) so invalidateWhere can
+    /// materialise the affected entities WITHOUT deleting — they still exist, so
+    /// their lists stay valid (cf. invalidateMany WithLists=false). No chunking:
+    /// invalidation evicts cache, it does not hold a write lock. nullopt = DB
+    /// error (parité). Projects all columns (the `*`-equivalent).
+    template<typename Descriptor>
+        requires list::spec::ValidFilterSet<Descriptor>
+    static io::Task<std::optional<std::vector<E>>> selectWhereRaw(
+        const list::spec::Filters<Descriptor>& filters)
+    {
+        try {
+            auto where = list::spec::buildWhereClause<Descriptor>(filters);
+            std::string sql;
+            sql.reserve(128);
+            sql += "SELECT ";
+            sql += Mapping::SQL::returning_columns;
+            sql += " FROM ";
+            sql += Mapping::table_name;
+            if (!where.sql.empty()) {
+                sql += " WHERE ";
+                sql += where.sql;
+            }
+
+            auto result = co_await PgProvider::queryParams(sql.c_str(), where.params);
+            std::vector<E> out;
+            out.reserve(static_cast<size_t>(result.rows()));
+            for (int r = 0; r < result.rows(); ++r) {
+                if (auto e = E::fromRow(result[r]))
+                    out.push_back(std::move(*e));
+            }
+            co_return out;
+        } catch (const io::PgError& e) {
+            RELAIS_LOG_ERROR << name() << ": selectWhereRaw DB error - " << e.what();
+            co_return std::nullopt;
         }
     }
 

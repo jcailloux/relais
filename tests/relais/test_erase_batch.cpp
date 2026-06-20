@@ -45,6 +45,14 @@ std::vector<typename Repo::EntityType> eraseManyRawSync(std::span<const Key> ids
     return r ? std::move(*r) : std::vector<typename Repo::EntityType>{};
 }
 
+template<typename Repo, typename Desc>
+std::vector<typename Repo::EntityType> eraseWhereRawSync(
+    const jcailloux::relais::list::spec::Filters<Desc>& f) {
+    // eraseWhereRaw now returns optional (nullopt = DB error); same unwrap.
+    auto r = sync(TestInternals::eraseWhereRaw<Repo, Desc>(f));
+    return r ? std::move(*r) : std::vector<typename Repo::EntityType>{};
+}
+
 // COUNT(*) over a table with an optional predicate appended (literal — test-only).
 int64_t countRows(const std::string& sql) {
     auto r = execQuery(sql.c_str());
@@ -156,7 +164,7 @@ TEST_CASE("eraseWhereRaw: selective predicate deletes only the matched rows",
         decl::Filters<Desc> f;
         f.template get<0>() = author;  // index 0 = author_id (filterable EQ)
 
-        auto out = sync(TestInternals::eraseWhereRaw<UncachedTestArticleRepo, Desc>(f));
+        auto out = eraseWhereRawSync<UncachedTestArticleRepo, Desc>(f);
         REQUIRE(out.size() == 3);
         for (const auto& a : out) REQUIRE(a.author_id == author);
 
@@ -173,7 +181,7 @@ TEST_CASE("eraseWhereRaw: selective predicate deletes only the matched rows",
         decl::Filters<Desc> f;
         f.template get<0>() = int64_t{-12345};  // no such author
 
-        auto out = sync(TestInternals::eraseWhereRaw<UncachedTestArticleRepo, Desc>(f));
+        auto out = eraseWhereRawSync<UncachedTestArticleRepo, Desc>(f);
         REQUIRE(out.empty());
         REQUIRE(countRows("SELECT COUNT(*) FROM relais_test_articles WHERE author_id IN ("
             + std::to_string(author) + "," + std::to_string(other) + ")") == 5);
@@ -181,7 +189,7 @@ TEST_CASE("eraseWhereRaw: selective predicate deletes only the matched rows",
 
     SECTION("empty filters → unconditional purge of the table") {
         decl::Filters<Desc> f;  // no active filter → no inner WHERE
-        auto out = sync(TestInternals::eraseWhereRaw<UncachedTestArticleRepo, Desc>(f));
+        auto out = eraseWhereRawSync<UncachedTestArticleRepo, Desc>(f);
         REQUIRE(out.size() == 5);
         REQUIRE(countRows("SELECT COUNT(*) FROM relais_test_articles") == 0);
     }
@@ -208,7 +216,7 @@ TEST_CASE("eraseWhereRaw converges past K_pg in bounded chunks",
     decl::Filters<Desc> f;
     f.template get<0>() = int64_t{777};
 
-    auto out = sync(TestInternals::eraseWhereRaw<UncachedTestArticleRepo, Desc>(f));
+    auto out = eraseWhereRawSync<UncachedTestArticleRepo, Desc>(f);
 
     // Every matching row comes back across the two RETURNING chunks.
     REQUIRE(out.size() == 10001);
