@@ -1,6 +1,7 @@
 #ifndef JCX_RELAIS_REPO_H
 #define JCX_RELAIS_REPO_H
 
+#include <concepts>
 #include <optional>
 #include <span>
 #include <type_traits>
@@ -12,6 +13,7 @@
 #include "jcailloux/relais/repository/ListMixin.h"
 #include "jcailloux/relais/config/FixedString.h"
 #include "jcailloux/relais/entity/EntityConcepts.h"
+#include "jcailloux/relais/list/spec/GeneratedFilters.h"
 #include "jcailloux/relais/cache/Metrics.h"
 #include "jcailloux/relais/cache/GDSFPolicy.h"
 
@@ -94,6 +96,29 @@ class Repo
 {
     using Key = decltype(std::declval<const E>().key());
     using Base = typename detail::MixinStack<E, Name, Cfg, Key, Invalidations...>::type;
+
+    // Augment the entity's standalone FilterSet with the Entity alias so it
+    // satisfies ValidFilterSet (the filter core needs Descriptor::Entity).
+    // A nested template so it is only instantiated for HasFilterSet entities —
+    // a bare nested struct would hard-error on entities without a FilterSet.
+    template<typename EE>
+    struct FilterDescriptorFor : EE::MappingType::FilterSet {
+        using Entity = EE;
+    };
+
+    // Default predicate type for the where-variants' template parameter. The
+    // user-facing FilterSet<E> alias is a hard-requires type — used as a default
+    // template argument it would be instantiated (and ill-formed) at *class*
+    // instantiation for entities without a FilterSet, before the requires-clause
+    // could exclude the method. This resolves to the aggregate when present and a
+    // harmless dummy otherwise, keeping the declaration well-formed; the
+    // requires-clause then removes the method for non-FilterSet entities.
+    template<typename EE, bool = HasFilterSet<EE>>
+    struct WherePredicate { using type = int; };
+    template<typename EE>
+    struct WherePredicate<EE, true> {
+        using type = typename EE::MappingType::FilterSet::Values;
+    };
 
     // Compile-time validation
     static_assert(ReadableEntity<E>,
@@ -274,6 +299,57 @@ public:
         }
         co_await Base::template invalidateManyImpl<false>(
             std::span<const E>(entities));
+    }
+
+    // =======================================================================
+    // Predicate erase / invalidate (where — declared FilterSet required)
+    // =======================================================================
+    //
+    // The predicate is the generated named aggregate FilterSet<E>, built with
+    // designated initializers: repo.eraseWhere({.author_id = 42}). It bridges to
+    // the positional Filters<Descriptor> the L3 raw methods consume via
+    // toFilterTuple() — index-aligned because both follow the same param-sorted
+    // filter order. Pred is a defaulted template parameter so the signature stays
+    // well-formed (SFINAE) for entities without a FilterSet, and so a braced
+    // initializer (a non-deduced context) falls back to FilterSet<E>.
+
+    /// Delete every row matching the predicate from L3, then evict the deleted
+    /// set across the cache hierarchy (WithLists=true — the rows leave the table,
+    /// so their lists change, exactly like eraseMany). Returns the number of rows
+    /// deleted across all K_pg chunks; nullopt signals a DB error.
+    template<typename Pred = typename WherePredicate<E>::type>
+    static io::Task<std::optional<size_t>> eraseWhere(Pred pred)
+        requires HasFilterSet<E>
+              && std::same_as<Pred, typename WherePredicate<E>::type>
+              && (!Cfg.read_only)
+    {
+        using FD = FilterDescriptorFor<E>;
+        list::spec::Filters<FD> filters;
+        filters.values = pred.toFilterTuple();
+        auto deleted = co_await Base::template eraseWhereRaw<FD>(filters);
+        if (!deleted) co_return std::nullopt;  // DB error
+        co_await Base::template invalidateManyImpl<true>(
+            std::span<const E>(*deleted));
+        co_return deleted->size();
+    }
+
+    /// Evict every row matching the predicate from the cache hierarchy without
+    /// deleting it from L3 — a later find/list repopulates from the DB. Resolves
+    /// the affected set via selectWhereRaw (SELECT WHERE pred), then runs the
+    /// cascade with WithLists=false: the rows still exist, so lists stay valid
+    /// (parité mono invalidate; oracle invalidateWhere(P) ≡ invalidateMany(ids)).
+    template<typename Pred = typename WherePredicate<E>::type>
+    static io::Task<void> invalidateWhere(Pred pred)
+        requires HasFilterSet<E>
+              && std::same_as<Pred, typename WherePredicate<E>::type>
+    {
+        using FD = FilterDescriptorFor<E>;
+        list::spec::Filters<FD> filters;
+        filters.values = pred.toFilterTuple();
+        auto entities = co_await Base::template selectWhereRaw<FD>(filters);
+        if (!entities) co_return;  // DB error → nothing evicted
+        co_await Base::template invalidateManyImpl<false>(
+            std::span<const E>(*entities));
     }
 };
 
