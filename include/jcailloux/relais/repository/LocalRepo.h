@@ -262,6 +262,15 @@ public:
         }
     }
 
+    /// Batch invalidation common path — L1 entity tier. Targeted point-evicts,
+    /// one per affected key (each bumps the generation slot → anti stale-write),
+    /// then delegate to L2/L3. Never purgeAll: that would drop unrelated hot
+    /// entries; point-evicts stay exact. ⌈N⌉ evicts but each is ~0ns RAM.
+    static io::Task<void> invalidateManyImpl(std::span<const E> entities) {
+        for (const auto& e : entities) evict(e.key());
+        co_await Base::invalidateManyImpl(entities);
+    }
+
     /// Invalidate L1 cache only. Non-coroutine since there is no async work.
     /// Removes both real entries and ghosts.
     /// Increments the generation counter to prevent stale fetches from caching.

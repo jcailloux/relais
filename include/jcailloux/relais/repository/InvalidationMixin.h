@@ -1,8 +1,11 @@
 #ifndef JCX_RELAIS_INVALIDATION_MIXIN_H
 #define JCX_RELAIS_INVALIDATION_MIXIN_H
 
+#include <span>
 #include "jcailloux/relais/io/Task.h"
 #include "jcailloux/relais/repository/InvalidateOn.h"
+
+namespace relais_test { struct TestInternals; }
 
 namespace jcailloux::relais {
 
@@ -142,6 +145,19 @@ public:
         }
         co_await Base::invalidate(id);
     }
+
+protected:
+    /// Batch invalidation common path — top of the chain. Propagates the
+    /// deduplicated cross-invalidation for the whole affected set (union of
+    /// distinct target keys invalidated once, materialized by value before any
+    /// invalidation — the InvalidationData raw pointers never outlive this
+    /// frame), then delegates the entity/list tiers down the chain.
+    static io::Task<void> invalidateManyImpl(std::span<const Entity> entities) {
+        co_await propagateDeleteMany<Entity, InvList>(entities);
+        co_await Base::invalidateManyImpl(entities);
+    }
+
+    friend struct ::relais_test::TestInternals;
 };
 
 }  // namespace jcailloux::relais

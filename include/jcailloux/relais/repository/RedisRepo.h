@@ -278,6 +278,22 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
 
     protected:
         // =====================================================================
+        // Batch invalidation common path — L2 entity tier
+        // =====================================================================
+
+        /// Evict the whole affected set from L2 in one variadic UNLINK batch
+        /// (sub-chunked at K_redis by RedisCache::invalidateMany), then delegate
+        /// down the chain. ⌈N/K_redis⌉ round-trips instead of N evictRedis.
+        static io::Task<void> invalidateManyImpl(std::span<const E> entities) {
+            std::vector<std::string> keys;
+            keys.reserve(entities.size());
+            for (const auto& e : entities) keys.push_back(makeRedisKey(e.key()));
+            co_await cache::RedisCache::invalidateMany(
+                std::span<const std::string>(keys));
+            co_await Base::invalidateManyImpl(entities);
+        }
+
+        // =====================================================================
         // Raw methods returning entity by value (for LocalRepo move path)
         // =====================================================================
 
