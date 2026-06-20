@@ -328,8 +328,15 @@ public:
         filters.values = pred.toFilterTuple();
         auto deleted = co_await Base::template eraseWhereRaw<FD>(filters);
         if (!deleted) co_return std::nullopt;  // DB error
-        co_await Base::template invalidateManyImpl<true>(
+        // Entity tier (L1 evict + L2 UNLINK + cross-inval), per deleted row, with
+        // WithLists=false so the OWN-list tier is left to the predicate fast-path.
+        co_await Base::template invalidateManyImpl<false>(
             std::span<const E>(*deleted));
+        // Own-list tier: ONE RangeModification (L1) + ONE predicate EVAL (L2) for
+        // the whole deleted set — O(1)/O(groups), filter-aware, never-miss. The
+        // rows left the table, so their lists change (eraseMany analogue), but the
+        // predicate drives invalidation, not the resolved id set.
+        co_await Base::template invalidateWhereLists<FD>(filters);
         co_return deleted->size();
     }
 

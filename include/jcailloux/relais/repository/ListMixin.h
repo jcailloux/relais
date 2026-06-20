@@ -121,6 +121,18 @@ class ListMixin : public Base {
             return {ds.field_index, ds.direction};
         }
 
+        // Predicate fast-path hooks (eraseWhere) — see CanonicalEncoding /
+        // GeneratedTraits. Enable ListCache's RangeModification consumption.
+        static bool predicateGroupCompatible(const Filters& predicate,
+                                             const Filters& group) {
+            return list::spec::predicateGroupCompatible<Descriptor>(predicate, group);
+        }
+
+        static list::spec::SortRange predicateSortRange(const Filters& predicate,
+                                                        size_t field_index) {
+            return list::spec::predicateSortRange<Descriptor>(predicate, field_index);
+        }
+
         static std::optional<size_t> parseSortField(std::string_view field) {
             return list::spec::parseSortField<Descriptor>(field);
         }
@@ -485,6 +497,25 @@ protected:
         co_await Base::template invalidateManyImpl<WithLists>(entities);
     }
 
+    /// Predicate list invalidation (eraseWhere fast-path). Replaces the per-entity
+    /// blob-array list work with ONE RangeModification (L1) + ONE predicate EVAL
+    /// (L2) for the whole deleted set — O(1)/O(groups) instead of O(N). The caller
+    /// (Repo::eraseWhere) runs the entity tier separately via invalidateManyImpl
+    /// with WithLists=false. The predicate arrives as Filters<Desc> where Desc is
+    /// the entity's standalone FilterSet; its value tuple is identical to this
+    /// repo's ListDescriptor filter tuple (both inherit the same FilterSet), so it
+    /// copies straight across.
+    template<typename Desc>
+    static io::Task<void> invalidateWhereLists(const list::spec::Filters<Desc>& predicate) {
+        if constexpr (kHasL1 || kHasL2) {
+            DescriptorFilters local;
+            local.values = predicate.values;
+            if constexpr (kHasL1) { listCache().onEntityRangeDeleted(local); }
+            if constexpr (kHasL2) { co_await invalidateWhereListsL2(local); }
+        }
+        co_await Base::template invalidateWhereLists<Desc>(predicate);
+    }
+
     static io::Task<bool> updateWithContext(
         const Key& id, const Entity& entity, const Entity* old_entity)
         requires MutableEntity<Entity> && HasFullUpdate<Entity> && (!Base::config.read_only)
@@ -552,6 +583,37 @@ protected:
               result += std::to_string(Traits::extractSortValue(entity, Is))), ...);
         }(std::make_index_sequence<list::spec::sort_count<Descriptor>>{});
         return result;
+    }
+
+    /// Build the per-sort-dimension predicate value ranges as two parallel CSVs
+    /// (lo, hi), indexed by sort field — the Lua picks lo_vals[si]/hi_vals[si] for
+    /// each group's sort dimension. Unconstrained dimensions get the full int64
+    /// domain (every page in range).
+    static std::pair<std::string, std::string> buildPredicateRangeCsv(
+        const DescriptorFilters& predicate) {
+        std::string lo, hi;
+        [&]<size_t... Is>(std::index_sequence<Is...>) {
+            size_t count = 0;
+            (([&] {
+                auto r = list::spec::predicateSortRange<Descriptor>(predicate, Is);
+                if (count++ > 0) { lo += ","; hi += ","; }
+                lo += std::to_string(r.lo);
+                hi += std::to_string(r.hi);
+            }()), ...);
+        }(std::make_index_sequence<list::spec::sort_count<Descriptor>>{});
+        return {std::move(lo), std::move(hi)};
+    }
+
+    /// Predicate-driven L2 list invalidation (single EVAL, O(groups)).
+    static io::Task<size_t> invalidateWhereListsL2(const DescriptorFilters& predicate) {
+        auto masterKey = redisMasterSetKey();
+        auto prefixLen = std::string(Base::name()).size() + 9;  // ":dlist:g:"
+        auto schema = list::spec::filterSchema<Descriptor>();
+        auto pblob = list::spec::encodeFilterSet<Descriptor>(predicate);
+        auto [loCsv, hiCsv] = buildPredicateRangeCsv(predicate);
+
+        co_return co_await cache::RedisCache::invalidateListGroupsByPredicate(
+            masterKey, prefixLen, schema, pblob, loCsv, hiCsv);
     }
 
     /// Selective L2 invalidation for entity creation (or deletion).
