@@ -67,7 +67,7 @@ void appendOptional(std::vector<uint8_t>& buf, const std::optional<T>& opt) {
 /// values and the optional sort directly — invalidation has no cursor/offset to
 /// fabricate, so it must not be forced to build a full ListDescriptorQuery.
 template<typename Descriptor>
-    requires ValidListDescriptor<Descriptor>
+    requires ValidFilterSet<Descriptor>
 std::string groupKey(
     const Filters<Descriptor>& filters,
     const std::optional<DescriptorSortSpec<Descriptor>>& sort
@@ -161,7 +161,7 @@ std::string cacheKey(const ListDescriptorQuery<Descriptor>& query) {
 /// For each filter: [0x01][value_bytes] if entity has a value, [0x00] if optional and null.
 /// Lua compares this blob against the binary portion of the group key for filter matching.
 template<typename Descriptor>
-    requires ValidListDescriptor<Descriptor>
+    requires ValidFilterSet<Descriptor>
 std::string encodeEntityFilterBlob(const typename Descriptor::Entity& entity) {
     std::vector<uint8_t> buf;
     buf.reserve(64);
@@ -188,7 +188,7 @@ std::string encodeEntityFilterBlob(const typename Descriptor::Entity& entity) {
 /// Type: 's'=string, '8'=int64_t, '4'=int32_t, '1'=bool/uint8_t.
 /// Operator: '='=EQ, '!'=NE, '>'=GT, 'G'=GE, '<'=LT, 'L'=LE, '@'=IN, '#'=NIN.
 template<typename Descriptor>
-    requires ValidListDescriptor<Descriptor>
+    requires ValidFilterSet<Descriptor>
 std::string filterSchema() {
     std::string schema;
     schema.reserve(filter_count<Descriptor> * 2);

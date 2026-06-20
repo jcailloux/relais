@@ -70,12 +70,12 @@ constexpr size_t find_filter_index() {
 // Forward declaration — Filters::matchesFilters takes entity-side tags, which
 // are stored in the decoupled FilterTags struct (scalar tag_type slots).
 template<typename Descriptor>
-    requires ValidListDescriptor<Descriptor>
+    requires ValidFilterSet<Descriptor>
 struct FilterTags;
 
 /// Generated Filters struct that holds filter values
 template<typename Descriptor>
-    requires ValidListDescriptor<Descriptor>
+    requires ValidFilterSet<Descriptor>
 struct Filters {
     /// Tuple storing all filter values (each as std::optional<T>)
     detail::FiltersTuple<Descriptor> values{};
@@ -188,7 +188,7 @@ public:
 /// built on tag_type (always optional<element>) so an IN filter's optional<vector>
 /// slot does not leak into entity-side tag storage — an entity holds one value.
 template<typename Descriptor>
-    requires ValidListDescriptor<Descriptor>
+    requires ValidFilterSet<Descriptor>
 struct FilterTags {
     /// Tuple storing the entity's scalar tag values (each as std::optional<element>)
     detail::TagsTuple<Descriptor> values{};
@@ -222,7 +222,7 @@ struct FilterTags {
 
 /// Extract filter tags from an entity
 template<typename Descriptor>
-    requires ValidListDescriptor<Descriptor>
+    requires ValidFilterSet<Descriptor>
 [[nodiscard]] FilterTags<Descriptor> extractTags(const typename Descriptor::Entity& entity) noexcept {
     FilterTags<Descriptor> tags;
 

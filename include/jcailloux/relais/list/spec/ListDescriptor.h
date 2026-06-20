@@ -33,13 +33,25 @@ concept HasSorts = requires {
     requires std::tuple_size_v<std::remove_cvref_t<decltype(Descriptor::sorts)>> >= 1;
 };
 
-/// Combined concept for a valid list descriptor
+/// A filter set: an entity + a tuple of filters, no sort/pagination required.
+/// This is the predicate-only substrate the filter core operates on (Filters,
+/// FilterTags, buildWhereClause, groupKey, encodeEntityFilterBlob, extractTags).
+/// A ListDescriptor is one consumer; eraseWhere/invalidateWhere is another. An
+/// entity may declare filters WITHOUT a cached list and still satisfy this.
 template<typename Descriptor>
-concept ValidListDescriptor =
+concept ValidFilterSet =
     HasEntity<Descriptor> &&
     HasFilters<Descriptor> &&
-    HasSorts<Descriptor> &&
     relais::Readable<typename Descriptor::Entity>;
+
+/// A valid list descriptor is a FilterSet that ALSO declares a sort dimension
+/// (+ pagination/cache). Composition, not a parallel definition: every list
+/// descriptor is a filter set, so retargeting the core onto ValidFilterSet only
+/// widens what it accepts — existing list call sites stay valid byte-for-byte.
+template<typename Descriptor>
+concept ValidListDescriptor =
+    ValidFilterSet<Descriptor> &&
+    HasSorts<Descriptor>;
 
 // =============================================================================
 // Helper to count filters and sorts

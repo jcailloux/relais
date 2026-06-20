@@ -81,7 +81,7 @@ void addArrayParamForDb(io::PgParams& params, const std::vector<T>& values) {
 ///   params: PgParams with values for each active filter
 ///   param_offset: next available parameter index (for appending more params)
 template<typename Descriptor>
-    requires ValidListDescriptor<Descriptor>
+    requires ValidFilterSet<Descriptor>
 struct WhereClause {
     std::string sql;
     io::PgParams params;
@@ -89,7 +89,7 @@ struct WhereClause {
 };
 
 template<typename Descriptor>
-    requires ValidListDescriptor<Descriptor>
+    requires ValidFilterSet<Descriptor>
 [[nodiscard]] WhereClause<Descriptor> buildWhereClause(
     const Filters<Descriptor>& filters
 ) noexcept {
