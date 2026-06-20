@@ -1041,6 +1041,198 @@ return total
                 }
             }
 
+            /// Predicate-driven list invalidation (eraseWhere fast-path): ONE EVAL
+            /// for the whole deleted set, O(groups) not O(N). Lua does HGETALL master
+            /// → pmatch(group filters, predicate) prunes filter-incompatible groups
+            /// → chk_range(page, [lo,hi]) DELs pages whose sort range overlaps the
+            /// predicate's range on that group's sort dimension. Never-miss: an
+            /// absent predicate constraint is a wildcard; only EQ-differ / IN-disjoint
+            /// prune, only a provably non-overlapping page is skipped.
+            static io::Task<size_t> invalidateListGroupsByPredicate(
+                const std::string& masterKey,
+                size_t prefixLen,
+                const std::string& filterSchema,
+                const std::string& predicateBlob,
+                const std::string& loValues,
+                const std::string& hiValues)
+            {
+                if (!PgProvider::hasRedis()) co_return 0;
+
+                try {
+                    static constexpr std::string_view lua = R"(
+local master = KEYS[1]
+local prefix_len = tonumber(ARGV[1])
+local hdr_size = tonumber(ARGV[2])
+local schema = ARGV[3]
+local pblob = ARGV[4]
+
+local lo_vals = {}
+for v in string.gmatch(ARGV[5], '([^,]+)') do lo_vals[#lo_vals + 1] = tonumber(v) end
+local hi_vals = {}
+for v in string.gmatch(ARGV[6], '([^,]+)') do hi_vals[#hi_vals + 1] = tonumber(v) end
+local n_filters = #schema / 2
+local total = 0
+
+local function u32(s, p)
+    local b1,b2,b3,b4 = string.byte(s, p, p+3)
+    if not b4 then return 0 end
+    return b1 + b2*256 + b3*65536 + b4*16777216
+end
+
+local function i64(s, p)
+    local b1,b2,b3,b4,b5,b6,b7,b8 = string.byte(s, p, p+7)
+    if not b8 then return 0 end
+    local val = b1 + b2*256 + b3*65536 + b4*16777216
+              + b5*4294967296 + b6*1099511627776
+              + b7*281474976710656 + b8*72057594037927936
+    if val >= 2^63 then val = val - 2^64 end
+    return val
+end
+
+local function skip(s, pos, ft)
+    if ft == 115 then return pos + 4 + u32(s, pos)
+    elseif ft == 56 then return pos + 8
+    elseif ft == 52 then return pos + 4
+    else return pos + 1 end
+end
+
+-- Skip a set: [count:u32][elem×count]. pos points at the count.
+local function skipset(s, pos, ft)
+    local n = u32(s, pos); pos = pos + 4
+    for i = 1, n do pos = skip(s, pos, ft) end
+    return pos
+end
+
+-- Equality of one element at p1 (in s1) against one element at p2 (in s2).
+local function eqval(s1, p1, s2, p2, ft)
+    if ft == 115 then
+        local l1 = u32(s1, p1); local l2 = u32(s2, p2)
+        return l1 == l2 and (l1 == 0 or string.sub(s1, p1+4, p1+3+l1) == string.sub(s2, p2+4, p2+3+l2))
+    elseif ft == 56 then return string.sub(s1, p1, p1+7) == string.sub(s2, p2, p2+7)
+    elseif ft == 52 then return string.sub(s1, p1, p1+3) == string.sub(s2, p2, p2+3)
+    else return string.byte(s1, p1) == string.byte(s2, p2) end
+end
+
+-- Two sets (both [count][elem×count]) share no element?
+local function setdisjoint(s1, p1, s2, p2, ft)
+    local n1 = u32(s1, p1); p1 = p1 + 4
+    for i = 1, n1 do
+        local q = p2
+        local n2 = u32(s2, q); q = q + 4
+        for j = 1, n2 do
+            if eqval(s1, p1, s2, q, ft) then return false end
+            q = skip(s2, q, ft)
+        end
+        p1 = skip(s1, p1, ft)
+    end
+    return true
+end
+
+-- Predicate↔group compatibility. bin = group filter bytes, blob = predicate
+-- filter bytes (same encoding). Prune (return false) only when both present and
+-- provably disjoint: EQ values differ, or IN sets share no element. Absent on
+-- either side is a wildcard; comparison / NE / NIN never prune.
+local function pmatch(bin, blob)
+    local gp = 1; local pp = 1
+    for f = 0, n_filters - 1 do
+        local ft = string.byte(schema, f*2+1)
+        local fo = string.byte(schema, f*2+2)
+        if gp > #bin or pp > #blob then break end
+        local gx = string.byte(bin, gp); local px = string.byte(blob, pp)
+        gp = gp + 1; pp = pp + 1
+        local is_set = (fo == 64 or fo == 35)
+        if px == 0 then
+            if gx == 1 then
+                if is_set then gp = skipset(bin, gp, ft) else gp = skip(bin, gp, ft) end
+            end
+        elseif gx == 0 then
+            if is_set then pp = skipset(blob, pp, ft) else pp = skip(blob, pp, ft) end
+        elseif is_set then
+            if fo == 64 and setdisjoint(bin, gp, blob, pp, ft) then return false end
+            gp = skipset(bin, gp, ft); pp = skipset(blob, pp, ft)
+        elseif fo == 61 then
+            if not eqval(bin, gp, blob, pp, ft) then return false end
+            gp = skip(bin, gp, ft); pp = skip(blob, pp, ft)
+        else
+            gp = skip(bin, gp, ft); pp = skip(blob, pp, ft)
+        end
+    end
+    return true
+end
+
+-- Range overlap: does [lo,hi] overlap the page's effective sort range? Range
+-- generalization of `chk` (the lo==hi case is the per-entity point check).
+local function chk_range(pk, lo, hi)
+    local hdr = redis.call('GETRANGE', pk, 0, hdr_size - 1)
+    if #hdr < hdr_size or string.byte(hdr, 1) ~= 0x53 or string.byte(hdr, 2) ~= 0x52 then
+        return true
+    end
+    local first = i64(hdr, 3); local last = i64(hdr, 11)
+    local fl = string.byte(hdr, 19)
+    local desc = (fl % 2) == 1
+    local fp = (math.floor(fl / 2) % 2) == 1
+    local inc = (math.floor(fl / 4) % 2) == 1
+    local off = (math.floor(fl / 8) % 2) == 0
+    if off then
+        if inc then return true end
+        if desc then return hi >= last else return lo <= last end
+    else
+        if fp or inc then return true end
+        if desc then
+            return lo <= first and hi >= last
+        else
+            return lo <= last and hi >= first
+        end
+    end
+end
+
+local groups = redis.call('HGETALL', master)
+if not groups or #groups == 0 then return 0 end
+
+for gi = 1, #groups, 2 do
+    local gk = groups[gi]
+    local si = tonumber(groups[gi + 1])
+    local bin = string.sub(gk, prefix_len + 1)
+    if pmatch(bin, pblob) then
+        local lo = lo_vals[si + 1]
+        local hi = hi_vals[si + 1]
+        if not lo then lo = -9223372036854775808 end
+        if not hi then hi = 9223372036854775807 end
+        local tk = gk .. ':_keys'
+        local pages = redis.call('SMEMBERS', tk)
+        if pages and #pages > 0 then
+            local c = 0
+            for _, pk in ipairs(pages) do
+                if chk_range(pk, lo, hi) then
+                    redis.call('DEL', pk)
+                    redis.call('SREM', tk, pk)
+                    c = c + 1
+                end
+            end
+            if c == #pages then redis.call('UNLINK', tk) end
+            total = total + c
+        end
+    end
+end
+return total
+)";
+
+                    auto result = co_await PgProvider::redis(
+                        "EVAL", lua, "1", masterKey,
+                        std::to_string(prefixLen),
+                        static_cast<int>(list::kListBoundsHeaderSize),
+                        filterSchema,
+                        predicateBlob,
+                        loValues,
+                        hiValues);
+
+                    co_return result.isNil() ? 0 : static_cast<size_t>(result.asInteger());
+                } catch (const std::exception& e) {
+                    RELAIS_LOG_WARN << "RedisCache invalidateListGroupsByPredicate error: " << e.what();
+                    co_return 0;
+                }
+            }
+
             /// Invalidate all matching list groups for an update (two entities).
             /// Lua does: HGETALL master → filter match old+new → SortBounds → DEL pages.
             static io::Task<size_t> invalidateListGroupsSelectiveUpdate(
