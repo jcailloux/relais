@@ -227,6 +227,33 @@ its active filter values. So `insert(uid, role)` drops the
 For cross-repo list invalidation (a change in one table dropping another table's
 list pages), see [`InvalidateListVia`](invalidation.md#selective-list-invalidation-via-invalidatelistvia).
 
+## Predicate erase and invalidate
+
+A batch `eraseWhere(pred)` / `invalidateWhere(pred)` (see
+[batch and predicate erase / invalidate](invalidation.md#batch-and-predicate-erase--invalidate))
+removes or evicts a set of rows in one call. The entity tier is handled per
+resolved row, but the **own-list** tier never iterates that id set — it is driven
+directly by the predicate, in O(1)/O(groups):
+
+- **L1**: one `RangeModification`. The `ModificationTracker` carries a second
+  track (predicate + generation) alongside the per-entity one, sharing the
+  generation counter and the bitmap/drain cycle. A cached page is dropped lazily
+  on the next `query()` when the predicate is *range-affecting* — group-compatible
+  **and** sort-range-overlapping. The per-entity check is the `lo == hi` special
+  case of this range check.
+- **L2**: one predicate-driven `EVAL` over the cached groups (`pmatch` set-vs-set
+  + `chk_range` overlap), one Redis round-trip.
+
+The fast-path is **filter-aware and never-miss**: it prunes only groups the
+predicate provably cannot affect (EQ-different / IN-disjoint; an absent
+constraint is a wildcard that matches). It is **always** taken — there is no
+`purgeAll` fallback for large sets. `eraseWhere` drops the affected pages (rows
+left the table); `invalidateWhere` keeps them (rows persist, the next `query()`
+repopulates).
+
+`eraseWhere` appends its `RangeModification` on **every** call, even at zero rows
+deleted — the predicate fast-path fires unconditionally.
+
 ## List methods (auto-detected)
 
 | Method | Description |
