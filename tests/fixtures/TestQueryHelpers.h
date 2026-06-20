@@ -28,7 +28,7 @@ inline ArticleListQuery makeArticleQuery(
     if (category) q.filters.template get<1>() = std::move(*category);
 
     using Desc = TestArticleListRepo::ListDescriptorType;
-    q.group_key = ld::groupCacheKey<Desc>(q);
+    q.group_key = ld::groupKey<Desc>(q.filters, q.sort);
     q.cache_key = ld::cacheKey<Desc>(q);
     return q;
 }
@@ -44,7 +44,7 @@ inline PurchaseListQuery makePurchaseQuery(
     if (user_id) q.filters.template get<1>() = *user_id;
 
     using Desc = TestPurchaseListRepo::ListDescriptorType;
-    q.group_key = ld::groupCacheKey<Desc>(q);
+    q.group_key = ld::groupKey<Desc>(q.filters, q.sort);
     q.cache_key = ld::cacheKey<Desc>(q);
     return q;
 }

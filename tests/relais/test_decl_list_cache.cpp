@@ -56,7 +56,7 @@ TestListQuery makeViewCountQuery(std::string_view category, uint16_t limit) {
     q.sort = jcailloux::relais::list::SortSpec<size_t>{1, jcailloux::relais::list::SortDirection::Desc};
 
     // Canonical cache keys
-    q.group_key = decl::groupCacheKey<TestDecl>(q);
+    q.group_key = decl::groupKey<TestDecl>(q.filters, q.sort);
     q.cache_key = decl::cacheKey<TestDecl>(q);
     return q;
 }

@@ -603,7 +603,7 @@ static BothPurchaseListQuery makeBothPurchaseQuery(
     if (user_id) q.filters.template get<1>() = *user_id;
 
     using Desc = BothPurchaseListRepo::ListDescriptorType;
-    q.group_key = decl::groupCacheKey<Desc>(q);
+    q.group_key = decl::groupKey<Desc>(q.filters, q.sort);
     q.cache_key = decl::cacheKey<Desc>(q);
     return q;
 }
