@@ -12,6 +12,7 @@
 #include "jcailloux/relais/io/redis/RedisResult.h"
 #include "jcailloux/relais/PgProvider.h"
 #include "jcailloux/relais/Log.h"
+#include "jcailloux/relais/detail/Chunk.h"
 
 #include <glaze/glaze.hpp>
 #include <jcailloux/relais/list/ListCache.h>
@@ -472,6 +473,42 @@ namespace jcailloux::relais::cache {
                     RELAIS_LOG_WARN << "RedisCache UNLINK error: " << e.what();
                     co_return false;
                 }
+            }
+
+            /// Redis command-size ceiling for variadic key invalidation. One
+            /// `UNLINK k1 … kN` carries at most this many keys; larger sets are
+            /// split into ⌈N/K⌉ commands. 1k keeps each argv well under Redis'
+            /// limits and the proto buffer bounded on huge purges.
+            static constexpr size_t kInvalidateChunk = 1000;
+
+            /// Variadic batch eviction: `UNLINK k1 … kN` sub-chunked at
+            /// kInvalidateChunk. A single primitive — NOT a loop over
+            /// invalidate(key) — so a set of N keys costs ⌈N/K⌉ round-trips
+            /// instead of N. Awaited per chunk (a purge is off the hot path) so
+            /// the observable post-state is fully drained on return. UNLINK is
+            /// idempotent on absent keys, so partial overlap is harmless.
+            /// Returns true if every chunk succeeded; false on the first error
+            /// (best-effort — already-sent chunks stay evicted).
+            static io::Task<bool> invalidateMany(std::span<const std::string> keys) {
+                if (keys.empty() || !PgProvider::hasRedis()) {
+                    co_return keys.empty();
+                }
+
+                for (auto chunk : relais::detail::chunkSpan(keys, kInvalidateChunk)) {
+                    std::vector<std::string> args;
+                    args.reserve(chunk.size() + 1);
+                    args.emplace_back("UNLINK");
+                    for (const auto& k : chunk) {
+                        args.push_back(k);
+                    }
+                    try {
+                        co_await PgProvider::redisDynamic(std::move(args));
+                    } catch (const std::exception& e) {
+                        RELAIS_LOG_WARN << "RedisCache UNLINK (batch) error: " << e.what();
+                        co_return false;
+                    }
+                }
+                co_return true;
             }
 
             /// Invalidate keys matching a pattern using SCAN (non-blocking).
