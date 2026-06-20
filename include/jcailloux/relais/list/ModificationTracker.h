@@ -71,6 +71,9 @@ namespace detail {
     using SmallestUintFor = std::conditional_t<(N <= 8), uint8_t,
                             std::conditional_t<(N <= 16), uint16_t,
                             std::conditional_t<(N <= 32), uint32_t, uint64_t>>>;
+
+    /// Default range-payload — an entity-only tracker carries no predicate ranges.
+    struct NoRangePayload {};
 }
 
 // =============================================================================
@@ -87,7 +90,8 @@ namespace detail {
 // TotalSegments = number of chunks, known at compile time (from ChunkMap config).
 //
 
-template<typename E, size_t TotalSegments>
+template<typename E, size_t TotalSegments,
+         typename RangePayload = detail::NoRangePayload>
 class ModificationTracker {
 public:
     static_assert(TotalSegments >= 2 && TotalSegments <= 64,
@@ -108,10 +112,32 @@ public:
         mutable BitmapType pending_segments;
     };
 
+    /// Predicate range modification (eraseWhere fast-path): one entry stands in
+    /// for an unbounded set of deletes matching a predicate, instead of N entity
+    /// modifications. Shares the generation counter and the per-chunk bitmap
+    /// drain lifecycle with entity modifications.
+    struct TrackedRange {
+        RangePayload predicate;
+        uint32_t generation;
+        alignas(std::atomic_ref<BitmapType>::required_alignment)
+        mutable BitmapType pending_segments;
+    };
+
 private:
     std::vector<TrackedModification> modifications_;
+    std::vector<TrackedRange> ranges_;
     mutable std::shared_mutex mutex_;
     std::atomic<uint32_t> latest_generation_{0};
+
+    /// Atomic max into latest_generation_ (shared by entity + range tracks).
+    void bumpLatest(uint32_t gen) {
+        uint32_t current = latest_generation_.load(std::memory_order_relaxed);
+        while (gen > current &&
+               !latest_generation_.compare_exchange_weak(
+                   current, gen,
+                   std::memory_order_release, std::memory_order_relaxed)) {
+        }
+    }
 
 public:
     explicit ModificationTracker() {
@@ -142,15 +168,21 @@ public:
         track(Modification::deleted(entity, gen));
     }
 
+    /// Record a predicate range delete (eraseWhere). One entry covers every row
+    /// matching `predicate`; consumed lazily like entity modifications.
+    void notifyRangeDeleted(RangePayload predicate, uint32_t gen) {
+        bumpLatest(gen);
+        std::unique_lock lock(mutex_);
+        ranges_.push_back(TrackedRange{
+            .predicate = std::move(predicate),
+            .generation = gen,
+            .pending_segments = initial_bitmap_
+        });
+    }
+
 private:
     void track(Modification mod) {
-        // Update latest generation (atomic max)
-        uint32_t current_latest = latest_generation_.load(std::memory_order_relaxed);
-        while (mod.generation > current_latest &&
-               !latest_generation_.compare_exchange_weak(
-                   current_latest, mod.generation,
-                   std::memory_order_release, std::memory_order_relaxed)) {
-        }
+        bumpLatest(mod.generation);
 
         {
             std::unique_lock lock(mutex_);
@@ -182,34 +214,47 @@ public:
     ///   Only taken when there are actual removals.
     void drainChunk(uint32_t cutoff_gen, uint8_t chunk_id) {
         std::vector<size_t> to_erase;
+        std::vector<size_t> to_erase_ranges;
         const BitmapType chunk_bit = BitmapType{1} << chunk_id;
+        const auto clear = [&](BitmapType& slot) -> bool {
+            std::atomic_ref<BitmapType> bitmap(slot);
+            BitmapType remaining = bitmap.fetch_and(
+                static_cast<BitmapType>(~chunk_bit), std::memory_order_relaxed)
+                & static_cast<BitmapType>(~chunk_bit);
+            return remaining == 0;
+        };
 
         {
             std::shared_lock lock(mutex_);
             for (size_t i = 0; i < modifications_.size(); ++i) {
                 if (modifications_[i].modification.generation > cutoff_gen) continue;
-
-                std::atomic_ref<BitmapType> bitmap(modifications_[i].pending_segments);
-                BitmapType remaining = bitmap.fetch_and(
-                    static_cast<BitmapType>(~chunk_bit), std::memory_order_relaxed)
-                    & static_cast<BitmapType>(~chunk_bit);
-
-                if (remaining == 0) {
-                    to_erase.push_back(i);
-                }
+                if (clear(modifications_[i].pending_segments)) to_erase.push_back(i);
+            }
+            for (size_t i = 0; i < ranges_.size(); ++i) {
+                if (ranges_[i].generation > cutoff_gen) continue;
+                if (clear(ranges_[i].pending_segments)) to_erase_ranges.push_back(i);
             }
         }
 
-        if (!to_erase.empty()) {
-            std::unique_lock lock(mutex_);
-            for (auto it = to_erase.rbegin(); it != to_erase.rend(); ++it) {
-                size_t idx = *it;
-                if (idx < modifications_.size()) {
-                    if (idx != modifications_.size() - 1) {
-                        std::swap(modifications_[idx], modifications_.back());
-                    }
-                    modifications_.pop_back();
+        if (to_erase.empty() && to_erase_ranges.empty()) return;
+
+        std::unique_lock lock(mutex_);
+        for (auto it = to_erase.rbegin(); it != to_erase.rend(); ++it) {
+            size_t idx = *it;
+            if (idx < modifications_.size()) {
+                if (idx != modifications_.size() - 1) {
+                    std::swap(modifications_[idx], modifications_.back());
                 }
+                modifications_.pop_back();
+            }
+        }
+        for (auto it = to_erase_ranges.rbegin(); it != to_erase_ranges.rend(); ++it) {
+            size_t idx = *it;
+            if (idx < ranges_.size()) {
+                if (idx != ranges_.size() - 1) {
+                    std::swap(ranges_[idx], ranges_.back());
+                }
+                ranges_.pop_back();
             }
         }
     }
@@ -220,6 +265,9 @@ public:
         std::unique_lock lock(mutex_);
         std::erase_if(modifications_, [cutoff_gen](const TrackedModification& t) {
             return t.modification.generation <= cutoff_gen;
+        });
+        std::erase_if(ranges_, [cutoff_gen](const TrackedRange& t) {
+            return t.generation <= cutoff_gen;
         });
     }
 
@@ -248,6 +296,27 @@ public:
         }
     }
 
+    /// Execute a callback for each predicate range modification with its bitmap.
+    /// Callback signature: void(const RangePayload&, uint32_t generation, BitmapType).
+    template<typename Callback>
+    void forEachRangeWithBitmap(Callback&& callback) const {
+        std::shared_lock lock(mutex_);
+        for (const auto& tracked : ranges_) {
+            std::atomic_ref<BitmapType> bitmap(tracked.pending_segments);
+            callback(tracked.predicate, tracked.generation,
+                     bitmap.load(std::memory_order_relaxed));
+        }
+    }
+
+    /// Execute a callback for each predicate range modification (without bitmap).
+    template<typename Callback>
+    void forEachRange(Callback&& callback) const {
+        std::shared_lock lock(mutex_);
+        for (const auto& tracked : ranges_) {
+            callback(tracked.predicate, tracked.generation);
+        }
+    }
+
     /// Check if there are modifications since the given generation.
     /// Use this for short-circuit optimization before iterating.
     [[nodiscard]] bool hasModificationsSince(uint32_t since_gen) const {
@@ -260,12 +329,17 @@ public:
 
     [[nodiscard]] bool empty() const {
         std::shared_lock lock(mutex_);
-        return modifications_.empty();
+        return modifications_.empty() && ranges_.empty();
     }
 
     [[nodiscard]] size_t size() const {
         std::shared_lock lock(mutex_);
         return modifications_.size();
+    }
+
+    [[nodiscard]] size_t rangeCount() const {
+        std::shared_lock lock(mutex_);
+        return ranges_.size();
     }
 
     [[nodiscard]] uint32_t latestGeneration() const {
