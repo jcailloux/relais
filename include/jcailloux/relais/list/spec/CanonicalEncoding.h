@@ -56,6 +56,45 @@ void appendOptional(std::vector<uint8_t>& buf, const std::optional<T>& opt) {
     }
 }
 
+/// Append the filter portion of a value set to buf, in declaration order. This
+/// is the byte-exact prefix shared by every group key, the predicate blob, and
+/// the canonical hash — set ops emit [presence][count:u32][elem×count]
+/// (sorted+unique), scalars emit [presence][value]. Extracted so groupKey and
+/// encodeFilterSet (eraseWhere predicate) stay byte-identical: the Lua matcher
+/// compares a group's bytes against the predicate's, so any divergence desyncs.
+template<typename Descriptor>
+void appendFilterSet(std::vector<uint8_t>& buf, const Filters<Descriptor>& filters) {
+    [&]<size_t... Is>(std::index_sequence<Is...>) {
+        ([&] {
+            using FilterType = filter_at<Descriptor, Is>;
+            const auto& filter_value = filters.template get<Is>();
+            if constexpr (FilterType::is_set_op) {
+                // Set op (IN/NIN): [presence][count:u32][elem×count]. Encoding is
+                // byte-identical for both — only the match verdict differs (L1/L2/
+                // L3), never the key. Canonicalize (sort+unique) defensively here,
+                // not only in the parser, so filters built programmatically also
+                // hash to a stable group_key.
+                buf.push_back(filter_value.has_value() ? 1 : 0);
+                if (filter_value) {
+                    auto sorted = *filter_value;
+                    std::sort(sorted.begin(), sorted.end());
+                    sorted.erase(std::unique(sorted.begin(), sorted.end()), sorted.end());
+                    appendToBuffer(buf, static_cast<uint32_t>(sorted.size()));
+                    // Pin the element type: iterating std::vector<bool> yields a
+                    // proxy reference, not bool — appendToBuffer would deduce the
+                    // proxy, match no branch and emit zero bytes, desyncing the
+                    // group set from the (scalar) entity blob. Explicit T forces
+                    // the proxy to materialize and keeps strings copy-free.
+                    using ElemT = typename std::decay_t<decltype(sorted)>::value_type;
+                    for (const auto& e : sorted) appendToBuffer<ElemT>(buf, e);
+                }
+            } else {
+                appendOptional(buf, filter_value);
+            }
+        }(), ...);
+    }(std::make_index_sequence<filter_count<Descriptor>>{});
+}
+
 }  // namespace detail
 
 // =============================================================================
@@ -76,35 +115,7 @@ std::string groupKey(
     buf.reserve(128);
 
     // Filters in declaration order (alphabetically sorted by generator)
-    [&]<size_t... Is>(std::index_sequence<Is...>) {
-        ([&] {
-            using FilterType = filter_at<Descriptor, Is>;
-            const auto& filter_value = filters.template get<Is>();
-            if constexpr (FilterType::is_set_op) {
-                // Set op (IN/NIN): [presence][count:u32][elem×count]. Encoding is
-                // byte-identical for both — only the match verdict differs (L1/L2/
-                // L3), never the key. Canonicalize (sort+unique) defensively here,
-                // not only in the parser, so filters built programmatically also
-                // hash to a stable group_key.
-                buf.push_back(filter_value.has_value() ? 1 : 0);
-                if (filter_value) {
-                    auto sorted = *filter_value;
-                    std::sort(sorted.begin(), sorted.end());
-                    sorted.erase(std::unique(sorted.begin(), sorted.end()), sorted.end());
-                    detail::appendToBuffer(buf, static_cast<uint32_t>(sorted.size()));
-                    // Pin the element type: iterating std::vector<bool> yields a
-                    // proxy reference, not bool — appendToBuffer would deduce the
-                    // proxy, match no branch and emit zero bytes, desyncing the
-                    // group set from the (scalar) entity blob. Explicit T forces
-                    // the proxy to materialize and keeps strings copy-free.
-                    using ElemT = typename std::decay_t<decltype(sorted)>::value_type;
-                    for (const auto& e : sorted) detail::appendToBuffer<ElemT>(buf, e);
-                }
-            } else {
-                detail::appendOptional(buf, filter_value);
-            }
-        }(), ...);
-    }(std::make_index_sequence<filter_count<Descriptor>>{});
+    detail::appendFilterSet<Descriptor>(buf, filters);
 
     // Sort specification
     uint8_t has_sort = sort.has_value() ? 1 : 0;
@@ -180,6 +191,22 @@ std::string encodeEntityFilterBlob(const typename Descriptor::Entity& entity) {
         }(), ...);
     }(std::make_index_sequence<filter_count<Descriptor>>{});
 
+    return std::string(reinterpret_cast<const char*>(buf.data()), buf.size());
+}
+
+/// Encode a predicate's filter values as the byte-exact group-key filter prefix
+/// (set ops as canonical sets, scalars as [presence][value]) — NO sort suffix.
+/// This is the predicate blob the Lua `pmatch` compares, position by position,
+/// against each group's stored filter bytes (`bin`). It uses the SAME encoding
+/// as groupKey's filter portion, so a present predicate value and a present
+/// group value at the same filter are directly comparable; an absent predicate
+/// value (presence 0) is a wildcard that never prunes the group.
+template<typename Descriptor>
+    requires ValidFilterSet<Descriptor>
+std::string encodeFilterSet(const Filters<Descriptor>& filters) {
+    std::vector<uint8_t> buf;
+    buf.reserve(64);
+    detail::appendFilterSet<Descriptor>(buf, filters);
     return std::string(reinterpret_cast<const char*>(buf.data()), buf.size());
 }
 

@@ -6,6 +6,7 @@
 #include <concepts>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <optional>
 #include <string_view>
 #include <tuple>
@@ -382,6 +383,124 @@ template<typename Descriptor>
     }(std::make_index_sequence<sort_count<Descriptor>>{});
 
     return result;
+}
+
+// =============================================================================
+// Predicate fast-path primitives (eraseWhere) — derive a per-sort-dimension
+// value range from a predicate, and test a cached group for predicate
+// compatibility. Both are never-miss: a predicate constraint that cannot be
+// evaluated narrows nothing / prunes nothing.
+// =============================================================================
+
+/// Inclusive int64 range a predicate constrains a sort column to. Defaults to
+/// the full domain (predicate says nothing about that column → every page of a
+/// compatible group is in range).
+struct SortRange {
+    int64_t lo{std::numeric_limits<int64_t>::min()};
+    int64_t hi{std::numeric_limits<int64_t>::max()};
+};
+
+namespace detail {
+
+/// Intersect predicate filter I into the running [lo,hi]. Only EQ / IN /
+/// comparison on an arithmetic column narrow it; GT/LT are loosened to GE/LE
+/// (wider → never-miss); NE / NIN / absent leave it full.
+template<typename Descriptor, size_t I>
+void narrowSortRange(SortRange& r, const Filters<Descriptor>& pred) noexcept {
+    using FT = filter_at<Descriptor, I>;
+    if constexpr (std::is_arithmetic_v<typename FT::element_type>) {
+        const auto& v = pred.template get<I>();
+        if (!v.has_value()) return;
+        constexpr Op op = FT::op;
+        if constexpr (op == Op::IN) {
+            if (v->empty()) return;
+            int64_t mn = std::numeric_limits<int64_t>::max();
+            int64_t mx = std::numeric_limits<int64_t>::min();
+            for (const auto& e : *v) {
+                int64_t x = toInt64ForCursor(e);
+                mn = std::min(mn, x);
+                mx = std::max(mx, x);
+            }
+            r.lo = std::max(r.lo, mn);
+            r.hi = std::min(r.hi, mx);
+        } else if constexpr (op == Op::EQ) {
+            int64_t x = toInt64ForCursor(*v);
+            r.lo = std::max(r.lo, x);
+            r.hi = std::min(r.hi, x);
+        } else if constexpr (op == Op::GT || op == Op::GE) {
+            r.lo = std::max(r.lo, toInt64ForCursor(*v));
+        } else if constexpr (op == Op::LT || op == Op::LE) {
+            r.hi = std::min(r.hi, toInt64ForCursor(*v));
+        }
+    }
+}
+
+/// Narrow the range from every predicate filter on sort dimension Ss's column.
+/// Kept as its own function so predicateSortRange's outer dispatch holds no
+/// nested fold (a nested fold inside a ternary-IIFE ICEs GCC 16).
+template<typename Descriptor, size_t Ss>
+void narrowSortRangeForDim(SortRange& r, const Filters<Descriptor>& pred) noexcept {
+    [&]<size_t... Fs>(std::index_sequence<Fs...>) {
+        ([&] {
+            if constexpr (filter_at<Descriptor, Fs>::column()
+                          == sort_at<Descriptor, Ss>::column()) {
+                narrowSortRange<Descriptor, Fs>(r, pred);
+            }
+        }(), ...);
+    }(std::make_index_sequence<filter_count<Descriptor>>{});
+}
+
+/// Per-filter predicate↔group compatibility. False only when both sides are
+/// present and provably disjoint: EQ values differ, or IN sets share no element.
+/// Absent side = wildcard; comparison / NE / NIN = conservative (compatible).
+template<typename Descriptor, size_t I>
+[[nodiscard]] bool predicateCompatAt(
+    const Filters<Descriptor>& pred, const Filters<Descriptor>& group) noexcept {
+    const auto& pv = pred.template get<I>();
+    const auto& gv = group.template get<I>();
+    if (!pv.has_value() || !gv.has_value()) return true;
+    constexpr Op op = filter_at<Descriptor, I>::op;
+    if constexpr (op == Op::EQ) {
+        return *pv == *gv;
+    } else if constexpr (op == Op::IN) {
+        for (const auto& e : *pv) {
+            if (std::ranges::find(*gv, e) != gv->end()) return true;
+        }
+        return false;
+    } else {
+        return true;
+    }
+}
+
+}  // namespace detail
+
+/// Range of sort-field values any row matching the predicate can hold, for the
+/// sort dimension `field_index`. A page whose [first,last] does not overlap this
+/// range cannot contain a deleted row. Full range when the predicate does not
+/// constrain the sorted column.
+template<typename Descriptor>
+    requires ValidListDescriptor<Descriptor>
+[[nodiscard]] SortRange predicateSortRange(
+    const Filters<Descriptor>& predicate, size_t field_index) noexcept {
+    SortRange r;
+    [&]<size_t... Ss>(std::index_sequence<Ss...>) {
+        ((field_index == Ss
+            ? (detail::narrowSortRangeForDim<Descriptor, Ss>(r, predicate), void())
+            : void()), ...);
+    }(std::make_index_sequence<sort_count<Descriptor>>{});
+    return r;
+}
+
+/// True if a cached group (its filter values `group`) can hold a row matching the
+/// predicate. Conjunction over filters: any provably-incompatible filter prunes
+/// the group. Never-miss.
+template<typename Descriptor>
+    requires ValidFilterSet<Descriptor>
+[[nodiscard]] bool predicateGroupCompatible(
+    const Filters<Descriptor>& predicate, const Filters<Descriptor>& group) noexcept {
+    return [&]<size_t... Is>(std::index_sequence<Is...>) {
+        return (detail::predicateCompatAt<Descriptor, Is>(predicate, group) && ...);
+    }(std::make_index_sequence<filter_count<Descriptor>>{});
 }
 
 // =============================================================================
