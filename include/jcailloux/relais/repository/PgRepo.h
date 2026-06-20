@@ -330,9 +330,15 @@ protected:
     // batch op (invalidateMany/eraseMany/...): the affected set is resolved to
     // a vector<E> upstream, then this cascades L1 evict + L2 UNLINK + list
     // invalidation + deduplicated cross-inval through the mixin chain — exactly
-    // the per-tier work of the mono invalidate(id), batched. L3 (this layer)
-    // owns no entity cache, so the base is a no-op terminator.
+    // the per-tier work of the mono op, batched. L3 (this layer) owns no entity
+    // cache, so the base is a no-op terminator.
+    //
+    // WithLists gates the OWN-list tier (ListMixin): eraseMany passes true (the
+    // entity left the table → its list pages change, like mono erase), while
+    // invalidateMany passes false (the entity still exists → its lists are
+    // untouched, like mono invalidate). Cross-inval + entity evict run in both.
 
+    template<bool WithLists = true>
     static io::Task<void> invalidateManyImpl(
         [[maybe_unused]] std::span<const E> entities) {
         co_return;
@@ -424,7 +430,10 @@ protected:
     /// Precondition: ids deduplicated upstream. No partition pruning: pk=ANY
     /// scans all partitions (cf. plan §3); RETURNING still carries the partition
     /// column so callers can derive the L1 single-partition evict hint.
-    static io::Task<std::vector<E>> eraseManyRaw(std::span<const Key> ids)
+    /// nullopt signals a DB error (parité mono erase, whose EraseOutcome.affected
+    /// is nullopt on PgError); an empty vector means "no matching row" — the
+    /// public eraseMany maps the two to nullopt vs a 0 count.
+    static io::Task<std::optional<std::vector<E>>> eraseManyRaw(std::span<const Key> ids)
         requires (!Cfg.read_only)
     {
         std::vector<E> out;
@@ -447,7 +456,7 @@ protected:
             co_return out;
         } catch (const io::PgError& e) {
             RELAIS_LOG_ERROR << name() << ": eraseManyRaw DB error - " << e.what();
-            co_return std::vector<E>{};
+            co_return std::nullopt;
         }
     }
 

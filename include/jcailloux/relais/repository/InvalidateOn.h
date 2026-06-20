@@ -24,6 +24,24 @@ template<typename K>
     return keys;
 }
 
+/// Stable dedup by equality only — first-seen order, O(N²) linear scan (N small,
+/// mirrors LocalRepo::findMany's choice). Unlike dedupSorted it needs no
+/// operator< , so it works on composite/partition Keys that only model equality.
+/// Used at the public batch entry to collapse duplicate Keys before erase/find.
+template<typename K>
+[[nodiscard]] std::vector<K> dedupStable(std::span<const K> keys) {
+    std::vector<K> out;
+    out.reserve(keys.size());
+    for (const auto& k : keys) {
+        bool seen = false;
+        for (const auto& u : out) {
+            if (u == k) { seen = true; break; }
+        }
+        if (!seen) out.push_back(k);
+    }
+    return out;
+}
+
 /// Awaited value type of an awaitable expression (Task<T>/Immediate<T> → T).
 /// Lets a batch resolver deduce its result container without a real co_await.
 template<typename T> struct awaited { using type = T; };
