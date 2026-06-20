@@ -86,6 +86,30 @@ concept HasListDescriptor = requires {
     typename E::MappingType::ListDescriptor;
 };
 
+// -----------------------------------------------------------------------------
+// FilterSet detection
+// -----------------------------------------------------------------------------
+
+/// E's Mapping declares a FilterSet (predicate spec — filters tuple + named
+/// Values aggregate). Drives the where-variants (eraseWhere/invalidateWhere).
+/// Decoupled from HasListDescriptor: an entity may declare filters WITHOUT a
+/// cached list and still satisfy this (étape 0b decorrelation); conversely a
+/// list entity's ListDescriptor inherits its FilterSet, so list entities
+/// satisfy both.
+template<typename E>
+concept HasFilterSet = requires {
+    typename E::MappingType::FilterSet;
+    typename E::MappingType::FilterSet::Values;
+};
+
+/// User-facing predicate aggregate for the where-variants — a struct of named
+/// optionals (one per filter), built with designated initializers:
+///   repo.eraseWhere({.author_id = 42, .category = "tech"});
+/// Named by HTTP param, robust to filter reordering (unlike a positional tuple).
+template<typename E>
+    requires HasFilterSet<E>
+using FilterSet = typename E::MappingType::FilterSet::Values;
+
 /// E's Mapping has partition hint support (partition-pruned DELETE).
 /// Auto-detected from Mapping providing delete_with_partition SQL and
 /// makePartitionHintParams method (generated when @relais partition_key is used).

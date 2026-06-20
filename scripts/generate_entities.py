@@ -1321,26 +1321,25 @@ class MappingGenerator:
     # =========================================================================
 
     def _generate_embedded_descriptor(self, entity: ParsedEntity) -> list[str]:
-        """Generate ListDescriptor struct nested inside the Mapping."""
+        """Generate the predicate FilterSet and (when sorted) ListDescriptor structs
+        nested inside the Mapping. FilterSet is the standalone predicate spec
+        (satisfies ValidFilterSet → HasFilterSet → eraseWhere/invalidateWhere);
+        ListDescriptor composes over it (filters via inheritance) and only exists
+        when a sort dimension is declared — that is what activates ListMixin."""
         a = entity.annotation
         struct_fqn = (f"{entity.namespace}::{entity.class_name}"
                       if entity.namespace else entity.class_name)
         decl_ns = "jcailloux::relais::list::spec"
 
-        limits = a.limits if a.limits else [10, 25, 50]
-        default_limit = limits[0]
-        max_limit = limits[-1]
-        limits_str = ", ".join(str(v) for v in limits)
+        lines: list[str] = []
 
-        lines = [
-            "    // Embedded ListDescriptor — auto-detected by ListMixin",
-            "    struct ListDescriptor {",
-        ]
-
+        # Standalone FilterSet — predicate spec, decoupled from list caching.
         if a.filters:
             # Sort filters alphabetically by param name for deterministic cache keys
             a.filters.sort(key=lambda f: f.param)
-            lines.append("")
+            members_by_name = {m.name: m for m in entity.members}
+            lines.append("    // Embedded FilterSet — predicate spec (HasFilterSet)")
+            lines.append("    struct FilterSet {")
             lines.append("        static constexpr auto filters = std::tuple{")
             for i, f in enumerate(a.filters):
                 comma = "," if i < len(a.filters) - 1 else ""
@@ -1359,7 +1358,44 @@ class MappingGenerator:
                         f'>{{}}{comma}')
             lines.append("        };")
 
+            # Named predicate aggregate — one optional per filter, in the same
+            # (param-sorted) order as the filters tuple, so toFilterTuple() lines
+            # up element-for-element with Filters<Descriptor>::values. Members are
+            # named by HTTP param (unique) for designated-init: {.author_id = 42}.
+            # IN / NOT IN take a set, mirroring Filter::filter_type.
+            lines.append("")
+            lines.append("        struct Values {")
+            for f in a.filters:
+                m = members_by_name.get(f.field)
+                element = m.inner_type if m else "int64_t"
+                if f.op in ("in", "nin"):
+                    opt_type = f"std::optional<std::vector<{element}>>"
+                else:
+                    opt_type = f"std::optional<{element}>"
+                lines.append(f"            {opt_type} {f.param}{{}};")
+            tuple_members = ", ".join(f.param for f in a.filters)
+            lines.append("")
+            lines.append("            /// Bridge to the positional Filters<Descriptor>::values tuple.")
+            lines.append("            [[nodiscard]] auto toFilterTuple() const {")
+            lines.append(f"                return std::tuple{{{tuple_members}}};")
+            lines.append("            }")
+            lines.append("        };")
+            lines.append("    };")
+
+        # ListDescriptor — sorts + pagination; inherits FilterSet's filters tuple.
+        # Emitted only when a sort dimension exists (ListMixin requires it).
         if a.sorts:
+            limits = a.limits if a.limits else [10, 25, 50]
+            default_limit = limits[0]
+            max_limit = limits[-1]
+            limits_str = ", ".join(str(v) for v in limits)
+
+            if lines:
+                lines.append("")
+            base = " : FilterSet" if a.filters else ""
+            lines.append("    // Embedded ListDescriptor — auto-detected by ListMixin")
+            lines.append(f"    struct ListDescriptor{base} {{")
+
             lines.append("")
             lines.append("        static constexpr auto sorts = std::tuple{")
             for i, s in enumerate(a.sorts):
@@ -1374,13 +1410,13 @@ class MappingGenerator:
                     f'>{{}}{comma}')
             lines.append("        };")
 
-        lines.append("")
-        lines.append(
-            f"        static constexpr std::array<uint16_t, {len(limits)}> "
-            f"allowedLimits = {{{limits_str}}};")
-        lines.append(f"        static constexpr uint16_t defaultLimit = {default_limit};")
-        lines.append(f"        static constexpr uint16_t maxLimit = {max_limit};")
-        lines.append("    };")
+            lines.append("")
+            lines.append(
+                f"        static constexpr std::array<uint16_t, {len(limits)}> "
+                f"allowedLimits = {{{limits_str}}};")
+            lines.append(f"        static constexpr uint16_t defaultLimit = {default_limit};")
+            lines.append(f"        static constexpr uint16_t maxLimit = {max_limit};")
+            lines.append("    };")
 
         return lines
 
