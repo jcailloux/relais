@@ -46,7 +46,7 @@ template<Op op, typename T>
 
 /// Check if entity matches all active filters
 template<typename Descriptor>
-    requires ValidListDescriptor<Descriptor>
+    requires ValidFilterSet<Descriptor>
 [[nodiscard]] bool matchesFilters(
     const typename Descriptor::Entity& entity,
     const Filters<Descriptor>& filters
