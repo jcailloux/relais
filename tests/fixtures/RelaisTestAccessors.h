@@ -101,6 +101,23 @@ struct TestInternals {
         return Repo::findManyRaw(ids);
     }
 
+    /// Reach the internal batched erase (eraseManyRaw) — protected like eraseImpl.
+    /// Returns the deleted entities (RETURNING). Lazy Task: `ids` must outlive
+    /// the sync() that drives it.
+    template<typename Repo, typename Key>
+    static auto eraseManyRaw(std::span<const Key> ids) {
+        return Repo::eraseManyRaw(ids);
+    }
+
+    /// Reach the internal predicate erase (eraseWhereRaw). Descriptor is the
+    /// repo's augmented ListDescriptorType (carries the Entity alias the filter
+    /// helpers resolve). FiltersT stays deduced so this header need not include
+    /// GeneratedCriteria. Lazy Task: `filters` must outlive the sync().
+    template<typename Repo, typename Descriptor, typename FiltersT>
+    static auto eraseWhereRaw(const FiltersT& filters) {
+        return Repo::template eraseWhereRaw<Descriptor>(filters);
+    }
+
     /// Populate L2 directly in the repo's configured format (BEVE/JSON) under
     /// its real Redis key — lets a test stage an L2-only entry (no DB row) to
     /// prove the MGET path. setInCache is protected; RedisRepo befriends us.

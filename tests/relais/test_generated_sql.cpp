@@ -24,6 +24,10 @@
 #include "fixtures/generated/TestEventEntity.h"
 #include "fixtures/generated/TestCompositeKeyListEntity.h"
 #include "fixtures/generated/TestAllPkJunctionEntity.h"
+#include "fixtures/generated/TestArticleInEntity.h"
+
+#include <jcailloux/relais/list/spec/GeneratedCriteria.h>
+#include <jcailloux/relais/repository/PgRepo.h>
 
 namespace {
 
@@ -31,6 +35,15 @@ using UserSQL = entity::generated::TestUserMapping::SQL;
 using EventSQL = entity::generated::TestEventMapping::SQL;
 using CompositeSQL = entity::generated::TestCompositeKeyListMapping::SQL;
 using JunctionSQL = entity::generated::TestAllPkJunctionMapping::SQL;
+
+namespace decl = jcailloux::relais::list::spec;
+namespace detail = jcailloux::relais::detail;
+
+// Mirror ListMixin's descriptor augmentation (cf. test_gen_list_in.cpp): the
+// embedded ListDescriptor gains the Entity alias the free helpers resolve.
+struct ArticleDesc : entity::generated::TestArticleInEntity::MappingType::ListDescriptor {
+    using Entity = entity::generated::TestArticleInEntity;
+};
 
 }  // namespace
 
@@ -141,4 +154,76 @@ TEST_CASE("delete_by_pk_batch shares the WHERE shape of select_by_pk_batch",
         CHECK(where_of(CompositeSQL::delete_by_pk_batch) ==
               where_of(CompositeSQL::select_by_pk_batch));
     }
+}
+
+// #############################################################################
+//  delete_where — assemblage runtime (étape 2, §1)
+// #############################################################################
+//
+// delete_where N'EST PAS un template du générateur : le prédicat est injecté en
+// milieu de string au runtime (sortie buildWhereClause, numérotée $n). On verrouille
+// ici la forme produite par detail::buildDeleteWhereSql + la survie du $n quand le
+// prédicat vient réellement de buildWhereClause<Descriptor>.
+
+TEST_CASE("delete_where - ctid-bounded form", "[generator][sql][batch][where]") {
+    SECTION("[SQL] unconditional purge — no inner WHERE") {
+        // where_sql vide → purge totale : pas de clause WHERE dans le sous-select,
+        // mais le LIMIT K_pg borne toujours la suppression par statement.
+        const std::string sql = detail::buildDeleteWhereSql(
+            "relais_test_users",
+            "id, username, email, balance, created_at",
+            /*where_sql=*/"", detail::kPgEraseChunk);
+        CHECK(sql ==
+              "DELETE FROM relais_test_users WHERE ctid IN "
+              "(SELECT ctid FROM relais_test_users LIMIT 10000) "
+              "RETURNING id, username, email, balance, created_at");
+    }
+
+    SECTION("[SQL] predicate purge — inner WHERE carries the $n predicate") {
+        const std::string sql = detail::buildDeleteWhereSql(
+            "relais_test_users",
+            "id, username, email, balance, created_at",
+            /*where_sql=*/"\"balance\" < $1", detail::kPgEraseChunk);
+        CHECK(sql ==
+              "DELETE FROM relais_test_users WHERE ctid IN "
+              "(SELECT ctid FROM relais_test_users WHERE \"balance\" < $1 "
+              "LIMIT 10000) "
+              "RETURNING id, username, email, balance, created_at");
+        // Le prédicat $n vit dans le sous-select (le ctid IN), pas après le LIMIT.
+        CHECK(sql.find("$1") < sql.find("LIMIT"));
+    }
+
+    SECTION("[SQL] K_pg is the library chunk bound, not a per-entity policy") {
+        // Constante librairie : 10k, identique quelle que soit l'entité.
+        CHECK(detail::kPgEraseChunk == 10000);
+        const std::string sql = detail::buildDeleteWhereSql(
+            "t", "id", "", detail::kPgEraseChunk);
+        CHECK(sql.find("LIMIT 10000") != std::string::npos);
+    }
+}
+
+TEST_CASE("delete_where - $n survives buildWhereClause -> assembly",
+          "[generator][sql][batch][where]") {
+    // Le prédicat réel sort de buildWhereClause<Descriptor> ($n numéroté à partir
+    // de 1) ; l'assembleur doit le replacer tel quel dans le sous-select ctid.
+    decl::Filters<ArticleDesc> f;
+    f.template get<2>() = true;  // is_published EQ -> "is_published"=$1
+
+    auto wc = decl::buildWhereClause<ArticleDesc>(f);
+    REQUIRE(wc.sql.find("$1") != std::string::npos);
+    REQUIRE(wc.params.params.size() == 1);
+
+    const std::string sql = detail::buildDeleteWhereSql(
+        entity::generated::TestArticleInMapping::table_name,
+        entity::generated::TestArticleInMapping::SQL::returning_columns,
+        wc.sql, detail::kPgEraseChunk);
+
+    // Forme attendue : le WHERE de buildWhereClause est encapsulé dans le ctid IN,
+    // suivi de LIMIT puis RETURNING <returning_columns>.
+    const std::string inner = std::string(" WHERE ") + wc.sql + " LIMIT 10000)";
+    CHECK(sql.find(inner) != std::string::npos);
+    CHECK(sql.find("WHERE ctid IN (SELECT ctid FROM ") != std::string::npos);
+    CHECK(sql.ends_with(std::string("RETURNING ")
+                        + entity::generated::TestArticleInMapping::SQL::returning_columns));
+    CHECK(sql.find("$1") < sql.find("LIMIT"));
 }
