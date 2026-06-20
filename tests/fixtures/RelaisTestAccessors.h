@@ -118,6 +118,15 @@ struct TestInternals {
         return Repo::template eraseWhereRaw<Descriptor>(filters);
     }
 
+    /// Reach the batch invalidation common path (invalidateManyImpl) — the
+    /// shared downstream of invalidateMany/eraseMany: L1 evict + L2 UNLINK +
+    /// list invalidation + deduplicated cross-inval. Takes the already-resolved
+    /// affected set. Lazy Task: `entities` must outlive the sync().
+    template<typename Repo, typename Ent>
+    static auto invalidateManyImpl(std::span<const Ent> entities) {
+        return Repo::invalidateManyImpl(entities);
+    }
+
     /// Populate L2 directly in the repo's configured format (BEVE/JSON) under
     /// its real Redis key — lets a test stage an L2-only entry (no DB row) to
     /// prove the MGET path. setInCache is protected; RedisRepo befriends us.
