@@ -39,6 +39,13 @@ struct TestInternals {
         return Repo::listCache().modifications_.size();
     }
 
+    /// Number of pending predicate range modifications (eraseWhere fast-path).
+    /// One eraseWhere should add exactly one — proves O(1), not N per-entity mods.
+    template<typename Repo>
+    static size_t pendingRangeCount() {
+        return Repo::listCache().modifications_.rangeCount();
+    }
+
     /// Number of chunks in the list cache (= number of cleanup cycles to drain all bitmap bits).
     template<typename Repo>
     static constexpr size_t listCacheChunkCount() {
