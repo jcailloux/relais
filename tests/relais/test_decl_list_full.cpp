@@ -52,7 +52,7 @@ static FullArticleListQuery makeFullArticleQuery(
     if (category) q.filters.template get<1>() = std::move(*category);
 
     using Desc = FullCacheArticleListRepo::ListDescriptorType;
-    q.group_key = decl::groupCacheKey<Desc>(q);
+    q.group_key = decl::groupKey<Desc>(q.filters, q.sort);
     q.cache_key = decl::cacheKey<Desc>(q);
     return q;
 }
@@ -68,7 +68,7 @@ static FullPurchaseListQuery makeFullPurchaseQuery(
     if (user_id) q.filters.template get<1>() = *user_id;
 
     using Desc = FullCachePurchaseListRepo::ListDescriptorType;
-    q.group_key = decl::groupCacheKey<Desc>(q);
+    q.group_key = decl::groupKey<Desc>(q.filters, q.sort);
     q.cache_key = decl::cacheKey<Desc>(q);
     return q;
 }
@@ -483,7 +483,7 @@ static FullArticleDescQuery makeFullViewCountQuery(
     q.limit = limit;
     q.filters.get<1>() = category;
     q.sort = list_ns::SortSpec<size_t>{1, list_ns::SortDirection::Desc};
-    q.group_key = decl::groupCacheKey<FullArticleDecl>(q);
+    q.group_key = decl::groupKey<FullArticleDecl>(q.filters, q.sort);
     q.cache_key = decl::cacheKey<FullArticleDecl>(q);
     return q;
 }

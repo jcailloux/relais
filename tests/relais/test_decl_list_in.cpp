@@ -369,7 +369,7 @@ template<typename Desc, typename Vec>
 std::string groupKeyForSet(Vec v) {
     decl::ListDescriptorQuery<Desc> q;
     q.filters.template get<0>() = std::move(v);
-    return decl::groupCacheKey<Desc>(q);
+    return decl::groupKey<Desc>(q.filters, q.sort);
 }
 
 }  // namespace
@@ -397,7 +397,7 @@ TEST_CASE("[DeclListIn] binary: int64 set canonicalization", "[list][in][unit][b
 TEST_CASE("[DeclListIn] binary: presence byte and count layout", "[list][in][unit][binary]") {
     // Inactive filter: a single 0x00 presence byte, no count, no elements.
     decl::ListDescriptorQuery<DescInInt64> q_inactive;
-    const std::string key_inactive = decl::groupCacheKey<DescInInt64>(q_inactive);
+    const std::string key_inactive = decl::groupKey<DescInInt64>(q_inactive.filters, q_inactive.sort);
 
     // Present-but-empty: presence 0x01 + count 0 (4 bytes) + no elements.
     const std::string key_empty = groupKeyForSet<DescInInt64>(std::vector<int64_t>{});
@@ -523,7 +523,7 @@ const std::string kInMaster = "test:in:l2:master";
 
 template<typename Desc>
 std::string registerInGroup(const decl::ListDescriptorQuery<Desc>& q) {
-    std::string groupKey = std::string(kInPrefix) + decl::groupCacheKey<Desc>(q);
+    std::string groupKey = std::string(kInPrefix) + decl::groupKey<Desc>(q.filters, q.sort);
     std::string pageKey = groupKey + ":p";
     sync(PgProvider::redis("SET", pageKey, "x"));               // < header → chk true
     sync(PgProvider::redis("SADD", groupKey + ":_keys", pageKey));

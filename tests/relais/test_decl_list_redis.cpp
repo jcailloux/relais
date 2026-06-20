@@ -72,7 +72,7 @@ static L2ArticleListQuery makeL2ArticleQuery(
     if (category) q.filters.template get<1>() = std::move(*category);
 
     using Desc = L2DeclArticleListRepo::ListDescriptorType;
-    q.group_key = decl::groupCacheKey<Desc>(q);
+    q.group_key = decl::groupKey<Desc>(q.filters, q.sort);
     q.cache_key = decl::cacheKey<Desc>(q);
     return q;
 }
@@ -88,7 +88,7 @@ static L2PurchaseListQuery makeL2PurchaseQuery(
     if (user_id) q.filters.template get<1>() = *user_id;
 
     using Desc = L2DeclPurchaseListRepo::ListDescriptorType;
-    q.group_key = decl::groupCacheKey<Desc>(q);
+    q.group_key = decl::groupKey<Desc>(q.filters, q.sort);
     q.cache_key = decl::cacheKey<Desc>(q);
     return q;
 }
@@ -100,7 +100,7 @@ static L2ArticleDescQuery makeL2ViewCountQuery(std::string_view category, uint16
     q.filters.get<1>() = category;
     q.sort = jcailloux::relais::list::SortSpec<size_t>{1, jcailloux::relais::list::SortDirection::Desc};
 
-    q.group_key = decl::groupCacheKey<L2ArticleDecl>(q);
+    q.group_key = decl::groupKey<L2ArticleDecl>(q.filters, q.sort);
     q.cache_key = decl::cacheKey<L2ArticleDecl>(q);
     return q;
 }
@@ -1087,7 +1087,7 @@ static L2ArticleDescQuery makeL2ViewCountQueryOffset(
     q.filters.get<1>() = category;
     q.sort = jcailloux::relais::list::SortSpec<size_t>{
         1, jcailloux::relais::list::SortDirection::Desc};
-    q.group_key = decl::groupCacheKey<L2ArticleDecl>(q);
+    q.group_key = decl::groupKey<L2ArticleDecl>(q.filters, q.sort);
     q.cache_key = decl::cacheKey<L2ArticleDecl>(q);
     return q;
 }
