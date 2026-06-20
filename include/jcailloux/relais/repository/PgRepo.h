@@ -19,6 +19,7 @@
 #include "jcailloux/relais/entity/EntityConcepts.h"
 #include "jcailloux/relais/cache/CacheView.h"
 #include "jcailloux/relais/entity/FieldUpdate.h"
+#include "jcailloux/relais/list/spec/GeneratedCriteria.h"
 
 namespace relais_test { struct TestInternals; }
 
@@ -112,6 +113,45 @@ inline std::string buildUpdateReturning(
         sql += std::to_string(param++);
     }
     sql += " RETURNING ";
+    sql += returning_columns;
+    return sql;
+}
+
+/// K_pg — per-statement LIMIT bound for the iterative predicate DELETE. Library
+/// tuning constant (NOT a per-entity generation policy): 10k rows ≈ sub-second
+/// of row locks / WAL per statement, so a large purge stays interruptible and
+/// never holds a table-wide lock window. eraseWhereRaw loops at this granularity.
+inline constexpr size_t kPgEraseChunk = 10000;
+
+/// Build the iterative ctid-bounded predicate DELETE:
+///   DELETE FROM <t> WHERE ctid IN (SELECT ctid FROM <t> [WHERE <pred>] LIMIT K)
+///   RETURNING <cols>
+/// Pure string assembly (no I/O) so the generated form is unit-testable. The
+/// runtime-injected `where_sql` (buildWhereClause output, `$n`-numbered) can't be
+/// a static C-string template — hence assembled here rather than by the Python
+/// generator (cf. plan step 1 deferral). Empty `where_sql` → unconditional purge.
+/// The ctid sub-select + LIMIT is what makes one statement delete at most K rows;
+/// the caller re-runs the same statement until it returns 0 (the predicate keeps
+/// matching the not-yet-deleted remainder).
+inline std::string buildDeleteWhereSql(
+    std::string_view table_name,
+    std::string_view returning_columns,
+    std::string_view where_sql,
+    size_t chunk)
+{
+    std::string sql;
+    sql.reserve(128);
+    sql += "DELETE FROM ";
+    sql += table_name;
+    sql += " WHERE ctid IN (SELECT ctid FROM ";
+    sql += table_name;
+    if (!where_sql.empty()) {
+        sql += " WHERE ";
+        sql += where_sql;
+    }
+    sql += " LIMIT ";
+    sql += std::to_string(chunk);
+    sql += ") RETURNING ";
     sql += returning_columns;
     return sql;
 }
@@ -357,6 +397,82 @@ protected:
         } catch (const io::PgError& e) {
             RELAIS_LOG_ERROR << name() << ": findManyRaw DB error - " << e.what();
             co_return std::vector<std::optional<E>>(ids.size());
+        }
+    }
+
+    /// Batched erase by enumerated keys via `delete_by_pk_batch`
+    /// (WHERE pk = ANY($1) RETURNING *). One statement = deletion + the deleted
+    /// rows, mirroring the mono-key `old` capture: the returned entities feed
+    /// downstream cross-tier invalidation. Returns the entities actually deleted
+    /// (absent ids contribute nothing) — size ≤ ids.size(), order is PG's.
+    /// Precondition: ids deduplicated upstream. No partition pruning: pk=ANY
+    /// scans all partitions (cf. plan §3); RETURNING still carries the partition
+    /// column so callers can derive the L1 single-partition evict hint.
+    static io::Task<std::vector<E>> eraseManyRaw(std::span<const Key> ids)
+        requires (!Cfg.read_only)
+    {
+        std::vector<E> out;
+        if (ids.empty()) co_return out;
+        try {
+            std::vector<io::PgParams> keyParams;
+            keyParams.reserve(ids.size());
+            for (const auto& id : ids)
+                keyParams.push_back(io::PgParams::fromKey(id));
+            auto arrayParams = io::PgParams::buildArrayLiteral(keyParams);
+
+            auto result = co_await PgProvider::queryParams(
+                Mapping::SQL::delete_by_pk_batch, arrayParams);
+
+            out.reserve(static_cast<size_t>(result.rows()));
+            for (int r = 0; r < result.rows(); ++r) {
+                if (auto e = E::fromRow(result[r]))
+                    out.push_back(std::move(*e));
+            }
+            co_return out;
+        } catch (const io::PgError& e) {
+            RELAIS_LOG_ERROR << name() << ": eraseManyRaw DB error - " << e.what();
+            co_return std::vector<E>{};
+        }
+    }
+
+    /// Predicate erase: deletes every row matching `filters`, in K_pg-bounded
+    /// chunks (detail::buildDeleteWhereSql), looping until a chunk deletes 0 rows.
+    /// Returns ALL deleted entities (RETURNING per chunk, accumulated) so the
+    /// caller drives chunk-by-chunk invalidation. The same statement re-runs each
+    /// round: the ctid sub-select keeps matching the not-yet-deleted remainder, so
+    /// the bound caps lock/WAL pressure per statement, never the total set.
+    /// Templated on the filter Descriptor (the entity-level HasFilterSet concept +
+    /// generator-emitted standalone FilterSet land in step 6).
+    template<typename Descriptor>
+        requires list::spec::ValidFilterSet<Descriptor> && (!Cfg.read_only)
+    static io::Task<std::vector<E>> eraseWhereRaw(
+        const list::spec::Filters<Descriptor>& filters)
+    {
+        std::vector<E> out;
+        try {
+            auto where = list::spec::buildWhereClause<Descriptor>(filters);
+            const std::string sql = detail::buildDeleteWhereSql(
+                Mapping::table_name, Mapping::SQL::returning_columns,
+                where.sql, detail::kPgEraseChunk);
+
+            for (;;) {
+                auto result = co_await PgProvider::queryParams(
+                    sql.c_str(), where.params);
+                const int n = result.rows();
+                if (n == 0) break;
+                out.reserve(out.size() + static_cast<size_t>(n));
+                for (int r = 0; r < n; ++r) {
+                    if (auto e = E::fromRow(result[r]))
+                        out.push_back(std::move(*e));
+                }
+                // A short chunk (< K_pg) means the predicate is exhausted; skip
+                // the extra round-trip that would only confirm 0 rows.
+                if (static_cast<size_t>(n) < detail::kPgEraseChunk) break;
+            }
+            co_return out;
+        } catch (const io::PgError& e) {
+            RELAIS_LOG_ERROR << name() << ": eraseWhereRaw DB error - " << e.what();
+            co_return std::vector<E>{};
         }
     }
 
