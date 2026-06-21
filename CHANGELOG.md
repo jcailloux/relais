@@ -4,6 +4,29 @@
 
 ### Added
 
+- **Typed self-sealing list query builder.** `Repo::queryBuilder()` is the
+  primary C++ construction path for a list query: `.filter<"name">(v)`,
+  `.sortBy<"name", Dir>()` (and `.sortAsc`/`.sortDesc`), `.limit(n)`,
+  `.after(cursor)`/`.offset(n)`, terminated by `.build()`. Filters and sort are
+  set **by name, checked at compile time** (an unknown name is a `static_assert`,
+  not a runtime miss); a `Sort<>` reorder can no longer silently bind the wrong
+  column. `.limit()` is the trusted path — exact page size, no grid
+  normalization. `.build()` is the single sealing point.
+
+### Changed
+
+- **List queries are now sealed and immutable.** The construction type split in
+  two: `Repo::ListQueryParams` (mutable — `filters`, `sort`, `limit`, `cursor`,
+  `offset`; no key fields) and `Repo::ListQuery` (immutable, constructible only
+  via `seal()`, const getters `.filters()`/`.sort()`/`.limit()`/`.cursor()`/
+  `.offset()`/`.groupKey()`/`.cacheKey()`). `seal<Descriptor>(params)` — or
+  `.build()` — computes both cache keys **once** from the final params. The
+  manual `q.group_key = …` / `q.cache_key = …` assignment is removed: a query
+  that reaches `query()` always carries keys consistent with its contents, by
+  construction. `query()`/`queryJson()`/`queryBinary()` and
+  `parseListQuery`/`parseListQueryStrict` now operate on `ListQuery` (sealed).
+  `sortBy<"name", Dir>` is `consteval` (sort resolved by name at compile time).
+
 - **Batch and predicate erase / invalidate.** Four set-oriented methods beside
   the per-id pair. `eraseMany(span<const Key>)` / `invalidateMany(span<const Key>)`
   take an enumerated, deduped key set; `eraseWhere(pred)` / `invalidateWhere(pred)`

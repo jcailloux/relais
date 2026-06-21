@@ -150,24 +150,17 @@ descriptor.
 ## Query from C++ code (no HTTP)
 
 To query from C++ and get **structs back** — not JSON, not `shared_ptr` —
-build the `ListQuery` directly. `Repo::ListQuery` is
-`list::spec::ListDescriptorQuery<Descriptor>`; its fields are `filters`,
-`sort`, `limit` (default 20), `cursor`, `offset`, `group_key`, `cache_key`.
+build the query with `Repo::queryBuilder()`. The builder is the primary
+construction path: it sets filters and sort **by name** (compile-time verified)
+and `.build()` is the single point that seals it into the immutable
+`Repo::ListQuery` — the only type `query()` accepts.
 
 ```cpp
-#include <jcailloux/relais/list/spec/HttpQueryParser.h>  // groupCacheKey / cacheKey live here
-namespace ld = jcailloux::relais::list::spec;
-
-AuditLogRepo::ListQuery q;
-q.limit = 200;
-q.filters.get<"user_id">() = uid;       // by name; value type is the field T
-
-// MANDATORY: derive the cache keys before query(). Skipping this is a silent
-// footgun — both keys stay empty, every call collides on the same key, and the
-// cache returns stale/wrong pages with no error.
-using Desc = AuditLogRepo::ListDescriptorType;
-q.group_key = ld::groupCacheKey<Desc>(q);
-q.cache_key = ld::cacheKey<Desc>(q);
+auto q = AuditLogRepo::queryBuilder()
+    .filter<"user_id">(uid)        // by name; value type is the field T
+    .sortDesc<"created_at">()      // name + direction checked at compile time
+    .limit(200)                    // exact — trusted path, no grid normalization
+    .build();                      // seals → AuditLogRepo::ListQuery
 
 auto view = co_await AuditLogRepo::query(q);   // CacheView<ListWrapper<Entity>>
 for (const auto& e : view->items)              // items is std::vector<Entity>, BY VALUE
@@ -175,9 +168,53 @@ for (const auto& e : view->items)              // items is std::vector<Entity>, 
 // view->size(), view->total_count, view->cursor() also available.
 ```
 
+The cache keys (`groupKey`/`cacheKey`) are computed **once at seal time** from
+the final params — there is no manual key derivation and no way to forget it. A
+query that reaches `query()` always carries keys consistent with its contents,
+by construction.
+
+Builder surface:
+
+| Method | Effect |
+|---|---|
+| `.filter<"name">(v)` | Set a filter by name; slot type is exact (scalar vs `in`/`nin` set) |
+| `.sortBy<"name", Dir>()` / `.sortAsc<"name">()` / `.sortDesc<"name">()` | Sort by name + direction, compile-time resolved |
+| `.sort(spec)` | Escape hatch — a `DescriptorSortSpec` resolved at runtime |
+| `.limit(n)` | Exact page size, **no** grid normalization (caller owns key cardinality) |
+| `.after(list::Cursor)` | Keyset cursor; mutually exclusive with `offset` (cursor wins) |
+| `.offset(n)` | Offset pagination; ignored once a cursor is set |
+| `.build()` | Seal into `ListQuery` (the only sealing point) |
+| `.params()` | The accumulated mutable `ListQueryParams` |
+
 `items` is a `std::vector<Entity>` (by value). The `std::vector<EntityPtr>`
 inside `CachedListResult` is the internal L2/Redis representation — not the
 public `query()` API.
+
+### Sealed query and the params escape hatch
+
+`Repo::ListQuery` is `list::spec::ListQuery<Descriptor>` — immutable,
+constructible **only** through `seal()`. It exposes const getters
+(`.filters() .sort() .limit() .cursor() .offset() .groupKey() .cacheKey()`); it
+is not default-constructible and has no settable fields.
+
+When the builder's fixed chain doesn't fit — assembling params in a loop, from a
+table, or mutating after the fact — drop to the mutable bundle and seal
+explicitly:
+
+```cpp
+namespace ld = jcailloux::relais::list::spec;
+using Desc = AuditLogRepo::ListDescriptorType;
+
+AuditLogRepo::ListQueryParams p;          // mutable: filters, sort, limit, cursor, offset
+p.limit = 200;
+p.filters.get<"user_id">() = uid;
+auto q = ld::seal<Desc>(std::move(p));    // computes both keys, yields ListQuery
+
+// Re-seal after mutating a sealed query (e.g. advancing the cursor):
+auto p2 = q.params();
+p2.cursor = next;
+auto q2 = ld::seal<Desc>(std::move(p2));
+```
 
 ### Filter object model
 
@@ -185,8 +222,9 @@ Generated filters are `std::optional<T>` — **active** means `has_value()`.
 Two accessors: `get<"field">()` (compile-time, by param name) and `get<N>()`
 (by index). **Gotcha:** `get<N>()` indices follow the **alphabetical order of
 param names** (the generator sorts filters for deterministic cache keys —
-`generate_entities.py:1269`), *not* declaration order. Prefer `get<"name">()`
-to stay immune to this.
+`generate_entities.py:1269`), *not* declaration order. The builder's
+`.filter<"name">()` and the name accessor are immune to this; reach for `get<N>()`
+only when an index is genuinely what you mean.
 
 ### Behavior & gotchas
 
