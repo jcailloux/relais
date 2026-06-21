@@ -43,6 +43,15 @@ namespace jcailloux::relais::io::batch {
 //
 // Budget: ConcurrencyGate limits total in-flight PG + Redis sends.
 
+/// Result of a pipelined PG write, with coalescing indicator.
+/// Non-templated (independent of Io) so it can be named in the type-erased
+/// PgProvider provider signatures (pg_write_) — enables return-direct binding
+/// with zero added coroutine frame.
+struct PgWriteResult {
+    PgResult result;
+    bool coalesced = false;
+};
+
 template<IoContext Io>
 class BatchScheduler {
     using Clock = std::chrono::steady_clock;
@@ -99,11 +108,9 @@ public:
         co_return co_await submitPgRead(std::move(entry));
     }
 
-    /// Result of a pipelined PG write, with coalescing indicator.
-    struct WriteResult {
-        PgResult result;
-        bool coalesced = false;
-    };
+    /// Result of a pipelined PG write, with coalescing indicator (alias of the
+    /// namespace-scope PgWriteResult — see above for why it lives outside).
+    using WriteResult = PgWriteResult;
 
     /// Submit a PG write (INSERT/UPDATE/DELETE RETURNING).
     /// Returns {PgResult, coalesced}. coalesced=true means an identical
@@ -116,13 +123,6 @@ public:
         entry.seq = next_write_seq_++;
 
         co_return co_await submitPgWriteEntry(std::move(entry));
-    }
-
-    /// Submit a PG execute (DELETE, affected rows).
-    /// Returns {affected_rows, coalesced}.
-    Task<std::pair<int, bool>> submitPgExecute(const char* sql, PgParams params) {
-        auto [result, coalesced] = co_await submitPgWrite(sql, std::move(params));
-        co_return std::pair{result.affectedRows(), coalesced};
     }
 
     /// Submit a Redis command (read or write — Redis pipeline handles both).

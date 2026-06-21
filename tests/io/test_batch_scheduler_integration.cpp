@@ -116,8 +116,8 @@ DetachedTask coalescedExecute(
     const char* sql,
     PgParams params)
 {
-    auto [affected, coalesced] = co_await batcher->submitPgExecute(sql, std::move(params));
-    (void)affected;
+    auto [result, coalesced] = co_await batcher->submitPgWrite(sql, std::move(params));
+    (void)result;
     if (coalesced) coalesced_count.fetch_add(1, std::memory_order_relaxed);
     ++completed;
 }
@@ -241,7 +241,7 @@ TEST_CASE("BatchScheduler: submitPgWrite returns result with RETURNING",
     REQUIRE(done);
 }
 
-TEST_CASE("BatchScheduler: submitPgExecute returns affected rows",
+TEST_CASE("BatchScheduler: submitPgWrite returns affected rows",
           "[io][batch][integration]")
 {
     Io io;
@@ -258,10 +258,10 @@ TEST_CASE("BatchScheduler: submitPgExecute returns affected rows",
             "INSERT INTO batch_test_exec VALUES (1), (2), (3)");
 
         auto params = PgParams::make(2);
-        auto [affected, coalesced] = co_await batcher->submitPgExecute(
+        auto [result, coalesced] = co_await batcher->submitPgWrite(
             "DELETE FROM batch_test_exec WHERE id = $1", std::move(params));
 
-        REQUIRE(affected == 1);
+        REQUIRE(result.affectedRows() == 1);
         REQUIRE_FALSE(coalesced);
 
         done = true;
@@ -947,7 +947,7 @@ TEST_CASE("Write coalescing: N absolute SETs are idempotent in final state",
     REQUIRE(done);
 }
 
-TEST_CASE("Write coalescing: submitPgExecute coalescing returns correct affected rows",
+TEST_CASE("Write coalescing: submitPgWrite coalescing returns correct affected rows",
           "[io][batch][integration][coalesce]")
 {
     Io io;
@@ -965,7 +965,7 @@ TEST_CASE("Write coalescing: submitPgExecute coalescing returns correct affected
         co_await batcher->directQuery(
             "INSERT INTO coal_exec VALUES (1, 0)");
 
-        // Launch identical DELETEs via submitPgExecute
+        // Launch identical DELETEs via submitPgWrite
         constexpr int N = 6;
         std::atomic<int> completed{0};
         std::atomic<int> coalesced_count{0};
