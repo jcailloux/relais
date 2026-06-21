@@ -597,15 +597,13 @@ static BothPurchaseListQuery makeBothPurchaseQuery(
     std::optional<std::string> status = std::nullopt,
     uint16_t limit = 10
 ) {
-    BothPurchaseListQuery q;
+    using Desc = BothPurchaseListRepo::ListDescriptorType;
+    decl::ListQueryParams<Desc> q;
     q.limit = limit;
     if (status)  q.filters.template get<0>() = std::move(*status);
     if (user_id) q.filters.template get<1>() = *user_id;
 
-    using Desc = BothPurchaseListRepo::ListDescriptorType;
-    q.group_key = decl::groupKey<Desc>(q.filters, q.sort);
-    q.cache_key = decl::cacheKey<Desc>(q);
-    return q;
+    return decl::seal<Desc>(std::move(q));
 }
 
 

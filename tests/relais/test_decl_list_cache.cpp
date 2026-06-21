@@ -42,23 +42,21 @@ TestArticleEntity makeArticle(
 // =============================================================================
 
 using TestDecl = TestArticleListDecl;
-using TestListQuery = decl::ListDescriptorQuery<TestDecl>;
+using TestListParams = decl::ListQueryParams<TestDecl>;
+using TestListQuery = decl::ListQuery<TestDecl>;
 
-/// Build a ListDescriptorQuery for articles filtered by category, sorted by view_count DESC.
+/// Build a sealed ListQuery for articles filtered by category, sorted by view_count DESC.
 TestListQuery makeViewCountQuery(std::string_view category, uint16_t limit) {
-    TestListQuery q;
-    q.limit = limit;
+    TestListParams p;
+    p.limit = limit;
 
     // Filter index 1 = category (alphabetical: author_id=0, category=1)
-    q.filters.get<1>() = category;
+    p.filters.get<1>() = std::string(category);
 
     // Sort index 1 = view_count, DESC
-    q.sort = jcailloux::relais::list::SortSpec<size_t>{1, jcailloux::relais::list::SortDirection::Desc};
+    p.sort = jcailloux::relais::list::SortSpec<size_t>{1, jcailloux::relais::list::SortDirection::Desc};
 
-    // Canonical cache keys
-    q.group_key = decl::groupKey<TestDecl>(q.filters, q.sort);
-    q.cache_key = decl::cacheKey<TestDecl>(q);
-    return q;
+    return decl::seal<TestDecl>(std::move(p));
 }
 
 // #############################################################################
@@ -100,25 +98,23 @@ TEST_CASE("[decl-sortby] yields identical canonical keys as raw index", "[decl][
     using jcailloux::relais::list::SortDirection;
     using jcailloux::relais::list::SortSpec;
 
-    TestListQuery viaName;
-    viaName.limit = 10;
-    viaName.filters.get<1>() = std::string("tech");
-    viaName.sort = decl::sortDesc<TestDecl, "view_count">();
-    viaName.group_key = decl::groupKey<TestDecl>(viaName.filters, viaName.sort);
-    viaName.cache_key = decl::cacheKey<TestDecl>(viaName);
+    TestListParams pName;
+    pName.limit = 10;
+    pName.filters.get<1>() = std::string("tech");
+    pName.sort = decl::sortDesc<TestDecl, "view_count">();
+    auto viaName = decl::seal<TestDecl>(pName);
 
-    TestListQuery viaIndex;
-    viaIndex.limit = 10;
-    viaIndex.filters.get<1>() = std::string("tech");
-    viaIndex.sort = SortSpec<size_t>{1, SortDirection::Desc};
-    viaIndex.group_key = decl::groupKey<TestDecl>(viaIndex.filters, viaIndex.sort);
-    viaIndex.cache_key = decl::cacheKey<TestDecl>(viaIndex);
+    TestListParams pIndex;
+    pIndex.limit = 10;
+    pIndex.filters.get<1>() = std::string("tech");
+    pIndex.sort = SortSpec<size_t>{1, SortDirection::Desc};
+    auto viaIndex = decl::seal<TestDecl>(pIndex);
 
     // group_key drives Redis invalidation — any drift would corrupt
     // invalidation, not just sorting.
-    REQUIRE(viaName.sort == viaIndex.sort);
-    REQUIRE(viaName.group_key == viaIndex.group_key);
-    REQUIRE(viaName.cache_key == viaIndex.cache_key);
+    REQUIRE(viaName.sort() == viaIndex.sort());
+    REQUIRE(viaName.groupKey() == viaIndex.groupKey());
+    REQUIRE(viaName.cacheKey() == viaIndex.cacheKey());
 }
 
 TEST_CASE("[decl-sortby] unknown sort name", "[decl][sortby]") {
@@ -771,7 +767,7 @@ TEST_CASE("[DeclListRepo] Bitmap skip optimization",
 
         // 2. Read the chunk_id assigned to this cache entry
         auto chunk_id_opt = TestInternals::getListEntryChunkId<TestArticleListRepo>(
-            q.cache_key);
+            q.cacheKey());
         REQUIRE(chunk_id_opt.has_value());
         uint8_t chunk_id = *chunk_id_opt;
 

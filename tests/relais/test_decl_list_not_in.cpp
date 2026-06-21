@@ -449,21 +449,21 @@ using Params = std::unordered_map<std::string, std::string>;
 TEST_CASE("[DeclListNin] parse: CSV set sorted and deduped into NIN slot",
           "[list][nin][unit][parse]") {
     auto q = decl::parseListQuery<DescNinString>(Params{{"category", "spam,draft"}});
-    REQUIRE(q.filters.get<0>().has_value());
-    CHECK(*q.filters.get<0>() == std::vector<std::string>{"draft", "spam"});  // sorted
+    REQUIRE(q.filters().get<0>().has_value());
+    CHECK(*q.filters().get<0>() == std::vector<std::string>{"draft", "spam"});  // sorted
 }
 
 TEST_CASE("[DeclListNin] parse: order/dups → identical group key (shared canon)",
           "[list][nin][unit][parse]") {
     auto a = decl::parseListQuery<DescNinString>(Params{{"category", "draft,spam"}});
     auto b = decl::parseListQuery<DescNinString>(Params{{"category", "spam,draft,spam"}});
-    CHECK(a.group_key == b.group_key);
+    CHECK(a.groupKey() == b.groupKey());
 }
 
 TEST_CASE("[DeclListNin] parse: invalid int elements dropped", "[list][nin][unit][parse]") {
     auto q = decl::parseListQuery<DescNinInt64>(Params{{"author_id", "1,abc,3"}});
-    REQUIRE(q.filters.get<0>().has_value());
-    CHECK(*q.filters.get<0>() == std::vector<int64_t>{1, 3});
+    REQUIRE(q.filters().get<0>().has_value());
+    CHECK(*q.filters().get<0>() == std::vector<int64_t>{1, 3});
 }
 
 TEST_CASE("[DeclListNin] parse: empty value leaves NIN inactive (≡ NOT IN {} = universe, §1.2)",
@@ -472,7 +472,7 @@ TEST_CASE("[DeclListNin] parse: empty value leaves NIN inactive (≡ NOT IN {} =
     // semantics: inactive ≡ unfiltered ≡ NOT IN {} = universe (unlike IN, where
     // inactive is a compromise vs the empty-set = ∅).
     auto q = decl::parseListQuery<DescNinInt64>(Params{{"author_id", "abc,xyz"}});
-    CHECK_FALSE(q.filters.get<0>().has_value());
+    CHECK_FALSE(q.filters().get<0>().has_value());
 }
 
 TEST_CASE("[DeclListNin] parse: element count capped at 256", "[list][nin][unit][parse]") {
@@ -482,8 +482,8 @@ TEST_CASE("[DeclListNin] parse: element count capped at 256", "[list][nin][unit]
         csv += std::to_string(i);
     }
     auto q = decl::parseListQuery<DescNinInt64>(Params{{"author_id", csv}});
-    REQUIRE(q.filters.get<0>().has_value());
-    CHECK(q.filters.get<0>()->size() == 256);
+    REQUIRE(q.filters().get<0>().has_value());
+    CHECK(q.filters().get<0>()->size() == 256);
 }
 
 TEST_CASE("[DeclListNin] parse: strict rejects undeclared, accepts well-formed NIN",
@@ -496,8 +496,8 @@ TEST_CASE("[DeclListNin] parse: strict rejects undeclared, accepts well-formed N
         auto r = decl::parseListQueryStrict<DescNinString>(
             Params{{"category", "spam,draft,spam"}});
         REQUIRE(r.has_value());
-        REQUIRE(r->filters.get<0>().has_value());
-        CHECK(*r->filters.get<0>() == std::vector<std::string>{"draft", "spam"});
+        REQUIRE(r->filters().get<0>().has_value());
+        CHECK(*r->filters().get<0>() == std::vector<std::string>{"draft", "spam"});
     }
 }
 
@@ -508,10 +508,10 @@ TEST_CASE("[DeclListNin] parse: HTTP IN and NIN produce the same canonical set",
     // verdict time. Here author_id is IN, category is NIN — parse both.
     auto q = decl::parseListQuery<DescInNin>(
         Params{{"author_id", "2,1,2"}, {"category", "spam,draft,spam"}});
-    REQUIRE(q.filters.get<0>().has_value());
-    REQUIRE(q.filters.get<1>().has_value());
-    CHECK(*q.filters.get<0>() == std::vector<int64_t>{1, 2});            // IN, canonical
-    CHECK(*q.filters.get<1>() == std::vector<std::string>{"draft", "spam"});  // NIN, canonical
+    REQUIRE(q.filters().get<0>().has_value());
+    REQUIRE(q.filters().get<1>().has_value());
+    CHECK(*q.filters().get<0>() == std::vector<int64_t>{1, 2});            // IN, canonical
+    CHECK(*q.filters().get<1>() == std::vector<std::string>{"draft", "spam"});  // NIN, canonical
 }
 
 // =============================================================================
@@ -583,7 +583,7 @@ constexpr size_t kNinPrefixLen = 10;
 const std::string kNinMaster = "test:nin:l2:master";
 
 template<typename Desc>
-std::string registerNinGroup(const decl::ListDescriptorQuery<Desc>& q) {
+std::string registerNinGroup(const decl::ListQueryParams<Desc>& q) {
     std::string groupKey = std::string(kNinPrefix) + decl::groupKey<Desc>(q.filters, q.sort);
     std::string pageKey = groupKey + ":p";
     sync(PgProvider::redis("SET", pageKey, "x"));               // < header → chk true
@@ -618,7 +618,7 @@ TEST_CASE("[DeclListNin][L2] create invalidates groups whose set EXCLUDES the va
     TransactionGuard tx;
 
     auto mk = [](std::vector<std::string> set) {
-        decl::ListDescriptorQuery<DescNinString> q;
+        decl::ListQueryParams<DescNinString> q;
         q.filters.get<0>() = std::move(set);
         return registerNinGroup<DescNinString>(q);
     };
@@ -645,7 +645,7 @@ TEST_CASE("[DeclListNin][L2] alignment — NIN in middle position (create)",
     TransactionGuard tx;
     // DescCombo: [EQ author_id][NIN category][GE view_count]
     auto mk = [](int64_t author, std::vector<std::string> cats, int32_t viewGe) {
-        decl::ListDescriptorQuery<DescCombo> q;
+        decl::ListQueryParams<DescCombo> q;
         q.filters.get<0>() = author;
         q.filters.get<1>() = std::move(cats);
         q.filters.get<2>() = viewGe;
@@ -668,7 +668,7 @@ TEST_CASE("[DeclListNin][L2] alignment — NIN in first position (create)",
     TransactionGuard tx;
     // DescNinFirst: [NIN category][EQ author_id]
     auto mk = [](std::vector<std::string> cats, int64_t author) {
-        decl::ListDescriptorQuery<DescNinFirst> q;
+        decl::ListQueryParams<DescNinFirst> q;
         q.filters.get<0>() = std::move(cats);
         q.filters.get<1>() = author;
         return registerNinGroup<DescNinFirst>(q);
@@ -686,7 +686,7 @@ TEST_CASE("[DeclListNin][L2] alignment — NIN in last position (create)",
     TransactionGuard tx;
     // DescNinLast: [EQ author_id][NIN category]
     auto mk = [](int64_t author, std::vector<std::string> cats) {
-        decl::ListDescriptorQuery<DescNinLast> q;
+        decl::ListQueryParams<DescNinLast> q;
         q.filters.get<0>() = author;
         q.filters.get<1>() = std::move(cats);
         return registerNinGroup<DescNinLast>(q);
@@ -707,7 +707,7 @@ TEST_CASE("[DeclListNin][L2] IN and NIN coexist — both route through skipset (
     // DescInNin: [IN author_id][NIN category]. Proves the two set ops both advance
     // via skipset without colliding on the cursor.
     auto mk = [](std::vector<int64_t> authors, std::vector<std::string> cats) {
-        decl::ListDescriptorQuery<DescInNin> q;
+        decl::ListQueryParams<DescInNin> q;
         q.filters.get<0>() = std::move(authors);
         q.filters.get<1>() = std::move(cats);
         return registerNinGroup<DescInNin>(q);
@@ -727,7 +727,7 @@ TEST_CASE("[DeclListNin][L2] optional-null entity matches no NIN group; empty se
     TransactionGuard tx;
     // DescNinOptInt32: [NIN view_count] on a std::optional<int32_t> member.
     auto mk = [](std::optional<std::vector<int32_t>> set) {
-        decl::ListDescriptorQuery<DescNinOptInt32> q;
+        decl::ListQueryParams<DescNinOptInt32> q;
         if (set) q.filters.get<0>() = std::move(*set);
         return registerNinGroup<DescNinOptInt32>(q);
     };
@@ -755,7 +755,7 @@ TEST_CASE("[DeclListNin][L2] update invalidates when old XOR new is excluded fro
           "[integration][db][redis][list][nin][l2]") {
     TransactionGuard tx;
     auto mk = [](std::vector<std::string> set) {
-        decl::ListDescriptorQuery<DescNinString> q;
+        decl::ListQueryParams<DescNinString> q;
         q.filters.get<0>() = std::move(set);
         return registerNinGroup<DescNinString>(q);
     };
@@ -786,7 +786,7 @@ TEST_CASE("[DeclListNin][L2] alignment — NIN in middle position (update, 2nd L
     // Replays NIN-middle alignment against the SECOND, duplicated Lua script
     // (`...Update`) to catch any copy-paste divergence from the create path.
     auto mk = [](int64_t author, std::vector<std::string> cats, int32_t viewGe) {
-        decl::ListDescriptorQuery<DescCombo> q;
+        decl::ListQueryParams<DescCombo> q;
         q.filters.get<0>() = author;
         q.filters.get<1>() = std::move(cats);
         q.filters.get<2>() = viewGe;
@@ -870,7 +870,7 @@ void crossTierNinProperty(const std::vector<Entity>& entities,
         std::vector<std::string> pages;
         pages.reserve(sets.size());
         for (const auto& s : sets) {
-            decl::ListDescriptorQuery<DescNin> q;
+            decl::ListQueryParams<DescNin> q;
             q.filters.template get<0>() = s;
             pages.push_back(registerNinGroup<DescNin>(q));
         }

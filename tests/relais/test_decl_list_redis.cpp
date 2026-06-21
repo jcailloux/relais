@@ -39,7 +39,7 @@ using L2PurchaseListQuery = L2DeclPurchaseListRepo::ListQuery;
 
 // Type aliases for L2 declarative query types
 using L2ArticleDecl = L2DeclArticleListRepo::ListDescriptorType;
-using L2ArticleDescQuery = decl::ListDescriptorQuery<L2ArticleDecl>;
+using L2ArticleParams = decl::ListQueryParams<L2ArticleDecl>;
 
 } // namespace relais_test
 
@@ -66,15 +66,12 @@ static L2ArticleListQuery makeL2ArticleQuery(
     std::optional<int64_t> author_id = std::nullopt,
     uint16_t limit = 10
 ) {
-    L2ArticleListQuery q;
+    using Desc = L2DeclArticleListRepo::ListDescriptorType;
+    decl::ListQueryParams<Desc> q;
     q.limit = limit;
     if (author_id) q.filters.template get<0>() = *author_id;
     if (category) q.filters.template get<1>() = std::move(*category);
-
-    using Desc = L2DeclArticleListRepo::ListDescriptorType;
-    q.group_key = decl::groupKey<Desc>(q.filters, q.sort);
-    q.cache_key = decl::cacheKey<Desc>(q);
-    return q;
+    return decl::seal<Desc>(std::move(q));
 }
 
 static L2PurchaseListQuery makeL2PurchaseQuery(
@@ -82,27 +79,21 @@ static L2PurchaseListQuery makeL2PurchaseQuery(
     std::optional<std::string> status = std::nullopt,
     uint16_t limit = 10
 ) {
-    L2PurchaseListQuery q;
+    using Desc = L2DeclPurchaseListRepo::ListDescriptorType;
+    decl::ListQueryParams<Desc> q;
     q.limit = limit;
     if (status) q.filters.template get<0>() = std::move(*status);
     if (user_id) q.filters.template get<1>() = *user_id;
-
-    using Desc = L2DeclPurchaseListRepo::ListDescriptorType;
-    q.group_key = decl::groupKey<Desc>(q.filters, q.sort);
-    q.cache_key = decl::cacheKey<Desc>(q);
-    return q;
+    return decl::seal<Desc>(std::move(q));
 }
 
-/// Build a ListDescriptorQuery for articles sorted by view_count DESC (L2 variant).
-static L2ArticleDescQuery makeL2ViewCountQuery(std::string_view category, uint16_t limit) {
-    L2ArticleDescQuery q;
+/// Build a sealed ListQuery for articles sorted by view_count DESC (L2 variant).
+static L2ArticleListQuery makeL2ViewCountQuery(std::string_view category, uint16_t limit) {
+    L2ArticleParams q;
     q.limit = limit;
-    q.filters.get<1>() = category;
+    q.filters.get<1>() = std::string(category);
     q.sort = jcailloux::relais::list::SortSpec<size_t>{1, jcailloux::relais::list::SortDirection::Desc};
-
-    q.group_key = decl::groupKey<L2ArticleDecl>(q.filters, q.sort);
-    q.cache_key = decl::cacheKey<L2ArticleDecl>(q);
-    return q;
+    return decl::seal<L2ArticleDecl>(std::move(q));
 }
 
 
@@ -738,10 +729,10 @@ TEST_CASE("[DeclList L2] Lua SortBounds — per-page precision",
         REQUIRE(p1->items[1].view_count.value() == 80);
 
         // Page 2: [60, 40] via cursor (fp=false, cursor mode, complete)
-        auto q2 = makeL2ViewCountQuery("tech", 2);
-        q2.cursor = jcailloux::relais::list::Cursor::decode(
+        auto q2params = makeL2ViewCountQuery("tech", 2).params();
+        q2params.cursor = jcailloux::relais::list::Cursor::decode(
             std::string(p1->cursor())).value();
-        q2.cache_key = decl::cacheKey<L2ArticleDecl>(q2);
+        auto q2 = decl::seal<L2ArticleDecl>(std::move(q2params));
         auto p2 = sync(L2DeclArticleListRepo::query(q2));
         REQUIRE(p2->size() == 2);
         REQUIRE(p2->items[0].view_count.value() == 60);
@@ -779,10 +770,10 @@ TEST_CASE("[DeclList L2] Lua SortBounds — per-page precision",
         REQUIRE(p1->size() == 2);
 
         // Page 2: [60, 40] via cursor
-        auto q2 = makeL2ViewCountQuery("tech", 2);
-        q2.cursor = jcailloux::relais::list::Cursor::decode(
+        auto q2params = makeL2ViewCountQuery("tech", 2).params();
+        q2params.cursor = jcailloux::relais::list::Cursor::decode(
             std::string(p1->cursor())).value();
-        q2.cache_key = decl::cacheKey<L2ArticleDecl>(q2);
+        auto q2 = decl::seal<L2ArticleDecl>(std::move(q2params));
         auto p2 = sync(L2DeclArticleListRepo::query(q2));
         REQUIRE(p2->size() == 2);
 
@@ -983,7 +974,7 @@ TEST_CASE("[DeclList L2] ListBoundsHeader binary verification",
         REQUIRE(result->size() == 3);
 
         // Read raw binary from Redis (includes 19-byte header)
-        auto redisKey = buildRedisPageKey<L2DeclArticleListRepo>(q.cache_key);
+        auto redisKey = buildRedisPageKey<L2DeclArticleListRepo>(q.cacheKey());
         auto raw = sync(jcailloux::relais::cache::RedisCache::getRawBinary(redisKey));
         REQUIRE(raw.has_value());
         REQUIRE(raw->size() >= list_ns::kListBoundsHeaderSize);
@@ -1023,14 +1014,14 @@ TEST_CASE("[DeclList L2] ListBoundsHeader binary verification",
         REQUIRE(p1->items[1].view_count.value() == 80);
 
         // Page 2 via cursor: [60, 40]
-        auto q2 = makeL2ViewCountQuery("tech", 2);
-        q2.cursor = list_ns::Cursor::decode(std::string(p1->cursor())).value();
-        q2.cache_key = decl::cacheKey<L2ArticleDecl>(q2);
+        auto q2params = makeL2ViewCountQuery("tech", 2).params();
+        q2params.cursor = list_ns::Cursor::decode(std::string(p1->cursor())).value();
+        auto q2 = decl::seal<L2ArticleDecl>(std::move(q2params));
         auto p2 = sync(L2DeclArticleListRepo::query(q2));
         REQUIRE(p2->size() == 2);
 
         // Read raw binary for page 2
-        auto redisKey = buildRedisPageKey<L2DeclArticleListRepo>(q2.cache_key);
+        auto redisKey = buildRedisPageKey<L2DeclArticleListRepo>(q2.cacheKey());
         auto raw = sync(jcailloux::relais::cache::RedisCache::getRawBinary(redisKey));
         REQUIRE(raw.has_value());
 
@@ -1055,7 +1046,7 @@ TEST_CASE("[DeclList L2] ListBoundsHeader binary verification",
         auto result = sync(L2DeclArticleListRepo::query(q));
         REQUIRE(result->size() == 2);
 
-        auto redisKey = buildRedisPageKey<L2DeclArticleListRepo>(q.cache_key);
+        auto redisKey = buildRedisPageKey<L2DeclArticleListRepo>(q.cacheKey());
         auto raw = sync(jcailloux::relais::cache::RedisCache::getRawBinary(redisKey));
         REQUIRE(raw.has_value());
 
@@ -1078,18 +1069,16 @@ TEST_CASE("[DeclList L2] ListBoundsHeader binary verification",
 // #############################################################################
 
 /// Build a L2 sorted query with explicit offset (offset-based pagination, no cursor).
-static L2ArticleDescQuery makeL2ViewCountQueryOffset(
+static L2ArticleListQuery makeL2ViewCountQueryOffset(
     std::string_view category, uint16_t limit, uint32_t offset)
 {
-    L2ArticleDescQuery q;
+    L2ArticleParams q;
     q.limit = limit;
     q.offset = offset;
-    q.filters.get<1>() = category;
+    q.filters.get<1>() = std::string(category);
     q.sort = jcailloux::relais::list::SortSpec<size_t>{
         1, jcailloux::relais::list::SortDirection::Desc};
-    q.group_key = decl::groupKey<L2ArticleDecl>(q.filters, q.sort);
-    q.cache_key = decl::cacheKey<L2ArticleDecl>(q);
-    return q;
+    return decl::seal<L2ArticleDecl>(std::move(q));
 }
 
 TEST_CASE("[DeclList L2] Insertion invalidation edge cases",
@@ -1148,9 +1137,9 @@ TEST_CASE("[DeclList L2] Insertion invalidation edge cases",
         REQUIRE(p1->items[0].view_count.value() == 100);
 
         // Page 2 [60, 40] via cursor: first_page=false, cursor, complete
-        auto q2 = makeL2ViewCountQuery("tech", 2);
-        q2.cursor = list_ns::Cursor::decode(std::string(p1->cursor())).value();
-        q2.cache_key = decl::cacheKey<L2ArticleDecl>(q2);
+        auto q2params = makeL2ViewCountQuery("tech", 2).params();
+        q2params.cursor = list_ns::Cursor::decode(std::string(p1->cursor())).value();
+        auto q2 = decl::seal<L2ArticleDecl>(std::move(q2params));
         auto p2 = sync(L2DeclArticleListRepo::query(q2));
         REQUIRE(p2->size() == 2);
 
@@ -1220,16 +1209,16 @@ TEST_CASE("[DeclList L2] Insertion invalidation edge cases",
         REQUIRE(p1->size() == 2);
 
         // Page 2 [60, 40] via cursor: complete
-        auto q2 = makeL2ViewCountQuery("tech", 2);
-        q2.cursor = list_ns::Cursor::decode(std::string(p1->cursor())).value();
-        q2.cache_key = decl::cacheKey<L2ArticleDecl>(q2);
+        auto q2params = makeL2ViewCountQuery("tech", 2).params();
+        q2params.cursor = list_ns::Cursor::decode(std::string(p1->cursor())).value();
+        auto q2 = decl::seal<L2ArticleDecl>(std::move(q2params));
         auto p2 = sync(L2DeclArticleListRepo::query(q2));
         REQUIRE(p2->size() == 2);
 
         // Page 3 [20] via cursor: incomplete (1 < limit 2)
-        auto q3 = makeL2ViewCountQuery("tech", 2);
-        q3.cursor = list_ns::Cursor::decode(std::string(p2->cursor())).value();
-        q3.cache_key = decl::cacheKey<L2ArticleDecl>(q3);
+        auto q3params = makeL2ViewCountQuery("tech", 2).params();
+        q3params.cursor = list_ns::Cursor::decode(std::string(p2->cursor())).value();
+        auto q3 = decl::seal<L2ArticleDecl>(std::move(q3params));
         auto p3 = sync(L2DeclArticleListRepo::query(q3));
         REQUIRE(p3->size() == 1);
 

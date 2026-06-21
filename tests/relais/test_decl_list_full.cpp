@@ -46,15 +46,12 @@ static FullArticleListQuery makeFullArticleQuery(
     std::optional<int64_t> author_id = std::nullopt,
     uint16_t limit = 10
 ) {
-    FullArticleListQuery q;
+    using Desc = FullCacheArticleListRepo::ListDescriptorType;
+    decl::ListQueryParams<Desc> q;
     q.limit = limit;
     if (author_id) q.filters.template get<0>() = *author_id;
     if (category) q.filters.template get<1>() = std::move(*category);
-
-    using Desc = FullCacheArticleListRepo::ListDescriptorType;
-    q.group_key = decl::groupKey<Desc>(q.filters, q.sort);
-    q.cache_key = decl::cacheKey<Desc>(q);
-    return q;
+    return decl::seal<Desc>(std::move(q));
 }
 
 static FullPurchaseListQuery makeFullPurchaseQuery(
@@ -62,15 +59,12 @@ static FullPurchaseListQuery makeFullPurchaseQuery(
     std::optional<std::string> status = std::nullopt,
     uint16_t limit = 10
 ) {
-    FullPurchaseListQuery q;
+    using Desc = FullCachePurchaseListRepo::ListDescriptorType;
+    decl::ListQueryParams<Desc> q;
     q.limit = limit;
     if (status) q.filters.template get<0>() = std::move(*status);
     if (user_id) q.filters.template get<1>() = *user_id;
-
-    using Desc = FullCachePurchaseListRepo::ListDescriptorType;
-    q.group_key = decl::groupKey<Desc>(q.filters, q.sort);
-    q.cache_key = decl::cacheKey<Desc>(q);
-    return q;
+    return decl::seal<Desc>(std::move(q));
 }
 
 
@@ -473,19 +467,17 @@ namespace {
 namespace list_ns = jcailloux::relais::list;
 
 using FullArticleDecl = FullCacheArticleListRepo::ListDescriptorType;
-using FullArticleDescQuery = decl::ListDescriptorQuery<FullArticleDecl>;
+using FullArticleDescQuery = decl::ListQuery<FullArticleDecl>;
 
 /// Build a sorted query for L1+L2 articles (view_count DESC).
 static FullArticleDescQuery makeFullViewCountQuery(
     std::string_view category, uint16_t limit)
 {
-    FullArticleDescQuery q;
+    decl::ListQueryParams<FullArticleDecl> q;
     q.limit = limit;
-    q.filters.get<1>() = category;
+    q.filters.get<1>() = std::string(category);
     q.sort = list_ns::SortSpec<size_t>{1, list_ns::SortDirection::Desc};
-    q.group_key = decl::groupKey<FullArticleDecl>(q.filters, q.sort);
-    q.cache_key = decl::cacheKey<FullArticleDecl>(q);
-    return q;
+    return decl::seal<FullArticleDecl>(std::move(q));
 }
 } // anonymous namespace
 
@@ -601,9 +593,9 @@ TEST_CASE("[DeclList L1+L2] Insertion invalidation edge cases",
         REQUIRE(p1->size() == 2);
 
         // Page 2 [60] via cursor: NOT first, incomplete (1 < limit 2)
-        auto q2 = makeFullViewCountQuery("tech", 2);
-        q2.cursor = list_ns::Cursor::decode(std::string(p1->cursor())).value();
-        q2.cache_key = decl::cacheKey<FullArticleDecl>(q2);
+        auto q2params = makeFullViewCountQuery("tech", 2).params();
+        q2params.cursor = list_ns::Cursor::decode(std::string(p1->cursor())).value();
+        auto q2 = decl::seal<FullArticleDecl>(std::move(q2params));
         auto p2 = sync(FullCacheArticleListRepo::query(q2));
         REQUIRE(p2->size() == 1);
         REQUIRE(p2->items[0].view_count.value() == 60);

@@ -367,7 +367,7 @@ namespace {
 
 template<typename Desc, typename Vec>
 std::string groupKeyForSet(Vec v) {
-    decl::ListDescriptorQuery<Desc> q;
+    decl::ListQueryParams<Desc> q;
     q.filters.template get<0>() = std::move(v);
     return decl::groupKey<Desc>(q.filters, q.sort);
 }
@@ -396,7 +396,7 @@ TEST_CASE("[DeclListIn] binary: int64 set canonicalization", "[list][in][unit][b
 
 TEST_CASE("[DeclListIn] binary: presence byte and count layout", "[list][in][unit][binary]") {
     // Inactive filter: a single 0x00 presence byte, no count, no elements.
-    decl::ListDescriptorQuery<DescInInt64> q_inactive;
+    decl::ListQueryParams<DescInInt64> q_inactive;
     const std::string key_inactive = decl::groupKey<DescInInt64>(q_inactive.filters, q_inactive.sort);
 
     // Present-but-empty: presence 0x01 + count 0 (4 bytes) + no elements.
@@ -422,32 +422,32 @@ using Params = std::unordered_map<std::string, std::string>;
 
 TEST_CASE("[DeclListIn] parse: CSV set, sorted and deduped", "[list][in][unit][parse]") {
     auto q = decl::parseListQuery<DescInString>(Params{{"category", "tech,science"}});
-    REQUIRE(q.filters.get<0>().has_value());
-    CHECK(*q.filters.get<0>() == std::vector<std::string>{"science", "tech"});  // sorted
+    REQUIRE(q.filters().get<0>().has_value());
+    CHECK(*q.filters().get<0>() == std::vector<std::string>{"science", "tech"});  // sorted
 }
 
 TEST_CASE("[DeclListIn] parse: duplicates collapse", "[list][in][unit][parse]") {
     auto q = decl::parseListQuery<DescInString>(Params{{"category", "tech,tech,tech"}});
-    REQUIRE(q.filters.get<0>().has_value());
-    CHECK(*q.filters.get<0>() == std::vector<std::string>{"tech"});
+    REQUIRE(q.filters().get<0>().has_value());
+    CHECK(*q.filters().get<0>() == std::vector<std::string>{"tech"});
 }
 
 TEST_CASE("[DeclListIn] parse: order-independent group key", "[list][in][unit][parse]") {
     auto a = decl::parseListQuery<DescInString>(Params{{"category", "science,tech"}});
     auto b = decl::parseListQuery<DescInString>(Params{{"category", "tech,science"}});
-    CHECK(a.group_key == b.group_key);
+    CHECK(a.groupKey() == b.groupKey());
 }
 
 TEST_CASE("[DeclListIn] parse: invalid int elements are dropped", "[list][in][unit][parse]") {
     auto q = decl::parseListQuery<DescInInt64>(Params{{"author_id", "1,abc,3"}});
-    REQUIRE(q.filters.get<0>().has_value());
-    CHECK(*q.filters.get<0>() == std::vector<int64_t>{1, 3});
+    REQUIRE(q.filters().get<0>().has_value());
+    CHECK(*q.filters().get<0>() == std::vector<int64_t>{1, 3});
 }
 
 TEST_CASE("[DeclListIn] parse: no valid element leaves filter inactive (no HTTP empty set)",
           "[list][in][unit][parse]") {
     auto q = decl::parseListQuery<DescInInt64>(Params{{"author_id", "abc,xyz"}});
-    CHECK_FALSE(q.filters.get<0>().has_value());  // unfiltered, not empty-set
+    CHECK_FALSE(q.filters().get<0>().has_value());  // unfiltered, not empty-set
 }
 
 TEST_CASE("[DeclListIn] parse: element count capped at 256", "[list][in][unit][parse]") {
@@ -457,8 +457,8 @@ TEST_CASE("[DeclListIn] parse: element count capped at 256", "[list][in][unit][p
         csv += std::to_string(i);
     }
     auto q = decl::parseListQuery<DescInInt64>(Params{{"author_id", csv}});
-    REQUIRE(q.filters.get<0>().has_value());
-    CHECK(q.filters.get<0>()->size() == 256);
+    REQUIRE(q.filters().get<0>().has_value());
+    CHECK(q.filters().get<0>()->size() == 256);
 }
 
 TEST_CASE("[DeclListIn] parse: strict rejects undeclared filter, accepts IN",
@@ -470,8 +470,8 @@ TEST_CASE("[DeclListIn] parse: strict rejects undeclared filter, accepts IN",
     SECTION("well-formed IN → ok, canonical set") {
         auto r = decl::parseListQueryStrict<DescInString>(Params{{"category", "tech,science,tech"}});
         REQUIRE(r.has_value());
-        REQUIRE(r->filters.get<0>().has_value());
-        CHECK(*r->filters.get<0>() == std::vector<std::string>{"science", "tech"});
+        REQUIRE(r->filters().get<0>().has_value());
+        CHECK(*r->filters().get<0>() == std::vector<std::string>{"science", "tech"});
     }
 }
 
@@ -522,7 +522,7 @@ constexpr size_t kInPrefixLen = 10;
 const std::string kInMaster = "test:in:l2:master";
 
 template<typename Desc>
-std::string registerInGroup(const decl::ListDescriptorQuery<Desc>& q) {
+std::string registerInGroup(const decl::ListQueryParams<Desc>& q) {
     std::string groupKey = std::string(kInPrefix) + decl::groupKey<Desc>(q.filters, q.sort);
     std::string pageKey = groupKey + ":p";
     sync(PgProvider::redis("SET", pageKey, "x"));               // < header → chk true
@@ -557,7 +557,7 @@ TEST_CASE("[DeclListIn][L2] create invalidates only groups whose set contains th
     TransactionGuard tx;
 
     auto mk = [](std::vector<std::string> set) {
-        decl::ListDescriptorQuery<DescInString> q;
+        decl::ListQueryParams<DescInString> q;
         q.filters.get<0>() = std::move(set);
         return registerInGroup<DescInString>(q);
     };
@@ -584,7 +584,7 @@ TEST_CASE("[DeclListIn][L2] alignment — IN in middle position (create)",
     TransactionGuard tx;
     // DescCombo: [EQ author_id][IN category][GE view_count]
     auto mk = [](int64_t author, std::vector<std::string> cats, int32_t viewGe) {
-        decl::ListDescriptorQuery<DescCombo> q;
+        decl::ListQueryParams<DescCombo> q;
         q.filters.get<0>() = author;
         q.filters.get<1>() = std::move(cats);
         q.filters.get<2>() = viewGe;
@@ -607,7 +607,7 @@ TEST_CASE("[DeclListIn][L2] alignment — IN in first position (create)",
     TransactionGuard tx;
     // DescInFirst: [IN category][EQ author_id]
     auto mk = [](std::vector<std::string> cats, int64_t author) {
-        decl::ListDescriptorQuery<DescInFirst> q;
+        decl::ListQueryParams<DescInFirst> q;
         q.filters.get<0>() = std::move(cats);
         q.filters.get<1>() = author;
         return registerInGroup<DescInFirst>(q);
@@ -625,7 +625,7 @@ TEST_CASE("[DeclListIn][L2] alignment — IN in last position (create)",
     TransactionGuard tx;
     // DescInLast: [EQ author_id][IN category]
     auto mk = [](int64_t author, std::vector<std::string> cats) {
-        decl::ListDescriptorQuery<DescInLast> q;
+        decl::ListQueryParams<DescInLast> q;
         q.filters.get<0>() = author;
         q.filters.get<1>() = std::move(cats);
         return registerInGroup<DescInLast>(q);
@@ -645,7 +645,7 @@ TEST_CASE("[DeclListIn][L2] optional-null entity and empty-set group never match
     TransactionGuard tx;
     // DescInOptInt32: [IN view_count] on a std::optional<int32_t> member.
     auto mk = [](std::optional<std::vector<int32_t>> set) {
-        decl::ListDescriptorQuery<DescInOptInt32> q;
+        decl::ListQueryParams<DescInOptInt32> q;
         if (set) q.filters.get<0>() = std::move(*set);
         return registerInGroup<DescInOptInt32>(q);
     };
@@ -668,7 +668,7 @@ TEST_CASE("[DeclListIn][L2] update invalidates groups whose set holds old OR new
           "[integration][db][redis][list][in][l2]") {
     TransactionGuard tx;
     auto mk = [](std::vector<std::string> set) {
-        decl::ListDescriptorQuery<DescInString> q;
+        decl::ListQueryParams<DescInString> q;
         q.filters.get<0>() = std::move(set);
         return registerInGroup<DescInString>(q);
     };
@@ -690,7 +690,7 @@ TEST_CASE("[DeclListIn][L2] alignment — IN in middle position (update, revue C
     // Replays the IN-middle alignment against the SECOND, duplicated Lua script
     // (`...Update`) to catch any copy-paste divergence from the create path.
     auto mk = [](int64_t author, std::vector<std::string> cats, int32_t viewGe) {
-        decl::ListDescriptorQuery<DescCombo> q;
+        decl::ListQueryParams<DescCombo> q;
         q.filters.get<0>() = author;
         q.filters.get<1>() = std::move(cats);
         q.filters.get<2>() = viewGe;
@@ -741,7 +741,7 @@ void crossTierProperty(const std::vector<Entity>& entities,
         std::vector<std::string> pages;
         pages.reserve(sets.size());
         for (const auto& s : sets) {
-            decl::ListDescriptorQuery<Desc> q;
+            decl::ListQueryParams<Desc> q;
             q.filters.template get<0>() = s;
             pages.push_back(registerInGroup<Desc>(q));
         }
