@@ -25,8 +25,8 @@ inline ArticleListQuery makeArticleQuery(
     using Desc = TestArticleListRepo::ListDescriptorType;
     ld::ListQueryParams<Desc> p;
     p.limit = limit;
-    if (author_id) p.filters.template get<0>() = *author_id;
-    if (category) p.filters.template get<1>() = std::move(*category);
+    if (author_id) p.filters.template get<"author_id">() = *author_id;
+    if (category) p.filters.template get<"category">() = std::move(*category);
     return ld::seal<Desc>(std::move(p));
 }
 
@@ -38,8 +38,8 @@ inline PurchaseListQuery makePurchaseQuery(
     using Desc = TestPurchaseListRepo::ListDescriptorType;
     ld::ListQueryParams<Desc> p;
     p.limit = limit;
-    if (status) p.filters.template get<0>() = std::move(*status);
-    if (user_id) p.filters.template get<1>() = *user_id;
+    if (status) p.filters.template get<"status">() = std::move(*status);
+    if (user_id) p.filters.template get<"user_id">() = *user_id;
     return ld::seal<Desc>(std::move(p));
 }
 

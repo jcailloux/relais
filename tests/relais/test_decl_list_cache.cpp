@@ -50,8 +50,7 @@ TestListQuery makeViewCountQuery(std::string_view category, uint16_t limit) {
     TestListParams p;
     p.limit = limit;
 
-    // Filter index 1 = category (alphabetical: author_id=0, category=1)
-    p.filters.get<1>() = std::string(category);
+    p.filters.get<"category">() = std::string(category);
 
     // Sort index 1 = view_count, DESC
     p.sort = jcailloux::relais::list::SortSpec<size_t>{1, jcailloux::relais::list::SortDirection::Desc};
@@ -100,7 +99,7 @@ TEST_CASE("[decl-sortby] yields identical canonical keys as raw index", "[decl][
 
     TestListParams pName;
     pName.limit = 10;
-    pName.filters.get<1>() = std::string("tech");
+    pName.filters.get<"category">() = std::string("tech");
     pName.sort = decl::sortDesc<TestDecl, "view_count">();
     auto viaName = decl::seal<TestDecl>(pName);
 
