@@ -454,12 +454,16 @@ protected:
                 keyParams.push_back(io::PgParams::fromKey(id));
             auto arrayParams = io::PgParams::buildArrayLiteral(keyParams);
 
-            auto result = co_await PgProvider::queryParams(
+            // Write path (seq-ordered): an eraseMany sequenced after an insert/
+            // update of the same PK in the same flow lands in seq order. The
+            // returned PgWriteResult carries the RETURNING rows; coalesced is
+            // irrelevant — upper layers invalidate from the returned entities.
+            auto w = co_await PgProvider::queryWrite(
                 Mapping::SQL::delete_by_pk_batch, arrayParams);
 
-            out.reserve(static_cast<size_t>(result.rows()));
-            for (int r = 0; r < result.rows(); ++r) {
-                if (auto e = E::fromRow(result[r]))
+            out.reserve(static_cast<size_t>(w.result.rows()));
+            for (int r = 0; r < w.result.rows(); ++r) {
+                if (auto e = E::fromRow(w.result[r]))
                     out.push_back(std::move(*e));
             }
             co_return out;
@@ -558,10 +562,13 @@ protected:
     {
         try {
             auto params = E::toInsertParams(entity);
-            auto result = co_await PgProvider::queryParams(
+            // Write path (seq-ordered): keeps insert in seq with update/erase of
+            // the same PK. coalesced ignored — two inserts with identical params
+            // yield distinct PKs, so coalescing is effectively unreachable.
+            auto w = co_await PgProvider::queryWrite(
                 Mapping::SQL::insert, params);
-            if (result.empty()) co_return std::nullopt;
-            co_return E::fromRow(result[0]);
+            if (w.result.empty()) co_return std::nullopt;
+            co_return E::fromRow(w.result[0]);
         } catch (const io::PgError& e) {
             RELAIS_LOG_ERROR << name() << ": insert error - " << e.what();
             co_return std::nullopt;
@@ -602,9 +609,12 @@ protected:
             for (auto& p : keyParams.params)
                 params.params.push_back(std::move(p));
 
-            auto result = co_await PgProvider::queryParams(sql.c_str(), params);
-            if (result.empty()) co_return std::nullopt;
-            co_return E::fromRow(result[0]);
+            // Write path (seq-ordered): keeps patch in seq with update/erase of
+            // the same PK. coalesced ignored — an identical patch is idempotent
+            // (absolute SET), so a coalesced follower observes the same row.
+            auto w = co_await PgProvider::queryWrite(sql.c_str(), params);
+            if (w.result.empty()) co_return std::nullopt;
+            co_return E::fromRow(w.result[0]);
         } catch (const io::PgError& e) {
             RELAIS_LOG_ERROR << name() << ": patch error - " << e.what();
             co_return std::nullopt;
