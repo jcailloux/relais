@@ -320,8 +320,9 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
         /// misses are delegated to Base::findManyRaw (one ANY) and realigned on
         /// request order. The L3-fetched misses are warmed back into L2 by a
         /// detached pipeline (fire-and-forget — the return does NOT await the
-        /// SETs, one RTT off the miss path). MGET does not refresh per-key TTL
-        /// (no batched GETEX); the detached fill resets TTL on the warmed misses.
+        /// SETs, one RTT off the miss path). With l2_refresh_on_get, the L2 hits
+        /// get their TTL refreshed in the same MGET round-trip (mgetRawEx); the
+        /// detached fill resets TTL on the warmed misses.
         /// Precondition: ids deduplicated (dedup lives at the public entry,
         /// LocalRepo::findMany); no re-dedup here.
         static io::Task<std::vector<std::optional<E>>> findManyRaw(std::span<const Key> ids) {
@@ -428,26 +429,34 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
 
         /// Batched get: one MGET, each present slot deserialized in the
         /// configured L2 format (BEVE or JSON). Mirror of getFromCache for the
-        /// multi-key case. MGET cannot refresh TTL — no GETEX batch variant.
+        /// multi-key case. With l2_refresh_on_get, refreshes every hit's TTL via
+        /// mgetRawEx (gathered GETEX, one round-trip) — same if constexpr gate as
+        /// getFromCache.
         static io::Task<std::vector<std::optional<E>>> mgetFromCache(
             std::span<const std::string> keys)
         {
-            if constexpr (useL2Binary) {
-                auto raws = co_await cache::RedisCache::mgetRaw(keys);
-                std::vector<std::optional<E>> out;
-                out.reserve(raws.size());
-                for (const auto& r : raws) {
-                    if (r) {
+            std::vector<std::optional<std::string>> raws;
+            if constexpr (Cfg.l2_refresh_on_get) {
+                raws = co_await cache::RedisCache::mgetRawEx(keys, l2Ttl());
+            } else {
+                raws = co_await cache::RedisCache::mgetRaw(keys);
+            }
+
+            std::vector<std::optional<E>> out;
+            out.reserve(raws.size());
+            for (const auto& r : raws) {
+                if (r) {
+                    if constexpr (useL2Binary) {
                         out.push_back(E::fromBinary(std::span<const uint8_t>(
                             reinterpret_cast<const uint8_t*>(r->data()), r->size())));
                     } else {
-                        out.emplace_back(std::nullopt);
+                        out.push_back(E::fromJson(*r));
                     }
+                } else {
+                    out.emplace_back(std::nullopt);
                 }
-                co_return out;
-            } else {
-                co_return co_await cache::RedisCache::mget<E>(keys);
             }
+            co_return out;
         }
 
         /// Fire-and-forget L2 warming for a batch of fetched entities. Mirrors

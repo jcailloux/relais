@@ -9,6 +9,7 @@
 #include <span>
 
 #include "jcailloux/relais/io/Task.h"
+#include "jcailloux/relais/io/WhenAll.h"
 #include "jcailloux/relais/io/redis/RedisResult.h"
 #include "jcailloux/relais/PgProvider.h"
 #include "jcailloux/relais/Log.h"
@@ -113,6 +114,34 @@ namespace jcailloux::relais::cache {
                     RELAIS_LOG_WARN << "RedisCache MGET error: " << e.what();
                 }
                 co_return out;
+            }
+
+            /// MGET with per-key TTL refresh — mirror of mgetRaw that also bumps
+            /// each present key's expiry to `ttl` (GETEX EX), the multi-key
+            /// counterpart of getRawEx. Redis has no multi-key GETEX, so the N
+            /// GETEX are fanned out as independent tasks and *gathered*: each
+            /// task advances to its submit (entering the same batch) before any
+            /// flush → one round-trip. Awaiting them one-by-one would serialize
+            /// into N round-trips ("first goes direct"). Slot semantics identical
+            /// to mgetRaw (nullopt = nil/absent, else raw bulk payload, binary-
+            /// safe). Empty keys → empty result, no I/O. `keys` must outlive the
+            /// call (span; the per-key tasks bind it by reference until gathered).
+            template<typename Rep, typename Period>
+            static io::Task<std::vector<std::optional<std::string>>> mgetRawEx(
+                std::span<const std::string> keys,
+                std::chrono::duration<Rep, Period> ttl)
+            {
+                std::vector<std::optional<std::string>> out(keys.size());
+                if (keys.empty() || !PgProvider::hasRedis()) {
+                    co_return out;
+                }
+
+                std::vector<io::Task<std::optional<std::string>>> tasks;
+                tasks.reserve(keys.size());
+                for (const auto& k : keys) {
+                    tasks.push_back(getRawEx(k, ttl));
+                }
+                co_return co_await io::whenAll(std::move(tasks));
             }
 
             /// Typed MGET deserializing each present slot as JSON (mirror of
@@ -253,6 +282,12 @@ namespace jcailloux::relais::cache {
                 }
             }
 
+            // INVARIANT: `key` (a reference) must be materialized (copied into
+            // the command args by PgProvider::redis) BEFORE the first suspension.
+            // mgetRawEx gathers N of these as lazy tasks over a caller-owned span;
+            // the args snapshot happens synchronously in whenAll's start loop, so
+            // the span need only outlive the call. Inserting a co_await before the
+            // PgProvider::redis below would let `key` dangle under that gather.
             template<typename Rep, typename Period>
             static io::Task<std::optional<std::string>> getRawEx(const std::string& key,
                                                                       std::chrono::duration<Rep, Period> ttl) {

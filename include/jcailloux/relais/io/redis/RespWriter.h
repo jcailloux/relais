@@ -1,6 +1,7 @@
 #ifndef JCX_RELAIS_IO_REDIS_RESP_WRITER_H
 #define JCX_RELAIS_IO_REDIS_RESP_WRITER_H
 
+#include <algorithm>
 #include <cstddef>
 #include <cstring>
 #include <string>
@@ -30,7 +31,14 @@ public:
             size_t len = argvlen[i];
             total += 1 + numDigits(len) + 2 + len + 2; // $<len>\r\n<data>\r\n
         }
-        buf_.reserve(buf_.size() + total);
+        // Geometric growth. A pipeline (or whenAll gather) queues N commands as
+        // N successive writeCommand calls; reserving the *exact* need each time
+        // reallocs on every call → O(N²) byte copies. Doubling keeps a batch of
+        // N commands amortized O(N). max() still honors a single command larger
+        // than the doubled capacity.
+        const size_t need = buf_.size() + total;
+        if (need > buf_.capacity())
+            buf_.reserve(std::max(need, buf_.capacity() * 2));
 
         // *<argc>\r\n
         buf_ += '*';
