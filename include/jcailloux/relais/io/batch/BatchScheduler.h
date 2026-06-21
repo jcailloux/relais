@@ -526,6 +526,13 @@ private:
         // Write coalescing: if an identical write (same SQL + same params)
         // is already in the batch, attach as follower instead of adding
         // a new entry. The follower will receive the leader's result.
+        //
+        // Coalescing is sound ONLY for idempotent (absolute-SET) writes:
+        // dropping N-1 identical writes is equivalent to keeping one iff the
+        // write yields the same final state applied once or N times. The entity
+        // generator guarantees this — it only emits absolute `col=$n` SETs,
+        // never self-referential `col=col+$n`. Locked by test_relais_gen_sql
+        // ("no self-referential SET"). Do not coalesce relative writes here.
         for (auto* existing : pg_write_batch_.entries) {
             if (existing->sql == entry->sql && existing->params == entry->params) {
                 entry->coalesced = true;

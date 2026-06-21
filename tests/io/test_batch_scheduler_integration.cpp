@@ -889,6 +889,64 @@ TEST_CASE("Write coalescing: coalesced followers get correct result",
     REQUIRE(done);
 }
 
+// Idempotence invariant behind write-coalescing: dropping N-1 identical writes
+// is sound ONLY because the SET is absolute (val=$2). N coalesced absolute writes
+// must leave the SAME final state as a single write. (The generator guarantees
+// only absolute SETs — locked statically by test_relais_gen_sql; here we lock the
+// runtime consequence.)
+TEST_CASE("Write coalescing: N absolute SETs are idempotent in final state",
+          "[io][batch][integration][coalesce]")
+{
+    Io io;
+    bool done = false;
+    TimeoutGuard timeout(io);
+
+    auto task = [&]() -> DetachedTask {
+        auto pool = co_await PgPool<Io>::create(io, CONNINFO, 1, 1);
+        auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, nullptr, 8);
+
+        co_await bootstrapPg(batcher);
+
+        co_await batcher->directQuery(
+            "CREATE TEMP TABLE IF NOT EXISTS coal_idem (id INT PRIMARY KEY, val INT)");
+        co_await batcher->directQuery(
+            "INSERT INTO coal_idem VALUES (1, 0)");
+
+        // N identical absolute writes on the same key — all coalesce into one.
+        constexpr int N = 8;
+        constexpr int kVal = 99;
+        std::atomic<int> completed{0};
+        std::atomic<int> coalesced_count{0};
+        static constexpr const char* SQL =
+            "UPDATE coal_idem SET val = $2 WHERE id = $1 RETURNING id";
+
+        for (int i = 0; i < N; ++i) {
+            coalescedWrite(batcher, completed, coalesced_count, SQL, 1, kVal);
+        }
+
+        while (completed.load() < N) {
+            co_await YieldAwaiter{io};
+        }
+        REQUIRE(completed.load() == N);
+        // Coalescing must actually have happened, otherwise the invariant is untested.
+        REQUIRE(coalesced_count.load() > 0);
+
+        // Final state equals a single absolute write: val == kVal, exactly one row.
+        auto check = co_await batcher->directQuery(
+            "SELECT val FROM coal_idem WHERE id = 1");
+        REQUIRE(check.ok());
+        REQUIRE(check.rows() == 1);
+        REQUIRE(check[0].get<int32_t>(0) == kVal);
+
+        done = true;
+    };
+    task();
+
+    io.runUntil([&] { return done || timeout.timed_out; });
+    REQUIRE_FALSE(timeout.timed_out);
+    REQUIRE(done);
+}
+
 TEST_CASE("Write coalescing: submitPgExecute coalescing returns correct affected rows",
           "[io][batch][integration][coalesce]")
 {

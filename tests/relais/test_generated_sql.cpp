@@ -15,6 +15,7 @@
  *   [SQL] — assertion directe sur une constante Mapping::SQL::*
  */
 
+#include <regex>
 #include <string>
 #include <string_view>
 
@@ -35,6 +36,7 @@ using UserSQL = entity::generated::TestUserMapping::SQL;
 using EventSQL = entity::generated::TestEventMapping::SQL;
 using CompositeSQL = entity::generated::TestCompositeKeyListMapping::SQL;
 using JunctionSQL = entity::generated::TestAllPkJunctionMapping::SQL;
+using ArticleSQL = entity::generated::TestArticleInMapping::SQL;
 
 namespace decl = jcailloux::relais::list::spec;
 namespace detail = jcailloux::relais::detail;
@@ -199,6 +201,47 @@ TEST_CASE("delete_where - ctid-bounded form", "[generator][sql][batch][where]") 
         const std::string sql = detail::buildDeleteWhereSql(
             "t", "id", "", detail::kPgEraseChunk);
         CHECK(sql.find("LIMIT 10000") != std::string::npos);
+    }
+}
+
+// #############################################################################
+//  Invariante d'idempotence du coalescing — SET absolus, jamais auto-référents
+// #############################################################################
+//
+// Le write-coalescing du BatchScheduler (addToPgWriteBatch) déduplique les
+// écritures sur (sql ptr ==, params ==) et ne conserve qu'un PgWriteEntry. Cette
+// fusion n'est CORRECTE que si chaque écriture est idempotente : un SET absolu
+// (col=$n) appliqué N fois == appliqué 1 fois. Un SET relatif (col=col+$n)
+// casserait l'équivalence. Garde porteuse : le générateur ne doit JAMAIS émettre
+// d'auto-référence dans un SET/VALUES.
+TEST_CASE("generated writes are idempotent - no self-referential SET",
+          "[generator][sql][coalescing]") {
+    // `col = col + ...` / `col = col - ...` : un membre droit qui référence une
+    // colonne (mot) suivie d'un opérateur additif. Un SET absolu (col=$n) a '$'
+    // juste après '=' → jamais de match. NOW() n'est pas matché ('(' ≠ [-+]).
+    const std::regex self_ref(R"(=\s*[A-Za-z_]\w*\s*[-+])");
+    auto absolute = [&](std::string_view sql) {
+        return !std::regex_search(std::string(sql), self_ref);
+    };
+
+    SECTION("[SQL] update — absolute SET only") {
+        CHECK(absolute(UserSQL::update));
+        CHECK(absolute(EventSQL::update));
+        CHECK(absolute(ArticleSQL::update));
+    }
+
+    SECTION("[SQL] insert — no self-reference in VALUES") {
+        CHECK(absolute(UserSQL::insert));
+        CHECK(absolute(EventSQL::insert));
+        CHECK(absolute(CompositeSQL::insert));
+        CHECK(absolute(JunctionSQL::insert));
+        CHECK(absolute(ArticleSQL::insert));
+    }
+
+    SECTION("[SQL] a relative SET would be caught — sentinel") {
+        // Vérifie que le motif détecte bien l'auto-référence qu'on interdit.
+        CHECK_FALSE(absolute("UPDATE t SET balance=balance+$2 WHERE id=$1"));
+        CHECK_FALSE(absolute("UPDATE t SET n = n - $1"));
     }
 }
 
