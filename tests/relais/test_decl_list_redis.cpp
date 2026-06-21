@@ -69,8 +69,8 @@ static L2ArticleListQuery makeL2ArticleQuery(
     using Desc = L2DeclArticleListRepo::ListDescriptorType;
     decl::ListQueryParams<Desc> q;
     q.limit = limit;
-    if (author_id) q.filters.template get<0>() = *author_id;
-    if (category) q.filters.template get<1>() = std::move(*category);
+    if (author_id) q.filters.template get<"author_id">() = *author_id;
+    if (category) q.filters.template get<"category">() = std::move(*category);
     return decl::seal<Desc>(std::move(q));
 }
 
@@ -82,8 +82,8 @@ static L2PurchaseListQuery makeL2PurchaseQuery(
     using Desc = L2DeclPurchaseListRepo::ListDescriptorType;
     decl::ListQueryParams<Desc> q;
     q.limit = limit;
-    if (status) q.filters.template get<0>() = std::move(*status);
-    if (user_id) q.filters.template get<1>() = *user_id;
+    if (status) q.filters.template get<"status">() = std::move(*status);
+    if (user_id) q.filters.template get<"user_id">() = *user_id;
     return decl::seal<Desc>(std::move(q));
 }
 
@@ -91,7 +91,7 @@ static L2PurchaseListQuery makeL2PurchaseQuery(
 static L2ArticleListQuery makeL2ViewCountQuery(std::string_view category, uint16_t limit) {
     L2ArticleParams q;
     q.limit = limit;
-    q.filters.get<1>() = std::string(category);
+    q.filters.get<"category">() = std::string(category);
     q.sort = jcailloux::relais::list::SortSpec<size_t>{1, jcailloux::relais::list::SortDirection::Desc};
     return decl::seal<L2ArticleDecl>(std::move(q));
 }
@@ -1075,7 +1075,7 @@ static L2ArticleListQuery makeL2ViewCountQueryOffset(
     L2ArticleParams q;
     q.limit = limit;
     q.offset = offset;
-    q.filters.get<1>() = std::string(category);
+    q.filters.get<"category">() = std::string(category);
     q.sort = jcailloux::relais::list::SortSpec<size_t>{
         1, jcailloux::relais::list::SortDirection::Desc};
     return decl::seal<L2ArticleDecl>(std::move(q));
