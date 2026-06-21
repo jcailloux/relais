@@ -245,7 +245,7 @@ class ListMixin : public Base {
         CacheQuery cq;
         cq.filters = q.filters();
         cq.limit = q.limit();
-        cq.cursor = q.cursor();
+        cq.cursor = q.cursor().raw();
         cq.cache_key = q.cacheKey();
         if (q.sort()) {
             cq.sort = *q.sort();
@@ -284,6 +284,11 @@ public:
 
     /// Fluent builder type — accumulates params, build() seals into a ListQuery.
     using QueryBuilder = list::spec::ListQueryBuilder<Descriptor>;
+
+    /// Descriptor-tagged keyset cursor — decode a server-minted token with
+    /// Cursor::decode(token), pass it to queryBuilder().after(). A cursor from
+    /// another repo's descriptor is rejected at compile time.
+    using Cursor = list::spec::TypedCursor<Descriptor>;
 
     /// Open a fluent builder: the primary, name-checked construction path for a
     /// ListQuery. Sets filters/sort by name (compile-time verified), exact limit
@@ -866,9 +871,9 @@ protected:
             header.bounds = bounds;
             header.sort_direction = (sort.direction == list::SortDirection::Desc)
                 ? list::SortDirection::Desc : list::SortDirection::Asc;
-            header.is_first_page = query.cursor().data.empty() && query.offset() == 0;
+            header.is_first_page = query.cursor().empty() && query.offset() == 0;
             header.is_incomplete = wrapper.items.size() < static_cast<size_t>(query.limit());
-            header.pagination_mode = query.cursor().data.empty()
+            header.pagination_mode = query.cursor().empty()
                 ? list::PaginationMode::Offset
                 : list::PaginationMode::Cursor;
 
@@ -926,15 +931,16 @@ protected:
 
             // Cursor keyset condition (page 2+ with cursor). The tiebreaker is
             // the full primary key — a PostgreSQL row-value comparison.
-            if (!query.cursor().data.empty()
-                && query.cursor().data.size() >= sizeof(int64_t) * (1 + kKeyN)) {
+            const auto& cursor_data = query.cursor().raw().data;
+            if (!cursor_data.empty()
+                && cursor_data.size() >= sizeof(int64_t) * (1 + kKeyN)) {
                 int64_t cursor_sort_value = 0;
-                std::memcpy(&cursor_sort_value, query.cursor().data.data(),
+                std::memcpy(&cursor_sort_value, cursor_data.data(),
                             sizeof(cursor_sort_value));
                 int64_t cursor_keys[kKeyN];
                 for (size_t i = 0; i < kKeyN; ++i) {
                     std::memcpy(&cursor_keys[i],
-                                query.cursor().data.data() + sizeof(int64_t) * (1 + i),
+                                cursor_data.data() + sizeof(int64_t) * (1 + i),
                                 sizeof(int64_t));
                 }
 
@@ -977,7 +983,7 @@ protected:
             sql += std::to_string(query.limit());
 
             // Offset pagination (mutually exclusive with cursor)
-            if (query.offset() > 0 && query.cursor().data.empty()) {
+            if (query.offset() > 0 && query.cursor().empty()) {
                 sql += " OFFSET ";
                 sql += std::to_string(query.offset());
             }

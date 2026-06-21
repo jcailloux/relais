@@ -730,7 +730,7 @@ TEST_CASE("[DeclList L2] Lua SortBounds — per-page precision",
 
         // Page 2: [60, 40] via cursor (fp=false, cursor mode, complete)
         auto q2params = makeL2ViewCountQuery("tech", 2).params();
-        q2params.cursor = jcailloux::relais::list::Cursor::decode(
+        q2params.cursor = L2DeclArticleListRepo::Cursor::decode(
             std::string(p1->cursor())).value();
         auto q2 = decl::seal<L2ArticleDecl>(std::move(q2params));
         auto p2 = sync(L2DeclArticleListRepo::query(q2));
@@ -771,7 +771,7 @@ TEST_CASE("[DeclList L2] Lua SortBounds — per-page precision",
 
         // Page 2: [60, 40] via cursor
         auto q2params = makeL2ViewCountQuery("tech", 2).params();
-        q2params.cursor = jcailloux::relais::list::Cursor::decode(
+        q2params.cursor = L2DeclArticleListRepo::Cursor::decode(
             std::string(p1->cursor())).value();
         auto q2 = decl::seal<L2ArticleDecl>(std::move(q2params));
         auto p2 = sync(L2DeclArticleListRepo::query(q2));
@@ -1015,7 +1015,7 @@ TEST_CASE("[DeclList L2] ListBoundsHeader binary verification",
 
         // Page 2 via cursor: [60, 40]
         auto q2params = makeL2ViewCountQuery("tech", 2).params();
-        q2params.cursor = list_ns::Cursor::decode(std::string(p1->cursor())).value();
+        q2params.cursor = L2DeclArticleListRepo::Cursor::decode(std::string(p1->cursor())).value();
         auto q2 = decl::seal<L2ArticleDecl>(std::move(q2params));
         auto p2 = sync(L2DeclArticleListRepo::query(q2));
         REQUIRE(p2->size() == 2);
@@ -1138,7 +1138,7 @@ TEST_CASE("[DeclList L2] Insertion invalidation edge cases",
 
         // Page 2 [60, 40] via cursor: first_page=false, cursor, complete
         auto q2params = makeL2ViewCountQuery("tech", 2).params();
-        q2params.cursor = list_ns::Cursor::decode(std::string(p1->cursor())).value();
+        q2params.cursor = L2DeclArticleListRepo::Cursor::decode(std::string(p1->cursor())).value();
         auto q2 = decl::seal<L2ArticleDecl>(std::move(q2params));
         auto p2 = sync(L2DeclArticleListRepo::query(q2));
         REQUIRE(p2->size() == 2);
@@ -1210,14 +1210,14 @@ TEST_CASE("[DeclList L2] Insertion invalidation edge cases",
 
         // Page 2 [60, 40] via cursor: complete
         auto q2params = makeL2ViewCountQuery("tech", 2).params();
-        q2params.cursor = list_ns::Cursor::decode(std::string(p1->cursor())).value();
+        q2params.cursor = L2DeclArticleListRepo::Cursor::decode(std::string(p1->cursor())).value();
         auto q2 = decl::seal<L2ArticleDecl>(std::move(q2params));
         auto p2 = sync(L2DeclArticleListRepo::query(q2));
         REQUIRE(p2->size() == 2);
 
         // Page 3 [20] via cursor: incomplete (1 < limit 2)
         auto q3params = makeL2ViewCountQuery("tech", 2).params();
-        q3params.cursor = list_ns::Cursor::decode(std::string(p2->cursor())).value();
+        q3params.cursor = L2DeclArticleListRepo::Cursor::decode(std::string(p2->cursor())).value();
         auto q3 = decl::seal<L2ArticleDecl>(std::move(q3params));
         auto p3 = sync(L2DeclArticleListRepo::query(q3));
         REQUIRE(p3->size() == 1);

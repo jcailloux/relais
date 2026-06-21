@@ -7,6 +7,7 @@
 #include <utility>
 
 #include "GeneratedFilters.h"
+#include "TypedCursor.h"
 #include "jcailloux/relais/list/ListQuery.h"
 
 namespace jcailloux::relais::list::spec {
@@ -37,7 +38,7 @@ struct ListQueryParams {
     Filters<Descriptor> filters;
     std::optional<DescriptorSortSpec<Descriptor>> sort;
     uint16_t limit{20};
-    list::Cursor cursor;
+    TypedCursor<Descriptor> cursor;
     uint32_t offset{0};      ///< Offset for traditional offset+limit pagination
 
     bool operator==(const ListQueryParams&) const = default;
@@ -61,7 +62,7 @@ public:
     [[nodiscard]] const Filters<Descriptor>& filters() const noexcept { return params_.filters; }
     [[nodiscard]] const std::optional<DescriptorSortSpec<Descriptor>>& sort() const noexcept { return params_.sort; }
     [[nodiscard]] uint16_t limit() const noexcept { return params_.limit; }
-    [[nodiscard]] const list::Cursor& cursor() const noexcept { return params_.cursor; }
+    [[nodiscard]] const TypedCursor<Descriptor>& cursor() const noexcept { return params_.cursor; }
     [[nodiscard]] uint32_t offset() const noexcept { return params_.offset; }
     [[nodiscard]] const ListQueryParams<Descriptor>& params() const noexcept { return params_; }
 

@@ -165,15 +165,15 @@ ListQuery<Descriptor> parseListQuery(const Map& params) {
         query.limit = defaultLimit<Descriptor>();
     }
 
-    // Parse cursor
+    // Parse cursor — descriptor-tagged at the trust boundary.
     if (auto it = params.find("after"); it != params.end()) {
-        if (auto cursor = list::Cursor::decode(it->second)) {
+        if (auto cursor = TypedCursor<Descriptor>::decode(it->second)) {
             query.cursor = std::move(*cursor);
         }
     }
 
     // Parse offset (ignored if cursor is present — cursor takes precedence)
-    if (query.cursor.data.empty()) {
+    if (query.cursor.empty()) {
         if (auto it = params.find("offset"); it != params.end()) {
             query.offset = static_cast<uint32_t>(jcailloux::relais::list::spec::parse::toInt(it->second));
         }
@@ -295,9 +295,9 @@ std::expected<ListQuery<Descriptor>, QueryValidationError> parseListQueryStrict(
         query.limit = defaultLimit<Descriptor>();
     }
 
-    // Parse cursor (no validation needed, just decoding)
+    // Parse cursor (no validation needed, just decoding) — descriptor-tagged.
     if (auto it = params.find("after"); it != params.end()) {
-        if (auto cursor = list::Cursor::decode(it->second)) {
+        if (auto cursor = TypedCursor<Descriptor>::decode(it->second)) {
             query.cursor = std::move(*cursor);
         }
     }
@@ -308,7 +308,7 @@ std::expected<ListQuery<Descriptor>, QueryValidationError> parseListQueryStrict(
     }
 
     // Reject conflicting pagination: cursor + offset
-    if (!query.cursor.data.empty() && query.offset > 0) {
+    if (!query.cursor.empty() && query.offset > 0) {
         return std::unexpected(QueryValidationError{
             .type = QueryValidationError::Type::ConflictingPagination,
             .field = {},

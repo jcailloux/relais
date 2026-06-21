@@ -84,10 +84,11 @@ public:
 
     /// Set the page cursor for keyset pagination (decision 4). The cursor is an
     /// opaque, server-minted token (decision 6): the caller decodes the token it
-    /// previously emitted via list::Cursor::decode (runtime validation at the
-    /// trust boundary) and passes the decoded cursor here. Mutually exclusive
-    /// with offset() — the cursor wins in cacheKey().
-    ListQueryBuilder& after(list::Cursor cursor) {
+    /// previously emitted via Repo::Cursor::decode (runtime validation at the
+    /// trust boundary) and passes the decoded cursor here. Its TypedCursor<D> tag
+    /// makes a cursor from another descriptor a compile error, not a runtime
+    /// mis-decode. Mutually exclusive with offset() — the cursor wins in cacheKey().
+    ListQueryBuilder& after(TypedCursor<Descriptor> cursor) {
         params_.cursor = std::move(cursor);
         return *this;
     }
