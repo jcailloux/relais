@@ -23,13 +23,13 @@ namespace {
 using CRepo = L1TestCompositeKeyListRepo;
 using CDesc = CRepo::ListDescriptorType;
 
-CRepo::ListQuery makeQ(uint16_t limit, rlist::Cursor cursor = {}) {
-    CRepo::ListQuery q;
+CRepo::ListQuery makeQ(uint16_t limit, rlist::Cursor cursor = {},
+                       std::optional<int64_t> tenant = std::nullopt) {
+    rspec::ListQueryParams<CDesc> q;
     q.limit = limit;
     q.cursor = std::move(cursor);
-    q.group_key = rspec::groupKey<CDesc>(q.filters, q.sort);
-    q.cache_key = rspec::cacheKey<CDesc>(q);
-    return q;
+    if (tenant) q.filters.template get<"tenant_id">() = *tenant;
+    return rspec::seal<CDesc>(std::move(q));
 }
 
 void seed(int64_t tenant_id, int64_t item_id) {
@@ -81,12 +81,7 @@ TEST_CASE("[DeclList composite] keyset pagination over a composite key",
     }
 
     SECTION("filter on first key column narrows the set") {
-        auto q = makeQ(50);
-        q.filters.template get<"tenant_id">() = int64_t{1};
-        q.group_key = rspec::groupKey<CDesc>(q.filters, q.sort);
-        q.cache_key = rspec::cacheKey<CDesc>(q);
-
-        auto r = sync(CRepo::query(q));
+        auto r = sync(CRepo::query(makeQ(50, {}, int64_t{1})));
         REQUIRE(r->items.size() == 2);
         for (const auto& e : r->items) REQUIRE(e.tenant_id == 1);
     }
@@ -108,11 +103,7 @@ TEST_CASE("[DeclList composite] automatic list invalidation on CRUD",
     seed(2, 10);
 
     auto tenantQuery = [](int64_t tenant) {
-        auto q = makeQ(50);
-        q.filters.template get<"tenant_id">() = tenant;
-        q.group_key = rspec::groupKey<CDesc>(q.filters, q.sort);
-        q.cache_key = rspec::cacheKey<CDesc>(q);
-        return q;
+        return makeQ(50, {}, tenant);
     };
 
     SECTION("insert through the repo drops the matching cached page") {

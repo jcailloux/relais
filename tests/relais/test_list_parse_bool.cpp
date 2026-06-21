@@ -87,35 +87,35 @@ TEST_CASE("parse::toBool accepts the standard HTTP boolean conventions",
 TEST_CASE("HTTP scalar bool EQ filter activates via parseValue",
           "[list][parse][bool]") {
     auto q = parseOne<BoolEqDesc>("true");
-    REQUIRE(q.filters.template get<0>().has_value());
-    CHECK(*q.filters.template get<0>() == true);
-    CHECK(decl::matchesFilters<BoolEqDesc>(makeArticle(true), q.filters));
-    CHECK_FALSE(decl::matchesFilters<BoolEqDesc>(makeArticle(false), q.filters));
+    REQUIRE(q.filters().template get<0>().has_value());
+    CHECK(*q.filters().template get<0>() == true);
+    CHECK(decl::matchesFilters<BoolEqDesc>(makeArticle(true), q.filters()));
+    CHECK_FALSE(decl::matchesFilters<BoolEqDesc>(makeArticle(false), q.filters()));
 
     auto qOff = parseOne<BoolEqDesc>("off");
-    REQUIRE(qOff.filters.template get<0>().has_value());
-    CHECK(*qOff.filters.template get<0>() == false);
-    CHECK(decl::matchesFilters<BoolEqDesc>(makeArticle(false), qOff.filters));
+    REQUIRE(qOff.filters().template get<0>().has_value());
+    CHECK(*qOff.filters().template get<0>() == false);
+    CHECK(decl::matchesFilters<BoolEqDesc>(makeArticle(false), qOff.filters()));
 
     // Junk leaves the filter inactive rather than defaulting to false.
     auto qJunk = parseOne<BoolEqDesc>("maybe");
-    CHECK_FALSE(qJunk.filters.template get<0>().has_value());
+    CHECK_FALSE(qJunk.filters().template get<0>().has_value());
 }
 
 TEST_CASE("HTTP bool IN list parses, dedups and canonicalizes",
           "[list][parse][bool]") {
     // Mixed conventions, duplicates collapsed, sorted (false < true).
     auto q = parseOne<BoolInDesc>("yes,no,1,off");
-    REQUIRE(q.filters.template get<0>().has_value());
-    CHECK(*q.filters.template get<0>() == std::vector<bool>{false, true});
+    REQUIRE(q.filters().template get<0>().has_value());
+    CHECK(*q.filters().template get<0>() == std::vector<bool>{false, true});
 
     auto qSingleton = parseOne<BoolInDesc>("t");
-    REQUIRE(qSingleton.filters.template get<0>().has_value());
-    CHECK(*qSingleton.filters.template get<0>() == std::vector<bool>{true});
-    CHECK(decl::matchesFilters<BoolInDesc>(makeArticle(true), qSingleton.filters));
-    CHECK_FALSE(decl::matchesFilters<BoolInDesc>(makeArticle(false), qSingleton.filters));
+    REQUIRE(qSingleton.filters().template get<0>().has_value());
+    CHECK(*qSingleton.filters().template get<0>() == std::vector<bool>{true});
+    CHECK(decl::matchesFilters<BoolInDesc>(makeArticle(true), qSingleton.filters()));
+    CHECK_FALSE(decl::matchesFilters<BoolInDesc>(makeArticle(false), qSingleton.filters()));
 
     // Invalid elements dropped; an all-invalid list leaves the filter inactive.
     auto qBad = parseOne<BoolInDesc>("maybe,perhaps");
-    CHECK_FALSE(qBad.filters.template get<0>().has_value());
+    CHECK_FALSE(qBad.filters().template get<0>().has_value());
 }

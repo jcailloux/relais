@@ -111,10 +111,8 @@ std::vector<T> parseInList(const std::string& str) {
 /// Parse ListQuery from a parameter map (e.g. req->getParameters())
 template<typename Descriptor, typename Map = std::unordered_map<std::string, std::string>>
     requires ValidListDescriptor<Descriptor>
-ListDescriptorQuery<Descriptor> parseListQuery(const Map& params) {
-    using Query = ListDescriptorQuery<Descriptor>;
-
-    Query query;
+ListQuery<Descriptor> parseListQuery(const Map& params) {
+    ListQueryParams<Descriptor> query;
 
     // Parse each filter by iterating over the declaration
     [&]<size_t... Is>(std::index_sequence<Is...>) {
@@ -181,11 +179,8 @@ ListDescriptorQuery<Descriptor> parseListQuery(const Map& params) {
         }
     }
 
-    // Build canonical cache keys from parsed values
-    query.group_key = groupKey<Descriptor>(query.filters, query.sort);
-    query.cache_key = cacheKey<Descriptor>(query);
-
-    return query;
+    // Seal: compute both canonical keys once, return the immutable query.
+    return seal<Descriptor>(std::move(query));
 }
 
 // =============================================================================
@@ -196,12 +191,10 @@ ListDescriptorQuery<Descriptor> parseListQuery(const Map& params) {
 /// Returns error if any parameter is invalid (unknown filter, invalid sort, bad limit)
 template<typename Descriptor, typename Map = std::unordered_map<std::string, std::string>>
     requires ValidListDescriptor<Descriptor>
-std::expected<ListDescriptorQuery<Descriptor>, QueryValidationError> parseListQueryStrict(
+std::expected<ListQuery<Descriptor>, QueryValidationError> parseListQueryStrict(
     const Map& params
 ) {
-    using Query = ListDescriptorQuery<Descriptor>;
-
-    Query query;
+    ListQueryParams<Descriptor> query;
 
     // Collect declared filter names for validation
     std::vector<std::string_view> declared_filters;
@@ -323,11 +316,8 @@ std::expected<ListDescriptorQuery<Descriptor>, QueryValidationError> parseListQu
         });
     }
 
-    // Build canonical cache keys from parsed values
-    query.group_key = groupKey<Descriptor>(query.filters, query.sort);
-    query.cache_key = cacheKey<Descriptor>(query);
-
-    return query;
+    // Seal: compute both canonical keys once, return the immutable query.
+    return seal<Descriptor>(std::move(query));
 }
 
 }  // namespace jcailloux::relais::list::spec

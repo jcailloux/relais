@@ -242,12 +242,12 @@ class ListMixin : public Base {
 
     static CacheQuery toCacheQuery(const auto& q) {
         CacheQuery cq;
-        cq.filters = q.filters;
-        cq.limit = q.limit;
-        cq.cursor = q.cursor;
-        cq.cache_key = q.cache_key;
-        if (q.sort) {
-            cq.sort = *q.sort;
+        cq.filters = q.filters();
+        cq.limit = q.limit();
+        cq.cursor = q.cursor();
+        cq.cache_key = q.cacheKey();
+        if (q.sort()) {
+            cq.sort = *q.sort();
         }
         return cq;
     }
@@ -274,8 +274,12 @@ public:
     /// Augmented descriptor — pass to parseListQueryStrict<ListDescriptorType>(req)
     using ListDescriptorType = Descriptor;
 
-    /// List query type — compatible with parseListQueryStrict return type
-    using ListQuery = list::spec::ListDescriptorQuery<Descriptor>;
+    /// Sealed list query type — the sole argument query() accepts. Produced by
+    /// seal()/builder; compatible with parseListQueryStrict's return type.
+    using ListQuery = list::spec::ListQuery<Descriptor>;
+
+    /// Mutable params bundle — fill then seal() into a ListQuery.
+    using ListQueryParams = list::spec::ListQueryParams<Descriptor>;
 
     /// List result type — returned by query() (epoch-guarded, zero-copy)
     using ListResult = cache::CacheView<ListWrapperType>;
@@ -291,7 +295,7 @@ public:
     /// L1 hit: zero overhead (Immediate holds ListResult directly, no Task).
     static io::Immediate<ListResult> query(const ListQuery& q) {
         if constexpr (kHasL1) {
-            if (auto cached = listCache().getByKey(q.cache_key)) {
+            if (auto cached = listCache().getByKey(q.cacheKey())) {
                 RELAIS_METRICS_INC(list_l1_counters_.hits);
                 return std::move(cached);
             }
@@ -307,7 +311,7 @@ public:
     static io::Immediate<std::string> queryJson(const ListQuery& q) {
         // L1 check: serialize from cached entities
         if constexpr (kHasL1) {
-            if (auto cached = listCache().getByKey(q.cache_key)) {
+            if (auto cached = listCache().getByKey(q.cacheKey())) {
                 RELAIS_METRICS_INC(list_l1_counters_.hits);
                 return cached->json();
             }
@@ -325,7 +329,7 @@ public:
     {
         // L1 check: serialize from cached entities
         if constexpr (kHasL1) {
-            if (auto cached = listCache().getByKey(q.cache_key)) {
+            if (auto cached = listCache().getByKey(q.cacheKey())) {
                 RELAIS_METRICS_INC(list_l1_counters_.hits);
                 return cached->binary();
             }
@@ -701,7 +705,7 @@ protected:
     static io::Task<std::string> queryJsonSlow(const ListQuery& q) {
         // L2 check: BEVE → JSON transcode (skip ListBoundsHeader)
         if constexpr (kHasL2) {
-            auto pageKey = redisPageKey(q.cache_key);
+            auto pageKey = redisPageKey(q.cacheKey());
 
             std::optional<std::vector<uint8_t>> beve;
             if constexpr (Base::config.l2_refresh_on_get) {
@@ -736,7 +740,7 @@ protected:
     {
         // L2 check: raw binary from Redis (skip ListBoundsHeader)
         if constexpr (kHasL2) {
-            auto pageKey = redisPageKey(q.cache_key);
+            auto pageKey = redisPageKey(q.cacheKey());
 
             std::optional<std::vector<uint8_t>> beve;
             if constexpr (Base::config.l2_refresh_on_get) {
@@ -771,7 +775,7 @@ protected:
 
         // 1. L1 check — epoch-guarded view, zero-copy
         if constexpr (kHasL1) {
-            if (auto cached = listCache().getByKey(query.cache_key))
+            if (auto cached = listCache().getByKey(query.cacheKey()))
                 co_return std::move(cached);
         }
 
@@ -779,7 +783,7 @@ protected:
 
         // 2. L2 check — binary (BEVE) with auto header skip
         if constexpr (kHasL2) {
-            auto pageKey = redisPageKey(query.cache_key);
+            auto pageKey = redisPageKey(query.cacheKey());
 
             std::optional<ListWrapperType> cached;
             if constexpr (Base::config.l2_refresh_on_get) {
@@ -797,7 +801,7 @@ protected:
                         std::chrono::duration_cast<std::chrono::microseconds>(
                             Clock::now() - start).count());
 
-                    auto sort = query.sort.value_or(defaultSortAsListSpec());
+                    auto sort = query.sort().value_or(defaultSortAsListSpec());
                     list::SortBounds bounds;
                     if (!cached->items.empty()) {
                         bounds.first_value = list::spec::extractSortValue<Descriptor>(
@@ -817,7 +821,7 @@ protected:
 
         // 3. Cache miss — query database
         auto entities = co_await queryFromDb(query);
-        auto sort = query.sort.value_or(defaultSortAsListSpec());
+        auto sort = query.sort().value_or(defaultSortAsListSpec());
 
         auto elapsed_us = static_cast<float>(
             std::chrono::duration_cast<std::chrono::microseconds>(
@@ -828,8 +832,8 @@ protected:
         wrapper.items = std::move(entities);
 
         // Set cursor for pagination (base64 string in ListWrapper)
-        if (wrapper.items.size() >= query.limit && !wrapper.items.empty()) {
-            auto cache_sort = query.sort.value_or(Traits::defaultSort());
+        if (wrapper.items.size() >= query.limit() && !wrapper.items.empty()) {
+            auto cache_sort = query.sort().value_or(Traits::defaultSort());
             auto cursor = Traits::extractCursor(wrapper.items.back(), cache_sort);
             wrapper.next_cursor = cursor.encode();
         }
@@ -850,14 +854,14 @@ protected:
             header.bounds = bounds;
             header.sort_direction = (sort.direction == list::SortDirection::Desc)
                 ? list::SortDirection::Desc : list::SortDirection::Asc;
-            header.is_first_page = query.cursor.data.empty() && query.offset == 0;
-            header.is_incomplete = wrapper.items.size() < static_cast<size_t>(query.limit);
-            header.pagination_mode = query.cursor.data.empty()
+            header.is_first_page = query.cursor().data.empty() && query.offset() == 0;
+            header.is_incomplete = wrapper.items.size() < static_cast<size_t>(query.limit());
+            header.pagination_mode = query.cursor().data.empty()
                 ? list::PaginationMode::Offset
                 : list::PaginationMode::Cursor;
 
-            auto pageKey = redisPageKey(query.cache_key);
-            auto groupKey = redisGroupKey(query.group_key);
+            auto pageKey = redisPageKey(query.cacheKey());
+            auto groupKey = redisGroupKey(query.groupKey());
 
             // Store page binary with header prepended (reads wrapper, does not consume)
             co_await cache::RedisCache::setListBinary(pageKey, wrapper, l2Ttl(), header);
@@ -883,10 +887,10 @@ protected:
     static io::Task<std::vector<Entity>> queryFromDb(const ListQuery& query) {
         try {
             // Build WHERE clause from filters
-            auto where = list::spec::buildWhereClause<Descriptor>(query.filters);
+            auto where = list::spec::buildWhereClause<Descriptor>(query.filters());
 
             // Parse sort
-            auto sort = query.sort.value_or(defaultSortAsListSpec());
+            auto sort = query.sort().value_or(defaultSortAsListSpec());
             auto sort_col = list::spec::sortColumnName<Descriptor>(sort.field);
             const bool is_desc = (sort.direction == list::SortDirection::Desc);
 
@@ -910,15 +914,15 @@ protected:
 
             // Cursor keyset condition (page 2+ with cursor). The tiebreaker is
             // the full primary key — a PostgreSQL row-value comparison.
-            if (!query.cursor.data.empty()
-                && query.cursor.data.size() >= sizeof(int64_t) * (1 + kKeyN)) {
+            if (!query.cursor().data.empty()
+                && query.cursor().data.size() >= sizeof(int64_t) * (1 + kKeyN)) {
                 int64_t cursor_sort_value = 0;
-                std::memcpy(&cursor_sort_value, query.cursor.data.data(),
+                std::memcpy(&cursor_sort_value, query.cursor().data.data(),
                             sizeof(cursor_sort_value));
                 int64_t cursor_keys[kKeyN];
                 for (size_t i = 0; i < kKeyN; ++i) {
                     std::memcpy(&cursor_keys[i],
-                                query.cursor.data.data() + sizeof(int64_t) * (1 + i),
+                                query.cursor().data.data() + sizeof(int64_t) * (1 + i),
                                 sizeof(int64_t));
                 }
 
@@ -958,12 +962,12 @@ protected:
             sql += is_desc ? "DESC" : "ASC";
             appendKeyColumns(sql, is_desc ? "DESC" : "ASC");
             sql += " LIMIT ";
-            sql += std::to_string(query.limit);
+            sql += std::to_string(query.limit());
 
             // Offset pagination (mutually exclusive with cursor)
-            if (query.offset > 0 && query.cursor.data.empty()) {
+            if (query.offset() > 0 && query.cursor().data.empty()) {
                 sql += " OFFSET ";
-                sql += std::to_string(query.offset);
+                sql += std::to_string(query.offset());
             }
 
             // Execute

@@ -130,38 +130,49 @@ std::string groupKey(
 }
 
 /// Build the full page-level canonical key (group_key + limit + cursor).
-/// Uniquely identifies a specific page within a group. Reads the pre-populated
-/// `group_key` plus the pagination fields, so it stays on ListDescriptorQuery.
+/// Uniquely identifies a specific page within a group. Takes the precomputed
+/// `group_key` plus the pagination params — pure mechanics, no key storage.
 template<typename Descriptor>
     requires ValidListDescriptor<Descriptor>
-std::string cacheKey(const ListDescriptorQuery<Descriptor>& query) {
+std::string cacheKey(const std::string& group_key, const ListQueryParams<Descriptor>& params) {
     // Start from the group key
-    std::string key = query.group_key;
+    std::string key = group_key;
 
     std::vector<uint8_t> buf;
     buf.reserve(32);
 
     // Limit
-    detail::appendToBuffer(buf, query.limit);
+    detail::appendToBuffer(buf, params.limit);
 
     // Cursor
-    if (!query.cursor.data.empty()) {
-        uint32_t cursor_len = static_cast<uint32_t>(query.cursor.data.size());
+    if (!params.cursor.data.empty()) {
+        uint32_t cursor_len = static_cast<uint32_t>(params.cursor.data.size());
         detail::appendToBuffer(buf, cursor_len);
         buf.insert(buf.end(),
-            reinterpret_cast<const uint8_t*>(query.cursor.data.data()),
-            reinterpret_cast<const uint8_t*>(query.cursor.data.data()) + query.cursor.data.size());
+            reinterpret_cast<const uint8_t*>(params.cursor.data.data()),
+            reinterpret_cast<const uint8_t*>(params.cursor.data.data()) + params.cursor.data.size());
     }
 
     // Offset (mutually exclusive with cursor — cursor takes precedence)
-    if (query.offset > 0 && query.cursor.data.empty()) {
+    if (params.offset > 0 && params.cursor.data.empty()) {
         uint8_t offset_marker = 0x4F;  // 'O' — distinguishes from cursor data
         buf.push_back(offset_marker);
-        detail::appendToBuffer(buf, query.offset);
+        detail::appendToBuffer(buf, params.offset);
     }
 
     key.append(reinterpret_cast<const char*>(buf.data()), buf.size());
     return key;
+}
+
+/// Seal a mutable params bundle into an immutable ListQuery, computing both
+/// canonical keys exactly once from the final params. The sole producer of a
+/// ListQuery outside the fluent builder — query() accepts nothing else.
+template<typename Descriptor>
+    requires ValidListDescriptor<Descriptor>
+ListQuery<Descriptor> seal(ListQueryParams<Descriptor> params) {
+    auto gk = groupKey<Descriptor>(params.filters, params.sort);
+    auto ck = cacheKey<Descriptor>(gk, params);
+    return ListQuery<Descriptor>(std::move(params), std::move(gk), std::move(ck));
 }
 
 // =============================================================================
