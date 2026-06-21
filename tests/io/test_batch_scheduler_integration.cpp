@@ -122,6 +122,25 @@ DetachedTask coalescedExecute(
     ++completed;
 }
 
+// Ordered-write helper — submits one write, records its affectedRows and, if it
+// has a RETURNING row, the first returned int column. Used to prove intra-batch
+// write→write order (INSERT-then-UPDATE same PK).
+DetachedTask orderedWrite(
+    std::shared_ptr<BatchScheduler<Io>> batcher,
+    std::atomic<int>& completed,
+    std::atomic<int>& affected_out,
+    std::atomic<int>& returned_val_out,
+    const char* sql,
+    PgParams params)
+{
+    auto [result, coalesced] = co_await batcher->submitPgWrite(sql, std::move(params));
+    (void)coalesced;
+    affected_out.store(static_cast<int>(result.affectedRows()), std::memory_order_relaxed);
+    if (result.rows() > 0)
+        returned_val_out.store(result[0].get<int32_t>(0), std::memory_order_relaxed);
+    ++completed;
+}
+
 DetachedTask concurrentRedisSet(
     std::shared_ptr<BatchScheduler<Io>> batcher,
     std::atomic<int>& completed,
@@ -271,6 +290,58 @@ TEST_CASE("BatchScheduler: submitPgWrite returns affected rows",
     io.runUntil([&] { return done || timeout.timed_out; });
     REQUIRE_FALSE(timeout.timed_out);
     REQUIRE(done);
+}
+
+// =============================================================================
+// Write ordering contract — intra-batch write→write order == seq order.
+//
+// Two writes of the same PK submitted into the same write batch (INSERT then
+// UPDATE) must land in submission (seq) order: the INSERT runs before the
+// UPDATE, so the UPDATE matches the freshly-inserted row and the row's final
+// value is the UPDATE's. Both are launched without yielding between them, so
+// they accumulate into one pending write batch (same path the coalescing tests
+// exercise). seq sorting (firePgWriteBatch) is what restores submission order.
+// Contract: docs/runtime-and-threading.md ("Write ordering").
+// =============================================================================
+TEST_CASE("Write ordering: INSERT-then-UPDATE same PK lands in seq order",
+          "[io][batch][integration]")
+{
+    Io io;
+    std::atomic<int> completed{0};
+    std::atomic<int> insert_affected{-1};
+    std::atomic<int> update_affected{-1};
+    std::atomic<int> insert_ret{-1};   // INSERT has no RETURNING → stays -1
+    std::atomic<int> update_val{-1};    // UPDATE RETURNING val → the final value
+    TimeoutGuard timeout(io);
+
+    auto task = [&]() -> DetachedTask {
+        auto pool = co_await PgPool<Io>::create(io, CONNINFO, 1, 1);
+        auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, nullptr, 8);
+
+        co_await batcher->directQuery(
+            "CREATE TEMP TABLE IF NOT EXISTS ord_test (id INT PRIMARY KEY, val INT)");
+
+        // INSERT takes seq=0, UPDATE seq=1 — submitted in this order, no yield
+        // between → same batch. The UPDATE must see the inserted row.
+        orderedWrite(batcher, completed, insert_affected, insert_ret,
+            "INSERT INTO ord_test (id, val) VALUES ($1, $2)",
+            PgParams::make(1, 100));
+        orderedWrite(batcher, completed, update_affected, update_val,
+            "UPDATE ord_test SET val = $2 WHERE id = $1 RETURNING val",
+            PgParams::make(1, 999));
+    };
+    task();
+
+    io.runUntil([&] { return completed.load() == 2 || timeout.timed_out; });
+    REQUIRE_FALSE(timeout.timed_out);
+    REQUIRE(completed.load() == 2);
+
+    // INSERT created the row; UPDATE matched it (affected==1, RETURNING 1 row)
+    // — proving the INSERT executed first.
+    REQUIRE(insert_affected.load() == 1);
+    REQUIRE(update_affected.load() == 1);
+    // Final value is the UPDATE's, not the INSERT's.
+    REQUIRE(update_val.load() == 999);
 }
 
 // =============================================================================

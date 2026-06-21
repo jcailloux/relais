@@ -116,6 +116,14 @@ public:
     /// Returns {PgResult, coalesced}. coalesced=true means an identical
     /// write (same SQL + same params) was already in the batch and this
     /// caller received the leader's result without a DB round-trip.
+    ///
+    /// Ordering: each write takes a monotonic `seq` here, at submit time, and a
+    /// batch fires its writes in `seq` order (firePgWriteBatch's sort). So two
+    /// writes submitted in a flow — e.g. INSERT then UPDATE of the same PK —
+    /// execute in submission order even when they land in the same batch. Order
+    /// BETWEEN batches is the caller's responsibility, carried by `co_await`
+    /// (read-your-writes intra-flow). The scheduler does NOT track write
+    /// dependencies across concurrent coroutines. See docs/runtime-and-threading.md.
     Task<WriteResult> submitPgWrite(const char* sql, PgParams params) {
         PgWriteEntry entry;
         entry.sql = sql;
@@ -864,7 +872,10 @@ private:
     // =========================================================================
 
     DetachedTask firePgWriteBatch(std::vector<PgWriteEntry*> entries) {
-        // Sort by sequence number
+        // Sort by submission sequence: restores submission order regardless of
+        // how entries were accumulated/coalesced, so intra-batch write→write
+        // order == seq order == the order the caller submitted them. This is the
+        // write-ordering contract (docs/runtime-and-threading.md).
         std::sort(entries.begin(), entries.end(),
             [](const auto* a, const auto* b) { return a->seq < b->seq; });
 

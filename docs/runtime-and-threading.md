@@ -89,3 +89,33 @@ See **[io-context-adapters.md](io-context-adapters.md)** for the full recipe
 - Bootstrapping from another thread (the loop is busy): drive the lazy
   `PgPool::create()` onto the loop with `spawnOn` and block on a `std::promise`;
   do the `init()` in its completion callback (which runs on the loop thread).
+
+## Write ordering
+
+Writes (`insert`/`patch`/`update`/`erase`/`eraseMany`) route through one **write
+batch** per loop. Each takes a monotonic sequence number at submit time, and the
+batch fires its writes in that order. Two guarantees follow:
+
+- **Intra-flow (read-your-writes).** Within one coroutine, `co_await`-ing a write
+  before issuing the next orders them by construction — the second doesn't start
+  until the first's continuation resumes. Holds for any dependent pair, same
+  batch or not.
+- **Intra-batch.** Writes that land in the same batch fire in submission (`seq`)
+  order. An `INSERT` then an `UPDATE` of the same PK, submitted in that order,
+  execute in that order: the `UPDATE` matches the freshly-inserted row.
+
+What the framework does **not** do: track write dependencies across *concurrent*
+coroutines. Two coroutines writing the same key with no `co_await` between them
+race — their relative order is undefined, and no I/O layer can resolve that
+meaningfully (it is a business-logic race). Order dependent writes with `co_await`.
+
+### Exception: `eraseWhereRaw` is not seq-ordered
+
+`eraseWhereRaw` (the predicate `DELETE … WHERE <cond>` behind `eraseWhere`) does
+**not** go through the write batch. Its SQL is a per-call `std::string` (unstable
+pointer → not coalescing-safe) and it runs as a chunked `DELETE` loop with a data
+dependency between chunks, so it stays on the read path (`queryParams`), outside
+the seq-ordered write batch. A `eraseWhere` is therefore **not** `seq`-ordered
+relative to batch writes; if you need it ordered against another write, `co_await`
+it explicitly. (Its L2 invalidation branch is separate and *does* go through the
+batched `invalidateMany` path — this exception is about the `DELETE` itself.)
