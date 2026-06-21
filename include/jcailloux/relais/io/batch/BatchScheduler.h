@@ -41,7 +41,8 @@ namespace jcailloux::relais::io::batch {
 // - Redis: reads + writes in the same pipeline (Redis guarantees order).
 // - Coalescing: identical queries share the same result.
 //
-// Budget: ConcurrencyGate limits total in-flight PG + Redis sends.
+// Budget: separate ConcurrencyGates cap in-flight PG and Redis sends
+// independently, so neither tier starves the other under mixed load.
 
 /// Result of a pipelined PG write, with coalescing indicator.
 /// Non-templated (independent of Io) so it can be named in the type-erased
@@ -65,7 +66,8 @@ public:
         : io_(io)
         , pg_pool_(std::move(pg_pool))
         , redis_pool_(std::move(redis_pool))
-        , gate_{max_concurrent}
+        , pg_gate_{max_concurrent}
+        , redis_gate_{max_concurrent}
     {}
 
     ~BatchScheduler() = default;
@@ -255,7 +257,7 @@ private:
     };
 
     // =========================================================================
-    // ConcurrencyGate — coroutine semaphore for shared PG+Redis budget
+    // ConcurrencyGate — coroutine semaphore for a per-tier in-flight budget
     // =========================================================================
 
     struct ConcurrencyGate {
@@ -690,7 +692,7 @@ private:
     // =========================================================================
 
     DetachedTask firePgReadBatch(std::vector<PgReadEntry*> entries) {
-        co_await gate_.acquire();
+        co_await pg_gate_.acquire();
         auto guard = co_await pg_pool_->acquire();
         auto& conn = guard.conn();
 
@@ -835,7 +837,7 @@ private:
             }
         }
 
-        gate_.release();
+        pg_gate_.release();
 
         // Collect handles BEFORE resuming any — resuming a leader can destroy
         // its coroutine frame (symmetric transfer), invalidating followers
@@ -885,7 +887,7 @@ private:
         std::sort(entries.begin(), entries.end(),
             [](const auto* a, const auto* b) { return a->seq < b->seq; });
 
-        co_await gate_.acquire();
+        co_await pg_gate_.acquire();
         auto guard = co_await pg_pool_->acquire();
         auto& conn = guard.conn();
 
@@ -934,7 +936,7 @@ private:
             }
         }
 
-        gate_.release();
+        pg_gate_.release();
 
         // Collect all continuation handles BEFORE resuming any.
         // Resuming a leader can destroy its coroutine frame (symmetric
@@ -974,7 +976,7 @@ private:
     // =========================================================================
 
     DetachedTask fireRedisBatch(std::vector<RedisEntry*> entries) {
-        co_await gate_.acquire();
+        co_await redis_gate_.acquire();
 
         try {
             auto& client = redis_pool_->next();
@@ -1030,7 +1032,7 @@ private:
             }
         }
 
-        gate_.release();
+        redis_gate_.release();
 
         // Collect handles BEFORE resuming any — symmetric transfer can destroy
         // the resumed coroutine's frame, and we'd be iterating `entries` after
@@ -1062,7 +1064,7 @@ private:
     // =========================================================================
 
     Task<PgResult> sendSinglePgRead(PgReadEntry entry) {
-        co_await gate_.acquire();
+        co_await pg_gate_.acquire();
 
         PgResult result;
         auto start = Clock::now();
@@ -1071,7 +1073,7 @@ private:
             auto guard = co_await pg_pool_->acquire();
             result = co_await guard.conn().queryParams(entry.single_sql, entry.params);
         } catch (...) {
-            gate_.release();
+            pg_gate_.release();
             throw;
         }
 
@@ -1084,12 +1086,12 @@ private:
             elapsed_ns, estimator_.getRequestTime(entry.single_sql));
         estimator_.updateSqlTiming(entry.single_sql, 1, 1, elapsed_ns);
 
-        gate_.release();
+        pg_gate_.release();
         co_return result;
     }
 
     Task<PgResult> sendSinglePgWrite(PgWriteEntry entry) {
-        co_await gate_.acquire();
+        co_await pg_gate_.acquire();
 
         PgResult result;
         auto start = Clock::now();
@@ -1098,7 +1100,7 @@ private:
             auto guard = co_await pg_pool_->acquire();
             result = co_await guard.conn().queryParams(entry.sql, entry.params);
         } catch (...) {
-            gate_.release();
+            pg_gate_.release();
             throw;
         }
 
@@ -1111,12 +1113,12 @@ private:
             elapsed_ns, estimator_.getRequestTime(entry.sql));
         estimator_.updateSqlTiming(entry.sql, 1, 1, elapsed_ns);
 
-        gate_.release();
+        pg_gate_.release();
         co_return result;
     }
 
     Task<RedisResult> sendSingleRedis(RedisEntry entry) {
-        co_await gate_.acquire();
+        co_await redis_gate_.acquire();
 
         RedisResult result;
         auto start = Clock::now();
@@ -1137,7 +1139,7 @@ private:
                 static_cast<int>(argv.size()),
                 argv.data(), argvlen.data());
         } catch (...) {
-            gate_.release();
+            redis_gate_.release();
             throw;
         }
 
@@ -1147,7 +1149,7 @@ private:
 
         estimator_.updateRedisNetworkTime(elapsed_ns);
 
-        gate_.release();
+        redis_gate_.release();
         co_return result;
     }
 
@@ -1207,7 +1209,13 @@ private:
     Io& io_;
     std::shared_ptr<PgPool<Io>> pg_pool_;
     std::shared_ptr<RedisPool<Io>> redis_pool_;
-    ConcurrencyGate gate_;
+    // Per-tier concurrency budgets. Split so a burst of in-flight Redis sends
+    // can never steal PG's connection slots (and vice-versa): under mixed
+    // PG+Redis load PG keeps its full budget. Both reads and writes share the
+    // PG gate — writes still pipeline on a single connection, so the gate only
+    // bounds concurrent read fires against the write fire, never reorders them.
+    ConcurrencyGate pg_gate_;
+    ConcurrencyGate redis_gate_;
     TimingEstimator estimator_;
 
     // Current accumulating batches (one of each at a time)
