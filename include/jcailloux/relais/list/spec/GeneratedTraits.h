@@ -299,6 +299,55 @@ template<typename Descriptor>
 }
 
 // =============================================================================
+// sortBy / sortAsc / sortDesc - Compile-time sort by field name
+// =============================================================================
+
+namespace detail {
+
+/// Find the index of a sort field by name (compile-time). Mirror of
+/// find_filter_index: walks Descriptor::sorts, static_asserts on an unknown
+/// name. Resolves against the SAME name table as the runtime parseSortField,
+/// so the typed helper and the HTTP path cannot diverge.
+template<typename Descriptor, FixedString Name, size_t I = 0>
+constexpr size_t find_sort_index() {
+    if constexpr (I >= sort_count<Descriptor>) {
+        static_assert(I < sort_count<Descriptor>, "Sort field name not found in declaration");
+        return I;
+    } else if constexpr (sort_at<Descriptor, I>::name == Name) {
+        return I;
+    } else {
+        return find_sort_index<Descriptor, Name, I + 1>();
+    }
+}
+
+}  // namespace detail
+
+/// Build a DescriptorSortSpec (list::SortSpec<size_t>) from a sort field NAME,
+/// resolved and verified at compile time. Replaces the bare positional index
+/// (SortSpec<size_t>{index, dir}): reordering the Sort<> tuple now turns a wrong
+/// name into a compile error instead of silently sorting on the wrong column.
+/// Zero runtime cost — the index is a compile-time constant.
+template<typename Descriptor, FixedString Name, SortDirection Dir = SortDirection::Asc>
+    requires ValidListDescriptor<Descriptor>
+[[nodiscard]] consteval list::SortSpec<size_t> sortBy() noexcept {
+    return list::SortSpec<size_t>{detail::find_sort_index<Descriptor, Name>(), Dir};
+}
+
+/// Ascending sugar for sortBy.
+template<typename Descriptor, FixedString Name>
+    requires ValidListDescriptor<Descriptor>
+[[nodiscard]] consteval list::SortSpec<size_t> sortAsc() noexcept {
+    return sortBy<Descriptor, Name, SortDirection::Asc>();
+}
+
+/// Descending sugar for sortBy.
+template<typename Descriptor, FixedString Name>
+    requires ValidListDescriptor<Descriptor>
+[[nodiscard]] consteval list::SortSpec<size_t> sortDesc() noexcept {
+    return sortBy<Descriptor, Name, SortDirection::Desc>();
+}
+
+// =============================================================================
 // Default sort specification
 // =============================================================================
 
