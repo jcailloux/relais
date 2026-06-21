@@ -250,12 +250,11 @@ likewise a runtime concern. Re-emit only the `next_cursor` a page handed you.
 ### Filter object model
 
 Generated filters are `std::optional<T>` — **active** means `has_value()`.
-Two accessors: `get<"field">()` (compile-time, by param name) and `get<N>()`
-(by index). **Gotcha:** `get<N>()` indices follow the **alphabetical order of
-param names** (the generator sorts filters for deterministic cache keys —
-`generate_entities.py:1269`), *not* declaration order. The builder's
-`.filter<"name">()` and the name accessor are immune to this; reach for `get<N>()`
-only when an index is genuinely what you mean.
+Access is by param name only: `get<"field">()` (compile-time lookup) or the
+builder's `.filter<"name">()`. There is no positional accessor — filter slots
+follow the **alphabetical order of param names** (the generator sorts filters
+for deterministic cache keys — `generate_entities.py:1269`), *not* declaration
+order, so an index never coincides with the declaration site and is a footgun.
 
 ### Behavior & gotchas
 

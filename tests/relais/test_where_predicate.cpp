@@ -153,16 +153,16 @@ struct DescAligned {
 TEST_CASE("predicateGroupCompatible prunes EQ-incompatible groups, wildcards stay",
           "[where][unit][compat]") {
     decl::Filters<DescEq> group;
-    group.get<0>() = int64_t{42};            // group filters author_id = 42
+    group.get<"author_id">() = int64_t{42};            // group filters author_id = 42
 
     SECTION("same EQ value → compatible") {
         decl::Filters<DescEq> pred;
-        pred.get<0>() = int64_t{42};
+        pred.get<"author_id">() = int64_t{42};
         CHECK(decl::predicateGroupCompatible<DescEq>(pred, group));
     }
     SECTION("different EQ value → pruned") {
         decl::Filters<DescEq> pred;
-        pred.get<0>() = int64_t{7};
+        pred.get<"author_id">() = int64_t{7};
         CHECK_FALSE(decl::predicateGroupCompatible<DescEq>(pred, group));
     }
     SECTION("absent predicate constraint is a wildcard → compatible") {
@@ -171,17 +171,17 @@ TEST_CASE("predicateGroupCompatible prunes EQ-incompatible groups, wildcards sta
     }
     SECTION("absent group constraint is a wildcard → compatible") {
         decl::Filters<DescEq> pred;
-        pred.get<0>() = int64_t{7};
+        pred.get<"author_id">() = int64_t{7};
         decl::Filters<DescEq> open;     // group filters nothing
         CHECK(decl::predicateGroupCompatible<DescEq>(pred, open));
     }
     SECTION("a single incompatible filter prunes the group") {
         decl::Filters<DescEq> pred;
-        pred.get<0>() = int64_t{42};                 // author matches
-        pred.get<1>() = std::string("tech");
+        pred.get<"author_id">() = int64_t{42};                 // author matches
+        pred.get<"category">() = std::string("tech");
         decl::Filters<DescEq> g2;
-        g2.get<0>() = int64_t{42};
-        g2.get<1>() = std::string("news");           // category differs → prune
+        g2.get<"author_id">() = int64_t{42};
+        g2.get<"category">() = std::string("news");           // category differs → prune
         CHECK_FALSE(decl::predicateGroupCompatible<DescEq>(pred, g2));
     }
 }
@@ -190,14 +190,14 @@ TEST_CASE("predicateGroupCompatible prunes IN-disjoint groups only",
           "[where][unit][compat]") {
     SECTION("sets share an element → compatible") {
         decl::Filters<DescIn> pred, group;
-        pred.get<0>() = std::vector<std::string>{"a", "b"};
-        group.get<0>() = std::vector<std::string>{"b", "c"};
+        pred.get<"category">() = std::vector<std::string>{"a", "b"};
+        group.get<"category">() = std::vector<std::string>{"b", "c"};
         CHECK(decl::predicateGroupCompatible<DescIn>(pred, group));
     }
     SECTION("disjoint sets → pruned") {
         decl::Filters<DescIn> pred, group;
-        pred.get<0>() = std::vector<std::string>{"a"};
-        group.get<0>() = std::vector<std::string>{"c"};
+        pred.get<"category">() = std::vector<std::string>{"a"};
+        group.get<"category">() = std::vector<std::string>{"c"};
         CHECK_FALSE(decl::predicateGroupCompatible<DescIn>(pred, group));
     }
 }
@@ -208,7 +208,7 @@ TEST_CASE("predicateGroupCompatible prunes IN-disjoint groups only",
 
 TEST_CASE("predicateSortRange narrows the aligned sort dimension", "[where][unit][range]") {
     decl::Filters<DescAligned> pred;
-    pred.get<0>() = int32_t{50};   // view_count >= 50 (GE)
+    pred.get<"views_min">() = int32_t{50};   // view_count >= 50 (GE)
 
     // Sort dim 0 == view_count == the filtered column → lower-bounded at 50.
     auto r = decl::predicateSortRange<DescAligned>(pred, 0);
@@ -220,7 +220,7 @@ TEST_CASE("predicateSortRange leaves an unconstrained dimension full", "[where][
     // EQ on author_id, sorts on id — orthogonal: the predicate says nothing about
     // the sorted column, so every page is in range.
     decl::Filters<DescEq> pred;
-    pred.get<0>() = int64_t{42};
+    pred.get<"author_id">() = int64_t{42};
 
     auto r = decl::predicateSortRange<DescEq>(pred, 0);  // sort dim 0 == id
     CHECK(r.lo == std::numeric_limits<int64_t>::min());

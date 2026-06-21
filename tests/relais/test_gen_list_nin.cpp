@@ -103,10 +103,10 @@ TEST_CASE("generator emits a functional NIN descriptor (both forms)", "[list][ni
     };
     auto q = decl::parseListQuery<GenDesc>(params);
 
-    REQUIRE(q.filters().template get<0>().has_value());
-    REQUIRE(q.filters().template get<1>().has_value());
-    CHECK(*q.filters().template get<0>() == std::vector<int64_t>{1, 2});
-    CHECK(*q.filters().template get<1>()
+    REQUIRE(q.filters().template get<"authors">().has_value());
+    REQUIRE(q.filters().template get<"category">().has_value());
+    CHECK(*q.filters().template get<"authors">() == std::vector<int64_t>{1, 2});
+    CHECK(*q.filters().template get<"category">()
           == std::vector<std::string>{"science", "tech"});
 
     SECTION("L3: both NIN filters compile to `!= ALL`") {
@@ -130,7 +130,7 @@ TEST_CASE("generator NIN empty-set is the universe", "[list][nin][gen]") {
     // NOT IN {} = everything matches (§1.2). An empty set is the identity for
     // anti-membership: SQL `!= ALL('{}')` is TRUE, L1 find on empty -> end().
     decl::Filters<GenDesc> f;
-    f.template get<0>() = std::vector<int64_t>{};  // authors NOT IN {}
+    f.template get<"authors">() = std::vector<int64_t>{};  // authors NOT IN {}
 
     CHECK(decl::matchesFilters<GenDesc>(makeEntity(1, "x"), f));
     CHECK(decl::matchesFilters<GenDesc>(makeEntity(999, "y"), f));
@@ -147,9 +147,9 @@ TEST_CASE("generator NIN coexists with EQ and range neighbors", "[list][nin][gen
     // NIN/EQ/GE tuple through matchesFilters + buildWhereClause, proving the NIN
     // filter (index 0) stays aligned with its scalar neighbors.
     decl::Filters<GenDesc> f;
-    f.template get<0>() = std::vector<int64_t>{1};  // authors  NOT IN {1}
-    f.template get<2>() = true;                     // is_published EQ true
-    f.template get<3>() = 10;                        // views_min GE 10
+    f.template get<"authors">() = std::vector<int64_t>{1};  // authors  NOT IN {1}
+    f.template get<"is_published">() = true;                     // is_published EQ true
+    f.template get<"views_min">() = 10;                        // views_min GE 10
 
     CHECK(decl::matchesFilters<GenDesc>(makeEntity(7, "x", 20, true), f));
     // author 1 ∈ {1} (NIN, first position — excluded; proves alignment past it holds)

@@ -80,17 +80,6 @@ struct Filters {
     /// Tuple storing all filter values (each as std::optional<T>)
     detail::FiltersTuple<Descriptor> values{};
 
-    /// Access filter by index
-    template<size_t I>
-    [[nodiscard]] auto& get() noexcept {
-        return std::get<I>(values);
-    }
-
-    template<size_t I>
-    [[nodiscard]] const auto& get() const noexcept {
-        return std::get<I>(values);
-    }
-
     /// Access filter by name (compile-time lookup)
     template<FixedString Name>
     [[nodiscard]] auto& get() noexcept {
@@ -193,17 +182,6 @@ struct FilterTags {
     /// Tuple storing the entity's scalar tag values (each as std::optional<element>)
     detail::TagsTuple<Descriptor> values{};
 
-    /// Access tag by index
-    template<size_t I>
-    [[nodiscard]] auto& get() noexcept {
-        return std::get<I>(values);
-    }
-
-    template<size_t I>
-    [[nodiscard]] const auto& get() const noexcept {
-        return std::get<I>(values);
-    }
-
     /// Access tag by name (compile-time lookup)
     template<FixedString Name>
     [[nodiscard]] auto& get() noexcept {
@@ -227,7 +205,7 @@ template<typename Descriptor>
     FilterTags<Descriptor> tags;
 
     [&]<size_t... Is>(std::index_sequence<Is...>) {
-        ((tags.template get<Is>() = [&] {
+        ((std::get<Is>(tags.values) = [&] {
             using FilterType = filter_at<Descriptor, Is>;
             // Use extractMemberValue to support both data members and member functions
             const auto value = detail::extractMemberValue<FilterType::entity_ptr>(entity);

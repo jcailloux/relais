@@ -101,10 +101,10 @@ TEST_CASE("generator emits a functional IN descriptor (both forms)", "[list][in]
     };
     auto q = decl::parseListQuery<GenDesc>(params);
 
-    REQUIRE(q.filters().template get<0>().has_value());
-    REQUIRE(q.filters().template get<1>().has_value());
-    CHECK(*q.filters().template get<0>() == std::vector<int64_t>{1, 2});
-    CHECK(*q.filters().template get<1>()
+    REQUIRE(q.filters().template get<"authors">().has_value());
+    REQUIRE(q.filters().template get<"category">().has_value());
+    CHECK(*q.filters().template get<"authors">() == std::vector<int64_t>{1, 2});
+    CHECK(*q.filters().template get<"category">()
           == std::vector<std::string>{"science", "tech"});
 
     SECTION("L3: both IN filters compile to `= ANY`") {
@@ -131,9 +131,9 @@ TEST_CASE("generator IN coexists with EQ and range neighbors", "[list][in][gen]"
     // IN/EQ/GE tuple through matchesFilters + buildWhereClause, proving the IN
     // filter (index 0) stays aligned with its scalar neighbors.
     decl::Filters<GenDesc> f;
-    f.template get<0>() = std::vector<int64_t>{1};  // authors  IN {1}
-    f.template get<2>() = true;                     // is_published EQ true
-    f.template get<3>() = 10;                        // views_min GE 10
+    f.template get<"authors">() = std::vector<int64_t>{1};  // authors  IN {1}
+    f.template get<"is_published">() = true;                     // is_published EQ true
+    f.template get<"views_min">() = 10;                        // views_min GE 10
 
     CHECK(decl::matchesFilters<GenDesc>(makeEntity(1, "x", 20, true), f));
     // view_count 5 < 10 (range)

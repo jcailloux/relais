@@ -67,7 +67,7 @@ void appendFilterSet(std::vector<uint8_t>& buf, const Filters<Descriptor>& filte
     [&]<size_t... Is>(std::index_sequence<Is...>) {
         ([&] {
             using FilterType = filter_at<Descriptor, Is>;
-            const auto& filter_value = filters.template get<Is>();
+            const auto& filter_value = std::get<Is>(filters.values);
             if constexpr (FilterType::is_set_op) {
                 // Set op (IN/NIN): [presence][count:u32][elem×count]. Encoding is
                 // byte-identical for both — only the match verdict differs (L1/L2/

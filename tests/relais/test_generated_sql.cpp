@@ -207,7 +207,7 @@ TEST_CASE("delete_where - $n survives buildWhereClause -> assembly",
     // Le prédicat réel sort de buildWhereClause<Descriptor> ($n numéroté à partir
     // de 1) ; l'assembleur doit le replacer tel quel dans le sous-select ctid.
     decl::Filters<ArticleDesc> f;
-    f.template get<2>() = true;  // is_published EQ -> "is_published"=$1
+    f.template get<"is_published">() = true;  // is_published EQ -> "is_published"=$1
 
     auto wc = decl::buildWhereClause<ArticleDesc>(f);
     REQUIRE(wc.sql.find("$1") != std::string::npos);

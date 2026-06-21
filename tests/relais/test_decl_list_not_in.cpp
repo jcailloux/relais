@@ -180,7 +180,7 @@ bool l1Match(const Entity& e, const decl::Filters<Desc>& f) {
 
 TEST_CASE("[DeclListNin] NIN string anti-membership", "[list][nin][unit]") {
     decl::Filters<DescNinString> f;
-    f.get<0>() = std::vector<std::string>{"science", "tech"};
+    f.get<"category">() = std::vector<std::string>{"science", "tech"};
 
     CHECK_FALSE(l1Match<DescNinString>(makeArticle(1, "tech", 0), f));     // ∈ set
     CHECK_FALSE(l1Match<DescNinString>(makeArticle(2, "science", 0), f));  // ∈ set
@@ -190,13 +190,13 @@ TEST_CASE("[DeclListNin] NIN string anti-membership", "[list][nin][unit]") {
 
 TEST_CASE("[DeclListNin] NIN int64 anti-membership", "[list][nin][unit]") {
     decl::Filters<DescNinInt64> f;
-    f.get<0>() = std::vector<int64_t>{1, 2, 3};
+    f.get<"author_id">() = std::vector<int64_t>{1, 2, 3};
 
     CHECK_FALSE(l1Match<DescNinInt64>(makeArticle(1, "x", 2), f));  // ∈ set
     CHECK(l1Match<DescNinInt64>(makeArticle(2, "x", 9), f));        // ∉ set
 
     SECTION("negatives and extremes") {
-        f.get<0>() = std::vector<int64_t>{INT64_MIN, -1, 0, INT64_MAX};
+        f.get<"author_id">() = std::vector<int64_t>{INT64_MIN, -1, 0, INT64_MAX};
         CHECK_FALSE(l1Match<DescNinInt64>(makeArticle(1, "x", INT64_MIN), f));
         CHECK_FALSE(l1Match<DescNinInt64>(makeArticle(2, "x", -1), f));
         CHECK_FALSE(l1Match<DescNinInt64>(makeArticle(3, "x", 0), f));
@@ -207,7 +207,7 @@ TEST_CASE("[DeclListNin] NIN int64 anti-membership", "[list][nin][unit]") {
 
 TEST_CASE("[DeclListNin] NIN int32 on optional member", "[list][nin][unit]") {
     decl::Filters<DescNinOptInt32> f;
-    f.get<0>() = std::vector<int32_t>{10, 20, INT32_MIN, INT32_MAX};
+    f.get<"view_count">() = std::vector<int32_t>{10, 20, INT32_MIN, INT32_MAX};
 
     CHECK_FALSE(l1Match<DescNinOptInt32>(makeArticle(1, "x", 0, 20), f));        // ∈ set
     CHECK_FALSE(l1Match<DescNinOptInt32>(makeArticle(2, "x", 0, INT32_MIN), f)); // ∈ set
@@ -224,12 +224,12 @@ TEST_CASE("[DeclListNin] NIN bool anti-membership", "[list][nin][unit]") {
     decl::Filters<DescNinBool> f;
 
     SECTION("set {true} excludes true, keeps false") {
-        f.get<0>() = std::vector<bool>{true};
+        f.get<"is_published">() = std::vector<bool>{true};
         CHECK_FALSE(l1Match<DescNinBool>(makeArticle(1, "x", 0, std::nullopt, true), f));
         CHECK(l1Match<DescNinBool>(makeArticle(2, "x", 0, std::nullopt, false), f));
     }
     SECTION("set {true,false} excludes both") {
-        f.get<0>() = std::vector<bool>{false, true};
+        f.get<"is_published">() = std::vector<bool>{false, true};
         CHECK_FALSE(l1Match<DescNinBool>(makeArticle(1, "x", 0, std::nullopt, true), f));
         CHECK_FALSE(l1Match<DescNinBool>(makeArticle(2, "x", 0, std::nullopt, false), f));
     }
@@ -241,7 +241,7 @@ TEST_CASE("[DeclListNin] NIN bool anti-membership", "[list][nin][unit]") {
 
 TEST_CASE("[DeclListNin] singleton set behaves like NE", "[list][nin][unit]") {
     decl::Filters<DescNinString> f;
-    f.get<0>() = std::vector<std::string>{"tech"};
+    f.get<"category">() = std::vector<std::string>{"tech"};
 
     CHECK_FALSE(l1Match<DescNinString>(makeArticle(1, "tech", 0), f));  // == tech
     CHECK(l1Match<DescNinString>(makeArticle(2, "science", 0), f));     // != tech
@@ -253,8 +253,8 @@ TEST_CASE("[DeclListNin] empty set matches everything (NOT IN {} = universe, §1
     decl::Filters<DescNinString> f;
     // Programmatic empty set: present-but-empty optional<vector>. The exact
     // opposite of IN {} (which matches nothing).
-    f.get<0>() = std::vector<std::string>{};
-    REQUIRE(f.get<0>().has_value());
+    f.get<"category">() = std::vector<std::string>{};
+    REQUIRE(f.get<"category">().has_value());
 
     CHECK(l1Match<DescNinString>(makeArticle(1, "tech", 0), f));
     CHECK(l1Match<DescNinString>(makeArticle(2, "", 0), f));
@@ -265,8 +265,8 @@ TEST_CASE("[DeclListNin] empty set still excludes a null optional member (§1.1)
     // NOT IN {} = universe, but a NULL member is excluded from every set result,
     // empty included — the null guard wins over the empty-set universe.
     decl::Filters<DescNinOptInt32> f;
-    f.get<0>() = std::vector<int32_t>{};
-    REQUIRE(f.get<0>().has_value());
+    f.get<"view_count">() = std::vector<int32_t>{};
+    REQUIRE(f.get<"view_count">().has_value());
 
     CHECK(l1Match<DescNinOptInt32>(makeArticle(1, "x", 0, 5), f));               // non-null ∉ {}
     CHECK_FALSE(l1Match<DescNinOptInt32>(makeArticle(2, "x", 0, std::nullopt), f)); // null excluded
@@ -274,7 +274,7 @@ TEST_CASE("[DeclListNin] empty set still excludes a null optional member (§1.1)
 
 TEST_CASE("[DeclListNin] inactive NIN filter matches every entity", "[list][nin][unit]") {
     decl::Filters<DescNinString> f;  // filter left unset (nullopt)
-    REQUIRE_FALSE(f.get<0>().has_value());
+    REQUIRE_FALSE(f.get<"category">().has_value());
 
     CHECK(l1Match<DescNinString>(makeArticle(1, "tech", 0), f));
     CHECK(l1Match<DescNinString>(makeArticle(2, "anything", 0), f));
@@ -286,9 +286,9 @@ TEST_CASE("[DeclListNin] inactive NIN filter matches every entity", "[list][nin]
 
 TEST_CASE("[DeclListNin] EQ + NIN + range combination", "[list][nin][unit]") {
     decl::Filters<DescCombo> f;
-    f.get<0>() = int64_t{42};                                  // EQ author_id == 42
-    f.get<1>() = std::vector<std::string>{"news", "spam"};     // NIN category
-    f.get<2>() = int32_t{10};                                  // GE view_count >= 10
+    f.get<"author_id">() = int64_t{42};                                  // EQ author_id == 42
+    f.get<"category">() = std::vector<std::string>{"news", "spam"};     // NIN category
+    f.get<"view_count">() = int32_t{10};                                  // GE view_count >= 10
 
     SECTION("all three satisfied (category ∉ {news,spam})") {
         CHECK(l1Match<DescCombo>(makeArticle(1, "tech", 42, 15), f));
@@ -308,7 +308,7 @@ TEST_CASE("[DeclListNin] EQ + NIN + range combination", "[list][nin][unit]") {
     }
     SECTION("only NIN active — EQ and range inactive") {
         decl::Filters<DescCombo> g;
-        g.get<1>() = std::vector<std::string>{"spam"};
+        g.get<"category">() = std::vector<std::string>{"spam"};
         CHECK(l1Match<DescCombo>(makeArticle(7, "tech", 999, std::nullopt), g));
         CHECK_FALSE(l1Match<DescCombo>(makeArticle(8, "spam", 999, std::nullopt), g));
     }
@@ -320,8 +320,8 @@ TEST_CASE("[DeclListNin] EQ + NIN + range combination", "[list][nin][unit]") {
 
 TEST_CASE("[DeclListNin] IN and NIN coexist on distinct columns", "[list][nin][unit]") {
     decl::Filters<DescInNin> f;
-    f.get<0>() = std::vector<int64_t>{1, 2};                    // author_id IN {1,2}
-    f.get<1>() = std::vector<std::string>{"spam", "draft"};     // category NOT IN {spam,draft}
+    f.get<"author_id">() = std::vector<int64_t>{1, 2};                    // author_id IN {1,2}
+    f.get<"category">() = std::vector<std::string>{"spam", "draft"};     // category NOT IN {spam,draft}
 
     // author ∈ {1,2} AND category ∉ {spam,draft}
     CHECK(l1Match<DescInNin>(makeArticle(1, "tech", 1), f));
@@ -354,7 +354,7 @@ std::string paramStr(const jcailloux::relais::io::PgParam& p) {
 TEST_CASE("[DeclListNin] SQL: NIN emits != ALL with one array param",
           "[list][nin][unit][sql]") {
     decl::Filters<DescNinString> f;
-    f.get<0>() = std::vector<std::string>{"science", "tech"};
+    f.get<"category">() = std::vector<std::string>{"science", "tech"};
 
     auto wc = decl::buildWhereClause<DescNinString>(f);
     CHECK(wc.sql == "\"category\" != ALL($1)");
@@ -365,7 +365,7 @@ TEST_CASE("[DeclListNin] SQL: NIN emits != ALL with one array param",
 
 TEST_CASE("[DeclListNin] SQL: NIN int64 array literal", "[list][nin][unit][sql]") {
     decl::Filters<DescNinInt64> f;
-    f.get<0>() = std::vector<int64_t>{1, 2, 3};
+    f.get<"author_id">() = std::vector<int64_t>{1, 2, 3};
 
     auto wc = decl::buildWhereClause<DescNinInt64>(f);
     CHECK(wc.sql == "\"author_id\" != ALL($1)");
@@ -375,7 +375,7 @@ TEST_CASE("[DeclListNin] SQL: NIN int64 array literal", "[list][nin][unit][sql]"
 
 TEST_CASE("[DeclListNin] SQL: singleton NIN behaves like != x", "[list][nin][unit][sql]") {
     decl::Filters<DescNinString> f;
-    f.get<0>() = std::vector<std::string>{"tech"};
+    f.get<"category">() = std::vector<std::string>{"tech"};
 
     auto wc = decl::buildWhereClause<DescNinString>(f);
     CHECK(wc.sql == "\"category\" != ALL($1)");      // != ALL('{tech}') ≡ != 'tech'
@@ -385,8 +385,8 @@ TEST_CASE("[DeclListNin] SQL: singleton NIN behaves like != x", "[list][nin][uni
 TEST_CASE("[DeclListNin] SQL: empty set yields != ALL('{}') (universe, §1.2)",
           "[list][nin][unit][sql]") {
     decl::Filters<DescNinString> f;
-    f.get<0>() = std::vector<std::string>{};  // present-but-empty
-    REQUIRE(f.get<0>().has_value());
+    f.get<"category">() = std::vector<std::string>{};  // present-but-empty
+    REQUIRE(f.get<"category">().has_value());
 
     auto wc = decl::buildWhereClause<DescNinString>(f);
     CHECK(wc.sql == "\"category\" != ALL($1)");
@@ -396,9 +396,9 @@ TEST_CASE("[DeclListNin] SQL: empty set yields != ALL('{}') (universe, §1.2)",
 
 TEST_CASE("[DeclListNin] SQL: EQ + NIN + range $n numbering", "[list][nin][unit][sql]") {
     decl::Filters<DescCombo> f;
-    f.get<0>() = int64_t{42};                                  // EQ author_id
-    f.get<1>() = std::vector<std::string>{"news", "spam"};     // NIN category
-    f.get<2>() = int32_t{10};                                  // GE view_count
+    f.get<"author_id">() = int64_t{42};                                  // EQ author_id
+    f.get<"category">() = std::vector<std::string>{"news", "spam"};     // NIN category
+    f.get<"view_count">() = int32_t{10};                                  // GE view_count
 
     auto wc = decl::buildWhereClause<DescCombo>(f);
     CHECK(wc.sql == "\"author_id\"=$1 AND \"category\" != ALL($2) AND \"view_count\">=$3");
@@ -410,7 +410,7 @@ TEST_CASE("[DeclListNin] SQL: EQ + NIN + range $n numbering", "[list][nin][unit]
 
     SECTION("only NIN active — EQ/range skipped, NIN takes $1") {
         decl::Filters<DescCombo> g;
-        g.get<1>() = std::vector<std::string>{"spam"};
+        g.get<"category">() = std::vector<std::string>{"spam"};
         auto wc2 = decl::buildWhereClause<DescCombo>(g);
         CHECK(wc2.sql == "\"category\" != ALL($1)");
         REQUIRE(wc2.params.params.size() == 1);
@@ -421,8 +421,8 @@ TEST_CASE("[DeclListNin] SQL: EQ + NIN + range $n numbering", "[list][nin][unit]
 TEST_CASE("[DeclListNin] SQL: IN and NIN coexist — two array params, $n correct",
           "[list][nin][unit][sql]") {
     decl::Filters<DescInNin> f;
-    f.get<0>() = std::vector<int64_t>{1, 2};                   // author_id IN {1,2}
-    f.get<1>() = std::vector<std::string>{"spam", "draft"};    // category NOT IN {spam,draft}
+    f.get<"author_id">() = std::vector<int64_t>{1, 2};                   // author_id IN {1,2}
+    f.get<"category">() = std::vector<std::string>{"spam", "draft"};    // category NOT IN {spam,draft}
 
     auto wc = decl::buildWhereClause<DescInNin>(f);
     CHECK(wc.sql == "\"author_id\" = ANY($1) AND \"category\" != ALL($2)");
@@ -449,8 +449,8 @@ using Params = std::unordered_map<std::string, std::string>;
 TEST_CASE("[DeclListNin] parse: CSV set sorted and deduped into NIN slot",
           "[list][nin][unit][parse]") {
     auto q = decl::parseListQuery<DescNinString>(Params{{"category", "spam,draft"}});
-    REQUIRE(q.filters().get<0>().has_value());
-    CHECK(*q.filters().get<0>() == std::vector<std::string>{"draft", "spam"});  // sorted
+    REQUIRE(q.filters().get<"category">().has_value());
+    CHECK(*q.filters().get<"category">() == std::vector<std::string>{"draft", "spam"});  // sorted
 }
 
 TEST_CASE("[DeclListNin] parse: order/dups → identical group key (shared canon)",
@@ -462,8 +462,8 @@ TEST_CASE("[DeclListNin] parse: order/dups → identical group key (shared canon
 
 TEST_CASE("[DeclListNin] parse: invalid int elements dropped", "[list][nin][unit][parse]") {
     auto q = decl::parseListQuery<DescNinInt64>(Params{{"author_id", "1,abc,3"}});
-    REQUIRE(q.filters().get<0>().has_value());
-    CHECK(*q.filters().get<0>() == std::vector<int64_t>{1, 3});
+    REQUIRE(q.filters().get<"author_id">().has_value());
+    CHECK(*q.filters().get<"author_id">() == std::vector<int64_t>{1, 3});
 }
 
 TEST_CASE("[DeclListNin] parse: empty value leaves NIN inactive (≡ NOT IN {} = universe, §1.2)",
@@ -472,7 +472,7 @@ TEST_CASE("[DeclListNin] parse: empty value leaves NIN inactive (≡ NOT IN {} =
     // semantics: inactive ≡ unfiltered ≡ NOT IN {} = universe (unlike IN, where
     // inactive is a compromise vs the empty-set = ∅).
     auto q = decl::parseListQuery<DescNinInt64>(Params{{"author_id", "abc,xyz"}});
-    CHECK_FALSE(q.filters().get<0>().has_value());
+    CHECK_FALSE(q.filters().get<"author_id">().has_value());
 }
 
 TEST_CASE("[DeclListNin] parse: element count capped at 256", "[list][nin][unit][parse]") {
@@ -482,8 +482,8 @@ TEST_CASE("[DeclListNin] parse: element count capped at 256", "[list][nin][unit]
         csv += std::to_string(i);
     }
     auto q = decl::parseListQuery<DescNinInt64>(Params{{"author_id", csv}});
-    REQUIRE(q.filters().get<0>().has_value());
-    CHECK(q.filters().get<0>()->size() == 256);
+    REQUIRE(q.filters().get<"author_id">().has_value());
+    CHECK(q.filters().get<"author_id">()->size() == 256);
 }
 
 TEST_CASE("[DeclListNin] parse: strict rejects undeclared, accepts well-formed NIN",
@@ -496,8 +496,8 @@ TEST_CASE("[DeclListNin] parse: strict rejects undeclared, accepts well-formed N
         auto r = decl::parseListQueryStrict<DescNinString>(
             Params{{"category", "spam,draft,spam"}});
         REQUIRE(r.has_value());
-        REQUIRE(r->filters().get<0>().has_value());
-        CHECK(*r->filters().get<0>() == std::vector<std::string>{"draft", "spam"});
+        REQUIRE(r->filters().get<"category">().has_value());
+        CHECK(*r->filters().get<"category">() == std::vector<std::string>{"draft", "spam"});
     }
 }
 
@@ -508,10 +508,10 @@ TEST_CASE("[DeclListNin] parse: HTTP IN and NIN produce the same canonical set",
     // verdict time. Here author_id is IN, category is NIN — parse both.
     auto q = decl::parseListQuery<DescInNin>(
         Params{{"author_id", "2,1,2"}, {"category", "spam,draft,spam"}});
-    REQUIRE(q.filters().get<0>().has_value());
-    REQUIRE(q.filters().get<1>().has_value());
-    CHECK(*q.filters().get<0>() == std::vector<int64_t>{1, 2});            // IN, canonical
-    CHECK(*q.filters().get<1>() == std::vector<std::string>{"draft", "spam"});  // NIN, canonical
+    REQUIRE(q.filters().get<"author_id">().has_value());
+    REQUIRE(q.filters().get<"category">().has_value());
+    CHECK(*q.filters().get<"author_id">() == std::vector<int64_t>{1, 2});            // IN, canonical
+    CHECK(*q.filters().get<"category">() == std::vector<std::string>{"draft", "spam"});  // NIN, canonical
 }
 
 // =============================================================================
@@ -619,7 +619,7 @@ TEST_CASE("[DeclListNin][L2] create invalidates groups whose set EXCLUDES the va
 
     auto mk = [](std::vector<std::string> set) {
         decl::ListQueryParams<DescNinString> q;
-        q.filters.get<0>() = std::move(set);
+        q.filters.get<"category">() = std::move(set);
         return registerNinGroup<DescNinString>(q);
     };
     auto g_sd = mk({"spam", "draft"});
@@ -646,9 +646,9 @@ TEST_CASE("[DeclListNin][L2] alignment — NIN in middle position (create)",
     // DescCombo: [EQ author_id][NIN category][GE view_count]
     auto mk = [](int64_t author, std::vector<std::string> cats, int32_t viewGe) {
         decl::ListQueryParams<DescCombo> q;
-        q.filters.get<0>() = author;
-        q.filters.get<1>() = std::move(cats);
-        q.filters.get<2>() = viewGe;
+        q.filters.get<"author_id">() = author;
+        q.filters.get<"category">() = std::move(cats);
+        q.filters.get<"view_count">() = viewGe;
         return registerNinGroup<DescCombo>(q);
     };
     auto gAll = mk(42, {"spam"},        10);   // EQ ok, NIN ok (science∉), range ok
@@ -669,8 +669,8 @@ TEST_CASE("[DeclListNin][L2] alignment — NIN in first position (create)",
     // DescNinFirst: [NIN category][EQ author_id]
     auto mk = [](std::vector<std::string> cats, int64_t author) {
         decl::ListQueryParams<DescNinFirst> q;
-        q.filters.get<0>() = std::move(cats);
-        q.filters.get<1>() = author;
+        q.filters.get<"category">() = std::move(cats);
+        q.filters.get<"author_id">() = author;
         return registerNinGroup<DescNinFirst>(q);
     };
     auto gMatch  = mk({"spam"}, 42);  // NIN ok (tech∉) + EQ ok
@@ -687,8 +687,8 @@ TEST_CASE("[DeclListNin][L2] alignment — NIN in last position (create)",
     // DescNinLast: [EQ author_id][NIN category]
     auto mk = [](int64_t author, std::vector<std::string> cats) {
         decl::ListQueryParams<DescNinLast> q;
-        q.filters.get<0>() = author;
-        q.filters.get<1>() = std::move(cats);
+        q.filters.get<"author_id">() = author;
+        q.filters.get<"category">() = std::move(cats);
         return registerNinGroup<DescNinLast>(q);
     };
     auto gMatch   = mk(42, {"spam"});
@@ -708,8 +708,8 @@ TEST_CASE("[DeclListNin][L2] IN and NIN coexist — both route through skipset (
     // via skipset without colliding on the cursor.
     auto mk = [](std::vector<int64_t> authors, std::vector<std::string> cats) {
         decl::ListQueryParams<DescInNin> q;
-        q.filters.get<0>() = std::move(authors);
-        q.filters.get<1>() = std::move(cats);
+        q.filters.get<"author_id">() = std::move(authors);
+        q.filters.get<"category">() = std::move(cats);
         return registerNinGroup<DescInNin>(q);
     };
     auto gMatch  = mk({1, 2}, {"spam", "draft"});  // IN ok (1∈) AND NIN ok (tech∉)
@@ -728,7 +728,7 @@ TEST_CASE("[DeclListNin][L2] optional-null entity matches no NIN group; empty se
     // DescNinOptInt32: [NIN view_count] on a std::optional<int32_t> member.
     auto mk = [](std::optional<std::vector<int32_t>> set) {
         decl::ListQueryParams<DescNinOptInt32> q;
-        if (set) q.filters.get<0>() = std::move(*set);
+        if (set) q.filters.get<"view_count">() = std::move(*set);
         return registerNinGroup<DescNinOptInt32>(q);
     };
     auto gSet   = mk(std::vector<int32_t>{10, 20});
@@ -756,7 +756,7 @@ TEST_CASE("[DeclListNin][L2] update invalidates when old XOR new is excluded fro
     TransactionGuard tx;
     auto mk = [](std::vector<std::string> set) {
         decl::ListQueryParams<DescNinString> q;
-        q.filters.get<0>() = std::move(set);
+        q.filters.get<"category">() = std::move(set);
         return registerNinGroup<DescNinString>(q);
     };
 
@@ -787,9 +787,9 @@ TEST_CASE("[DeclListNin][L2] alignment — NIN in middle position (update, 2nd L
     // (`...Update`) to catch any copy-paste divergence from the create path.
     auto mk = [](int64_t author, std::vector<std::string> cats, int32_t viewGe) {
         decl::ListQueryParams<DescCombo> q;
-        q.filters.get<0>() = author;
-        q.filters.get<1>() = std::move(cats);
-        q.filters.get<2>() = viewGe;
+        q.filters.get<"author_id">() = author;
+        q.filters.get<"category">() = std::move(cats);
+        q.filters.get<"view_count">() = viewGe;
         return registerNinGroup<DescCombo>(q);
     };
     auto gAll = mk(42, {"spam"}, 10);   // both old/new NIN-match (tech∉spam), range ok
@@ -871,14 +871,14 @@ void crossTierNinProperty(const std::vector<Entity>& entities,
         pages.reserve(sets.size());
         for (const auto& s : sets) {
             decl::ListQueryParams<DescNin> q;
-            q.filters.template get<0>() = s;
+            std::get<0>(q.filters.values) = s;
             pages.push_back(registerNinGroup<DescNin>(q));
         }
         fireCreate<DescNin>(e);  // one NIN create, Lua scans every registered group
 
         for (size_t i = 0; i < sets.size(); ++i) {
             decl::Filters<DescNin> fn;
-            fn.template get<0>() = sets[i];
+            std::get<0>(fn.values) = sets[i];
             const bool ninL1 = decl::matchesFilters<DescNin>(e, fn);
             const bool ninL2 = !alive(pages[i]);           // deleted ⇔ matched
 
@@ -888,7 +888,7 @@ void crossTierNinProperty(const std::vector<Entity>& entities,
             const bool ninL3 = fld.has_value() && sqlAllVerdict(*fld, arr, cast);
 
             decl::Filters<DescIn> fi;
-            fi.template get<0>() = sets[i];
+            std::get<0>(fi.values) = sets[i];
             const bool inL1 = decl::matchesFilters<DescIn>(e, fi);
 
             CAPTURE(e.id, i, arr, ninL1, ninL2, ninL3, inL1, fld.has_value());

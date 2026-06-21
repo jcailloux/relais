@@ -128,12 +128,12 @@ ListQuery<Descriptor> parseListQuery(const Map& params) {
                     // (§1.2): inactive ≡ unfiltered ≡ universe. No HTTP empty-set.
                     auto vals = detail::parseInList<typename FilterType::element_type>(it->second);
                     if (!vals.empty()) {
-                        query.filters.template get<Is>() = std::move(vals);
+                        std::get<Is>(query.filters.values) = std::move(vals);
                     }
                 } else {
                     using ValueType = typename FilterType::value_type;
                     if (auto val = detail::parseValue<ValueType>(it->second)) {
-                        query.filters.template get<Is>() = std::move(*val);
+                        std::get<Is>(query.filters.values) = std::move(*val);
                     }
                 }
             }
@@ -237,12 +237,12 @@ std::expected<ListQuery<Descriptor>, QueryValidationError> parseListQueryStrict(
                 if constexpr (FilterType::is_set_op) {
                     auto vals = detail::parseInList<typename FilterType::element_type>(it->second);
                     if (!vals.empty()) {
-                        query.filters.template get<Is>() = std::move(vals);
+                        std::get<Is>(query.filters.values) = std::move(vals);
                     }
                 } else {
                     using ValueType = typename FilterType::value_type;
                     if (auto val = detail::parseValue<ValueType>(it->second)) {
-                        query.filters.template get<Is>() = std::move(*val);
+                        std::get<Is>(query.filters.values) = std::move(*val);
                     }
                 }
             }

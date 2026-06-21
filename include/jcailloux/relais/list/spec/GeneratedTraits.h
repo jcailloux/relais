@@ -57,7 +57,7 @@ template<typename Descriptor>
     [&]<size_t... Is>(std::index_sequence<Is...>) {
         result = (([&] {
             using FilterType = filter_at<Descriptor, Is>;
-            const auto& filter_value = filters.template get<Is>();
+            const auto& filter_value = std::get<Is>(filters.values);
 
             // Filter not active -> matches
             if (!filter_value.has_value()) return true;
@@ -458,7 +458,7 @@ template<typename Descriptor, size_t I>
 void narrowSortRange(SortRange& r, const Filters<Descriptor>& pred) noexcept {
     using FT = filter_at<Descriptor, I>;
     if constexpr (std::is_arithmetic_v<typename FT::element_type>) {
-        const auto& v = pred.template get<I>();
+        const auto& v = std::get<I>(pred.values);
         if (!v.has_value()) return;
         constexpr Op op = FT::op;
         if constexpr (op == Op::IN) {
@@ -505,8 +505,8 @@ void narrowSortRangeForDim(SortRange& r, const Filters<Descriptor>& pred) noexce
 template<typename Descriptor, size_t I>
 [[nodiscard]] bool predicateCompatAt(
     const Filters<Descriptor>& pred, const Filters<Descriptor>& group) noexcept {
-    const auto& pv = pred.template get<I>();
-    const auto& gv = group.template get<I>();
+    const auto& pv = std::get<I>(pred.values);
+    const auto& gv = std::get<I>(group.values);
     if (!pv.has_value() || !gv.has_value()) return true;
     constexpr Op op = filter_at<Descriptor, I>::op;
     if constexpr (op == Op::EQ) {
