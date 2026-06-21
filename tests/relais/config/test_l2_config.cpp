@@ -15,6 +15,7 @@
 
 #include "fixtures/test_helper.h"
 #include "fixtures/TestRepositories.h"
+#include "fixtures/RelaisTestAccessors.h"
 
 using namespace relais_test;
 
@@ -176,6 +177,76 @@ TEST_CASE("L2 Config - l2_refresh_on_get",
         auto item = sync(L2RefreshFalseRepo::find(id));
         REQUIRE(item->name == "l2_noref_updated");
         REQUIRE(item->value == 99);
+    }
+}
+
+
+// Multi-key counterpart: the batched L2 read (findManyRaw) must refresh every
+// hit's TTL in one MGET round-trip (mgetRawEx fans out N GETEX via whenAll).
+// Driven at the L2 tier (findManyRaw, via TestInternals) — a public findMany
+// with L1 present would short-circuit on L1 and never re-touch Redis, so it
+// could not exercise the GETEX path at all.
+TEST_CASE("L2 Config - l2_refresh_on_get (multi-key MGET)",
+          "[integration][db][config][l2][refresh][findmany]")
+{
+    TransactionGuard tx;
+
+    SECTION("[refresh] true: gathered GETEX extends TTL for every key") {
+        std::vector<int64_t> ids;
+        for (int i = 0; i < 4; ++i)
+            ids.push_back(insertTestItem("l2_mget_ref_" + std::to_string(i), i));
+
+        // Populate L2 for all keys (TTL = 1s).
+        for (auto id : ids) sync(L2RefreshTrueRepo::find(id));
+
+        // Wait 700ms, then a multi-key read: mgetRawEx bumps every key's TTL by
+        // 1s from now, in a single round-trip.
+        waitForExpiration(std::chrono::milliseconds{700});
+        {
+            auto v = sync(TestInternals::findManyRaw<L2RefreshTrueRepo, int64_t>(ids));
+            REQUIRE(v.size() == ids.size());
+        }
+
+        // 700ms more (1.4s total > 1s original TTL), then mutate the DB rows.
+        waitForExpiration(std::chrono::milliseconds{700});
+        for (auto id : ids)
+            updateTestItem(id, "l2_mget_modified", 99);
+
+        // Every key's TTL was extended → all still serve the cached value.
+        auto v = sync(TestInternals::findManyRaw<L2RefreshTrueRepo, int64_t>(ids));
+        REQUIRE(v.size() == ids.size());
+        for (size_t i = 0; i < ids.size(); ++i) {
+            REQUIRE(v[i].has_value());
+            REQUIRE(v[i]->name == "l2_mget_ref_" + std::to_string(i));
+            REQUIRE(v[i]->value == static_cast<int32_t>(i));
+        }
+    }
+
+    SECTION("[refresh] false: plain MGET does not extend TTL, keys expire") {
+        std::vector<int64_t> ids;
+        for (int i = 0; i < 4; ++i)
+            ids.push_back(insertTestItem("l2_mget_noref_" + std::to_string(i), i));
+
+        for (auto id : ids) sync(L2RefreshFalseRepo::find(id));
+
+        waitForExpiration(std::chrono::milliseconds{700});
+        {
+            auto v = sync(TestInternals::findManyRaw<L2RefreshFalseRepo, int64_t>(ids));
+            REQUIRE(v.size() == ids.size());
+        }
+
+        // 500ms more (1.2s total > 1s TTL) — no refresh, keys have expired.
+        waitForExpiration(std::chrono::milliseconds{500});
+        for (auto id : ids)
+            updateTestItem(id, "l2_mget_updated", 99);
+
+        auto v = sync(TestInternals::findManyRaw<L2RefreshFalseRepo, int64_t>(ids));
+        REQUIRE(v.size() == ids.size());
+        for (size_t i = 0; i < ids.size(); ++i) {
+            REQUIRE(v[i].has_value());
+            REQUIRE(v[i]->name == "l2_mget_updated");
+            REQUIRE(v[i]->value == 99);
+        }
     }
 }
 
