@@ -350,7 +350,9 @@ private:
             co_return co_await sendSinglePgRead(std::move(entry));
         }
 
-        // Nagle: first query goes direct, subsequent accumulate during RTT
+        // Nagle: first query goes direct, subsequent accumulate during its RTT.
+        // This branch is the leader's set + clear half of the pg_read_inflight_
+        // latch invariant (proven at its declaration).
         if (!pg_read_inflight_) {
             pg_read_inflight_ = true;
             PgResult result;
@@ -859,7 +861,11 @@ private:
         for (auto h : to_resume) h.resume();
         for (auto* e : to_delete) delete e;
 
-        // Chain: fire next accumulated batch or clear inflight
+        // Drain-or-chain — the clear-or-keep half of the pg_read_inflight_
+        // latch invariant (proven at its declaration). More accumulated → fire
+        // the next batch and KEEP the latch set; otherwise clear it. This runs
+        // on the loop thread, so this read-modify-write of the latch cannot
+        // race the leader's own clear in submitPgRead.
         if (!pg_read_batch_.entries.empty()) {
             firePgReadBatchNow();
         } else {
@@ -1209,8 +1215,27 @@ private:
     PgWriteBatch pg_write_batch_;
     RedisBatch redis_batch_;
 
-    // Nagle inflight flags — true while a direct send is in-flight,
-    // causing subsequent queries to accumulate in the batch.
+    // Nagle inflight latches — true while a direct send is in-flight, so
+    // subsequent same-tier queries accumulate into the batch instead of each
+    // paying its own round-trip.
+    //
+    // Invariant (pg_read_inflight_, mono-thread): a plain bool, never atomic.
+    // Every read and write of it runs on the one loop thread, only at points
+    // where no other coroutine can interleave — coroutines hand off
+    // cooperatively at co_await, they never preempt — so there is no data race
+    // and no memory ordering to enforce. Lifecycle:
+    //   - Set true by the *leader*: the read that finds it false. The leader
+    //     sends one query direct (bypassing the batch) and suspends on its RTT.
+    //   - Reads arriving during that RTT find it true and accumulate into
+    //     pg_read_batch_ (departure timer / size check fires the batch).
+    //   - Cleared on the leader's resume (submitPgRead, success or throw) and,
+    //     independently, at firePgReadBatch's tail once accumulation drains; a
+    //     non-empty tail chains the next batch WITHOUT clearing, keeping the
+    //     latch set across back-to-back batches.
+    // The latch only ever *under*-gates: clearing it while work is still
+    // pending costs at most one extra direct send on another pooled connection,
+    // and reads are independent + idempotent, so that is correctness-neutral.
+    // It can never stick true (no clear-site is skippable) nor deadlock.
     bool pg_read_inflight_ = false;
     bool pg_write_inflight_ = false;
     bool redis_inflight_ = false;
