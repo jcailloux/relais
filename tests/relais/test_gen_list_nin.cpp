@@ -103,14 +103,14 @@ TEST_CASE("generator emits a functional NIN descriptor (both forms)", "[list][ni
     };
     auto q = decl::parseListQuery<GenDesc>(params);
 
-    REQUIRE(q.filters.template get<0>().has_value());
-    REQUIRE(q.filters.template get<1>().has_value());
-    CHECK(*q.filters.template get<0>() == std::vector<int64_t>{1, 2});
-    CHECK(*q.filters.template get<1>()
+    REQUIRE(q.filters().template get<0>().has_value());
+    REQUIRE(q.filters().template get<1>().has_value());
+    CHECK(*q.filters().template get<0>() == std::vector<int64_t>{1, 2});
+    CHECK(*q.filters().template get<1>()
           == std::vector<std::string>{"science", "tech"});
 
     SECTION("L3: both NIN filters compile to `!= ALL`") {
-        auto wc = decl::buildWhereClause<GenDesc>(q.filters);
+        auto wc = decl::buildWhereClause<GenDesc>(q.filters());
         CHECK(countNotAll(wc.sql) == 2);
         // Two NIN sets => exactly two array params, no $n drift.
         CHECK(wc.params.params.size() == 2);
@@ -118,11 +118,11 @@ TEST_CASE("generator emits a functional NIN descriptor (both forms)", "[list][ni
 
     SECTION("L1: matchesFilters honors the generated Op::NIN (anti-membership)") {
         // author ∉ {1,2} AND category ∉ {science,tech} -> matches.
-        CHECK(decl::matchesFilters<GenDesc>(makeEntity(9, "news"), q.filters));
+        CHECK(decl::matchesFilters<GenDesc>(makeEntity(9, "news"), q.filters()));
         // author 1 ∈ {1,2} -> excluded.
-        CHECK_FALSE(decl::matchesFilters<GenDesc>(makeEntity(1, "news"), q.filters));
+        CHECK_FALSE(decl::matchesFilters<GenDesc>(makeEntity(1, "news"), q.filters()));
         // category "tech" ∈ {science,tech} -> excluded.
-        CHECK_FALSE(decl::matchesFilters<GenDesc>(makeEntity(9, "tech"), q.filters));
+        CHECK_FALSE(decl::matchesFilters<GenDesc>(makeEntity(9, "tech"), q.filters()));
     }
 }
 

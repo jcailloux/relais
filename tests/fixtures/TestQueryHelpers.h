@@ -22,15 +22,12 @@ inline ArticleListQuery makeArticleQuery(
     std::optional<int64_t> author_id = std::nullopt,
     uint16_t limit = 10
 ) {
-    ArticleListQuery q;
-    q.limit = limit;
-    if (author_id) q.filters.template get<0>() = *author_id;
-    if (category) q.filters.template get<1>() = std::move(*category);
-
     using Desc = TestArticleListRepo::ListDescriptorType;
-    q.group_key = ld::groupKey<Desc>(q.filters, q.sort);
-    q.cache_key = ld::cacheKey<Desc>(q);
-    return q;
+    ld::ListQueryParams<Desc> p;
+    p.limit = limit;
+    if (author_id) p.filters.template get<0>() = *author_id;
+    if (category) p.filters.template get<1>() = std::move(*category);
+    return ld::seal<Desc>(std::move(p));
 }
 
 inline PurchaseListQuery makePurchaseQuery(
@@ -38,15 +35,12 @@ inline PurchaseListQuery makePurchaseQuery(
     std::optional<std::string> status = std::nullopt,
     uint16_t limit = 10
 ) {
-    PurchaseListQuery q;
-    q.limit = limit;
-    if (status) q.filters.template get<0>() = std::move(*status);
-    if (user_id) q.filters.template get<1>() = *user_id;
-
     using Desc = TestPurchaseListRepo::ListDescriptorType;
-    q.group_key = ld::groupKey<Desc>(q.filters, q.sort);
-    q.cache_key = ld::cacheKey<Desc>(q);
-    return q;
+    ld::ListQueryParams<Desc> p;
+    p.limit = limit;
+    if (status) p.filters.template get<0>() = std::move(*status);
+    if (user_id) p.filters.template get<1>() = *user_id;
+    return ld::seal<Desc>(std::move(p));
 }
 
 } // namespace relais_test

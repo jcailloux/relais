@@ -191,22 +191,22 @@ TEST_CASE("parse without a limit param uses the descriptor default", "[list][lim
     const std::unordered_map<std::string, std::string> no_params;
 
     SECTION("tolerant parser") {
-        CHECK(parseListQuery<FiveDesc>(no_params).limit == 5);
-        CHECK(parseListQuery<SingleDesc>(no_params).limit == 50);
+        CHECK(parseListQuery<FiveDesc>(no_params).limit() == 5);
+        CHECK(parseListQuery<SingleDesc>(no_params).limit() == 50);
     }
 
     SECTION("strict parser") {
         auto q5 = parseListQueryStrict<FiveDesc>(no_params);
         REQUIRE(q5.has_value());
-        CHECK(q5->limit == 5);
+        CHECK(q5->limit() == 5);
 
         auto qc = parseListQueryStrict<SingleDesc>(no_params);
         REQUIRE(qc.has_value());
-        CHECK(qc->limit == 50);
+        CHECK(qc->limit() == 50);
     }
 
     SECTION("an explicit limit still overrides the default") {
         const std::unordered_map<std::string, std::string> with_limit{{"limit", "20"}};
-        CHECK(parseListQuery<FiveDesc>(with_limit).limit == 20);  // 20 ∈ {5,10,20,50,100}
+        CHECK(parseListQuery<FiveDesc>(with_limit).limit() == 20);  // 20 ∈ {5,10,20,50,100}
     }
 }
