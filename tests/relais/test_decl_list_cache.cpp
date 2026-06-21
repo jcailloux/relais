@@ -63,6 +63,73 @@ TestListQuery makeViewCountQuery(std::string_view category, uint16_t limit) {
 
 // #############################################################################
 //
+//  sortBy / sortAsc / sortDesc — compile-time sort by field name (no I/O)
+//  TestArticleListDecl sorts: index 0 = "id", index 1 = "view_count"
+//
+// #############################################################################
+
+TEST_CASE("[decl-sortby] resolves field name to index", "[decl][sortby]") {
+    // Compile-time resolution against Descriptor::sorts.
+    STATIC_REQUIRE(decl::sortBy<TestDecl, "id">().field == 0);
+    STATIC_REQUIRE(decl::sortBy<TestDecl, "view_count">().field == 1);
+
+    // Tied to the runtime resolver: the consteval helper and parseSortField
+    // share the same name table and must never diverge.
+    REQUIRE(decl::sortBy<TestDecl, "view_count">().field
+            == decl::parseSortField<TestDecl>("view_count").value());
+    REQUIRE(decl::sortBy<TestDecl, "id">().field
+            == decl::parseSortField<TestDecl>("id").value());
+}
+
+TEST_CASE("[decl-sortby] direction sugar honors Asc/Desc", "[decl][sortby]") {
+    using jcailloux::relais::list::SortDirection;
+
+    STATIC_REQUIRE(decl::sortAsc<TestDecl, "view_count">().direction == SortDirection::Asc);
+    STATIC_REQUIRE(decl::sortDesc<TestDecl, "view_count">().direction == SortDirection::Desc);
+    STATIC_REQUIRE(decl::sortBy<TestDecl, "view_count", SortDirection::Asc>().direction
+                   == SortDirection::Asc);
+    STATIC_REQUIRE(decl::sortBy<TestDecl, "view_count", SortDirection::Desc>().direction
+                   == SortDirection::Desc);
+
+    // Field index is independent of direction.
+    STATIC_REQUIRE(decl::sortAsc<TestDecl, "view_count">().field
+                   == decl::sortDesc<TestDecl, "view_count">().field);
+}
+
+TEST_CASE("[decl-sortby] yields identical canonical keys as raw index", "[decl][sortby]") {
+    using jcailloux::relais::list::SortDirection;
+    using jcailloux::relais::list::SortSpec;
+
+    TestListQuery viaName;
+    viaName.limit = 10;
+    viaName.filters.get<1>() = std::string("tech");
+    viaName.sort = decl::sortDesc<TestDecl, "view_count">();
+    viaName.group_key = decl::groupKey<TestDecl>(viaName.filters, viaName.sort);
+    viaName.cache_key = decl::cacheKey<TestDecl>(viaName);
+
+    TestListQuery viaIndex;
+    viaIndex.limit = 10;
+    viaIndex.filters.get<1>() = std::string("tech");
+    viaIndex.sort = SortSpec<size_t>{1, SortDirection::Desc};
+    viaIndex.group_key = decl::groupKey<TestDecl>(viaIndex.filters, viaIndex.sort);
+    viaIndex.cache_key = decl::cacheKey<TestDecl>(viaIndex);
+
+    // group_key drives Redis invalidation — any drift would corrupt
+    // invalidation, not just sorting.
+    REQUIRE(viaName.sort == viaIndex.sort);
+    REQUIRE(viaName.group_key == viaIndex.group_key);
+    REQUIRE(viaName.cache_key == viaIndex.cache_key);
+}
+
+TEST_CASE("[decl-sortby] unknown sort name", "[decl][sortby]") {
+    // sortBy<TestDecl, "nonexistent">() static_asserts at compile time
+    // (find_sort_index). The runtime resolver shares the same name table —
+    // the negative side is observable here; the static_assert guards the rest.
+    REQUIRE_FALSE(decl::parseSortField<TestDecl>("nonexistent").has_value());
+}
+
+// #############################################################################
+//
 //  TEST CASE 1: Article list query (filters, limit, empty)
 //
 // #############################################################################
