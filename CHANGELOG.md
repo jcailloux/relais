@@ -4,6 +4,16 @@
 
 ### Added
 
+- **Descriptor-tagged keyset cursor (`Repo::Cursor`).** `Repo::Cursor` is
+  `list::spec::TypedCursor<Descriptor>`, obtained only through
+  `Repo::Cursor::decode(token)` (the raw constructor is private). `.after()` and
+  `ListQueryParams::cursor` take it, so handing one list's cursor to another
+  list's query/builder is a compile error, not a runtime mis-decode. The base64
+  wire token is unchanged (`view->cursor()` is still a `std::string`); the tag
+  lives on the construction side only. Limit: `decode` does not verify a token's
+  provenance — a well-formed token from another list still decodes (its keyset
+  bytes are then meaningless), as the token is opaque and arrives off the wire.
+
 - **Typed self-sealing list query builder.** `Repo::queryBuilder()` is the
   primary C++ construction path for a list query: `.filter<"name">(v)`,
   `.sortBy<"name", Dir>()` (and `.sortAsc`/`.sortDesc`), `.limit(n)`,

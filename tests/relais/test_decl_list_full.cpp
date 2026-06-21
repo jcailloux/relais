@@ -594,7 +594,7 @@ TEST_CASE("[DeclList L1+L2] Insertion invalidation edge cases",
 
         // Page 2 [60] via cursor: NOT first, incomplete (1 < limit 2)
         auto q2params = makeFullViewCountQuery("tech", 2).params();
-        q2params.cursor = list_ns::Cursor::decode(std::string(p1->cursor())).value();
+        q2params.cursor = FullCacheArticleListRepo::Cursor::decode(std::string(p1->cursor())).value();
         auto q2 = decl::seal<FullArticleDecl>(std::move(q2params));
         auto p2 = sync(FullCacheArticleListRepo::query(q2));
         REQUIRE(p2->size() == 1);

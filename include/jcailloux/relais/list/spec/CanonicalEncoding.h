@@ -144,17 +144,18 @@ std::string cacheKey(const std::string& group_key, const ListQueryParams<Descrip
     // Limit
     detail::appendToBuffer(buf, params.limit);
 
-    // Cursor
-    if (!params.cursor.data.empty()) {
-        uint32_t cursor_len = static_cast<uint32_t>(params.cursor.data.size());
+    // Cursor — read the opaque byte token behind the descriptor tag.
+    const auto& cursor_data = params.cursor.raw().data;
+    if (!cursor_data.empty()) {
+        uint32_t cursor_len = static_cast<uint32_t>(cursor_data.size());
         detail::appendToBuffer(buf, cursor_len);
         buf.insert(buf.end(),
-            reinterpret_cast<const uint8_t*>(params.cursor.data.data()),
-            reinterpret_cast<const uint8_t*>(params.cursor.data.data()) + params.cursor.data.size());
+            reinterpret_cast<const uint8_t*>(cursor_data.data()),
+            reinterpret_cast<const uint8_t*>(cursor_data.data()) + cursor_data.size());
     }
 
     // Offset (mutually exclusive with cursor — cursor takes precedence)
-    if (params.offset > 0 && params.cursor.data.empty()) {
+    if (params.offset > 0 && cursor_data.empty()) {
         uint8_t offset_marker = 0x4F;  // 'O' — distinguishes from cursor data
         buf.push_back(offset_marker);
         detail::appendToBuffer(buf, params.offset);

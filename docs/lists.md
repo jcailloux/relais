@@ -181,7 +181,7 @@ Builder surface:
 | `.sortBy<"name", Dir>()` / `.sortAsc<"name">()` / `.sortDesc<"name">()` | Sort by name + direction, compile-time resolved |
 | `.sort(spec)` | Escape hatch — a `DescriptorSortSpec` resolved at runtime |
 | `.limit(n)` | Exact page size, **no** grid normalization (caller owns key cardinality) |
-| `.after(list::Cursor)` | Keyset cursor; mutually exclusive with `offset` (cursor wins) |
+| `.after(Repo::Cursor)` | Keyset cursor (descriptor-tagged); mutually exclusive with `offset` (cursor wins) |
 | `.offset(n)` | Offset pagination; ignored once a cursor is set |
 | `.build()` | Seal into `ListQuery` (the only sealing point) |
 | `.params()` | The accumulated mutable `ListQueryParams` |
@@ -212,9 +212,40 @@ auto q = ld::seal<Desc>(std::move(p));    // computes both keys, yields ListQuer
 
 // Re-seal after mutating a sealed query (e.g. advancing the cursor):
 auto p2 = q.params();
-p2.cursor = next;
+p2.cursor = next;                         // next is an AuditLogRepo::Cursor
 auto q2 = ld::seal<Desc>(std::move(p2));
 ```
+
+### Keyset cursor
+
+The keyset cursor is descriptor-tagged: `Repo::Cursor` is
+`list::spec::TypedCursor<Descriptor>`. The wire token is unchanged — a page's
+`view->cursor()` is still a base64 `std::string`; you decode the token you
+previously emitted and pass the result to `.after()`:
+
+```cpp
+auto cursor = AuditLogRepo::Cursor::decode(token);   // optional<AuditLogRepo::Cursor>
+if (!cursor) { /* malformed token — reject at the trust boundary */ }
+
+auto next = AuditLogRepo::queryBuilder()
+    .filter<"user_id">(uid)
+    .sortDesc<"created_at">()
+    .after(*cursor)
+    .build();
+```
+
+`decode()` is the **only** way to obtain a cursor from a token (the raw
+constructor is private). The tag makes one kind of mistake a compile error:
+handing `OtherRepo::Cursor` to this repo's `.after()` (or assigning it into this
+repo's params) does not compile — distinct types, no conversion.
+
+What the tag does **not** catch: `Repo::Cursor::decode` does not verify that a
+token actually originated from *this* descriptor's pages. A well-formed token
+minted by another list decodes successfully and yields a same-typed cursor whose
+keyset bytes are meaningless for this query. This is intrinsic — the token is
+opaque and arrives off the wire, so its provenance cannot be a compile-time
+fact; intra-descriptor coherence (cursor vs the request's current sort) is
+likewise a runtime concern. Re-emit only the `next_cursor` a page handed you.
 
 ### Filter object model
 

@@ -23,7 +23,7 @@ namespace {
 using CRepo = L1TestCompositeKeyListRepo;
 using CDesc = CRepo::ListDescriptorType;
 
-CRepo::ListQuery makeQ(uint16_t limit, rlist::Cursor cursor = {},
+CRepo::ListQuery makeQ(uint16_t limit, CRepo::Cursor cursor = {},
                        std::optional<int64_t> tenant = std::nullopt) {
     rspec::ListQueryParams<CDesc> q;
     q.limit = limit;
@@ -68,12 +68,12 @@ TEST_CASE("[DeclList composite] keyset pagination over a composite key",
 
     SECTION("paginate with limit=2: no dups, no gaps, correct order") {
         std::vector<std::pair<int64_t, int64_t>> got;
-        rlist::Cursor cursor;
+        CRepo::Cursor cursor;
         for (int page = 0; page < 8; ++page) {
             auto r = sync(CRepo::query(makeQ(2, cursor)));
             for (const auto& e : r->items) got.emplace_back(e.tenant_id, e.item_id);
             if (r->items.size() < 2) break;
-            auto next = rlist::Cursor::decode(r->cursor());
+            auto next = CRepo::Cursor::decode(r->cursor());
             if (!next || next->empty()) break;
             cursor = std::move(*next);
         }

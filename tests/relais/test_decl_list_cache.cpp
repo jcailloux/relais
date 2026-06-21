@@ -159,10 +159,10 @@ TEST_CASE("[decl-builder] cursor changes the page key, not the group", "[decl][b
         .limit(24)
         .build();
 
-    jcailloux::relais::list::Cursor c1;
-    c1.data = {std::byte{0x01}};
-    jcailloux::relais::list::Cursor c2;
-    c2.data = {std::byte{0x02}};
+    // Two distinct server-minted tokens, decoded through the descriptor-tagged
+    // boundary ("AQ" = 0x01, "Ag" = 0x02).
+    auto c1 = TestArticleListRepo::Cursor::decode("AQ").value();
+    auto c2 = TestArticleListRepo::Cursor::decode("Ag").value();
 
     auto page1 = TestArticleListRepo::queryBuilder()
         .filter<"category">(std::string("tech"))
@@ -183,6 +183,18 @@ TEST_CASE("[decl-builder] cursor changes the page key, not the group", "[decl][b
     REQUIRE(page1.cacheKey() != base.cacheKey());
     REQUIRE(page1.cacheKey() != page2.cacheKey());
 }
+
+// Cross-descriptor cursor confusion is a compile error, not a runtime mis-decode
+// (decision 6 / test 10c). A Purchase cursor and an Article cursor are distinct
+// types with no conversion between them: it cannot be assigned into Article
+// params, nor passed to queryBuilder().after() (which takes the cursor by value,
+// so the non-constructibility below is exactly what rejects it). Compile-time only.
+static_assert(!std::is_constructible_v<TestArticleListRepo::Cursor,
+                                       TestPurchaseListRepo::Cursor>,
+              "a cursor from another descriptor must not convert (guards .after())");
+static_assert(!std::is_assignable_v<TestArticleListRepo::Cursor&,
+                                    TestPurchaseListRepo::Cursor>,
+              "a cursor from another descriptor must not assign (guards params.cursor)");
 
 // #############################################################################
 //
