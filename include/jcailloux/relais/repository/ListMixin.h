@@ -18,6 +18,7 @@
 #include "jcailloux/relais/list/spec/GeneratedTraits.h"
 #include "jcailloux/relais/list/spec/GeneratedCriteria.h"
 #include "jcailloux/relais/list/spec/HttpQueryParser.h"
+#include "jcailloux/relais/list/spec/ListQueryBuilder.h"
 #include "jcailloux/relais/entity/EntityConcepts.h"
 #include "jcailloux/relais/list/ListWrapper.h"
 #include "jcailloux/relais/cache/Metrics.h"
@@ -280,6 +281,17 @@ public:
 
     /// Mutable params bundle — fill then seal() into a ListQuery.
     using ListQueryParams = list::spec::ListQueryParams<Descriptor>;
+
+    /// Fluent builder type — accumulates params, build() seals into a ListQuery.
+    using QueryBuilder = list::spec::ListQueryBuilder<Descriptor>;
+
+    /// Open a fluent builder: the primary, name-checked construction path for a
+    /// ListQuery. Sets filters/sort by name (compile-time verified), exact limit
+    /// (trusted path — no grid), and the keyset cursor; .build() seals.
+    ///   auto q = Repo::queryBuilder().filter<"gallery_id">(gid)
+    ///               .sortDesc<"created_at">().limit(24).after(cursor).build();
+    ///   co_await Repo::query(q);
+    [[nodiscard]] static QueryBuilder queryBuilder() noexcept { return QueryBuilder{}; }
 
     /// List result type — returned by query() (epoch-guarded, zero-copy)
     using ListResult = cache::CacheView<ListWrapperType>;
