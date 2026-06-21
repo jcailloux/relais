@@ -644,9 +644,9 @@ protected:
             for (auto& p : fieldParams.params)
                 params.params.push_back(std::move(p));
 
-            auto [affected, coalesced] = co_await PgProvider::execute(
+            auto [result, coalesced] = co_await PgProvider::queryWrite(
                 Mapping::SQL::update, params);
-            co_return WriteOutcome{affected > 0, coalesced};
+            co_return WriteOutcome{result.affectedRows() > 0, coalesced};
 
         } catch (const io::PgError& e) {
             RELAIS_LOG_ERROR << name() << ": update error - " << e.what();
@@ -660,24 +660,24 @@ protected:
         requires (!Cfg.read_only)
     {
         try {
-            int affected;
-            bool coalesced;
+            io::batch::PgWriteResult w;
             if constexpr (HasPartitionHint<E>) {
                 if (hint) {
                     auto params = Mapping::makePartitionHintParams(*hint);
-                    std::tie(affected, coalesced) = co_await PgProvider::execute(
+                    w = co_await PgProvider::queryWrite(
                         Mapping::SQL::delete_with_partition, params);
                 } else {
                     auto params = io::PgParams::fromKey(id);
-                    std::tie(affected, coalesced) = co_await PgProvider::execute(
+                    w = co_await PgProvider::queryWrite(
                         Mapping::SQL::delete_by_pk, params);
                 }
             } else {
                 auto params = io::PgParams::fromKey(id);
-                std::tie(affected, coalesced) = co_await PgProvider::execute(
+                w = co_await PgProvider::queryWrite(
                     Mapping::SQL::delete_by_pk, params);
             }
-            co_return EraseOutcome{static_cast<size_t>(affected), coalesced};
+            co_return EraseOutcome{
+                static_cast<size_t>(w.result.affectedRows()), w.coalesced};
         } catch (const io::PgError& e) {
             RELAIS_LOG_ERROR << name() << ": erase error - " << e.what();
             co_return EraseOutcome{};

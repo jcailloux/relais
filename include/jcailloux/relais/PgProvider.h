@@ -80,16 +80,18 @@ public:
         return pg_entity_query_(batch_sql, single_sql, params);
     }
 
-    /// Execute a command (INSERT/UPDATE/DELETE), returning {affected_rows, coalesced}.
+    /// Submit a write (INSERT/UPDATE/DELETE) on the seq-ordered write path,
+    /// returning {PgResult, coalesced}. Like queryParams but write-batched: the
+    /// returned PgResult carries RETURNING rows; affectedRows() gives the count.
     /// coalesced=true means an identical write was already batched and this
     /// caller received the leader's result without a DB round-trip.
-    /// Projection of queryWrite() — keeps a single write binding to the scheduler.
+    /// Sole write entry point — read counts/rows from the returned PgResult.
     /// @note sql and params must remain valid until the co_await completes.
-    static io::Task<std::pair<int, bool>> execute(
+    static io::Task<io::batch::PgWriteResult> queryWrite(
         const char* sql, const io::PgParams& params)
     {
-        auto [result, coalesced] = co_await queryWrite(sql, params);
-        co_return std::pair{result.affectedRows(), coalesced};
+        assert(pg_write_ && "PgProvider::queryWrite() called before init() on this thread (providers are thread_local — init() must run on each loop thread)");
+        return pg_write_(sql, params);
     }
 
     /// Execute a parameterized SQL query with inline args.
@@ -98,14 +100,6 @@ public:
     static io::Task<io::PgResult> queryArgs(const char* sql, Args&&... args) {
         auto params = io::PgParams::make(std::forward<Args>(args)...);
         co_return co_await queryParams(sql, params);
-    }
-
-    /// Execute a command with inline args, returning {affected_rows, coalesced}.
-    /// The PgParams object is kept alive in the coroutine frame.
-    template<typename... Args>
-    static io::Task<std::pair<int, bool>> executeArgs(const char* sql, Args&&... args) {
-        auto params = io::PgParams::make(std::forward<Args>(args)...);
-        co_return co_await execute(sql, params);
     }
 
     // =========================================================================
@@ -299,22 +293,6 @@ public:
     friend class io::IoPool;
 
 private:
-
-    // =========================================================================
-    // Internal write-path entry point
-    // =========================================================================
-
-    /// Submit a write on the seq-ordered write path, returning the full
-    /// {PgResult, coalesced} — like queryParams but write-batched (carries
-    /// RETURNING rows). Internal for now; execute() projects affectedRows from
-    /// it. Promoted to a public RETURNING entry point in a later step.
-    /// @note sql and params must remain valid until the co_await completes.
-    static io::Task<io::batch::PgWriteResult> queryWrite(
-        const char* sql, const io::PgParams& params)
-    {
-        assert(pg_write_ && "PgProvider::queryWrite()/execute() called before init() on this thread (providers are thread_local — init() must run on each loop thread)");
-        return pg_write_(sql, params);
-    }
 
     // =========================================================================
     // String conversion helpers for Redis args
