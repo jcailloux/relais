@@ -126,6 +126,67 @@ TEST_CASE("[decl-sortby] unknown sort name", "[decl][sortby]") {
 
 // #############################################################################
 //
+//  Fluent builder — Repo::queryBuilder()…build() (plan step 3, no I/O)
+//  The builder is the primary construction path; build() is the single seal.
+//
+// #############################################################################
+
+TEST_CASE("[decl-builder] builder equals a hand-sealed query", "[decl][builder]") {
+    // Built by name: filters and sort resolved + checked at compile time.
+    auto built = TestArticleListRepo::queryBuilder()
+        .filter<"category">(std::string("tech"))
+        .sortDesc<"view_count">()
+        .limit(24)
+        .build();
+
+    // Same query filled positionally and sealed by hand.
+    TestListParams p;
+    p.filters.get<1>() = std::string("tech");      // category
+    p.sort = decl::sortDesc<TestDecl, "view_count">();
+    p.limit = 24;
+    auto sealed = decl::seal<TestDecl>(p);
+
+    // operator== covers params + both keys; assert the keys explicitly too,
+    // since group_key drives Redis invalidation.
+    REQUIRE(built == sealed);
+    REQUIRE(built.groupKey() == sealed.groupKey());
+    REQUIRE(built.cacheKey() == sealed.cacheKey());
+}
+
+TEST_CASE("[decl-builder] cursor changes the page key, not the group", "[decl][builder]") {
+    auto base = TestArticleListRepo::queryBuilder()
+        .filter<"category">(std::string("tech"))
+        .sortDesc<"view_count">()
+        .limit(24)
+        .build();
+
+    jcailloux::relais::list::Cursor c1;
+    c1.data = {std::byte{0x01}};
+    jcailloux::relais::list::Cursor c2;
+    c2.data = {std::byte{0x02}};
+
+    auto page1 = TestArticleListRepo::queryBuilder()
+        .filter<"category">(std::string("tech"))
+        .sortDesc<"view_count">()
+        .limit(24)
+        .after(c1)
+        .build();
+    auto page2 = TestArticleListRepo::queryBuilder()
+        .filter<"category">(std::string("tech"))
+        .sortDesc<"view_count">()
+        .limit(24)
+        .after(c2)
+        .build();
+
+    // Same filters+sort → same group; only the page identity (cache_key) moves.
+    REQUIRE(page1.groupKey() == base.groupKey());
+    REQUIRE(page2.groupKey() == base.groupKey());
+    REQUIRE(page1.cacheKey() != base.cacheKey());
+    REQUIRE(page1.cacheKey() != page2.cacheKey());
+}
+
+// #############################################################################
+//
 //  TEST CASE 1: Article list query (filters, limit, empty)
 //
 // #############################################################################
