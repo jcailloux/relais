@@ -162,7 +162,7 @@ TEST_CASE("eraseWhereRaw: selective predicate deletes only the matched rows",
 
     SECTION("author_id EQ deletes exactly that author's rows, returns them") {
         decl::Filters<Desc> f;
-        f.template get<0>() = author;  // index 0 = author_id (filterable EQ)
+        f.template get<"author_id">() = author;  // index 0 = author_id (filterable EQ)
 
         auto out = eraseWhereRawSync<UncachedTestArticleRepo, Desc>(f);
         REQUIRE(out.size() == 3);
@@ -179,7 +179,7 @@ TEST_CASE("eraseWhereRaw: selective predicate deletes only the matched rows",
 
     SECTION("no match → empty result, nothing deleted") {
         decl::Filters<Desc> f;
-        f.template get<0>() = int64_t{-12345};  // no such author
+        f.template get<"author_id">() = int64_t{-12345};  // no such author
 
         auto out = eraseWhereRawSync<UncachedTestArticleRepo, Desc>(f);
         REQUIRE(out.empty());
@@ -214,7 +214,7 @@ TEST_CASE("eraseWhereRaw converges past K_pg in bounded chunks",
     insertTestArticle("keep", decoy, "survivor", 1);
 
     decl::Filters<Desc> f;
-    f.template get<0>() = int64_t{777};
+    f.template get<"author_id">() = int64_t{777};
 
     auto out = eraseWhereRawSync<UncachedTestArticleRepo, Desc>(f);
 

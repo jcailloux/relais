@@ -98,7 +98,7 @@ template<typename Descriptor>
     [&]<size_t... Is>(std::index_sequence<Is...>) {
         ([&] {
             using FilterType = filter_at<Descriptor, Is>;
-            const auto& filter_value = filters.template get<Is>();
+            const auto& filter_value = std::get<Is>(filters.values);
 
             if (filter_value.has_value()) {
                 if (!result.sql.empty()) result.sql += " AND ";

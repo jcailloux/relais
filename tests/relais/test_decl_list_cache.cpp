@@ -105,8 +105,8 @@ TEST_CASE("[decl-sortby] yields identical canonical keys as raw index", "[decl][
 
     TestListParams pIndex;
     pIndex.limit = 10;
-    pIndex.filters.get<1>() = std::string("tech");
-    pIndex.sort = SortSpec<size_t>{1, SortDirection::Desc};
+    pIndex.filters.get<"category">() = std::string("tech");
+    pIndex.sort = SortSpec<size_t>{1, SortDirection::Desc};  // raw sort index
     auto viaIndex = decl::seal<TestDecl>(pIndex);
 
     // group_key drives Redis invalidation — any drift would corrupt
@@ -138,9 +138,9 @@ TEST_CASE("[decl-builder] builder equals a hand-sealed query", "[decl][builder]"
         .limit(24)
         .build();
 
-    // Same query filled positionally and sealed by hand.
+    // Same query filled by name and sealed by hand.
     TestListParams p;
-    p.filters.get<1>() = std::string("tech");      // category
+    p.filters.get<"category">() = std::string("tech");
     p.sort = decl::sortDesc<TestDecl, "view_count">();
     p.limit = 24;
     auto sealed = decl::seal<TestDecl>(p);
