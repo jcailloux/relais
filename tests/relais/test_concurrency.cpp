@@ -1252,6 +1252,63 @@ TEST_CASE("Concurrency - eraseMany vs mono erase overlapping keys",
 
 
 // -----------------------------------------------------------------------------
+//  §6.3b — eraseMany vs concurrent find: the deleted-row L2→L1 phantom
+//
+//  Reader threads hammer find() on the very keys an eraser thread is deleting
+//  via eraseMany. If the batch cascade evicts L1 BEFORE clearing L2, a reader
+//  hits the window: L1-miss → L2-hit (the still-present deleted row) → re-store
+//  into the SHARED L1. Nothing re-evicts L1, so the phantom PERSISTS past
+//  quiescence — a resurrected deleted row. With L2 cleared before L1 (matching
+//  mono erase), a racing reader can only L1-hit the not-yet-evicted entry
+//  (bounded, self-heals at the evict); no L1-miss reaches the L2 phantom.
+//  Requires L1+L2 — the bug is an L2 hit repopulating L1 (no L2, no phantom).
+// -----------------------------------------------------------------------------
+template<typename Repo>
+static void runEraseManyVsFinds(const std::vector<int64_t>& ids) {
+    parallel(NUM_THREADS, [&](int t) {
+        for (int j = 0; j < OPS_PER_THREAD; ++j) {
+            if (t % 2 == 0) {
+                for (auto id : ids) sync(Repo::find(id));  // probe the L1→L2 path
+            } else {
+                sync(Repo::eraseMany(std::span<const int64_t>(ids)));
+            }
+        }
+    });
+
+    // No row is re-inserted → every deleted key must be gone from every tier.
+    // A surviving L1 phantom would resurrect a deleted row right here.
+    for (auto id : ids) {
+        REQUIRE(sync(Repo::find(id)) == nullptr);
+    }
+}
+
+// NOTE: hidden ([.]) — currently RED. It exposes a deeper, pre-existing
+// read-fill-races-delete phantom that the L2-before-L1 reorder does NOT close:
+// a find() whose L3 fetch straddles the delete writes the entity back into
+// L1/L2 AFTER the eraser cleared them (the read path caches unconditionally;
+// the generation guard meant to reject such stale fills is dead code). Closing
+// it requires wiring the generation snapshot/check into the store + L2 write-
+// back paths. Un-hide once that lands.
+TEST_CASE("Concurrency - eraseMany vs concurrent finds (no L2->L1 phantom)",
+          "[.][integration][db][redis][concurrency][tsan][batch][erase]")
+{
+    TransactionGuard tx;
+
+    // A wide pool widens the per-window opportunity: the single effective
+    // eraseMany evicts every L1 slot then suspends on the multi-key UNLINK
+    // (~1 RTT), and readers probing any of these keys during that suspension
+    // catch the phantom in the buggy (L1-before-L2) order.
+    constexpr int POOL = 48;
+    std::vector<int64_t> ids;
+    for (int i = 0; i < POOL; ++i)
+        ids.push_back(insertTestItem("conc_emf_" + std::to_string(i), i));
+
+    findManyView<FullCacheTestItemRepo>(ids);  // warm L1 + L2
+    runEraseManyVsFinds<FullCacheTestItemRepo>(ids);
+}
+
+
+// -----------------------------------------------------------------------------
 //  §6.4 — concurrent eraseWhere with overlapping predicates
 //
 //  {author = A} and {category = tech} both match A's tech articles. Two thread
