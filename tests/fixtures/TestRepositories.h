@@ -174,6 +174,15 @@ using L2TestItemRepo = Repo<TestItemEntity, "test:l2", cfg::Redis>;
 /// Both L1+L2 — tests full hierarchy
 using FullCacheTestItemRepo = Repo<TestItemEntity, "test:both", cfg::Both>;
 
+/// L2 only, multi-instance topology — Redis-side generation coherence (12b)
+using SharedL2TestItemRepo =
+    Repo<TestItemEntity, "test:l2:shared", cfg::Redis.with_l2_shared_across_instances()>;
+
+/// Both L1+L2, multi-instance topology — L1 process-local recheck + L2
+/// Redis-side generation (12b)
+using SharedBothTestItemRepo =
+    Repo<TestItemEntity, "test:both:shared", cfg::Both.with_l2_shared_across_instances()>;
+
 // Configuration test repositories
 using ShortTTLTestItemRepo = Repo<TestItemEntity, "test:short_ttl", test_config::ShortTTL>;
 using WriteThroughTestItemRepo = Repo<TestItemEntity, "test:write_through", test_config::WriteThrough>;

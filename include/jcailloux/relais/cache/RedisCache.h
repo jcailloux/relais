@@ -546,6 +546,199 @@ namespace jcailloux::relais::cache {
                 co_return true;
             }
 
+            // =================================================================
+            // Cross-instance L2 generation (topology-gated; commit 12b)
+            // =================================================================
+            //
+            // The read-fill recheck's shared authority when one Redis is hit by
+            // multiple processes: a sharded generation hash `{repo}:l2gen` whose
+            // field = the recheck slot. Invalidation HINCRBYs the slot; a filling
+            // reader snapshots the slot at fetch-start (getGen/getGenMany) and the
+            // fill is a conditional Lua SET — atomic check-and-set — so a value
+            // straddling any instance's invalidation is never written. The check
+            // and the SET share one EVAL, so no compensating UNLINK is needed
+            // (unlike the process-local async-SET path). L2 hit is unaffected
+            // (plain GET); the gen is touched only on the miss-fill cold path.
+            //
+            // Redis Cluster note: the gen hash lives on one node, and the fill
+            // EVAL spans the gen key + entity key(s) → same-slot requirement.
+            // relais targets a single logical Redis (one client); a Cluster
+            // deployment must hash-tag the entity keys onto the gen node or shard
+            // the gen hash. Single-node / single-shard Redis is unaffected.
+
+            /// Build the generation-hash key for a repo from its name prefix.
+            static std::string genKeyFor(std::string_view namePrefix) {
+                return std::string(namePrefix) + ":l2gen";
+            }
+
+            /// Snapshot one generation slot. Absent field → 0 (the baseline
+            /// before any bump; HINCRBY makes a touched slot ≥ 1).
+            static io::Task<int64_t> getGen(const std::string& genKey, std::size_t slot) {
+                if (!PgProvider::hasRedis()) co_return 0;
+                try {
+                    auto r = co_await PgProvider::redis("HGET", genKey, slot);
+                    if (r.isNil()) co_return 0;
+                    auto s = r.asString();
+                    co_return s.empty() ? int64_t{0} : static_cast<int64_t>(std::stoll(s));
+                } catch (const std::exception& e) {
+                    RELAIS_LOG_WARN << "RedisCache getGen error: " << e.what();
+                    co_return 0;
+                }
+            }
+
+            /// Snapshot many generation slots in one HMGET (request order; nil → 0).
+            static io::Task<std::vector<int64_t>> getGenMany(
+                const std::string& genKey, std::span<const std::size_t> slots)
+            {
+                std::vector<int64_t> out(slots.size(), 0);
+                if (slots.empty() || !PgProvider::hasRedis()) co_return out;
+
+                std::vector<std::string> args;
+                args.reserve(slots.size() + 2);
+                args.emplace_back("HMGET");
+                args.push_back(genKey);
+                for (auto s : slots) args.push_back(std::to_string(s));
+
+                try {
+                    auto r = co_await PgProvider::redisDynamic(std::move(args));
+                    if (r.isArray()) {
+                        const size_t n = r.arraySize();
+                        for (size_t i = 0; i < slots.size() && i < n; ++i) {
+                            auto e = r.at(i);
+                            if (e.isString()) {
+                                auto s = e.asString();
+                                if (!s.empty()) out[i] = static_cast<int64_t>(std::stoll(s));
+                            }
+                        }
+                    }
+                } catch (const std::exception& e) {
+                    RELAIS_LOG_WARN << "RedisCache getGenMany error: " << e.what();
+                }
+                co_return out;
+            }
+
+            /// Bump one generation slot (HINCRBY +1). Must be awaited BEFORE the
+            /// entity UNLINK on an erase, so a straddling fill sees the moved gen.
+            static io::Task<void> bumpGen(const std::string& genKey, std::size_t slot) {
+                if (!PgProvider::hasRedis()) co_return;
+                try {
+                    co_await PgProvider::redis("HINCRBY", genKey, slot, 1);
+                } catch (const std::exception& e) {
+                    RELAIS_LOG_WARN << "RedisCache bumpGen error: " << e.what();
+                }
+            }
+
+            /// Bump many generation slots in one EVAL (one HINCRBY per slot).
+            static io::Task<void> bumpGenMany(
+                const std::string& genKey, std::span<const std::size_t> slots)
+            {
+                if (slots.empty() || !PgProvider::hasRedis()) co_return;
+                static constexpr std::string_view lua =
+                    "for i = 1, #ARGV do redis.call('HINCRBY', KEYS[1], ARGV[i], 1) end\n"
+                    "return #ARGV";
+
+                std::vector<std::string> args;
+                args.reserve(slots.size() + 4);
+                args.emplace_back("EVAL");
+                args.emplace_back(lua);
+                args.emplace_back("1");
+                args.push_back(genKey);
+                for (auto s : slots) args.push_back(std::to_string(s));
+
+                try {
+                    co_await PgProvider::redisDynamic(std::move(args));
+                } catch (const std::exception& e) {
+                    RELAIS_LOG_WARN << "RedisCache bumpGenMany error: " << e.what();
+                }
+            }
+
+            /// One filled entry for a conditional batch SET (setManyIfGen).
+            struct GenFill {
+                std::string key;       // entity Redis key
+                std::size_t slot;      // its generation slot
+                int64_t snap;          // gen snapshot taken at fetch-start
+                std::string payload;   // serialized entity (binary-safe)
+            };
+
+            /// Conditional fill: `SET key payload EX ttl` iff the slot's gen still
+            /// equals `snap`. Atomic check-and-set in one EVAL — a mutation that
+            /// bumped the gen since the snapshot rejects the fill (returns false),
+            /// with no compensating UNLINK needed. payload is binary-safe.
+            static io::Task<bool> setIfGen(const std::string& genKey,
+                                           const std::string& key,
+                                           std::size_t slot, int64_t snap,
+                                           std::string_view payload, int64_t ttlSeconds)
+            {
+                if (!PgProvider::hasRedis()) co_return false;
+                static constexpr std::string_view lua = R"(
+local cur = redis.call('HGET', KEYS[1], ARGV[1])
+cur = cur and tonumber(cur) or 0
+if cur == tonumber(ARGV[2]) then
+    redis.call('SET', KEYS[2], ARGV[3], 'EX', ARGV[4])
+    return 1
+end
+return 0
+)";
+                try {
+                    auto r = co_await PgProvider::redis(
+                        "EVAL", lua, "2", genKey, key,
+                        slot, snap, payload, ttlSeconds);
+                    co_return !r.isNil() && r.asInteger() == 1;
+                } catch (const std::exception& e) {
+                    RELAIS_LOG_WARN << "RedisCache setIfGen error: " << e.what();
+                    co_return false;
+                }
+            }
+
+            /// Batched conditional fill: one EVAL for N entries, each SET only if
+            /// its slot's gen still matches its snapshot. Mirror of setIfGen for
+            /// the findManyRaw warm-back. Returns the number of entries written.
+            static io::Task<size_t> setManyIfGen(const std::string& genKey,
+                                                 std::span<const GenFill> entries,
+                                                 int64_t ttlSeconds)
+            {
+                if (entries.empty() || !PgProvider::hasRedis()) co_return 0;
+                static constexpr std::string_view lua = R"(
+local ttl = ARGV[1]
+local n = #KEYS - 1
+local count = 0
+for i = 1, n do
+    local base = 1 + (i - 1) * 3
+    local slot = ARGV[base + 1]
+    local snap = tonumber(ARGV[base + 2])
+    local payload = ARGV[base + 3]
+    local cur = redis.call('HGET', KEYS[1], slot)
+    cur = cur and tonumber(cur) or 0
+    if cur == snap then
+        redis.call('SET', KEYS[i + 1], payload, 'EX', ttl)
+        count = count + 1
+    end
+end
+return count
+)";
+                std::vector<std::string> args;
+                args.reserve(entries.size() * 4 + 4);
+                args.emplace_back("EVAL");
+                args.emplace_back(lua);
+                args.emplace_back(std::to_string(entries.size() + 1));
+                args.push_back(genKey);                          // KEYS[1]
+                for (const auto& e : entries) args.push_back(e.key);  // KEYS[2..]
+                args.push_back(std::to_string(ttlSeconds));      // ARGV[1]
+                for (const auto& e : entries) {                  // ARGV triples
+                    args.push_back(std::to_string(e.slot));
+                    args.push_back(std::to_string(e.snap));
+                    args.push_back(e.payload);
+                }
+
+                try {
+                    auto r = co_await PgProvider::redisDynamic(std::move(args));
+                    co_return r.isNil() ? 0 : static_cast<size_t>(r.asInteger());
+                } catch (const std::exception& e) {
+                    RELAIS_LOG_WARN << "RedisCache setManyIfGen error: " << e.what();
+                    co_return 0;
+                }
+            }
+
             /// Invalidate keys matching a pattern using SCAN (non-blocking).
             /// Safer than KEYS for production use.
             static io::Task<size_t> invalidatePatternSafe(const std::string& pattern,

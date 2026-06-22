@@ -1361,6 +1361,39 @@ TEST_CASE("Concurrency - read-fill recheck per tier (L1-only, L2-only)",
     }
 }
 
+// Multi-instance topology (l2_shared_across_instances): the L2 read-fill recheck
+// is the Redis-side generation hash, not the process-local counter. The erase
+// HINCRBYs the slot before the entity UNLINK; a straddling fill snapshots the
+// gen (HGET) at fetch-start and lands via an atomic conditional SET (setIfGen),
+// so a value straddling the delete is rejected by the moved gen — closing the
+// same phantom across processes. Single process here exercises the real Redis
+// path (find → getGen → setIfGen, erase → bumpGen → UNLINK); the cross-instance
+// straddle itself is pinned deterministically in test_l2_gen. L2-only drives the
+// Redis-side gen alone; L1+L2 also drives LocalRepo's process-local recheck.
+TEST_CASE("Concurrency - read-fill recheck, shared topology (Redis-side gen)",
+          "[integration][db][redis][concurrency][tsan][erase]")
+{
+    TransactionGuard tx;
+    constexpr int POOL = 48;
+    std::vector<int64_t> ids;
+    for (int i = 0; i < POOL; ++i)
+        ids.push_back(insertTestItem("conc_shared_" + std::to_string(i), i));
+
+    SECTION("L2-only shared") {
+        for (auto id : ids) sync(SharedL2TestItemRepo::find(id));  // warm L2
+        runEraseManyVsFinds<SharedL2TestItemRepo>(ids);
+    }
+    SECTION("L1+L2 shared") {
+        findManyView<SharedBothTestItemRepo>(ids);  // warm L1 + L2
+        runEraseManyVsFinds<SharedBothTestItemRepo>(ids);
+    }
+    SECTION("L1+L2 shared, mono erase vs finds") {
+        findManyView<SharedBothTestItemRepo>(ids);  // warm L1 + L2
+        runEraseVsFinds<SharedBothTestItemRepo>(ids);
+    }
+}
+
+
 
 // -----------------------------------------------------------------------------
 //  §6.4 — concurrent eraseWhere with overlapping predicates
