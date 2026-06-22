@@ -147,13 +147,22 @@ struct Invalidate {
         return detail::dedupSorted(std::move(keys));
     }
 
-    /// Batch delete cross-invalidation: one Cache::invalidate per *distinct*
-    /// target key. A set of N source entities sharing M targets costs M
-    /// invalidations, not N — the dedup win the per-entity fold can't get.
+    /// Batch delete cross-invalidation over the M *distinct* target keys. When
+    /// the target exposes the batch facade (`invalidateMany(span)`, every Repo
+    /// does), the M evictions collapse to a single multi-key UNLINK at the L2
+    /// tier (⌈M/1000⌉ commands) instead of M single-key UNLINKs — the same final
+    /// state (oracle: invalidateMany ≡ mono invalidate loop), fewer round-trips.
+    /// A target without the facade falls back to the per-key loop.
     template<typename E>
     static io::Task<void> invalidateManyForDelete(std::span<const E> entities) {
-        for (const auto& k : targetKeysForDelete<E>(entities))
-            co_await Cache::invalidate(k);
+        auto keys = targetKeysForDelete<E>(entities);
+        if (keys.empty()) co_return;
+        using KeyT = decltype(extractKey(std::declval<E>()));
+        if constexpr (requires(std::span<const KeyT> s) { Cache::invalidateMany(s); }) {
+            co_await Cache::invalidateMany(std::span<const KeyT>(keys));
+        } else {
+            for (const auto& k : keys) co_await Cache::invalidate(k);
+        }
     }
 
 private:
