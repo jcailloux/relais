@@ -80,6 +80,18 @@ public:
         return pg_entity_query_(batch_sql, single_sql, params);
     }
 
+    /// Execute a multi-key entity read (findMany) — one entry carrying N keys,
+    /// fused with concurrent single finds into a single deduplicated `pk = ANY`.
+    /// `keys` is moved into the scheduler entry (lives until the read completes).
+    /// @note sql pointers must remain valid until the co_await completes.
+    static io::Task<io::PgResult> entityQueryParamsMany(
+        const char* batch_sql, const char* single_sql,
+        std::vector<io::PgParams> keys)
+    {
+        assert(pg_entity_query_many_ && "PgProvider::entityQueryParamsMany() called before init() on this thread (providers are thread_local — init() must run on each loop thread)");
+        return pg_entity_query_many_(batch_sql, single_sql, std::move(keys));
+    }
+
     /// Submit a write (INSERT/UPDATE/DELETE) on the seq-ordered write path,
     /// returning {PgResult, coalesced}. Like queryParams but write-batched: the
     /// returned PgResult carries RETURNING rows; affectedRows() gives the count.
@@ -237,6 +249,13 @@ public:
             co_return co_await batcher->submitEntityRead(
                 batch_sql, single_sql, io::PgParams{params});
         };
+        pg_entity_query_many_ = [batcher](const char* batch_sql, const char* single_sql,
+                                          std::vector<io::PgParams> keys)
+            -> io::Task<io::PgResult>
+        {
+            co_return co_await batcher->submitEntityReadMany(
+                batch_sql, single_sql, std::move(keys));
+        };
         // Return-direct: submitPgWrite already returns Task<io::batch::PgWriteResult>,
         // so no co_await/co_return wrapper — zero added coroutine frame on the write path.
         pg_write_ = [batcher](const char* sql, const io::PgParams& params) {
@@ -261,6 +280,7 @@ public:
         pg_query_ = nullptr;
         pg_query_params_ = nullptr;
         pg_entity_query_ = nullptr;
+        pg_entity_query_many_ = nullptr;
         pg_write_ = nullptr;
         redis_exec_ = nullptr;
     }
@@ -274,6 +294,8 @@ public:
         const char*, const io::PgParams&)>;
     using PgEntityQueryFn = std::function<io::Task<io::PgResult>(
         const char*, const char*, const io::PgParams&)>;
+    using PgEntityQueryManyFn = std::function<io::Task<io::PgResult>(
+        const char*, const char*, std::vector<io::PgParams>)>;
     using PgWriteFn = std::function<io::Task<io::batch::PgWriteResult>(
         const char*, const io::PgParams&)>;
     using RedisExecFn = std::function<io::Task<io::RedisResult>(
@@ -286,6 +308,7 @@ public:
     static inline thread_local PgQueryFn pg_query_;
     static inline thread_local PgQueryParamsFn pg_query_params_;
     static inline thread_local PgEntityQueryFn pg_entity_query_;
+    static inline thread_local PgEntityQueryManyFn pg_entity_query_many_;
     static inline thread_local PgWriteFn pg_write_;
     static inline thread_local RedisExecFn redis_exec_;
 

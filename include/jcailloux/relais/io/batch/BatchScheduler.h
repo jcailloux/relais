@@ -99,6 +99,24 @@ public:
         co_return co_await submitPgRead(std::move(entry));
     }
 
+    /// Submit a multi-key entity read (findMany): ONE entry carrying N keys.
+    /// When it lands in a batch, its keys join the same deduplicated ANY array
+    /// as concurrent single finds of the same table — K segments collapse to one
+    /// `pk = ANY($1)`. As the Nagle leader it sends its own ANY direct (the shape
+    /// findManyRaw used before fusion). The returned PgResult holds the rows for
+    /// this entry's keys, unordered; the caller re-aligns by primary key.
+    /// `keys` must be non-empty (callers short-circuit the empty case).
+    Task<PgResult> submitEntityReadMany(const char* batch_sql, const char* single_sql,
+                                        std::vector<PgParams> keys) {
+        PgReadEntry entry;
+        entry.batch_sql = batch_sql;
+        entry.single_sql = single_sql;
+        entry.is_entity = true;
+        entry.batch_keys = std::move(keys);
+
+        co_return co_await submitPgRead(std::move(entry));
+    }
+
     /// Submit a list/custom query read (pipelined, not batched via ANY).
     Task<PgResult> submitQueryRead(const char* sql, PgParams params) {
         PgReadEntry entry;
@@ -202,6 +220,14 @@ private:
 
         // Key values for ANY-batch result matching (populated before ANY send)
         std::vector<std::string> key_values;
+
+        // Multi-key entity entry (findMany): N keys carried by ONE entry. When
+        // non-empty, this entry stands in for all these keys in the shared ANY
+        // array, and its result is the SUBSET of rows matching any of them.
+        // `params`/`key_values` (the single-key fields above) are unused then.
+        std::vector<PgParams> batch_keys;
+        // Per-key match values, populated at fire time (mirror of key_values).
+        std::vector<std::vector<std::string>> batch_key_values;
 
         // Lifecycle / error / coalescing
         bool cancelled = false;
@@ -512,8 +538,12 @@ private:
         for (auto* existing : pg_read_batch_.entries) {
             if (existing->batch_sql == entry->batch_sql &&
                 existing->single_sql == entry->single_sql &&
-                existing->params == entry->params)
+                existing->params == entry->params &&
+                existing->batch_keys == entry->batch_keys)
             {
+                // batch_keys is empty for single finds/list reads (compares
+                // equal → params decides); for findMany it guards against
+                // coalescing two different key sets onto one entry.
                 existing->followers.push_back(entry);
                 return;
             }
@@ -705,10 +735,12 @@ private:
                 PgParams params;       // Combined params (for entity: ANY array; for list: original)
                 std::vector<PgReadEntry*> waiters;  // Entries waiting for this segment's result
                 bool is_any = false;   // True if this is an ANY-batch segment
+                int n_keys = 0;        // Distinct keys folded into an ANY segment
             };
             std::vector<Segment> segments;
 
-            // Group entity reads by batch_sql pointer
+            // Group entity reads by batch_sql pointer. An entry carries one key
+            // (find) or N keys (findMany); both feed the same ANY fusion.
             std::unordered_map<const char*, std::vector<PgReadEntry*>> entity_groups;
             for (auto* e : entries) {
                 if (e->is_entity && e->batch_sql) {
@@ -724,34 +756,51 @@ private:
                 }
             }
 
-            // Build ANY segments from entity groups
+            // One segment per entity group. Gather every key across all finds and
+            // findManys in the group, DEDUPLICATE, and emit a single ANY array;
+            // distributeAnyResults later fans each row out to every waiter that
+            // asked for that key. A group reducing to a single distinct key skips
+            // ANY entirely (single_sql). Same batch_sql ⇒ same repo ⇒ same
+            // single_sql across the group (constexpr pointers), so group[0] picks it.
             for (auto& [sql, group] : entity_groups) {
-                if (group.size() == 1) {
-                    // Single entity: no batching overhead
-                    auto* e = group[0];
-                    Segment seg;
-                    seg.sql = e->single_sql;
-                    seg.params = std::move(e->params);
-                    seg.waiters.push_back(e);
-                    seg.is_any = false;
-                    segments.push_back(std::move(seg));
-                } else {
-                    // Multiple entities: build ANY($1) array literal
-                    // Save key_values on each entry for result matching
-                    std::vector<PgParams> keys;
-                    keys.reserve(group.size());
-                    for (auto* e : group) {
+                std::vector<PgParams> unique_keys;
+                std::vector<std::vector<std::string>> unique_vals;  // parallel match values
+                auto addKey = [&](std::vector<std::string> vals, const PgParams& p) {
+                    for (const auto& uv : unique_vals)
+                        if (uv == vals) return;  // already in the ANY array
+                    unique_keys.push_back(p);
+                    unique_vals.push_back(std::move(vals));
+                };
+                for (auto* e : group) {
+                    if (!e->batch_keys.empty()) {
+                        // findMany: precompute per-key match values once, dedup each.
+                        e->batch_key_values.clear();
+                        e->batch_key_values.reserve(e->batch_keys.size());
+                        for (auto& kp : e->batch_keys) {
+                            auto vals = kp.keyValues();
+                            addKey(vals, kp);
+                            e->batch_key_values.push_back(std::move(vals));
+                        }
+                    } else {
                         e->key_values = e->params.keyValues();
-                        keys.push_back(std::move(e->params));
+                        addKey(e->key_values, e->params);
                     }
-
-                    Segment seg;
-                    seg.sql = sql;  // batch_sql: SELECT ... WHERE pk = ANY($1)
-                    seg.params = PgParams::buildArrayLiteral(keys);
-                    seg.waiters = group;
-                    seg.is_any = true;
-                    segments.push_back(std::move(seg));
                 }
+
+                Segment seg;
+                seg.waiters = group;
+                seg.n_keys = static_cast<int>(unique_keys.size());
+                if (unique_keys.size() == 1) {
+                    // Single distinct key: no ANY, fan the lone row to all waiters.
+                    seg.sql = group[0]->single_sql;
+                    seg.params = std::move(unique_keys[0]);
+                    seg.is_any = false;
+                } else {
+                    seg.sql = sql;  // batch_sql: SELECT ... WHERE pk = ANY($1)
+                    seg.params = PgParams::buildArrayLiteral(unique_keys);
+                    seg.is_any = true;
+                }
+                segments.push_back(std::move(seg));
             }
 
             // Pipeline all segments with sync between each
@@ -805,14 +854,12 @@ private:
                         }
                     }
 
-                    // Update timing estimator for per-key cost
-                    if (!seg.waiters.empty()) {
-                        auto* first_waiter = seg.waiters[0];
+                    // Update timing estimator for per-key cost. seg.n_keys is the
+                    // distinct-key count (not the waiter count): findMany folds
+                    // many keys into one waiter, so waiters.size() would undercount.
+                    if (seg.n_keys > 0) {
                         estimator_.updateSqlTimingPerKey(
-                            first_waiter->batch_sql
-                                ? first_waiter->batch_sql
-                                : first_waiter->single_sql,
-                            static_cast<int>(seg.waiters.size()),
+                            seg.sql, seg.n_keys,
                             static_cast<double>(pr.processing_time_us) * 1000.0);
                     }
                 }
@@ -1068,10 +1115,30 @@ private:
 
         PgResult result;
         auto start = Clock::now();
+        const char* timed_sql = entry.single_sql;
+        int n_keys = 1;
 
         try {
             auto guard = co_await pg_pool_->acquire();
-            result = co_await guard.conn().queryParams(entry.single_sql, entry.params);
+            if (!entry.batch_keys.empty()) {
+                // Multi-key entry sent direct (Nagle leader or estimator
+                // bootstrap): one ANY query carrying all its keys — exactly the
+                // shape findManyRaw issued before fusion. A lone key skips the
+                // array and uses single_sql. `arr` is a local that outlives the
+                // co_await below.
+                if (entry.batch_keys.size() == 1) {
+                    result = co_await guard.conn().queryParams(
+                        entry.single_sql, entry.batch_keys[0]);
+                } else {
+                    timed_sql = entry.batch_sql;
+                    n_keys = static_cast<int>(entry.batch_keys.size());
+                    auto arr = PgParams::buildArrayLiteral(entry.batch_keys);
+                    result = co_await guard.conn().queryParams(entry.batch_sql, arr);
+                }
+            } else {
+                result = co_await guard.conn().queryParams(
+                    entry.single_sql, entry.params);
+            }
         } catch (...) {
             pg_gate_.release();
             throw;
@@ -1083,8 +1150,11 @@ private:
 
         // Update timing estimator
         estimator_.updatePgNetworkTime(
-            elapsed_ns, estimator_.getRequestTime(entry.single_sql));
-        estimator_.updateSqlTiming(entry.single_sql, 1, 1, elapsed_ns);
+            elapsed_ns, estimator_.getRequestTime(timed_sql));
+        if (n_keys > 1)
+            estimator_.updateSqlTimingPerKey(timed_sql, n_keys, elapsed_ns);
+        else
+            estimator_.updateSqlTiming(timed_sql, 1, 1, elapsed_ns);
 
         pg_gate_.release();
         co_return result;
@@ -1157,41 +1227,56 @@ private:
     // Helpers
     // =========================================================================
 
-    /// Distribute an ANY-batch PgResult to individual waiters by matching
-    /// PK column values. Each waiter gets a zero-copy sliceRow view.
-    /// Waiters without a match receive an empty PgResult.
+    /// Distribute an ANY-batch PgResult to individual waiters by matching PK
+    /// column values. A single-key waiter (find) gets a zero-copy single-row
+    /// sliceRow of its matching row (empty PgResult if absent). A multi-key
+    /// waiter (findMany) gets a sliceRows view over EVERY row matching one of its
+    /// keys. Matching is per-waiter, so a shared key's row fans out to each waiter
+    /// that asked for it — and no waiter ever sees another caller's rows.
     void distributeAnyResults(std::vector<PgReadEntry*>& waiters,
                                PgResult& batch_result,
                                int64_t processing_time_us) {
         int n_rows = batch_result.valid()
             ? PQntuples(batch_result.raw()) : 0;
-        int n_pk_cols = waiters.empty() ? 0
-            : static_cast<int>(waiters[0]->key_values.size());
 
-        // Build lookup: for each row, extract PK columns as strings
-        // and match against each waiter's key_values.
-        // O(rows * waiters * pk_cols) — typically small (< 100 total).
-        for (auto* waiter : waiters) {
-            waiter->processing_time_us = processing_time_us;
-            bool matched = false;
-
-            for (int r = 0; r < n_rows && !matched; ++r) {
-                bool row_match = true;
-                for (int c = 0; c < n_pk_cols; ++c) {
-                    auto rv = batch_result[r].rawValue(c);
-                    if (rv != std::string_view(waiter->key_values[c])) {
-                        row_match = false;
-                        break;
-                    }
-                }
-                if (row_match) {
-                    waiter->result = PgResult::sliceRow(batch_result, r);
-                    matched = true;
+        // INVARIANT: the first vals.size() result columns are the PK columns in
+        // key order — select_by_pk_batch must SELECT them first, matching the
+        // column order keyValues()/buildArrayLiteral fold the keys in. The
+        // single-key path relied on this already; multi-key fan-out now does too.
+        // True iff row r equals the PK tuple `vals` (column-wise text compare).
+        auto rowMatches = [&](int r, const std::vector<std::string>& vals) {
+            for (size_t c = 0; c < vals.size(); ++c) {
+                if (batch_result[r].rawValue(static_cast<int>(c))
+                        != std::string_view(vals[c])) {
+                    return false;
                 }
             }
+            return true;
+        };
 
-            if (!matched) {
-                waiter->result = PgResult{};  // not found
+        // O(rows * keys * pk_cols) per waiter — typically small (< 100 total).
+        for (auto* waiter : waiters) {
+            waiter->processing_time_us = processing_time_us;
+
+            if (!waiter->batch_key_values.empty()) {
+                // findMany: collect every row matching any of its keys.
+                std::vector<int> idx;
+                for (int r = 0; r < n_rows; ++r) {
+                    for (const auto& vals : waiter->batch_key_values) {
+                        if (rowMatches(r, vals)) { idx.push_back(r); break; }
+                    }
+                }
+                waiter->result = PgResult::sliceRows(batch_result, std::move(idx));
+            } else {
+                // find: first matching row, or empty.
+                bool matched = false;
+                for (int r = 0; r < n_rows && !matched; ++r) {
+                    if (rowMatches(r, waiter->key_values)) {
+                        waiter->result = PgResult::sliceRow(batch_result, r);
+                        matched = true;
+                    }
+                }
+                if (!matched) waiter->result = PgResult{};  // not found
             }
         }
     }
