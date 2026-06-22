@@ -74,10 +74,18 @@ public:
     /// Move `value` into owned_ and point position `i` at it.
     /// Precondition: reserveOwned() reserved enough capacity (no realloc).
     void adopt(size_t i, E value) {
+        items_[i] = adoptValue(std::move(value));
+    }
+
+    /// Move `value` into owned_ and return a stable pointer to it, WITHOUT
+    /// pointing any slot — for a value shared by several request positions
+    /// (e.g. a read-fill-recheck-rejected entity reused across duplicate ids).
+    /// Precondition: reserveOwned() reserved enough capacity (no realloc).
+    const E* adoptValue(E value) {
         assert(owned_.size() < owned_.capacity()
-               && "MultiView::adopt would reallocate owned_ and dangle pointers");
+               && "MultiView::adoptValue would reallocate owned_ and dangle pointers");
         owned_.push_back(std::move(value));
-        items_[i] = &owned_.back();
+        return &owned_.back();
     }
 
     /// Transfer guard ownership out. Leaves the view's slots intact but

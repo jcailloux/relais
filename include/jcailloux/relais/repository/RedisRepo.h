@@ -2,6 +2,7 @@
 #define JCX_RELAIS_REDISREPO_H
 
 #include "jcailloux/relais/repository/PgRepo.h"
+#include "jcailloux/relais/repository/RecheckGuard.h"
 #include "jcailloux/relais/cache/RedisCache.h"
 #include "jcailloux/relais/cache/Metrics.h"
 #include "jcailloux/relais/config/CacheConfig.h"
@@ -28,6 +29,13 @@ requires CacheableEntity<E>
 class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
     using Base = PgRepo<E, Name, Cfg, Key>;
     using Mapping = typename E::MappingType;
+
+    /// Read-fill recheck guard — shared with LocalRepo for the same repo (same
+    /// Name/Key/SlotsLog2 → one static slot array seen by both tiers). In an
+    /// L2-only config LocalRepo is absent, so this layer both bumps (on its
+    /// mutation paths) and rechecks; in L1+L2 LocalRepo's bump is on the same
+    /// array, so the L2 recheck here observes it.
+    using Recheck = RecheckGuard<Name, Key, Cfg.recheck_slots_log2>;
 
     static constexpr bool useL2Binary =
         (Cfg.l2_format == config::L2Format::Binary) && HasBinarySerialization<E>;
@@ -175,6 +183,7 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
 
             auto outcome = co_await Base::updateOutcome(id, entity);
             if (outcome.success && !outcome.coalesced) {
+                bumpGen(id);
                 if constexpr (Cfg.update_strategy == InvalidateAndLazyReload) {
                     co_await evictRedis(id);
                 } else {
@@ -211,6 +220,7 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
 
             auto outcome = co_await Base::eraseOutcome(id, hint);
             if (outcome.affected.has_value() && !outcome.coalesced) {
+                bumpGen(id);
                 co_await evictRedis(id);
             }
             co_return outcome;
@@ -221,6 +231,7 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
         /// Invalidate Redis cache for a key and return void.
         /// Used as cross-invalidation target interface.
         static io::Task<void> invalidate(const Key& id) {
+            bumpGen(id);
             co_await evictRedis(id);
         }
 
@@ -288,7 +299,10 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
         static io::Task<void> invalidateManyImpl(std::span<const E> entities) {
             std::vector<std::string> keys;
             keys.reserve(entities.size());
-            for (const auto& e : entities) keys.push_back(makeRedisKey(e.key()));
+            for (const auto& e : entities) {
+                bumpGen(e.key());
+                keys.push_back(makeRedisKey(e.key()));
+            }
             co_await cache::RedisCache::invalidateMany(
                 std::span<const std::string>(keys));
             co_await Base::template invalidateManyImpl<WithLists>(entities);
@@ -298,7 +312,28 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
         // Raw methods returning entity by value (for LocalRepo move path)
         // =====================================================================
 
+        /// Bump the shared recheck counter — only when L2 is the TOP caching
+        /// layer (L2-only config). In L1+L2, LocalRepo above already bumps the
+        /// same array, so the L2 recheck here observes its writes for free.
+        static void bumpGen(const Key& id) {
+            if constexpr (Cfg.cache_level == config::CacheLevel::L2) {
+                Recheck::bump(id);
+            }
+        }
+
         /// Find with L2 -> L3 fallback, returning entity by value.
+        ///
+        /// Read-fill recheck (L2, process-local — SINGLE-INSTANCE coherence):
+        /// snapshot the recheck slot at fetch-start; if a mutation lands before
+        /// the L2 store, skip it. The store is itself async (a SET round-trip),
+        /// so a mutation can slip in during it — recheck once more afterwards
+        /// and compensate with a raw UNLINK. Within ONE process this is airtight
+        /// (either our recheck catches the bump or this process's own evict
+        /// UNLINKs after our SET). Across MULTIPLE processes sharing this Redis,
+        /// the counter is process-local (static) and cannot see another
+        /// instance's invalidation — that case is closed separately by the
+        /// topology-gated Redis-side generation (commit 12b); until then L2 is
+        /// bounded by l2_ttl in multi-instance deployments.
         static io::Task<std::optional<E>> findRaw(const Key& id) {
             auto redisKey = makeRedisKey(id);
             auto cached = co_await getFromCache(redisKey);
@@ -308,9 +343,15 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
             }
 
             RELAIS_METRICS_INC(l2_counters_.misses);
+            uint64_t snap = Recheck::snapshot(id);
             auto entity = co_await Base::findRaw(id);
-            if (entity) {
+            if (entity && !Recheck::changed(id, snap)) {
                 co_await setInCache(redisKey, *entity);
+                if (Recheck::changed(id, snap)) {
+                    // Mutation slipped in during the async SET → undo. Raw
+                    // invalidate (not evictRedis) to avoid a spurious bump.
+                    co_await cache::RedisCache::invalidate(redisKey);
+                }
             }
             co_return entity;
         }
@@ -352,15 +393,27 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
 
             if (missIds.empty()) co_return out;
 
+            // Snapshot the recheck slots at fetch-start, one per L2-miss key.
+            std::vector<uint64_t> snaps;
+            snaps.reserve(missIds.size());
+            for (const auto& mid : missIds) snaps.push_back(Recheck::snapshot(mid));
+
             auto fetched = co_await Base::findManyRaw(missIds);
 
             // Merge the L3 hits back into request order and collect them (one
-            // owned copy each) for the detached L2 warming.
-            std::vector<std::pair<std::string, E>> toFill;
+            // owned copy each) for the detached L2 warming. Read-fill recheck:
+            // a key already mutated by the time we get here is dropped from the
+            // fill set (early gate); the rest carry their id+snapshot so the
+            // detached task can re-check around the async SET and compensate.
+            std::vector<L2FillEntry> toFill;
             toFill.reserve(missPos.size());
             for (size_t j = 0; j < missPos.size(); ++j) {
                 if (fetched[j]) {
-                    toFill.emplace_back(std::move(redisKeys[missPos[j]]), *fetched[j]);
+                    if (!Recheck::changed(missIds[j], snaps[j])) {
+                        toFill.push_back(L2FillEntry{
+                            std::move(redisKeys[missPos[j]]), missIds[j],
+                            snaps[j], *fetched[j]});
+                    }
                     out[missPos[j]] = std::move(fetched[j]);
                 }
             }
@@ -377,6 +430,7 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
         {
             auto result = co_await Base::insertRaw(entity);
             if (result) {
+                bumpGen(result->key());
                 co_await setInCache(makeRedisKey(result->key()), *result);
             }
             co_return result;
@@ -387,6 +441,7 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
         static io::Task<std::optional<E>> patchRaw(const Key& id, Updates&&... updates)
             requires HasFieldUpdate<E> && (!Cfg.read_only)
         {
+            bumpGen(id);
             co_await evictRedis(id);
             co_return co_await Base::patchRaw(id, std::forward<Updates>(updates)...);
         }
@@ -459,13 +514,31 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
             co_return out;
         }
 
+        /// One detached L2 warm-back: the Redis key, the entity key + the
+        /// recheck snapshot taken at fetch-start (for the compensating recheck),
+        /// and an owned entity copy.
+        struct L2FillEntry {
+            std::string key;
+            Key id;
+            uint64_t snap;
+            E entity;
+        };
+
         /// Fire-and-forget L2 warming for a batch of fetched entities. Mirrors
         /// setInCache but off the return path (DetachedTask), so the caller
         /// never blocks on the SET RTT. Owns its arguments by value.
-        static io::DetachedTask fillL2Detached(std::vector<std::pair<std::string, E>> entries) {
+        ///
+        /// Read-fill recheck (per entry): skip the SET if the key already
+        /// mutated since fetch-start; otherwise SET, then re-check and UNLINK
+        /// (compensate) if a mutation slipped in during the async SET.
+        static io::DetachedTask fillL2Detached(std::vector<L2FillEntry> entries) {
             try {
-                for (const auto& [key, entity] : entries) {
-                    co_await setInCache(key, entity);
+                for (const auto& e : entries) {
+                    if (Recheck::changed(e.id, e.snap)) continue;
+                    co_await setInCache(e.key, e.entity);
+                    if (Recheck::changed(e.id, e.snap)) {
+                        co_await cache::RedisCache::invalidate(e.key);
+                    }
                 }
             } catch (...) {}
         }

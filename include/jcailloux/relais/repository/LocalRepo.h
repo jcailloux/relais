@@ -12,6 +12,7 @@
 
 #include "jcailloux/relais/io/Task.h"
 #include "jcailloux/relais/repository/RedisRepo.h"
+#include "jcailloux/relais/repository/RecheckGuard.h"
 #include "jcailloux/relais/Log.h"
 #include "jcailloux/relais/cache/CacheTier.h"
 #include "jcailloux/relais/cache/CacheMetadata.h"
@@ -65,6 +66,10 @@ class LocalRepo : public std::conditional_t<
 
     using Metadata = cache::CacheMetadata<HasGDSF, HasTTL>;
     using Tier = cache::CacheTier<Key, E, Metadata>;
+
+    /// Read-fill recheck guard — shared with RedisRepo for the same repo
+    /// (same Name/Key/SlotsLog2 → one static slot array seen by both tiers).
+    using Recheck = RecheckGuard<Name, Key, Cfg.recheck_slots_log2>;
 
     /// TTL in seconds (compile-time, for metadata construction).
     static constexpr uint32_t kTtlSec = static_cast<uint32_t>(
@@ -425,13 +430,17 @@ private:
     // =========================================================================
 
     /// Slow path for find(): L1 miss -> dedup -> (L2) -> DB -> cache.
+    /// Snapshot the recheck slot at fetch-start; the admit gate skips the L1
+    /// store if a mutation landed during the fetch (read-fill recheck).
     static io::Task<cache::CacheView<E>> findSlow(const Key& id) {
+        uint64_t snap = Recheck::snapshot(id);
         auto hit = co_await tier().findOrFetch(
             id,
             [&id]() -> io::Task<std::optional<E>> {
                 co_return co_await Base::findRaw(id);
             },
-            [](const E&, float) -> Metadata { return buildMetadata(); }
+            [](const E&, float) -> Metadata { return buildMetadata(); },
+            [&id, snap]() { return !Recheck::changed(id, snap); }
         );
         if (hit) {
             co_return cache::CacheView<E>(
@@ -442,12 +451,14 @@ private:
 
     /// Slow path for findJson(): L1 miss -> dedup -> (L2) -> DB -> cache -> JSON.
     static io::Task<std::string> findJsonSlow(const Key& id) {
+        uint64_t snap = Recheck::snapshot(id);
         auto hit = co_await tier().findOrFetch(
             id,
             [&id]() -> io::Task<std::optional<E>> {
                 co_return co_await Base::findRaw(id);
             },
-            [](const E&, float) -> Metadata { return buildMetadata(); }
+            [](const E&, float) -> Metadata { return buildMetadata(); },
+            [&id, snap]() { return !Recheck::changed(id, snap); }
         );
         if (hit) co_return hit.value->json();
         co_return std::string{};
@@ -457,12 +468,14 @@ private:
     static io::Task<std::vector<uint8_t>> findBinarySlow(const Key& id)
         requires HasBinarySerialization<E>
     {
+        uint64_t snap = Recheck::snapshot(id);
         auto hit = co_await tier().findOrFetch(
             id,
             [&id]() -> io::Task<std::optional<E>> {
                 co_return co_await Base::findRaw(id);
             },
-            [](const E&, float) -> Metadata { return buildMetadata(); }
+            [](const E&, float) -> Metadata { return buildMetadata(); },
+            [&id, snap]() { return !Recheck::changed(id, snap); }
         );
         if (hit) co_return hit.value->binary();
         co_return std::vector<uint8_t>{};
@@ -484,18 +497,32 @@ private:
         missIds.reserve(missU.size());
         for (size_t k : missU) missIds.push_back(unique[k]);
 
-        auto fetched = co_await Base::findManyRaw(missIds);
+        // Snapshot the recheck slots at fetch-start, one per miss key.
+        std::vector<uint64_t> snaps;
+        snaps.reserve(missIds.size());
+        for (const auto& mid : missIds) snaps.push_back(Recheck::snapshot(mid));
 
-        for (size_t j = 0; j < missU.size(); ++j) {
-            if (fetched[j]) {
-                auto hit = tier().store(unique[missU[j]], std::move(*fetched[j]),
-                                        buildMetadata());
-                uniqueHit[missU[j]] = static_cast<const E*>(hit.value);
-            }
-        }
+        auto fetched = co_await Base::findManyRaw(missIds);
 
         cache::MultiView<E> view(slot.size());
         view.setGuard(std::move(guard));
+        // Worst case: every miss straddled a mutation and is parked un-cached.
+        view.reserveOwned(missU.size());
+
+        for (size_t j = 0; j < missU.size(); ++j) {
+            if (!fetched[j]) continue;
+            if (!Recheck::changed(missIds[j], snaps[j])) {
+                auto hit = tier().store(unique[missU[j]], std::move(*fetched[j]),
+                                        buildMetadata());
+                uniqueHit[missU[j]] = static_cast<const E*>(hit.value);
+            } else {
+                // A mutation straddled the batch fetch → return the value to
+                // the caller (mono/batch parity) but do NOT cache it. Parked in
+                // the view's owned_, kept alive by the view itself.
+                uniqueHit[missU[j]] = view.adoptValue(std::move(*fetched[j]));
+            }
+        }
+
         for (size_t i = 0; i < slot.size(); ++i)
             view.pointAt(i, uniqueHit[slot[i]]);
         co_return view;
@@ -509,30 +536,15 @@ private:
         [](const Key&, const Metadata&, const E&, long) { return false; };
 
     // =========================================================================
-    // Generation counter — stale write prevention (lock-free, cross-thread)
+    // Read-fill recheck — stale write prevention (lock-free, cross-thread)
     // =========================================================================
     //
-    // Flat array of atomic counters indexed by hash(key) % kGenSlots.
-    // Zero allocation, zero epoch overhead.
-    //
-    // Hash collisions are safe: two keys sharing a slot may cause an
-    // unnecessary cache miss (pessimistic), never stale data.
+    // Delegates to RecheckGuard (shared with RedisRepo). bumpGeneration is the
+    // write-side hook; the read side snapshots at fetch-start and gates the
+    // store. See RecheckGuard.h for the full rationale.
 
-    static constexpr size_t kGenSlots = 4096;  // Power-of-2 mask. Collision = pessimistic miss, never stale
-    using GenHash = cache::detail::AutoHash<Key>;
-    static inline std::array<std::atomic<uint32_t>, kGenSlots> generation_slots_{};
-
-    /// Increment the generation for a key (called on every write path).
-    static void bumpGeneration(const Key& id) {
-        generation_slots_[GenHash{}(id) & (kGenSlots - 1)]
-            .fetch_add(1, std::memory_order_relaxed);
-    }
-
-    /// Read current generation for a key's slot.
-    static uint32_t readGeneration(const Key& id) {
-        return generation_slots_[GenHash{}(id) & (kGenSlots - 1)]
-            .load(std::memory_order_relaxed);
-    }
+    /// Bump the generation for a key (called on every confirmed write path).
+    static void bumpGeneration(const Key& id) { Recheck::bump(id); }
 
 #ifdef RELAIS_BUILDING_TESTS
     friend struct ::relais_test::TestInternals;
