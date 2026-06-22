@@ -51,7 +51,13 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
         using typename Base::FindResultType;
         using Base::name;
 
-        static constexpr auto l2Ttl() { return std::chrono::nanoseconds(Cfg.l2_ttl); }
+        // GCC miscompiles std::chrono::nanoseconds(Cfg.l2_ttl.ns) under
+        // -fsanitize=thread (the class-type NTTP subobject read folds to 0 at
+        // the construction site, though a plain field read is fine). Materialize
+        // the count into a static constexpr int64 first, then build durations
+        // from that scalar — both immune.
+        static constexpr int64_t kL2TtlNs = Cfg.l2_ttl.ns;
+        static constexpr auto l2Ttl() { return std::chrono::nanoseconds(kL2TtlNs); }
 
         /// Find by ID with L2 (Redis) -> L3 (DB) fallback.
         /// Returns epoch-guarded CacheView (empty if not found).

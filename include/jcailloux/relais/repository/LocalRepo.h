@@ -54,7 +54,13 @@ class LocalRepo : public std::conditional_t<
     RedisRepo<E, Name, Cfg, Key>
 > {
     static constexpr bool HasRedis = (Cfg.cache_level == config::CacheLevel::L1_L2);
-    static constexpr bool HasTTL = (std::chrono::nanoseconds(Cfg.l1_ttl).count() > 0);
+    // Materialize the L1 TTL ns into a scalar constant: GCC miscompiles
+    // std::chrono::nanoseconds(Cfg.l1_ttl) — a duration built straight from a
+    // class-type NTTP subobject — under -fsanitize=thread (it folds to 0 at the
+    // construction site, though a plain field read is fine). Building durations
+    // from kL1TtlNs sidesteps it. Mirrors RedisRepo::kL2TtlNs.
+    static constexpr int64_t kL1TtlNs = Cfg.l1_ttl.ns;
+    static constexpr bool HasTTL = (kL1TtlNs > 0);
     static constexpr bool HasGDSF = cache::GDSFPolicy::enabled;
     static constexpr bool HasCleanup = HasGDSF || HasTTL;
 
@@ -74,7 +80,7 @@ class LocalRepo : public std::conditional_t<
     /// TTL in seconds (compile-time, for metadata construction).
     static constexpr uint32_t kTtlSec = static_cast<uint32_t>(
         std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::nanoseconds(Cfg.l1_ttl)).count());
+            std::chrono::nanoseconds(kL1TtlNs)).count());
 
 public:
     using typename Base::EntityType;
@@ -83,7 +89,7 @@ public:
     using FindResultType = cache::CacheView<E>;
     using Base::name;
 
-    static constexpr auto l1Ttl() { return std::chrono::nanoseconds(Cfg.l1_ttl); }
+    static constexpr auto l1Ttl() { return std::chrono::nanoseconds(kL1TtlNs); }
 
 #if RELAIS_ENABLE_METRICS
     static inline cache::L1Counters l1_counters_{};
