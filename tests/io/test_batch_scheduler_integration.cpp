@@ -10,8 +10,10 @@
 #include <jcailloux/relais/io/Task.h>
 #include <jcailloux/relais/PgProvider.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <vector>
 
 using namespace jcailloux::relais::io;
 using namespace jcailloux::relais::io::batch;
@@ -138,6 +140,38 @@ DetachedTask orderedWrite(
     affected_out.store(static_cast<int>(result.affectedRows()), std::memory_order_relaxed);
     if (result.rows() > 0)
         returned_val_out.store(result[0].get<int32_t>(0), std::memory_order_relaxed);
+    ++completed;
+}
+
+// Entity-read helpers for the ANY-fusion test. Each records the result it
+// actually received so the test can prove fan-out (a shared key reaches several
+// waiters) and isolation (no waiter sees another's rows).
+DetachedTask entityFind(
+    std::shared_ptr<BatchScheduler<Io>> batcher,
+    std::atomic<int>& completed,
+    const char* batch_sql, const char* single_sql,
+    int key, std::vector<int>* out_vals)
+{
+    auto result = co_await batcher->submitEntityRead(
+        batch_sql, single_sql, PgParams::make(key));
+    for (int r = 0; r < result.rows(); ++r)
+        out_vals->push_back(result[r].get<int32_t>(1));  // val column
+    ++completed;
+}
+
+DetachedTask entityFindMany(
+    std::shared_ptr<BatchScheduler<Io>> batcher,
+    std::atomic<int>& completed,
+    const char* batch_sql, const char* single_sql,
+    std::vector<int> keys, std::vector<int>* out_ids)
+{
+    std::vector<PgParams> kp;
+    kp.reserve(keys.size());
+    for (int k : keys) kp.push_back(PgParams::make(k));
+    auto result = co_await batcher->submitEntityReadMany(
+        batch_sql, single_sql, std::move(kp));
+    for (int r = 0; r < result.rows(); ++r)
+        out_ids->push_back(result[r].get<int32_t>(0));  // id column
     ++completed;
 }
 
@@ -800,6 +834,75 @@ Task<void> bootstrapPg(std::shared_ptr<BatchScheduler<Io>> batcher)
         (void)result;
         (void)coalesced;
     }
+}
+
+// =============================================================================
+// Entity-read fusion (P2-B): concurrent find + findMany collapse into ONE
+// deduplicated `pk = ANY` segment. Asserts the fan-out / isolation contract:
+//   - a key requested by both a find and a findMany feeds BOTH (fan-out),
+//   - each waiter receives EXACTLY its own rows (no cross-caller leakage),
+//   - absent keys yield empty results (single → no rows, multi → empty subset).
+// =============================================================================
+
+TEST_CASE("Entity read fusion: concurrent find + findMany share one ANY",
+          "[io][batch][integration][findmany][fusion]")
+{
+    Io io;
+    bool done = false;
+    TimeoutGuard timeout(io);
+
+    auto task = [&]() -> DetachedTask {
+        auto pool = co_await PgPool<Io>::create(io, CONNINFO, 4, 4);
+        auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, nullptr, 8);
+
+        // Bootstrap so Nagle batching is active (else every read goes direct).
+        co_await bootstrapPg(batcher);
+
+        co_await batcher->directQuery(
+            "CREATE TEMP TABLE IF NOT EXISTS fuse_test (id INT PRIMARY KEY, val INT)");
+        co_await batcher->directQuery(
+            "INSERT INTO fuse_test VALUES (1,10),(2,20),(3,30),(4,40),(5,50)");
+
+        static constexpr const char* SINGLE =
+            "SELECT id, val FROM fuse_test WHERE id = $1";
+        static constexpr const char* ANY =
+            "SELECT id, val FROM fuse_test WHERE id = ANY($1)";
+
+        std::atomic<int> completed{0};
+        std::vector<int> leaderVals, find2Vals, find5Vals, find9Vals,
+                         manyIds, manyAbsentIds;
+
+        // The first read goes direct (Nagle leader); the rest accumulate during
+        // its RTT and FUSE into one deduplicated ANY.
+        entityFind(batcher, completed, ANY, SINGLE, 1, &leaderVals);
+        entityFind(batcher, completed, ANY, SINGLE, 2, &find2Vals);   // shares key 2
+        entityFindMany(batcher, completed, ANY, SINGLE, {2, 3, 4}, &manyIds);
+        entityFind(batcher, completed, ANY, SINGLE, 5, &find5Vals);   // disjoint
+        entityFind(batcher, completed, ANY, SINGLE, 9, &find9Vals);   // absent
+        entityFindMany(batcher, completed, ANY, SINGLE, {7, 8}, &manyAbsentIds);
+
+        while (completed.load() < 6) co_await YieldAwaiter{io};
+
+        // Leader served direct → its own single row.
+        REQUIRE(leaderVals == std::vector<int>{10});
+        // Fan-out: key 2's row reaches both the single find and the findMany.
+        REQUIRE(find2Vals == std::vector<int>{20});
+        std::sort(manyIds.begin(), manyIds.end());
+        REQUIRE(manyIds == std::vector<int>{2, 3, 4});  // exactly its keys
+        // Disjoint find: only its row, no leakage from the findMany.
+        REQUIRE(find5Vals == std::vector<int>{50});
+        // Absent single key → zero rows.
+        REQUIRE(find9Vals.empty());
+        // Absent multi keys → empty subset.
+        REQUIRE(manyAbsentIds.empty());
+
+        done = true;
+    };
+    task();
+
+    io.runUntil([&] { return done || timeout.timed_out; });
+    REQUIRE_FALSE(timeout.timed_out);
+    REQUIRE(done);
 }
 
 TEST_CASE("Write coalescing: identical writes in batch are coalesced",

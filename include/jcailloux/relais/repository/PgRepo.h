@@ -391,23 +391,26 @@ protected:
     }
 
     /// Batched find by IDs via WHERE pk = ANY($1). Returns one optional<E> per
-    /// id, aligned on request order (nullopt for absent ids). Emits one direct
-    /// ANY query — bypasses the per-find Nagle coalescing of entityQueryParams.
+    /// id, aligned on request order (nullopt for absent ids). Submits ONE
+    /// multi-key entity entry: when it lands in a batch its keys fuse with
+    /// concurrent single finds into a single deduplicated ANY (K segments → 1),
+    /// while remaining one alloc / one frame for the isolated findMany.
     /// Precondition: ids already deduplicated (dedup lives at the public entry,
     /// LocalRepo::findMany); no re-dedup here.
     static io::Task<std::vector<std::optional<E>>> findManyRaw(std::span<const Key> ids) {
         std::vector<std::optional<E>> out(ids.size());
         if (ids.empty()) co_return out;
         try {
-            // One PG array literal per key column, built from the requested ids.
+            // One PgParams per requested key; the scheduler folds them (with any
+            // concurrent finds) into the shared ANY array at fire time.
             std::vector<io::PgParams> keyParams;
             keyParams.reserve(ids.size());
             for (const auto& id : ids)
                 keyParams.push_back(io::PgParams::fromKey(id));
-            auto arrayParams = io::PgParams::buildArrayLiteral(keyParams);
 
-            auto result = co_await PgProvider::queryParams(
-                Mapping::SQL::select_by_pk_batch, arrayParams);
+            auto result = co_await PgProvider::entityQueryParamsMany(
+                Mapping::SQL::select_by_pk_batch,
+                Mapping::SQL::select_by_pk, std::move(keyParams));
 
             // ANY returns rows unordered and omits absent ids — match each row
             // back to its requested position by primary key (mirrors

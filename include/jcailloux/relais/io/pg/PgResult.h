@@ -77,6 +77,7 @@ public:
 
     [[nodiscard]] int rows() const noexcept {
         if (!result_) return 0;
+        if (is_multi_slice_) return static_cast<int>(row_indices_.size());
         if (is_slice_) return 1;
         return PQntuples(result_.get());
     }
@@ -106,6 +107,7 @@ public:
     // Row access
 
     [[nodiscard]] Row operator[](int row) const noexcept {
+        if (is_multi_slice_) return Row(*this, row_indices_[row]);
         return Row(*this, is_slice_ ? row_offset_ : row);
     }
 
@@ -135,10 +137,25 @@ public:
         return r;
     }
 
+    /// Create a multi-row subset view sharing the same PGresult, exposing only
+    /// the listed rows (in the given order). Zero-copy: shares ownership of the
+    /// underlying PGresult. Used to fan a fused ANY-batch result out to a
+    /// findMany waiter — its slice carries exactly the rows for its keys, never
+    /// another caller's. An empty index list yields a valid, zero-row result.
+    static PgResult sliceRows(const PgResult& batch, std::vector<int> row_indices) {
+        PgResult r;
+        r.result_ = batch.result_;
+        r.row_indices_ = std::move(row_indices);
+        r.is_multi_slice_ = true;
+        return r;
+    }
+
 private:
     std::shared_ptr<PGresult> result_{nullptr, &PQclear};
     int row_offset_ = 0;   // for sliceRow views
     bool is_slice_ = false;
+    std::vector<int> row_indices_;     // for sliceRows views
+    bool is_multi_slice_ = false;
 };
 
 // Array parsing helpers — PostgreSQL text-format arrays ({1,2,3}, {}, {"a,b"})
