@@ -366,6 +366,7 @@ private:
     static void resetModificationTracker(auto& t) {
         std::unique_lock lock(t.mutex_);
         t.modifications_.clear();
+        t.ranges_.clear();  // predicate range deletes (eraseWhere fast-path)
         t.latest_generation_.store(0, std::memory_order_relaxed);
     }
 };
