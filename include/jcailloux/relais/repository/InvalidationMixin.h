@@ -3,6 +3,7 @@
 
 #include <span>
 #include "jcailloux/relais/io/Task.h"
+#include "jcailloux/relais/io/WhenAll.h"
 #include "jcailloux/relais/repository/InvalidateOn.h"
 
 namespace relais_test { struct TestInternals; }
@@ -154,8 +155,15 @@ protected:
     /// frame), then delegates the entity/list tiers down the chain.
     template<bool WithLists = true>
     static io::Task<void> invalidateManyImpl(std::span<const Entity> entities) {
-        co_await propagateDeleteMany<Entity, InvList>(entities);
-        co_await Base::template invalidateManyImpl<WithLists>(entities);
+        // Cross-target invalidation (other repos) and the own entity/list tiers
+        // touch disjoint caches with no inter-dependency — gather them so their
+        // L2 commands co-pipeline in one flush instead of two sequential RTTs.
+        // Both children take `entities` by value (span copied into the frame);
+        // its referent outlives the whenAll await. L1→L2 order is preserved
+        // within each child (RAM evict before any submit), anti-stale-write held.
+        co_await io::whenAll(
+            propagateDeleteMany<Entity, InvList>(entities),
+            Base::template invalidateManyImpl<WithLists>(entities));
     }
 
     friend struct ::relais_test::TestInternals;
