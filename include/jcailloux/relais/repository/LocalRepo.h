@@ -262,14 +262,23 @@ public:
         }
     }
 
-    /// Batch invalidation common path — L1 entity tier. Targeted point-evicts,
-    /// one per affected key (each bumps the generation slot → anti stale-write),
-    /// then delegate to L2/L3. Never purgeAll: that would drop unrelated hot
-    /// entries; point-evicts stay exact. ⌈N⌉ evicts but each is ~0ns RAM.
+    /// Batch invalidation common path — L1 entity tier. Delegate to L2/L3
+    /// FIRST, then point-evict L1 (one per affected key, each ~0ns RAM). Never
+    /// purgeAll: that would drop unrelated hot entries; point-evicts stay exact.
+    ///
+    /// Order matters — L2-before-L1, matching mono erase (RedisRepo::eraseOutcome
+    /// UNLINK then LocalRepo::erase evict). L1-before-L2 leaves a window where a
+    /// concurrent L1-miss reads the not-yet-UNLINKed L2 phantom (a deleted row)
+    /// and re-stores it into the shared L1 → a PERSISTENT phantom (nothing
+    /// re-evicts L1, survives until TTL). With L2 cleared first, a racing reader
+    /// can only L1-hit the not-yet-evicted entry (bounded stale, self-heals at
+    /// the evict below) — never resurrect a deleted row. The dead generation
+    /// counter (bumpGeneration is unconsulted) gates nothing here; the ordering
+    /// is the actual anti-stale-write invariant.
     template<bool WithLists = true>
     static io::Task<void> invalidateManyImpl(std::span<const E> entities) {
-        for (const auto& e : entities) evict(e.key());
         co_await Base::template invalidateManyImpl<WithLists>(entities);
+        for (const auto& e : entities) evict(e.key());
     }
 
     /// Invalidate L1 cache only. Non-coroutine since there is no async work.
