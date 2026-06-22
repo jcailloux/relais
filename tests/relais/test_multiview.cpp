@@ -92,6 +92,33 @@ TEST_CASE("MultiView adopt keeps owned_ pointers stable (no realloc)", "[multivi
     REQUIRE(v[3] == first);
 }
 
+TEST_CASE("MultiView adoptValue parks without binding a slot", "[multiview]") {
+    MultiView<Probe> v(3);
+    v.reserveOwned(2);
+
+    // adoptValue parks a value and hands back a stable pointer, leaving slots
+    // untouched — the read-fill-recheck path uses this to return a rejected
+    // entity that several request positions may share.
+    const Probe* p = v.adoptValue(Probe{42, "parked"});
+    REQUIRE(v[0] == nullptr);
+    REQUIRE(v[1] == nullptr);
+    REQUIRE(v[2] == nullptr);
+
+    // Point two distinct request positions at the one parked value (duplicate
+    // ids → one owned copy, two aliases).
+    v.pointAt(0, p);
+    v.pointAt(2, p);
+    REQUIRE(v[0] == p);
+    REQUIRE(v[2] == p);
+    REQUIRE(*v[0] == Probe{42, "parked"});
+
+    // A second adoptValue must not reallocate (capacity reserved) → p stays valid.
+    const Probe* q = v.adoptValue(Probe{43, "second"});
+    REQUIRE(v[0] == p);
+    REQUIRE(*v[0] == Probe{42, "parked"});
+    REQUIRE(*q == Probe{43, "second"});
+}
+
 TEST_CASE("MultiView mixes external and owned slots", "[multiview]") {
     Probe external{99, "ext"};
 

@@ -204,23 +204,35 @@ public:
     // Cold path — async, deduped, GDSF admission
     // =========================================================================
 
+    /// Always-admit gate — the default when the caller imposes no read-fill
+    /// recheck (e.g. uncached fetches that have no generation counter).
+    struct AlwaysAdmit {
+        bool operator()() const noexcept { return true; }
+    };
+
     /// Find in cache or fetch asynchronously. Coalescences concurrent misses.
     ///
     /// Fetcher: () -> Task<optional<Value>>
     /// MetaBuilder: (const Value&, float elapsed_us) -> Metadata
+    /// AdmitGate: () -> bool — evaluated once, right before the store. Returning
+    ///   false returns the fetched value to the caller WITHOUT caching it (the
+    ///   read-fill recheck: a mutation landed during the fetch). Defaults to
+    ///   always-admit.
     ///
     /// Returns Hit pointing to the cached entry, or empty if not found.
     /// When GDSF has admission pressure, the entry may be ghosted instead
     /// of cached (returned via transient pool in that case).
-    template<typename Fetcher, typename MetaBuilder>
-    io::Task<Hit> findOrFetch(const Key& key, Fetcher&& f, MetaBuilder&& mb) {
+    template<typename Fetcher, typename MetaBuilder, typename AdmitGate = AlwaysAdmit>
+    io::Task<Hit> findOrFetch(const Key& key, Fetcher&& f, MetaBuilder&& mb,
+                              AdmitGate gate = {}) {
         auto [entry, is_leader] = inflightMap().acquire(key);
 
         if (is_leader) {
             Hit result;
             try {
                 result = co_await fetchAndAdmit(
-                    key, std::forward<Fetcher>(f), std::forward<MetaBuilder>(mb));
+                    key, std::forward<Fetcher>(f), std::forward<MetaBuilder>(mb),
+                    gate);
                 {
                     std::lock_guard lk(entry->mu);
                     entry->outcome = result
@@ -261,7 +273,8 @@ public:
             if (hit) co_return hit;
             // Evicted between leader store and follower read — fallback
             co_return co_await fetchAndAdmit(
-                key, std::forward<Fetcher>(f), std::forward<MetaBuilder>(mb));
+                key, std::forward<Fetcher>(f), std::forward<MetaBuilder>(mb),
+                gate);
         }
         case InflightEntry::Outcome::not_found:
             co_return Hit{};
@@ -583,12 +596,27 @@ private:
     // Fetch + admission
     // =========================================================================
 
-    template<typename Fetcher, typename MetaBuilder>
-    io::Task<Hit> fetchAndAdmit(const Key& key, Fetcher&& f, MetaBuilder&& mb) {
+    /// Return a value to the caller WITHOUT caching it — kept alive by the
+    /// returned EpochGuard in the transient pool. Used when the read-fill
+    /// recheck rejects the fill (a mutation straddled the fetch).
+    Hit transientHit(Value&& v) {
+        auto guard = epoch::EpochGuard::acquire();
+        auto* ptr = transientPool().New(std::move(v));
+        transientPool().Retire(ptr);
+        return Hit{ptr, nullptr, std::move(guard)};
+    }
+
+    template<typename Fetcher, typename MetaBuilder, typename AdmitGate>
+    io::Task<Hit> fetchAndAdmit(const Key& key, Fetcher&& f, MetaBuilder&& mb,
+                                AdmitGate gate) {
         if constexpr (kHasGDSF) {
             auto start = std::chrono::steady_clock::now();
             auto opt = co_await f();
             if (!opt) co_return Hit{};
+
+            // Read-fill recheck: a mutation landed during the fetch → the value
+            // may be stale; return it but do not pollute the cache.
+            if (!gate()) co_return transientHit(std::move(*opt));
 
             auto elapsed_us = static_cast<float>(
                 std::chrono::duration_cast<std::chrono::microseconds>(
@@ -669,6 +697,9 @@ private:
             // Non-GDSF path
             auto opt = co_await f();
             if (!opt) co_return Hit{};
+
+            // Read-fill recheck (see GDSF branch).
+            if (!gate()) co_return transientHit(std::move(*opt));
 
             auto meta = mb(*opt, 0.0f);
             auto r = map_.upsert(Map::make_key(key), std::move(*opt), std::move(meta));

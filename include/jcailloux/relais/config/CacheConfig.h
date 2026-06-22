@@ -55,6 +55,12 @@ namespace jcailloux::relais::config {
         Duration l1_ttl = std::chrono::hours(1);  // Duration{0} = no TTL
         uint8_t l1_chunk_count_log2 = 3;  // 2^3 = 8 chunks (ChunkMap default)
 
+        // Read-fill recheck — sharded generation counter sizing (power-of-2).
+        // Bounds memory by accepting collisions (pessimistic miss, never stale).
+        // Scales with WRITE concurrency (write_rate × fetch_duration), NOT key
+        // count. 2^12 = 4096 slots = 32 KB/repo. Raise it for write-heavy repos.
+        uint8_t recheck_slots_log2 = 12;
+
         // L2 (Redis cache)
         Duration l2_ttl = std::chrono::hours(4);
         bool l2_refresh_on_get = false;
@@ -66,6 +72,7 @@ namespace jcailloux::relais::config {
         consteval CacheConfig with_update_strategy(UpdateStrategy v) const { auto c = *this; c.update_strategy = v; return c; }
         consteval CacheConfig with_l1_ttl(Duration v) const { auto c = *this; c.l1_ttl = v; return c; }
         consteval CacheConfig with_l1_chunk_count_log2(uint8_t v) const { auto c = *this; c.l1_chunk_count_log2 = v; return c; }
+        consteval CacheConfig with_recheck_slots_log2(uint8_t v) const { auto c = *this; c.recheck_slots_log2 = v; return c; }
         consteval CacheConfig with_l2_ttl(Duration v) const { auto c = *this; c.l2_ttl = v; return c; }
         consteval CacheConfig with_l2_refresh_on_get(bool v) const { auto c = *this; c.l2_refresh_on_get = v; return c; }
         consteval CacheConfig with_l2_format(L2Format v) const { auto c = *this; c.l2_format = v; return c; }

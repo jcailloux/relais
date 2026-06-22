@@ -1282,15 +1282,14 @@ static void runEraseManyVsFinds(const std::vector<int64_t>& ids) {
     }
 }
 
-// NOTE: hidden ([.]) — currently RED. It exposes a deeper, pre-existing
-// read-fill-races-delete phantom that the L2-before-L1 reorder does NOT close:
-// a find() whose L3 fetch straddles the delete writes the entity back into
-// L1/L2 AFTER the eraser cleared them (the read path caches unconditionally;
-// the generation guard meant to reject such stale fills is dead code). Closing
-// it requires wiring the generation snapshot/check into the store + L2 write-
-// back paths. Un-hide once that lands.
+// Closed by the read-fill recheck (commit 12a): a find() whose L3 fetch
+// straddles the delete used to write the entity back into L1/L2 AFTER the
+// eraser cleared them (the read path cached unconditionally). The reader now
+// snapshots the recheck slot at fetch-start and skips the store when a
+// mutation bumped it in between — the value still returns to the caller, but
+// it never pollutes the cache, so no deleted row is resurrected.
 TEST_CASE("Concurrency - eraseMany vs concurrent finds (no L2->L1 phantom)",
-          "[.][integration][db][redis][concurrency][tsan][batch][erase]")
+          "[integration][db][redis][concurrency][tsan][batch][erase]")
 {
     TransactionGuard tx;
 
@@ -1305,6 +1304,61 @@ TEST_CASE("Concurrency - eraseMany vs concurrent finds (no L2->L1 phantom)",
 
     findManyView<FullCacheTestItemRepo>(ids);  // warm L1 + L2
     runEraseManyVsFinds<FullCacheTestItemRepo>(ids);
+}
+
+// Mono variant: per-key erase() racing per-key find(). Exercises the mono
+// eraseOutcome → evictRedis path and the mono findRaw/findSlow read-fill
+// recheck (the batch test above drives eraseMany + findManyRaw instead).
+template<typename Repo>
+static void runEraseVsFinds(const std::vector<int64_t>& ids) {
+    parallel(NUM_THREADS, [&](int t) {
+        for (int j = 0; j < OPS_PER_THREAD; ++j) {
+            if (t % 2 == 0) {
+                for (auto id : ids) sync(Repo::find(id));
+            } else {
+                for (auto id : ids) sync(Repo::erase(id));
+            }
+        }
+    });
+    for (auto id : ids) {
+        REQUIRE(sync(Repo::find(id)) == nullptr);
+    }
+}
+
+TEST_CASE("Concurrency - mono erase vs concurrent finds (no phantom)",
+          "[integration][db][redis][concurrency][tsan][erase]")
+{
+    TransactionGuard tx;
+    constexpr int POOL = 48;
+    std::vector<int64_t> ids;
+    for (int i = 0; i < POOL; ++i)
+        ids.push_back(insertTestItem("conc_mef_" + std::to_string(i), i));
+
+    findManyView<FullCacheTestItemRepo>(ids);  // warm L1 + L2
+    runEraseVsFinds<FullCacheTestItemRepo>(ids);
+}
+
+// Per-tier coverage of the read-fill recheck. L1-only exercises LocalRepo's
+// snapshot/gate alone (no Redis). L2-only exercises RedisRepo's own recheck
+// AND its bumpGen — there LocalRepo is absent, so RedisRepo is the top layer
+// and must bump the shared counter itself.
+TEST_CASE("Concurrency - read-fill recheck per tier (L1-only, L2-only)",
+          "[integration][db][redis][concurrency][tsan][erase]")
+{
+    TransactionGuard tx;
+    constexpr int POOL = 48;
+    std::vector<int64_t> ids;
+    for (int i = 0; i < POOL; ++i)
+        ids.push_back(insertTestItem("conc_tier_" + std::to_string(i), i));
+
+    SECTION("L1-only") {
+        for (auto id : ids) sync(L1TestItemRepo::find(id));  // warm L1
+        runEraseManyVsFinds<L1TestItemRepo>(ids);
+    }
+    SECTION("L2-only") {
+        for (auto id : ids) sync(L2TestItemRepo::find(id));  // warm L2
+        runEraseManyVsFinds<L2TestItemRepo>(ids);
+    }
 }
 
 
