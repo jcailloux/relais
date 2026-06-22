@@ -7,6 +7,7 @@
 #include <type_traits>
 #include <vector>
 #include "jcailloux/relais/io/Task.h"
+#include "jcailloux/relais/io/WhenAll.h"
 #include "jcailloux/relais/Log.h"
 #include "jcailloux/relais/repository/LocalRepo.h"
 #include "jcailloux/relais/repository/InvalidationMixin.h"
@@ -328,15 +329,17 @@ public:
         filters.values = pred.toFilterTuple();
         auto deleted = co_await Base::template eraseWhereRaw<FD>(filters);
         if (!deleted) co_return std::nullopt;  // DB error
-        // Entity tier (L1 evict + L2 UNLINK + cross-inval), per deleted row, with
-        // WithLists=false so the OWN-list tier is left to the predicate fast-path.
-        co_await Base::template invalidateManyImpl<false>(
-            std::span<const E>(*deleted));
-        // Own-list tier: ONE RangeModification (L1) + ONE predicate EVAL (L2) for
-        // the whole deleted set — O(1)/O(groups), filter-aware, never-miss. The
-        // rows left the table, so their lists change (eraseMany analogue), but the
-        // predicate drives invalidation, not the resolved id set.
-        co_await Base::template invalidateWhereLists<FD>(filters);
+        // Two disjoint tiers, gathered so their L2 commands share one flush:
+        //  - entity tier (L1 evict + L2 UNLINK + cross-inval) per deleted row,
+        //    WithLists=false so the OWN-list tier is left to the predicate path;
+        //  - own-list tier: ONE RangeModification (L1) + ONE predicate EVAL (L2)
+        //    for the whole deleted set — O(1)/O(groups), filter-aware, never-miss.
+        // The rows left the table, so their lists change (eraseMany analogue), but
+        // the predicate drives that, not the resolved id set. `*deleted`/`filters`
+        // outlive the await; each child evicts L1 before any submit (anti-stale).
+        co_await io::whenAll(
+            Base::template invalidateManyImpl<false>(std::span<const E>(*deleted)),
+            Base::template invalidateWhereLists<FD>(filters));
         co_return deleted->size();
     }
 
