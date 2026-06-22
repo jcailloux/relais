@@ -4,6 +4,7 @@
 #include <mutex>
 
 #include "jcailloux/relais/io/Task.h"
+#include "jcailloux/relais/io/WhenAll.h"
 #include "jcailloux/relais/io/pg/PgError.h"
 #include "jcailloux/relais/io/pg/PgParams.h"
 
@@ -510,9 +511,20 @@ protected:
     template<bool WithLists = true>
     static io::Task<void> invalidateManyImpl(std::span<const Entity> entities) {
         if constexpr (WithLists) {
-            for (const auto& e : entities) {
-                if constexpr (kHasL1) { listCache().onEntityDeleted(e); }
-                if constexpr (kHasL2) { co_await invalidateL2Deleted(e); }
+            // L1 list tracker is RAM-only (generation bump), keep the loop.
+            if constexpr (kHasL1) {
+                for (const auto& e : entities) listCache().onEntityDeleted(e);
+            }
+            // L2 selective EVALs are independent per entity — gather them so the
+            // N commands co-pipeline in one flush instead of N sequential RTTs.
+            // Each task reads its entity synchronously before its first suspend
+            // (invalidateL2Created extracts blob/sortVals up front); `entities`
+            // outlives the whenAll await, so the lazy tasks' references stay live.
+            if constexpr (kHasL2) {
+                std::vector<io::Task<size_t>> tasks;
+                tasks.reserve(entities.size());
+                for (const auto& e : entities) tasks.push_back(invalidateL2Deleted(e));
+                co_await io::whenAll(std::move(tasks));
             }
         }
         co_await Base::template invalidateManyImpl<WithLists>(entities);
