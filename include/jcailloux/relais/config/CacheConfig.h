@@ -66,6 +66,19 @@ namespace jcailloux::relais::config {
         bool l2_refresh_on_get = false;
         L2Format l2_format = L2Format::Binary;
 
+        // Cross-instance L2 coherence — set TRUE when this Redis is shared by
+        // more than one process. A deployment FACT (is L2 shared?), not a
+        // behavior knob.
+        //  - false (default, single-instance): the read-fill recheck is the
+        //    cheap process-local counter (no extra Redis ops); L2 coherence is
+        //    guaranteed within the process, bounded by l2_ttl across instances.
+        //  - true (multi-instance): the recheck authority moves to Redis (a
+        //    sharded generation hash, HINCRBY on invalidation, conditional
+        //    setIfGen at fill) so a fill straddling ANY instance's invalidation
+        //    is rejected. Adds an HGET at miss + an EVAL at fill (cold path
+        //    only; the L2 hit stays a plain GET).
+        bool l2_shared_across_instances = false;
+
         // Fluent chainable modifiers (compile-time only)
         consteval CacheConfig with_cache_level(CacheLevel v) const { auto c = *this; c.cache_level = v; return c; }
         consteval CacheConfig with_read_only(bool v = true) const { auto c = *this; c.read_only = v; return c; }
@@ -76,6 +89,7 @@ namespace jcailloux::relais::config {
         consteval CacheConfig with_l2_ttl(Duration v) const { auto c = *this; c.l2_ttl = v; return c; }
         consteval CacheConfig with_l2_refresh_on_get(bool v) const { auto c = *this; c.l2_refresh_on_get = v; return c; }
         consteval CacheConfig with_l2_format(L2Format v) const { auto c = *this; c.l2_format = v; return c; }
+        consteval CacheConfig with_l2_shared_across_instances(bool v = true) const { auto c = *this; c.l2_shared_across_instances = v; return c; }
 
         constexpr auto operator<=>(const CacheConfig&) const = default;
     };
