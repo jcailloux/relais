@@ -55,7 +55,7 @@ default build, so a key written once and never read again lingers until touched.
 `with_l1_ttl(0s)` disables time expiry entirely.
 
 **2. Memory budget + GDSF (`RELAIS_L1_MAX_MEMORY`) — compile-time opt-in.**
-Size-aware GDSF eviction (score = frequency × cost, evicts when over budget) and
+Size-aware GDSF eviction (score = frequency × cost ÷ entry size, evicts when over budget) and
 the `RELAIS_L1_MAX_MEMORY` ceiling are **off unless you build with
 `-DRELAIS_GDSF_ENABLED=1`** (the CMake option defaults `OFF`). In a default build
 the budget env var is read but never consulted, GDSF never admits/scores/evicts,
@@ -87,6 +87,10 @@ To cap L1 by *memory* (a hard ceiling with proactive eviction), build with
 | `config::Local` | L1 only | Per-instance data (default) |
 | `config::Redis` | L2 only | Shared / cross-instance data |
 | `config::Both` | L1 + L2 | High-read, feature flags |
+
+> `config::Both` ships its own TTLs — `l1_ttl = 1min`, `l2_ttl = 1h` (short L1 over
+> long L2). The `1h` L1 figure cited above is the struct default, which `Local` and
+> uncustomized configs use; `Both` overrides it.
 
 ### Composing
 
@@ -185,14 +189,15 @@ PgRepo::eraseImpl(id, hint)
 
 ### Partition-key `patch`
 
-`patch` builds `UPDATE ... WHERE pk=$N RETURNING *` from the partial key alone —
-acceptable because `id` is indexed across partitions:
+`patch` builds `UPDATE ... WHERE pk=$N RETURNING <all columns>` from the partial
+key alone — acceptable because `id` is indexed across partitions:
 
 ```cpp
 auto updated = co_await EventRepo::patch(eventId,
     set<EF::title>(std::string("Updated")),
     set<EF::priority>(99));
-// UPDATE events SET "title"=$1, "priority"=$2 WHERE "id"=$3 RETURNING *
+// UPDATE events SET title=$1, priority=$2 WHERE "id"=$3
+//   RETURNING id, region, user_id, title, priority, created_at
 ```
 
 ## Batched reads with `findMany`

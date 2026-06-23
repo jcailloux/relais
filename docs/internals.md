@@ -301,8 +301,8 @@ static Tier& tier() {
 ```
 
 The acquire load pairs with the release store: a reader that sees the published
-pointer also sees the fully-`enroll`-ed tier (registered with `GDSFPolicy` and the
-runtime sweep).
+pointer also sees the fully-`enroll`-ed tier (registered with `GDSFPolicy`'s sweep
+registry).
 
 ### Read and TTL validation
 
@@ -328,10 +328,13 @@ sliding-refresh knob on L1.
 
 ### Cleanup
 
-Cleanup is per-chunk, driven by the runtime sweep (`enroll`'s `sweep_fn`), not by
-a global stop-the-world pass. The tier walks one chunk at a time, evicting expired
-entries (and, when GDSF is on, low-score entries against a byte target) so a sweep
-never holds a chunk locked longer than that chunk.
+Cleanup is per-chunk, driven by `GDSFPolicy`'s global sweep (`enroll`'s
+`sweep_fn`), fired from `tickInsertion` on the fetch/admission path — **not** by
+the background `RuntimeThread`, which only refreshes the cached clock and memory
+readings and never sweeps L1. It is also not a global stop-the-world pass: the
+tier walks one chunk at a time, evicting expired entries (and, when GDSF is on,
+low-score entries against a byte target) so a sweep never holds a chunk locked
+longer than that chunk.
 
 ## L2 Cache: Redis Integration
 
@@ -395,14 +398,17 @@ Database Query --> Store in L2 --> Store in L1 --> Return CacheView
 
 ### Delete: `erase(id)`
 
-`erase` threads an **opportunistic hint** (a `const E*` from any tier that already
-holds the entity) down the chain so a partition-pruned `DELETE` is possible without
-an extra read. The real method is `eraseOutcome(id, hint)` at each layer (L2-before-L1
-eviction order, matching `eraseMany`):
+`erase` threads an **opportunistic hint** (a `const E*` to an entity already held
+in cache) down the chain so a partition-pruned `DELETE` is possible without an
+extra read. The hint is taken **only for partition entities** (`HasPartitionHint<E>`)
+and is an **owned copy** (`std::optional<E> local_hint` filled from the L1 hit),
+not a borrow into the live slot. The real method is `eraseOutcome(id, hint)` at
+each layer (L2-before-L1 eviction order, matching `eraseMany`):
 
 ```
 LocalRepo::erase(id)
-    |-- hint = getFromCache(id)              // free L1 check (~0ns), as const E*
+    |-- if constexpr (HasPartitionHint<E>):   // skipped entirely otherwise
+    |     local_hint.emplace(*tier().find(id)) // copy out of L1 (~0ns), hint = &local_hint
     v
 RedisRepo::eraseOutcome(id, hint)
     |-- outcome = co_await Base::eraseOutcome(id, hint)
@@ -420,9 +426,13 @@ PgRepo::eraseOutcome(id, hint)
 
 So the order is **DB delete → L2 UNLINK → L1 evict** (L2 still before L1, matching
 `eraseMany`): the DB delete runs in `PgRepo` (innermost), then `RedisRepo` UNLINKs
-L2, then control returns to `LocalRepo` which evicts L1 last — precisely so `*hint`
-(a pointer into the L1 slot) stays alive through `makePartitionHintParams` at the
-DB layer. (`bumpGen` here is the recheck bump — process-local by default,
+L2, then control returns to `LocalRepo` which evicts L1 last. The reason for
+L1-last is the **phantom-resurrection invariant**, not hint lifetime (the hint is
+an owned copy that outlives the slot regardless). Were L1 evicted *before* L2, a
+racing L1-miss could read the not-yet-UNLINKed L2 row (a deleted phantom) and
+re-store it into the shared L1 — a persistent phantom nothing re-evicts. Clearing
+L2 first removes that source: a racing reader can at worst L1-hit the
+not-yet-evicted entry (bounded-stale, self-heals at the L1 evict below). (`bumpGen` here is the recheck bump — process-local by default,
 `HINCRBY` only when `l2_shared_across_instances`; see [§2](#configuration-system--cacheconfig-nttp).)
 
 **Performance rule**: never add a DB round-trip just for partition pruning. Use the
@@ -485,7 +495,8 @@ using ListCacheType = list::ListCache<Entity, Base::config.l1_chunk_count_log2,
 
 static ListCacheType& listCache() {
     static ListCacheType instance(listCacheConfig());
-    // first touch enrolls "<name>:list" with GDSFPolicy + the runtime sweep
+    // first touch enrolls "<name>:list" in GDSFPolicy's sweep registry — only
+    // when GDSF is compiled in (the entity tier enrolls whenever GDSF or TTL is on)
     return instance;
 }
 ```
@@ -620,13 +631,13 @@ Source entity modified
   -> ...
 ```
 
-**Cascade:** `TargetCache::invalidate(key)` calls `propagate=true` by default, so the target's own `Invalidations...` are triggered automatically. Multi-hop chains work:
+**Cascade:** `TargetCache::invalidate(key)` always propagates — `InvalidationMixin::invalidate` runs `propagateDelete<Entity, Invalidations...>` then `Base::invalidate(id)` unconditionally (there is no opt-out flag), so the target's own `Invalidations...` fire automatically. Multi-hop chains work:
 
 ```
 C modified -> InvalidateVia resolves c_id -> [a_id]
-  -> RepoA::invalidate(a_id, propagate=true)
-    -> RepoA::Invalidations... -> Invalidate<RepoD, &A::d_id>
-      -> RepoD::invalidate(d_id, propagate=true)
+  -> RepoA::invalidate(a_id)        // propagates RepoA::Invalidations...
+    -> Invalidate<RepoD, &A::d_id>
+      -> RepoD::invalidate(d_id)    // propagates RepoD::Invalidations...
 ```
 
 ### Selective List Invalidation: `InvalidateListVia`
@@ -721,7 +732,8 @@ ResultView getByKey(const std::string& key) {
 
 Validation short-circuits cheaply when nothing changed since the page was cached —
 see [§9](#modification-tracking). There is no per-get counter or `GetAction`
-callback; cleanup is the runtime sweep draining chunk bitmaps.
+callback; cleanup is the per-chunk `GDSFPolicy` sweep (via `ListCache::sweep` →
+`drainChunk`) draining chunk bitmaps.
 
 ### SortBounds — O(1) Range Checking
 
@@ -822,12 +834,16 @@ This ensures switching `Cfg.cache_level` from `L2` to `None` doesn't break compi
 
 ### Sort Value Encoding Limitation
 
-Sort values are encoded as `int64_t` via `toInt64ForCursor()`. This works for:
-- **Integers**: Direct cast
-- **Timestamps** (`std::string`): Parsed to microseconds since epoch
-- **Enums**: Cast to underlying type
+Sort values are encoded as `int64_t` via `toInt64ForCursor()`. It has exactly
+three branches:
+- **Integers**: direct cast
+- **Enums**: cast to the underlying type
+- **Optionals** of the above: unwrapped (recursively); `nullopt` → `0`
 
-**Limitation**: Non-numeric types (e.g. `std::string`) fall back to `0`, which breaks cursor pagination and sort bounds range checks. All current sort fields are numeric or date types.
+**Limitation**: every other type — including `std::string` (so timestamps stored
+as ISO-8601 strings) — falls back to `0`, which breaks cursor pagination and sort
+bounds range checks. Sort fields must be an integral or enum type (store
+timestamps as an integral epoch column, not a string).
 
 ## Modification Tracking
 
@@ -1110,6 +1126,7 @@ form, not `patch` itself):
 
 ```
 LocalRepo::patch(id, set<F>(v)...)
+    |-- onMutation(id); bumpGeneration(id); tier().evict(id)  // evict L1 before the UPDATE
     |-- entity = co_await Base::patchRaw(id, updates...)
     |-- storeAndView(id, *entity)            // re-store the fresh RETURNING row in L1
     v
