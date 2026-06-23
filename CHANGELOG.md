@@ -23,6 +23,26 @@
   column. `.limit()` is the trusted path — exact page size, no grid
   normalization. `.build()` is the single sealing point.
 
+- **Cross-instance L2 coherence (`CacheConfig::l2_shared_across_instances`).**
+  Topology flag, default `false`. Set it `true` when more than one process
+  targets the same Redis: a Redis-side per-slot generation (versioned CAS)
+  rejects any cache fill that straddles an invalidation on *any* instance,
+  guaranteeing zero stale writes to L2 cross-process. The L2 hit stays a plain
+  `GET` — the generation is consulted only at a miss-fill. `false`
+  (single-instance) is the safe, zero-extra-Redis-cost default: coherence is
+  process-local. Multi-instance with the flag off leaves a `l2_ttl`-bounded
+  stale window on the rare straddling race.
+
+- **`CacheConfig::recheck_slots_log2`** (default 12 → 4096 slots, 32 KB/repo) —
+  sizes the process-local read-fill recheck table. It scales with write
+  concurrency, not key count; a slot collision yields a pessimistic cache miss,
+  never a stale read. Raise it for write-heavy repos where write concurrency
+  approaches the slot count.
+
+- **`l2_refresh_on_get` now covers multi-key reads.** When set, `findMany`
+  refreshes the L2 TTL of every hit key in a single round-trip, mirroring the
+  single-`get` behavior. Default `false` leaves `MGET` untouched.
+
 ### Changed
 
 - **List queries are now sealed and immutable.** The construction type split in
@@ -51,6 +71,23 @@
   id set. `eraseMany`/`invalidateMany` need an L1-bearing repo and a `Key`;
   `eraseWhere`/`invalidateWhere` need `HasFilterSet<E>`; `erase*` needs `!read_only`.
 
+- **Batch erase/invalidate detach their deferred cleanup.** `eraseMany`/
+  `eraseWhere`/`invalidateMany`/`invalidateWhere` await only the critical pass —
+  the entity-tier L2 `UNLINK`, L1 evict, and L1 list-tracker bump — then fire the
+  cross-target invalidation and selective L2 list `EVAL`s fire-and-forget.
+  Caller-visible `erase*` latency is one `DELETE` + one entity round-trip; the
+  deferred L2 work no longer blocks the return. L1 list reads stay guarded (the
+  `ModificationTracker` bump is in the critical pass); detached L2 list staleness
+  is `l2_ttl`-bounded, unchanged.
+
+- **Fewer round-trips on concurrent reads and batch invalidation.** Concurrent
+  point reads (`find` + `findMany`) on the same table coalesce into one
+  `WHERE pk = ANY` server round-trip with per-caller fan-out. Batch invalidation
+  gathers its cross-target `UNLINK`s (M mono-key → one multi-key) and its L2 list
+  `EVAL`s into a single flush instead of one round-trip each. PostgreSQL and Redis
+  no longer share one concurrency budget — PG keeps its full connection pool under
+  mixed load. No API change; identical results.
+
 - **`nin` list filter operator (set anti-membership).** `filterable:nin` (alias `not_in`) is the logical inverse of `in`: it matches a column against *none* of a comma-separated value set, reusing the `in` parsing, canonicalization, binary format, and cache key. Element types, the 256 bound, and the compile-time `enum`/converter rejection are shared with `in`. SQL uses `!= ALL($n)` mirroring `= ANY($n)`. NULL column values match neither `in` nor `nin` (three-valued logic — `nin` is the negation of `in` only on non-NULL rows); the empty set is the universe (`nin {}` matches everything, opposite of `in {}`).
 
 ### Removed
@@ -60,6 +97,17 @@
   The index was a footgun: slots follow alphabetical param-name order, never
   declaration order, so a numeric index silently bound the wrong filter on any
   reorder or addition. Generic iteration uses `std::get<I>(obj.values)` directly.
+
+### Fixed
+
+- **Read-fill race re-cached deleted entities.** A read whose L3 fetch straddled
+  a concurrent `erase`/`invalidate` (mono or batch) wrote the just-deleted row
+  back into L1 and L2 *after* eviction had cleared them, leaving a
+  `l2_ttl`-bounded phantom until expiry. A process-local read-fill recheck
+  (generation snapshot at the miss, recompare before the cache store) now skips
+  the store on a straddling mutation — zero cost on cache hits, no per-entry
+  metadata. Cross-instance L2 is closed under `l2_shared_across_instances` (see
+  Added).
 
 ## [0.5.0-alpha.8] - 2026-06-18
 
