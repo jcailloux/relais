@@ -149,12 +149,12 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
         }
 
         /// Update entity in database with L2 cache handling.
-        /// Returns true on success, false on error.
-        static io::Task<bool> update(const Key& id, const E& entity)
+        /// Returns: rows affected (0 if not found), or nullopt on DB error.
+        static io::Task<std::optional<size_t>> update(const Key& id, const E& entity)
             requires MutableEntity<E> && HasFullUpdate<E> && (!Cfg.read_only)
         {
             auto outcome = co_await updateOutcome(id, entity);
-            co_return outcome.success;
+            co_return outcome.affected;
         }
 
         /// Partial update: invalidates Redis then delegates to Base::patchRaw.
@@ -188,7 +188,7 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
             using enum config::UpdateStrategy;
 
             auto outcome = co_await Base::updateOutcome(id, entity);
-            if (outcome.success && !outcome.coalesced) {
+            if (outcome.affected.value_or(0) > 0 && !outcome.coalesced) {
                 co_await bumpGen(id);
                 if constexpr (Cfg.update_strategy == InvalidateAndLazyReload) {
                     // Safe strategy: the bump above then an evict — the next read

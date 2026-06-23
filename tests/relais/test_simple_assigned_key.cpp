@@ -64,9 +64,9 @@ TEST_CASE("AssignedKey<TestAssignedKey> - update round-trip (Uncached)",
     SECTION("[update] writes the new value, leaves the PK intact") {
         sync(UncachedTestAssignedKeyRepo::insert(makeTestAssignedKey(5, 100, "a")));
 
-        bool ok = sync(UncachedTestAssignedKeyRepo::update(
+        auto ok = sync(UncachedTestAssignedKeyRepo::update(
             5, makeTestAssignedKey(5, 200, "b")));
-        REQUIRE(ok);
+        REQUIRE(ok == 1);
 
         auto found = sync(UncachedTestAssignedKeyRepo::find(5));
         REQUIRE(found != nullptr);
