@@ -12,6 +12,11 @@ lazy BEVE/JSON serialization. Repositories only ever speak `Entity`.
 This page covers writing the struct, the annotation language, what the generator
 emits (and **where** — the namespace matters), and how to wire it into CMake.
 
+> The `Entity<Struct, Mapping>` public surface (`key()`, `json()`/`binary()`,
+> `set<F>`/`setNull<F>`) and the concept hierarchy that gates repository methods
+> live in
+> [api-reference.md › Entity and concepts](api-reference.md#entity-and-concepts).
+
 ## 1. Define the struct
 
 ```cpp
@@ -119,7 +124,9 @@ The generator also emits, **at global scope** (outside `entity::generated`):
 |---|---|
 | `@relais table=users` | PostgreSQL table name (required; otherwise derived from the class name with a warning). |
 | `@relais read_only` | Marks the entity read-only — no `toInsertParams`, no `update`/`patch`. Still emits an (empty) `Field` enum (see [below](#the-traitstypefield-contract)). |
+| `@relais model=name` | Parsed but **ignored** for the table name — `table=` is authoritative (only suppresses the no-`table=` warning). |
 | `@relais_list limits=10,25,50` | Pagination limits for a list entity. First = `defaultLimit`, last = `maxLimit`. |
+| `@relais_list entity=Fqn` | Override the fully-qualified entity name embedded in the generated list descriptor. |
 
 ### Field-level
 
@@ -128,7 +135,6 @@ The generator also emits, **at global scope** (outside `entity::generated`):
 | `primary_key` | Marks the primary key. Repeat across fields for a composite key. |
 | `db_managed` | Excluded from `INSERT` (DB-generated, e.g. serial id, default timestamp). |
 | `timestamp` | Stored as `std::string` (ISO 8601). |
-| `nullable` | `std::optional<T>` handling, `setNull` support in `patch`. |
 | `column=db_name` | Override the DB column name (defaults to the field name). |
 | `raw_json` | `glz::raw_json_t` — stored verbatim as a string column. |
 | `json_field` | Struct (or `vector<Struct>`) serialized to/from a JSON column. For arrays of *scalars*, use a native array column instead — see [Array columns](#array-columns). |
@@ -137,6 +143,12 @@ The generator also emits, **at global scope** (outside `entity::generated`):
 | `partition_key` | Partition column — enables single-partition DELETE pruning (see [caching.md](caching.md#partition-key-repositories)). |
 | `filterable[...]` | List filter — see [lists.md](lists.md). |
 | `sortable[...]` | List sort — see [lists.md](lists.md). |
+
+> **Nullability is not an annotation.** A field is nullable iff its C++ type is
+> `std::optional<T>` — the generator sets `FieldInfo<F>::is_nullable` from the
+> type alone, and that flag is what gates `setNull<F>()` in
+> [`patch`](caching.md#partial-updates-with-patch). A `// @relais nullable`
+> marker is inert (not parsed).
 
 ## Array columns
 

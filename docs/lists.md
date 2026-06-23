@@ -5,6 +5,11 @@ tracking. **Auto-activated** when the entity's Mapping carries an embedded
 `ListDescriptor` (detected by the `HasListDescriptor` concept) — no extra
 configuration on the `Repo`.
 
+> **Prerequisite:** [concepts.md](concepts.md) and [entities.md](entities.md).
+> This guide teaches list declaration and querying; the exact builder,
+> query-type, cursor, and parser signatures live in
+> [api-reference.md › List and query API](api-reference.md#list-and-query-api).
+
 ## Declare a list entity
 
 Annotate fields with `filterable` / `sortable`; pagination limits stay at class
@@ -79,11 +84,14 @@ Two semantics differ from `in`:
   empty set is unreachable over HTTP (an empty param leaves the filter inactive,
   which coincides with "match everything"); it exists only by construction.
 
-Consumer note: `!= ALL($n)` is non-sargable on Postgres (anti-membership), so a
-`nin` filter is bounded by keyset pagination, not an index seek. Invalidation
-churn is higher than `in` — the complement is far less selective, so a write is
-more likely to fall inside a cached `nin` group and purge its page. Per-operation
-cost is identical to `in` (same `cmpin`/`skipset`, same Redis round-trip).
+<details><summary>Consumer note — cost and invalidation churn</summary>
+
+`!= ALL($n)` is non-sargable on Postgres (anti-membership), so a `nin` filter is
+bounded by keyset pagination, not an index seek. Invalidation churn is higher
+than `in` — the complement is far less selective, so a write is more likely to
+fall inside a cached `nin` group and purge its page. Per-operation cost is
+identical to `in` (same `cmpin`/`skipset`, same Redis round-trip).
+</details>
 
 ### `sortable` syntax
 
@@ -173,18 +181,10 @@ the final params — there is no manual key derivation and no way to forget it. 
 query that reaches `query()` always carries keys consistent with its contents,
 by construction.
 
-Builder surface:
-
-| Method | Effect |
-|---|---|
-| `.filter<"name">(v)` | Set a filter by name; slot type is exact (scalar vs `in`/`nin` set) |
-| `.sortBy<"name", Dir>()` / `.sortAsc<"name">()` / `.sortDesc<"name">()` | Sort by name + direction, compile-time resolved |
-| `.sort(spec)` | Escape hatch — a `DescriptorSortSpec` resolved at runtime |
-| `.limit(n)` | Exact page size, **no** grid normalization (caller owns key cardinality) |
-| `.after(Repo::Cursor)` | Keyset cursor (descriptor-tagged); mutually exclusive with `offset` (cursor wins) |
-| `.offset(n)` | Offset pagination; ignored once a cursor is set |
-| `.build()` | Seal into `ListQuery` (the only sealing point) |
-| `.params()` | The accumulated mutable `ListQueryParams` |
+The full builder surface — every setter, its exact slot type, and
+`.build()`/`.params()` — is in
+[api-reference.md › QueryBuilder](api-reference.md#list-and-query-api). The
+example above is the common chain; `.build()` is the single sealing point.
 
 `items` is a `std::vector<Entity>` (by value). The `std::vector<EntityPtr>`
 inside `CachedListResult` is the internal L2/Redis representation — not the
@@ -193,9 +193,9 @@ public `query()` API.
 ### Sealed query and the params escape hatch
 
 `Repo::ListQuery` is `list::spec::ListQuery<Descriptor>` — immutable,
-constructible **only** through `seal()`. It exposes const getters
-(`.filters() .sort() .limit() .cursor() .offset() .groupKey() .cacheKey()`); it
-is not default-constructible and has no settable fields.
+constructible **only** through `seal()`, not default-constructible, with no
+settable fields (const getters only; see
+[api-reference.md › ListQuery](api-reference.md#list-and-query-api)).
 
 When the builder's fixed chain doesn't fit — assembling params in a loop, from a
 table, or mutating after the fact — drop to the mutable bundle and seal
@@ -252,9 +252,9 @@ likewise a runtime concern. Re-emit only the `next_cursor` a page handed you.
 Generated filters are `std::optional<T>` — **active** means `has_value()`.
 Access is by param name only: `get<"field">()` (compile-time lookup) or the
 builder's `.filter<"name">()`. There is no positional accessor — filter slots
-follow the **alphabetical order of param names** (the generator sorts filters
-for deterministic cache keys — `generate_entities.py:1269`), *not* declaration
-order, so an index never coincides with the declaration site and is a footgun.
+follow the **alphabetical order of param names** (the generator sorts filters by
+param name for deterministic cache keys), *not* declaration order, so an index
+never coincides with the declaration site and is a footgun.
 
 ### Behavior & gotchas
 
@@ -264,10 +264,12 @@ order, so an index never coincides with the declaration site and is a footgun.
   an out-of-range limit (HTTP), but a hand-built `ListQuery` passes `limit`
   straight into SQL. For "load everything", set `limit` above the row count
   yourself — exceeding `maxLimit` silently yields a truncated page, no error.
-- **At least one `sortable` field is required.** The generator emits a
-  `ListDescriptor` if *any* of `filterable`/`sortable`/`limits` is present, but
-  `ValidListDescriptor` requires `HasSorts ≥ 1` (cursor pagination needs a
-  deterministic order). `filterable` alone won't compile a usable list.
+- **At least one `sortable` field is required.** The generator embeds a
+  `ListDescriptor` **only when the entity has ≥1 sort**; `filterable`/`limits`
+  alone yield a `FilterSet` but no `ListDescriptor`, so `HasListDescriptor` fails
+  and `ListMixin` is never activated. Cursor pagination needs a deterministic
+  order — so `filterable` alone won't give you a cached list (it still powers
+  `eraseWhere`/`invalidateWhere`).
 - **Composite keys are supported.** The keyset cursor spans every primary-key
   column, so an entity with a composite key (including an all-PK junction) can
   carry a `@relais_list`. Key components must be integers.
@@ -297,11 +299,14 @@ list pages), see [`InvalidateListVia`](invalidation.md#selective-list-invalidati
 
 ## Predicate erase and invalidate
 
-A batch `eraseWhere(pred)` / `invalidateWhere(pred)` (see
+`eraseWhere(pred)` / `invalidateWhere(pred)` (see
 [batch and predicate erase / invalidate](invalidation.md#batch-and-predicate-erase--invalidate))
-removes or evicts a set of rows in one call. The entity tier is handled per
-resolved row, but the **own-list** tier never iterates that id set — it is driven
-directly by the predicate, in O(1)/O(groups):
+delete or evict a set of rows in one call — but they treat the list tier
+differently.
+
+**`eraseWhere`** deletes the rows, so their pages must change. The entity tier is
+evicted per resolved row, but the **own-list** tier never iterates that id set —
+it is driven directly by the predicate, in O(1)/O(groups):
 
 - **L1**: one `RangeModification`. The `ModificationTracker` carries a second
   track (predicate + generation) alongside the per-entity one, sharing the
@@ -312,24 +317,24 @@ directly by the predicate, in O(1)/O(groups):
 - **L2**: one predicate-driven `EVAL` over the cached groups (`pmatch` set-vs-set
   + `chk_range` overlap), one Redis round-trip.
 
-The fast-path is **filter-aware and never-miss**: it prunes only groups the
+This fast-path is **filter-aware and never-miss**: it prunes only groups the
 predicate provably cannot affect (EQ-different / IN-disjoint; an absent
 constraint is a wildcard that matches). It is **always** taken — there is no
-`purgeAll` fallback for large sets. `eraseWhere` drops the affected pages (rows
-left the table); `invalidateWhere` keeps them (rows persist, the next `query()`
-repopulates).
+`purgeAll` fallback for large sets. `eraseWhere` appends its `RangeModification`
+on **every** call, even at zero rows deleted — the fast-path fires
+unconditionally.
 
-`eraseWhere` appends its `RangeModification` on **every** call, even at zero rows
-deleted — the predicate fast-path fires unconditionally.
+**`invalidateWhere`** does *not* touch the list tier at all. It resolves the
+matching rows (`SELECT … WHERE pred`, so its entity tier is O(rows)) and evicts
+only the entity caches; the rows still exist, so cached list pages stay valid
+(the oracle `invalidateWhere(P) ≡ invalidateMany(ids resolved by P)`).
 
-## List methods (auto-detected)
+## List methods
 
-| Method | Description |
-|---|---|
-| `query(ListQuery)` | Execute a paginated query (L1 cached) |
-| `listSize()` | Current list-cache entry count |
-| `trySweep()` | Non-blocking cleanup of entity + list L1 caches |
-| `purge()` | Blocking full cleanup of entity + list L1 caches |
-| `warmup()` | Prime both entity and list caches |
-| `ListDescriptorType` | Alias for `parseListQueryStrict<>()` |
+A list-enabled repo adds `query()` and `listSize()`, and its L1 maintenance
+calls (`sweep`/`purge`/`warmup`) cover both the entity and list caches;
+`ListDescriptorType` is the alias you pass to `parseListQuery*<…>` and the
+builder. Exact signatures and the full set of `Repo` list aliases are in
+[api-reference.md › Repository API](api-reference.md#repository-api) and
+[› List and query API](api-reference.md#list-and-query-api).
 </content>

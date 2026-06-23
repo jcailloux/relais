@@ -12,6 +12,12 @@ using PurchaseRepo = Repo<PurchaseEntity, "Purchase", config::Local,
 >;
 ```
 
+> **Prerequisite:** [concepts.md](concepts.md) and [entities.md](entities.md).
+> This guide teaches *what/when* to declare; the exact template parameters of the
+> four descriptors, the resolver overloads, and the batch-method signatures live
+> in
+> [api-reference.md › Invalidation descriptors](api-reference.md#invalidation-descriptors).
+
 ## The four mechanisms
 
 | Mechanism | What it does | Use case |
@@ -47,21 +53,14 @@ using UserRepo = Repo<UserEntity, "User", config::Local,
 The resolver returns `Task<iterable<Key>>` (e.g. `Task<std::vector<int64_t>>`).
 If the target cache has its own `Invalidations...`, those cascade automatically.
 
-### Raw queries — `PgProvider` / `PgResult` contract
+### Raw queries — the `PgProvider` escape hatch
 
 A resolver is the canonical escape hatch for a direct SQL query the declarative
-layer can't express. The contract:
-
-- **`PgProvider::queryArgs(sql, args...)`** — parameterized query, builds and
-  keeps `PgParams` alive in the coroutine frame. Use `queryParams(sql, params)`
-  for a pre-built `PgParams`, `query(sql)` for no params. All return
-  `io::Task<io::PgResult>`. `sql`/`params` must outlive the `co_await`.
-- **Row count is `result.rows()`** (returns `int`), **not** `size()` — there is
-  no `size()`. Also `empty()`, `ok()` (command succeeded), `affectedRows()`.
-- **`result[i]`** → a `Row`. **`row.get<T>(col)`** reads column index `col`
-  (0-based `int`); specialized for `int64_t`, `int32_t`, `double`, `bool`,
-  `std::string`, `std::string_view`. Use `row.getOpt<T>(col)` / `row.isNull(col)`
-  for nullable columns. `get<T>` throws `PgError` on a parse failure.
+layer can't express. The `PgProvider` query entry points, the `PgResult`/`Row`
+accessors, and the error types are specified in
+[api-reference.md › PgProvider](api-reference.md#runtime-and-io). One gotcha
+worth repeating inline: **the row count is `result.rows()` (an `int`), not
+`size()`** — there is no `size()`.
 
 ```cpp
 auto r = co_await PgProvider::queryArgs(
@@ -75,9 +74,14 @@ for (int i = 0; i < r.rows(); ++i)        // rows(), not size()
 
 For indirect list invalidation where a source change should selectively drop
 cached list *pages*, use `InvalidateListVia` with a typed resolver. The target
-list repo defines a `GroupKey` (typed filter values) and an `invalidateByTarget`
-method; the resolver returns `ListInvalidationTarget<GroupKey>`. This API is
+list repo defines a `GroupKey` (typed filter values) and **must provide** an
+`invalidateByTarget(GroupKey, optional<sort_value>)` method that the resolver
+drives; the resolver returns `ListInvalidationTarget<GroupKey>`. This API is
 **cache-level agnostic** — identical for L1 (RAM) and L2 (Redis).
+
+> `invalidateByTarget` is the target repo's responsibility — the shipped mixin
+> ships the lower-level `invalidateListGroupByKey` / `invalidateAllListGroups`
+> primitives it builds on, not `invalidateByTarget` itself.
 
 ```cpp
 using Target = cache::ListInvalidationTarget<ArticleListRepo::GroupKey>;
@@ -111,8 +115,8 @@ using PurchaseRepo = Repo<PurchaseEntity, "Purchase", config::Local,
 | **Per-group** | `sort_value` absent (`nullopt`) | All pages in the targeted group |
 | **Full pattern** | resolver returns `std::nullopt` | All groups in the repository |
 
-Each cached Redis page carries a 19-byte binary header with sort-bounds
-metadata. For per-page granularity, a Lua script reads those headers atomically
+Each cached Redis page carries a 19-byte binary header (magic + sort bounds +
+flags). For per-page granularity, a Lua script reads those headers atomically
 (`GETRANGE`) and deletes only the affected pages — one Redis round-trip.
 
 ## Batch and predicate erase / invalidate
@@ -127,13 +131,17 @@ server-side. `erase*` removes the rows from L3; `invalidate*` only evicts caches
 |---|---|---|---|---|
 | `eraseMany(span<const Key>)` | enumerated keys | `DELETE … WHERE pk = ANY` | dropped (rows gone) | `optional<size_t>` rows deleted |
 | `invalidateMany(span<const Key>)` | enumerated keys | untouched | kept (rows persist) | `void` |
-| `eraseWhere(pred)` | `FilterSet<E>` predicate | `DELETE … WHERE pred RETURNING` | dropped via predicate fast-path | `optional<size_t>` rows deleted |
+| `eraseWhere(pred)` | `FilterSet<E>` predicate | chunked `DELETE … RETURNING` (ctid-bounded, `K_pg`/chunk) | dropped via predicate fast-path | `optional<size_t>` rows deleted |
 | `invalidateWhere(pred)` | `FilterSet<E>` predicate | untouched | kept | `void` |
 
 `optional<size_t>` mirrors mono `erase`: `nullopt` is a DB error, `0` a valid
-non-matching set. `eraseMany`/`invalidateMany` require an L1-bearing repo and a
-`Key`; `eraseWhere`/`invalidateWhere` require `HasFilterSet<E>`. `erase*`
-additionally requires a writable (`!read_only`) config.
+non-matching set. The real gates: `eraseMany` and the `erase*` family require a
+writable (`!read_only`) config; `invalidateMany` is unconditional;
+`eraseWhere`/`invalidateWhere` require `HasFilterSet<E>`. All four are facades on
+`Repo` regardless of preset — the cascade short-circuits in tiers a preset omits.
+
+> Exact signatures (and the `eraseWhere`/`invalidateWhere` template form) are in
+> [api-reference.md › Deletes & invalidation](api-reference.md#repository-api).
 
 ### Enumerated keys — `eraseMany` / `invalidateMany`
 
@@ -150,7 +158,7 @@ keys model `==` but not `<`). Across the hierarchy the cascade collapses to one
 round-trip per tier: `eraseMany` issues one `DELETE WHERE pk = ANY($1) RETURNING`
 (the `RETURNING` set is the affected-entity source — no extra read) and one
 batched `UNLINK`; `invalidateMany` issues one batched `UNLINK`, sub-chunked at
-`K_redis`. Cross-invalidation declared via `Invalidations...` is **deduplicated**
+1000 keys per command. Cross-invalidation declared via `Invalidations...` is **deduplicated**
 across the whole set before propagating.
 
 ### Predicate — `eraseWhere` / `invalidateWhere`
@@ -165,8 +173,9 @@ co_await ArticleRepo::eraseWhere({.category = std::string("tech")});
 co_await ArticleRepo::invalidateWhere({.author_id = 42});  // evict only
 ```
 
-`eraseWhere` fuses resolve and delete in one `DELETE WHERE pred RETURNING`;
-`invalidateWhere` resolves via one `SELECT WHERE pred`, then evicts. The entity
+`eraseWhere` fuses resolve and delete in a chunked, ctid-bounded
+`DELETE … RETURNING` loop (`K_pg` rows per chunk, looping until a chunk deletes
+nothing); `invalidateWhere` resolves via one `SELECT WHERE pred`, then evicts. The entity
 tier evicts per resolved row (L1 + L2 + deduped cross-inval). The **own-list**
 tier is driven by the predicate, not the resolved id set: `eraseWhere` emits
 exactly **one `RangeModification` (L1) + one predicate-driven `EVAL` (L2)** for
@@ -185,6 +194,6 @@ oracle holds: `invalidateWhere(P)` ≡ `invalidateMany(ids resolved by P)`.
 **Explicit `invalidate(id)`:**
 
 1. Fetch the entity for propagation.
-2. Invalidate all tiers.
-3. Propagate to dependent caches.
+2. Propagate to dependent caches.
+3. Invalidate all tiers (L1 + L2).
 </content>
