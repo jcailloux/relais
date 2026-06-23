@@ -206,6 +206,10 @@ class ListMixin : public Base {
 
     // Epoch pool for list wrappers (non-L1 paths only)
     static epoch::memory_pool<ListWrapperType>& listPool() {
+        // Force epoch_s + ThreadIdPool construction before the pool, so they
+        // outlive ~memory_pool() at static teardown (see PgRepo::pool()).
+        static const int deps [[maybe_unused]] =
+            (epoch::internal::get_epoch(), parlay::num_thread_ids(), 0);
         static epoch::memory_pool<ListWrapperType> p;
         return p;
     }
