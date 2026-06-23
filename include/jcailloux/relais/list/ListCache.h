@@ -117,7 +117,7 @@ struct SortBounds {
 //
 // Format (little-endian):
 //   Offset  Size  Field
-//   0       2     Magic bytes: 0x52 0x4C ("SR" = Relais)
+//   0       2     Magic bytes: 0x53 0x52 ("SR" = Relais)
 //   2       8     first_value (int64_t LE)
 //   10      8     last_value (int64_t LE)
 //   18      1     flags:

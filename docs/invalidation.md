@@ -7,8 +7,8 @@ The `InvalidationMixin` sits atop the chain and intercepts `insert`/`update`/
 
 ```cpp
 using PurchaseRepo = Repo<PurchaseEntity, "Purchase", config::Local,
-    cache::Invalidate<UserStatsRepo, &Purchase::user_id>,   // entity → entity
-    cache::InvalidateList<PurchaseListRepo>                  // entity → list
+    Invalidate<UserStatsRepo, &Purchase::user_id>,   // entity → entity
+    InvalidateList<PurchaseListRepo>                  // entity → list
 >;
 ```
 
@@ -45,7 +45,7 @@ struct UserToGuildsResolver {
 };
 
 using UserRepo = Repo<UserEntity, "User", config::Local,
-    cache::InvalidateVia<GuildDetailRepo, &User::user_id,
+    InvalidateVia<GuildDetailRepo, &User::user_id,
         &UserToGuildsResolver::resolve>
 >;
 ```
@@ -84,7 +84,7 @@ drives; the resolver returns `ListInvalidationTarget<GroupKey>`. This API is
 > primitives it builds on, not `invalidateByTarget` itself.
 
 ```cpp
-using Target = cache::ListInvalidationTarget<ArticleListRepo::GroupKey>;
+using Target = ListInvalidationTarget<ArticleListRepo::GroupKey>;
 
 struct PurchaseToArticleResolver {
     static io::Task<std::vector<Target>> resolve(int64_t user_id) {
@@ -102,7 +102,7 @@ struct PurchaseToArticleResolver {
 };
 
 using PurchaseRepo = Repo<PurchaseEntity, "Purchase", config::Local,
-    cache::InvalidateListVia<ArticleListRepo, &Purchase::user_id,
+    InvalidateListVia<ArticleListRepo, &Purchase::user_id,
         &PurchaseToArticleResolver::resolve>
 >;
 ```
