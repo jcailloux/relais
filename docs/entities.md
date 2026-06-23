@@ -12,9 +12,10 @@ BEVE/JSON serialization. Repositories only ever speak `Entity`.
 This page covers writing the struct, the annotation language, what the generator
 emits (and **where** — the namespace matters), and how to wire it into CMake.
 
-> The `Entity<Struct, Mapping>` public surface (`key()`, `json()`/`binary()`,
-> `set<F>`/`setNull<F>`) and the concept hierarchy that gates repository methods
-> live in
+> The `Entity<Struct, Mapping>` public surface (`key()`, `json()`/`binary()`),
+> the `set<F>`/`setNull<F>` patch factories (free functions in
+> `jcailloux::relais::entity`), and the concept hierarchy that gates repository
+> methods live in
 > [api-reference.md › Entity and concepts](api-reference.md#entity-and-concepts).
 
 ## 1. Define the struct
@@ -115,6 +116,8 @@ The generator also emits, **at global scope** (outside `entity::generated`):
 - `glz::meta<::User>` — *only if the source header doesn't already define one*
   (see [Custom JSON field names](#custom-json-field-names)).
 - `glz::meta<UserMapping::RowView>` — drives zero-copy row→JSON/BEVE.
+- `glz::meta<EnumType>` — for each `@relais enum`/`enum=` field, *only if the
+  source header doesn't already specialize it*.
 
 ## Annotation reference
 
@@ -124,8 +127,8 @@ The generator also emits, **at global scope** (outside `entity::generated`):
 |---|---|
 | `@relais table=users` | PostgreSQL table name (required; otherwise derived from the class name with a warning). |
 | `@relais read_only` | Marks the entity read-only — no `toInsertParams`, no `update`/`patch`. Still emits an (empty) `Field` enum (see [below](#the-traitstypefield-contract)). |
-| `@relais model=name` | Parsed but **ignored** for the table name — `table=` is authoritative (only suppresses the no-`table=` warning). |
-| `@relais_list limits=10,25,50` | Pagination limits for a list entity. First = `defaultLimit`, last = `maxLimit`. |
+| `@relais model=name` | Parsed but **ignored** for the table name — `table=` is authoritative. Suppresses the generic no-annotation warning, but the table-name-derivation warning still fires when `table=` is absent. |
+| `@relais_list limits=10,25,50` | Pagination limits for a list entity. Values are sorted and de-duplicated: smallest = `defaultLimit`, largest = `maxLimit`. |
 | `@relais_list entity=Fqn` | Override the fully-qualified entity name embedded in the generated list descriptor. |
 
 ### Field-level
@@ -136,7 +139,7 @@ The generator also emits, **at global scope** (outside `entity::generated`):
 | `db_managed` | Excluded from `INSERT` (DB-generated, e.g. serial id, default timestamp). |
 | `timestamp` | Stored as `std::string` (ISO 8601). |
 | `column=db_name` | Override the DB column name (defaults to the field name). |
-| `raw_json` | `glz::raw_json_t` — stored verbatim as a string column. |
+| `raw_json` | Stored verbatim as a string column — but **detected from the field's C++ type** (`glz::raw_json_t`, or any type whose spelling contains `raw_json`); the annotation itself is inert (tokenized but never consulted for codegen). |
 | `json_field` | Struct (or `vector<Struct>`) serialized to/from a JSON column. For arrays of *scalars*, use a native array column instead — see [Array columns](#array-columns). |
 | `enum` | Auto-resolve the DB↔enum mapping from `glz::meta<EnumType>` in the source header. |
 | `enum=db1:Variant1,db2:Variant2` | Explicit DB↔enum mapping (overrides `glz::meta`). |
@@ -258,14 +261,23 @@ For each entity the generator produces, inside `entity::generated`:
 
 - **`{Class}Mapping`** — `table_name`, `primary_key_column(s)`, a `Col` index
   enum, a `SQL` struct (`select_by_pk`, `insert`, `update`, `delete_by_pk`,
-  `select_by_pk_batch`), `fromRow`/`toInsertParams`/`key`, a `RowView` +
-  `rowToJson`/`rowToBeve` for zero-copy serialization, `TraitsType` (the `Field`
-  enum + `FieldInfo` for `patch`), and `dynamicSize` for memory accounting.
+  `delete_by_pk_batch`, `select_by_pk_batch`, `returning_columns`),
+  `fromRow`/`toInsertParams`/`key`, a `RowView` + `rowToJson`/`rowToBeve` for
+  zero-copy serialization, `TraitsType` (the `Field` enum + `FieldInfo` for
+  `patch`), and — only when the entity has a heap field (string/vector/raw_json)
+  — `dynamicSize` for memory accounting.
 - **`{Class}Entity`** — the `Entity<Struct, Mapping>` alias (public API type).
 - **Partition-key entities** — `SQL::delete_with_partition` +
   `makePartitionHintParams()`.
-- **List entities** — an embedded `ListDescriptor` (auto-detected by ListMixin)
-  and a `{Class}ListWrapper` alias.
+- **Filterable entities (≥1 `filterable`)** — an embedded `FilterSet` (with a
+  nested `Values`) driving `eraseWhere`/`invalidateWhere`, independent of any
+  `ListDescriptor`.
+- **List entities (≥1 `sortable`)** — an embedded `ListDescriptor` (auto-detected
+  by ListMixin) and a `{Class}ListWrapper` alias. `@relais_list limits=` *alone*
+  (no `sortable`/`filterable`) emits neither the `FilterSet` nor the
+  `ListDescriptor` — only the `{Class}ListWrapper` alias over a descriptor-less
+  Mapping, so there is no cached `query()`. A real cached list needs ≥1
+  `sortable` (see [lists.md](lists.md)).
 
 ## The `TraitsType::Field` contract
 
@@ -282,6 +294,12 @@ and the repository gates the full-update path (`update`, `updateOutcome`,
 `updateWithContext`, `updateJson`, `updateBinary`) on the `HasFullUpdate`
 concept:
 
-- `update()` and `patch()` are absent from the repository type.
+- `update()` (and the rest of the full-update family) is absent from the
+  repository type — `HasFullUpdate` is not satisfied.
+- `patch()` is gated on `HasFieldUpdate` (just requires `TraitsType::Field` to
+  exist) and `!read_only`, **not** `HasFullUpdate`. The empty `Field` enum still
+  satisfies `HasFieldUpdate`, so `patch()` stays present as a method template —
+  it is merely uninstantiable (no `Field` enumerator to pass). It vanishes
+  entirely only on a `read_only` repository.
 - `insert()` and `erase()` remain available.
 </content>

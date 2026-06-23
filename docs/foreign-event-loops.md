@@ -231,7 +231,9 @@ void initRelaisOnLoop(trantor::EventLoop* loop, const char* conninfo,
         });
 
     auto pool = fut.get();  // blocks until connected + bound (or throws)
-    keepAlive(std::move(io), pool);  // store per-loop runtime for the process
+    // illustrative: you must keep io + pool alive program-long — store them
+    // somewhere (keepAlive is not a relais API).
+    keepAlive(std::move(io), pool);
 }
 ```
 
@@ -242,13 +244,18 @@ database's `max_connections`. (relais ships `io::IoPool` as a reference N-loop
 runtime for its own `EpollIoContext`; external routers follow the same
 init-per-loop-thread contract shown above.)
 
+Expose `isInLoopThread()` on your adapter and `PgProvider::init` will assert it
+runs on the loop thread — the same safety net `EpollIoContext` gets. The sketch
+above omits it, silently opting out of that check.
+
 ## The background runtime thread (you don't wire it)
 
 When your framework drives the event loops, relais's cached clock and L1 memory
 budget are still ticked — by relais itself, not by anything you write.
 
 relais owns a single `RuntimeThread` — one `jthread`, a 100 ms tick that
-refreshes `CachedClock`, `CachedMemory`, and the GDSF heap accounting. The first
+refreshes `CachedClock` and `CachedMemory`, and — only when GDSF eviction is
+compiled in — resets its admitted-bytes counter (`on_heap_refresh`). The first
 L1-caching `CacheTier` to come alive calls `RuntimeThread::ensureStarted()` in
 its constructor; it's idempotent (`std::call_once`), so it spins up exactly once
 per process regardless of how many loops or repos you have. It is **independent
