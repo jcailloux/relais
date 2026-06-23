@@ -326,12 +326,21 @@ protected:
     // Batch invalidation common path (chemin commun)
     // =====================================================================
     //
-    // invalidateManyImpl(span<const E>) is the shared downstream of every
-    // batch op (invalidateMany/eraseMany/...): the affected set is resolved to
-    // a vector<E> upstream, then this cascades L1 evict + L2 UNLINK + list
-    // invalidation + deduplicated cross-inval through the mixin chain — exactly
-    // the per-tier work of the mono op, batched. L3 (this layer) owns no entity
-    // cache, so the base is a no-op terminator.
+    // The batch invalidation cascade (invalidateMany/eraseMany/...) is split into
+    // two passes that each flow through the mixin chain (commit 13, fire-and-forget
+    // cleanup):
+    //   - invalidateManyCritical — the latency-critical, awaited work: L1 evict +
+    //     L2 entity UNLINK + gen bump + L1 list-tracker bump. Kept synchronous so
+    //     erase*/invalidate* return only once the entity tier is coherent (the
+    //     recheck guard of commit 12 cannot reject a strictly-after phantom, so
+    //     the entity UNLINK must precede the caller's return).
+    //   - invalidateManyDeferred — the detachable, order-free work: deduplicated
+    //     cross-target invalidation + selective L2 list EVALs. Fired fire-and-forget
+    //     by the facade (invalidate-stale tolerated; L1 list reads stay guarded by
+    //     the synchronous tracker bump, L2 list/cross-target staleness is l2_ttl-
+    //     bounded). Repo::invalidateManyImpl awaits both — the reference path the
+    //     cascade unit tests reach via TestInternals.
+    // L3 (this layer) owns no entity cache, so both passes are no-op terminators.
     //
     // WithLists gates the OWN-list tier (ListMixin): eraseMany passes true (the
     // entity left the table → its list pages change, like mono erase), while
@@ -339,16 +348,28 @@ protected:
     // untouched, like mono invalidate). Cross-inval + entity evict run in both.
 
     template<bool WithLists = true>
-    static io::Task<void> invalidateManyImpl(
+    static io::Task<void> invalidateManyCritical(
         [[maybe_unused]] std::span<const E> entities) {
         co_return;
     }
 
-    /// Terminal no-op for the predicate list fast-path (eraseWhere). L3 has no
+    template<bool WithLists = true>
+    static io::Task<void> invalidateManyDeferred(
+        [[maybe_unused]] std::span<const E> entities) {
+        co_return;
+    }
+
+    /// Terminal no-ops for the predicate list fast-path (eraseWhere). L3 has no
     /// list cache; the real work lives in ListMixin when present. Always-present
     /// bottom of the chain so the call resolves even without a ListDescriptor.
     template<typename Desc>
-    static io::Task<void> invalidateWhereLists(
+    static io::Task<void> invalidateWhereListsCritical(
+        [[maybe_unused]] const list::spec::Filters<Desc>& predicate) {
+        co_return;
+    }
+
+    template<typename Desc>
+    static io::Task<void> invalidateWhereListsDeferred(
         [[maybe_unused]] const list::spec::Filters<Desc>& predicate) {
         co_return;
     }

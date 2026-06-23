@@ -148,22 +148,26 @@ public:
     }
 
 protected:
-    /// Batch invalidation common path — top of the chain. Propagates the
-    /// deduplicated cross-invalidation for the whole affected set (union of
-    /// distinct target keys invalidated once, materialized by value before any
-    /// invalidation — the InvalidationData raw pointers never outlive this
-    /// frame), then delegates the entity/list tiers down the chain.
+    /// Batch invalidation, critical pass — no cross-target here (it is deferred):
+    /// delegate the entity tier + L1 list tracker straight down the chain. Awaited
+    /// by the facade (latency-critical: the entity UNLINK must precede the return,
+    /// see PgRepo for the split rationale).
     template<bool WithLists = true>
-    static io::Task<void> invalidateManyImpl(std::span<const Entity> entities) {
-        // Cross-target invalidation (other repos) and the own entity/list tiers
-        // touch disjoint caches with no inter-dependency — gather them so their
-        // L2 commands co-pipeline in one flush instead of two sequential RTTs.
-        // Both children take `entities` by value (span copied into the frame);
-        // its referent outlives the whenAll await. L1→L2 order is preserved
-        // within each child (RAM evict before any submit), anti-stale-write held.
+    static io::Task<void> invalidateManyCritical(std::span<const Entity> entities) {
+        co_await Base::template invalidateManyCritical<WithLists>(entities);
+    }
+
+    /// Batch invalidation, deferred pass — deduplicated cross-target invalidation
+    /// (union of distinct target keys invalidated once, materialized by value
+    /// before any invalidation — the InvalidationData raw pointers never outlive
+    /// this frame) co-pipelined with the own L2 list EVALs (disjoint caches, no
+    /// inter-dependency) so their commands share one flush. Fired fire-and-forget
+    /// by the facade (invalidate-stale tolerated).
+    template<bool WithLists = true>
+    static io::Task<void> invalidateManyDeferred(std::span<const Entity> entities) {
         co_await io::whenAll(
             propagateDeleteMany<Entity, InvList>(entities),
-            Base::template invalidateManyImpl<WithLists>(entities));
+            Base::template invalidateManyDeferred<WithLists>(entities));
     }
 
     friend struct ::relais_test::TestInternals;
