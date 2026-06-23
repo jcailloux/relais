@@ -382,7 +382,7 @@ public:
     }
 
     /// Update entity and invalidate list caches.
-    static io::Task<bool> update(const Key& id, const Entity& entity)
+    static io::Task<std::optional<size_t>> update(const Key& id, const Entity& entity)
         requires MutableEntity<Entity> && HasFullUpdate<Entity> && (!Base::config.read_only)
     {
         std::optional<Entity> old;
@@ -573,12 +573,12 @@ protected:
         co_await Base::template invalidateWhereListsDeferred<Desc>(predicate);
     }
 
-    static io::Task<bool> updateWithContext(
+    static io::Task<std::optional<size_t>> updateWithContext(
         const Key& id, const Entity& entity, const Entity* old_entity)
         requires MutableEntity<Entity> && HasFullUpdate<Entity> && (!Base::config.read_only)
     {
-        bool ok = co_await Base::update(id, entity);
-        if (ok) {
+        auto affected = co_await Base::update(id, entity);
+        if (affected.value_or(0) > 0) {
             if constexpr (kHasL1) {
                 if (old_entity) {
                     listCache().onEntityUpdated(*old_entity, entity);
@@ -590,7 +590,7 @@ protected:
                 co_await invalidateL2Updated(old_entity ? *old_entity : entity, entity);
             }
         }
-        co_return ok;
+        co_return affected;
     }
 
     static io::Task<std::optional<size_t>> eraseWithContext(

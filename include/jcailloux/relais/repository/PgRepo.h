@@ -249,12 +249,13 @@ public:
     // Update
     // =====================================================================
 
-    /// Full update of entity in database. Returns true on success.
-    static io::Task<bool> update(const Key& id, const E& entity)
+    /// Full update of entity in database.
+    /// Returns: rows affected (0 if not found), or nullopt on DB error.
+    static io::Task<std::optional<size_t>> update(const Key& id, const E& entity)
         requires MutableEntity<E> && HasFullUpdate<E> && (!Cfg.read_only)
     {
         auto outcome = co_await updateOutcome(id, entity);
-        co_return outcome.success;
+        co_return outcome.affected;
     }
 
     // =====================================================================
@@ -655,7 +656,7 @@ protected:
     // cache operations (L1 evict, L2 Redis SET/DEL).
 
     struct WriteOutcome {
-        bool success = false;
+        std::optional<size_t> affected;
         bool coalesced = false;
     };
 
@@ -680,7 +681,8 @@ protected:
 
             auto [result, coalesced] = co_await PgProvider::queryWrite(
                 Mapping::SQL::update, params);
-            co_return WriteOutcome{result.affectedRows() > 0, coalesced};
+            co_return WriteOutcome{
+                static_cast<size_t>(result.affectedRows()), coalesced};
 
         } catch (const io::PgError& e) {
             RELAIS_LOG_ERROR << name() << ": update error - " << e.what();

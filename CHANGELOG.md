@@ -43,6 +43,13 @@
   refreshes the L2 TTL of every hit key in a single round-trip, mirroring the
   single-`get` behavior. Default `false` leaves `MGET` untouched.
 
+### Changed (Breaking)
+
+- **`update`/`updateJson`/`updateBinary` return `Task<std::optional<size_t>>`**
+  (was `Task<bool>`) — rows affected (`0` = not found), `nullopt` = DB error,
+  parity with the `erase` family. Migration: a former truthy `if (update(...))`
+  must guard on `*r > 0` — an `optional` is truthy even at `0`.
+
 ### Changed
 
 - **List queries are now sealed and immutable.** The construction type split in

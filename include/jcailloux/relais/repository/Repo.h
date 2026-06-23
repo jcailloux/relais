@@ -232,26 +232,28 @@ public:
 
     /// Update entity from JSON string.
     /// Parses JSON to create entity, then updates via the full mixin chain.
-    static io::Task<bool> updateJson(const Key& id, std::string_view json)
+    /// Returns: rows affected (0 if not found), or nullopt on DB error or parse failure.
+    static io::Task<std::optional<size_t>> updateJson(const Key& id, std::string_view json)
         requires MutableEntity<E> && HasFullUpdate<E> && (!Cfg.read_only)
     {
         auto entity_opt = E::fromJson(json);
         if (!entity_opt) {
             RELAIS_LOG_ERROR << name() << ": updateJson failed to parse JSON";
-            co_return false;
+            co_return std::nullopt;
         }
         co_return co_await Base::update(id, *entity_opt);
     }
 
     /// Update entity from binary data.
     /// Creates entity from binary, then updates via the full mixin chain.
-    static io::Task<bool> updateBinary(const Key& id, std::span<const uint8_t> buffer)
+    /// Returns: rows affected (0 if not found), or nullopt on DB error or parse failure.
+    static io::Task<std::optional<size_t>> updateBinary(const Key& id, std::span<const uint8_t> buffer)
         requires MutableEntity<E> && HasFullUpdate<E> && HasBinarySerialization<E> && (!Cfg.read_only)
     {
         auto entity_opt = E::fromBinary(buffer);
         if (!entity_opt) {
             RELAIS_LOG_ERROR << name() << ": updateBinary failed to parse binary data";
-            co_return false;
+            co_return std::nullopt;
         }
         co_return co_await Base::update(id, *entity_opt);
     }
