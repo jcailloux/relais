@@ -5,6 +5,11 @@ directly — they route through `PgProvider`, which dispatches to a per-loop
 `BatchScheduler` + connection pools running on an **event loop**. Before any repo
 call works you must stand up that runtime and bind it. This page covers how.
 
+> **Prerequisite:** [concepts.md](concepts.md) for the mental model. Exact
+> signatures (`IoPool`/`IoPoolConfig`, `IoPool::create`, `PgProvider::init`,
+> the `Task`/`spawnOn`/`Outcome` family) live in
+> [api-reference.md › Runtime and I/O](api-reference.md#runtime-and-io).
+
 ## The model in one picture
 
 ```
@@ -64,6 +69,10 @@ pool->workerIo(0).post([] {
 calls only work **inside a coroutine running on a worker loop** (here, posted to
 `workerIo(0)`); calling them from an un-bound thread asserts/throws.
 
+> The snippet sets the fields that matter most; the full `IoPoolConfig` field
+> list with defaults is in
+> [api-reference.md › Runtime and I/O](api-reference.md#runtime-and-io).
+
 ## Bring your own loop (Drogon, asio, libuv, …)
 
 **Do you need this?** Only if a web framework already owns the event loops your
@@ -119,5 +128,6 @@ pointer → not coalescing-safe) and it runs as a chunked `DELETE` loop with a d
 dependency between chunks, so it stays on the read path (`queryParams`), outside
 the seq-ordered write batch. A `eraseWhere` is therefore **not** `seq`-ordered
 relative to batch writes; if you need it ordered against another write, `co_await`
-it explicitly. (Its L2 invalidation branch is separate and *does* go through the
-batched `invalidateMany` path — this exception is about the `DELETE` itself.)
+it explicitly. (Its cache-invalidation branch is separate and *is* batched/
+pipelined — entity-tier UNLINKs share one flush, like `invalidateMany`, plus one
+predicate-driven list EVAL — this exception is about the `DELETE` itself.)

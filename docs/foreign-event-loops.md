@@ -54,6 +54,10 @@ and enforced by the harness:
 | `TimerToken postDelayed(duration, cb)` | run `cb` once, on the loop thread, after the delay; return a cancellable token. Used to flush a batch on an adaptive deadline |
 | `void cancelTimer(TimerToken)` | cancel a pending `postDelayed`; no-op if already fired or unknown |
 
+> The exact concept signatures and member types, plus the
+> `IoContextConformance::runAll` and `spawnOn` signatures, are in
+> [api-reference.md › Runtime and I/O](api-reference.md#runtime-and-io).
+
 ## Sketch: trantor (Drogon)
 
 ```cpp
