@@ -126,9 +126,15 @@ read it differently:
 | `parseListQuery` (tolerant) | `defaultLimit` | rounds up to the next step, caps at `maxLimit` |
 | `parseListQueryStrict` (strict) | `defaultLimit` | `InvalidLimit` error |
 
+The strict parser additionally rejects a request carrying **both** `after` (a
+cursor) and a non-zero `offset` (`ConflictingPagination`); the tolerant parser
+gives the cursor precedence and silently ignores `offset`. The active cursor
+param is `after` — `cursor` is reserved but ignored.
+
 A hand-written descriptor with no `allowedLimits` member falls back to the grid
-`{10,25,50,100}`, and to a default page size of `20` (the `ListQuery` struct
-default).
+`{10,25,50,100}`, and to a default page size of `20` (the
+`ListQueryParams::limit{20}` default; `ListQuery` itself is not
+default-constructible).
 
 ## Query
 
@@ -145,7 +151,7 @@ io::Task<std::string> handleAuditLogList(
     if (!q)
         co_return R"({"error":"invalid query"})";  // q.error() has the detail
 
-    auto result = co_await AuditLogRepo::query(std::move(*q));  // L1 cached, CacheView
+    auto result = co_await AuditLogRepo::query(*q);             // L1 cached, CacheView
     co_return result->json();                                   // ListWrapper::json() → std::string
 }
 ```
@@ -155,8 +161,10 @@ io::Task<std::string> handleAuditLogList(
 descriptor. `query()` returns a guarded list view (`CacheView<ListWrapper<Entity>>`)
 either way; here `result->json()` serializes it to a `std::string`, while the
 [C++ section](#query-from-c-code-no-http) below reads the struct accessors
-(`view->items`) on the same view. (For JSON directly, `queryJson(q)` returns an
-`io::Immediate<std::string>` and skips the view.)
+(`view->items`) on the same view. (For serialized output directly, `queryJson(q)` returns an
+`io::Immediate<std::string>`, and `queryBinary(q)` — requiring
+`HasBinarySerialization<Entity>` — an `io::Immediate<std::vector<uint8_t>>`; both
+skip the view.)
 
 ## Query from C++ code (no HTTP)
 
@@ -176,7 +184,8 @@ auto q = AuditLogRepo::queryBuilder()
 auto view = co_await AuditLogRepo::query(q);   // CacheView<ListWrapper<Entity>>
 for (const auto& e : view->items)              // items is std::vector<Entity>, BY VALUE
     use(e.user_id);                            // struct fields accessed directly
-// view->size(), view->total_count, view->cursor() also available.
+// view->size() (= items.size()) and view->cursor() (next-page token) also available.
+// (view->total_count is NOT populated by query() — it stays 0 on this path.)
 ```
 
 The cache keys (`groupKey`/`cacheKey`) are computed **once at seal time** from
@@ -223,8 +232,10 @@ auto q2 = ld::seal<Desc>(std::move(p2));
 
 The keyset cursor is descriptor-tagged: `Repo::Cursor` is
 `list::spec::TypedCursor<Descriptor>`. The wire token is unchanged — a page's
-`view->cursor()` is still a base64 `std::string`; you decode the token you
-previously emitted and pass the result to `.after()`:
+`view->cursor()` is still a `std::string_view` over the base64 token — set
+**only when the page is full** (`items.size() >= limit`); a short final page leaves it empty, which is
+how you detect end-of-pagination. You decode the token you previously emitted and
+pass the result to `.after()`:
 
 ```cpp
 auto cursor = AuditLogRepo::Cursor::decode(token);   // optional<AuditLogRepo::Cursor>
@@ -292,8 +303,8 @@ listCache().onEntityDeleted(entity);
 The tracker uses a monotonic generation counter (not timestamps); pages affected
 by recent modifications are dropped on `get()`. "Affected" is decided by
 `matchesFilters`: a cached page is dropped only if the changed entity matches
-its active filter values. So `insert(uid, role)` drops the
-`discord_user_id=uid` page but leaves `discord_user_id=other` pages intact.
+its active filter values. So inserting a row with `user_id=uid` drops the
+`user_id=uid` page but leaves `user_id=other` pages intact.
 
 For cross-repo list invalidation (a change in one table dropping another table's
 list pages), see [`InvalidateListVia`](invalidation.md#selective-list-invalidation-via-invalidatelistvia).

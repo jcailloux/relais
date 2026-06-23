@@ -10,6 +10,11 @@ call works you must stand up that runtime and bind it. This page covers how.
 > the `Task`/`spawnOn`/`Outcome` family) live in
 > [api-reference.md › Runtime and I/O](api-reference.md#runtime-and-io).
 
+> This page covers the **I/O runtime** (loops, pools, binding). The separate
+> always-on background `RuntimeThread` (cached clock + L1 memory tick) starts
+> itself — you never wire it; see
+> [foreign-event-loops.md › The background runtime thread](foreign-event-loops.md#the-background-runtime-thread-you-dont-wire-it).
+
 ## The model in one picture
 
 ```
@@ -96,8 +101,10 @@ See **[foreign-event-loops.md](foreign-event-loops.md)** for the full recipe
 
 - One `IoContext` event loop per thread; build `PgPool`/`RedisPool` **on** that
   loop (their connection I/O is async on the loop).
-- `PgProvider::init(io, pool[, redis])` **on each loop thread** — binds that
-  thread's `thread_local` providers. Mono-loop: once. N-loop: once per loop.
+- `PgProvider::init(io, pgPool[, redisClient])` **on each loop thread** — binds
+  that thread's `thread_local` providers. The optional Redis arg is a
+  `RedisClient` (not a `RedisPool`); `init` wraps it into a single-client pool.
+  Mono-loop: once. N-loop: once per loop.
 - Repo calls (`find`/`insert`/`patch`/`erase`/…) run **on a bound loop thread**.
 - No state is shared between loops — a request stays on its loop end to end.
 - Bootstrapping from another thread (the loop is busy): drive the lazy

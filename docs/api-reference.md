@@ -129,7 +129,7 @@ static void                  resetMetrics();
 
 <details><summary>Public-but-internal members (not part of the supported surface)</summary>
 
-The mixin layers also expose a few `public` methods that exist for cross-invalidation wiring or debugging, not for application use: `invalidateAllListGroups()` / `invalidateListGroupByKey(key, sort_value)` (coarse/targeted list-group eviction, driven by `InvalidateListVia`), `makeGroupKey(...)` / `makeRedisKey(key)` (key derivation), `evictRedis(key)` (L2-only evict), and `avgConstructionTime()` (L1 timing, testing/debug). They are reachable on `Repo` by name-hiding but are not contract surface — prefer the documented methods above.
+The mixin layers also expose a few `public` methods that exist for cross-invalidation wiring or debugging, not for application use: `invalidateAllListGroups()` / `invalidateListGroupByKey(key, sort_value)` (coarse/targeted list-group eviction primitives that a target repo's `invalidateByTarget` builds on), `makeGroupKey(...)` / `makeRedisKey(key)` (key derivation), `evictRedis(key)` (L2-only evict), and `avgConstructionTime()` (L1 timing, testing/debug). They are reachable on `Repo` by name-hiding but are not contract surface — prefer the documented methods above.
 </details>
 
 → Guides: [caching.md](caching.md), [lists.md](lists.md), [invalidation.md](invalidation.md)
@@ -138,11 +138,12 @@ The mixin layers also expose a few `public` methods that exist for cross-invalid
 
 ## CacheConfig
 
-`CacheConfig` is the structural NTTP aggregate that configures a repository at compile time: which cache tiers are active, their TTLs and sizing, the L2 wire format, and the update/coherence policy. It is passed as the third template parameter of `Repo<Entity, Name, Cfg, Key>`. Because it is a structural type, every field and preset is usable directly as a template argument, and all customization happens through `consteval` fluent modifiers that return a new value.
+`CacheConfig` is the structural NTTP aggregate that configures a repository at compile time: which cache tiers are active, their TTLs and sizing, the L2 wire format, and the update/coherence policy. It is passed as the third template parameter of `Repo<E, Name, Cfg, Invalidations...>`. Because it is a structural type, every field and preset is usable directly as a template argument, and all customization happens through `consteval` fluent modifiers that return a new value.
 
 ```cpp
-template<typename Entity, config::FixedString Name, config::CacheConfig Cfg, typename Key>
-class Repo;
+template<typename E, config::FixedString Name,
+         config::CacheConfig Cfg = config::Local, typename... Invalidations>
+class Repo;   // Key is deduced from E::key(), not a template parameter
 ```
 
 <details><summary>Why <code>Duration</code> and <code>FixedString</code> exist (NTTP structural types)</summary>
@@ -295,7 +296,7 @@ The descriptor detects the span overload with `if constexpr (requires { Resolver
 
 ### 4. `InvalidateListVia<ListRepo, KeyExtractor, Resolver>`
 
-Indirect entity→list with **selective** page invalidation. The resolver returns typed `ListInvalidationTarget<GroupKey>` values (`GroupKey = ListRepo::GroupKey`, the canonical filter-key encoding — see [List and query API](#list-and-query-api)); each invalidates one list group via `ListRepo::invalidateByTarget(target.filters, target.sort_value)`.
+Indirect entity→list with **selective** page invalidation. The resolver returns typed `ListInvalidationTarget<GroupKey>` values (`GroupKey = ListRepo::GroupKey`, the canonical filter-key encoding — see [List and query API](#list-and-query-api)); each invalidates one list group via `ListRepo::invalidateByTarget(target.filters, target.sort_value)` — a contract the target `ListRepo` **must define itself** (`GroupKey` + `invalidateByTarget`). The shipped mixins provide only the lower-level primitives it builds on: `ListMixin` ships `invalidateAllListGroups`, and the L2 tier (`RedisRepo`/`PgRepo`) ships `invalidateListGroupByKey` (see [invalidation.md](invalidation.md#selective-list-invalidation-via-invalidatelistvia)).
 
 Resolver contract — three granularities, two overloads:
 
@@ -550,7 +551,7 @@ The wire token is plain base64 over the cursor bytes: `int64(sort_value)` follow
 
 ### HTTP parsers
 
-Both take a parameter map (default `std::unordered_map<std::string, std::string>`, e.g. Drogon's `req->getParameters()`) and return a **sealed** `ListQuery<Descriptor>`. Recognized non-filter keys: `sort` (`field:dir`), `limit`, `after` (cursor), `offset`, `cursor`. Filter keys match `Filter::name`; IN/NIN values are comma-separated.
+Both take a parameter map (default `std::unordered_map<std::string, std::string>`, e.g. Drogon's `req->getParameters()`) and return a **sealed** `ListQuery<Descriptor>`. Recognized non-filter keys: `sort` (`field:dir`), `limit`, `after` (the cursor), `offset`, and `cursor` (reserved/ignored — the cursor is read only from `after`). Filter keys match `Filter::name`; IN/NIN values are comma-separated.
 
 ```cpp
 template<typename Descriptor, typename Map = std::unordered_map<std::string, std::string>>
@@ -834,7 +835,7 @@ static void runAll(Io& io, Drive drive);   // testing/IoContextConformance.h
 ```
 - **role**: an *executable contract* for the `IoContext` extension point — runnable checks for the semantics the concept can only describe. An adapter author instantiates `runAll` against their type to prove the shim is correct before wiring relais pools onto it; relais CI runs it against `EpollIoContext`.
 - **`drive`**: the one author-supplied primitive — `drive(io, pred)` pumps the loop **on the calling thread** until `pred()` returns true, re-checking `pred` between iterations (the loop's internal wait must be bounded). For `EpollIoContext`: `[](auto& c, auto pred){ c.runUntil(pred); }`.
-- **checks (C1-C10)**: post executes exactly once / FIFO order / re-post from a callback; watch fires readable with the right mask / `updateWatch` remask / `removeWatch` stops delivery / **reentrant self-`removeWatch`** (C10, an ASan use-after-free trap); **cross-thread `post`** runs on the loop thread and wakes it (C7); `postDelayed` fires once; `cancelTimer` cancels.
+- **checks (C1-C10)**: post executes exactly once (C1) / FIFO order (C2) / re-post from a callback (C3); watch fires readable with the right mask (C4) / `updateWatch` remask (C5) / `removeWatch` stops delivery (C6) / **reentrant self-`removeWatch`** (C10, an ASan use-after-free trap); **cross-thread `post`** runs on the loop thread and wakes it (C7); `postDelayed` fires once (C8); `cancelTimer` cancels (C9). (The harness numbers the last four out of run order — `runAll` executes reentrant-removeWatch seventh but labels it C10.)
 - **framework-agnostic**: Catch-free — throws `ConformanceError` (a `std::runtime_error`) on failure, so it drops into any test framework.
 
 > Modifying the `IoContext` concept and not re-running `runAll` against every foreign adapter is how a co-located consumer silently breaks. The harness is the gate.

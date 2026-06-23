@@ -75,13 +75,14 @@ for (int i = 0; i < r.rows(); ++i)        // rows(), not size()
 For indirect list invalidation where a source change should selectively drop
 cached list *pages*, use `InvalidateListVia` with a typed resolver. The target
 list repo defines a `GroupKey` (typed filter values) and **must provide** an
-`invalidateByTarget(GroupKey, optional<sort_value>)` method that the resolver
+`invalidateByTarget(GroupKey, std::optional<int64_t> sort_value)` method that the resolver
 drives; the resolver returns `ListInvalidationTarget<GroupKey>`. This API is
 **cache-level agnostic** — identical for L1 (RAM) and L2 (Redis).
 
-> `invalidateByTarget` is the target repo's responsibility — the shipped mixin
-> ships the lower-level `invalidateListGroupByKey` / `invalidateAllListGroups`
-> primitives it builds on, not `invalidateByTarget` itself.
+> `invalidateByTarget` is the target repo's responsibility. The shipped mixins
+> provide only the lower-level primitives it builds on — `invalidateAllListGroups`
+> (`ListMixin`) and `invalidateListGroupByKey` (the L2 tier, `RedisRepo`/`PgRepo`) —
+> not `invalidateByTarget` itself.
 
 ```cpp
 using Target = ListInvalidationTarget<ArticleListRepo::GroupKey>;
@@ -159,7 +160,11 @@ round-trip per tier: `eraseMany` issues one `DELETE WHERE pk = ANY($1) RETURNING
 (the `RETURNING` set is the affected-entity source — no extra read) and one
 batched `UNLINK`; `invalidateMany` issues one batched `UNLINK`, sub-chunked at
 1000 keys per command. Cross-invalidation declared via `Invalidations...` is **deduplicated**
-across the whole set before propagating.
+across the whole set before propagating. Unlike the mono ops, the batch path
+**awaits only the latency-critical pass** (entity L1 evict + L2 entity `UNLINK` +
+L1 list-tracker bump) and **fires the deferred pass detached** (cross-target
+cross-invalidation + L2 list `EVAL`s): the caller returns before that remainder
+completes, with `l2_ttl`-bounded staleness on the deferred targets.
 
 ### Predicate — `eraseWhere` / `invalidateWhere`
 
@@ -185,7 +190,11 @@ oracle holds: `invalidateWhere(P)` ≡ `invalidateMany(ids resolved by P)`.
 
 ## Propagation behavior
 
-**Modification ops** (`insert`, `update`, `erase`):
+This section describes the **mono (single-key) path**, which awaits the full
+cascade; the batch ops above split it into an awaited critical pass and a
+detached deferred pass.
+
+**Modification ops** (`insert`, `update`, `patch`, `erase`):
 
 1. Fetch the old value first (for updates/deletes).
 2. Run the DB operation.
