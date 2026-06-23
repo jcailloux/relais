@@ -6,8 +6,8 @@ An **entity** in relais is two decoupled pieces:
 2. A generated **Mapping** — ORM glue (SQL strings, `fromRow`, `toInsertParams`,
    `key`, `TraitsType`, list descriptor) derived from `@relais` annotations.
 
-At the API layer `Entity<Struct, Mapping>` fuses the two and adds thread-safe
-lazy BEVE/JSON serialization. Repositories only ever speak `Entity`.
+At the API layer `Entity<Struct, Mapping>` fuses the two and adds on-demand
+BEVE/JSON serialization. Repositories only ever speak `Entity`.
 
 This page covers writing the struct, the annotation language, what the generator
 emits (and **where** — the namespace matters), and how to wire it into CMake.

@@ -68,6 +68,9 @@ pool->workerIo(0).post([] {
 `create()` returns once every worker has connected and bound its providers. Repo
 calls only work **inside a coroutine running on a worker loop** (here, posted to
 `workerIo(0)`); calling them from an un-bound thread asserts/throws.
+`io::DetachedTask` is a fire-and-forget coroutine — you wrap the body in one
+because `post()` takes a plain callable, not an awaitable (see
+[api-reference.md › Runtime and I/O](api-reference.md#runtime-and-io)).
 
 > The snippet sets the fields that matter most; the full `IoPoolConfig` field
 > list with defaults is in
