@@ -36,7 +36,7 @@ namespace jcailloux::relais {
 // Initialization (in application startup):
 //   auto pool = co_await PgPool<MyIo>::create(io, conninfo, 4, 16);
 //   auto redis = co_await RedisClient<MyIo>::connect(io, "127.0.0.1", 6379);
-//   PgProvider::init(pool, redis);
+//   PgProvider::init(io, pool, redis);   // on the loop thread it serves
 //
 // Usage in repositories:
 //   auto result = co_await PgProvider::queryParams(sql, params);
