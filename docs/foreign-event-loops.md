@@ -10,7 +10,7 @@ event loop** instead of bridging across threads.
 > the shared-nothing N-loop model and ~50 ns L1 hits. Write an adapter only when a
 > web framework already owns the loops your requests run on, and the per-request
 > bridge to `IoPool` (~3 µs) is a measured cost worth removing. Read
-> [runtime-and-threading.md](runtime-and-threading.md) first.
+> [runtime.md](runtime.md) first.
 
 ## Why you'd want this
 
@@ -59,6 +59,7 @@ and enforced by the harness:
 #include <jcailloux/relais/io/IoContext.h>
 #include <trantor/net/EventLoop.h>
 #include <trantor/net/Channel.h>
+#include <chrono>
 #include <memory>
 #include <unordered_map>
 
@@ -66,7 +67,8 @@ namespace relais = jcailloux::relais;
 
 class TrantorIoContext {
 public:
-    using WatchHandle = int;  // the fd doubles as the handle
+    using WatchHandle = int;                 // the fd doubles as the handle
+    using TimerToken  = trantor::TimerId;     // trantor's own timer id
 
     explicit TrantorIoContext(trantor::EventLoop* loop) : loop_(loop) {}
 
@@ -110,6 +112,15 @@ public:
 
     // queueInLoop is thread-safe and wakes the loop via its own eventfd.
     void post(std::function<void()> cb) { loop_->queueInLoop(std::move(cb)); }
+
+    // BatchScheduler flushes a batch on an adaptive deadline via these.
+    TimerToken postDelayed(std::chrono::nanoseconds delay,
+                           std::function<void()> cb) {
+        double seconds = std::chrono::duration<double>(delay).count();
+        return loop_->runAfter(seconds, std::move(cb));  // trantor: delay in seconds
+    }
+
+    void cancelTimer(TimerToken token) { loop_->invalidateTimer(token); }
 
 private:
     static void applyMask(trantor::Channel& ch, relais::io::IoEvent ev) {

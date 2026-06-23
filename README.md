@@ -60,7 +60,7 @@ target_link_libraries(my_app PRIVATE jcailloux::relais)
 
 To run the entity generator as a build step, also put relais's `cmake/` on the
 module path — see
-[entities-and-generator.md › CMake integration](docs/entities-and-generator.md#cmake-integration).
+[entities.md › CMake integration](docs/entities.md#cmake-integration).
 
 ## Quick start
 
@@ -95,7 +95,7 @@ using entity::generated::UserEntity;          // ← bring the alias into scope
 
 > Full annotation reference, the generated namespace, custom JSON field names,
 > and the `glz::meta` ODR rule are in
-> **[docs/entities-and-generator.md](docs/entities-and-generator.md)**.
+> **[docs/entities.md](docs/entities.md)**.
 
 ### 3 — Declare the repository
 
@@ -152,7 +152,7 @@ io::Task<void> example() {
 
 Calls must run **on a loop thread**. Full threading contract, N-loop scaling,
 and running relais on a foreign loop (Drogon/asio/…) are in
-**[docs/runtime-and-threading.md](docs/runtime-and-threading.md)**.
+**[docs/runtime.md](docs/runtime.md)**.
 
 ## Cache presets
 
@@ -166,41 +166,33 @@ and running relais on a foreign loop (Drogon/asio/…) are in
 Start from a preset and override with `.with_*()` chaining. Read path:
 `L1 → L2 → DB`, back-filling each tier on the way up.
 
-## Performance — three levels
+## Navigating this documentation
 
-Speed comes from three independent choices, in order of impact. The first two are
-the built-in path; the third is an advanced opt-in.
+Each file owns one subject and reads on its own. Pick by what you're trying to do:
 
-1. **The right cache preset.** An L1 hit is a `thread_local` shardmap lookup
-   (~50 ns, no syscall, no I/O); only real L2/L3 misses do async I/O. Choosing the
-   tier per entity (`Local`/`Both` for hot reads) is the largest lever.
-2. **The shared-nothing runtime (`IoPool`).** N epoll loops, one per core, each
-   with its own pools — a request stays on its loop end to end, no cross-thread
-   hop. Throughput scales ~linearly with cores at unchanged latency. This is the
-   built-in runtime and reaches the L1-hit latency above on its own.
-3. **Co-location on a foreign loop *(optional)*.** Relevant only when a web
-   framework (Drogon/asio/libuv) already owns the loops your requests run on:
-   bridging each call to `IoPool` then costs a ~3 µs thread hop, even on an L1
-   hit. Running relais inline on those existing loops removes it, via a small
-   [`IoContext` adapter](docs/io-context-adapters.md). If relais drives your
-   runtime, you do not need this.
+| Intention | Doc | What's there |
+|---|---|---|
+| **Learn** (5 min) | this README › [Quick start](#quick-start) | Struct → generate → repo → call. |
+| **Understand** the model | [docs/concepts.md](docs/concepts.md) | How the pieces fit: entity/mapping split, the compile-time mixin tower, read/write flow, shared-nothing runtime, type-safety by concepts. |
+| **Do** a task — entities | [docs/entities.md](docs/entities.md) | Struct, `@relais` annotations, the generator. |
+| **Do** a task — caching | [docs/caching.md](docs/caching.md) | `CacheConfig`, presets, `patch`, partition keys. |
+| **Do** a task — invalidation | [docs/invalidation.md](docs/invalidation.md) | The four `Invalidate*` mechanisms, resolvers. |
+| **Do** a task — lists | [docs/lists.md](docs/lists.md) | `filterable`/`sortable`, paginated `query()`, cursors. |
+| **Do** a task — runtime | [docs/runtime.md](docs/runtime.md) | `IoPool`, N-loop scaling, the threading rule. |
+| **Look up** a signature | [docs/api-reference.md](docs/api-reference.md) | The exhaustive public surface — every method, config field, descriptor, list/query type, runtime type, annotation index. Every guide links here. |
+| **Integrate** on an existing loop | [docs/runtime.md](docs/runtime.md) → [docs/foreign-event-loops.md](docs/foreign-event-loops.md) | Co-locate relais on a framework loop (Drogon/asio/…) via an `IoContext` adapter — advanced, optional. |
+| **Dissect** the implementation | [docs/internals.md](docs/internals.md) | Mixin chain, RepoBuilder, cache tier, ListCache, ModificationTracker — for contributors. |
+| **Run** an example | [examples/](examples/README.md) | CI-compiled counterparts to the runtime snippets. |
 
-New to coroutines and event loops? `examples/event_loop_basics.cpp` drives a
-coroutine on a single loop **without a database** — the event-loop machinery every
-runtime is built from, in the smallest thing that compiles and runs.
+**Reading paths**
 
-## Documentation
+- **New here?** README → [concepts.md](docs/concepts.md) → the guide for the subject you need.
+- **AI agent?** Read [concepts.md](docs/concepts.md) then [api-reference.md](docs/api-reference.md) — together they are enough to use relais (declare a repo, read/write, list, invalidate, stand up the runtime) **without opening a single header.**
+- **New to coroutines and event loops?** `examples/event_loop_basics.cpp` drives a coroutine on a single loop **without a database** — the smallest thing that compiles and runs.
 
-| Topic | Doc |
-|---|---|
-| **Entities & code generator** — struct → Mapping, annotations, `entity::generated` namespace, `glz::meta`/ODR, CMake wiring | [docs/entities-and-generator.md](docs/entities-and-generator.md) |
-| **Caching, config & `patch`** — `CacheConfig`, presets, read-only, partition keys, partial updates | [docs/caching.md](docs/caching.md) |
-| **Cross-invalidation** — the four `Invalidate*` mechanisms, resolvers, selective list pages | [docs/invalidation.md](docs/invalidation.md) |
-| **List cache** — `filterable`/`sortable`, paginated `query()`, modification tracking | [docs/lists.md](docs/lists.md) |
-| **Runtime & threading** — `IoPool`, N-loop scaling, the one threading rule | [docs/runtime-and-threading.md](docs/runtime-and-threading.md) |
-| **Foreign event loops** *(advanced, optional)* — co-locate on an existing framework loop via an `IoContext` adapter; only when a measured bridge cost justifies it — `IoPool` suffices otherwise | [docs/io-context-adapters.md](docs/io-context-adapters.md) |
-| **Runnable examples** — CI-compiled counterparts to the runtime snippets | [examples/](examples/README.md) |
-| **Internals** — mixin chain, cache tier, contribution guide | [INTERNALS.md](INTERNALS.md) |
+**Performance** comes from three independent levers: the right cache preset, the
+shared-nothing `IoPool` runtime, and optional co-location on a foreign loop. Full
+model and the numbers: [concepts.md › Performance model](docs/concepts.md#performance-model).
 
 ## Testing
 
