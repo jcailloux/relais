@@ -291,6 +291,26 @@ private:
         int inflight = 0;
         std::deque<std::coroutine_handle<>> waiters;
 
+        // RAII permit — releases the slot on any scope exit (normal return,
+        // exception, or coroutine-frame destruction on cancellation). Mirrors
+        // PgPool::ConnectionGuard so the in-flight budget is never leaked by a
+        // throw between acquire and the (former) manual release.
+        struct [[nodiscard]] Permit {
+            ConcurrencyGate* gate = nullptr;
+            Permit() = default;
+            explicit Permit(ConcurrencyGate* g) noexcept : gate(g) {}
+            Permit(Permit&& o) noexcept : gate(std::exchange(o.gate, nullptr)) {}
+            Permit& operator=(Permit&&) = delete;
+            Permit(const Permit&) = delete;
+            Permit& operator=(const Permit&) = delete;
+            ~Permit() { if (gate) gate->release(); }
+
+            // Release at a deterministic point (batch drain-or-chain ordering
+            // requires the slot freed before the next batch is fired); the
+            // destructor then no-ops.
+            void release() { if (gate) { std::exchange(gate, nullptr)->release(); } }
+        };
+
         struct Awaiter {
             ConcurrencyGate* gate;
 
@@ -302,8 +322,9 @@ private:
                 gate->waiters.push_back(h);
             }
 
-            void await_resume() noexcept {
+            Permit await_resume() noexcept {
                 ++gate->inflight;
+                return Permit{gate};
             }
         };
 
@@ -722,7 +743,7 @@ private:
     // =========================================================================
 
     DetachedTask firePgReadBatch(std::vector<PgReadEntry*> entries) {
-        co_await pg_gate_.acquire();
+        auto permit = co_await pg_gate_.acquire();
         auto guard = co_await pg_pool_->acquire();
         auto& conn = guard.conn();
 
@@ -884,7 +905,7 @@ private:
             }
         }
 
-        pg_gate_.release();
+        permit.release();
 
         // Collect handles BEFORE resuming any — resuming a leader can destroy
         // its coroutine frame (symmetric transfer), invalidating followers
@@ -934,7 +955,7 @@ private:
         std::sort(entries.begin(), entries.end(),
             [](const auto* a, const auto* b) { return a->seq < b->seq; });
 
-        co_await pg_gate_.acquire();
+        auto permit = co_await pg_gate_.acquire();
         auto guard = co_await pg_pool_->acquire();
         auto& conn = guard.conn();
 
@@ -983,7 +1004,7 @@ private:
             }
         }
 
-        pg_gate_.release();
+        permit.release();
 
         // Collect all continuation handles BEFORE resuming any.
         // Resuming a leader can destroy its coroutine frame (symmetric
@@ -1023,7 +1044,7 @@ private:
     // =========================================================================
 
     DetachedTask fireRedisBatch(std::vector<RedisEntry*> entries) {
-        co_await redis_gate_.acquire();
+        auto permit = co_await redis_gate_.acquire();
 
         try {
             auto& client = redis_pool_->next();
@@ -1079,7 +1100,7 @@ private:
             }
         }
 
-        redis_gate_.release();
+        permit.release();
 
         // Collect handles BEFORE resuming any — symmetric transfer can destroy
         // the resumed coroutine's frame, and we'd be iterating `entries` after
@@ -1111,14 +1132,19 @@ private:
     // =========================================================================
 
     Task<PgResult> sendSinglePgRead(PgReadEntry entry) {
-        co_await pg_gate_.acquire();
+        // RAII permit: frees the in-flight slot on every exit — including a
+        // throw from the estimator updates below, which are intentionally
+        // outside the connection scope.
+        auto permit = co_await pg_gate_.acquire();
 
         PgResult result;
         auto start = Clock::now();
         const char* timed_sql = entry.single_sql;
         int n_keys = 1;
 
-        try {
+        {
+            // Inner scope: connection returned to the pool here, before the
+            // estimator runs — preserves the pool turnover timing.
             auto guard = co_await pg_pool_->acquire();
             if (!entry.batch_keys.empty()) {
                 // Multi-key entry sent direct (Nagle leader or estimator
@@ -1139,9 +1165,6 @@ private:
                 result = co_await guard.conn().queryParams(
                     entry.single_sql, entry.params);
             }
-        } catch (...) {
-            pg_gate_.release();
-            throw;
         }
 
         auto elapsed_ns = static_cast<double>(
@@ -1156,22 +1179,18 @@ private:
         else
             estimator_.updateSqlTiming(timed_sql, 1, 1, elapsed_ns);
 
-        pg_gate_.release();
-        co_return result;
+        co_return result;  // ~permit releases the slot here (or on any throw above)
     }
 
     Task<PgResult> sendSinglePgWrite(PgWriteEntry entry) {
-        co_await pg_gate_.acquire();
+        auto permit = co_await pg_gate_.acquire();
 
         PgResult result;
         auto start = Clock::now();
 
-        try {
+        {
             auto guard = co_await pg_pool_->acquire();
             result = co_await guard.conn().queryParams(entry.sql, entry.params);
-        } catch (...) {
-            pg_gate_.release();
-            throw;
         }
 
         auto elapsed_ns = static_cast<double>(
@@ -1183,17 +1202,16 @@ private:
             elapsed_ns, estimator_.getRequestTime(entry.sql));
         estimator_.updateSqlTiming(entry.sql, 1, 1, elapsed_ns);
 
-        pg_gate_.release();
-        co_return result;
+        co_return result;  // ~permit releases the slot here (or on any throw above)
     }
 
     Task<RedisResult> sendSingleRedis(RedisEntry entry) {
-        co_await redis_gate_.acquire();
+        auto permit = co_await redis_gate_.acquire();
 
         RedisResult result;
         auto start = Clock::now();
 
-        try {
+        {
             auto& client = redis_pool_->next();
 
             std::vector<const char*> argv;
@@ -1208,9 +1226,6 @@ private:
             result = co_await client.execArgv(
                 static_cast<int>(argv.size()),
                 argv.data(), argvlen.data());
-        } catch (...) {
-            redis_gate_.release();
-            throw;
         }
 
         auto elapsed_ns = static_cast<double>(
@@ -1219,8 +1234,7 @@ private:
 
         estimator_.updateRedisNetworkTime(elapsed_ns);
 
-        redis_gate_.release();
-        co_return result;
+        co_return result;  // ~permit releases the slot here (or on any throw above)
     }
 
     // =========================================================================
