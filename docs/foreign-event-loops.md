@@ -18,8 +18,9 @@ If your HTTP framework already runs one epoll loop per core (Drogon/trantor,
 asio, libuv, seastar…), the most efficient way to use the relais cache is to
 construct the relais pools **on those same loops**. Then:
 
-- an **L1 cache hit** — the common case — is a pure `thread_local` shardmap
-  lookup, ~50 ns, **zero thread hops, zero syscalls**;
+- an **L1 cache hit** — the common case — is a pure in-process shardmap
+  lookup, ~50 ns, **zero thread hops, zero syscalls** (L1 is a process-global
+  sharded cache shared across loops, not per-loop state);
 - only real **L2/L3 misses** do async I/O, on the same thread, no cross-loop
   bounce.
 
