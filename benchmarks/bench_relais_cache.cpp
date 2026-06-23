@@ -1633,3 +1633,360 @@ TEST_CASE("Benchmark - predicate erase / invalidate (where)", "[benchmark][where
         WARN(formatTable("eraseWhere predicate delete (1 DELETE RETURNING + 1 RangeMod + 1 EVAL)", erase));
     }
 }
+
+
+// #############################################################################
+//
+//  15. Detached cleanup (commit 13) — caller throughput / time-to-return
+//
+//  eraseMany/eraseWhere split the batch cleanup into a CRITICAL pass (awaited:
+//  L3 DELETE + L1 evict + L2 entity UNLINK + gen bump + L1 list bump) and a
+//  DEFERRED pass (fired fire-and-forget: cross-target + the L2 list EVALs). The
+//  caller returns after the critical pass; the deferred Redis work drains in the
+//  background, l2_ttl-bounded (cache-staleness tolerance).
+//
+//  This isolates what detachment buys, on the WithLists=true cascade — the only
+//  path with a non-trivial deferred half (invalidateMany uses WithLists=false,
+//  so its deferred pass is empty). Rows persist (invalidate semantics), so the
+//  affected set is reusable across samples without re-insert:
+//    A. latency    — drain (critical+deferred awaited) vs detached (critical
+//                    only) → the per-call latency the L2 list EVAL no longer
+//                    adds to the caller's path.
+//    B. throughput — K concurrent coroutines issuing the cascade in a loop on
+//                    one event loop. Detached lets call N+1 start while N's EVALs
+//                    are in flight → concurrent EVALs coalesce into fewer Redis
+//                    round-trips. Reported as caller-observed op rate (critical
+//                    completions); deferred EVALs trail in the background.
+//
+//  Local L1+L2+lists repo so the deferred pass hits Redis (the detachable work).
+//
+//  Run with:
+//    ./bench_relais_cache "[batch-detach]"
+//    BENCH_DURATION_S=10 ./bench_relais_cache "[batch-detach]"
+//
+// #############################################################################
+
+/// L1+L2 + auto-detected ListMixin (TestArticleEntity carries a ListDescriptor).
+using FullCacheArticleListRepo =
+    Repo<TestArticleEntity, "bench:article:both", cfg::Both>;
+
+TEST_CASE("Benchmark - detached batch cleanup", "[benchmark][batch-detach]") {
+    using Repo = FullCacheArticleListRepo;
+
+    TransactionGuard tx;
+    TestInternals::resetListCacheState<Repo>();
+    WARN(gdsf_banner());
+
+    static constexpr int POOL = 128;
+    const std::vector<int> Ns = {8, 32, 128};
+
+    // Shared author + article pool. Rows persist (invalidate, no delete), so the
+    // same set is re-primed and re-evicted every sample.
+    auto author = insertTestUser("detach_bench", "detach@test.com", 0);
+    std::vector<int64_t> ids;
+    std::vector<TestArticleEntity> entities;
+    ids.reserve(POOL);
+    entities.reserve(POOL);
+    for (int i = 0; i < POOL; ++i) {
+        auto id = insertTestArticle("tech", author, "DT_" + std::to_string(i), i * 10);
+        ids.push_back(id);
+        auto v = sync(Repo::find(id));            // materialize entity + warm L1+L2
+        REQUIRE(v != nullptr);
+        entities.push_back(*v);
+    }
+
+    // Local list query for THIS repo's Descriptor — makeArticleQuery builds for
+    // TestArticleListRepo, whose Descriptor (parameterized by repo Name) differs.
+    auto makeQuery = [&](uint16_t limit) {
+        namespace ld = jcailloux::relais::list::spec;
+        using Desc = Repo::ListDescriptorType;
+        ld::ListQueryParams<Desc> p;
+        p.limit = limit;
+        p.filters.template get<"author_id">() = author;
+        p.filters.template get<"category">() = std::string("tech");
+        return ld::seal<Desc>(std::move(p));
+    };
+
+    // Re-prime the list page + the first n entity entries (unmeasured setup).
+    auto reprime = [&](int n) {
+        sync(Repo::query(makeQuery(POOL)));
+        for (int k = 0; k < n; ++k) sync(Repo::find(ids[k]));
+    };
+
+    // --- A. latency: drain vs detached -------------------------------------
+    // Both arms borrow the same span over entities[0..n) (symmetric caller cost).
+    // drain awaits the L2 list EVAL; detached fires it and returns. Delta ≈ the
+    // EVAL round-trip removed from the caller path.
+    {
+        std::vector<BenchResult> lat;
+        for (int n : Ns) {
+            std::span<const TestArticleEntity> setN(entities.data(), n);
+            lat.push_back(benchWithSetup(
+                "drain(" + std::to_string(n) + ")",
+                [&, n]() { reprime(n); },
+                [&, setN]() { sync(TestInternals::invalidateManyImpl<Repo>(setN)); }));
+            lat.push_back(benchWithSetup(
+                "detached(" + std::to_string(n) + ")",
+                [&, n]() { reprime(n); },
+                [&, setN]() { sync(TestInternals::invalidateManyDetached<Repo>(setN)); }));
+        }
+        WARN(formatTable("detached cleanup — time-to-return vs full drain", lat));
+    }
+
+    // --- B. cascade throughput sentinel ------------------------------------
+    // A single regression number: caller op rate (critical completion) of the
+    // detached cascade under saturated concurrency on one event loop. At this
+    // batch size the critical pass is CPU-bound on the loop thread (N L1 evicts +
+    // N list-tracker bumps + the deferred copy per op), so concurrency does NOT
+    // scale it — that is expected. The I/O-bound pipelining curve (distinct keys,
+    // super-linear Redis batching) is bench_io_batch's "[batch][scaling]"; this
+    // tracks the FULL facade-cascade cost (L1 + list bookkeeping + fire) that
+    // bench_io_batch's raw-Redis path does not see.
+    {
+        static constexpr int CORO = 32;
+        static constexpr int N = 32;
+        std::span<const TestArticleEntity> setN(entities.data(), N);
+
+        std::atomic<bool> running{true};
+        std::atomic<int64_t> ops{0};
+        std::latch done{CORO};
+        auto t0 = Clock::now();
+        for (int c = 0; c < CORO; ++c) {
+            detail::testLoop().dispatch([&, setN]() {
+                [](std::span<const TestArticleEntity> set,
+                   std::atomic<bool>& running, std::atomic<int64_t>& ops,
+                   std::latch& done) -> DetachedHandle {
+                    while (running.load(std::memory_order_relaxed)) {
+                        co_await TestInternals::invalidateManyDetached<Repo>(set);
+                        ops.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    done.count_down();
+                }(setN, running, ops, done);
+            });
+        }
+        std::this_thread::sleep_for(std::chrono::seconds(benchDurationSeconds()));
+        running.store(false, std::memory_order_relaxed);
+        done.wait();
+        auto el = Clock::now() - t0;
+        // Settle fired deferreds before TransactionGuard flush.
+        for (int s = 0; s < 4; ++s) sync(Repo::query(makeQuery(1)));
+
+        int64_t cascade_ops = ops.load(std::memory_order_relaxed);
+        DurationResult result{el, cascade_ops};
+        auto base = formatDurationThroughput(
+            "detached cascade throughput (" + std::to_string(CORO)
+                + " coros, " + std::to_string(N) + " entities/op, single loop)",
+            1, result);
+        // The op unit is a 32-entity batch; report the per-entity rate too, and
+        // flag the single-loop ceiling — the shared-nothing model scales by adding
+        // loops (one per core), not threads per loop.
+        auto us = std::chrono::duration_cast<std::chrono::microseconds>(el).count();
+        double entity_s = (us > 0) ? cascade_ops * N * 1'000'000.0 / us : 0.0;
+        std::ostringstream extra;
+        extra << "\n  per-entity:      " << fmtOps(entity_s)
+              << " (cascade x " << N << " entities)"
+              << "\n  note:            single event loop; ~Nx with N per-core loops"
+              << " (cf. bench_io_batch [batch][scaling] for I/O pipelining)";
+        WARN(base + extra.str());
+    }
+}
+
+
+// #############################################################################
+//
+//  16. Tier matrix — read latency / throughput per cache tier, isolated
+//
+//  One repo per tier, each measured on its own (no cross-pollution: every Repo
+//  type owns a distinct L1 cache + Redis prefix, so warming one never warms
+//  another). Reads target DISTINCT keys (stride) so L2/DB reads actually pipeline
+//  through the BatchScheduler instead of coalescing onto one key.
+//
+//    DB only (Uncached) — every find hits PostgreSQL.
+//    L2 only (Redis)    — cfg::Redis has no L1, so every find is an L2 hit.
+//    L1 only (Local)    — warm, every find is a synchronous RAM hit.
+//
+//  Per tier, a concurrency sweep on ONE event loop. The "1 coro" row is the
+//  sequential rate (latency = 1/throughput); higher rows expose the pipelining
+//  win for the I/O tiers. L1 hits resolve synchronously (no suspend), so its
+//  curve is flat — concurrency does not apply to a RAM read.
+//
+//  Run with:
+//    ./bench_relais_cache "[tier-matrix]"
+//    BENCH_DURATION_S=5 ./bench_relais_cache "[tier-matrix]"
+//
+// #############################################################################
+
+namespace {
+
+inline double percentile(const std::vector<double>& sorted, double q) {
+    if (sorted.empty()) return 0.0;
+    auto idx = static_cast<size_t>(q * (sorted.size() - 1));
+    return sorted[idx];
+}
+
+struct TierStat {
+    int concurrency;
+    int64_t ops;          // operations completed in the window
+    double tput;          // ops/s
+    double avg_us;        // wall / ops
+    double p50, p90, p99; // µs (0 when not sampled)
+    bool sampled;
+};
+
+// Concurrent reads on the shared test loop: `coro` DetachedHandle workers, each
+// reading DISTINCT keys (stride) so the I/O tiers pipeline through the batcher
+// instead of coalescing onto one key. Sample=true times every op (negligible
+// Clock overhead vs µs I/O); Sample=false keeps the ns-scale L1 path timer-free
+// so its throughput stays real (two Clock::now() would dwarf a ~30ns RAM hit).
+template<typename Repo, bool Sample>
+TierStat tierReadStat(const std::vector<int64_t>& ids, int coro) {
+    static constexpr size_t CAP = 20000;   // max latency samples per coro
+    int nkeys = static_cast<int>(ids.size());
+    std::atomic<bool> running{true};
+    std::atomic<int64_t> ops{0};
+    std::latch done{coro};
+    std::vector<std::vector<double>> lat(coro);
+    if constexpr (Sample) for (auto& v : lat) v.reserve(CAP);
+
+    auto t0 = Clock::now();
+    for (int c = 0; c < coro; ++c) {
+        detail::testLoop().dispatch([&ids, nkeys, c, &running, &ops, &done, &lat]() {
+            [](const std::vector<int64_t>& ids, int nkeys, int c,
+               std::atomic<bool>& running, std::atomic<int64_t>& ops,
+               std::latch& done, std::vector<double>& mine) -> DetachedHandle {
+                int64_t i = c;
+                while (running.load(std::memory_order_relaxed)) {
+                    if constexpr (Sample) {
+                        auto s = Clock::now();
+                        auto v = co_await Repo::find(ids[(c * 131 + i++) % nkeys]);
+                        auto e = Clock::now();
+                        doNotOptimize(v);
+                        if (mine.size() < CAP)
+                            mine.push_back(
+                                std::chrono::duration<double, std::micro>(e - s).count());
+                    } else {
+                        auto v = co_await Repo::find(ids[(c * 131 + i++) % nkeys]);
+                        doNotOptimize(v);
+                    }
+                    ops.fetch_add(1, std::memory_order_relaxed);
+                }
+                done.count_down();
+            }(ids, nkeys, c, running, ops, done, lat[c]);
+        });
+    }
+    std::this_thread::sleep_for(std::chrono::seconds(benchDurationSeconds()));
+    running.store(false, std::memory_order_relaxed);
+    done.wait();
+    auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+        Clock::now() - t0).count();
+
+    int64_t total = ops.load(std::memory_order_relaxed);
+    TierStat st{coro, total,
+                (us > 0) ? total * 1'000'000.0 / us : 0.0,
+                (total > 0) ? static_cast<double>(us) / total : 0.0,
+                0.0, 0.0, 0.0, Sample};
+    if constexpr (Sample) {
+        std::vector<double> all;
+        size_t n = 0; for (auto& v : lat) n += v.size();
+        all.reserve(n);
+        for (auto& v : lat) all.insert(all.end(), v.begin(), v.end());
+        std::sort(all.begin(), all.end());
+        st.p50 = percentile(all, 0.50);
+        st.p90 = percentile(all, 0.90);
+        st.p99 = percentile(all, 0.99);
+    }
+    return st;
+}
+
+inline void tierRow(std::ostringstream& o, const std::string& head, const TierStat& r) {
+    o << "  " << std::left << std::setw(15) << head
+      << std::right << std::setw(10) << r.ops
+      << std::setw(13) << fmtOps(r.tput)
+      << std::setw(9) << fmtDuration(r.avg_us);
+    if (r.sampled)
+        o << std::setw(9) << fmtDuration(r.p50)
+          << std::setw(9) << fmtDuration(r.p90)
+          << std::setw(9) << fmtDuration(r.p99);
+    else
+        o << std::setw(9) << "-" << std::setw(9) << "-" << std::setw(9) << "-";
+    o << "\n";
+}
+
+inline void tierHeader(std::ostringstream& o, const std::string& col1) {
+    o << "  " << std::left << std::setw(15) << col1
+      << std::right << std::setw(10) << "ops"
+      << std::setw(13) << "throughput"
+      << std::setw(9) << "avg"
+      << std::setw(9) << "p50"
+      << std::setw(9) << "p90"
+      << std::setw(9) << "p99" << "\n  " << std::string(74, '-') << "\n";
+}
+
+// Per-tier sweep: rows = concurrency levels.
+inline std::string tierSweepTable(const std::string& title, int nkeys,
+                                  const std::vector<TierStat>& rows) {
+    auto bar = std::string(74, '=');
+    std::ostringstream o;
+    o << "\n  " << bar << "\n  " << title
+      << "   (keys=" << nkeys << ", " << benchDurationSeconds() << "s/level)\n  "
+      << std::string(74, '-') << "\n";
+    tierHeader(o, "concurrency");
+    for (const auto& r : rows)
+        tierRow(o, std::to_string(r.concurrency) + " coros", r);
+    o << "  " << bar;
+    return o.str();
+}
+
+// Cross-tier comparison at one concurrency level: rows = tiers, side by side.
+inline std::string tierCompareTable(int nkeys, int conc,
+        const std::vector<std::pair<std::string, TierStat>>& rows) {
+    auto bar = std::string(74, '=');
+    std::ostringstream o;
+    o << "\n  " << bar << "\n  TIER COMPARISON @ concurrency=" << conc
+      << "   (keys=" << nkeys << ", " << benchDurationSeconds() << "s)\n  "
+      << std::string(74, '-') << "\n";
+    tierHeader(o, "tier");
+    for (const auto& [label, r] : rows)
+        tierRow(o, label, r);
+    o << "  " << bar
+      << "\n  (L1 latency not sampled: ns-scale, see avg; a per-op timer would distort it)";
+    return o.str();
+}
+
+} // anonymous namespace
+
+TEST_CASE("Benchmark - tier matrix", "[benchmark][tier-matrix]") {
+    TransactionGuard tx;
+    WARN(gdsf_banner());
+
+    static constexpr int N = 1000;
+    const std::vector<int> levels = {1, 16, 64, 128};
+
+    std::vector<int64_t> ids;
+    ids.reserve(N);
+    for (int i = 0; i < N; ++i)
+        ids.push_back(insertTestItem("tier_" + std::to_string(i), i));
+
+    std::vector<TierStat> db, l2, l1;
+
+    // DB only — no cache to warm; every find is a PostgreSQL round-trip.
+    for (int k : levels) db.push_back(tierReadStat<UncachedTestItemRepo, true>(ids, k));
+    WARN(tierSweepTable("DB only (Uncached) — find -> PostgreSQL", N, db));
+
+    // L2 only — cfg::Redis, no L1; warm L2 so every find is a Redis hit.
+    for (auto id : ids) sync(L2TestItemRepo::find(id));
+    for (int k : levels) l2.push_back(tierReadStat<L2TestItemRepo, true>(ids, k));
+    WARN(tierSweepTable("L2 only (Redis hit) — find -> Redis GET", N, l2));
+
+    // L1 only — warm RAM; finds resolve synchronously (latency not sampled).
+    for (auto id : ids) sync(L1TestItemRepo::find(id));
+    for (int k : levels) l1.push_back(tierReadStat<L1TestItemRepo, false>(ids, k));
+    WARN(tierSweepTable("L1 only (RAM hit) — synchronous (concurrency N/A)", N, l1));
+
+    // Side-by-side at the top concurrency level — the easy-compare view.
+    WARN(tierCompareTable(N, levels.back(), {
+        {"L1 (RAM)",    l1.back()},
+        {"L2 (Redis)",  l2.back()},
+        {"DB (Pg)",     db.back()},
+    }));
+}
