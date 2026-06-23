@@ -109,6 +109,14 @@
   metadata. Cross-instance L2 is closed under `l2_shared_across_instances` (see
   Added).
 
+### Documentation
+
+- **Read-on-error contract.** `find`/`findJson`/`findBinary`/`findMany` collapse
+  a DB error into the empty result, indistinguishable from a genuine miss; reads
+  never throw. Distinguish the two via the raw `PgProvider` path, which rethrows
+  `PgError`. Error visibility is a write-side guarantee (`erase*` → `nullopt`),
+  not a read-side one.
+
 ## [0.5.0-alpha.8] - 2026-06-18
 
 ### Added

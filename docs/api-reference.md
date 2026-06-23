@@ -52,6 +52,8 @@ Single-key reads resolve to an **epoch-guarded `cache::CacheView<E>`** (defined 
 
 > `Immediate<T>` is awaitable, so `co_await Repo::find(id)` compiles uniformly whatever `Cfg` selects — an L1 hit is synchronous and frameless, an L2/L3 miss suspends. See [caching.md](caching.md) for the epoch/eviction model.
 
+> **Reads collapse DB errors into not-found.** `find`/`findJson`/`findBinary`/`findMany` catch `io::PgError` and return the empty result (empty `CacheView`/`MultiView`, empty string, empty vector) — a DB error is **indistinguishable from a genuine miss**, and reads never throw. To distinguish the two, query through the raw `PgProvider` path (`PgProvider::queryParams`, below), which rethrows `PgError` from `await_resume`. The write side is the inverse: `erase`/`eraseMany`/`eraseWhere` return `optional<size_t>` with `nullopt` for a DB error — error visibility is a write-side guarantee, not a read-side one.
+
 ### Writes
 
 Available only when `!Cfg.read_only`. Each write flows down the full chain: L3 commit → L2 SET/evict → L1 store/evict → list invalidation → cross-invalidation. Write coalescing (identical SQL+params) propagates a `coalesced` flag so upper layers skip redundant cache ops.
