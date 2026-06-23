@@ -7,7 +7,7 @@ zero virtual calls, zero runtime configuration overhead.
 ```cpp
 using UserRepo = relais::Repo<UserEntity, "User", config::Both>;
 
-auto user = co_await UserRepo::find(123);   // L1 hit → L2 → DB, transparently
+auto user = co_await UserRepo::find(123);   // L1 → L2 → L3, transparently
 ```
 
 One `using` alias declares a fully-cached repository. The cache tower, list
@@ -23,14 +23,15 @@ config and the entity's traits — you pay for exactly what you enable.
   template parameter, tuned with `consteval` fluent chaining. Cache strategy is
   a type, not a runtime flag.
 - **Decoupled entities.** Pure framework-agnostic structs; `Entity<Struct,
-  Mapping>` adds ORM + thread-safe lazy BEVE/JSON only at the API layer.
+  Mapping>` adds ORM + on-demand BEVE/JSON only at the API layer.
 - **Auto-detected features.** List caching activates when the entity has a
   `ListDescriptor`; cross-invalidation activates when you pass `Invalidate...`
   descriptors.
-- **Type-safe by construction.** Hierarchical concepts (`ReadableEntity` →
-  `CacheableEntity` → `MutableEntity` → `CreatableEntity`) and `requires`
-  clauses turn misuse (writing to a read-only repo, `patch` without a `Field`
-  enum) into compile errors.
+- **Type-safe by construction.** Concepts rooted at `ReadableEntity` —
+  `CacheableEntity` (read + serialize) and `MutableEntity` → `CreatableEntity`
+  (read + write [+ key]) as independent branches — and `requires` clauses turn
+  misuse (writing to a read-only repo, `patch` without a `Field` enum) into
+  compile errors.
 - **Shared-nothing runtime.** Async I/O over epoll coroutines; per-loop
   connection pools, no cross-thread hops on the hot path.
 
@@ -38,8 +39,7 @@ config and the entity's traits — you pay for exactly what you enable.
 
 - C++23 compiler (GCC 13+, Clang 17+), CMake 3.20+
 - PostgreSQL (libpq)
-- [shardmap](https://github.com/jcailloux/shardmap) — in-memory TTL cache
-- [glaze](https://github.com/stephenberry/glaze) — JSON/BEVE serialization
+- [glaze](https://github.com/stephenberry/glaze) — JSON/BEVE serialization (fetched automatically)
 - Redis (optional, for L2)
 
 ## Install
@@ -47,16 +47,16 @@ config and the entity's traits — you pay for exactly what you enable.
 ```cmake
 include(FetchContent)
 
-FetchContent_Declare(shardmap
-    GIT_REPOSITORY https://github.com/jcailloux/shardmap.git GIT_TAG main)
-FetchContent_MakeAvailable(shardmap)          # declare shardmap first
-
 FetchContent_Declare(relais
     GIT_REPOSITORY https://github.com/jcailloux/relais.git GIT_TAG main)
-FetchContent_MakeAvailable(relais)
+FetchContent_MakeAvailable(relais)            # pulls glaze transitively
 
 target_link_libraries(my_app PRIVATE jcailloux::relais)
 ```
+
+relais needs `find_package(PostgreSQL)` to succeed (libpq dev headers) and pulls
+glaze itself; the L1 hash map (ChunkMap) and its lock-free backend are vendored —
+no extra `FetchContent` to declare.
 
 To run the entity generator as a build step, also put relais's `cmake/` on the
 module path — see
@@ -117,7 +117,8 @@ using SessRepo = relais::Repo<SessionEntity, "Session",
 | `Cfg` | `CacheConfig` | `config::Local` | Cache behavior (NTTP) |
 | `Invalidations...` | types | — | Cross-invalidation descriptors |
 
-Key is auto-deduced from `Entity::key()`.
+Key is auto-deduced from `Entity::key()` — the accessor relais exposes over your
+`primary_key` field (here `id`).
 
 ### 4 — Stand up the runtime, then call
 
@@ -139,8 +140,7 @@ io::Task<void> example() {
     auto user = co_await UserRepo::find(123);              // cached read
 
     UserEntity u; u.username = "alice"; u.email = "alice@example.com";
-    auto created = co_await UserRepo::insert(
-        std::make_shared<const UserEntity>(std::move(u)));
+    auto created = co_await UserRepo::insert(u);           // takes const E&
 
     using F = UserEntity::Field;
     using jcailloux::relais::entity::set;
@@ -181,7 +181,7 @@ Each file owns one subject and reads on its own. Pick by what you're trying to d
 | **Do** a task — runtime | [docs/runtime.md](docs/runtime.md) | `IoPool`, N-loop scaling, the threading rule. |
 | **Look up** a signature | [docs/api-reference.md](docs/api-reference.md) | The exhaustive public surface — every method, config field, descriptor, list/query type, runtime type, annotation index. Every guide links here. |
 | **Integrate** on an existing loop | [docs/runtime.md](docs/runtime.md) → [docs/foreign-event-loops.md](docs/foreign-event-loops.md) | Co-locate relais on a framework loop (Drogon/asio/…) via an `IoContext` adapter — advanced, optional. |
-| **Dissect** the implementation | [docs/internals.md](docs/internals.md) | Mixin chain, RepoBuilder, cache tier, ListCache, ModificationTracker — for contributors. |
+| **Dissect** the implementation | [docs/internals.md](docs/internals.md) | Mixin chain, layer selection, cache tiers, ListCache, ModificationTracker — for contributors. |
 | **Run** an example | [examples/](examples/README.md) | CI-compiled counterparts to the runtime snippets. |
 
 **Reading paths**

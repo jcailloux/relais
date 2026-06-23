@@ -11,9 +11,9 @@ This document describes the internal architecture of relais for contributors and
 
 ## Contents
 
-1. [Repository Mixin Chain](#repository-mixin-chain) — method-hiding tower, `RepoBuilder`, conditional layer selection
+1. [Repository Mixin Chain](#repository-mixin-chain) — method-hiding tower, `CacheLayerSelector`/`MixinStack`, conditional layer selection
 2. [Configuration System — CacheConfig NTTP](#configuration-system--cacheconfig-nttp) — compile-time config plumbing
-3. [L1 Cache: CacheTier](#l1-cache-cachetier) — RAM tier over shardmap: by-value storage, singleton, TTL, cleanup
+3. [L1 Cache: CacheTier](#l1-cache-cachetier) — RAM tier over ChunkMap: by-value storage, singleton, TTL, cleanup
 4. [L2 Cache: Redis Integration](#l2-cache-redis-integration) — key format, TTL refresh
 5. [Cache Flow on Operations](#cache-flow-on-operations) — read/delete/write paths across tiers
 6. [ListMixin — Automatic List Caching](#listmixin--automatic-list-caching) — detection, descriptor augmentation, interception
@@ -247,9 +247,9 @@ inline constexpr CacheConfig Both{  .cache_level = CacheLevel::L1_L2,
 ## L1 Cache: CacheTier
 
 The L1 (RAM) cache is a `cache::CacheTier<Key, E, Metadata>` (`cache/CacheTier.h`),
-which wraps a [shardmap](../jcailloux-shardmap) `ChunkMap` and adds GDSF
-admission/scoring, ghost lifecycle, inflight-fetch dedup, TTL, and cleanup behind
-one interface. Two facts drive everything below:
+which wraps a `ChunkMap` (`cache/ChunkMap.h`, relais's own sharded map over the
+vendored `parlay_hash` lock-free table) and adds GDSF admission/scoring, ghost
+lifecycle, inflight-fetch dedup, TTL, and cleanup behind one interface. Two facts drive everything below:
 
 - **Entities are stored by value** — `CacheTier<Key, E, ...>` holds `E`, not a
   `shared_ptr`. A read does not copy: `find()` returns a `Hit` (a `const E*` into
@@ -655,7 +655,7 @@ list/                            # namespace jcailloux::relais::list
 ├── ModificationTracker.h    # Unified modification tracking
 ├── SortDirection.h          # SortDirection enum
 └── spec/                        # namespace list::spec — compile-time descriptors & parsers
-    ├── ListDescriptor.h        # HasListDescriptor concept, descriptor requirements
+    ├── ListDescriptor.h        # descriptor-shape concepts (HasSorts/HasFilters/ValidListDescriptor) — note: HasListDescriptor itself lives in entity/EntityConcepts.h
     ├── ListDescriptorQuery.h   # ListDescriptorQuery<Descriptor> — query type for parsers
     ├── FilterDescriptor.h      # Filter<Name, MemberPtr, ColumnName, Op, ...> template
     ├── SortDescriptor.h        # Sort<Name, MemberPtr, ColumnName, Dir> template
@@ -903,9 +903,10 @@ read, validation short-circuits on the generation, then checks affectedness:
 bool isAffectedByModifications(const MetadataImpl& meta, const Result& result) const {
     uint32_t stored_gen = meta.stored_generation;
     if (!modifications_.hasModificationsSince(stored_gen)) return false;  // O(1) skip
-    // else: forEachModificationWithBitmap / forEachRange — a mod/range affects the
+    // else: forEachModification / forEachRange — a mod/range affects the
     // page if the entity matches the query filters AND its sort value falls within
-    // the page's SortBounds (per-chunk variant: isAffectedByModificationsForChunk).
+    // the page's SortBounds (per-chunk variant isAffectedByModificationsForChunk
+    // adds the bitmap skip: forEachModificationWithBitmap).
 }
 ```
 
@@ -1022,7 +1023,7 @@ class Entity : public Struct {
   no cached `shared_ptr`, no `releaseCaches()`. `binary()`/`json()` re-serialize on
   every call. For *cached* serialization, use `Repo::findJson()` / `findBinary()`,
   which serve the bytes off L1/L2.
-- `Entity` does **not** conditionally expose `makeFullKeyParams` or `ListDescriptor`
+- `Entity` does **not** conditionally expose `makePartitionHintParams` or `ListDescriptor`
   — those live on the `Mapping`; the repository detects them there via concepts.
 
 #### Glaze Metadata Resolution
@@ -1180,7 +1181,7 @@ entity/
 ├── SerializationTraits.h   # HasJsonSerialization, HasBinarySerialization
 ├── EntityConcepts.h        # Readable/Serializable/Writable/Keyed + composed concepts;
 │                           # HasListDescriptor, HasFilterSet + FilterSet<E>, HasPartitionHint
-├── FieldUpdate.h          # set<F>(), setNull<F>(), applyFieldUpdate
+├── FieldUpdate.h          # set<F>(), setNull<F>(), fieldColumnName/fieldValue extractors
 └── Entity.h               # Entity<Struct, Mapping>
 ```
 
@@ -1277,7 +1278,7 @@ computed relative path).
 | `nullable` | `std::optional<T>` | `row.getOpt<T>(col)` | Optional parameter in PgParams |
 | `raw_json` | `glz::raw_json_t` | `e.field.str = row.get<std::string>(col)` | `e.field.str` as parameter |
 | `json_field` | Struct / `vector<T>` | `glz::read_json(e.field, row_str)` | `glz::write_json(e.field, json)` |
-| `enum=...` | `enum class` | `glz::read<glz::opts{.format=JSON}>` | `enumToString()` helper |
+| `enum=...` | `enum class` | generated `if (s == "db_val") e.field = Enum::val;` chain | generated `switch` pushing the `db_val` string literals |
 
 ### Test Entities
 

@@ -15,21 +15,16 @@ event loop** instead of bridging across threads.
 ## Why you'd want this
 
 If your HTTP framework already runs one epoll loop per core (Drogon/trantor,
-asio, libuv, seastar…), the most efficient way to use the relais cache is to
-construct the relais pools **on those same loops**. Then:
+asio, libuv, seastar…), construct the relais pools **on those same loops**:
 
-- an **L1 cache hit** — the common case — is a pure in-process shardmap
-  lookup, ~50 ns, **zero thread hops, zero syscalls** (L1 is a process-global
-  sharded cache shared across loops, not per-loop state);
-- only real **L2/L3 misses** do async I/O, on the same thread, no cross-loop
-  bounce.
+- an **L1 cache hit** is then a pure in-process `ChunkMap` lookup (~50 ns, zero
+  thread hops, zero syscalls — L1 is a process-global sharded cache, not per-loop
+  state);
+- only real **L2/L3 misses** do async I/O, inline on the same thread.
 
-The alternative — keeping relais on its own dedicated loops and bridging from
-the framework's threads — forces a thread hop plus two syscalls **per request,
-even on an L1 hit** (~3 µs of bridge for a 50 ns operation). That topology only
-pays off when you cannot replicate the DB/Redis pools onto every front-end loop
-(e.g. the connection budget won't cover one pool per loop); otherwise,
-co-locate.
+Bridging from the framework's threads to dedicated relais loops instead costs a
+hop + two syscalls per request, even on an L1 hit. Co-locate unless you can't fit
+one DB/Redis pool per front-end loop within your connection budget.
 
 ## Ownership
 
@@ -249,8 +244,8 @@ init-per-loop-thread contract shown above.)
 
 ## The background runtime thread (you don't wire it)
 
-A legitimate worry when co-locating: *"my framework drives the event loops — but
-who ticks relais's cached clock and L1 memory budget?"* Nothing you write.
+When your framework drives the event loops, relais's cached clock and L1 memory
+budget are still ticked — by relais itself, not by anything you write.
 
 relais owns a single `RuntimeThread` — one `jthread`, a 100 ms tick that
 refreshes `CachedClock`, `CachedMemory`, and the GDSF heap accounting. The first

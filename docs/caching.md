@@ -14,7 +14,7 @@ L2 miss → DB → fill L2 → fill L1 → return
 ```
 
 - **L1 (RAM)** — entities held **by value** in a process-global, sharded
-  in-memory cache (`CacheTier`/shardmap) shared across all loop threads; reads
+  in-memory cache (`CacheTier` over `ChunkMap`) shared across all loop threads; reads
   borrow an epoch-guarded `CacheView<E>`, never a `shared_ptr`.
 - **L2 (Redis)** — BEVE binary, shared across instances.
 - **L3 (PostgreSQL)** — source of truth, rows hydrated via `fromRow()`.
@@ -41,38 +41,43 @@ the fields it leans on: `cache_level`, `l1_ttl`, `l2_ttl`, `l2_format`,
 > the structural stand-ins that make `.with_l1_ttl(30min)` and `Repo<E, "Name">`
 > legal as template arguments.
 
-### Bounding L1: TTL *and* memory budget
+### Bounding L1: TTL, and the optional memory budget
 
-L1 has two independent bounds, and **you need at least one of them** or the
-cache grows without limit.
+L1 grows without limit unless something reclaims entries. What's available
+depends on **how relais was compiled**.
 
-**1. TTL (`l1_ttl`)** — a *staleness ceiling* against the source of truth, not
-the eviction mechanism. The default `1h` is a safety net: invalidation covers
+**1. TTL (`l1_ttl`) — always active.** A *staleness ceiling* against the source
+of truth, not a memory cap. The default `1h` is a safety net: invalidation covers
 writes through this repo, but **not** out-of-band mutations (another instance, a
-migration, manual SQL). Setting `with_l1_ttl(0s)` disables time expiry entirely.
+migration, manual SQL). Expiry is **lazy** — an expired entry is dropped when it
+is next looked up (`find()` evicts on read); there is no background sweep in the
+default build, so a key written once and never read again lingers until touched.
+`with_l1_ttl(0s)` disables time expiry entirely.
 
-**2. Memory budget (`RELAIS_L1_MAX_MEMORY`)** — the GDSF eviction trigger. GDSF
-(score = frequency × cost) only evicts **when over budget**; with no budget set,
-`isOverBudget()` always returns `false` and **GDSF never fires**. The budget is
-read once from the environment as a byte count:
+**2. Memory budget + GDSF (`RELAIS_L1_MAX_MEMORY`) — compile-time opt-in.**
+Size-aware GDSF eviction (score = frequency × cost, evicts when over budget) and
+the `RELAIS_L1_MAX_MEMORY` ceiling are **off unless you build with
+`-DRELAIS_GDSF_ENABLED=1`** (the CMake option defaults `OFF`). In a default build
+the budget env var is read but never consulted, GDSF never admits/scores/evicts,
+and the insertion-driven sweep never runs — TTL is the only bound. With GDSF
+enabled, the budget is a hard ceiling enforced by proactive eviction:
 
 ```bash
-RELAIS_L1_MAX_MEMORY=536870912   # 512 MiB; unset/0/invalid = unlimited
+RELAIS_L1_MAX_MEMORY=536870912   # 512 MiB (GDSF builds only); unset/0/invalid = unlimited
 ```
 
-The footgun is the combination:
+The footgun, by build mode:
 
-| `l1_ttl` | Budget set? | L1 memory |
+| Build | `l1_ttl` | L1 memory |
 |---|---|---|
-| `> 0` | no | Bounded by TTL (entries expire on access/sweep) |
-| `> 0` | yes | Bounded by budget (GDSF), TTL trims staleness on top |
-| **`0`** | **no** | **Unbounded — nothing evicts, nothing expires** ⚠️ |
-| `0` | yes | Bounded by budget (GDSF) only |
+| default (no GDSF) | `> 0` | Bounded by TTL + access pattern (lazy expiry on lookup; cold entries linger) |
+| default (no GDSF) | **`0`** | **Unbounded — nothing evicts, nothing expires** ⚠️ (the budget does nothing) |
+| `-DRELAIS_GDSF_ENABLED=1` | `> 0` | Bounded by budget (GDSF proactive eviction); TTL trims staleness on top |
+| `-DRELAIS_GDSF_ENABLED=1` | `0` | Bounded by budget (GDSF) only |
 
-So **`with_l1_ttl(0s)` is only safe with `RELAIS_L1_MAX_MEMORY` set.** Dropping
-the TTL removes the *only* bound a budget-less deployment had. If you turn off
-the TTL for instance-owned data, set a budget — and vice-versa, a budget alone
-(TTL kept) is the most robust setup.
+So in a **default build**, keep `l1_ttl > 0` — it is the only thing bounding L1.
+To cap L1 by *memory* (a hard ceiling with proactive eviction), build with
+`-DRELAIS_GDSF_ENABLED=1` and set `RELAIS_L1_MAX_MEMORY`.
 
 ## Presets
 
