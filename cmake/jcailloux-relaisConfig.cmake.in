@@ -2,6 +2,7 @@
 
 include(CMakeFindDependencyMacro)
 
+find_dependency(Threads)
 find_dependency(PostgreSQL)
 
 if(NOT TARGET glaze::glaze)

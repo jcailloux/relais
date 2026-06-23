@@ -58,6 +58,12 @@ relais needs `find_package(PostgreSQL)` to succeed (libpq dev headers) and pulls
 glaze itself; the L1 hash map (ChunkMap) and its lock-free backend are vendored —
 no extra `FetchContent` to declare.
 
+Alternatively, after `cmake --install`, consume the installed package with
+`find_package(jcailloux-relais REQUIRED)` (target `jcailloux::relais`). The
+vendored parlay_hash headers ship with it, but — like PostgreSQL — **glaze must
+be findable** by the consumer (`find_package(glaze)` resolvable), since it is an
+external dependency, not vendored.
+
 To run the entity generator as a build step, also put relais's `cmake/` on the
 module path — see
 [entities.md › CMake integration](docs/entities.md#cmake-integration).
