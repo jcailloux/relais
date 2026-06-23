@@ -313,8 +313,10 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
         /// Evict the whole affected set from L2 in one variadic UNLINK batch
         /// (sub-chunked at K_redis by RedisCache::invalidateMany), then delegate
         /// down the chain. ⌈N/K_redis⌉ round-trips instead of N evictRedis.
+        /// Latency-critical: the entity UNLINK is awaited by the caller (a
+        /// strictly-after phantom would survive past a detached UNLINK).
         template<bool WithLists = true>
-        static io::Task<void> invalidateManyImpl(std::span<const E> entities) {
+        static io::Task<void> invalidateManyCritical(std::span<const E> entities) {
             std::vector<std::string> keys;
             keys.reserve(entities.size());
             for (const auto& e : entities) {
@@ -335,7 +337,14 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
             }
             co_await cache::RedisCache::invalidateMany(
                 std::span<const std::string>(keys));
-            co_await Base::template invalidateManyImpl<WithLists>(entities);
+            co_await Base::template invalidateManyCritical<WithLists>(entities);
+        }
+
+        /// L2 entity tier has no deferred work — the UNLINK is critical. Pass the
+        /// deferred cascade straight down to the own-list / cross-target tiers.
+        template<bool WithLists = true>
+        static io::Task<void> invalidateManyDeferred(std::span<const E> entities) {
+            co_await Base::template invalidateManyDeferred<WithLists>(entities);
         }
 
         // =====================================================================

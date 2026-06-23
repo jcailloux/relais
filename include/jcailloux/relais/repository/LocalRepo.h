@@ -287,9 +287,16 @@ public:
     /// counter (bumpGeneration is unconsulted) gates nothing here; the ordering
     /// is the actual anti-stale-write invariant.
     template<bool WithLists = true>
-    static io::Task<void> invalidateManyImpl(std::span<const E> entities) {
-        co_await Base::template invalidateManyImpl<WithLists>(entities);
+    static io::Task<void> invalidateManyCritical(std::span<const E> entities) {
+        co_await Base::template invalidateManyCritical<WithLists>(entities);
         for (const auto& e : entities) evict(e.key());
+    }
+
+    /// L1 entity tier has no deferred work — the point-evict is critical RAM.
+    /// Pass the deferred cascade down to the own-list / cross-target tiers.
+    template<bool WithLists = true>
+    static io::Task<void> invalidateManyDeferred(std::span<const E> entities) {
+        co_await Base::template invalidateManyDeferred<WithLists>(entities);
     }
 
     /// Invalidate L1 cache only. Non-coroutine since there is no async work.

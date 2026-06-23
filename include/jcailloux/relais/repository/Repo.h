@@ -278,9 +278,15 @@ public:
         auto keys = detail::dedupStable<Key>(ids);
         auto deleted = co_await Base::eraseManyRaw(std::span<const Key>(keys));
         if (!deleted) co_return std::nullopt;  // DB error
-        co_await Base::template invalidateManyImpl<true>(
+        // Await the latency-critical cleanup (L1 evict + L2 entity UNLINK + gen
+        // bump + L1 list bump), then fire the order-free remainder (cross-target
+        // + L2 list EVALs) detached — the caller returns after DELETE + 1 entity
+        // RTT, not after the full cascade.
+        co_await Base::template invalidateManyCritical<true>(
             std::span<const E>(*deleted));
-        co_return deleted->size();
+        auto n = deleted->size();
+        fireInvalidateManyDeferred<true>(std::move(*deleted));
+        co_return n;
     }
 
     /// Evict the enumerated entities from the cache hierarchy without deleting
@@ -298,8 +304,9 @@ public:
             auto view = co_await Base::find(k);
             if (view) entities.push_back(*view);
         }
-        co_await Base::template invalidateManyImpl<false>(
+        co_await Base::template invalidateManyCritical<false>(
             std::span<const E>(entities));
+        fireInvalidateManyDeferred<false>(std::move(entities));
     }
 
     // =======================================================================
@@ -335,12 +342,17 @@ public:
         //  - own-list tier: ONE RangeModification (L1) + ONE predicate EVAL (L2)
         //    for the whole deleted set — O(1)/O(groups), filter-aware, never-miss.
         // The rows left the table, so their lists change (eraseMany analogue), but
-        // the predicate drives that, not the resolved id set. `*deleted`/`filters`
-        // outlive the await; each child evicts L1 before any submit (anti-stale).
+        // the predicate drives that, not the resolved id set. Await the critical
+        // tiers (entity L1/L2 evict + ONE L1 RangeModification), then fire the
+        // deferred remainder (cross-target + the single predicate L2 list EVAL)
+        // detached. `*deleted`/`filters` outlive the await; each critical child
+        // evicts L1 before any submit (anti-stale).
         co_await io::whenAll(
-            Base::template invalidateManyImpl<false>(std::span<const E>(*deleted)),
-            Base::template invalidateWhereLists<FD>(filters));
-        co_return deleted->size();
+            Base::template invalidateManyCritical<false>(std::span<const E>(*deleted)),
+            Base::template invalidateWhereListsCritical<FD>(filters));
+        auto n = deleted->size();
+        fireEraseWhereDeferred<FD>(std::move(*deleted), filters);
+        co_return n;
     }
 
     /// Evict every row matching the predicate from the cache hierarchy without
@@ -358,8 +370,38 @@ public:
         filters.values = pred.toFilterTuple();
         auto entities = co_await Base::template selectWhereRaw<FD>(filters);
         if (!entities) co_return;  // DB error → nothing evicted
-        co_await Base::template invalidateManyImpl<false>(
+        co_await Base::template invalidateManyCritical<false>(
             std::span<const E>(*entities));
+        fireInvalidateManyDeferred<false>(std::move(*entities));
+    }
+
+private:
+    // ----------------------------------------------------------------------
+    // Fire-and-forget deferred cleanup (commit 13). The detached coroutine owns
+    // the affected set / predicate by value, so the lazy deferred tasks'
+    // references stay live for the whole detached lifetime. Exceptions are
+    // swallowed (best-effort; staleness is l2_ttl-bounded). Defined here (the
+    // most-derived class) so `Base::invalidateManyDeferred` resolves to the chain
+    // top — InvalidationMixin (cross-target) when present, else the own tiers.
+    // ----------------------------------------------------------------------
+
+    template<bool WithLists>
+    static io::DetachedTask fireInvalidateManyDeferred(std::vector<E> entities) {
+        try {
+            co_await Base::template invalidateManyDeferred<WithLists>(
+                std::span<const E>(entities));
+        } catch (...) {}
+    }
+
+    template<typename Desc>
+    static io::DetachedTask fireEraseWhereDeferred(
+        std::vector<E> deleted, list::spec::Filters<Desc> predicate) {
+        try {
+            co_await io::whenAll(
+                Base::template invalidateManyDeferred<false>(
+                    std::span<const E>(deleted)),
+                Base::template invalidateWhereListsDeferred<Desc>(predicate));
+        } catch (...) {}
     }
 };
 

@@ -125,13 +125,18 @@ struct TestInternals {
         return Repo::template eraseWhereRaw<Descriptor>(filters);
     }
 
-    /// Reach the batch invalidation common path (invalidateManyImpl) — the
-    /// shared downstream of invalidateMany/eraseMany: L1 evict + L2 UNLINK +
-    /// list invalidation + deduplicated cross-inval. Takes the already-resolved
-    /// affected set. Lazy Task: `entities` must outlive the sync().
+    /// Reach the batch invalidation cascade — the shared downstream of
+    /// invalidateMany/eraseMany: L1 evict + L2 UNLINK + list invalidation +
+    /// deduplicated cross-inval. Drives BOTH passes (critical then deferred)
+    /// awaited, so the test observes the full effect deterministically — the
+    /// production facade awaits only the critical pass and fires the deferred one
+    /// fire-and-forget. Takes the already-resolved affected set; the coroutine
+    /// copies the span into its frame, so `entities` must outlive the sync().
     template<typename Repo, typename Ent>
-    static auto invalidateManyImpl(std::span<const Ent> entities) {
-        return Repo::invalidateManyImpl(entities);
+    static jcailloux::relais::io::Task<void> invalidateManyImpl(
+        std::span<const Ent> entities) {
+        co_await Repo::template invalidateManyCritical<true>(entities);
+        co_await Repo::template invalidateManyDeferred<true>(entities);
     }
 
     /// Populate L2 directly in the repo's configured format (BEVE/JSON) under

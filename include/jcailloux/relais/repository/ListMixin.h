@@ -509,25 +509,34 @@ protected:
     /// lists). Per-entity loop for correctness; the single-bump L1 + single-EVAL
     /// L2 collapse is a downstream optimization.
     template<bool WithLists = true>
-    static io::Task<void> invalidateManyImpl(std::span<const Entity> entities) {
-        if constexpr (WithLists) {
-            // L1 list tracker is RAM-only (generation bump), keep the loop.
-            if constexpr (kHasL1) {
-                for (const auto& e : entities) listCache().onEntityDeleted(e);
-            }
-            // L2 selective EVALs are independent per entity — gather them so the
-            // N commands co-pipeline in one flush instead of N sequential RTTs.
-            // Each task reads its entity synchronously before its first suspend
-            // (invalidateL2Created extracts blob/sortVals up front); `entities`
-            // outlives the whenAll await, so the lazy tasks' references stay live.
-            if constexpr (kHasL2) {
-                std::vector<io::Task<size_t>> tasks;
-                tasks.reserve(entities.size());
-                for (const auto& e : entities) tasks.push_back(invalidateL2Deleted(e));
-                co_await io::whenAll(std::move(tasks));
-            }
+    static io::Task<void> invalidateManyCritical(std::span<const Entity> entities) {
+        // L1 list tracker is RAM-only (generation bump) and latency-critical: the
+        // synchronous bump is what guards a concurrent L1 list read-fill against
+        // re-caching a page the deleted rows belonged to (the tracker is consulted
+        // on every list GET). Keep it awaited; the L2 list EVALs are deferred.
+        if constexpr (WithLists && kHasL1) {
+            for (const auto& e : entities) listCache().onEntityDeleted(e);
         }
-        co_await Base::template invalidateManyImpl<WithLists>(entities);
+        co_await Base::template invalidateManyCritical<WithLists>(entities);
+    }
+
+    template<bool WithLists = true>
+    static io::Task<void> invalidateManyDeferred(std::span<const Entity> entities) {
+        // L2 selective EVALs are independent per entity — gather them so the
+        // N commands co-pipeline in one flush instead of N sequential RTTs.
+        // Each task reads its entity synchronously before its first suspend
+        // (invalidateL2Created extracts blob/sortVals up front); `entities`
+        // outlives the whenAll await, so the lazy tasks' references stay live.
+        // Detachable: the synchronous L1 tracker bump (critical pass) already
+        // guards L1 list reads; L2 list pages carry no read-fill recheck guard,
+        // so a straddling L2 list read-fill is l2_ttl-bounded either way.
+        if constexpr (WithLists && kHasL2) {
+            std::vector<io::Task<size_t>> tasks;
+            tasks.reserve(entities.size());
+            for (const auto& e : entities) tasks.push_back(invalidateL2Deleted(e));
+            co_await io::whenAll(std::move(tasks));
+        }
+        co_await Base::template invalidateManyDeferred<WithLists>(entities);
     }
 
     /// Predicate list invalidation (eraseWhere fast-path). Replaces the per-entity
@@ -539,14 +548,29 @@ protected:
     /// repo's ListDescriptor filter tuple (both inherit the same FilterSet), so it
     /// copies straight across.
     template<typename Desc>
-    static io::Task<void> invalidateWhereLists(const list::spec::Filters<Desc>& predicate) {
-        if constexpr (kHasL1 || kHasL2) {
+    static io::Task<void> invalidateWhereListsCritical(
+        const list::spec::Filters<Desc>& predicate) {
+        // ONE RangeModification on the L1 tracker (RAM, synchronous) — the
+        // latency-critical guard for L1 list reads, like the per-entity bump.
+        if constexpr (kHasL1) {
             DescriptorFilters local;
             local.values = predicate.values;
-            if constexpr (kHasL1) { listCache().onEntityRangeDeleted(local); }
-            if constexpr (kHasL2) { co_await invalidateWhereListsL2(local); }
+            listCache().onEntityRangeDeleted(local);
         }
-        co_await Base::template invalidateWhereLists<Desc>(predicate);
+        co_await Base::template invalidateWhereListsCritical<Desc>(predicate);
+    }
+
+    template<typename Desc>
+    static io::Task<void> invalidateWhereListsDeferred(
+        const list::spec::Filters<Desc>& predicate) {
+        // The single predicate EVAL (L2) — detachable like the per-entity list
+        // EVALs; the L1 range bump (critical pass) already guards L1 list reads.
+        if constexpr (kHasL2) {
+            DescriptorFilters local;
+            local.values = predicate.values;
+            co_await invalidateWhereListsL2(local);
+        }
+        co_await Base::template invalidateWhereListsDeferred<Desc>(predicate);
     }
 
     static io::Task<bool> updateWithContext(
