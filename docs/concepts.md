@@ -81,7 +81,7 @@ The presets name the common towers: `Uncached` (PgRepo only), `Local` (+ L1),
 through on a miss, back-filling each tier it passed on the way up:
 
 ```
-L1 hit  → return                              (thread_local RAM, no I/O)
+L1 hit  → return                              (in-process RAM, no I/O)
 L1 miss → L2 hit  → store into L1 → return    (Redis round-trip)
        └→ L2 miss → DB query → store L2 → store L1 → return
 ```
@@ -194,8 +194,8 @@ The practical upshot:
 Speed in relais comes from three independent choices, in order of impact. The
 first two are the built-in path; the third is an advanced opt-in.
 
-1. **The right cache preset.** An L1 hit is a `thread_local` shardmap lookup
-   (~50 ns, no syscall, no I/O); only real L2/L3 misses do async I/O. Choosing the
+1. **The right cache preset.** An L1 hit is an in-process sharded shardmap lookup
+   (~50 ns, no syscall, no I/O, no thread hop); only real L2/L3 misses do async I/O. Choosing the
    tier per entity (`Local`/`Both` for hot reads, `Redis` for cross-instance
    shared data) is the largest lever — see [§2](#2--the-compile-time-mixin-tower)
    and [§3](#3--the-read--write-flow).

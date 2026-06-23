@@ -73,7 +73,7 @@ those existing loops removes it. If relais drives your runtime (jobs, or a serve
 built on `IoPool`), skip this section: no adapter needed.
 
 If your framework already runs one epoll loop per core, run relais **inline on
-those loops** instead — an L1 cache hit is then a pure `thread_local` lookup
+those loops** instead — an L1 cache hit is then a pure in-process lookup
 (~50 ns, zero hops). Write a small `IoContext` adapter for your loop, verify it
 with the conformance harness, then `init()` per loop thread.
 

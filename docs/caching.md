@@ -1,5 +1,10 @@
 # Caching, configuration & partial updates
 
+> **Prerequisite:** the [mental model](concepts.md) — the mixin tower, the
+> read/write flow, and why a tier you don't configure isn't in the binary. This
+> guide is the how-to for the cache tiers; every method signature lives in
+> [api-reference.md › Repository API](api-reference.md#repository-api).
+
 relais composes up to three cache tiers at compile time:
 
 ```
@@ -8,7 +13,9 @@ L1 miss → L2 hit → fill L1 → return
 L2 miss → DB → fill L2 → fill L1 → return
 ```
 
-- **L1 (RAM)** — `shared_ptr<const Entity>`, per-loop `thread_local` shardmap.
+- **L1 (RAM)** — entities held **by value** in a process-global, sharded
+  in-memory cache (`CacheTier`/shardmap) shared across all loop threads; reads
+  borrow an epoch-guarded `CacheView<E>`, never a `shared_ptr`.
 - **L2 (Redis)** — BEVE binary, shared across instances.
 - **L3 (PostgreSQL)** — source of truth, rows hydrated via `fromRow()`.
 
@@ -19,39 +26,20 @@ branching on configuration.
 
 Configuration is a **structural aggregate** passed as a Non-Type Template
 Parameter. Every field has a default; override only what differs, via
-`consteval` fluent chaining.
+`consteval` fluent chaining — each `with_*()` returns a new config at compile
+time (see [Composing](#composing) below).
 
-```cpp
-namespace config = jcailloux::relais::config;
+The full field list (tiers, TTLs, sizing, `update_strategy`, plus the
+cross-instance and read-fill-guard knobs) with defaults, every preset, and all
+`with_*()` signatures is the canonical reference in
+[api-reference.md › CacheConfig](api-reference.md#cacheconfig). This guide covers
+the fields it leans on: `cache_level`, `l1_ttl`, `l2_ttl`, `l2_format`,
+`read_only`.
 
-struct CacheConfig {
-    CacheLevel     cache_level     = CacheLevel::None;
-    bool           read_only       = false;
-    UpdateStrategy update_strategy = UpdateStrategy::InvalidateAndLazyReload;
-
-    // L1 (RAM) — eviction is GDSF (score = frequency × cost), not TTL-driven
-    Duration l1_ttl              = 1h;   // Duration{0} = no TTL (eviction only)
-    uint8_t  l1_chunk_count_log2 = 3;    // 2^3 = 8 chunks (ChunkMap)
-
-    // L2 (Redis)
-    Duration l2_ttl           = 4h;
-    bool     l2_refresh_on_get = false;
-    L2Format l2_format        = L2Format::Binary;   // Binary (BEVE) | Json
-
-    // Fluent chaining (consteval — compile-time only)
-    consteval CacheConfig with_cache_level(CacheLevel) const;
-    consteval CacheConfig with_read_only(bool = true) const;
-    consteval CacheConfig with_update_strategy(UpdateStrategy) const;
-    consteval CacheConfig with_l1_ttl(Duration) const;
-    consteval CacheConfig with_l1_chunk_count_log2(uint8_t) const;
-    consteval CacheConfig with_l2_ttl(Duration) const;
-    consteval CacheConfig with_l2_refresh_on_get(bool) const;
-    consteval CacheConfig with_l2_format(L2Format) const;
-};
-```
-
-`Duration` wraps `std::chrono::duration` (whose private members bar it from NTTP
-aggregates). `FixedString` lets string literals be template parameters.
+> `Duration` wraps `std::chrono::duration` (whose private members bar it from
+> NTTP aggregates); `FixedString` lets string literals be template parameters —
+> the structural stand-ins that make `.with_l1_ttl(30min)` and `Repo<E, "Name">`
+> legal as template arguments.
 
 ### Bounding L1: TTL *and* memory budget
 
@@ -118,8 +106,8 @@ using AuditLogRepo = Repo<AuditLogEntity, "AuditLog",
 Enforced via `requires` clauses, not runtime checks:
 
 ```cpp
-static Task<bool> update(const Key& id, EntityPtr e)
-    requires MutableEntity<Entity> && (!Cfg.read_only);
+static io::Task<bool> update(const Key& id, const E& entity)
+    requires MutableEntity<E> && HasFullUpdate<E> && (!Cfg.read_only);
 ```
 
 ## Partial updates with `patch`
@@ -149,8 +137,9 @@ Requirements:
 - Hand-written entities without `TraitsType` don't support `patch` — gated by
   the `HasFieldUpdate` concept.
 
-Cache handling: L1 (and L2 if present) is invalidated *before* the update; the
-re-fetched entity repopulates caches on the next `find`.
+Cache handling: L1 (and L2 if present) is evicted *before* the `UPDATE` runs;
+`patch` then re-stores the fresh `RETURNING` row into L1 synchronously, so the
+view it returns is already warm. Other tiers re-fill on the next read.
 
 ## Partition-key repositories
 
@@ -236,32 +225,10 @@ Contract:
   → synchronous resolution with no coroutine frame (still allocates the dedup and
   view buffers — the batch wins on misses, not on the all-hit micro-path).
 
-## API surface
+## Method signatures
 
-### Core (all repos)
-
-| Method | Returns | Constraint |
-|---|---|---|
-| `find(id)` | `Task<EntityPtr>` | — |
-| `findJson(id)` | `Task<shared_ptr<const string>>` | — |
-| `insert(entity)` | `Task<EntityPtr>` | `!read_only` |
-| `update(id, entity)` | `Task<bool>` | `!read_only` |
-| `patch(id, set<F>()...)` | `Task<EntityPtr>` | `!read_only`, `HasFieldUpdate` |
-| `erase(id)` | `Task<optional<size_t>>` | `!read_only` |
-| `invalidate(id)` | `Task<void>` | — |
-| `updateJson(id, json)` | `Task<bool>` | `!read_only` |
-| `updateBinary(id, data)` | `Task<bool>` | `!read_only`, `HasBinarySerialization` |
-
-### LocalRepo (L1) extras
-
-| Method | Description |
-|---|---|
-| `findMany(ids)` | Batched multi-id read → guarded `MultiView<E>` (see above) |
-| `trySweep()` | Non-blocking cleanup of expired entries |
-| `purge()` | Force cleanup of all expired entries |
-| `size()` | Current L1 entry count |
-| `warmup()` | Prime cache structures at startup |
-
-List repositories add `query()`, `listSize()`, and a `ListDescriptorType` alias
-— see [lists.md](lists.md).
+Every repository method — reads, writes, deletes/invalidation, and the L1
+maintenance calls — with exact return types and `requires` constraints lives in
+[api-reference.md › Repository API](api-reference.md#repository-api). List repos
+add `query()`/`listSize()` — see [lists.md](lists.md).
 </content>
