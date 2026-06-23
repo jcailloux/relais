@@ -380,6 +380,14 @@ protected:
     // =====================================================================
 
     static epoch::memory_pool<E>& pool() {
+        // Force epoch_s + ThreadIdPool construction before the pool, so they
+        // outlive ~memory_pool()→clear()→num_workers() at static teardown
+        // (statics are destroyed in reverse construction order). Without this,
+        // ThreadIdPool is created lazily on the first Retire — after the pool —
+        // and freed before it, yielding a use-after-free at exit. Mirrors
+        // parlay's own guard in get_default_pool().
+        static const int deps [[maybe_unused]] =
+            (epoch::internal::get_epoch(), parlay::num_thread_ids(), 0);
         static epoch::memory_pool<E> p;
         return p;
     }
