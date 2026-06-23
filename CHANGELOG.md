@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-06-24
+
 ### Added
 
 - **Descriptor-tagged keyset cursor (`Repo::Cursor`).** `Repo::Cursor` is
