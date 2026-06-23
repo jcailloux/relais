@@ -25,10 +25,12 @@ throughput ~linearly with cores at unchanged per-request latency.
 > **Call `PgProvider::init(io, pool)` ON the event-loop thread it serves, once
 > per loop.** Repo calls must then run on that same loop thread.
 
-Providers are `thread_local`, so init() on thread A does nothing for thread B.
-Debug builds assert this for adapters that expose `isInLoopThread()` (relais's
-`EpollIoContext` does); otherwise the first repo call on an un-bound thread fails
-loud with "called before init() on this thread".
+Providers are `thread_local`, so `init()` on thread A binds nothing for thread B.
+In debug builds a repo call on a thread that never ran `init()` trips an `assert`
+— `PgProvider::query() called before init() on this thread (providers are
+thread_local — init() must run on each loop thread)`. `init()` itself also asserts
+`isInLoopThread()` on adapters that expose it (relais's `EpollIoContext` does),
+catching an `init()` on the wrong thread.
 
 ## Easy path: the built-in `IoPool`
 
@@ -75,7 +77,7 @@ those loops** instead — an L1 cache hit is then a pure `thread_local` lookup
 (~50 ns, zero hops). Write a small `IoContext` adapter for your loop, verify it
 with the conformance harness, then `init()` per loop thread.
 
-See **[io-context-adapters.md](io-context-adapters.md)** for the full recipe
+See **[foreign-event-loops.md](foreign-event-loops.md)** for the full recipe
 (adapter sketch, the conformance harness, the per-loop bootstrap with `spawnOn`).
 
 ## Threading contract, summarized
