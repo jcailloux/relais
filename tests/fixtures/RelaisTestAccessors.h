@@ -13,7 +13,9 @@
 #include <optional>
 #include <shared_mutex>
 #include <span>
+#include <vector>
 #include <jcailloux/relais/cache/GDSFPolicy.h>
+#include <jcailloux/relais/io/Task.h>
 
 namespace relais_test {
 
@@ -137,6 +139,31 @@ struct TestInternals {
         std::span<const Ent> entities) {
         co_await Repo::template invalidateManyCritical<true>(entities);
         co_await Repo::template invalidateManyDeferred<true>(entities);
+    }
+
+    /// Detached counterpart of invalidateManyImpl — the exact production facade
+    /// shape (commit 13): await ONLY the critical pass, then fire the deferred
+    /// pass (cross-target + L2 list EVALs) fire-and-forget. Lets a benchmark
+    /// measure caller time-to-return (critical only) against the drained
+    /// invalidateManyImpl (critical + deferred). Takes the same borrowed span as
+    /// invalidateManyImpl (symmetric caller-side cost); the fired deferred owns
+    /// its own copy so the set stays valid across every Redis suspend — mirroring
+    /// the facade, which moves an already-owned vector into the DetachedTask.
+    template<typename Repo, typename Ent>
+    static jcailloux::relais::io::Task<void> invalidateManyDetached(
+        std::span<const Ent> entities) {
+        co_await Repo::template invalidateManyCritical<true>(entities);
+        fireInvalidateManyDeferred<Repo, Ent>(
+            std::vector<Ent>(entities.begin(), entities.end()));
+    }
+
+    template<typename Repo, typename Ent>
+    static jcailloux::relais::io::DetachedTask fireInvalidateManyDeferred(
+        std::vector<Ent> entities) {
+        try {
+            co_await Repo::template invalidateManyDeferred<true>(
+                std::span<const Ent>(entities));
+        } catch (...) {}
     }
 
     /// Populate L2 directly in the repo's configured format (BEVE/JSON) under
