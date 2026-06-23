@@ -3,6 +3,9 @@ project(jcailloux-relais VERSION 0.5.0 LANGUAGES CXX)
 
 add_library(jcailloux-relais INTERFACE)
 add_library(jcailloux::relais ALIAS jcailloux-relais)
+# Export under the alias name so find_package() consumers and add_subdirectory()
+# consumers both see jcailloux::relais (not jcailloux::jcailloux-relais).
+set_target_properties(jcailloux-relais PROPERTIES EXPORT_NAME relais)
 
 target_include_directories(jcailloux-relais INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -71,10 +74,16 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(glaze)
 
-# ParlayHash (vendored) — lock-free hash map + epoch-based reclamation
+include(GNUInstallDirs)   # defines CMAKE_INSTALL_INCLUDEDIR, used just below
+
+# ParlayHash (vendored) — lock-free hash map + epoch-based reclamation.
+# Exported as part of our install set: the headers ship into the package's
+# include dir and the INTERFACE target carries an INSTALL_INTERFACE include path,
+# so a find_package() consumer resolves <parlay_hash/...> with nothing to re-add.
 add_library(parlayhash INTERFACE)
 target_include_directories(parlayhash INTERFACE
-    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/parlayhash/include")
+    "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party/parlayhash/include>"
+    "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>")
 target_compile_features(parlayhash INTERFACE cxx_std_17)
 
 find_package(Threads REQUIRED)
@@ -82,7 +91,7 @@ find_package(PostgreSQL REQUIRED)
 
 target_link_libraries(jcailloux-relais INTERFACE
     $<BUILD_INTERFACE:glaze::glaze>
-    $<BUILD_INTERFACE:parlayhash>
+    parlayhash
     Threads::Threads
     PostgreSQL::PostgreSQL
 )
@@ -91,13 +100,20 @@ target_link_libraries(jcailloux-relais INTERFACE
 # Install
 # =============================================================================
 include(CMakePackageConfigHelpers)
-include(GNUInstallDirs)
 
-install(TARGETS jcailloux-relais
+# Export both the public target and the vendored parlayhash INTERFACE target so
+# the installed jcailloux-relaisTargets.cmake is self-contained.
+install(TARGETS jcailloux-relais parlayhash
     EXPORT jcailloux-relaisTargets
 )
 
 install(DIRECTORY include/
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+)
+
+# Vendored parlay_hash headers — ship alongside relais headers so the exported
+# parlayhash INSTALL_INTERFACE include path resolves in a find_package() consumer.
+install(DIRECTORY third_party/parlayhash/include/
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
 )
 
