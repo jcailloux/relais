@@ -3,7 +3,10 @@
 Paginated query results, cached in L1 with lazy validation via modification
 tracking. **Auto-activated** when the entity's Mapping carries an embedded
 `ListDescriptor` (detected by the `HasListDescriptor` concept) — no extra
-configuration on the `Repo`.
+configuration on the `Repo`. The generator emits a `ListDescriptor` only when the
+entity has **at least one `sortable` field**; `filterable` alone gives you
+`eraseWhere`/`invalidateWhere` (see [Behavior & gotchas](#behavior--gotchas)) but
+no cached list.
 
 > **Prerequisite:** [concepts.md](concepts.md) and [entities.md](entities.md).
 > This guide teaches list declaration and querying; the exact builder,
@@ -69,12 +72,9 @@ defaulting to `false`.
 
 `filterable:nin` (alias `not_in`) is the logical inverse of `in`: it matches a
 column whose value is in *none* of the set. It shares the `in` machinery
-end-to-end — same comma-separated HTTP param, same canonicalization (dedup +
-sort), same element types (`int64`, `int32`, `std::string`, `bool`), same 256
-bound, same compile-time rejection of `enum` and converters. SQL uses
-`!= ALL($n)` with a single array param, mirroring `in`'s `= ANY($n)`.
-
-Two semantics differ from `in`:
+end-to-end (same param, canonicalization, element types, 256 bound, compile-time
+rejections); SQL uses `!= ALL($n)`, mirroring `in`'s `= ANY($n)`. Two semantics
+differ from `in`:
 
 - **NULL is excluded, not included.** A NULL column value matches neither `in`
   nor `nin` — `value NOT IN (…)` is SQL three-valued NULL, so the row drops out.
@@ -142,18 +142,21 @@ io::Task<std::string> handleAuditLogList(
 {
     // Parse + validate against the ListDescriptor
     auto q = parseListQueryStrict<AuditLogRepo::ListDescriptorType>(params);
-    if (!q) {
-        // q.error() describes the validation failure
-    }
+    if (!q)
+        co_return R"({"error":"invalid query"})";  // q.error() has the detail
 
-    auto result = co_await AuditLogRepo::query(std::move(*q));  // L1 cached
-    co_return *result.json();                                   // shared_ptr<const string>
+    auto result = co_await AuditLogRepo::query(std::move(*q));  // L1 cached, CacheView
+    co_return result->json();                                   // ListWrapper::json() → std::string
 }
 ```
 
 `parseListQueryStrict` takes a generic map (default
 `unordered_map<string, string>`) and validates every parameter against the
-descriptor.
+descriptor. `query()` returns a guarded list view (`CacheView<ListWrapper<Entity>>`)
+either way; here `result->json()` serializes it to a `std::string`, while the
+[C++ section](#query-from-c-code-no-http) below reads the struct accessors
+(`view->items`) on the same view. (For JSON directly, `queryJson(q)` returns an
+`io::Immediate<std::string>` and skips the view.)
 
 ## Query from C++ code (no HTTP)
 
@@ -241,11 +244,9 @@ repo's params) does not compile — distinct types, no conversion.
 
 What the tag does **not** catch: `Repo::Cursor::decode` does not verify that a
 token actually originated from *this* descriptor's pages. A well-formed token
-minted by another list decodes successfully and yields a same-typed cursor whose
-keyset bytes are meaningless for this query. This is intrinsic — the token is
-opaque and arrives off the wire, so its provenance cannot be a compile-time
-fact; intra-descriptor coherence (cursor vs the request's current sort) is
-likewise a runtime concern. Re-emit only the `next_cursor` a page handed you.
+minted by another list decodes to a same-typed cursor whose keyset bytes are
+meaningless for this query — provenance can't be a compile-time fact for an opaque
+token off the wire. Re-emit only the `next_cursor` a page handed you.
 
 ### Filter object model
 
@@ -265,10 +266,10 @@ never coincides with the declaration site and is a footgun.
   straight into SQL. For "load everything", set `limit` above the row count
   yourself — exceeding `maxLimit` silently yields a truncated page, no error.
 - **At least one `sortable` field is required.** The generator embeds a
-  `ListDescriptor` **only when the entity has ≥1 sort**; `filterable`/`limits`
-  alone yield a `FilterSet` but no `ListDescriptor`, so `HasListDescriptor` fails
-  and `ListMixin` is never activated. Cursor pagination needs a deterministic
-  order — so `filterable` alone won't give you a cached list (it still powers
+  `ListDescriptor` **only when the entity has ≥1 sort**; `filterable` alone
+  yields a `FilterSet` but no `ListDescriptor`, so `HasListDescriptor` fails and
+  `ListMixin` is never activated. Cursor pagination needs a deterministic order —
+  so `filterable` alone won't give you a cached list (it still powers
   `eraseWhere`/`invalidateWhere`).
 - **Composite keys are supported.** The keyset cursor spans every primary-key
   column, so an entity with a composite key (including an all-PK junction) can

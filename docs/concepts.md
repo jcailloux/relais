@@ -87,10 +87,10 @@ L1 miss → L2 hit  → store into L1 → return    (Redis round-trip)
 ```
 
 A hit on L1 is a synchronous, frameless lookup; only a real L2/L3 miss does
-asynchronous I/O. On a miss the fetched value is stored back into the tiers it
-passed — awaited before the read returns, with a recheck that drops the store if a
-concurrent write invalidated the key mid-fetch (so a back-fill is never stale).
-(Batched warm-fills, on the multi-key path, are instead detached fire-and-forget.)
+asynchronous I/O. The back-fill is awaited before the read returns, with a recheck
+that drops the store if a concurrent write invalidated the key mid-fetch (so a
+back-fill is never stale). Batched warm-fills, on the multi-key path, are instead
+detached fire-and-forget.
 
 **Writes go the other way: invalidate, then commit.** A mutation commits to
 PostgreSQL, then *evicts* the affected entries from L2 and L1 (and bumps the list
@@ -191,10 +191,9 @@ The practical upshot:
 
 ## Performance model
 
-Speed in relais comes from three independent choices, in order of impact. The
-first two are the built-in path; the third is an advanced opt-in.
+Speed in relais comes from three independent choices, in order of impact.
 
-1. **The right cache preset.** An L1 hit is an in-process sharded shardmap lookup
+1. **The right cache preset.** An L1 hit is an in-process sharded-map (`ChunkMap`) lookup
    (~50 ns, no syscall, no I/O, no thread hop); only real L2/L3 misses do async I/O. Choosing the
    tier per entity (`Local`/`Both` for hot reads, `Redis` for cross-instance
    shared data) is the largest lever — see [§2](#2--the-compile-time-mixin-tower)
