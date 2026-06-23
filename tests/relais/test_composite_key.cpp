@@ -108,8 +108,8 @@ TEST_CASE("CompositeKey<TestMembership> - CRUD (Uncached)",
 
         auto updated = makeTestMembership(101, 201, "owner");
         Key key{101, 201};
-        bool ok = sync(UncachedTestMembershipRepo::update(key, updated));
-        REQUIRE(ok);
+        auto ok = sync(UncachedTestMembershipRepo::update(key, updated));
+        REQUIRE(ok == 1);
 
         auto found = sync(UncachedTestMembershipRepo::find(key));
         REQUIRE(found != nullptr);
@@ -316,8 +316,8 @@ TEST_CASE("CompositeKey<TestMembership> - L1+L2 Cache",
 
         // Update
         auto updated = makeTestMembership(131, 231, "admin");
-        bool ok = sync(FullCacheTestMembershipRepo::update(key, updated));
-        REQUIRE(ok);
+        auto ok = sync(FullCacheTestMembershipRepo::update(key, updated));
+        REQUIRE(ok == 1);
 
         // Find updated entity
         auto found = sync(FullCacheTestMembershipRepo::find(key));

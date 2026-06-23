@@ -52,7 +52,7 @@ Single-key reads resolve to an **epoch-guarded `cache::CacheView<E>`** (defined 
 
 > `Immediate<T>` is awaitable, so `co_await Repo::find(id)` compiles uniformly whatever `Cfg` selects — an L1 hit is synchronous and frameless, an L2/L3 miss suspends. See [caching.md](caching.md) for the epoch/eviction model.
 
-> **Reads collapse DB errors into not-found.** `find`/`findJson`/`findBinary`/`findMany` catch `io::PgError` and return the empty result (empty `CacheView`/`MultiView`, empty string, empty vector) — a DB error is **indistinguishable from a genuine miss**, and reads never throw. To distinguish the two, query through the raw `PgProvider` path (`PgProvider::queryParams`, below), which rethrows `PgError` from `await_resume`. The write side is the inverse: `erase`/`eraseMany`/`eraseWhere` return `optional<size_t>` with `nullopt` for a DB error — error visibility is a write-side guarantee, not a read-side one.
+> **Reads collapse DB errors into not-found.** `find`/`findJson`/`findBinary`/`findMany` catch `io::PgError` and return the empty result (empty `CacheView`/`MultiView`, empty string, empty vector) — a DB error is **indistinguishable from a genuine miss**, and reads never throw. To distinguish the two, query through the raw `PgProvider` path (`PgProvider::queryParams`, below), which rethrows `PgError` from `await_resume`. The write side is the inverse: `update`/`erase`/`eraseMany`/`eraseWhere` return `optional<size_t>` with `nullopt` for a DB error — error visibility is a write-side guarantee, not a read-side one.
 
 ### Writes
 
@@ -61,9 +61,9 @@ Available only when `!Cfg.read_only`. Each write flows down the full chain: L3 c
 | Method | Returns | Constraints | Notes |
 |---|---|---|---|
 | `insert(const E& e)` | `Task<CacheView<E>>` | `CreatableEntity<E,Key>` (L1/L2) / `MutableEntity<E>` (L3) `&& !Cfg.read_only` | Empty view on error. Populates L1+L2; notifies lists. |
-| `update(const Key&, const E&)` | `Task<bool>` | `MutableEntity<E> && HasFullUpdate<E> && !Cfg.read_only` | `true` on success. Strategy via `Cfg.update_strategy`: `InvalidateAndLazyReload` (evict) vs optimistic write-through. |
-| `updateJson(const Key&, std::string_view)` | `Task<bool>` | `MutableEntity<E> && HasFullUpdate<E> && !Cfg.read_only` | Parses JSON → `update`. `false` on parse failure. |
-| `updateBinary(const Key&, std::span<const uint8_t>)` | `Task<bool>` | `… && HasBinarySerialization<E> && !Cfg.read_only` | Parses BEVE → `update`. `false` on parse failure. |
+| `update(const Key&, const E&)` | `Task<std::optional<size_t>>` | `MutableEntity<E> && HasFullUpdate<E> && !Cfg.read_only` | Rows affected (`0` = not found), `nullopt` = DB error. Strategy via `Cfg.update_strategy`: `InvalidateAndLazyReload` (evict) vs optimistic write-through. |
+| `updateJson(const Key&, std::string_view)` | `Task<std::optional<size_t>>` | `MutableEntity<E> && HasFullUpdate<E> && !Cfg.read_only` | Parses JSON → `update`. `nullopt` on parse failure or DB error. |
+| `updateBinary(const Key&, std::span<const uint8_t>)` | `Task<std::optional<size_t>>` | `… && HasBinarySerialization<E> && !Cfg.read_only` | Parses BEVE → `update`. `nullopt` on parse failure or DB error. |
 | `patch(const Key&, Updates&&...)` | `Task<CacheView<E>>` | `HasFieldUpdate<E> && !Cfg.read_only` | Variadic field updates (`UPDATE … RETURNING`); ≥1 update required. Evicts then re-fills cache; returns the refreshed view. |
 
 > `HasFullUpdate<E>` = generator emitted `toUpdateParams` (false for all-PK junction tables, so `update`/`updateJson`/`updateBinary` are cleanly *absent* there — `patch` still works via `HasFieldUpdate`).

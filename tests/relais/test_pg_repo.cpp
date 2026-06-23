@@ -119,12 +119,22 @@ TEST_CASE("PgRepo<TestItem> - update", "[integration][db][base][item]") {
 
         auto success = sync(UncachedTestItemRepo::update(id,
             makeTestItem("Updated", 20, "", true, id)));
-        REQUIRE(success == true);
+        REQUIRE(success.has_value());
+        REQUIRE(*success == 1);
 
         fetched = sync(UncachedTestItemRepo::find(id));
         REQUIRE(fetched != nullptr);
         REQUIRE(fetched->name == "Updated");
         REQUIRE(fetched->value == 20);
+    }
+
+    SECTION("[update] returns 0 rows for non-existent id") {
+        // Parity with erase: not-found is 0 affected rows (a value), not a DB
+        // error (nullopt). Distinguishes "row absent" from "query failed".
+        auto updated = sync(UncachedTestItemRepo::update(999999999,
+            makeTestItem("Ghost", 1, "", true, 999999999)));
+        REQUIRE(updated.has_value());
+        REQUIRE(*updated == 0);
     }
 
     SECTION("[update] preserves fields not changed") {

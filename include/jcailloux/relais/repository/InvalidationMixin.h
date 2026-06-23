@@ -60,7 +60,7 @@ public:
     /// Update entity and propagate cross-invalidation with old/new data.
     /// When Base is ListMixin, reuses the pre-fetched old entity via WithContext
     /// to avoid a redundant L1 lookup.
-    static io::Task<bool> update(const Key& id, const Entity& entity)
+    static io::Task<std::optional<size_t>> update(const Key& id, const Entity& entity)
         requires MutableEntity<Entity> && HasFullUpdate<Entity> && (!Base::config.read_only)
     {
         std::optional<Entity> old;
@@ -69,18 +69,18 @@ public:
             if (view) old.emplace(*view);
         }
 
-        bool ok;
+        std::optional<size_t> affected;
         if constexpr (detail::HasListMixin<Base>) {
-            ok = co_await Base::updateWithContext(id, entity, old ? &*old : nullptr);
+            affected = co_await Base::updateWithContext(id, entity, old ? &*old : nullptr);
         } else {
-            ok = co_await Base::update(id, entity);
+            affected = co_await Base::update(id, entity);
         }
 
-        if (ok) {
+        if (affected.value_or(0) > 0) {
             co_await propagateUpdate<Entity, InvList>(
                 old ? &*old : nullptr, entity);
         }
-        co_return ok;
+        co_return affected;
     }
 
     /// Erase entity and propagate cross-invalidation with deleted data.

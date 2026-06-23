@@ -212,13 +212,14 @@ public:
     }
 
     /// Update entity in database with L1 cache handling.
-    static io::Task<bool> update(const Key& id, const E& entity)
+    /// Returns: rows affected (0 if not found), or nullopt on DB error.
+    static io::Task<std::optional<size_t>> update(const Key& id, const E& entity)
         requires MutableEntity<E> && HasFullUpdate<E> && (!Cfg.read_only)
     {
         using enum config::UpdateStrategy;
 
         auto outcome = co_await Base::updateOutcome(id, entity);
-        if (outcome.success && !outcome.coalesced) {
+        if (outcome.affected.value_or(0) > 0 && !outcome.coalesced) {
             if constexpr (Cfg.update_strategy == InvalidateAndLazyReload) {
                 evict(id);
             } else {
@@ -227,7 +228,7 @@ public:
                 tier().store(id, E(entity), buildMetadata());
             }
         }
-        co_return outcome.success;
+        co_return outcome.affected;
     }
 
     /// Partial update: invalidates L1, delegates to Base::patchRaw,
