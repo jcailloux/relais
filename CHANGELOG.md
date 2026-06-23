@@ -116,6 +116,12 @@
   metadata. Cross-instance L2 is closed under `l2_shared_across_instances` (see
   Added).
 
+- **Static-destruction-order use-after-free in the epoch entity/list pools.** The
+  per-repo `memory_pool` was constructed before its `ThreadIdPool` dependency
+  (lazily created on the first retire), so at process exit the pool's destructor
+  read a freed `ThreadIdPool`. The pool accessors now force the epoch and thread
+  pool to construct first, guaranteeing reverse-order teardown.
+
 ### Documentation
 
 - **Read-on-error contract.** `find`/`findJson`/`findBinary`/`findMany` collapse
