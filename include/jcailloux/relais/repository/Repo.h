@@ -21,7 +21,7 @@
 namespace jcailloux::relais {
 
 // =============================================================================
-// RepoBuilder — assembles the mixin chain from template parameters
+// CacheLayerSelector + MixinStack — assemble the mixin chain from template params
 // =============================================================================
 //
 // Chain (bottom to top):

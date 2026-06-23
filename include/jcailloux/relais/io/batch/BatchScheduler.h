@@ -143,7 +143,7 @@ public:
     /// execute in submission order even when they land in the same batch. Order
     /// BETWEEN batches is the caller's responsibility, carried by `co_await`
     /// (read-your-writes intra-flow). The scheduler does NOT track write
-    /// dependencies across concurrent coroutines. See docs/runtime-and-threading.md.
+    /// dependencies across concurrent coroutines. See docs/runtime.md.
     Task<WriteResult> submitPgWrite(const char* sql, PgParams params) {
         PgWriteEntry entry;
         entry.sql = sql;
@@ -951,7 +951,7 @@ private:
         // Sort by submission sequence: restores submission order regardless of
         // how entries were accumulated/coalesced, so intra-batch write→write
         // order == seq order == the order the caller submitted them. This is the
-        // write-ordering contract (docs/runtime-and-threading.md).
+        // write-ordering contract (docs/runtime.md).
         std::sort(entries.begin(), entries.end(),
             [](const auto* a, const auto* b) { return a->seq < b->seq; });
 
