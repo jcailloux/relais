@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -56,7 +57,7 @@ public:
     /// Execute a simple SQL query (no parameters).
     /// @note sql must remain valid until the co_await completes.
     static io::Task<io::PgResult> query(const char* sql) {
-        assert(pg_query_ && "PgProvider::query() called before init() on this thread (providers are thread_local — init() must run on each loop thread)");
+        if (!pg_query_) throw std::logic_error("PgProvider::query() called before init() on this thread (providers are thread_local — init() must run on each loop thread)");
         return pg_query_(sql);
     }
 
@@ -65,7 +66,7 @@ public:
     static io::Task<io::PgResult> queryParams(
         const char* sql, const io::PgParams& params)
     {
-        assert(pg_query_params_ && "PgProvider::queryParams() called before init() on this thread (providers are thread_local — init() must run on each loop thread)");
+        if (!pg_query_params_) throw std::logic_error("PgProvider::queryParams() called before init() on this thread (providers are thread_local — init() must run on each loop thread)");
         return pg_query_params_(sql, params);
     }
 
@@ -76,7 +77,7 @@ public:
         const char* batch_sql, const char* single_sql,
         const io::PgParams& params)
     {
-        assert(pg_entity_query_ && "PgProvider::entityQueryParams() called before init() on this thread (providers are thread_local — init() must run on each loop thread)");
+        if (!pg_entity_query_) throw std::logic_error("PgProvider::entityQueryParams() called before init() on this thread (providers are thread_local — init() must run on each loop thread)");
         return pg_entity_query_(batch_sql, single_sql, params);
     }
 
@@ -88,7 +89,7 @@ public:
         const char* batch_sql, const char* single_sql,
         std::vector<io::PgParams> keys)
     {
-        assert(pg_entity_query_many_ && "PgProvider::entityQueryParamsMany() called before init() on this thread (providers are thread_local — init() must run on each loop thread)");
+        if (!pg_entity_query_many_) throw std::logic_error("PgProvider::entityQueryParamsMany() called before init() on this thread (providers are thread_local — init() must run on each loop thread)");
         return pg_entity_query_many_(batch_sql, single_sql, std::move(keys));
     }
 
@@ -102,7 +103,7 @@ public:
     static io::Task<io::batch::PgWriteResult> queryWrite(
         const char* sql, const io::PgParams& params)
     {
-        assert(pg_write_ && "PgProvider::queryWrite() called before init() on this thread (providers are thread_local — init() must run on each loop thread)");
+        if (!pg_write_) throw std::logic_error("PgProvider::queryWrite() called before init() on this thread (providers are thread_local — init() must run on each loop thread)");
         return pg_write_(sql, params);
     }
 
@@ -131,7 +132,7 @@ public:
     ///       std::string_view(reinterpret_cast<const char*>(bin.data()), bin.size()));
     template<typename... Args>
     static io::Task<io::RedisResult> redis(Args&&... args) {
-        assert(redis_exec_ && "PgProvider::redis() called before init() or Redis not configured");
+        if (!redis_exec_) throw std::logic_error("PgProvider::redis() called before init() or Redis not configured");
 
         // Build argv in the coroutine frame — lifetime extends until co_await completes.
         std::vector<std::string> arg_strs;
@@ -155,7 +156,7 @@ public:
     /// (e.g. MGET over N keys). `args` is the full argv — verb first — taken by
     /// value and kept alive in the coroutine frame. Binary-safe (length-prefixed).
     static io::Task<io::RedisResult> redisDynamic(std::vector<std::string> args) {
-        assert(redis_exec_ && "PgProvider::redisDynamic() called before init() or Redis not configured");
+        if (!redis_exec_) throw std::logic_error("PgProvider::redisDynamic() called before init() or Redis not configured");
 
         std::vector<const char*> argv;
         std::vector<size_t> argvlen;
