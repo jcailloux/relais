@@ -852,7 +852,13 @@ TEST_CASE("Entity read fusion: concurrent find + findMany share one ANY",
     TimeoutGuard timeout(io);
 
     auto task = [&]() -> DetachedTask {
-        auto pool = co_await PgPool<Io>::create(io, CONNINFO, 4, 4);
+        // Single connection: the temp table below is connection-local, while
+        // the leader's direct read and the fused ANY each acquire from the pool.
+        // A multi-connection pool would split them across connections — only one
+        // holds the data — so the fused read can land on an empty table. The
+        // fusion path (dedup + fan-out) runs entirely on one pipelined
+        // connection regardless, so a 1-connection pool exercises it fully.
+        auto pool = co_await PgPool<Io>::create(io, CONNINFO, 1, 1);
         auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, nullptr, 8);
 
         // Bootstrap so Nagle batching is active (else every read goes direct).
