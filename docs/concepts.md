@@ -13,7 +13,7 @@ Five ideas carry the whole library:
 4. [The shared-nothing runtime](#4--the-shared-nothing-runtime) — one event loop per thread, no cross-thread hops.
 5. [Type-safety by concepts](#5--type-safety-by-concepts) — capability is a compile-time property; misuse doesn't compile.
 
-A closing [performance model](#performance-model) ties the three speed levers together.
+A closing [performance model](#performance-model) ties the four speed levers together.
 
 ---
 
@@ -191,18 +191,24 @@ The practical upshot:
 
 ## Performance model
 
-Speed in relais comes from three independent choices, in order of impact.
+Speed in relais comes from four independent choices, in order of impact.
 
 1. **The right cache preset.** An L1 hit is an in-process sharded-map (`ChunkMap`) lookup
    (~50 ns, no syscall, no I/O, no thread hop); only real L2/L3 misses do async I/O. Choosing the
    tier per entity (`Local`/`Both` for hot reads, `Redis` for cross-instance
    shared data) is the largest lever — see [§2](#2--the-compile-time-mixin-tower)
    and [§3](#3--the-read--write-flow).
-2. **The shared-nothing runtime.** N loops, one per core, each self-contained;
+2. **Automatic SQL batching & pipelining.** Concurrent coroutines on one loop have
+   their reads coalesced into a single `SELECT … WHERE id = ANY($1)` per repo and
+   their writes pipelined (libpq pipeline mode), collapsing N round-trips into one
+   per tier. This lives in the I/O layer, **below** the cache — so it speeds up a
+   `config::Uncached`, write-heavy path just as much as a cached read one, with no
+   code to write. See [§4](#4--the-shared-nothing-runtime).
+3. **The shared-nothing runtime.** N loops, one per core, each self-contained;
    a request never hops threads, so throughput scales ~linearly with cores at
    unchanged latency. This is the `IoPool` default and reaches the L1-hit latency
    above on its own — see [§4](#4--the-shared-nothing-runtime).
-3. **Co-location on a foreign loop *(optional)*.** Relevant only when a web
+4. **Co-location on a foreign loop *(optional)*.** Relevant only when a web
    framework (Drogon/asio/libuv) already owns the loops your requests run on:
    bridging each call to a separate `IoPool` then costs a ~3 µs thread hop, even
    on an L1 hit. Running relais inline on those existing loops removes it, via a

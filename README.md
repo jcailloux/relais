@@ -1,8 +1,13 @@
 # relais
 
-**Header-only C++23 repository pattern with integrated L1/L2/L3 caching.**
-RAM → Redis → PostgreSQL, assembled at compile time from template parameters —
-zero virtual calls, zero runtime configuration overhead.
+**A header-only C++23 repository library for PostgreSQL, with an optional Redis L2
+tier** — L1/L2/L3 caching (RAM → Redis → PostgreSQL) assembled at compile time from
+template parameters: zero virtual calls, zero runtime configuration overhead.
+
+The backends are deliberate: batching, pipelining, and invalidation build on libpq's
+pipeline mode and Redis RESP, not a generic SQL/KV abstraction. Adopting relais means
+plugging in a component, not an ecosystem — its coroutine runtime, Redis client, and
+L1 map are all internal (see [Requirements](#requirements)).
 
 ```cpp
 using UserRepo = relais::Repo<UserEntity, "User", config::Both>;
@@ -32,15 +37,57 @@ config and the entity's traits — you pay for exactly what you enable.
   (read + write [+ key]) as independent branches — and `requires` clauses turn
   misuse (writing to a read-only repo, `patch` without a `Field` enum) into
   compile errors.
-- **Shared-nothing runtime.** Async I/O over epoll coroutines; per-loop
-  connection pools, no cross-thread hops on the hot path.
+- **Automatic SQL batching & pipelining.** Concurrent coroutines on one loop have
+  their reads coalesced (`SELECT … WHERE id = ANY($1)`) and their writes pipelined
+  into far fewer round-trips — no code to write, and a win even with caching off.
+- **Shared-nothing runtime, on your loop or ours.** Async I/O over epoll
+  coroutines; per-loop connection pools, no cross-thread hops on the hot path. The
+  event loop is an extension point (`IoContext`): the bundled `IoPool` is the easy
+  path, but relais runs inline on a framework loop (Drogon/asio/libuv) just as well.
+
+## When relais fits
+
+relais always brokers the database; the cache tiers are **independent** additions
+on top — L1 and L2 are orthogonal, so it's a menu, not a ladder. The baseline (no
+cache) already carries the type-safety and the batching:
+
+| Config | Tiers | Adds |
+|---|---|---|
+| `Uncached` | L3 only | Compile-time-checked API + SQL batching/pipelining + shared-nothing runtime — fewer round-trips and foot-guns, no cache, no Redis. |
+| `Local` | L1 only | In-process hot reads (~50 ns, no I/O). Per-instance, no Redis. |
+| `Redis` | L2 only | Out-of-process cache — outlives the process, scales past the L1 RAM budget, shareable across instances. |
+| `Both` | L1 + L2 | RAM reads backed by Redis (warm after a restart, shared across instances). |
+
+**Multi-instance.** L1 coherence then depends on how data is partitioned across
+processes. Disjoint key ownership keeps every invalidation local — nothing extra.
+Shared keys need a finite `l1_ttl` (staleness ceiling) plus
+`l2_shared_across_instances`, which moves fill-validity to Redis so a fill
+straddling another instance's invalidation is rejected. Details:
+[caching.md](docs/caching.md) ·
+[api-reference.md › CacheConfig](docs/api-reference.md#cacheconfig).
+
+So relais is not "a read cache": the type-safety and the batching pay off even on a
+write-heavy, uncached, single-instance workload. Storage other than PostgreSQL
+(+ optional Redis) is out of scope.
 
 ## Requirements
 
+relais has exactly **one external library dependency** — glaze. Everything else is
+either part of relais or a backing service you already run.
+
+**Build dependencies** — resolved by the consumer:
 - C++23 compiler (GCC 13+, Clang 17+), CMake 3.20+
-- PostgreSQL (libpq)
 - [glaze](https://github.com/stephenberry/glaze) — JSON/BEVE serialization (fetched automatically)
-- Redis (optional, for L2)
+- libpq — PostgreSQL client headers (`find_package(PostgreSQL)`)
+
+**Runtime services** — the assumed stack; processes you connect to, not libraries you link:
+- PostgreSQL
+- Redis — optional, only for the L2 tier
+
+**Internal to relais** — shipped with it, nothing to install or adopt:
+- The coroutine runtime (`io::Task`, `IoPool`) and per-loop connection pools
+- The Redis client — native RESP, no `hiredis` / `redis++`
+- The L1 hash map (`ChunkMap`) over a vendored lock-free backend (parlay_hash)
 
 ## Install
 
@@ -166,7 +213,7 @@ and running relais on a foreign loop (Drogon/asio/…) are in
 |---|---|---|
 | `config::Uncached` | none | Write-only tables, audit sinks |
 | `config::Local` | L1 | Per-instance data (default) |
-| `config::Redis` | L2 | Shared / cross-instance data |
+| `config::Redis` | L2 | Cross-instance, or cache that must outlive the process |
 | `config::Both` | L1 + L2 | High-read, feature flags |
 
 Start from a preset and override with `.with_*()` chaining. Read path:
@@ -196,9 +243,10 @@ Each file owns one subject and reads on its own. Pick by what you're trying to d
 - **AI agent?** Read [concepts.md](docs/concepts.md) then [api-reference.md](docs/api-reference.md) — together they are enough to use relais (declare a repo, read/write, list, invalidate, stand up the runtime) **without opening a single header.**
 - **New to coroutines and event loops?** `examples/event_loop_basics.cpp` drives a coroutine on a single loop **without a database** — the smallest thing that compiles and runs.
 
-**Performance** comes from three independent levers: the right cache preset, the
-shared-nothing `IoPool` runtime, and optional co-location on a foreign loop. Full
-model and the numbers: [concepts.md › Performance model](docs/concepts.md#performance-model).
+**Performance** comes from four independent levers: the right cache preset,
+automatic SQL batching/pipelining (independent of the cache), the shared-nothing
+`IoPool` runtime, and optional co-location on a foreign loop. Full model and the
+numbers: [concepts.md › Performance model](docs/concepts.md#performance-model).
 
 ## Testing
 
