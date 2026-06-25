@@ -544,6 +544,8 @@ ListQuery<Descriptor> seal(ListQueryParams<Descriptor> params);   // CanonicalEn
 
 The wire token is plain base64 over the cursor bytes: `int64(sort_value)` followed by the `N` int64 primary-key components (one for a scalar key, N for a composite key) — the full keyset tiebreaker for the `ORDER BY` row-value comparison.
 
+> **Primary keys must be integral.** Keyset pagination seeks from a fixed-width, totally-ordered tiebreaker, so every key component is encoded as `int64_t` here (and compared Redis-side during selective page invalidation) — inherent to cursor pagination, not a relais-specific limit. A non-integral primary key is therefore a **compile error** (`"list keyset pagination requires an integer primary key"`): an entity with a string PK (`uuid`, `slug`) cannot carry a `@relais_list` — use a `bigserial` surrogate key. This mirrors the integral-or-enum constraint on sort fields (see [Sort directions](#sort-directions)).
+
 <details><summary>Pagination cycle — mint and hand-back</summary>
 
 `query()` mints the next page's token into `ListResult`'s `next_cursor` when a full page is returned; the controller hands it back via `.after(Repo::Cursor::decode(token).value())`. The byte layout is built in `queryFromDb` and (de)serialized by `list::Cursor::encode`/`decode`.

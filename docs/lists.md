@@ -284,7 +284,17 @@ never coincides with the declaration site and is a footgun.
   `eraseWhere`/`invalidateWhere`).
 - **Composite keys are supported.** The keyset cursor spans every primary-key
   column, so an entity with a composite key (including an all-PK junction) can
-  carry a `@relais_list`. Key components must be integers.
+  carry a `@relais_list`.
+- **Primary-key and sort fields must be integral.** Keyset pagination resumes
+  from a totally-ordered, fixed-width tiebreaker — so the cursor encodes the sort
+  value and every primary-key component as `int64_t`, compared Redis-side during
+  selective invalidation. This is inherent to cursor pagination, not a relais
+  restriction: a string key has no fixed-width order to seek from. A non-integral
+  PK, or a non-integral/non-enum sort field, is a **compile error** (`"list
+  keyset pagination requires an integer primary key"`); use an integer surrogate
+  instead (`bigserial` key, epoch-microsecond timestamp, not an ISO-8601 string).
+  The constraint binds the PK itself — a string-PK entity gets no `@relais_list`
+  at all.
 
 ## CRUD → list notification (automatic)
 

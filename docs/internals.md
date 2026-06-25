@@ -845,6 +845,13 @@ as ISO-8601 strings) — falls back to `0`, which breaks cursor pagination and s
 bounds range checks. Sort fields must be an integral or enum type (store
 timestamps as an integral epoch column, not a string).
 
+The same `int64_t` cursor encoding constrains the **primary key**: every key
+component is written into the cursor and reparsed Redis-side during selective
+page invalidation. `extractKeyComponents()` therefore `static_assert`s that each
+component is integral (`"list keyset pagination requires an integer primary
+key"`), so a string PK is a compile error rather than a `0` fallback — an entity
+with a non-integral PK cannot carry a cached list at all.
+
 ## Modification Tracking
 
 ### ModificationTracker
