@@ -304,6 +304,33 @@ struct IoContextConformance {
             + std::to_string(cancelled));
     }
 
+    // C11: arm+cancel at scale. Arming many timers then cancelling them all must
+    // leave none firing — and, on a conforming adapter, must not accumulate state
+    // (a cancel removes the timer, it does not tombstone it until its deadline).
+    // This encodes the complexity expectation in the IoContext contract: relais
+    // arms+cancels a timer per in-flight I/O wait, so an adapter that defers
+    // cancellation to maturity would grow O(timeout) state at QPS. A later
+    // uncancelled fence proves the subsystem is still live after the churn.
+    template<io::IoContext Io, typename Drive>
+    static void checkTimerArmCancelAtScale(Io& io, Drive drive) {
+        constexpr int N = 2000;
+        int fired = 0;
+        std::vector<typename Io::TimerToken> tokens;
+        tokens.reserve(N);
+        for (int i = 0; i < N; ++i)
+            tokens.push_back(
+                io.postDelayed(std::chrono::milliseconds(1), [&] { ++fired; }));
+        for (auto t : tokens) io.cancelTimer(t);
+
+        bool fence = false;
+        io.postDelayed(std::chrono::milliseconds(3), [&] { fence = true; });
+        drive(io, [&] { return fence; });
+
+        detail::require(fired == 0,
+            "cancelTimer() at scale: no cancelled timer may fire, observed "
+            + std::to_string(fired));
+    }
+
     // -- aggregate ----------------------------------------------------------
 
     template<io::IoContext Io, typename Drive>
@@ -318,6 +345,7 @@ struct IoContextConformance {
         checkCrossThreadPost(io, drive);
         checkPostDelayedFires(io, drive);
         checkCancelTimer(io, drive);
+        checkTimerArmCancelAtScale(io, drive);
     }
 };
 

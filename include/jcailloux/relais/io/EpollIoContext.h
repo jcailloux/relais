@@ -9,9 +9,9 @@
 #include <cstring>
 #include <deque>
 #include <functional>
+#include <map>
+#include <memory_resource>
 #include <mutex>
-#include <queue>
-#include <set>
 #include <stdexcept>
 #include <thread>
 #include <unordered_map>
@@ -96,11 +96,18 @@ public:
     EpollIoContext& operator=(const EpollIoContext&) = delete;
 
     WatchHandle addWatch(int fd, IoEvent events, std::function<void(IoEvent)> cb) {
+        // Generation guard (CONC-1): a fresh generation per addWatch lets the
+        // dispatch loop reject a stale event harvested by epoll_wait for an fd
+        // that was closed and re-watched *within the same runOnce* (re-entrant
+        // drainPosted via the pipe branch). The generation rides in the high 32
+        // bits of epoll_data.u64; the fd stays in the low 32.
+        uint32_t gen = ++watch_gen_seq_;
+
         epoll_event ev{};
         ev.events = toEpoll(events);
-        ev.data.fd = fd;
+        ev.data.u64 = packData(gen, fd);
 
-        watches_[fd] = {events, std::move(cb)};
+        watches_[fd] = {events, gen, std::move(cb)};
 
         if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &ev) < 0) {
             if (epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, fd, &ev) < 0) {
@@ -124,7 +131,8 @@ public:
 
         epoll_event ev{};
         ev.events = toEpoll(events);
-        ev.data.fd = handle;
+        // Same watch, same generation — only the mask changes.
+        ev.data.u64 = packData(it->second.generation, handle);
         epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, handle, &ev);
     }
 
@@ -134,9 +142,7 @@ public:
             std::lock_guard lock(post_mutex_);
             post_queue_.push_back(std::move(cb));
         }
-        // Wakeup the event loop
-        char byte = 1;
-        [[maybe_unused]] auto _ = ::write(pipe_write_, &byte, 1);
+        wakeLoop();
     }
 
     /// Thread-safe: schedule a callback after a delay. Returns a token for cancellation.
@@ -146,18 +152,26 @@ public:
         auto token = next_timer_token_.fetch_add(1, std::memory_order_relaxed);
         {
             std::lock_guard lock(post_mutex_);
-            timer_queue_.push({deadline, token, std::move(cb)});
+            auto it = timers_.emplace(deadline, TimerEntry{token, std::move(cb)});
+            by_token_.emplace(token, it);
         }
-        // Wakeup to re-evaluate the nearest deadline
-        char byte = 1;
-        [[maybe_unused]] auto _ = ::write(pipe_write_, &byte, 1);
+        // Loop-local arm needs no syscall: runOnce re-arms the timerfd via
+        // fireExpiredTimers()->rearmTimerfd() before its next epoll_wait, so a
+        // postDelayed issued on the loop thread is already accounted for. The
+        // pipe wakeup is only needed to interrupt a loop blocked in another
+        // thread (cross-thread arm).
+        if (!isInLoopThread()) wakeLoop();
         return token;
     }
 
     /// Thread-safe: cancel a pending timer. No-op if already fired or not found.
+    /// Removes the entry outright (O(log n)) — no tombstone is left to accumulate.
     void cancelTimer(TimerToken token) {
         std::lock_guard lock(post_mutex_);
-        cancelled_tokens_.insert(token);
+        auto it = by_token_.find(token);
+        if (it == by_token_.end()) return;  // already fired or unknown
+        timers_.erase(it->second);
+        by_token_.erase(it);
     }
 
     /// Run the event loop until stop() is called.
@@ -179,15 +193,27 @@ public:
     /// Stop the event loop (thread-safe).
     void stop() {
         stopped_.store(true, std::memory_order_relaxed);
-        // Wakeup in case blocked in epoll_wait
-        char byte = 1;
-        [[maybe_unused]] auto _ = ::write(pipe_write_, &byte, 1);
+        wakeLoop();  // in case blocked in epoll_wait
     }
 
     /// True if called from the thread currently driving the loop. Lets callers
     /// (e.g. PgProvider::init) assert thread-affinity invariants in debug.
     [[nodiscard]] bool isInLoopThread() const noexcept {
         return loop_thread_.load(std::memory_order_relaxed) == std::this_thread::get_id();
+    }
+
+    /// Diagnostic: number of pipe wakeups issued (cross-thread post/postDelayed
+    /// and stop). A loop-local postDelayed arms the timerfd without a wakeup, so
+    /// this stays flat under loop-thread arming — exercised by the unit tests.
+    [[nodiscard]] uint64_t loopWakeups() const noexcept {
+        return wakeups_.load(std::memory_order_relaxed);
+    }
+
+    /// Diagnostic: timers currently in flight (excludes cancelled ones, which are
+    /// removed outright rather than tombstoned). Used to assert no accumulation.
+    [[nodiscard]] size_t pendingTimerCount() const {
+        std::lock_guard lock(post_mutex_);
+        return timers_.size();
     }
 
     /// Run one iteration of the event loop.
@@ -201,7 +227,8 @@ public:
         int n = epoll_wait(epoll_fd_, events, MAX_EVENTS, timeout_ms);
 
         for (int i = 0; i < n; ++i) {
-            int fd = events[i].data.fd;
+            uint64_t data = events[i].data.u64;
+            int fd = unpackFd(data);
 
             if (fd == pipe_read_) {
                 // Drain the wakeup pipe
@@ -220,7 +247,12 @@ public:
             }
 
             auto it = watches_.find(fd);
-            if (it != watches_.end()) {
+            // Generation guard (CONC-1): an earlier iteration of this same loop
+            // may have closed `fd` and a re-watch re-bound the number to a new
+            // connection. The event in events[] still carries the *old*
+            // generation, so a mismatch means it is stale on a recycled fd —
+            // skip it rather than deliver it to the wrong watch.
+            if (it != watches_.end() && it->second.generation == unpackGen(data)) {
                 auto io_events = fromEpoll(events[i].events);
                 // Copy the callback out before invoking: relais legitimately
                 // calls removeWatch(fd) from inside its own callback (e.g. a
@@ -240,6 +272,23 @@ public:
     }
 
 private:
+    // epoll_data.u64 layout: high 32 bits = watch generation, low 32 = fd.
+    static uint64_t packData(uint32_t gen, int fd) noexcept {
+        return (static_cast<uint64_t>(gen) << 32) | static_cast<uint32_t>(fd);
+    }
+    static int unpackFd(uint64_t data) noexcept {
+        return static_cast<int>(static_cast<uint32_t>(data));
+    }
+    static uint32_t unpackGen(uint64_t data) noexcept {
+        return static_cast<uint32_t>(data >> 32);
+    }
+
+    void wakeLoop() {
+        char byte = 1;
+        [[maybe_unused]] auto _ = ::write(pipe_write_, &byte, 1);
+        wakeups_.fetch_add(1, std::memory_order_relaxed);
+    }
+
     static uint32_t toEpoll(IoEvent events) {
         uint32_t e = 0;
         if (hasEvent(events, IoEvent::Read))  e |= EPOLLIN;
@@ -258,17 +307,13 @@ private:
 
     struct WatchEntry {
         IoEvent events;
+        uint32_t generation;
         std::function<void(IoEvent)> callback;
     };
 
     struct TimerEntry {
-        Clock::time_point deadline;
         TimerToken token;
         std::function<void()> callback;
-
-        bool operator>(const TimerEntry& o) const noexcept {
-            return deadline > o.deadline;
-        }
     };
 
     void drainPosted() {
@@ -285,19 +330,20 @@ private:
     void fireExpiredTimers() {
         auto now = Clock::now();
 
-        // Move matured timers out under lock
-        std::vector<TimerEntry> to_fire;
+        // Move matured timers out under lock, then fire them unlocked (a
+        // callback may re-enter postDelayed/cancelTimer). fire_scratch_ is a
+        // reused member: loop-thread only, capacity retained → no per-fire alloc.
+        fire_scratch_.clear();
         {
             std::lock_guard lock(post_mutex_);
-            while (!timer_queue_.empty() && timer_queue_.top().deadline <= now) {
-                auto entry = std::move(const_cast<TimerEntry&>(timer_queue_.top()));
-                timer_queue_.pop();
-                if (cancelled_tokens_.erase(entry.token)) continue;
-                to_fire.push_back(std::move(entry));
+            for (auto it = timers_.begin(); it != timers_.end() && it->first <= now; ) {
+                by_token_.erase(it->second.token);
+                fire_scratch_.push_back(std::move(it->second));
+                it = timers_.erase(it);
             }
         }
 
-        for (auto& entry : to_fire) {
+        for (auto& entry : fire_scratch_) {
             entry.callback();
         }
 
@@ -308,8 +354,8 @@ private:
         std::lock_guard lock(post_mutex_);
         struct itimerspec its{};
 
-        if (!timer_queue_.empty()) {
-            auto deadline = timer_queue_.top().deadline;
+        if (!timers_.empty()) {
+            auto deadline = timers_.begin()->first;
             auto now = Clock::now();
             if (deadline <= now) {
                 // Fire ASAP
@@ -340,12 +386,24 @@ private:
     int timer_fd_ = -1;
 
     std::unordered_map<int, WatchEntry> watches_;
+    uint32_t watch_gen_seq_ = 0;  // loop-thread only (addWatch)
 
     mutable std::mutex post_mutex_;
     std::deque<std::function<void()>> post_queue_;
-    std::priority_queue<TimerEntry, std::vector<TimerEntry>, std::greater<TimerEntry>> timer_queue_;
-    std::set<TimerToken> cancelled_tokens_;
+
+    // Timer subsystem: deadline-ordered multimap + token→iterator index, both
+    // backed by a pooled resource. arm = emplace (O(log n)), cancel = erase via
+    // the index (O(log n), no tombstone), fire = pop from begin(). The pool
+    // recycles freed nodes → zero steady-state malloc on arm/cancel. Declared
+    // before the containers so it outlives them (and is built first).
+    std::pmr::unsynchronized_pool_resource timer_pool_;
+    std::pmr::multimap<Clock::time_point, TimerEntry> timers_{&timer_pool_};
+    std::pmr::unordered_map<TimerToken,
+        std::pmr::multimap<Clock::time_point, TimerEntry>::iterator> by_token_{&timer_pool_};
+    std::vector<TimerEntry> fire_scratch_;  // reused by fireExpiredTimers (loop-thread)
+
     std::atomic<uint64_t> next_timer_token_{1};
+    std::atomic<uint64_t> wakeups_{0};
     std::atomic<bool> stopped_{false};
     std::atomic<std::thread::id> loop_thread_{};
 };

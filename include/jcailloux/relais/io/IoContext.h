@@ -56,10 +56,21 @@ constexpr IoEvent& operator|=(IoEvent& a, IoEvent b) noexcept {
 //     thread. The loop's wait must be bounded so posts cannot stall.
 //   - postDelayed(delay, cb): runs cb once on the loop thread after `delay`;
 //     returns a TimerToken. Thread-safe. (Used by BatchScheduler to flush a
-//     batch after an adaptive deadline.)
+//     batch after an adaptive deadline, and per in-flight I/O wait for the
+//     query/acquire timeout.)
 //   - cancelTimer(token): cancels a pending postDelayed; no-op if it already
 //     fired or the token is unknown. (Used to cancel the flush timer when a
-//     batch departs early because it filled up.)
+//     batch departs early because it filled up, and the timeout timer when a
+//     wait completes in time.)
+//
+// Complexity expectation (not a signature, but part of the contract): arm
+// (postDelayed) and cancel (cancelTimer) must be cheap from the loop thread —
+// no syscall per call, and cancel must *remove* the timer, not tombstone it
+// until its deadline. relais arms+cancels a timer per in-flight I/O wait, so
+// per-op allocation or O(timeout) tombstone growth is a correctness-relevant
+// cost at QPS, not a micro-optimization. Asio, Trantor and the bundled
+// EpollIoContext all satisfy this; IoContextConformance exercises arm+cancel at
+// scale.
 //
 // These rules are encoded as runnable checks in
 // testing/IoContextConformance.h — instantiate the harness against any adapter
