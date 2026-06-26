@@ -65,8 +65,17 @@ public:
         std::optional<ConnectionType> conn_;
     };
 
-    // Factory: create pool with initial connections
-
+    // Factory: create pool with initial connections.
+    //
+    // First line of defence against silent I/O hangs is the conninfo string —
+    // strongly recommended (these bound liveness without any client-side timer):
+    //   - connect_timeout=N         bounds the handshake (libpq, native).
+    //   - keepalives=1 keepalives_idle=.. keepalives_interval=.. keepalives_count=..
+    //                               bounds silent network death at the TCP layer.
+    //   - statement_timeout=..      the server kills an over-long query (lock/scan).
+    // These cover the cases where the server is reachable and/or the TCP stack
+    // cooperates. The deterministic, stack-independent bound is the client-side
+    // timeout (PgPoolConfig::acquire_timeout/query_timeout, added later).
     static Task<std::shared_ptr<PgPool>> create(
         Io& io,
         std::string conninfo,
