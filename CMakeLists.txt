@@ -229,11 +229,13 @@ if(RELAIS_BUILD_TESTS)
     relais_add_test(test_io_spawn         tests/io/test_spawn.cpp               LABELS "io;spawn")
     relais_add_test(test_io_when_all      tests/io/test_when_all.cpp            LABELS "io;whenall")
     relais_add_test(test_io_context_conformance tests/io/test_io_context_conformance.cpp LABELS "io;conformance")
+    relais_add_test(test_controllable_io_context tests/io/test_controllable_io_context.cpp LABELS "io;conformance;fixture")
 
     # -------------------------------------------------------------------------
     # Integration tests (require PostgreSQL + Redis)
     # -------------------------------------------------------------------------
     relais_add_test(test_io_pg_integration    tests/io/test_io_pg_integration.cpp    LABELS "io;integration" RESOURCE_LOCK)
+    relais_add_test(test_pg_probe             tests/io/test_pg_probe.cpp             LABELS "io;integration;fixture" RESOURCE_LOCK)
     relais_add_test(test_io_redis_integration tests/io/test_io_redis_integration.cpp LABELS "io;integration" RESOURCE_LOCK)
     relais_add_test(test_io_pg_pipeline       tests/io/test_pg_pipeline.cpp          LABELS "io;integration;pipeline" RESOURCE_LOCK)
     relais_add_test(test_io_redis_pool        tests/io/test_redis_pool.cpp           LABELS "io;integration;redis-pool" RESOURCE_LOCK)
