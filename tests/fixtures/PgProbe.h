@@ -17,7 +17,7 @@ namespace jcailloux::relais::io::test {
 // precautionary eviction), the only trustworthy answer to "did the write
 // actually commit?" is the database itself, read over an independent channel.
 // PgProbe is that channel: it never touches relais state, so what it returns is
-// ground truth (§10.1 / scenarios A & B of §10.4).
+// ground truth (scenarios A & B).
 //
 // Synchronous on purpose — it runs on the test thread, off the loop under test,
 // so it can be queried at any point without interleaving with that loop.
@@ -95,7 +95,7 @@ public:
     // Inject a clean server-side disconnect by terminating every backend whose
     // pg_stat_activity row matches `filter` (a boolean SQL expression, e.g.
     // "application_name = 'relais_under_test'"). This is the no-root, no-proxy
-    // way to deliver the read-path "DB down propre" RST of §10.4 T1. Returns the
+    // way to deliver the read-path "DB down propre" RST. Returns the
     // number of backends signalled. The probe's own backend is excluded by
     // default unless the filter selects it.
     int terminateBackends(const std::string& filter) {

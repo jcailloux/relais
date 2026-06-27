@@ -35,7 +35,7 @@ TEST_CASE("PgProbe: exists() reflects ground-truth presence", "[io][integration]
 }
 
 // terminateBackends() with a filter that matches nothing must be a safe no-op —
-// the session-kill RST injection path of §10.4 T1, exercised without collateral.
+// the session-kill RST injection path, exercised without collateral.
 TEST_CASE("PgProbe: terminateBackends with no match is a no-op", "[io][integration][fixture]") {
     PgProbe probe(conninfo());
     REQUIRE(probe.terminateBackends("application_name = 'no_such_app_xyz_relais'") == 0);

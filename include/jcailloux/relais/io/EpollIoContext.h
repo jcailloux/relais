@@ -96,7 +96,7 @@ public:
     EpollIoContext& operator=(const EpollIoContext&) = delete;
 
     WatchHandle addWatch(int fd, IoEvent events, std::function<void(IoEvent)> cb) {
-        // Generation guard (CONC-1): a fresh generation per addWatch lets the
+        // Generation guard: a fresh generation per addWatch lets the
         // dispatch loop reject a stale event harvested by epoll_wait for an fd
         // that was closed and re-watched *within the same runOnce* (re-entrant
         // drainPosted via the pipe branch). The generation rides in the high 32
@@ -247,7 +247,7 @@ public:
             }
 
             auto it = watches_.find(fd);
-            // Generation guard (CONC-1): an earlier iteration of this same loop
+            // Generation guard: an earlier iteration of this same loop
             // may have closed `fd` and a re-watch re-bound the number to a new
             // connection. The event in events[] still carries the *old*
             // generation, so a mismatch means it is stale on a recycled fd —
