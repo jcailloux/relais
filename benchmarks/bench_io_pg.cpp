@@ -102,7 +102,7 @@ TEST_CASE("Benchmark - PG pool query", "[benchmark][pg][latency][pool]")
     Io io;
 
     auto results = runTask(io, [](Io& io) -> Task<std::vector<BenchResult>> {
-        auto pool = co_await PgPool<Io>::create(io, getConnInfo(), 2, 4);
+        auto pool = co_await PgPool<Io>::create(io, getConnInfo(), {.min_connections = 2, .max_connections = 4});
         PgClient<Io> client(pool);
 
         std::vector<BenchResult> results;
@@ -138,7 +138,7 @@ TEST_CASE("Benchmark - PG table queries", "[benchmark][pg][latency][table]")
     Io io;
 
     auto results = runTask(io, [](Io& io) -> Task<std::vector<BenchResult>> {
-        auto pool = co_await PgPool<Io>::create(io, getConnInfo(), 2, 4);
+        auto pool = co_await PgPool<Io>::create(io, getConnInfo(), {.min_connections = 2, .max_connections = 4});
         PgClient<Io> client(pool);
 
         for (int i = 0; i < 20; ++i) {
@@ -190,7 +190,7 @@ TEST_CASE("Benchmark - PG write operations", "[benchmark][pg][latency][write]")
     Io io;
 
     auto results = runTask(io, [](Io& io) -> Task<std::vector<BenchResult>> {
-        auto pool = co_await PgPool<Io>::create(io, getConnInfo(), 2, 4);
+        auto pool = co_await PgPool<Io>::create(io, getConnInfo(), {.min_connections = 2, .max_connections = 4});
         PgClient<Io> client(pool);
 
         int counter = 0;
@@ -295,7 +295,7 @@ static int64_t seedThroughputRow() {
     Io io;
     return runTask(io,
         [](Io& io) -> Task<int64_t> {
-            auto pool = co_await PgPool<Io>::create(io, getConnInfo(), 1, 1);
+            auto pool = co_await PgPool<Io>::create(io, getConnInfo(), {.min_connections = 1, .max_connections = 1});
             PgClient<Io> client(pool);
             co_await client.query(
                 "DELETE FROM relais_test_items WHERE name = 'bench_pg_tp'");
@@ -312,7 +312,7 @@ static int64_t seedThroughputRow() {
 static void cleanupThroughputRow() {
     Io io;
     runTask(io, [](Io& io) -> Task<void> {
-        auto pool = co_await PgPool<Io>::create(io, getConnInfo(), 1, 1);
+        auto pool = co_await PgPool<Io>::create(io, getConnInfo(), {.min_connections = 1, .max_connections = 1});
         PgClient<Io> client(pool);
         co_await client.query(
             "DELETE FROM relais_test_items WHERE name = 'bench_pg_tp'");
@@ -337,7 +337,7 @@ TEST_CASE("Benchmark - PG throughput SELECT 1", "[benchmark][pg][throughput][sel
         auto pool = runTask(io,
             [](Io& io) -> Task<std::shared_ptr<PgPool<Io>>> {
                 co_return co_await PgPool<Io>::create(io, getConnInfo(),
-                                                      kPoolMin, kPoolMax);
+                                                      {.min_connections = kPoolMin, .max_connections = kPoolMax});
             }(io));
 
         ready.count_down();
@@ -383,7 +383,7 @@ TEST_CASE("Benchmark - PG throughput SELECT param", "[benchmark][pg][throughput]
         auto pool = runTask(io,
             [](Io& io) -> Task<std::shared_ptr<PgPool<Io>>> {
                 co_return co_await PgPool<Io>::create(io, getConnInfo(),
-                                                      kPoolMin, kPoolMax);
+                                                      {.min_connections = kPoolMin, .max_connections = kPoolMax});
             }(io));
 
         ready.count_down();
@@ -430,7 +430,7 @@ TEST_CASE("Benchmark - PG throughput SELECT by PK", "[benchmark][pg][throughput]
         auto pool = runTask(io,
             [](Io& io) -> Task<std::shared_ptr<PgPool<Io>>> {
                 co_return co_await PgPool<Io>::create(io, getConnInfo(),
-                                                      kPoolMin, kPoolMax);
+                                                      {.min_connections = kPoolMin, .max_connections = kPoolMax});
             }(io));
 
         ready.count_down();

@@ -35,7 +35,8 @@ namespace jcailloux::relais {
 // negligible compared to the network I/O latency of database/Redis operations.
 //
 // Initialization (in application startup):
-//   auto pool = co_await PgPool<MyIo>::create(io, conninfo, 4, 16);
+//   auto pool = co_await PgPool<MyIo>::create(io, conninfo,
+//                  {.min_connections = 4, .max_connections = 16});
 //   auto redis = co_await RedisClient<MyIo>::connect(io, "127.0.0.1", 6379);
 //   PgProvider::init(io, pool, redis);   // on the loop thread it serves
 //

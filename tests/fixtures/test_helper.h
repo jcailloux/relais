@@ -307,7 +307,9 @@ inline void initTest() {
         }
     }
     auto pool = io::test::runTask(io,
-        io::PgPool<IoCtx>::create(io, getConnInfo(), pg_min, pg_max));
+        io::PgPool<IoCtx>::create(io, getConnInfo(),
+            {.min_connections = static_cast<size_t>(pg_min),
+             .max_connections = static_cast<size_t>(pg_max)}));
 
     detail::testPg() = std::make_shared<io::PgClient<IoCtx>>(pool);
 

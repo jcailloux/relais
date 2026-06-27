@@ -110,8 +110,8 @@ public:
                     // PG pool
                     w.pg_pool = co_await PgPool<Io>::create(
                         *w.io, config.pg_conninfo,
-                        config.pg_min_conns_per_worker,
-                        config.pg_max_conns_per_worker);
+                        {.min_connections = config.pg_min_conns_per_worker,
+                         .max_connections = config.pg_max_conns_per_worker});
 
                     // Redis pool
                     if (!config.redis_unix_path.empty()) {

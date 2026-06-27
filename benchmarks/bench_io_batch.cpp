@@ -370,7 +370,7 @@ TEST_CASE("Benchmark - PG Read Batching", "[benchmark][batch][pg-read]")
     static constexpr int levels[] = {1, 4, 16, 64, 128};
 
     auto results = runTask(io, [](Io& io) -> Task<std::vector<ConcurrencyResult>> {
-        auto pool = co_await PgPool<Io>::create(io, CONNINFO, 2, 8);
+        auto pool = co_await PgPool<Io>::create(io, CONNINFO, {.min_connections = 2, .max_connections = 8});
 
         std::vector<ConcurrencyResult> results;
         double baseline = 0;
@@ -390,7 +390,7 @@ TEST_CASE("Benchmark - PG Read Batching", "[benchmark][batch][pg-read]")
     {
         Io io2;
         rtt_us = runTask(io2, [](Io& io2) -> Task<double> {
-            auto pool = co_await PgPool<Io>::create(io2, CONNINFO, 1, 4);
+            auto pool = co_await PgPool<Io>::create(io2, CONNINFO, {.min_connections = 1, .max_connections = 4});
             auto batcher = std::make_shared<BatchScheduler<Io>>(io2, pool, nullptr, 8);
             co_await bootstrapPg(*batcher);
             auto stats = BatchBenchAccessor::snapshot(*batcher);
@@ -414,7 +414,7 @@ TEST_CASE("Benchmark - PG Write Batching", "[benchmark][batch][pg-write]")
     static constexpr int levels[] = {1, 4, 16, 64};
 
     auto results = runTask(io, [](Io& io) -> Task<std::vector<ConcurrencyResult>> {
-        auto pool = co_await PgPool<Io>::create(io, CONNINFO, 2, 8);
+        auto pool = co_await PgPool<Io>::create(io, CONNINFO, {.min_connections = 2, .max_connections = 8});
 
         std::vector<ConcurrencyResult> results;
         double baseline = 0;
@@ -433,7 +433,7 @@ TEST_CASE("Benchmark - PG Write Batching", "[benchmark][batch][pg-write]")
     {
         Io io2;
         rtt_us = runTask(io2, [](Io& io2) -> Task<double> {
-            auto pool = co_await PgPool<Io>::create(io2, CONNINFO, 1, 4);
+            auto pool = co_await PgPool<Io>::create(io2, CONNINFO, {.min_connections = 1, .max_connections = 4});
             auto batcher = std::make_shared<BatchScheduler<Io>>(io2, pool, nullptr, 8);
             co_await bootstrapPg(*batcher);
             auto stats = BatchBenchAccessor::snapshot(*batcher);
@@ -457,7 +457,7 @@ TEST_CASE("Benchmark - Redis Batching", "[benchmark][batch][redis]")
     static constexpr int levels[] = {1, 4, 16, 64, 128};
 
     auto results = runTask(io, [](Io& io) -> Task<std::vector<ConcurrencyResult>> {
-        auto pg_pool = co_await PgPool<Io>::create(io, CONNINFO, 1, 4);
+        auto pg_pool = co_await PgPool<Io>::create(io, CONNINFO, {.min_connections = 1, .max_connections = 4});
         auto redis_pool = std::make_shared<RedisPool<Io>>(
             co_await RedisPool<Io>::create(io, redisHost(), redisPort(), 4));
 
@@ -489,7 +489,7 @@ TEST_CASE("Benchmark - Redis Batching", "[benchmark][batch][redis]")
     {
         Io io2;
         rtt_us = runTask(io2, [](Io& io2) -> Task<double> {
-            auto pg_pool = co_await PgPool<Io>::create(io2, CONNINFO, 1, 4);
+            auto pg_pool = co_await PgPool<Io>::create(io2, CONNINFO, {.min_connections = 1, .max_connections = 4});
             auto redis_pool = std::make_shared<RedisPool<Io>>(
                 co_await RedisPool<Io>::create(io2, redisHost(), redisPort(), 1));
             auto batcher = std::make_shared<BatchScheduler<Io>>(
@@ -525,7 +525,7 @@ TEST_CASE("Benchmark - Batch Scaling Summary", "[benchmark][batch][scaling]")
     auto all = runTask(io, [](Io& io) -> Task<AllResults> {
         AllResults out;
 
-        auto pg_pool = co_await PgPool<Io>::create(io, CONNINFO, 2, 8);
+        auto pg_pool = co_await PgPool<Io>::create(io, CONNINFO, {.min_connections = 2, .max_connections = 8});
         auto redis_pool = std::make_shared<RedisPool<Io>>(
             co_await RedisPool<Io>::create(io, redisHost(), redisPort(), 4));
 

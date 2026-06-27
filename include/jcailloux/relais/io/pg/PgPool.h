@@ -2,9 +2,11 @@
 #define JCX_RELAIS_IO_PG_POOL_H
 
 #include <cassert>
+#include <chrono>
 #include <coroutine>
 #include <cstddef>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -17,6 +19,26 @@
 #include "jcailloux/relais/io/pg/PgError.h"
 
 namespace jcailloux::relais::io {
+
+// Runtime pool configuration — deployment tuning, NOT the compile-time CacheConfig
+// NTTP. Struct + designated initializers so fields grow without breaking the
+// positional order at call sites.
+//
+// Separation of concerns:
+//   - conninfo carries what libpq/the server enforce (connect_timeout, keepalives,
+//     statement_timeout).
+//   - PgPoolConfig carries what only relais can guarantee client-side:
+//     - acquire_timeout bounds acquire(): the queue wait (Waiter timer, §6.2 a)
+//       and, from a later step, the connect handshake (§6.2 b). 0 = unbounded
+//       (discouraged — reintroduces the silent deadlock this config prevents).
+//     - query_timeout bounds each per-connection I/O wait (wired into PgConnection
+//       in a later step). 0 = delegated to the server's statement_timeout.
+struct PgPoolConfig {
+    size_t min_connections = 2;
+    size_t max_connections = 16;
+    std::chrono::milliseconds acquire_timeout{5000};
+    std::chrono::milliseconds query_timeout{0};
+};
 
 // PgPool — bounded connection pool with coroutine wait queue
 
@@ -75,17 +97,16 @@ public:
     //   - statement_timeout=..      the server kills an over-long query (lock/scan).
     // These cover the cases where the server is reachable and/or the TCP stack
     // cooperates. The deterministic, stack-independent bound is the client-side
-    // timeout (PgPoolConfig::acquire_timeout/query_timeout, added later).
+    // timeout (PgPoolConfig::acquire_timeout/query_timeout).
     static Task<std::shared_ptr<PgPool>> create(
         Io& io,
         std::string conninfo,
-        size_t min_connections = 2,
-        size_t max_connections = 16
+        PgPoolConfig cfg = {}
     ) {
         auto pool = std::shared_ptr<PgPool>(
-            new PgPool(io, std::move(conninfo), min_connections, max_connections));
+            new PgPool(io, std::move(conninfo), cfg));
 
-        for (size_t i = 0; i < min_connections; ++i) {
+        for (size_t i = 0; i < cfg.min_connections; ++i) {
             auto conn = co_await ConnectionType::connect(pool->io_, pool->conninfo_.c_str());
             pool->idle_.push_back(std::move(conn));
             ++pool->total_;
@@ -103,9 +124,22 @@ public:
             co_return ConnectionGuard(this->shared_from_this(), std::move(conn));
         }
 
-        if (total_ < max_connections_) {
+        if (total_ < cfg_.max_connections) {
+            // PGLIVE-2: ++total_ must be undone if connect throws. The
+            // ConnectionGuard — the sole owner of the release → --total_ path — is
+            // built only on success below, so a failed connect (a future
+            // PgPoolTimeout on connect, or a plain PgConnectionError today) would
+            // otherwise leak the slot permanently; after max_connections failures
+            // `total_ < max_connections` is false forever and the pool freezes.
+            // The scope guard decrements on any exception out of co_await connect.
             ++total_;
+            struct SlotGuard {
+                size_t* total;
+                bool committed = false;
+                ~SlotGuard() { if (!committed) --*total; }
+            } slot{&total_};
             auto conn = co_await ConnectionType::connect(io_, conninfo_.c_str());
+            slot.committed = true;
             co_return ConnectionGuard(this->shared_from_this(), std::move(conn));
         }
 
@@ -114,11 +148,15 @@ public:
     }
 
 private:
-    PgPool(Io& io, std::string conninfo, size_t min_conn, size_t max_conn)
+    // Forward-declared: onWaiterTimeout() names Waiter as a parameter type, and a
+    // parameter type is not in complete-class context (unlike a member body), so
+    // it must be visible before that declaration.
+    struct Waiter;
+
+    PgPool(Io& io, std::string conninfo, PgPoolConfig cfg)
         : io_(io)
         , conninfo_(std::move(conninfo))
-        , min_connections_(min_conn)
-        , max_connections_(max_conn)
+        , cfg_(cfg)
     {}
 
     void release(ConnectionType conn) {
@@ -132,6 +170,11 @@ private:
             }
             auto* waiter = waiters_.front();
             waiters_.pop_front();
+            // Win the acquire_timeout race (§6.2 a): cancel the waiter's timer
+            // before posting its resume. Single loop thread, so once cancelled the
+            // expiry callback (onWaiterTimeout) cannot run. No-op if unarmed
+            // (acquire_timeout == 0).
+            if (waiter->armed_) io_.cancelTimer(waiter->timer_);
             waiter->conn.emplace(std::move(conn));
             io_.post([h = waiter->continuation] { h.resume(); });
             return;
@@ -144,19 +187,61 @@ private:
         }
     }
 
+    // acquire_timeout expiry for a queued Waiter (§6.2 a). Single loop thread, so
+    // this and release() cannot interleave: whichever runs first removes the
+    // waiter — release pops it and cancels this timer; this erases it from the
+    // queue — and the other finds nothing to do. The resume is posted, never run
+    // inline, to keep the unwind out of fireExpiredTimers (§6.1/§6.3 rationale).
+    void onWaiterTimeout(Waiter* w) {
+        for (auto it = waiters_.begin(); it != waiters_.end(); ++it) {
+            if (*it == w) {
+                waiters_.erase(it);  // linear — the wait queue is short
+                w->timed_out_ = true;
+                io_.post([h = w->continuation] { h.resume(); });
+                return;
+            }
+        }
+        // Not found: release() already served this waiter and cancelled the
+        // timer — this callback should not even run; defensive no-op.
+    }
+
     struct Waiter {
         PgPool* pool;
         std::optional<ConnectionType> conn;
         std::coroutine_handle<> continuation;
+        typename Io::TimerToken timer_{};
+        bool armed_ = false;      // timer_ holds a live token
+        bool timed_out_ = false;  // acquire_timeout fired before a connection arrived
 
         bool await_ready() const noexcept { return false; }
 
+        // noexcept preserved: under OOM both postDelayed and waiters_.push_back may
+        // throw bad_alloc, which terminates — the same fatal-allocation contract as
+        // the original push_back-only body, and it avoids any half-armed/half-queued
+        // intermediate state.
         void await_suspend(std::coroutine_handle<> h) noexcept {
             continuation = h;
             pool->waiters_.push_back(this);
+            // Bound the queue wait by acquire_timeout (§6.2 a). 0 = unbounded.
+            // The timer callback captures the raw `self`; it stays valid because a
+            // queued acquire() frame is never destroyed while suspended here — the
+            // same invariant the waiters_-stored `continuation` already relies on.
+            // The frame is torn down only after a posted resume, which both
+            // release() (timer cancelled) and onWaiterTimeout() (timer consumed)
+            // emit strictly before the timer could dangle. A future cancellable
+            // acquire() caller would have to disarm on cancellation.
+            auto to = pool->cfg_.acquire_timeout;
+            if (to.count() > 0) {
+                timer_ = pool->io_.postDelayed(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(to),
+                    [pool = pool, self = this] { pool->onWaiterTimeout(self); });
+                armed_ = true;
+            }
         }
 
         ConnectionGuard await_resume() {
+            if (timed_out_)
+                throw PgPoolTimeout("queue wait exceeded acquire_timeout");
             assert(conn.has_value());
             return ConnectionGuard(pool->shared_from_this(), std::move(*conn));
         }
@@ -164,8 +249,7 @@ private:
 
     Io& io_;
     std::string conninfo_;
-    size_t min_connections_;
-    size_t max_connections_;
+    PgPoolConfig cfg_;
     size_t total_ = 0;
 
     std::vector<ConnectionType> idle_;

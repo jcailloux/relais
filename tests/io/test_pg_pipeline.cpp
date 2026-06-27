@@ -16,7 +16,7 @@ TEST_CASE("PgConnection pipeline: multiple SELECTs", "[io][pg][pipeline][integra
     bool done = false;
 
     auto task = [&]() -> DetachedTask {
-        auto pool = co_await PgPool<Io>::create(io, CONNINFO, 1, 2);
+        auto pool = co_await PgPool<Io>::create(io, CONNINFO, {.min_connections = 1, .max_connections = 2});
         auto guard = co_await pool->acquire();
         auto& conn = guard.conn();
 
@@ -83,7 +83,7 @@ TEST_CASE("PgConnection pipeline: error in one segment doesn't affect others",
     bool done = false;
 
     auto task = [&]() -> DetachedTask {
-        auto pool = co_await PgPool<Io>::create(io, CONNINFO, 1, 2);
+        auto pool = co_await PgPool<Io>::create(io, CONNINFO, {.min_connections = 1, .max_connections = 2});
         auto guard = co_await pool->acquire();
         auto& conn = guard.conn();
 

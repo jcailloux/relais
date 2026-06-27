@@ -222,7 +222,7 @@ TEST_CASE("PgPool create and acquire", "[pg][integration][pool]") {
 
     auto result = runTask(io, [](EpollIoContext& io) -> Task<int32_t> {
         auto pool = co_await PgPool<EpollIoContext>::create(
-            io, getConnInfo(), 2, 4);
+            io, getConnInfo(), {.min_connections = 2, .max_connections = 4});
 
         {
             auto guard = co_await pool->acquire();
@@ -238,7 +238,7 @@ TEST_CASE("PgClient query convenience", "[pg][integration][pool]") {
     EpollIoContext io;
 
     auto result = runTask(io, [](EpollIoContext& io) -> Task<std::string> {
-        auto pool = co_await PgPool<EpollIoContext>::create(io, getConnInfo(), 1, 4);
+        auto pool = co_await PgPool<EpollIoContext>::create(io, getConnInfo(), {.min_connections = 1, .max_connections = 4});
         PgClient<EpollIoContext> client(pool);
 
         auto r = co_await client.queryArgs("SELECT $1::text || ' ' || $2::text AS msg",
