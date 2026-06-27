@@ -744,8 +744,8 @@ private:
     // =========================================================================
 
     DetachedTask firePgReadBatch(std::vector<PgReadEntry*> entries) {
-        // PGLIVE-1: both acquisitions run *inside* the try. pg_pool_->acquire()
-        // throws PgPoolTimeout on acquire_timeout (§6.2); this coroutine is a
+        // Both acquisitions run *inside* the try. pg_pool_->acquire()
+        // throws PgPoolTimeout on acquire_timeout; this coroutine is a
         // DetachedTask whose unhandled_exception() has an empty body, so an
         // escaped throw is silently swallowed and would strand every batched
         // waiter + coalesced follower forever. The catch stamps the exception on
@@ -967,7 +967,7 @@ private:
         std::sort(entries.begin(), entries.end(),
             [](const auto* a, const auto* b) { return a->seq < b->seq; });
 
-        // PGLIVE-1: acquire inside the try (see firePgReadBatch). An escaped
+        // Acquire inside the try (see firePgReadBatch). An escaped
         // PgPoolTimeout from pg_pool_->acquire() would be swallowed by the
         // DetachedTask and strand every batched waiter + follower forever.
         std::optional<typename ConcurrencyGate::Permit> permit;

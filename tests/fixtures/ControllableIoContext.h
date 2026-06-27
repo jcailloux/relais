@@ -23,7 +23,7 @@ namespace jcailloux::relais::io::test {
 // On top of that it can withhold read-readiness from a single fd while leaving
 // timers and every other fd untouched — the exact shape of "the result arrived
 // but the connection didn't read it in time", which is what turns a committed
-// write into a client-side query_timeout (scenario A of §10.4).
+// write into a client-side query_timeout (scenario A).
 //
 // Mechanism: EpollIoContext watches are level-triggered (EPOLLIN, no EPOLLET),
 // so dropping the Read bit via updateWatch suppresses delivery of already-
@@ -108,8 +108,8 @@ public:
 
     [[nodiscard]] bool isInLoopThread() const noexcept { return inner_.isInLoopThread(); }
 
-    // The write(pipe) counter §10.3 asks for: each cross-thread wakeup is one
-    // write(pipe). Forwarded from production rather than duplicated.
+    // The write(pipe) counter the timeout tests rely on: each cross-thread wakeup
+    // is one write(pipe). Forwarded from production rather than duplicated.
     [[nodiscard]] uint64_t loopWakeups() const noexcept { return inner_.loopWakeups(); }
     [[nodiscard]] std::size_t pendingTimerCount() const { return inner_.pendingTimerCount(); }
 
