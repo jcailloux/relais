@@ -2,6 +2,7 @@
 #define JCX_RELAIS_IO_REDIS_POOL_H
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <memory>
 #include <string>
@@ -12,6 +13,17 @@
 #include "jcailloux/relais/io/redis/RedisClient.h"
 
 namespace jcailloux::relais::io {
+
+// Runtime Redis pool configuration. Unlike PgPool there is no acquire wait
+// (round-robin over a fixed vector, no blocking acquire), so the only client-side
+// bound is the per-operation I/O timeout, threaded to each RedisConnection's ctor,
+// exactly like PgPoolConfig::query_timeout on the PG side.
+//
+//   - query_timeout bounds each Redis I/O wait. 0 = no client bound (discouraged —
+//     a silent Redis blackhole then hangs the worker forever).
+struct RedisPoolConfig {
+    std::chrono::milliseconds query_timeout{0};
+};
 
 // RedisPool — fixed-size pool of RedisClient instances with round-robin dispatch.
 //
@@ -53,12 +65,16 @@ public:
         Io& io,
         const char* host = "127.0.0.1",
         int port = 6379,
-        size_t size = 4)
+        size_t size = 4,
+        RedisPoolConfig cfg = {})
     {
         RedisPool pool;
         pool.clients_.reserve(size);
         for (size_t i = 0; i < size; ++i) {
-            auto client = co_await RedisClient<Io>::connect(io, host, port);
+            // ms → ns is an exact widening (implicit). query_timeout is stored on
+            // each connection for its I/O waits.
+            auto client = co_await RedisClient<Io>::connect(
+                io, host, port, cfg.query_timeout);
             pool.clients_.push_back(std::move(client));
         }
         co_return std::move(pool);
@@ -68,12 +84,14 @@ public:
     static Task<RedisPool> createUnix(
         Io& io,
         const char* path = "/var/run/redis/redis-server.sock",
-        size_t size = 4)
+        size_t size = 4,
+        RedisPoolConfig cfg = {})
     {
         RedisPool pool;
         pool.clients_.reserve(size);
         for (size_t i = 0; i < size; ++i) {
-            auto client = co_await RedisClient<Io>::connectUnix(io, path);
+            auto client = co_await RedisClient<Io>::connectUnix(
+                io, path, cfg.query_timeout);
             pool.clients_.push_back(std::move(client));
         }
         co_return std::move(pool);
