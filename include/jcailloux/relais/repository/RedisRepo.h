@@ -395,6 +395,10 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
         ///    compensating UNLINK (check + SET share one EVAL).
         static io::Task<std::optional<E>> findRaw(const Key& id) {
             auto redisKey = makeRedisKey(id);
+            // No try/catch on the L2 read: every RedisCache operation already
+            // catches its own I/O failures and returns a nil/miss, so a Redis
+            // timeout or a dropped connection surfaces here as an absent value and
+            // falls through to the L3 fetch below. L2 is never authoritative on read.
             auto cached = co_await getFromCache(redisKey);
             if (cached) {
                 RELAIS_METRICS_INC(l2_counters_.hits);
@@ -451,6 +455,8 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
             redisKeys.reserve(ids.size());
             for (const auto& id : ids) redisKeys.push_back(makeRedisKey(id));
 
+            // A Redis failure surfaces as all-nil (RedisCache catches its own I/O
+            // errors), so every key falls through to the L3 MGET below.
             auto cached = co_await mgetFromCache(redisKeys);
 
             // Partition: L2 hits land in out directly; misses keep their origin

@@ -1,6 +1,7 @@
 #ifndef JCX_RELAIS_IO_REDIS_CLIENT_H
 #define JCX_RELAIS_IO_REDIS_CLIENT_H
 
+#include <chrono>
 #include <cstdint>
 #include <deque>
 #include <memory>
@@ -36,9 +37,10 @@ public:
     static Task<std::shared_ptr<RedisClient>> connect(
         Io& io,
         const char* host = "127.0.0.1",
-        int port = 6379
+        int port = 6379,
+        std::chrono::nanoseconds query_timeout = {}
     ) {
-        auto conn = co_await RedisConnection<Io>::connectTcp(io, host, port);
+        auto conn = co_await RedisConnection<Io>::connectTcp(io, host, port, query_timeout);
         co_return std::shared_ptr<RedisClient>(
             new RedisClient(io, std::move(conn)));
     }
@@ -47,9 +49,10 @@ public:
 
     static Task<std::shared_ptr<RedisClient>> connectUnix(
         Io& io,
-        const char* path = "/var/run/redis/redis-server.sock"
+        const char* path = "/var/run/redis/redis-server.sock",
+        std::chrono::nanoseconds query_timeout = {}
     ) {
-        auto conn = co_await RedisConnection<Io>::connectUnix(io, path);
+        auto conn = co_await RedisConnection<Io>::connectUnix(io, path, query_timeout);
         co_return std::shared_ptr<RedisClient>(
             new RedisClient(io, std::move(conn)));
     }
