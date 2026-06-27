@@ -28,8 +28,8 @@ namespace jcailloux::relais::io {
 //   - conninfo carries what libpq/the server enforce (connect_timeout, keepalives,
 //     statement_timeout).
 //   - PgPoolConfig carries what only relais can guarantee client-side:
-//     - acquire_timeout bounds acquire(): the queue wait (Waiter timer, §6.2 a)
-//       and, from a later step, the connect handshake (§6.2 b). 0 = unbounded
+//     - acquire_timeout bounds acquire(): the queue wait (Waiter timer) and the
+//       connect handshake. 0 = unbounded
 //       (discouraged — reintroduces the silent deadlock this config prevents).
 //     - query_timeout bounds each per-connection I/O wait (wired into PgConnection
 //       in a later step). 0 = delegated to the server's statement_timeout.
@@ -108,8 +108,8 @@ public:
 
         for (size_t i = 0; i < cfg.min_connections; ++i) {
             // ms → ns is an exact widening (implicit). acquire_timeout bounds the
-            // handshake (§6.2 b); query_timeout is stored on the connection for its
-            // later query I/O waits (§6.1).
+            // handshake; query_timeout is stored on the connection for its later
+            // query I/O waits.
             auto conn = co_await ConnectionType::connect(
                 pool->io_, pool->conninfo_.c_str(),
                 cfg.acquire_timeout, cfg.query_timeout);
@@ -130,7 +130,7 @@ public:
         }
 
         if (total_ < cfg_.max_connections) {
-            // PGLIVE-2: ++total_ must be undone if connect throws. The
+            // ++total_ must be undone if connect throws. The
             // ConnectionGuard — the sole owner of the release → --total_ path — is
             // built only on success below, so a failed connect (a future
             // PgPoolTimeout on connect, or a plain PgConnectionError today) would
@@ -143,9 +143,9 @@ public:
                 bool committed = false;
                 ~SlotGuard() { if (!committed) --*total; }
             } slot{&total_};
-            // acquire_timeout bounds this connect (§6.2 b): a hanging handshake
+            // acquire_timeout bounds this connect: a hanging handshake
             // (DNS, SYN blackhole) throws PgPoolTimeout, the SlotGuard unwinds
-            // ++total_ (PGLIVE-2), and acquire() propagates instead of freezing.
+            // ++total_, and acquire() propagates instead of freezing.
             auto conn = co_await ConnectionType::connect(
                 io_, conninfo_.c_str(), cfg_.acquire_timeout, cfg_.query_timeout);
             slot.committed = true;
@@ -179,7 +179,7 @@ private:
             }
             auto* waiter = waiters_.front();
             waiters_.pop_front();
-            // Win the acquire_timeout race (§6.2 a): cancel the waiter's timer
+            // Win the acquire_timeout race: cancel the waiter's timer
             // before posting its resume. Single loop thread, so once cancelled the
             // expiry callback (onWaiterTimeout) cannot run. No-op if unarmed
             // (acquire_timeout == 0).
@@ -196,11 +196,11 @@ private:
         }
     }
 
-    // acquire_timeout expiry for a queued Waiter (§6.2 a). Single loop thread, so
+    // acquire_timeout expiry for a queued Waiter. Single loop thread, so
     // this and release() cannot interleave: whichever runs first removes the
     // waiter — release pops it and cancels this timer; this erases it from the
     // queue — and the other finds nothing to do. The resume is posted, never run
-    // inline, to keep the unwind out of fireExpiredTimers (§6.1/§6.3 rationale).
+    // inline, to keep the unwind out of fireExpiredTimers.
     void onWaiterTimeout(Waiter* w) {
         for (auto it = waiters_.begin(); it != waiters_.end(); ++it) {
             if (*it == w) {
@@ -231,7 +231,7 @@ private:
         void await_suspend(std::coroutine_handle<> h) noexcept {
             continuation = h;
             pool->waiters_.push_back(this);
-            // Bound the queue wait by acquire_timeout (§6.2 a). 0 = unbounded.
+            // Bound the queue wait by acquire_timeout. 0 = unbounded.
             // The timer callback captures the raw `self`; it stays valid because a
             // queued acquire() frame is never destroyed while suspended here — the
             // same invariant the waiters_-stored `continuation` already relies on.
