@@ -389,11 +389,7 @@ public:
     static io::Task<std::optional<size_t>> update(const Key& id, const Entity& entity)
         requires MutableEntity<Entity> && HasFullUpdate<Entity> && (!Base::config.read_only)
     {
-        std::optional<Entity> old;
-        {
-            auto view = co_await Base::find(id);
-            if (view) old.emplace(*view);
-        }
+        std::optional<Entity> old = co_await findOldBestEffort(id);
         co_return co_await updateWithContext(id, entity, old ? &*old : nullptr);
     }
 
@@ -401,11 +397,7 @@ public:
     static io::Task<std::optional<size_t>> erase(const Key& id)
         requires (!Base::config.read_only)
     {
-        std::optional<Entity> old;
-        {
-            auto view = co_await Base::find(id);
-            if (view) old.emplace(*view);
-        }
+        std::optional<Entity> old = co_await findOldBestEffort(id);
         co_return co_await eraseWithContext(id, old ? &*old : nullptr);
     }
 
@@ -414,11 +406,7 @@ public:
     static io::Task<cache::CacheView<Entity>> patch(const Key& id, Updates&&... updates)
         requires HasFieldUpdate<Entity> && (!Base::config.read_only)
     {
-        std::optional<Entity> old;
-        {
-            auto view = co_await Base::find(id);
-            if (view) old.emplace(*view);
-        }
+        std::optional<Entity> old = co_await findOldBestEffort(id);
         co_return co_await patchWithContext(id, old ? &*old : nullptr,
             std::forward<Updates>(updates)...);
     }
@@ -577,11 +565,54 @@ protected:
         co_await Base::template invalidateWhereListsDeferred<Desc>(predicate);
     }
 
+    /// Best-effort pre-read of the current entity, used by the top mixin to feed
+    /// precise list/cross invalidation. The read path no longer swallows L3
+    /// errors, so this pre-read can throw; a failure is treated as "old unknown"
+    /// and the caller proceeds with the write + precautionary invalidation rather
+    /// than aborting on a preliminary read failure (preserves write liveness —
+    /// the precautionary eviction covers the lost `old`).
+    static io::Task<std::optional<Entity>> findOldBestEffort(const Key& id) {
+        try {
+            auto view = co_await Base::find(id);
+            if (view) co_return Entity(*view);
+        } catch (const io::PgError&) {
+            // old unknown — fall through and proceed without it.
+        }
+        co_return std::nullopt;
+    }
+
     static io::Task<std::optional<size_t>> updateWithContext(
         const Key& id, const Entity& entity, const Entity* old_entity)
         requires MutableEntity<Entity> && HasFullUpdate<Entity> && (!Base::config.read_only)
     {
-        auto affected = co_await Base::update(id, entity);
+        // co_await is illegal in a catch handler: capture the uncertain timeout,
+        // run the precautionary list invalidation after the try, then rethrow.
+        std::optional<size_t> affected;
+        std::exception_ptr timeout;
+        try {
+            affected = co_await Base::update(id, entity);
+        } catch (const io::PgQueryTimeout&) {
+            timeout = std::current_exception();
+        }
+        if (timeout) {
+            // Uncertain: invalidate the list pages touched by both old and new
+            // positions by precaution (new = the input `entity`, fully known).
+            // L1 tracker bump cannot fail; the L2 selective EVAL is best-effort.
+            if constexpr (kHasL1) {
+                if (old_entity) listCache().onEntityUpdated(*old_entity, entity);
+                else listCache().onEntityCreated(entity);
+            }
+            if constexpr (kHasL2) {
+                try {
+                    co_await invalidateL2Updated(old_entity ? *old_entity : entity, entity);
+                } catch (const std::exception& e) {
+                    RELAIS_LOG_ERROR << name()
+                        << ": L2 list precautionary invalidate failed (update timeout) - "
+                        << e.what();
+                }
+            }
+            std::rethrow_exception(timeout);
+        }
         if (affected.value_or(0) > 0) {
             if constexpr (kHasL1) {
                 if (old_entity) {
@@ -601,7 +632,31 @@ protected:
         const Key& id, const Entity* old_entity)
         requires (!Base::config.read_only)
     {
-        auto result = co_await Base::erase(id);
+        std::optional<size_t> result;
+        std::exception_ptr timeout;
+        try {
+            result = co_await Base::erase(id);
+        } catch (const io::PgQueryTimeout&) {
+            timeout = std::current_exception();
+        }
+        if (timeout) {
+            // Uncertain: the row may have been deleted. Invalidate the list pages
+            // it lived in, keyed on `old` (best-effort). Without `old` (pre-read
+            // failed) the list tier stays bounded by l*_ttl.
+            if (old_entity) {
+                if constexpr (kHasL1) { listCache().onEntityDeleted(*old_entity); }
+                if constexpr (kHasL2) {
+                    try {
+                        co_await invalidateL2Deleted(*old_entity);
+                    } catch (const std::exception& e) {
+                        RELAIS_LOG_ERROR << name()
+                            << ": L2 list precautionary invalidate failed (erase timeout) - "
+                            << e.what();
+                    }
+                }
+            }
+            std::rethrow_exception(timeout);
+        }
         if (result.has_value() && old_entity) {
             if constexpr (kHasL1) { listCache().onEntityDeleted(*old_entity); }
             if constexpr (kHasL2) { co_await invalidateL2Deleted(*old_entity); }
@@ -614,7 +669,32 @@ protected:
         const Key& id, const Entity* old_entity, Updates&&... updates)
         requires HasFieldUpdate<Entity> && (!Base::config.read_only)
     {
-        auto result = co_await Base::patch(id, std::forward<Updates>(updates)...);
+        cache::CacheView<Entity> result;
+        std::exception_ptr timeout;
+        try {
+            result = co_await Base::patch(id, std::forward<Updates>(updates)...);
+        } catch (const io::PgQueryTimeout&) {
+            timeout = std::current_exception();
+        }
+        if (timeout) {
+            // Uncertain: the patched row's new position is unknown (no RETURNING),
+            // so invalidate the pages keyed on `old` only — bump old's groups so a
+            // later list read re-fetches. A patch that moved the row to a new
+            // group leaves that one group bounded by l*_ttl (documented residual).
+            if (old_entity) {
+                if constexpr (kHasL1) { listCache().onEntityDeleted(*old_entity); }
+                if constexpr (kHasL2) {
+                    try {
+                        co_await invalidateL2Deleted(*old_entity);
+                    } catch (const std::exception& e) {
+                        RELAIS_LOG_ERROR << name()
+                            << ": L2 list precautionary invalidate failed (patch timeout) - "
+                            << e.what();
+                    }
+                }
+            }
+            std::rethrow_exception(timeout);
+        }
         if (result) {
             if constexpr (kHasL1) {
                 if (old_entity) {

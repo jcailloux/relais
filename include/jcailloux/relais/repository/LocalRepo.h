@@ -218,17 +218,25 @@ public:
     {
         using enum config::UpdateStrategy;
 
-        auto outcome = co_await Base::updateOutcome(id, entity);
-        if (outcome.affected.value_or(0) > 0 && !outcome.coalesced) {
-            if constexpr (Cfg.update_strategy == InvalidateAndLazyReload) {
-                evict(id);
-            } else {
-                tier().onMutation(id);
-                bumpGeneration(id);
-                tier().store(id, E(entity), buildMetadata());
+        try {
+            auto outcome = co_await Base::updateOutcome(id, entity);
+            if (outcome.affected.value_or(0) > 0 && !outcome.coalesced) {
+                if constexpr (Cfg.update_strategy == InvalidateAndLazyReload) {
+                    evict(id);
+                } else {
+                    tier().onMutation(id);
+                    bumpGeneration(id);
+                    tier().store(id, E(entity), buildMetadata());
+                }
             }
+            co_return outcome.affected;
+        } catch (const io::PgQueryTimeout&) {
+            // Uncertain: the UPDATE may have committed. Evict L1 by precaution so
+            // the next read re-fetches; the L1 evict is local and cannot fail.
+            // RedisRepo already evicted L2 before this unwound (L2-before-L1).
+            evict(id);
+            throw;
         }
-        co_return outcome.affected;
     }
 
     /// Partial update: invalidates L1, delegates to Base::patchRaw,
@@ -259,11 +267,18 @@ public:
             if (hit) { local_hint.emplace(*hit.value); hint = &*local_hint; }
         }
 
-        auto outcome = co_await Base::eraseOutcome(id, hint);
-        if (outcome.affected.has_value() && !outcome.coalesced) {
+        try {
+            auto outcome = co_await Base::eraseOutcome(id, hint);
+            if (outcome.affected.has_value() && !outcome.coalesced) {
+                evict(id);
+            }
+            co_return outcome.affected;
+        } catch (const io::PgQueryTimeout&) {
+            // Uncertain: the DELETE may have committed. Evict L1 by precaution
+            // (local, cannot fail). L2 was already evicted as this unwound.
             evict(id);
+            throw;
         }
-        co_return outcome.affected;
     }
 
     /// Invalidate L1 and L2 caches for a key.
