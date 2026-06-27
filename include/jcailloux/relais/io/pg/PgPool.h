@@ -107,7 +107,12 @@ public:
             new PgPool(io, std::move(conninfo), cfg));
 
         for (size_t i = 0; i < cfg.min_connections; ++i) {
-            auto conn = co_await ConnectionType::connect(pool->io_, pool->conninfo_.c_str());
+            // ms → ns is an exact widening (implicit). acquire_timeout bounds the
+            // handshake (§6.2 b); query_timeout is stored on the connection for its
+            // later query I/O waits (§6.1).
+            auto conn = co_await ConnectionType::connect(
+                pool->io_, pool->conninfo_.c_str(),
+                cfg.acquire_timeout, cfg.query_timeout);
             pool->idle_.push_back(std::move(conn));
             ++pool->total_;
         }
@@ -138,7 +143,11 @@ public:
                 bool committed = false;
                 ~SlotGuard() { if (!committed) --*total; }
             } slot{&total_};
-            auto conn = co_await ConnectionType::connect(io_, conninfo_.c_str());
+            // acquire_timeout bounds this connect (§6.2 b): a hanging handshake
+            // (DNS, SYN blackhole) throws PgPoolTimeout, the SlotGuard unwinds
+            // ++total_ (PGLIVE-2), and acquire() propagates instead of freezing.
+            auto conn = co_await ConnectionType::connect(
+                io_, conninfo_.c_str(), cfg_.acquire_timeout, cfg_.query_timeout);
             slot.committed = true;
             co_return ConnectionGuard(this->shared_from_this(), std::move(conn));
         }

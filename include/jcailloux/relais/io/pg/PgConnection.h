@@ -27,18 +27,20 @@ namespace jcailloux::relais::io {
 template<IoContext Io>
 class PgConnection {
 public:
-    PgConnection(Io& io, PGconn* conn) noexcept
-        : io_(&io), conn_(conn) {
+    PgConnection(Io& io, PGconn* conn,
+                 std::chrono::nanoseconds query_timeout = {}) noexcept
+        : io_(&io), conn_(conn), query_timeout_(query_timeout) {
         assert(conn_);
         PQsetnonblocking(conn_, 1);
     }
 
     ~PgConnection() {
         if (conn_) {
-            if (watch_active_) {
-                io_->removeWatch(watch_);
-                watch_active_ = false;
-            }
+            // Route teardown through removeCurrentWatch (CONC-2): it cancels any
+            // armed watch-bound timer BEFORE PQfinish closes the fd, so a pending
+            // timer cannot fire later on the destroyed object (the timer callback
+            // captures `this`) → no UAF.
+            removeCurrentWatch();
             PQfinish(conn_);
         }
     }
@@ -50,12 +52,32 @@ public:
         , watch_(std::exchange(o.watch_, {}))
         , watch_active_(std::exchange(o.watch_active_, false))
         , prepared_(std::move(o.prepared_))
-    {}
+        // CONC-2: dead_ + timer token + stored continuation must travel with the
+        // connection. release() takes ConnectionType *by value* → move-constructs;
+        // dropping dead_ here would resurrect a poisoned connection (connected() ==
+        // PQstatus==OK on a silent hang), and dropping the timer token would orphan it.
+        , dead_(o.dead_)
+        , current_cont_(std::exchange(o.current_cont_, {}))
+        , timer_(std::exchange(o.timer_, {}))
+        , timer_armed_(std::exchange(o.timer_armed_, false))
+        , query_timeout_(o.query_timeout_)
+    {
+        // Invariant tripwire (CONC-2): a connection must never be moved while its
+        // watch-bound timer is armed. The timer callback captures a raw `this` that
+        // move does NOT patch → moving an armed connection would leave the timer
+        // pointing at the moved-from shell = fire-on-destroyed UAF. The
+        // run-to-completion discipline (removeCurrentWatch precedes every resume, so
+        // a ConnectionGuard can't be moved mid-wait) guarantees this today; the
+        // assert turns any future suspended-frame cancellation into an immediate
+        // failure instead of a silent UAF. timer_armed_ here holds o's pre-move value.
+        assert(!timer_armed_);
+    }
 
     PgConnection& operator=(PgConnection&& o) noexcept {
         if (this != &o) {
+            assert(!o.timer_armed_);  // CONC-2: never move an armed connection (UAF)
             if (conn_) {
-                if (watch_active_) io_->removeWatch(watch_);
+                removeCurrentWatch();  // CONC-2: cancel timer before PQfinish (UAF)
                 PQfinish(conn_);
             }
             io_ = o.io_;
@@ -63,6 +85,11 @@ public:
             watch_ = std::exchange(o.watch_, {});
             watch_active_ = std::exchange(o.watch_active_, false);
             prepared_ = std::move(o.prepared_);
+            dead_ = o.dead_;
+            current_cont_ = std::exchange(o.current_cont_, {});
+            timer_ = std::exchange(o.timer_, {});
+            timer_armed_ = std::exchange(o.timer_armed_, false);
+            query_timeout_ = o.query_timeout_;
         }
         return *this;
     }
@@ -73,7 +100,10 @@ public:
     // Connection state
 
     [[nodiscard]] bool connected() const noexcept {
-        return conn_ && PQstatus(conn_) == CONNECTION_OK;
+        // dead_ first: a timed-out connection is poisoned (§6.4) even though
+        // PQstatus stays CONNECTION_OK on a *silent* hang (socket retained, no
+        // RST). release() must see false → throw the connection, not reuse it.
+        return !dead_ && conn_ && PQstatus(conn_) == CONNECTION_OK;
     }
 
     [[nodiscard]] int socket() const noexcept {
@@ -82,7 +112,13 @@ public:
 
     // Async connect (static factory)
 
-    static Task<PgConnection> connect(Io& io, const char* conninfo) {
+    // acquire_timeout bounds the connect handshake (§6.2 b); query_timeout is
+    // stored on the connection as the default bound for subsequent I/O waits
+    // (§6.1). Both default to 0 = unbounded (server/conninfo-delegated), which
+    // keeps direct callers (tests/benches) compiling unchanged.
+    static Task<PgConnection> connect(Io& io, const char* conninfo,
+                                      std::chrono::nanoseconds acquire_timeout = {},
+                                      std::chrono::nanoseconds query_timeout = {}) {
         PGconn* conn = PQconnectStart(conninfo);
         if (!conn)
             throw PgConnectionError("PQconnectStart returned null");
@@ -93,8 +129,8 @@ public:
             throw PgConnectionError("connect failed: " + err);
         }
 
-        PgConnection pgconn(io, conn);
-        co_await pgconn.awaitConnect();
+        PgConnection pgconn(io, conn, query_timeout);
+        co_await pgconn.awaitConnect(acquire_timeout);
         co_return std::move(pgconn);
     }
 
@@ -252,24 +288,29 @@ private:
     // Write-ready awaiter for pipeline flushing
     struct WriteAwaiter {
         PgConnection* self;
-        std::coroutine_handle<> continuation;
 
         bool await_ready() const noexcept { return false; }
 
         void await_suspend(std::coroutine_handle<> h) {
-            continuation = h;
+            self->current_cont_ = h;
             self->registerWatch(IoEvent::Write, [this](IoEvent) {
                 // Save before removeCurrentWatch destroys this lambda (and its captures)
-                auto coro = continuation;
+                auto coro = self->current_cont_;
                 self->removeCurrentWatch();
                 coro.resume();
-            });
+            }, self->query_timeout_);
         }
 
-        void await_resume() noexcept {}
+        // No longer noexcept (§6.1): on a query_timeout the timer posts the resume
+        // with dead_ set — return-without-throw would swallow the timeout (resume on
+        // a dead connection); a noexcept body + throw would std::terminate.
+        void await_resume() {
+            if (self->dead_)
+                throw PgQueryTimeout("write wait exceeded query_timeout");
+        }
     };
 
-    WriteAwaiter awaitWriteReady() { return {this, {}}; }
+    WriteAwaiter awaitWriteReady() { return {this}; }
 
     // Read a single query's result from the pipeline (everything up to NULL).
     Task<PgResult> awaitPipelineResult() {
@@ -338,34 +379,37 @@ private:
     // Read-ready awaiter (shared between pipeline and normal mode)
     struct ReadAwaiter {
         PgConnection* self;
-        std::coroutine_handle<> continuation;
 
         bool await_ready() const noexcept { return false; }
 
         void await_suspend(std::coroutine_handle<> h) {
-            continuation = h;
+            self->current_cont_ = h;
             self->registerWatch(IoEvent::Read, [this](IoEvent) {
                 // Save before removeCurrentWatch destroys this lambda (and its captures)
-                auto coro = continuation;
+                auto coro = self->current_cont_;
                 self->removeCurrentWatch();
                 coro.resume();
-            });
+            }, self->query_timeout_);
         }
 
-        void await_resume() noexcept {}
+        // No longer noexcept (§6.1): lever PgQueryTimeout sur resume post-timeout.
+        void await_resume() {
+            if (self->dead_)
+                throw PgQueryTimeout("read wait exceeded query_timeout");
+        }
     };
 
-    ReadAwaiter awaitReadReady() { return {this, {}}; }
+    ReadAwaiter awaitReadReady() { return {this}; }
     // Async connect polling
 
     struct ConnectAwaiter {
         PgConnection* self;
-        std::coroutine_handle<> continuation;
+        std::chrono::nanoseconds timeout;  // acquire_timeout (§6.2 b), 0 = unbounded
 
         bool await_ready() const noexcept { return false; }
 
         void await_suspend(std::coroutine_handle<> h) {
-            continuation = h;
+            self->current_cont_ = h;
             auto poll = PQconnectPoll(self->conn_);
             IoEvent events = IoEvent::None;
 
@@ -384,12 +428,20 @@ private:
                     return;
             }
 
+            // Arm the acquire_timeout ONCE here. pollConnect() flips the epoll mask
+            // via updateWatchEvents() (not registerWatch) across the multi-step
+            // handshake, so this single timer bounds the *entire* connect (§6.2 b);
+            // it is cancelled only at the final removeCurrentWatch.
             self->registerWatch(events, [this](IoEvent) {
                 pollConnect();
-            });
+            }, timeout);
         }
 
         void await_resume() {
+            // dead_ first (§6.2 b): the connect exceeded acquire_timeout → a
+            // connect-phase pool timeout, distinct from a server-refused connection.
+            if (self->dead_)
+                throw PgPoolTimeout("connect handshake exceeded acquire_timeout");
             if (PQstatus(self->conn_) != CONNECTION_OK)
                 throw PgConnectionError(
                     std::string("async connect failed: ") + PQerrorMessage(self->conn_));
@@ -409,13 +461,13 @@ private:
                 case PGRES_POLLING_OK:
                 case PGRES_POLLING_FAILED: {
                     // Save before removeCurrentWatch destroys this lambda (and its captures)
-                    auto coro = continuation;
+                    auto coro = self->current_cont_;
                     self->removeCurrentWatch();
                     coro.resume();
                     break;
                 }
                 default: {
-                    auto coro = continuation;
+                    auto coro = self->current_cont_;
                     self->removeCurrentWatch();
                     coro.resume();
                     break;
@@ -424,8 +476,8 @@ private:
         }
     };
 
-    ConnectAwaiter awaitConnect() {
-        return ConnectAwaiter{this, {}};
+    ConnectAwaiter awaitConnect(std::chrono::nanoseconds acquire_timeout = {}) {
+        return ConnectAwaiter{this, acquire_timeout};
     }
 
     // Auto-prepare: first call PREPAREs the statement, subsequent calls reuse it
@@ -447,19 +499,23 @@ private:
 
     struct ResultAwaiter {
         PgConnection* self;
-        std::coroutine_handle<> continuation;
         PgResult result;
 
         bool await_ready() const noexcept { return false; }
 
         void await_suspend(std::coroutine_handle<> h) {
-            continuation = h;
+            self->current_cont_ = h;
             self->registerWatch(IoEvent::Read, [this](IoEvent) {
                 consumeInput();
-            });
+            }, self->query_timeout_);
         }
 
         PgResult await_resume() {
+            // Already non-noexcept → hosts the dead_ check without a signature
+            // change. dead_ before result.ok() (§6.1): a timed-out read leaves
+            // result default-constructed; surface the timeout, not "query failed".
+            if (self->dead_)
+                throw PgQueryTimeout("result wait exceeded query_timeout");
             if (!result.ok())
                 throw PgError("query failed");
             return std::move(result);
@@ -469,7 +525,7 @@ private:
         void consumeInput() {
             if (!PQconsumeInput(self->conn_)) {
                 // Save before removeCurrentWatch destroys this lambda (and its captures)
-                auto coro = continuation;
+                auto coro = self->current_cont_;
                 self->removeCurrentWatch();
                 // result is on the awaiter (stack-allocated), safe to access after removeWatch
                 result = PgResult{};
@@ -487,7 +543,7 @@ private:
             }
 
             // Save before removeCurrentWatch destroys this lambda (and its captures)
-            auto coro = continuation;
+            auto coro = self->current_cont_;
             self->removeCurrentWatch();
             result = PgResult(last);
             coro.resume();
@@ -495,26 +551,68 @@ private:
     };
 
     ResultAwaiter awaitResult() noexcept {
-        return ResultAwaiter{this, {}, {}};
+        return ResultAwaiter{this, {}};
     }
 
     // Watch management helpers
 
-    void registerWatch(IoEvent events, std::function<void(IoEvent)> cb) {
-        if (watch_active_) io_->removeWatch(watch_);
+    void registerWatch(IoEvent events, std::function<void(IoEvent)> cb,
+                       std::chrono::nanoseconds timeout) {
+        // Route the existing-watch removal through removeCurrentWatch so a leftover
+        // timer from the previous awaiter is cancelled too (§6.1) — a bare
+        // removeWatch here would leak the predecessor's timer on every awaiter
+        // chaining (the pipeline chains one per result read).
+        removeCurrentWatch();
         watch_ = io_->addWatch(socket(), events, std::move(cb));
         watch_active_ = true;
+        // Arm the watch-bound timeout AFTER the watch is posted (§6.1). The
+        // invariant becomes: timer armed ⟺ watch active ⟺ connection waiting on I/O.
+        // 0 = unbounded (delegated to conninfo connect_timeout/statement_timeout).
+        if (timeout.count() > 0) {
+            timer_ = io_->postDelayed(timeout, [this] { timeoutCurrentWait(); });
+            timer_armed_ = true;
+        }
     }
 
     void updateWatchEvents(IoEvent events) {
+        // Deliberately does NOT touch the timer: the connect handshake flips the
+        // mask here repeatedly, and acquire_timeout must bound the whole handshake
+        // (§6.2 b), not restart per step.
         if (watch_active_)
             io_->updateWatch(watch_, events);
     }
 
     void removeCurrentWatch() {
+        // cancelTimer BEFORE removeWatch (§6.3): once the timer is gone the expiry
+        // callback cannot run, so the socket-success path that calls this fully
+        // neutralises the co-resident timeout. Single point that does both — no
+        // per-site cancelTimer to forget.
+        if (timer_armed_) {
+            io_->cancelTimer(timer_);
+            timer_armed_ = false;
+        }
         if (watch_active_) {
             io_->removeWatch(watch_);
             watch_active_ = false;
+        }
+    }
+
+    // Watch-bound timer expiry (§6.1/§6.3/§6.4). Three gestures: neutralise the
+    // co-resident socket event (removeCurrentWatch), poison the connection (dead_),
+    // and resume the stored continuation — DEFERRED via io_.post, never inline, so
+    // the unwind (release → PQfinish → fd close) lands in drainPosted() instead of
+    // fireExpiredTimers(): no re-entrant cancelTimer, and the fd-reuse invariant
+    // (§6.3) holds by construction. The awaiter's await_resume sees dead_ and
+    // throws (PgQueryTimeout for query waits, PgPoolTimeout for the connect wait).
+    void timeoutCurrentWait() {
+        // The token is already removed from the timer subsystem (it just fired);
+        // clearing the flag first keeps removeCurrentWatch from re-cancelling it.
+        timer_armed_ = false;
+        removeCurrentWatch();
+        dead_ = true;
+        if (current_cont_) {
+            auto coro = current_cont_;
+            io_->post([coro] { coro.resume(); });
         }
     }
 
@@ -523,6 +621,16 @@ private:
     typename Io::WatchHandle watch_{};
     bool watch_active_ = false;
     std::unordered_map<std::string, std::string> prepared_;
+
+    // Timeout machinery (§6.1). current_cont_ is the single in-flight continuation
+    // per connection (the pipeline chains co_awaits sequentially), set by every
+    // awaiter's await_suspend so timeoutCurrentWait can resume it without knowing
+    // which awaiter is parked.
+    bool dead_ = false;
+    std::coroutine_handle<> current_cont_{};
+    typename Io::TimerToken timer_{};
+    bool timer_armed_ = false;
+    std::chrono::nanoseconds query_timeout_{};  // default bound for query I/O waits
 };
 
 } // namespace jcailloux::relais::io
