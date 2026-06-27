@@ -8,6 +8,7 @@
 #include <deque>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -743,11 +744,20 @@ private:
     // =========================================================================
 
     DetachedTask firePgReadBatch(std::vector<PgReadEntry*> entries) {
-        auto permit = co_await pg_gate_.acquire();
-        auto guard = co_await pg_pool_->acquire();
-        auto& conn = guard.conn();
-
+        // PGLIVE-1: both acquisitions run *inside* the try. pg_pool_->acquire()
+        // throws PgPoolTimeout on acquire_timeout (§6.2); this coroutine is a
+        // DetachedTask whose unhandled_exception() has an empty body, so an
+        // escaped throw is silently swallowed and would strand every batched
+        // waiter + coalesced follower forever. The catch stamps the exception on
+        // all of them; the resume loop below then completes them with that error
+        // in both the success and the failure path.
+        std::optional<typename ConcurrencyGate::Permit> permit;
+        std::optional<typename PgPool<Io>::ConnectionGuard> guard;
         try {
+            permit.emplace(co_await pg_gate_.acquire());
+            guard.emplace(co_await pg_pool_->acquire());
+            auto& conn = guard->conn();
+
             conn.enterPipelineMode();
 
             // Group entity reads by batch_sql, send list/query reads as individual segments
@@ -894,18 +904,20 @@ private:
             }
 
         } catch (...) {
-            // On pipeline-wide failure, propagate exception to ALL waiters
-            // (leaders + coalesced followers) so callers see a real error
-            // instead of a silently-empty PgResult.
+            // On any failure — an acquire timeout (no conn acquired yet) or a
+            // pipeline-wide error — propagate the exception to ALL waiters
+            // (leaders + coalesced followers) so callers see a real error instead
+            // of a silently-empty PgResult, and never hang. exitPipelineMode is
+            // guarded: there is no connection on the acquire-timeout path.
             auto eptr = std::current_exception();
-            try { conn.exitPipelineMode(); } catch (...) {}
+            if (guard) { try { guard->conn().exitPipelineMode(); } catch (...) {} }
             for (auto* e : entries) {
                 e->error = eptr;
                 for (auto* f : e->followers) f->error = eptr;
             }
         }
 
-        permit.release();
+        if (permit) permit->release();
 
         // Collect handles BEFORE resuming any — resuming a leader can destroy
         // its coroutine frame (symmetric transfer), invalidating followers
@@ -955,11 +967,16 @@ private:
         std::sort(entries.begin(), entries.end(),
             [](const auto* a, const auto* b) { return a->seq < b->seq; });
 
-        auto permit = co_await pg_gate_.acquire();
-        auto guard = co_await pg_pool_->acquire();
-        auto& conn = guard.conn();
-
+        // PGLIVE-1: acquire inside the try (see firePgReadBatch). An escaped
+        // PgPoolTimeout from pg_pool_->acquire() would be swallowed by the
+        // DetachedTask and strand every batched waiter + follower forever.
+        std::optional<typename ConcurrencyGate::Permit> permit;
+        std::optional<typename PgPool<Io>::ConnectionGuard> guard;
         try {
+            permit.emplace(co_await pg_gate_.acquire());
+            guard.emplace(co_await pg_pool_->acquire());
+            auto& conn = guard->conn();
+
             conn.enterPipelineMode();
 
             int n_prepares = 0;
@@ -995,16 +1012,17 @@ private:
             }
 
         } catch (...) {
-            // Propagate exception to all waiters instead of silent PgResult{}.
+            // Propagate exception to all waiters instead of silent PgResult{} —
+            // covers both the acquire timeout (no conn yet) and a pipeline error.
             auto eptr = std::current_exception();
-            try { conn.exitPipelineMode(); } catch (...) {}
+            if (guard) { try { guard->conn().exitPipelineMode(); } catch (...) {} }
             for (auto* e : entries) {
                 e->error = eptr;
                 for (auto* f : e->followers) f->error = eptr;
             }
         }
 
-        permit.release();
+        if (permit) permit->release();
 
         // Collect all continuation handles BEFORE resuming any.
         // Resuming a leader can destroy its coroutine frame (symmetric
