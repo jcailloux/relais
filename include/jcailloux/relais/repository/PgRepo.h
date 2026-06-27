@@ -194,20 +194,17 @@ public:
     // Find by ID — JSON serialization (L3: database only)
     // =====================================================================
 
-    /// Find by ID and return JSON string (empty if not found).
+    /// Find by ID and return JSON string (empty if not found). A successful but
+    /// empty result is the only "absent" signal; every L3 error propagates (a
+    /// read timeout or DB-down must not masquerade as a missing row).
     static io::Task<std::string> findJson(const Key& id) {
-        try {
-            auto params = io::PgParams::fromKey(id);
-            auto result = co_await PgProvider::queryParams(
-                Mapping::SQL::select_by_pk, params);
-            if (result.empty()) co_return {};
-            auto entity = E::fromRow(result[0]);
-            if (!entity) co_return {};
-            co_return entity->json();
-        } catch (const io::PgError& e) {
-            RELAIS_LOG_ERROR << name() << ": findJson DB error - " << e.what();
-            co_return {};
-        }
+        auto params = io::PgParams::fromKey(id);
+        auto result = co_await PgProvider::queryParams(
+            Mapping::SQL::select_by_pk, params);
+        if (result.empty()) co_return {};
+        auto entity = E::fromRow(result[0]);
+        if (!entity) co_return {};
+        co_return entity->json();
     }
 
     // =====================================================================
@@ -218,18 +215,13 @@ public:
     static io::Task<std::vector<uint8_t>> findBinary(const Key& id)
         requires HasBinarySerialization<E>
     {
-        try {
-            auto params = io::PgParams::fromKey(id);
-            auto result = co_await PgProvider::queryParams(
-                Mapping::SQL::select_by_pk, params);
-            if (result.empty()) co_return {};
-            auto entity = E::fromRow(result[0]);
-            if (!entity) co_return {};
-            co_return entity->binary();
-        } catch (const io::PgError& e) {
-            RELAIS_LOG_ERROR << name() << ": findBinary DB error - " << e.what();
-            co_return {};
-        }
+        auto params = io::PgParams::fromKey(id);
+        auto result = co_await PgProvider::queryParams(
+            Mapping::SQL::select_by_pk, params);
+        if (result.empty()) co_return {};
+        auto entity = E::fromRow(result[0]);
+        if (!entity) co_return {};
+        co_return entity->binary();
     }
 
     // =====================================================================
@@ -407,17 +399,14 @@ protected:
     /// Find by ID, returning entity by value (no pool/view allocation).
     /// Routes through submitEntityRead for ANY-array batching.
     static io::Task<std::optional<E>> findRaw(const Key& id) {
-        try {
-            auto params = io::PgParams::fromKey(id);
-            auto result = co_await PgProvider::entityQueryParams(
-                Mapping::SQL::select_by_pk_batch,
-                Mapping::SQL::select_by_pk, params);
-            if (result.empty()) co_return std::nullopt;
-            co_return E::fromRow(result[0]);
-        } catch (const io::PgError& e) {
-            RELAIS_LOG_ERROR << name() << ": DB error - " << e.what();
-            co_return std::nullopt;
-        }
+        auto params = io::PgParams::fromKey(id);
+        auto result = co_await PgProvider::entityQueryParams(
+            Mapping::SQL::select_by_pk_batch,
+            Mapping::SQL::select_by_pk, params);
+        // A successful empty result means "absent"; any L3 error propagates so a
+        // read timeout / DB-down is never confused with a missing row.
+        if (result.empty()) co_return std::nullopt;
+        co_return E::fromRow(result[0]);
     }
 
     /// Batched find by IDs via WHERE pk = ANY($1). Returns one optional<E> per
@@ -430,38 +419,37 @@ protected:
     static io::Task<std::vector<std::optional<E>>> findManyRaw(std::span<const Key> ids) {
         std::vector<std::optional<E>> out(ids.size());
         if (ids.empty()) co_return out;
-        try {
-            // One PgParams per requested key; the scheduler folds them (with any
-            // concurrent finds) into the shared ANY array at fire time.
-            std::vector<io::PgParams> keyParams;
-            keyParams.reserve(ids.size());
-            for (const auto& id : ids)
-                keyParams.push_back(io::PgParams::fromKey(id));
 
-            auto result = co_await PgProvider::entityQueryParamsMany(
-                Mapping::SQL::select_by_pk_batch,
-                Mapping::SQL::select_by_pk, std::move(keyParams));
+        // One PgParams per requested key; the scheduler folds them (with any
+        // concurrent finds) into the shared ANY array at fire time.
+        std::vector<io::PgParams> keyParams;
+        keyParams.reserve(ids.size());
+        for (const auto& id : ids)
+            keyParams.push_back(io::PgParams::fromKey(id));
 
-            // ANY returns rows unordered and omits absent ids — match each row
-            // back to its requested position by primary key (mirrors
-            // distributeAnyResults). Linear match: N is small (cf. plan #6).
-            const int n = result.rows();
-            for (int r = 0; r < n; ++r) {
-                auto entity = E::fromRow(result[r]);
-                if (!entity) continue;
-                auto k = entity->key();
-                for (size_t i = 0; i < ids.size(); ++i) {
-                    if (!out[i] && ids[i] == k) {
-                        out[i] = std::move(entity);
-                        break;
-                    }
+        // A successful query yields the matched rows (absent ids stay nullopt);
+        // any L3 error propagates rather than collapsing into an all-absent
+        // vector that a caller could not tell apart from a genuine no-match.
+        auto result = co_await PgProvider::entityQueryParamsMany(
+            Mapping::SQL::select_by_pk_batch,
+            Mapping::SQL::select_by_pk, std::move(keyParams));
+
+        // ANY returns rows unordered and omits absent ids — match each row
+        // back to its requested position by primary key (mirrors
+        // distributeAnyResults). Linear match: N is small (cf. plan #6).
+        const int n = result.rows();
+        for (int r = 0; r < n; ++r) {
+            auto entity = E::fromRow(result[r]);
+            if (!entity) continue;
+            auto k = entity->key();
+            for (size_t i = 0; i < ids.size(); ++i) {
+                if (!out[i] && ids[i] == k) {
+                    out[i] = std::move(entity);
+                    break;
                 }
             }
-            co_return out;
-        } catch (const io::PgError& e) {
-            RELAIS_LOG_ERROR << name() << ": findManyRaw DB error - " << e.what();
-            co_return std::vector<std::optional<E>>(ids.size());
         }
+        co_return out;
     }
 
     /// Batched erase by enumerated keys via `delete_by_pk_batch`
@@ -500,6 +488,11 @@ protected:
                     out.push_back(std::move(*e));
             }
             co_return out;
+        } catch (const io::PgQueryTimeout&) {
+            // Uncertain: the batch DELETE may have committed (lost ACK). Propagate
+            // so the facade evicts by precaution; nullopt stays the deterministic
+            // failure (DB unchanged).
+            throw;
         } catch (const io::PgError& e) {
             RELAIS_LOG_ERROR << name() << ": eraseManyRaw DB error - " << e.what();
             co_return std::nullopt;
@@ -545,6 +538,11 @@ protected:
                 if (static_cast<size_t>(n) < detail::kPgEraseChunk) break;
             }
             co_return out;
+        } catch (const io::PgQueryTimeout&) {
+            // Uncertain: a chunk DELETE may have committed. Propagate so the
+            // facade invalidates by precaution; nullopt stays the deterministic
+            // failure.
+            throw;
         } catch (const io::PgError& e) {
             RELAIS_LOG_ERROR << name() << ": eraseWhereRaw DB error - " << e.what();
             co_return std::nullopt;
@@ -562,31 +560,29 @@ protected:
     static io::Task<std::optional<std::vector<E>>> selectWhereRaw(
         const list::spec::Filters<Descriptor>& filters)
     {
-        try {
-            auto where = list::spec::buildWhereClause<Descriptor>(filters);
-            std::string sql;
-            sql.reserve(128);
-            sql += "SELECT ";
-            sql += Mapping::SQL::returning_columns;
-            sql += " FROM ";
-            sql += Mapping::table_name;
-            if (!where.sql.empty()) {
-                sql += " WHERE ";
-                sql += where.sql;
-            }
-
-            auto result = co_await PgProvider::queryParams(sql.c_str(), where.params);
-            std::vector<E> out;
-            out.reserve(static_cast<size_t>(result.rows()));
-            for (int r = 0; r < result.rows(); ++r) {
-                if (auto e = E::fromRow(result[r]))
-                    out.push_back(std::move(*e));
-            }
-            co_return out;
-        } catch (const io::PgError& e) {
-            RELAIS_LOG_ERROR << name() << ": selectWhereRaw DB error - " << e.what();
-            co_return std::nullopt;
+        // Read path: a successful query (even empty) returns the matched set;
+        // any L3 error propagates (no swallow-to-nullopt), so invalidateWhere
+        // surfaces a resolve failure instead of silently evicting nothing.
+        auto where = list::spec::buildWhereClause<Descriptor>(filters);
+        std::string sql;
+        sql.reserve(128);
+        sql += "SELECT ";
+        sql += Mapping::SQL::returning_columns;
+        sql += " FROM ";
+        sql += Mapping::table_name;
+        if (!where.sql.empty()) {
+            sql += " WHERE ";
+            sql += where.sql;
         }
+
+        auto result = co_await PgProvider::queryParams(sql.c_str(), where.params);
+        std::vector<E> out;
+        out.reserve(static_cast<size_t>(result.rows()));
+        for (int r = 0; r < result.rows(); ++r) {
+            if (auto e = E::fromRow(result[r]))
+                out.push_back(std::move(*e));
+        }
+        co_return out;
     }
 
     /// Insert entity in database, returning entity by value.
@@ -602,6 +598,11 @@ protected:
                 Mapping::SQL::insert, params);
             if (w.result.empty()) co_return std::nullopt;
             co_return E::fromRow(w.result[0]);
+        } catch (const io::PgQueryTimeout&) {
+            // Uncertain: the INSERT may have committed (RETURNING id lost).
+            // Propagate so list/cross tiers invalidate from the input entity;
+            // nullopt stays the deterministic failure.
+            throw;
         } catch (const io::PgError& e) {
             RELAIS_LOG_ERROR << name() << ": insert error - " << e.what();
             co_return std::nullopt;
@@ -648,6 +649,11 @@ protected:
             auto w = co_await PgProvider::queryWrite(sql.c_str(), params);
             if (w.result.empty()) co_return std::nullopt;
             co_return E::fromRow(w.result[0]);
+        } catch (const io::PgQueryTimeout&) {
+            // Uncertain: the UPDATE may have committed. Propagate; the entity
+            // tiers were already evicted before this await (invalidate-first
+            // patch), so the precautionary eviction is already in place.
+            throw;
         } catch (const io::PgError& e) {
             RELAIS_LOG_ERROR << name() << ": patch error - " << e.what();
             co_return std::nullopt;
@@ -692,6 +698,12 @@ protected:
             co_return WriteOutcome{
                 static_cast<size_t>(result.affectedRows()), coalesced};
 
+        } catch (const io::PgQueryTimeout&) {
+            // Uncertain: the UPDATE may have committed (lost ACK). Propagate so
+            // each layer evicts its tier by precaution on the way out; the empty
+            // WriteOutcome (nullopt) stays the deterministic failure (DB
+            // unchanged) that keeps invalidations skipped.
+            throw;
         } catch (const io::PgError& e) {
             RELAIS_LOG_ERROR << name() << ": update error - " << e.what();
             co_return WriteOutcome{};
@@ -722,6 +734,11 @@ protected:
             }
             co_return EraseOutcome{
                 static_cast<size_t>(w.result.affectedRows()), w.coalesced};
+        } catch (const io::PgQueryTimeout&) {
+            // Uncertain: the DELETE may have committed. Propagate so each layer
+            // evicts its tier by precaution; the empty EraseOutcome (nullopt)
+            // stays the deterministic failure (DB unchanged).
+            throw;
         } catch (const io::PgError& e) {
             RELAIS_LOG_ERROR << name() << ": erase error - " << e.what();
             co_return EraseOutcome{};

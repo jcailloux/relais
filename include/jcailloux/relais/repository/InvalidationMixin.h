@@ -4,7 +4,9 @@
 #include <span>
 #include "jcailloux/relais/io/Task.h"
 #include "jcailloux/relais/io/WhenAll.h"
+#include "jcailloux/relais/io/pg/PgError.h"
 #include "jcailloux/relais/repository/InvalidateOn.h"
+#include "jcailloux/relais/Log.h"
 
 namespace relais_test { struct TestInternals; }
 
@@ -50,7 +52,27 @@ public:
     static io::Task<cache::CacheView<Entity>> insert(const Entity& entity)
         requires MutableEntity<Entity> && (!Base::config.read_only)
     {
-        auto result = co_await Base::insert(entity);
+        // co_await is illegal in a catch handler: capture the uncertain timeout,
+        // run the precautionary cross-invalidation after the try, then rethrow.
+        cache::CacheView<Entity> result;
+        std::exception_ptr timeout;
+        try {
+            result = co_await Base::insert(entity);
+        } catch (const io::PgQueryTimeout&) {
+            timeout = std::current_exception();
+        }
+        if (timeout) {
+            // Uncertain: the row may have been inserted (RETURNING id lost).
+            // Cross-invalidate from the INPUT entity — the dependent keys live in
+            // the entity's own fields, not the generated id. Best-effort.
+            try {
+                co_await propagateCreate<Entity, InvList>(entity);
+            } catch (const std::exception& e) {
+                RELAIS_LOG_ERROR << name()
+                    << ": cross-invalidation failed (insert timeout) - " << e.what();
+            }
+            std::rethrow_exception(timeout);
+        }
         if (result) {
             co_await propagateCreate<Entity, InvList>(*result);
         }
@@ -63,19 +85,32 @@ public:
     static io::Task<std::optional<size_t>> update(const Key& id, const Entity& entity)
         requires MutableEntity<Entity> && HasFullUpdate<Entity> && (!Base::config.read_only)
     {
-        std::optional<Entity> old;
-        {
-            auto view = co_await Base::find(id);
-            if (view) old.emplace(*view);
-        }
+        std::optional<Entity> old = co_await findOldBestEffort(id);
 
         std::optional<size_t> affected;
-        if constexpr (detail::HasListMixin<Base>) {
-            affected = co_await Base::updateWithContext(id, entity, old ? &*old : nullptr);
-        } else {
-            affected = co_await Base::update(id, entity);
+        std::exception_ptr timeout;
+        try {
+            if constexpr (detail::HasListMixin<Base>) {
+                affected = co_await Base::updateWithContext(id, entity, old ? &*old : nullptr);
+            } else {
+                affected = co_await Base::update(id, entity);
+            }
+        } catch (const io::PgQueryTimeout&) {
+            timeout = std::current_exception();
         }
-
+        if (timeout) {
+            // Uncertain: cross-invalidate by precaution, keyed on old (lost ⇒
+            // null) and the input new. Best-effort. The list/entity tiers already
+            // evicted themselves as the exception unwound through the inner layers.
+            try {
+                co_await propagateUpdate<Entity, InvList>(
+                    old ? &*old : nullptr, entity);
+            } catch (const std::exception& e) {
+                RELAIS_LOG_ERROR << name()
+                    << ": cross-invalidation failed (update timeout) - " << e.what();
+            }
+            std::rethrow_exception(timeout);
+        }
         if (affected.value_or(0) > 0) {
             co_await propagateUpdate<Entity, InvList>(
                 old ? &*old : nullptr, entity);
@@ -88,19 +123,32 @@ public:
     static io::Task<std::optional<size_t>> erase(const Key& id)
         requires (!Base::config.read_only)
     {
-        std::optional<Entity> old;
-        {
-            auto view = co_await Base::find(id);
-            if (view) old.emplace(*view);
-        }
+        std::optional<Entity> old = co_await findOldBestEffort(id);
 
         std::optional<size_t> result;
-        if constexpr (detail::HasListMixin<Base>) {
-            result = co_await Base::eraseWithContext(id, old ? &*old : nullptr);
-        } else {
-            result = co_await Base::erase(id);
+        std::exception_ptr timeout;
+        try {
+            if constexpr (detail::HasListMixin<Base>) {
+                result = co_await Base::eraseWithContext(id, old ? &*old : nullptr);
+            } else {
+                result = co_await Base::erase(id);
+            }
+        } catch (const io::PgQueryTimeout&) {
+            timeout = std::current_exception();
         }
-
+        if (timeout) {
+            // Uncertain: cross-invalidate by precaution from old (if known).
+            // Best-effort; without old the cross tier is bounded by l*_ttl.
+            if (old) {
+                try {
+                    co_await propagateDelete<Entity, InvList>(*old);
+                } catch (const std::exception& e) {
+                    RELAIS_LOG_ERROR << name()
+                        << ": cross-invalidation failed (erase timeout) - " << e.what();
+                }
+            }
+            std::rethrow_exception(timeout);
+        }
         if (result.has_value() && old) {
             co_await propagateDelete<Entity, InvList>(*old);
         }
@@ -113,20 +161,35 @@ public:
     static io::Task<cache::CacheView<Entity>> patch(const Key& id, Updates&&... updates)
         requires HasFieldUpdate<Entity> && (!Base::config.read_only)
     {
-        std::optional<Entity> old;
-        {
-            auto view = co_await Base::find(id);
-            if (view) old.emplace(*view);
-        }
+        std::optional<Entity> old = co_await findOldBestEffort(id);
 
         cache::CacheView<Entity> result;
-        if constexpr (detail::HasListMixin<Base>) {
-            result = co_await Base::patchWithContext(
-                id, old ? &*old : nullptr, std::forward<Updates>(updates)...);
-        } else {
-            result = co_await Base::patch(id, std::forward<Updates>(updates)...);
+        std::exception_ptr timeout;
+        try {
+            if constexpr (detail::HasListMixin<Base>) {
+                result = co_await Base::patchWithContext(
+                    id, old ? &*old : nullptr, std::forward<Updates>(updates)...);
+            } else {
+                result = co_await Base::patch(id, std::forward<Updates>(updates)...);
+            }
+        } catch (const io::PgQueryTimeout&) {
+            timeout = std::current_exception();
         }
-
+        if (timeout) {
+            // Uncertain: the patched new value is unknown (no RETURNING). Cross-
+            // invalidate keyed on old only (old as both old and new ⇒ old's target
+            // keys). A patch that moved a cross key leaves that target bounded by
+            // l*_ttl (documented residual). Best-effort.
+            if (old) {
+                try {
+                    co_await propagateUpdate<Entity, InvList>(&*old, *old);
+                } catch (const std::exception& e) {
+                    RELAIS_LOG_ERROR << name()
+                        << ": cross-invalidation failed (patch timeout) - " << e.what();
+                }
+            }
+            std::rethrow_exception(timeout);
+        }
         if (result) {
             co_await propagateUpdate<Entity, InvList>(
                 old ? &*old : nullptr, *result);
@@ -136,11 +199,7 @@ public:
 
     /// Invalidate all caches (L1 + L2) and propagate cross-invalidation.
     static io::Task<void> invalidate(const Key& id) {
-        std::optional<Entity> old;
-        {
-            auto view = co_await Base::find(id);
-            if (view) old.emplace(*view);
-        }
+        std::optional<Entity> old = co_await findOldBestEffort(id);
         if (old) {
             co_await propagateDelete<Entity, InvList>(*old);
         }
@@ -148,6 +207,20 @@ public:
     }
 
 protected:
+    /// Best-effort pre-read for cross-invalidation context. The read path no
+    /// longer swallows L3 errors, so this pre-read can throw; a failure is
+    /// treated as "old unknown" and the caller proceeds with the write +
+    /// precautionary invalidation rather than aborting on a preliminary read.
+    static io::Task<std::optional<Entity>> findOldBestEffort(const Key& id) {
+        try {
+            auto view = co_await Base::find(id);
+            if (view) co_return Entity(*view);
+        } catch (const io::PgError&) {
+            // old unknown — proceed without it.
+        }
+        co_return std::nullopt;
+    }
+
     /// Batch invalidation, critical pass — no cross-target here (it is deferred):
     /// delegate the entity tier + L1 list tracker straight down the chain. Awaited
     /// by the facade (latency-critical: the entity UNLINK must precede the return,

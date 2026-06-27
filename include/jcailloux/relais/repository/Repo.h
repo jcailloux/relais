@@ -278,7 +278,32 @@ public:
     {
         if (ids.empty()) co_return std::optional<size_t>{0};
         auto keys = detail::dedupStable<Key>(ids);
-        auto deleted = co_await Base::eraseManyRaw(std::span<const Key>(keys));
+        // co_await is illegal in a catch handler: capture the uncertain timeout,
+        // evict the input key set after the try, then rethrow.
+        std::optional<std::vector<E>> deleted;
+        std::exception_ptr timeout;
+        try {
+            deleted = co_await Base::eraseManyRaw(std::span<const Key>(keys));
+        } catch (const io::PgQueryTimeout&) {
+            timeout = std::current_exception();
+        }
+        if (timeout) {
+            // Uncertain: the batch DELETE may have committed (lost ACK). Evict the
+            // known input key set from the entity tier (L1+L2) by precaution — a
+            // possibly-deleted row must not stay cached. Per-key invalidate also
+            // runs cross-invalidation when the entity is still cached (the common
+            // case right after an erase). Fanned out with whenAll so the worst
+            // case — keys absent from cache while the DB is frozen, each falling
+            // through to a bounded L3 find — costs ONE query_timeout in parallel,
+            // not N sequentially (`keys` outlives the gather). Lists are NOT
+            // recoverable here: without the row bodies (no RETURNING) their
+            // filter/sort values are unknown, so that tier stays bounded by l*_ttl.
+            std::vector<io::Task<void>> evictions;
+            evictions.reserve(keys.size());
+            for (const auto& k : keys) evictions.push_back(Base::invalidate(k));
+            co_await io::whenAll(std::move(evictions));
+            std::rethrow_exception(timeout);
+        }
         if (!deleted) co_return std::nullopt;  // DB error
         // Await the latency-critical cleanup (L1 evict + L2 entity UNLINK + gen
         // bump + L1 list bump), then fire the order-free remainder (cross-target
@@ -336,7 +361,31 @@ public:
         using FD = FilterDescriptorFor<E>;
         list::spec::Filters<FD> filters;
         filters.values = pred.toFilterTuple();
-        auto deleted = co_await Base::template eraseWhereRaw<FD>(filters);
+        std::optional<std::vector<E>> deleted;
+        std::exception_ptr timeout;
+        try {
+            deleted = co_await Base::template eraseWhereRaw<FD>(filters);
+        } catch (const io::PgQueryTimeout&) {
+            timeout = std::current_exception();
+        }
+        if (timeout) {
+            // Uncertain: a chunk DELETE may have committed. The matched primary
+            // keys are unknowable after a lost ACK (a post-hoc SELECT no longer
+            // finds a committed delete), so the entity tier is left bounded by
+            // l1/l2_ttl (logged). The LIST tier is still recoverable — the
+            // predicate drives it directly, no resolved id set needed.
+            RELAIS_LOG_ERROR << name()
+                << ": eraseWhere timeout — entity tier left to l*_ttl "
+                   "(matched keys unknowable), invalidating lists by predicate";
+            try {
+                co_await Base::template invalidateWhereListsCritical<FD>(filters);
+            } catch (const std::exception& e) {
+                RELAIS_LOG_ERROR << name()
+                    << ": predicate list invalidate failed (eraseWhere timeout) - "
+                    << e.what();
+            }
+            std::rethrow_exception(timeout);
+        }
         if (!deleted) co_return std::nullopt;  // DB error
         // Two disjoint tiers, gathered so their L2 commands share one flush:
         //  - entity tier (L1 evict + L2 UNLINK + cross-inval) per deleted row,

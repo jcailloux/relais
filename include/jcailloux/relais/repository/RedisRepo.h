@@ -187,7 +187,33 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
         {
             using enum config::UpdateStrategy;
 
-            auto outcome = co_await Base::updateOutcome(id, entity);
+            // co_await is illegal inside a catch handler, so capture the
+            // uncertain timeout and run the precautionary L2 evict after the try.
+            WriteOutcome outcome;
+            std::exception_ptr timeout;
+            try {
+                outcome = co_await Base::updateOutcome(id, entity);
+            } catch (const io::PgQueryTimeout&) {
+                timeout = std::current_exception();
+            }
+            if (timeout) {
+                // Uncertain: the UPDATE may have committed. Evict L2 by
+                // precaution (bump gen + UNLINK), never write-through the
+                // unconfirmed value. Best-effort — Redis may be down — but the
+                // PgQueryTimeout must still surface, so the eviction's own I/O
+                // failure is logged, not allowed to mask it. RedisRepo unwinds
+                // before LocalRepo, so this L2 evict precedes the L1 evict
+                // (anti-phantom L2-before-L1, for free).
+                try {
+                    co_await bumpGen(id);
+                    co_await evictRedis(id);
+                } catch (const std::exception& e) {
+                    RELAIS_LOG_ERROR << Base::name()
+                        << ": L2 precautionary evict failed (update timeout) - "
+                        << e.what();
+                }
+                std::rethrow_exception(timeout);
+            }
             if (outcome.affected.value_or(0) > 0 && !outcome.coalesced) {
                 co_await bumpGen(id);
                 if constexpr (Cfg.update_strategy == InvalidateAndLazyReload) {
@@ -236,7 +262,27 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
                 }
             }
 
-            auto outcome = co_await Base::eraseOutcome(id, hint);
+            EraseOutcome outcome;
+            std::exception_ptr timeout;
+            try {
+                outcome = co_await Base::eraseOutcome(id, hint);
+            } catch (const io::PgQueryTimeout&) {
+                timeout = std::current_exception();
+            }
+            if (timeout) {
+                // Uncertain: the DELETE may have committed. Evict L2 by
+                // precaution; best-effort, but the timeout must still surface
+                // (L2-before-L1 holds by unwind order).
+                try {
+                    co_await bumpGen(id);
+                    co_await evictRedis(id);
+                } catch (const std::exception& e) {
+                    RELAIS_LOG_ERROR << Base::name()
+                        << ": L2 precautionary evict failed (erase timeout) - "
+                        << e.what();
+                }
+                std::rethrow_exception(timeout);
+            }
             if (outcome.affected.has_value() && !outcome.coalesced) {
                 co_await bumpGen(id);
                 co_await evictRedis(id);
