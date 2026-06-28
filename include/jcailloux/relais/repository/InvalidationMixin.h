@@ -74,7 +74,17 @@ public:
             std::rethrow_exception(timeout);
         }
         if (result) {
-            co_await propagateCreate<Entity, InvList>(*result);
+            // The write committed; cross-invalidation is best-effort. A dependency
+            // may resolve its target keys through a DB read (InvalidateVia) that can
+            // now surface an L3 error — never let that turn a committed write into an
+            // apparent failure (the caller would retry → double-write). Log and
+            // return success; an un-invalidated cross-target is TTL-bounded.
+            try {
+                co_await propagateCreate<Entity, InvList>(*result);
+            } catch (const std::exception& e) {
+                RELAIS_LOG_ERROR << name()
+                    << ": cross-invalidation failed (insert committed) - " << e.what();
+            }
         }
         co_return result;
     }
@@ -112,8 +122,14 @@ public:
             std::rethrow_exception(timeout);
         }
         if (affected.value_or(0) > 0) {
-            co_await propagateUpdate<Entity, InvList>(
-                old ? &*old : nullptr, entity);
+            // Best-effort: a committed write never fails on cross-invalidation.
+            try {
+                co_await propagateUpdate<Entity, InvList>(
+                    old ? &*old : nullptr, entity);
+            } catch (const std::exception& e) {
+                RELAIS_LOG_ERROR << name()
+                    << ": cross-invalidation failed (update committed) - " << e.what();
+            }
         }
         co_return affected;
     }
@@ -150,7 +166,13 @@ public:
             std::rethrow_exception(timeout);
         }
         if (result.has_value() && old) {
-            co_await propagateDelete<Entity, InvList>(*old);
+            // Best-effort: a committed delete never fails on cross-invalidation.
+            try {
+                co_await propagateDelete<Entity, InvList>(*old);
+            } catch (const std::exception& e) {
+                RELAIS_LOG_ERROR << name()
+                    << ": cross-invalidation failed (erase committed) - " << e.what();
+            }
         }
         co_return result;
     }
@@ -191,8 +213,14 @@ public:
             std::rethrow_exception(timeout);
         }
         if (result) {
-            co_await propagateUpdate<Entity, InvList>(
-                old ? &*old : nullptr, *result);
+            // Best-effort: a committed patch never fails on cross-invalidation.
+            try {
+                co_await propagateUpdate<Entity, InvList>(
+                    old ? &*old : nullptr, *result);
+            } catch (const std::exception& e) {
+                RELAIS_LOG_ERROR << name()
+                    << ": cross-invalidation failed (patch committed) - " << e.what();
+            }
         }
         co_return result;
     }
@@ -201,7 +229,14 @@ public:
     static io::Task<void> invalidate(const Key& id) {
         std::optional<Entity> old = co_await findOldBestEffort(id);
         if (old) {
-            co_await propagateDelete<Entity, InvList>(*old);
+            // Best-effort: a cross-invalidation failure must not skip the primary
+            // entity-tier eviction below.
+            try {
+                co_await propagateDelete<Entity, InvList>(*old);
+            } catch (const std::exception& e) {
+                RELAIS_LOG_ERROR << name()
+                    << ": cross-invalidation failed (invalidate) - " << e.what();
+            }
         }
         co_await Base::invalidate(id);
     }
