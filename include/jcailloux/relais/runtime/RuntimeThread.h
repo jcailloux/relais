@@ -1,6 +1,7 @@
 #ifndef JCX_RELAIS_RUNTIME_THREAD_H
 #define JCX_RELAIS_RUNTIME_THREAD_H
 
+#include <atomic>
 #include <chrono>
 #include <mutex>
 #include <thread>
@@ -20,9 +21,17 @@ struct RuntimeThread {
         static_cast<float>(std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::milliseconds{100}).count());
 
+    using HeapRefreshHook = void (*)() noexcept;
+
     /// Optional callback invoked after each CachedMemory::tick().
     /// Set by GDSFPolicy to reset its admitted counter on heap refresh.
-    static inline void (*on_heap_refresh)() noexcept = nullptr;
+    ///
+    /// Atomic because it is written once by the GDSFPolicy singleton's
+    /// constructor (which runs lazily, possibly after this thread has started)
+    /// and read on every tick by the background thread. The release/acquire pair
+    /// also publishes the GDSFPolicy state the hook touches: a reader that sees
+    /// the non-null hook sees a fully-constructed policy.
+    static inline std::atomic<HeapRefreshHook> on_heap_refresh{nullptr};
 
     /// Ensure the background thread is running (idempotent via call_once).
     static void ensureStarted() {
@@ -31,7 +40,8 @@ struct RuntimeThread {
                 while (!st.stop_requested()) {
                     CachedClock::tick();
                     CachedMemory::tick();
-                    if (on_heap_refresh) on_heap_refresh();
+                    if (auto hook = on_heap_refresh.load(std::memory_order_acquire))
+                        hook();
                     std::this_thread::sleep_for(kInterval);
                 }
             }};
