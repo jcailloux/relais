@@ -357,9 +357,11 @@ public:
 
 private:
     GDSFPolicy() : max_memory_(readMaxMemoryFromEnv()) {
-        runtime::RuntimeThread::on_heap_refresh = [] () noexcept {
-            GDSFPolicy::instance().onHeapRefresh();
-        };
+        // Release-store the hook last: a background-thread reader that acquire-
+        // loads it then sees this fully-constructed policy.
+        runtime::RuntimeThread::on_heap_refresh.store(
+            [] () noexcept { GDSFPolicy::instance().onHeapRefresh(); },
+            std::memory_order_release);
     }
 
     static size_t readMaxMemoryFromEnv() {
