@@ -6,6 +6,7 @@
 #include "jcailloux/relais/cache/RedisCache.h"
 #include "jcailloux/relais/cache/Metrics.h"
 #include "jcailloux/relais/config/CacheConfig.h"
+#include "jcailloux/relais/PgProvider.h"
 
 namespace jcailloux::relais {
 
@@ -199,14 +200,14 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
             if (timeout) {
                 // Uncertain: the UPDATE may have committed. Evict L2 by
                 // precaution (bump gen + UNLINK), never write-through the
-                // unconfirmed value. Best-effort — Redis may be down — but the
-                // PgQueryTimeout must still surface, so the eviction's own I/O
-                // failure is logged, not allowed to mask it. RedisRepo unwinds
-                // before LocalRepo, so this L2 evict precedes the L1 evict
-                // (anti-phantom L2-before-L1, for free).
+                // unconfirmed value. Best-effort — Redis may be down — and if the
+                // UNLINK cannot confirm, a deferred self-heal re-evicts on
+                // recovery (evictL2OrSelfHeal). The PgQueryTimeout must still
+                // surface, so the eviction's own I/O failure is logged, not
+                // allowed to mask it. RedisRepo unwinds before LocalRepo, so this
+                // L2 evict precedes the L1 evict (anti-phantom L2-before-L1).
                 try {
-                    co_await bumpGen(id);
-                    co_await evictRedis(id);
+                    co_await evictL2OrSelfHeal(id);
                 } catch (const std::exception& e) {
                     RELAIS_LOG_ERROR << Base::name()
                         << ": L2 precautionary evict failed (update timeout) - "
@@ -219,13 +220,14 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
                 // op catches its own I/O failure and degrades to a no-op, so a Redis
                 // outage or timeout here cannot throw past this success path and skip
                 // the L1 evict LocalRepo runs as the call unwinds. No try needed.
-                co_await bumpGen(id);
                 if constexpr (Cfg.update_strategy == InvalidateAndLazyReload) {
-                    // Safe strategy: the bump above then an evict — the next read
-                    // re-fills (read-fill recheck / Redis-side gen), so L2 always
-                    // reconverges on the DB across instances.
-                    co_await evictRedis(id);
+                    // Safe strategy: bump gen then UNLINK — the next read re-fills
+                    // (read-fill recheck / Redis-side gen), so L2 always reconverges
+                    // on the DB across instances. A failed UNLINK enqueues a
+                    // deferred self-heal so the phantom does not outlive the outage.
+                    co_await evictL2OrSelfHeal(id);
                 } else {
+                    co_await bumpGen(id);
                     // Optimistic write-through: authoritative SET of the value we
                     // just committed. NOTE — under CONCURRENT updaters this is
                     // last-write-to-Redis-wins (two writers can land their SETs in
@@ -234,8 +236,11 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
                     // optimistic write-through and orthogonal to the read-fill
                     // straddle the gen closes; the safe InvalidateAndLazyReload
                     // strategy has no such window. Single-writer / sequential
-                    // updates are exact.
-                    co_await setInCache(makeRedisKey(id), entity);
+                    // updates are exact. A failed SET leaves L2 holding the OLD
+                    // value — enqueue a self-heal that UNLINKs it on recovery
+                    // (degrade optimistic → lazy-reload rather than serve stale).
+                    bool ok = co_await setInCache(makeRedisKey(id), entity);
+                    if (!ok && PgProvider::hasRedis()) scheduleSelfHeal(id);
                 }
             }
             co_return outcome;
@@ -276,10 +281,10 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
             if (timeout) {
                 // Uncertain: the DELETE may have committed. Evict L2 by
                 // precaution; best-effort, but the timeout must still surface
-                // (L2-before-L1 holds by unwind order).
+                // (L2-before-L1 holds by unwind order). A failed UNLINK enqueues
+                // a deferred self-heal so a deleted row is not served on recovery.
                 try {
-                    co_await bumpGen(id);
-                    co_await evictRedis(id);
+                    co_await evictL2OrSelfHeal(id);
                 } catch (const std::exception& e) {
                     RELAIS_LOG_ERROR << Base::name()
                         << ": L2 precautionary evict failed (erase timeout) - "
@@ -288,8 +293,7 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
                 std::rethrow_exception(timeout);
             }
             if (outcome.affected.has_value() && !outcome.coalesced) {
-                co_await bumpGen(id);
-                co_await evictRedis(id);
+                co_await evictL2OrSelfHeal(id);
             }
             co_return outcome;
         }
@@ -299,8 +303,7 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
         /// Invalidate Redis cache for a key and return void.
         /// Used as cross-invalidation target interface.
         static io::Task<void> invalidate(const Key& id) {
-            co_await bumpGen(id);
-            co_await evictRedis(id);
+            co_await evictL2OrSelfHeal(id);
         }
 
         /// Invalidate Redis cache for a key.
@@ -425,6 +428,45 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
                 Recheck::bump(id);
             }
             co_return;
+        }
+
+        // =====================================================================
+        // Staleness self-heal — deferred re-eviction when L2 is unreachable
+        // =====================================================================
+
+        /// L1 evict for a phantom a concurrent read may have re-stored into the
+        /// process-shared L1 after a failed L2 evict. Set by LocalRepo (the L1
+        /// tier) when present — RedisRepo cannot name the derived tier, so the
+        /// derived layer registers its evict here. Null in an L2-only config:
+        /// the retry then does L2 only. Read at retry-run time (the tier is
+        /// initialized by the mutation that enqueued the retry).
+        static inline void (*l1SelfHealHook_)(const Key&) = nullptr;
+
+        /// Enqueue a deferred self-heal for `id` whose L2 eviction did not confirm
+        /// (Redis unreachable). The retry re-runs bump-gen → UNLINK L2 → evict L1
+        /// — L1 last, so its generation bump closes the read-fill straddle only
+        /// after the UNLINK lands (the COH ordering) — until the UNLINK confirms.
+        /// Deduped by Redis key, bounded, off the hot path. Without a Redis
+        /// reconnect path the queue can only degrade on l1/l2_ttl.
+        static void scheduleSelfHeal(const Key& id) {
+            PgProvider::enqueueSelfHeal(makeRedisKey(id), [id]() -> io::Task<bool> {
+                co_await bumpGen(id);
+                bool ok = co_await evictRedis(id);
+                if (ok && l1SelfHealHook_) l1SelfHealHook_(id);
+                co_return ok;
+            });
+        }
+
+        /// L2 entity eviction for a mutation (bump gen + UNLINK). If the UNLINK
+        /// could not confirm (Redis unreachable), enqueue a deferred self-heal so
+        /// the phantom is re-evicted on recovery. Best-effort by construction —
+        /// RedisCache swallows its own I/O errors — so it never throws; the bool
+        /// only tells the caller whether the UNLINK confirmed.
+        static io::Task<bool> evictL2OrSelfHeal(const Key& id) {
+            co_await bumpGen(id);
+            bool ok = co_await evictRedis(id);
+            if (!ok && PgProvider::hasRedis()) scheduleSelfHeal(id);
+            co_return ok;
         }
 
         /// Find with L2 -> L3 fallback, returning entity by value.
@@ -601,8 +643,10 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
         static io::Task<std::optional<E>> patchRaw(const Key& id, Updates&&... updates)
             requires HasFieldUpdate<E> && (!Cfg.read_only)
         {
-            co_await bumpGen(id);
-            co_await evictRedis(id);
+            // Invalidate-first: evict L2 before the DB write. A failed UNLINK
+            // enqueues a deferred self-heal so the pre-patch value does not
+            // outlive a Redis outage.
+            co_await evictL2OrSelfHeal(id);
             co_return co_await Base::patchRaw(id, std::forward<Updates>(updates)...);
         }
 

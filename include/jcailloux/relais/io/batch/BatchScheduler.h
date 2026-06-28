@@ -21,6 +21,7 @@
 #include "jcailloux/relais/io/pg/PgParams.h"
 #include "jcailloux/relais/io/redis/RedisPool.h"
 #include "jcailloux/relais/io/redis/RedisResult.h"
+#include "jcailloux/relais/io/SelfHealQueue.h"
 #include "jcailloux/relais/io/batch/TimingEstimator.h"
 
 #ifdef RELAIS_BUILDING_TESTS
@@ -67,6 +68,7 @@ public:
         : io_(io)
         , pg_pool_(std::move(pg_pool))
         , redis_pool_(std::move(redis_pool))
+        , self_heal_(io_, redis_pool_)
         , pg_gate_{max_concurrent}
         , redis_gate_{max_concurrent}
     {}
@@ -164,6 +166,13 @@ public:
         }
 
         co_return co_await submitRedisEntry(std::move(entry));
+    }
+
+    /// Register a deferred cache-eviction retry whose UNLINK could not reach
+    /// Redis (self-heal of the L2/L1 staleness bound). Off the hot path; the
+    /// queue dedupes by key, rebuilds dead Redis slots, and drains on recovery.
+    void enqueueSelfHeal(std::string key, typename SelfHealQueue<Io>::Retry retry) {
+        self_heal_.enqueue(std::move(key), std::move(retry));
     }
 
     /// Direct query bypass — for BEGIN/COMMIT/ROLLBACK/SET.
@@ -1326,6 +1335,10 @@ private:
     Io& io_;
     std::shared_ptr<PgPool<Io>> pg_pool_;
     std::shared_ptr<RedisPool<Io>> redis_pool_;
+    // Deferred retry of cache evictions that could not reach Redis (self-heal of
+    // the L2/L1 staleness bound). Loop-local; rebuilds dead Redis slots before
+    // retrying. Declared after redis_pool_ — it borrows io_ and shares the pool.
+    SelfHealQueue<Io> self_heal_;
     // Per-tier concurrency budgets. Split so a burst of in-flight Redis sends
     // can never steal PG's connection slots (and vice-versa): under mixed
     // PG+Redis load PG keeps its full budget. Both reads and writes share the

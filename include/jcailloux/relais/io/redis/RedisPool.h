@@ -53,6 +53,7 @@ public:
     RedisPool(RedisPool&& o) noexcept
         : clients_(std::move(o.clients_))
         , reconnect_factory_(std::move(o.reconnect_factory_))
+        , reviving_(o.reviving_)
         , counter_(o.counter_.load(std::memory_order_relaxed))
     {}
 
@@ -60,6 +61,7 @@ public:
         if (this != &o) {
             clients_ = std::move(o.clients_);
             reconnect_factory_ = std::move(o.reconnect_factory_);
+            reviving_ = o.reviving_;
             counter_.store(o.counter_.load(std::memory_order_relaxed),
                            std::memory_order_relaxed);
         }
@@ -136,10 +138,24 @@ public:
         co_return std::move(pool);
     }
 
-    /// Get the next client via round-robin. Thread-safe (atomic counter).
+    /// Get the next client via round-robin, skipping slots whose connection is
+    /// dead (a silent hang flagged by the watch-bound timeout, or an fd closed
+    /// by RST). Steering live traffic off dead slots is what lets a dead slot go
+    /// quiescent so reviveDeadClients() can rebuild it — without it, sustained
+    /// dispatch keeps a poisoned slot busy and the self-heal never converges. If
+    /// every slot is dead, returns the base round-robin pick; the caller's op
+    /// then fails and degrades, and reviveDeadClients() is the recovery path.
+    /// Steady-state hot-path cost: one connected() check (the first slot is live
+    /// and returns immediately). Thread-safe (atomic counter).
     [[nodiscard]] RedisClient<Io>& next() noexcept {
-        auto idx = counter_.fetch_add(1, std::memory_order_relaxed) % clients_.size();
-        return *clients_[idx];
+        const size_t n = clients_.size();
+        const size_t base = counter_.fetch_add(1, std::memory_order_relaxed);
+        for (size_t i = 0; i < n; ++i) {
+            auto& slot = clients_[(base + i) % n];
+            if (slot && slot->connected())
+                return *slot;
+        }
+        return *clients_[base % n];
     }
 
     /// Get a client by explicit index.
@@ -178,15 +194,25 @@ public:
     /// watch-bound, so this cannot hang.
     ///
     /// Postcondition: revives only the dead slots that are quiescent. A dead slot
-    /// still draining a suspended frame is deferred, and under traffic that keeps
-    /// dispatching to it (next() is dispatch-blind) it can stay non-quiescent across
-    /// passes — so a revived count below the dead count is a structural wait, not a
-    /// transient error. Convergence requires the caller to also steer dispatch away
-    /// from dead slots; on its own this method does not guarantee progress.
+    /// still draining a suspended frame is deferred; next() now steers live traffic
+    /// off dead slots (see next()), so an idle dead slot reaches quiescence and is
+    /// rebuilt on a later pass.
+    ///
+    /// Single-flight: concurrent calls collapse — while a pass is in flight (it
+    /// suspends on the connect) a second call co_returns 0 rather than starting an
+    /// overlapping pass that could connect+drop redundantly or, worse, race the
+    /// first pass's swap of the same slot. The drain that drives recovery calls
+    /// this once per cycle, but the guard keeps any other caller safe.
     Task<size_t> reviveDeadClients() {
         size_t revived = 0;
-        if (!reconnect_factory_)
+        if (!reconnect_factory_ || reviving_)
             co_return revived;
+        reviving_ = true;
+        // Clear on EVERY exit, any exception type (a stuck flag would brick
+        // self-heal permanently — every later call would early-return 0).
+        // Coroutine automatics are destroyed before final_suspend, so the next
+        // caller on this loop observes reviving_ == false.
+        struct ResetGuard { bool& f; ~ResetGuard() { f = false; } } reset_{reviving_};
         for (size_t i = 0; i < clients_.size(); ++i) {
             if (clients_[i] && clients_[i]->connected())
                 continue;
@@ -216,6 +242,8 @@ public:
 private:
     std::vector<std::shared_ptr<RedisClient<Io>>> clients_;
     ReconnectFactory reconnect_factory_;
+    // Single-flight guard for reviveDeadClients (loop-thread only, no atomic).
+    bool reviving_ = false;
     std::atomic<uint32_t> counter_{0};
 };
 

@@ -172,6 +172,17 @@ public:
             static_cast<int>(argv.size()), argv.data(), argvlen.data());
     }
 
+    /// Register a deferred cache-eviction retry whose UNLINK could not reach
+    /// Redis (self-heal of the L2/L1 staleness bound). No-op when Redis is not
+    /// configured — there is then no L2 phantom to chase. Routed to this thread's
+    /// BatchScheduler, which owns the per-loop self-heal queue and the pool it
+    /// rebuilds. Off the hot path: called only on a failed eviction.
+    static void enqueueSelfHeal(
+        std::string key, std::function<io::Task<bool>()> retry)
+    {
+        if (self_heal_enqueue_) self_heal_enqueue_(std::move(key), std::move(retry));
+    }
+
     /// Check if Redis is configured.
     [[nodiscard]] static bool hasRedis() noexcept {
         return redis_exec_ != nullptr;
@@ -272,8 +283,16 @@ public:
             {
                 return batcher->submitRedis(argc, argv, argvlen);
             };
+            // Self-heal needs the same batcher (its loop + its pool). Bound only
+            // with Redis: without L2 there is no phantom to chase.
+            self_heal_enqueue_ = [batcher](
+                std::string key, std::function<io::Task<bool>()> retry)
+            {
+                batcher->enqueueSelfHeal(std::move(key), std::move(retry));
+            };
         } else {
             redis_exec_ = nullptr;
+            self_heal_enqueue_ = nullptr;
         }
     }
 
@@ -285,6 +304,7 @@ public:
         pg_entity_query_many_ = nullptr;
         pg_write_ = nullptr;
         redis_exec_ = nullptr;
+        self_heal_enqueue_ = nullptr;
     }
 
     // =========================================================================
@@ -302,6 +322,8 @@ public:
         const char*, const io::PgParams&)>;
     using RedisExecFn = std::function<io::Task<io::RedisResult>(
         int, const char**, const size_t*)>;
+    using SelfHealEnqueueFn = std::function<void(
+        std::string, std::function<io::Task<bool>()>)>;
 
     // thread_local: each event-loop thread binds its OWN pool/batcher by calling
     // init() on that thread (shared-nothing). A Task co_awaited on loop K then
@@ -313,6 +335,7 @@ public:
     static inline thread_local PgEntityQueryManyFn pg_entity_query_many_;
     static inline thread_local PgWriteFn pg_write_;
     static inline thread_local RedisExecFn redis_exec_;
+    static inline thread_local SelfHealEnqueueFn self_heal_enqueue_;
 
     // IoPool needs to set these directly
     friend class io::IoPool;
