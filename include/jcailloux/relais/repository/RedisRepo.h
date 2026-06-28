@@ -215,6 +215,10 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
                 std::rethrow_exception(timeout);
             }
             if (outcome.affected.value_or(0) > 0 && !outcome.coalesced) {
+                // L2 invalidation is best-effort by construction: every RedisCache
+                // op catches its own I/O failure and degrades to a no-op, so a Redis
+                // outage or timeout here cannot throw past this success path and skip
+                // the L1 evict LocalRepo runs as the call unwinds. No try needed.
                 co_await bumpGen(id);
                 if constexpr (Cfg.update_strategy == InvalidateAndLazyReload) {
                     // Safe strategy: the bump above then an evict — the next read

@@ -621,6 +621,9 @@ protected:
                     listCache().onEntityCreated(entity);
                 }
             }
+            // The L1 tracker bump is RAM-only; the L2 selective EVAL is best-effort
+            // by construction (RedisCache swallows its own I/O failure → no-op), so
+            // a Redis outage here cannot throw past this success path. No try needed.
             if constexpr (kHasL2) {
                 co_await invalidateL2Updated(old_entity ? *old_entity : entity, entity);
             }
