@@ -195,6 +195,33 @@ public:
     /// Access the timing estimator (for testing/diagnostics).
     [[nodiscard]] const TimingEstimator& estimator() const noexcept { return estimator_; }
 
+    // =========================================================================
+    // Ordered teardown
+    // =========================================================================
+
+    /// Begin ordered teardown (loop-thread, idempotent). Stops the self-heal
+    /// queue from re-arming so the loop can pump to quiescence. In-flight detached
+    /// fires are NOT cancelled — they drain on their own, each bounded by the
+    /// per-operation query/acquire timeouts (a hung fire times out, unwinds in
+    /// error, and self-destroys). See quiescentForTeardown().
+    void beginShutdown() noexcept { self_heal_.beginShutdown(); }
+
+    /// True when no detached work remains in flight: no fire*Batch is running, no
+    /// batch is still accumulating (its departure timer would otherwise leave
+    /// entries unfired), and no self-heal drain is executing. Ordered teardown
+    /// pumps the loop until this holds (or a grace deadline elapses). Loop-thread
+    /// only — no synchronization, since every mutation runs on the one loop.
+    [[nodiscard]] bool quiescentForTeardown() const noexcept {
+        return detached_inflight_ == 0
+            && pg_read_batch_.entries.empty()
+            && pg_write_batch_.entries.empty()
+            && redis_batch_.entries.empty()
+            && !self_heal_.draining();
+    }
+
+    /// Diagnostic: in-flight detached fire coroutines (loop-thread only).
+    [[nodiscard]] size_t inflightDetached() const noexcept { return detached_inflight_; }
+
 private:
     // =========================================================================
     // Internal data structures
@@ -748,6 +775,21 @@ private:
         fireRedisBatch(std::move(entries));
     }
 
+    // RAII counter for in-flight detached fire coroutines. One is constructed at
+    // the top of each fire*Batch, right after its self-anchor — so it is destroyed
+    // *before* the anchor releases the scheduler, keeping detached_inflight_ (a
+    // scheduler member) valid through the decrement. Ordered teardown pumps the
+    // loop until the count is zero, with each fire bounded by the per-operation
+    // query/acquire timeouts. The dtor runs on every exit, including frame
+    // destruction, so the count never sticks.
+    struct InflightGuard {
+        size_t& counter;
+        explicit InflightGuard(size_t& c) noexcept : counter(c) { ++counter; }
+        ~InflightGuard() { --counter; }
+        InflightGuard(const InflightGuard&) = delete;
+        InflightGuard& operator=(const InflightGuard&) = delete;
+    };
+
     // =========================================================================
     // PG Read batch execution
     // =========================================================================
@@ -761,6 +803,11 @@ private:
         // frame end, after the final `this` access, so a chained fire (which takes
         // its own anchor) carries the lifetime forward.
         auto self = this->shared_from_this();
+        // Count this fire as in-flight detached work for the life of the frame so
+        // ordered teardown pumps the loop until it drains (declared after `self`
+        // → destroyed first → the decrement lands while `self` still holds the
+        // scheduler alive).
+        InflightGuard inflight{detached_inflight_};
         // Both acquisitions run *inside* the try. pg_pool_->acquire()
         // throws PgPoolTimeout on acquire_timeout; this coroutine is a
         // DetachedTask whose unhandled_exception() has an empty body, so an
@@ -981,6 +1028,8 @@ private:
         // firePgReadBatch): a resumed continuation may drop the last external
         // owner, and the chain below still touches `this`.
         auto self = this->shared_from_this();
+        // In-flight detached accounting for ordered teardown (see firePgReadBatch).
+        InflightGuard inflight{detached_inflight_};
         // Sort by submission sequence: restores submission order regardless of
         // how entries were accumulated/coalesced, so intra-batch write→write
         // order == seq order == the order the caller submitted them. This is the
@@ -1087,6 +1136,8 @@ private:
         // firePgReadBatch): a resumed continuation may drop the last external
         // owner, and the chain below still touches `this`.
         auto self = this->shared_from_this();
+        // In-flight detached accounting for ordered teardown (see firePgReadBatch).
+        InflightGuard inflight{detached_inflight_};
         auto permit = co_await redis_gate_.acquire();
 
         try {
@@ -1393,6 +1444,12 @@ private:
     bool pg_read_inflight_ = false;
     bool pg_write_inflight_ = false;
     bool redis_inflight_ = false;
+
+    // In-flight detached fire coroutines (the three fire*Batch). Plain size_t: it
+    // is mutated only on the loop thread (an eager fire start ++ via InflightGuard,
+    // its frame teardown --), and read only on that same thread by
+    // quiescentForTeardown during ordered teardown — no synchronization needed.
+    size_t detached_inflight_ = 0;
 
     // Write sequence counter
     uint64_t next_write_seq_ = 0;

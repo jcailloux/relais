@@ -94,8 +94,26 @@ public:
 
     [[nodiscard]] size_t pending() const noexcept { return pending_.size(); }
 
+    /// Begin ordered teardown: stop re-arming the recurring drain so the owning
+    /// loop can pump to quiescence. A drain already executing runs to completion
+    /// (bounded by redis_query_timeout); it just will not schedule another pass —
+    /// without this, a queue draining against a down Redis would re-arm forever
+    /// and teardown could never settle. Idempotent; loop-thread only.
+    void beginShutdown() noexcept {
+        shutting_down_ = true;
+        if (armed_) { io_.cancelTimer(timer_); armed_ = false; }
+    }
+
+    /// True while a drain pass is executing. Ordered teardown waits on this so a
+    /// drain suspended on Redis I/O is drained, not abandoned mid-flight.
+    [[nodiscard]] bool draining() const noexcept { return draining_; }
+
 private:
     void arm(std::chrono::nanoseconds delay) {
+        // Ordered teardown: never (re-)arm once shutting down. Guards both the
+        // enqueue path and drainTask's own tail re-arm, so the recurring drain
+        // stops and the loop can pump to quiescence.
+        if (shutting_down_) return;
         armed_ = true;
         timer_ = io_.postDelayed(delay, [this] {
             armed_ = false;
@@ -172,8 +190,9 @@ private:
     std::unordered_map<std::string, Retry> pending_;
     typename Io::TimerToken timer_{};
     std::chrono::nanoseconds backoff_ = kBaseDelay;
-    bool armed_ = false;      // a one-shot drain tick is pending
-    bool draining_ = false;   // a drain task is currently executing
+    bool armed_ = false;          // a one-shot drain tick is pending
+    bool draining_ = false;       // a drain task is currently executing
+    bool shutting_down_ = false;  // set by beginShutdown(): arm() becomes a no-op
 };
 
 } // namespace jcailloux::relais::io

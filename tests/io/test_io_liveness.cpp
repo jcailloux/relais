@@ -609,6 +609,121 @@ TEST_CASE("liveness: destroying the scheduler inside a detached fire does not UA
     pump(io);
 }
 
+// A self-driving starter that runs a Task<void> without the test thread blocking
+// on its result — so an in-flight detached fire can be observed mid-teardown.
+namespace {
+struct Starter {
+    struct promise_type {
+        Starter get_return_object() noexcept {
+            return Starter{std::coroutine_handle<promise_type>::from_promise(*this)};
+        }
+        std::suspend_never initial_suspend() noexcept { return {}; }
+        std::suspend_always final_suspend() noexcept { return {}; }
+        void return_void() noexcept {}
+        void unhandled_exception() noexcept {}
+    };
+    std::coroutine_handle<promise_type> handle;
+};
+}  // namespace
+
+TEST_CASE("liveness: ordered teardown drains an in-flight detached fire, no leak",
+          "[io][liveness][integration][teardown]") {
+    Io io;
+    auto pool = driveBounded(io, PgPool<Io>::create(io, getConnInfo(),
+        {.min_connections = 1, .max_connections = 2, .acquire_timeout = 2s,
+         .query_timeout = 400ms}));
+
+    auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, nullptr, 8);
+
+    // Warm the estimator past bootstrap so submitPgRead takes the batching path
+    // (a bootstrapping batcher sends every read direct, never firing a detached
+    // batch). Six successful reads clear the threshold of five.
+    for (int i = 0; i < 6; ++i) {
+        auto r = driveBounded(io, batcher->submitQueryRead("SELECT 1", PgParams{}));
+        REQUIRE(r.ok());
+    }
+
+    // Force both connections to exist, learn their fds, then withhold their reads:
+    // now the leader and the detached follower fire each take a held connection and
+    // hang on the result, bounded by query_timeout.
+    int fd1 = -1, fd2 = -1;
+    {
+        auto g1 = driveBounded(io, pool->acquire());
+        auto g2 = driveBounded(io, pool->acquire());
+        fd1 = g1.conn().socket();
+        fd2 = g2.conn().socket();
+    }
+    io.holdReads(fd1);
+    io.holdReads(fd2);
+
+    // Two concurrent reads: the leader goes direct on one held connection; the
+    // follower accumulates and, when its departure timer fires, runs as a DETACHED
+    // fire on the other held connection. Drive it without awaiting the result so
+    // the in-flight fire is observable mid-teardown.
+    bool done = false;
+    std::exception_ptr ex;
+    auto runner = [&]() -> Task<void> {
+        try {
+            co_await whenAll(
+                batcher->submitQueryRead("SELECT 1", PgParams{}),
+                batcher->submitQueryRead("SELECT 2", PgParams{}));
+        } catch (...) { ex = std::current_exception(); }
+        done = true;
+    };
+    auto starter = [&](Task<void> t) -> Starter { co_await std::move(t); };
+    auto s = starter(runner());
+
+    // The departure timer fires the follower as a detached fire; it suspends on the
+    // withheld read, well before the 400ms query bound.
+    pump(io, 100ms);
+    REQUIRE(batcher->inflightDetached() >= 1);
+    REQUIRE_FALSE(batcher->quiescentForTeardown());
+
+    // Ordered teardown: stop self-heal re-arming, then pump until the in-flight
+    // fire has drained (its read times out, it unwinds in error, the DetachedTask
+    // self-destructs). Bounded — the loop never hangs on it.
+    batcher->beginShutdown();
+    auto deadline = std::chrono::steady_clock::now() + 3s;
+    while (!batcher->quiescentForTeardown() &&
+           std::chrono::steady_clock::now() < deadline)
+        io.runOnce(20);
+
+    REQUIRE(batcher->quiescentForTeardown());
+    REQUIRE(batcher->inflightDetached() == 0);
+    REQUIRE(done);  // both waiters saw PgQueryTimeout; the driver frame completed
+
+    io.releaseReads(fd1);
+    io.releaseReads(fd2);
+    if (s.handle) s.handle.destroy();
+    pump(io);  // a leaked fire frame / stray timer would surface here under ASan
+}
+
+TEST_CASE("liveness: beginShutdown stops the self-heal queue from re-arming",
+          "[io][liveness][integration][teardown]") {
+    Io io;
+    // No Redis pool needed: the drain skips revive and just runs the retry.
+    auto pool = driveBounded(io, PgPool<Io>::create(io, getConnInfo(),
+        {.min_connections = 0, .max_connections = 1}));
+    auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, nullptr, 8);
+
+    int retries = 0;
+    auto retry = [&retries]() -> Task<bool> { ++retries; co_return true; };
+
+    // Before shutdown: an enqueue arms the recurring drain, which runs the retry.
+    batcher->enqueueSelfHeal("k1", retry);
+    pump(io, 250ms);  // base drain delay is 100ms
+    REQUIRE(retries == 1);
+
+    // After beginShutdown: an enqueue must NOT arm a new drain — so teardown can
+    // settle even while keys are still pending (a draining queue against a down
+    // Redis would otherwise re-arm forever).
+    batcher->beginShutdown();
+    batcher->enqueueSelfHeal("k2", retry);
+    pump(io, 250ms);
+    REQUIRE(retries == 1);                       // no second drain ran
+    REQUIRE(batcher->quiescentForTeardown());    // not draining, no fire in flight
+}
+
 TEST_CASE("liveness: fail-fast startup reclaims an in-flight connect, no fd leak",
           "[io][liveness][integration][teardown]") {
     SilentTcpServer silent;
