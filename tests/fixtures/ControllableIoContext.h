@@ -53,6 +53,7 @@ public:
 
     WatchHandle addWatch(int fd, IoEvent events, std::function<void(IoEvent)> cb) {
         requested_[fd] = events;
+        last_added_fd_ = fd;
         return inner_.addWatch(fd, effective(fd, events), std::move(cb));
     }
 
@@ -97,6 +98,12 @@ public:
 
     [[nodiscard]] bool isHeld(int fd) const { return held_.contains(fd); }
 
+    // The fd of the most recent addWatch — the connection a pool/client just
+    // established. Stable for that connection's lifetime, so a test reads it
+    // right after create()/connect() to learn which fd to hold, without a
+    // friend or an fd accessor on the pooled types.
+    [[nodiscard]] int lastAddedFd() const noexcept { return last_added_fd_; }
+
     // -- loop driving + diagnostics (forwarded) -----------------------------
 
     void run() { inner_.run(); }
@@ -133,6 +140,7 @@ private:
     Inner inner_;
     std::unordered_map<int, IoEvent> requested_;  // last mask relais asked for, per fd
     std::unordered_set<int> held_;                // fds with reads currently withheld
+    int last_added_fd_ = -1;                      // fd of the most recent addWatch
 };
 
 static_assert(IoContext<ControllableIoContext>,
