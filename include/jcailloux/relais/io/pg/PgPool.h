@@ -156,6 +156,14 @@ public:
         co_return co_await waiter;
     }
 
+    /// Diagnostics — connections counted against max_connections (idle + in-use +
+    /// in-flight connects), connections currently idle, and coroutines queued on
+    /// acquire_timeout. Loop-thread only (no lock): the pool mutates these solely
+    /// on its own loop. Used to assert no slot/waiter leak after a timeout storm.
+    [[nodiscard]] size_t totalConnections() const noexcept { return total_; }
+    [[nodiscard]] size_t idleCount() const noexcept { return idle_.size(); }
+    [[nodiscard]] size_t waiterCount() const noexcept { return waiters_.size(); }
+
 private:
     // Forward-declared: onWaiterTimeout() names Waiter as a parameter type, and a
     // parameter type is not in complete-class context (unlike a member body), so

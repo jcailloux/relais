@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <coroutine>
 #include <cstdint>
 #include <exception>
 #include <memory>
@@ -11,6 +12,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <pthread.h>
@@ -70,6 +72,55 @@ struct IoPoolConfig {
     // Core pinning
     bool pin_to_cores = true;
     int first_core = 1;  // Avoid core 0 (OS/IRQ)
+};
+
+// BootTask — an eager, owned coroutine for per-worker startup.
+//
+// Unlike DetachedTask (which self-destroys at final_suspend and hands back no
+// handle), BootTask starts immediately, parks its frame at final_suspend, and
+// gives the handle to its owner. That ownership is what lets fail-fast teardown
+// reclaim a boot that is still suspended on a connect which never completed
+// (a dependency blackholed at boot, past startup_timeout): destroying the frame
+// runs its in-frame connection destructors — PgConnection/RedisConnection both
+// cancel the watch-bound timer, removeWatch, and close/PQfinish the fd — so
+// neither the coroutine frame nor its socket fd leaks. With a self-destroying
+// DetachedTask the suspended frame and its fd would be abandoned, leaking one fd
+// per failed startup; a service that retries create() in a loop would exhaust
+// them.
+//
+// Destroy-only contract: the owner destroys the frame ONLY after the worker
+// thread is joined (nothing is mid-resume) and BEFORE the worker's IoContext is
+// torn down (removeWatch still reaches a live loop). The frame is never resumed
+// after the thread stops, so a boot suspended inside the startup lambda never
+// dereferences the (by then destroyed) lambda closure — destruction only runs
+// the frame's local destructors.
+struct BootTask {
+    struct promise_type {
+        BootTask get_return_object() noexcept {
+            return BootTask{
+                std::coroutine_handle<promise_type>::from_promise(*this)};
+        }
+        std::suspend_never initial_suspend() noexcept { return {}; }
+        std::suspend_always final_suspend() noexcept { return {}; }
+        void return_void() noexcept {}
+        void unhandled_exception() noexcept {}  // boot body try/catches; unreached
+    };
+
+    std::coroutine_handle<promise_type> handle{};
+
+    BootTask() noexcept = default;
+    explicit BootTask(std::coroutine_handle<promise_type> h) noexcept : handle(h) {}
+    BootTask(BootTask&& o) noexcept : handle(std::exchange(o.handle, {})) {}
+    BootTask& operator=(BootTask&& o) noexcept {
+        if (this != &o) {
+            if (handle) handle.destroy();
+            handle = std::exchange(o.handle, {});
+        }
+        return *this;
+    }
+    BootTask(const BootTask&) = delete;
+    BootTask& operator=(const BootTask&) = delete;
+    ~BootTask() { if (handle) handle.destroy(); }
 };
 
 // IoPool — N event loops pinned on N cores, each with its own resources.
@@ -132,7 +183,7 @@ public:
                 }
 
                 // Initialize resources on the event loop
-                auto initTask = [&]() -> DetachedTask {
+                auto initTask = [&]() -> BootTask {
                     try {
                         // PG pool — acquire_timeout bounds the warm-up connect.
                         w.pg_pool = co_await PgPool<Io>::create(
@@ -187,7 +238,11 @@ public:
                     }
                 };
 
-                initTask();
+                // Own the boot frame: on fail-fast, ~Worker destroys a frame
+                // still suspended on a blackholed connect instead of leaking it
+                // (frame + socket fd). Eager start runs the body to its first
+                // suspend before returning.
+                w.init_task = initTask();
 
                 // Run event loop until stop is requested
                 w.io->runUntil([&stop, &w] {
@@ -250,6 +305,11 @@ public:
 private:
     struct Worker {
         std::unique_ptr<Io> io;
+        // Owns the startup coroutine frame. Declared right after `io` so member
+        // destruction (reverse order) reclaims it BEFORE `io`: a boot still
+        // suspended on a connect at fail-fast is destroyed while its loop is
+        // alive, so its connection dtors' removeWatch lands on a live IoContext.
+        BootTask init_task;
         std::shared_ptr<PgPool<Io>> pg_pool;
         std::shared_ptr<RedisPool<Io>> redis_pool;
         std::shared_ptr<batch::BatchScheduler<Io>> batcher;

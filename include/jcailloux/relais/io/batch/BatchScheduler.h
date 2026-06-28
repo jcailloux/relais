@@ -56,7 +56,7 @@ struct PgWriteResult {
 };
 
 template<IoContext Io>
-class BatchScheduler {
+class BatchScheduler : public std::enable_shared_from_this<BatchScheduler<Io>> {
     using Clock = std::chrono::steady_clock;
     using TimerToken = typename Io::TimerToken;
 
@@ -753,6 +753,14 @@ private:
     // =========================================================================
 
     DetachedTask firePgReadBatch(std::vector<PgReadEntry*> entries) {
+        // Anchor the scheduler for the whole fire. The resume loop below runs
+        // continuations that can unwind to the last external owner of this
+        // scheduler (a provider/test teardown), and the drain-or-chain after it
+        // dereferences `this` (pg_read_batch_). Holding a self-reference keeps the
+        // object alive until this detached coroutine returns; it is released at
+        // frame end, after the final `this` access, so a chained fire (which takes
+        // its own anchor) carries the lifetime forward.
+        auto self = this->shared_from_this();
         // Both acquisitions run *inside* the try. pg_pool_->acquire()
         // throws PgPoolTimeout on acquire_timeout; this coroutine is a
         // DetachedTask whose unhandled_exception() has an empty body, so an
@@ -969,6 +977,10 @@ private:
     // =========================================================================
 
     DetachedTask firePgWriteBatch(std::vector<PgWriteEntry*> entries) {
+        // Keep the scheduler alive across the resume loop + drain-or-chain (see
+        // firePgReadBatch): a resumed continuation may drop the last external
+        // owner, and the chain below still touches `this`.
+        auto self = this->shared_from_this();
         // Sort by submission sequence: restores submission order regardless of
         // how entries were accumulated/coalesced, so intra-batch write→write
         // order == seq order == the order the caller submitted them. This is the
@@ -1071,6 +1083,10 @@ private:
     // =========================================================================
 
     DetachedTask fireRedisBatch(std::vector<RedisEntry*> entries) {
+        // Keep the scheduler alive across the resume loop + drain-or-chain (see
+        // firePgReadBatch): a resumed continuation may drop the last external
+        // owner, and the chain below still touches `this`.
+        auto self = this->shared_from_this();
         auto permit = co_await redis_gate_.acquire();
 
         try {

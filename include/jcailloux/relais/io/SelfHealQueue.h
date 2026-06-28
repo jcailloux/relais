@@ -105,6 +105,16 @@ private:
 
     /// One drain pass: rebuild dead Redis connections, then retry pending keys.
     /// Fire-and-forget on the loop; re-arms itself while work remains.
+    ///
+    /// Lifetime of the `this` touched after each co_await: this detached frame is
+    /// resumed only by the loop that owns this queue, and that loop outlives the
+    /// owning scheduler (the scheduler is torn down only after its worker thread is
+    /// joined). A drain still suspended at teardown is therefore never resumed — it
+    /// cannot dereference a freed queue. It is deliberately NOT anchored with a
+    /// shared_ptr to the scheduler: that would turn a suspended-at-teardown frame
+    /// into a retention cycle (frame -> scheduler -> this queue -> frame) leaking
+    /// the whole scheduler, strictly worse than the parked frame the dtor already
+    /// flags as the broader in-flight-detached concern shared with the fire timers.
     DetachedTask drainTask() {
         draining_ = true;
 
