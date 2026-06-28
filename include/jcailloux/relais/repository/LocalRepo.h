@@ -285,7 +285,11 @@ public:
     static io::Task<void> invalidate(const Key& id) {
         evict(id);
         if constexpr (HasRedis) {
-            co_await Base::evictRedis(id);
+            // A failed UNLINK enqueues a deferred self-heal (the retry re-runs the
+            // canonical bump → UNLINK → evict-L1 order, even though this immediate
+            // path evicts L1 first) so the phantom is bounded to seconds.
+            bool ok = co_await Base::evictRedis(id);
+            if (!ok && PgProvider::hasRedis()) Base::scheduleSelfHeal(id);
         }
     }
 
@@ -433,6 +437,13 @@ private:
                     },
                     .name = static_cast<const char*>(Name)
                 });
+                if constexpr (HasRedis) {
+                    // Let the L2 layer's deferred self-heal reach the shared L1:
+                    // RedisRepo cannot name this derived tier, so register its
+                    // point-evict as the hook the retry calls after a confirmed
+                    // UNLINK (kills a phantom a concurrent read re-stored).
+                    Base::l1SelfHealHook_ = &LocalRepo::evict;
+                }
                 // Release: publish only after the Tier is fully enrolled.
                 tier_ptr_.store(&instance, std::memory_order_release);
             }
