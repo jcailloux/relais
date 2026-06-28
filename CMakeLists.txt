@@ -241,6 +241,7 @@ if(RELAIS_BUILD_TESTS)
     relais_add_test(test_io_redis_pool        tests/io/test_redis_pool.cpp           LABELS "io;integration;redis-pool" RESOURCE_LOCK)
     relais_add_test(test_batch_scheduler_integration tests/io/test_batch_scheduler_integration.cpp LABELS "io;integration;batch" RESOURCE_LOCK)
     relais_add_test(test_io_pool_integration  tests/io/test_io_pool_integration.cpp   LABELS "io;integration;iopool" RESOURCE_LOCK)
+    relais_add_test(test_io_liveness          tests/io/test_io_liveness.cpp           LABELS "io;integration;liveness" RESOURCE_LOCK)
 
     relais_add_test(test_relais_base            tests/relais/test_pg_repo.cpp      DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db"                 RESOURCE_LOCK)
     relais_add_test(test_relais_redis           tests/relais/test_redis_repo.cpp     DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;redis"            RESOURCE_LOCK)
@@ -292,6 +293,11 @@ if(RELAIS_BUILD_TESTS)
         target_compile_options(test_io_when_all PRIVATE
             -fsanitize=thread -fno-omit-frame-pointer)
         target_link_options(test_io_when_all PRIVATE -fsanitize=thread)
+        # Liveness suite: timeouts + teardown across the loop thread and the
+        # detached fires — TSan validates no data race / UAF in the resume chains.
+        target_compile_options(test_io_liveness PRIVATE
+            -fsanitize=thread -fno-omit-frame-pointer)
+        target_link_options(test_io_liveness PRIVATE -fsanitize=thread)
     endif()
 
     # -------------------------------------------------------------------------
