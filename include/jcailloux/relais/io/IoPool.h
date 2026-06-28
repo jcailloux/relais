@@ -1,6 +1,7 @@
 #ifndef JCX_RELAIS_IO_POOL_H
 #define JCX_RELAIS_IO_POOL_H
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -165,13 +166,29 @@ public:
         std::mutex ready_mutex;
         std::condition_variable ready_cv;
 
+        // Drain window for ordered teardown (phase 2 in each worker). Sized to let
+        // a single fire blocked on a bounded query/acquire time out and
+        // self-destruct, so the common case — a handful of in-flight fires —
+        // drains with no leak. It is NOT a hard ceiling on total drain time: fires
+        // queued behind a saturated pool against a blackholed server time out
+        // serially (~ceil(N/conns) x query_timeout), and a 0 (unbounded) timeout
+        // never times out at all. Past this window the pump gives up and the
+        // still-suspended frame(s) are abandoned — a bounded, best-effort residual,
+        // far better than before ordered teardown (which abandoned every in-flight
+        // fire unconditionally), and no finite grace can cover the serial cascade.
+        // Captured BY VALUE into each worker: a temporary config argument must not
+        // be read at teardown, long after create() has returned.
+        const auto teardown_grace =
+            std::max(config.acquire_timeout, config.query_timeout)
+            + std::chrono::milliseconds(500);
+
         for (int i = 0; i < config.num_workers; ++i) {
             auto& w = pool->workers_[i];
             w.io = std::make_unique<Io>();
             w.worker_id = i;
 
             w.thread = std::jthread([&w, &config, &done_count,
-                                     &ready_mutex, &ready_cv, i]
+                                     &ready_mutex, &ready_cv, i, teardown_grace]
                                     (std::stop_token stop) {
                 // Pin to core
                 if (config.pin_to_cores) {
@@ -244,9 +261,26 @@ public:
                 // suspend before returning.
                 w.init_task = initTask();
 
-                // Run event loop until stop is requested
-                w.io->runUntil([&stop, &w] {
-                    return stop.stop_requested();
+                // Phase 1: serve until stop is requested.
+                w.io->runUntil([&stop] { return stop.stop_requested(); });
+
+                // Phase 2: ordered teardown. A detached fire or self-heal drain
+                // still suspended on a blackholed dependency would otherwise leak
+                // its frame — and, for a fire, the pool via its in-frame
+                // ConnectionGuard. Stop the self-heal queue re-arming, then pump
+                // the loop until every detached coroutine has completed (each is
+                // bounded by the per-operation query/acquire timeouts: a hung fire
+                // times out, unwinds in error, and self-destroys) or the grace
+                // window elapses (the fallback when a timeout is 0 or the serial
+                // drain outruns the window — the residual frame is then abandoned,
+                // bounded best-effort; see teardown_grace). The join in stop()
+                // blocks on this, so teardown waits for the drain rather than
+                // tearing the loop out from under it.
+                if (w.batcher) w.batcher->beginShutdown();
+                auto drain_deadline = Io::Clock::now() + teardown_grace;
+                w.io->runUntil([&w, drain_deadline] {
+                    return (!w.batcher || w.batcher->quiescentForTeardown())
+                           || Io::Clock::now() >= drain_deadline;
                 });
             });
         }
@@ -286,11 +320,14 @@ public:
         for (auto& w : workers_) {
             if (w.io) w.io->stop();
         }
+        // Request stop on every worker first, then join — so the per-worker
+        // ordered-teardown drains (phase 2) overlap instead of serializing into
+        // N x teardown_grace.
         for (auto& w : workers_) {
-            if (w.thread.joinable()) {
-                w.thread.request_stop();
-                w.thread.join();
-            }
+            if (w.thread.joinable()) w.thread.request_stop();
+        }
+        for (auto& w : workers_) {
+            if (w.thread.joinable()) w.thread.join();
         }
     }
 
