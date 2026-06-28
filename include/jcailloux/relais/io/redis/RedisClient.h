@@ -149,6 +149,15 @@ public:
         return conn_.connected();
     }
 
+    /// True when no coroutine is suspended inside this client: no lock holder
+    /// (busy_ — a holder mid-command is suspended in the connection's awaiter) and
+    /// no queued waiter. The pool checks this before destroying a dead client —
+    /// tearing one down while a frame is suspended in its connection or lock queue
+    /// would be a use-after-free.
+    [[nodiscard]] bool isQuiescent() const noexcept {
+        return !busy_ && waiters_.empty();
+    }
+
 private:
     explicit RedisClient(Io& io, RedisConnection<Io> conn) noexcept
         : io_(&io), conn_(std::move(conn)) {}
