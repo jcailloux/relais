@@ -276,6 +276,7 @@ if(RELAIS_BUILD_TESTS)
     relais_add_test(test_relais_invalidate_many tests/relais/test_invalidate_many.cpp     DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;redis;invalidatemany"  RESOURCE_LOCK)
     relais_add_test(test_relais_erase_invalidate_batch tests/relais/test_erase_invalidate_batch.cpp DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;redis;list;batch" RESOURCE_LOCK)
     relais_add_test(test_relais_where_predicate tests/relais/test_where_predicate.cpp     DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;redis;list;where"   RESOURCE_LOCK)
+    relais_add_test(test_relais_cache_coherence tests/relais/test_cache_coherence.cpp     DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;redis;coherence"    RESOURCE_LOCK)
     relais_add_test(test_relais_assigned_key   tests/relais/test_simple_assigned_key.cpp  DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;assigned-key"     RESOURCE_LOCK)
     relais_add_test(test_relais_gdsf          tests/relais/test_gdsf.cpp                DEFINITIONS RELAIS_BUILDING_TESTS "RELAIS_GDSF_ENABLED=1" LABELS "relais;integration;db;gdsf"             RESOURCE_LOCK)
     if(NOT RELAIS_GDSF_ENABLED)
@@ -298,6 +299,12 @@ if(RELAIS_BUILD_TESTS)
         target_compile_options(test_io_liveness PRIVATE
             -fsanitize=thread -fno-omit-frame-pointer)
         target_link_options(test_io_liveness PRIVATE -fsanitize=thread)
+        # NB: the cache-coherence suite is single-loop (one event-loop thread), so
+        # its concurrency-relevant surface — the shared static L1 under concurrent
+        # find/update/erase, and the coroutine resume chains — is TSan-validated by
+        # test_relais_concurrency and test_io_liveness, not here. It is gated under
+        # ASan/LSan instead (the relevant sanitizer for its uncertain-unwind
+        # eviction, detached-frame teardown, and self-heal revive).
     endif()
 
     # -------------------------------------------------------------------------
