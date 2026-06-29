@@ -3,18 +3,23 @@
  *
  * Performance benchmarks for the PostgreSQL I/O layer.
  *
- * Two flavors:
+ * Three flavors:
  *   - [latency]    : single coroutine, sequential round-trips (p50/p99 RTT).
  *   - [throughput] : N concurrent DetachedTask workers on the same epoll loop.
  *                    Exposes real pool/pipeline utilization. Without these,
  *                    the latency benchmarks would mislead readers into
  *                    treating 1/RTT as the system's max throughput.
+ *   - [timer]      : per-operation deadline arm/cancel cost in isolation, plus
+ *                    its zero-syscall / bounded-memory invariants. The
+ *                    [timeout] cases re-measure the same overhead end to end.
  *
  * Run with:
  *   ./bench_io_pg                                # all benchmarks
  *   ./bench_io_pg "[latency]"                    # latency only
  *   ./bench_io_pg "[throughput]"                 # throughput only
  *   ./bench_io_pg "[throughput][select]"         # throughput SELECT only
+ *   ./bench_io_pg "[timer]"                      # timer subsystem (no DB)
+ *   ./bench_io_pg "[timeout]"                    # query_timeout off vs on
  *   BENCH_SAMPLES=1000 ./bench_io_pg "[latency]"
  *   BENCH_DURATION_S=10 ./bench_io_pg "[throughput]"
  */
@@ -458,4 +463,199 @@ TEST_CASE("Benchmark - PG throughput SELECT by PK", "[benchmark][pg][throughput]
 
     WARN(formatThroughputTable("PG throughput — SELECT by PK",
                                 num_threads, results));
+}
+
+
+// #############################################################################
+// =============================================================================
+// TIMEOUT / TIMER — per-operation deadline overhead and timer-subsystem health
+//
+// Every timed operation arms a postDelayed on registerWatch and cancels it on
+// removeCurrentWatch when the result wins the race (the overwhelmingly common
+// case). query_timeout=0 arms nothing. These cases quantify the cost of the
+// armed-but-never-fired path and assert its two structural invariants:
+//   - loop-local arm issues no pipe wakeup (zero syscall),
+//   - cancel removes the node outright (no tombstone, bounded memory).
+// =============================================================================
+// #############################################################################
+
+// -----------------------------------------------------------------------------
+//  TIMER: isolated arm + cancel cost (no DB)
+//
+//  The end-to-end cases below drown this in the μs-scale round-trip; here it is
+//  measured directly. Steady state runs against a warmed pmr node pool, so the
+//  figure is the real per-op cost a timed query pays, with no malloc.
+// -----------------------------------------------------------------------------
+
+TEST_CASE("Benchmark - timer arm+cancel (loop-local)", "[benchmark][io][timer]")
+{
+    Io io;
+    io.runOnce(0);  // claim the loop thread so postDelayed takes the loop-local
+                    // (no-wakeup) arm path that a running event loop always uses
+
+    constexpr auto kNever = std::chrono::hours{1};  // deadline never reached
+    constexpr int kWarm = 20'000;
+    constexpr int kIters = 200'000;
+
+    for (int i = 0; i < kWarm; ++i) {               // warm the pmr node pool
+        auto t = io.postDelayed(kNever, []{});
+        io.cancelTimer(t);
+    }
+
+    uint64_t wake0 = io.loopWakeups();
+    auto t0 = Clock::now();
+    for (int i = 0; i < kIters; ++i) {
+        auto t = io.postDelayed(kNever, []{});
+        io.cancelTimer(t);
+    }
+    double arm_cancel_ns =
+        std::chrono::duration<double, std::nano>(Clock::now() - t0).count() / kIters;
+    uint64_t wake_delta = io.loopWakeups() - wake0;
+    size_t pending_after = io.pendingTimerCount();
+
+    // Memory stability at high QPS: N deadlines live at once (one per in-flight
+    // query), then all cancelled. pendingTimerCount must return exactly to 0 —
+    // erase is outright, no tombstones accumulate (validates the direct removal).
+    constexpr int kLive = 50'000;
+    std::vector<Io::TimerToken> tokens;
+    tokens.reserve(kLive);
+    for (int i = 0; i < kLive; ++i) tokens.push_back(io.postDelayed(kNever, []{}));
+    size_t peak_pending = io.pendingTimerCount();
+    for (auto t : tokens) io.cancelTimer(t);
+    size_t pending_drained = io.pendingTimerCount();
+
+    // Deterministic structural invariants gate; the ns figure only reports.
+    CHECK(wake_delta == 0);          // loop-local arm issues no pipe write
+    CHECK(pending_after == 0);       // every armed timer cancelled
+    CHECK(peak_pending == kLive);    // all live deadlines tracked, none coalesced
+    CHECK(pending_drained == 0);     // cancel-all leaves no residue
+
+    std::ostringstream out;
+    out << "\n  timer arm+cancel (loop-local, deadline never fires)\n"
+        << "    per-op:        " << fmtDuration(arm_cancel_ns / 1000.0) << "\n"
+        << "    pipe wakeups:  " << wake_delta << "  (loop-local arm → 0 syscall)\n"
+        << "    peak pending:  " << peak_pending << " timers held at once\n"
+        << "    after drain:   " << pending_drained << "  (outright erase, no tombstone)";
+    WARN(out.str());
+}
+
+
+// -----------------------------------------------------------------------------
+//  LATENCY: same query, query_timeout off vs armed-never-fired
+//
+//  p50/p99 side by side. The delta is the per-round-trip arm+cancel — expected
+//  to sit inside the round-trip noise (no syscall, no measurable regression).
+// -----------------------------------------------------------------------------
+
+TEST_CASE("Benchmark - PG pool query: timeout off vs on", "[benchmark][pg][latency][timeout]")
+{
+    Io io;
+
+    auto results = runTask(io, [](Io& io) -> Task<std::vector<BenchResult>> {
+        auto pool_off = co_await PgPool<Io>::create(io, getConnInfo(),
+            {.min_connections = 1, .max_connections = 1,
+             .query_timeout = std::chrono::milliseconds{0}});
+        auto pool_on = co_await PgPool<Io>::create(io, getConnInfo(),
+            {.min_connections = 1, .max_connections = 1,
+             .query_timeout = std::chrono::milliseconds{5000}});
+        PgClient<Io> off(pool_off);
+        PgClient<Io> on(pool_on);
+
+        std::vector<BenchResult> results;
+
+        results.push_back(co_await benchAsync("SELECT 1  (query_timeout=off)", [&]() -> Task<void> {
+            co_await off.query("SELECT 1");
+        }));
+
+        results.push_back(co_await benchAsync("SELECT 1  (query_timeout=5s, armed+cancelled)", [&]() -> Task<void> {
+            co_await on.query("SELECT 1");
+        }));
+
+        co_return results;
+    }(io));
+
+    WARN(formatTable("PG pool query — per-op deadline arm/cancel vs round-trip", results));
+}
+
+
+// -----------------------------------------------------------------------------
+//  THROUGHPUT: concurrent in-flight load, query_timeout off vs on
+//
+//  Single loop, kConc queries in flight at once — the pipeline saturates and
+//  deadlines arm/cancel back to back. Reports throughput delta plus two health
+//  metrics. The wakeup rate is non-zero in BOTH configs: it comes from the pool
+//  granting a queued waiter (io_.post resumes it, an unconditional pipe write) —
+//  the loop is oversubscribed (kConc > pool max) on purpose, to force pipelining.
+//  What matters here is that query_timeout=on matches the off baseline: the
+//  deadline arming is loop-local and adds no parasitic wakeup of its own. The
+//  absolute zero-syscall property of arming is proven in the [timer] case.
+//  peak pending = the memory bound: one timer per in-flight deadline, no more.
+// -----------------------------------------------------------------------------
+
+TEST_CASE("Benchmark - PG throughput: timeout off vs on", "[benchmark][pg][throughput][timeout]")
+{
+    constexpr int kConc = 32;          // in-flight queries on one loop
+    int duration_s = benchDurationSeconds();
+
+    struct Row {
+        const char* label;
+        double ops_s;
+        double wakeups_per_kop;
+        size_t peak_pending;
+    };
+    std::vector<Row> rows;
+
+    for (auto qt : {std::chrono::milliseconds{0}, std::chrono::milliseconds{5000}}) {
+        Io io;
+        auto pool = runTask(io, [qt](Io& io) -> Task<std::shared_ptr<PgPool<Io>>> {
+            co_return co_await PgPool<Io>::create(io, getConnInfo(),
+                {.min_connections = kPoolMax, .max_connections = kPoolMax,
+                 .query_timeout = qt});
+        }(io));
+
+        std::atomic<bool> running{true};
+        std::atomic<int64_t> ops{0};
+        std::atomic<int> done_count{0};
+        for (int i = 0; i < kConc; ++i)
+            pgSelect1Worker(pool, running, ops, done_count);
+
+        uint64_t wake0 = io.loopWakeups();
+        size_t peak = 0;
+        auto t0 = Clock::now();
+        auto deadline = t0 + std::chrono::seconds(duration_s);
+        io.runUntil([&] {
+            peak = std::max(peak, io.pendingTimerCount());
+            if (Clock::now() >= deadline)
+                running.store(false, std::memory_order_relaxed);
+            return done_count.load(std::memory_order_relaxed) >= kConc;
+        });
+        auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            Clock::now() - t0).count();
+
+        uint64_t wake_delta = io.loopWakeups() - wake0;
+        int64_t total = ops.load(std::memory_order_relaxed);
+        double ops_s = (elapsed_us > 0) ? total * 1'000'000.0 / elapsed_us : 0.0;
+        double wk_per_kop = (total > 0) ? wake_delta * 1000.0 / total : 0.0;
+        rows.push_back({qt.count() == 0 ? "query_timeout=off" : "query_timeout=5s",
+                        ops_s, wk_per_kop, peak});
+    }
+
+    // Enabling query_timeout must not add wakeups over the baseline: arming is
+    // loop-local. The two rates are structurally identical (~1 per granted
+    // waiter); any real delta would mean the timeout re-introduced a pipe write.
+    double wakeup_delta = rows[1].wakeups_per_kop - rows[0].wakeups_per_kop;
+    CHECK(std::abs(wakeup_delta) < 1.0);
+
+    std::ostringstream out;
+    out << "\n  PG throughput — " << kConc << " in-flight on one loop, "
+        << duration_s << "s\n";
+    for (const auto& r : rows)
+        out << "    " << std::left << std::setw(20) << r.label
+            << std::right << std::setw(12) << fmtOps(r.ops_s)
+            << "   wakeups/1k ops: " << std::fixed << std::setprecision(3)
+            << r.wakeups_per_kop
+            << "   peak pending: " << r.peak_pending << "\n";
+    out << "    timeout adds " << std::fixed << std::setprecision(4)
+        << wakeup_delta << " wakeups/1k ops (loop-local arm → no pipe write)";
+    WARN(out.str());
 }
