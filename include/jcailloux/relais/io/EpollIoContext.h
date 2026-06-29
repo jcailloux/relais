@@ -142,7 +142,14 @@ public:
             std::lock_guard lock(post_mutex_);
             post_queue_.push_back(std::move(cb));
         }
-        wakeLoop();
+        // Loop-local post needs no wakeup: a callback queued from the loop
+        // thread is drained within the current runOnce (its trailing
+        // drainPosted()) or, failing that, on the very next iteration —
+        // computeTimeout() returns 0 while post_queue_ is non-empty, so the loop
+        // never sleeps with work pending. The pipe write is only needed to
+        // interrupt a loop blocked in epoll_wait on another thread (cross-thread
+        // post). Mirrors the loop-local arm in postDelayed().
+        if (!isInLoopThread()) wakeLoop();
     }
 
     /// Thread-safe: schedule a callback after a delay. Returns a token for cancellation.
@@ -221,6 +228,18 @@ public:
         loop_thread_.store(std::this_thread::get_id(), std::memory_order_relaxed);
         drainPosted();
         fireExpiredTimers();
+
+        // fireExpiredTimers() above may have run a timer that posts a loop-local
+        // callback (e.g. a deferred timeout-resume). Such a post does not wake
+        // the loop — the wakeup is gated on cross-thread posts — and the
+        // epoll_wait timeout was fixed before those timers ran. Re-check the
+        // queue and poll instead of blocking, so the trailing drainPosted() runs
+        // the callback this iteration rather than after the full timeout. Only
+        // matters when we were about to block (timeout_ms != 0).
+        if (timeout_ms != 0) {
+            std::lock_guard lock(post_mutex_);
+            if (!post_queue_.empty()) timeout_ms = 0;
+        }
 
         static constexpr int MAX_EVENTS = 64;
         epoll_event events[MAX_EVENTS];
