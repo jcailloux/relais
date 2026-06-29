@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-06-30
+
 ### Added
 
 - **Client-side liveness timeouts (`query_timeout`, `acquire_timeout`).** Every I/O
