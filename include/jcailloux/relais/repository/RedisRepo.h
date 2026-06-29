@@ -188,29 +188,25 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
         {
             using enum config::UpdateStrategy;
 
-            // co_await is illegal inside a catch handler, so capture the
-            // uncertain timeout and run the precautionary L2 evict after the try.
+            // co_await is illegal in a catch handler: capture the uncertain
+            // outcome (timeout or lost connection), evict L2 after the try.
             WriteOutcome outcome;
             std::exception_ptr timeout;
             try {
                 outcome = co_await Base::updateOutcome(id, entity);
-            } catch (const io::PgQueryTimeout&) {
+            } catch (const io::PgUncertainError&) {
                 timeout = std::current_exception();
             }
             if (timeout) {
-                // Uncertain: the UPDATE may have committed. Evict L2 by
-                // precaution (bump gen + UNLINK), never write-through the
-                // unconfirmed value. Best-effort — Redis may be down — and if the
-                // UNLINK cannot confirm, a deferred self-heal re-evicts on
-                // recovery (evictL2OrSelfHeal). The PgQueryTimeout must still
-                // surface, so the eviction's own I/O failure is logged, not
-                // allowed to mask it. RedisRepo unwinds before LocalRepo, so this
-                // L2 evict precedes the L1 evict (anti-phantom L2-before-L1).
+                // Uncertain: the UPDATE may have committed. Evict L2 by precaution
+                // (bump gen + UNLINK), best-effort — a failed UNLINK enqueues a
+                // self-heal. Log its I/O failure rather than mask the uncertain
+                // exception. RedisRepo unwinds before LocalRepo (L2-before-L1).
                 try {
                     co_await evictL2OrSelfHeal(id);
                 } catch (const std::exception& e) {
                     RELAIS_LOG_ERROR << Base::name()
-                        << ": L2 precautionary evict failed (update timeout) - "
+                        << ": L2 precautionary evict failed (uncertain update) - "
                         << e.what();
                 }
                 std::rethrow_exception(timeout);
@@ -224,7 +220,7 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
                     // Safe strategy: bump gen then UNLINK — the next read re-fills
                     // (read-fill recheck / Redis-side gen), so L2 always reconverges
                     // on the DB across instances. A failed UNLINK enqueues a
-                    // deferred self-heal so the phantom does not outlive the outage.
+                    // deferred self-heal so the stale entry does not outlive the outage.
                     co_await evictL2OrSelfHeal(id);
                 } else {
                     co_await bumpGen(id);
@@ -275,7 +271,7 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
             std::exception_ptr timeout;
             try {
                 outcome = co_await Base::eraseOutcome(id, hint);
-            } catch (const io::PgQueryTimeout&) {
+            } catch (const io::PgUncertainError&) {
                 timeout = std::current_exception();
             }
             if (timeout) {
@@ -287,7 +283,7 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
                     co_await evictL2OrSelfHeal(id);
                 } catch (const std::exception& e) {
                     RELAIS_LOG_ERROR << Base::name()
-                        << ": L2 precautionary evict failed (erase timeout) - "
+                        << ": L2 precautionary evict failed (uncertain erase) - "
                         << e.what();
                 }
                 std::rethrow_exception(timeout);
@@ -367,7 +363,7 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
         /// (sub-chunked at K_redis by RedisCache::invalidateMany), then delegate
         /// down the chain. ⌈N/K_redis⌉ round-trips instead of N evictRedis.
         /// Latency-critical: the entity UNLINK is awaited by the caller (a
-        /// strictly-after phantom would survive past a detached UNLINK).
+        /// strictly-after stale entry would survive past a detached UNLINK).
         template<bool WithLists = true>
         static io::Task<void> invalidateManyCritical(std::span<const E> entities) {
             std::vector<std::string> keys;
@@ -434,7 +430,7 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
         // Staleness self-heal — deferred re-eviction when L2 is unreachable
         // =====================================================================
 
-        /// L1 evict for a phantom a concurrent read may have re-stored into the
+        /// L1 evict for a stale entry a concurrent read may have re-stored into the
         /// process-shared L1 after a failed L2 evict. Set by LocalRepo (the L1
         /// tier) when present — RedisRepo cannot name the derived tier, so the
         /// derived layer registers its evict here. Null in an L2-only config:
@@ -445,7 +441,7 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
         /// Enqueue a deferred self-heal for `id` whose L2 eviction did not confirm
         /// (Redis unreachable). The retry re-runs bump-gen → UNLINK L2 → evict L1
         /// — L1 last, so its generation bump closes the read-fill straddle only
-        /// after the UNLINK lands (the COH ordering) — until the UNLINK confirms.
+        /// after the UNLINK lands — until the UNLINK confirms.
         /// Deduped by Redis key, bounded, off the hot path. Without a Redis
         /// reconnect path the queue can only degrade on l1/l2_ttl.
         static void scheduleSelfHeal(const Key& id) {
@@ -459,7 +455,7 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
 
         /// L2 entity eviction for a mutation (bump gen + UNLINK). If the UNLINK
         /// could not confirm (Redis unreachable), enqueue a deferred self-heal so
-        /// the phantom is re-evicted on recovery. Best-effort by construction —
+        /// the stale entry is re-evicted on recovery. Best-effort by construction —
         /// RedisCache swallows its own I/O errors — so it never throws; the bool
         /// only tells the caller whether the UNLINK confirmed.
         static io::Task<bool> evictL2OrSelfHeal(const Key& id) {

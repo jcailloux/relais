@@ -62,20 +62,15 @@ public:
         , timer_armed_(std::exchange(o.timer_armed_, false))
         , query_timeout_(o.query_timeout_)
     {
-        // Invariant tripwire: a connection must never be moved while its watch-bound
-        // timer is armed. The timer callback captures a raw `this` that
-        // move does NOT patch → moving an armed connection would leave the timer
-        // pointing at the moved-from shell = fire-on-destroyed UAF. The
-        // run-to-completion discipline (removeCurrentWatch precedes every resume, so
-        // a ConnectionGuard can't be moved mid-wait) guarantees this today; the
-        // assert turns any future suspended-frame cancellation into an immediate
-        // failure instead of a silent UAF. timer_armed_ here holds o's pre-move value.
-        assert(!timer_armed_);
+        // Never move mid-wait: the watch callback (and timer) capture a raw `this`
+        // that move does not patch → UAF. watch_active_ catches the query_timeout=0
+        // case too (watch, no timer). Holds by run-to-completion; assert guards it.
+        assert(!watch_active_);
     }
 
     PgConnection& operator=(PgConnection&& o) noexcept {
         if (this != &o) {
-            assert(!o.timer_armed_);  // never move an armed connection (timer → UAF)
+            assert(!o.watch_active_);  // never move mid-wait (watch/timer → UAF)
             if (conn_) {
                 removeCurrentWatch();  // cancel timer before PQfinish (timer → UAF)
                 PQfinish(conn_);
@@ -237,7 +232,9 @@ public:
     /// Insert a sync point in the pipeline. Separates segments for error isolation.
     void pipelineSync() {
         if (!PQpipelineSync(conn_))
-            throw PgError(std::string("PQpipelineSync failed: ") + PQerrorMessage(conn_));
+            // Flushes the send buffer; earlier batch commands may already be
+            // executing server-side, so a failure here is uncertain.
+            throw PgConnectionLost(std::string("PQpipelineSync failed: ") + PQerrorMessage(conn_));
     }
 
     /// Flush the pipeline output buffer to the server.
@@ -246,7 +243,8 @@ public:
             int ret = PQflush(conn_);
             if (ret == 0) co_return;         // All flushed
             if (ret < 0)
-                throw PgError(std::string("PQflush failed: ") + PQerrorMessage(conn_));
+                // Bytes may already have reached the server → uncertain.
+                throw PgConnectionLost(std::string("PQflush failed: ") + PQerrorMessage(conn_));
             // ret == 1: need to wait for socket write-ready, then retry
             co_await awaitWriteReady();
         }
@@ -316,7 +314,8 @@ private:
     Task<PgResult> awaitPipelineResult() {
         while (true) {
             if (!PQconsumeInput(conn_))
-                throw PgError(std::string("PQconsumeInput failed: ") + PQerrorMessage(conn_));
+                // Post-send (reading the result): a dropped socket is uncertain.
+                throw PgConnectionLost(std::string("PQconsumeInput failed: ") + PQerrorMessage(conn_));
 
             if (PQisBusy(conn_)) {
                 co_await awaitReadReady();
@@ -343,7 +342,8 @@ private:
                 if (PQisBusy(conn_)) {
                     co_await awaitReadReady();
                     if (!PQconsumeInput(conn_))
-                        throw PgError(std::string("PQconsumeInput failed: ") + PQerrorMessage(conn_));
+                        // Post-send (reading the result): a dropped socket is uncertain.
+                        throw PgConnectionLost(std::string("PQconsumeInput failed: ") + PQerrorMessage(conn_));
                 }
             }
 
@@ -355,7 +355,8 @@ private:
     Task<void> consumePipelineSync() {
         while (true) {
             if (!PQconsumeInput(conn_))
-                throw PgError(std::string("PQconsumeInput failed: ") + PQerrorMessage(conn_));
+                // Post-send (reading the result): a dropped socket is uncertain.
+                throw PgConnectionLost(std::string("PQconsumeInput failed: ") + PQerrorMessage(conn_));
 
             if (PQisBusy(conn_)) {
                 co_await awaitReadReady();
@@ -392,7 +393,7 @@ private:
             }, self->query_timeout_);
         }
 
-        // No longer noexcept: lever PgQueryTimeout sur resume post-timeout.
+        // Not noexcept: throws PgQueryTimeout when resumed after a timeout.
         void await_resume() {
             if (self->dead_)
                 throw PgQueryTimeout("read wait exceeded query_timeout");
@@ -500,6 +501,7 @@ private:
     struct ResultAwaiter {
         PgConnection* self;
         PgResult result;
+        bool conn_lost = false;  // PQconsumeInput failed mid-result (uncertain)
 
         bool await_ready() const noexcept { return false; }
 
@@ -516,6 +518,10 @@ private:
             // default-constructed; surface the timeout, not "query failed".
             if (self->dead_)
                 throw PgQueryTimeout("result wait exceeded query_timeout");
+            // conn_lost before result.ok(): a dropped socket also leaves result
+            // !ok, but it is uncertain, not a deterministic server error.
+            if (conn_lost)
+                throw PgConnectionLost("connection lost reading result");
             if (!result.ok())
                 throw PgError("query failed");
             return std::move(result);
@@ -528,6 +534,7 @@ private:
                 auto coro = self->current_cont_;
                 self->removeCurrentWatch();
                 // result is on the awaiter (stack-allocated), safe to access after removeWatch
+                conn_lost = true;  // uncertain: socket dropped while reading the result
                 result = PgResult{};
                 coro.resume();
                 return;

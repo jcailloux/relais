@@ -31,13 +31,14 @@ namespace jcailloux::relais::io {
 //     - acquire_timeout bounds acquire(): the queue wait (Waiter timer) and the
 //       connect handshake. 0 = unbounded
 //       (discouraged — reintroduces the silent deadlock this config prevents).
-//     - query_timeout bounds each per-connection I/O wait (wired into PgConnection
-//       in a later step). 0 = delegated to the server's statement_timeout.
+//     - query_timeout bounds each per-connection I/O wait. A generous liveness
+//       backstop (not an SLA): it bounds a blackholed socket that statement_timeout
+//       misses. 0 delegates entirely to the server (discouraged); set tighter for an SLA.
 struct PgPoolConfig {
     size_t min_connections = 2;
     size_t max_connections = 16;
     std::chrono::milliseconds acquire_timeout{5000};
-    std::chrono::milliseconds query_timeout{0};
+    std::chrono::milliseconds query_timeout{30000};
 };
 
 // PgPool — bounded connection pool with coroutine wait queue

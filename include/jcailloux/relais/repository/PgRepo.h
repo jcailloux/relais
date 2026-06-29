@@ -320,13 +320,12 @@ protected:
     // =====================================================================
     //
     // The batch invalidation cascade (invalidateMany/eraseMany/...) is split into
-    // two passes that each flow through the mixin chain (commit 13, fire-and-forget
-    // cleanup):
+    // two passes that each flow through the mixin chain (fire-and-forget cleanup):
     //   - invalidateManyCritical — the latency-critical, awaited work: L1 evict +
     //     L2 entity UNLINK + gen bump + L1 list-tracker bump. Kept synchronous so
     //     erase*/invalidate* return only once the entity tier is coherent (the
-    //     recheck guard of commit 12 cannot reject a strictly-after phantom, so
-    //     the entity UNLINK must precede the caller's return).
+    //     read-fill recheck cannot reject a strictly-after stale entry, so the
+    //     entity UNLINK must precede the caller's return).
     //   - invalidateManyDeferred — the detachable, order-free work: deduplicated
     //     cross-target invalidation + selective L2 list EVALs. Fired fire-and-forget
     //     by the facade (invalidate-stale tolerated; L1 list reads stay guarded by
@@ -436,7 +435,7 @@ protected:
 
         // ANY returns rows unordered and omits absent ids — match each row
         // back to its requested position by primary key (mirrors
-        // distributeAnyResults). Linear match: N is small (cf. plan #6).
+        // distributeAnyResults). Linear match: N is small.
         const int n = result.rows();
         for (int r = 0; r < n; ++r) {
             auto entity = E::fromRow(result[r]);
@@ -488,7 +487,7 @@ protected:
                     out.push_back(std::move(*e));
             }
             co_return out;
-        } catch (const io::PgQueryTimeout&) {
+        } catch (const io::PgUncertainError&) {
             // Uncertain: the batch DELETE may have committed (lost ACK). Propagate
             // so the facade evicts by precaution; nullopt stays the deterministic
             // failure (DB unchanged).
@@ -538,7 +537,7 @@ protected:
                 if (static_cast<size_t>(n) < detail::kPgEraseChunk) break;
             }
             co_return out;
-        } catch (const io::PgQueryTimeout&) {
+        } catch (const io::PgUncertainError&) {
             // Uncertain: a chunk DELETE may have committed. Propagate so the
             // facade invalidates by precaution; nullopt stays the deterministic
             // failure.
@@ -598,7 +597,7 @@ protected:
                 Mapping::SQL::insert, params);
             if (w.result.empty()) co_return std::nullopt;
             co_return E::fromRow(w.result[0]);
-        } catch (const io::PgQueryTimeout&) {
+        } catch (const io::PgUncertainError&) {
             // Uncertain: the INSERT may have committed (RETURNING id lost).
             // Propagate so list/cross tiers invalidate from the input entity;
             // nullopt stays the deterministic failure.
@@ -649,7 +648,7 @@ protected:
             auto w = co_await PgProvider::queryWrite(sql.c_str(), params);
             if (w.result.empty()) co_return std::nullopt;
             co_return E::fromRow(w.result[0]);
-        } catch (const io::PgQueryTimeout&) {
+        } catch (const io::PgUncertainError&) {
             // Uncertain: the UPDATE may have committed. Propagate; the entity
             // tiers were already evicted before this await (invalidate-first
             // patch), so the precautionary eviction is already in place.
@@ -698,7 +697,7 @@ protected:
             co_return WriteOutcome{
                 static_cast<size_t>(result.affectedRows()), coalesced};
 
-        } catch (const io::PgQueryTimeout&) {
+        } catch (const io::PgUncertainError&) {
             // Uncertain: the UPDATE may have committed (lost ACK). Propagate so
             // each layer evicts its tier by precaution on the way out; the empty
             // WriteOutcome (nullopt) stays the deterministic failure (DB
@@ -734,7 +733,7 @@ protected:
             }
             co_return EraseOutcome{
                 static_cast<size_t>(w.result.affectedRows()), w.coalesced};
-        } catch (const io::PgQueryTimeout&) {
+        } catch (const io::PgUncertainError&) {
             // Uncertain: the DELETE may have committed. Propagate so each layer
             // evicts its tier by precaution; the empty EraseOutcome (nullopt)
             // stays the deterministic failure (DB unchanged).

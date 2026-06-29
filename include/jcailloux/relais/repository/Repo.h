@@ -284,7 +284,7 @@ public:
         std::exception_ptr timeout;
         try {
             deleted = co_await Base::eraseManyRaw(std::span<const Key>(keys));
-        } catch (const io::PgQueryTimeout&) {
+        } catch (const io::PgUncertainError&) {
             timeout = std::current_exception();
         }
         if (timeout) {
@@ -365,7 +365,7 @@ public:
         std::exception_ptr timeout;
         try {
             deleted = co_await Base::template eraseWhereRaw<FD>(filters);
-        } catch (const io::PgQueryTimeout&) {
+        } catch (const io::PgUncertainError&) {
             timeout = std::current_exception();
         }
         if (timeout) {

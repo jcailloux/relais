@@ -30,7 +30,9 @@ namespace jcailloux::relais::io {
 // (a typed std::function can't live in this address-agnostic struct without
 // templating it onto Io and polluting every {.query_timeout=} call site).
 struct RedisPoolConfig {
-    std::chrono::milliseconds query_timeout{0};
+    // Generous liveness backstop (not an SLA): bounds each Redis I/O wait. Redis
+    // has no server-side equivalent, so 0 leaves it fully unbounded (discouraged).
+    std::chrono::milliseconds query_timeout{30000};
 };
 
 // RedisPool — fixed-size pool of RedisClient instances with round-robin dispatch.

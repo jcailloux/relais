@@ -56,17 +56,15 @@ public:
         , timer_armed_(std::exchange(o.timer_armed_, false))
         , query_timeout_(o.query_timeout_)
     {
-        // Invariant tripwire: a connection must never be moved while its watch-bound
-        // timer is armed — the timer callback captures a raw `this` that move does
-        // NOT patch. The run-to-completion discipline (removeCurrentWatch precedes
-        // every resume) guarantees this today; the assert turns any future
-        // suspended-frame cancellation into an immediate failure, not a silent UAF.
-        assert(!timer_armed_);
+        // Never move mid-wait: the watch callback (and timer) capture a raw `this`
+        // that move does not patch → UAF. watch_active_ catches the query_timeout=0
+        // case too (watch, no timer). Holds by run-to-completion; assert guards it.
+        assert(!watch_active_);
     }
 
     RedisConnection& operator=(RedisConnection&& o) noexcept {
         if (this != &o) {
-            assert(!o.timer_armed_);  // never move an armed connection (timer → UAF)
+            assert(!o.watch_active_);  // never move mid-wait (watch/timer → UAF)
             if (fd_ >= 0) {
                 removeCurrentWatch();  // cancel timer before close (timer → UAF)
                 ::close(fd_);

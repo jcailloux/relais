@@ -230,7 +230,7 @@ public:
                 }
             }
             co_return outcome.affected;
-        } catch (const io::PgQueryTimeout&) {
+        } catch (const io::PgUncertainError&) {
             // Uncertain: the UPDATE may have committed. Evict L1 by precaution so
             // the next read re-fetches; the L1 evict is local and cannot fail.
             // RedisRepo already evicted L2 before this unwound (L2-before-L1).
@@ -273,7 +273,7 @@ public:
                 evict(id);
             }
             co_return outcome.affected;
-        } catch (const io::PgQueryTimeout&) {
+        } catch (const io::PgUncertainError&) {
             // Uncertain: the DELETE may have committed. Evict L1 by precaution
             // (local, cannot fail). L2 was already evicted as this unwound.
             evict(id);
@@ -281,31 +281,22 @@ public:
         }
     }
 
-    /// Invalidate L1 and L2 caches for a key.
+    /// Invalidate L1 and L2 for a key, L2 first then L1: the L1 generation bump
+    /// must land after the UNLINK so a concurrent L1-miss that read the stale L2
+    /// entry is rejected by the read-fill recheck. L1-first would let it survive
+    /// in the shared L1 until TTL even when the UNLINK succeeds (cf. invalidateManyCritical).
     static io::Task<void> invalidate(const Key& id) {
-        evict(id);
         if constexpr (HasRedis) {
-            // A failed UNLINK enqueues a deferred self-heal (the retry re-runs the
-            // canonical bump → UNLINK → evict-L1 order, even though this immediate
-            // path evicts L1 first) so the phantom is bounded to seconds.
-            bool ok = co_await Base::evictRedis(id);
-            if (!ok && PgProvider::hasRedis()) Base::scheduleSelfHeal(id);
+            co_await Base::evictL2OrSelfHeal(id);
         }
+        evict(id);
     }
 
-    /// Batch invalidation common path — L1 entity tier. Delegate to L2/L3
-    /// FIRST, then point-evict L1 (one per affected key, each ~0ns RAM). Never
-    /// purgeAll: that would drop unrelated hot entries; point-evicts stay exact.
-    ///
-    /// Order matters — L2-before-L1, matching mono erase (RedisRepo::eraseOutcome
-    /// UNLINK then LocalRepo::erase evict). L1-before-L2 leaves a window where a
-    /// concurrent L1-miss reads the not-yet-UNLINKed L2 phantom (a deleted row)
-    /// and re-stores it into the shared L1 → a PERSISTENT phantom (nothing
-    /// re-evicts L1, survives until TTL). With L2 cleared first, a racing reader
-    /// can only L1-hit the not-yet-evicted entry (bounded stale, self-heals at
-    /// the evict below) — never resurrect a deleted row. The dead generation
-    /// counter (bumpGeneration is unconsulted) gates nothing here; the ordering
-    /// is the actual anti-stale-write invariant.
+    /// Batch invalidation common path — L1 entity tier. Delegate to L2/L3 first,
+    /// then point-evict L1 (one per key, never purgeAll). L2-before-L1 matters: the
+    /// L1 evict's generation bump must land after the UNLINK so the read-fill
+    /// recheck rejects a racing L1-miss that read the stale L2 entry. L1-first would
+    /// let it survive in the shared L1 until TTL — the ordering is the invariant.
     template<bool WithLists = true>
     static io::Task<void> invalidateManyCritical(std::span<const E> entities) {
         co_await Base::template invalidateManyCritical<WithLists>(entities);
@@ -441,7 +432,7 @@ private:
                     // Let the L2 layer's deferred self-heal reach the shared L1:
                     // RedisRepo cannot name this derived tier, so register its
                     // point-evict as the hook the retry calls after a confirmed
-                    // UNLINK (kills a phantom a concurrent read re-stored).
+                    // UNLINK (kills a stale entry a concurrent read re-stored).
                     Base::l1SelfHealHook_ = &LocalRepo::evict;
                 }
                 // Release: publish only after the Tier is fully enrolled.
