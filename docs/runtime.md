@@ -141,3 +141,59 @@ relative to batch writes; if you need it ordered against another write, `co_awai
 it explicitly. (Its cache-invalidation branch is separate and *is* batched/
 pipelined — entity-tier UNLINKs share one flush, like `invalidateMany`, plus one
 predicate-driven list EVAL — this exception is about the `DELETE` itself.)
+
+## Liveness & failure semantics
+
+A repo call must never hang on a dead socket, and a *failed* call must never leave a
+cache holding a value the database no longer agrees with. Two mechanisms cover this.
+
+### Bounded waits, automatic recovery
+
+Every wait a repo call can block on is bounded by a client-side timer:
+
+- **`acquire_timeout`** (default 5 s) — acquiring a pooled connection, including the
+  warm-up connect at startup, so an unreachable database fails `create()` instead of
+  hanging forever.
+- **`query_timeout`** (default 30 s) — each per-connection I/O wait, PostgreSQL *and*
+  Redis.
+
+These are a **liveness backstop, not an SLA**: they bound a silently blackholed
+socket — dead network with no RST, frozen VM, firewall drop — that no server-side
+timeout can catch. Delegate the normal cases to the server first: `connect_timeout`,
+`keepalives`, and `statement_timeout` in the PG `conninfo` are cheaper and more
+precise; the client timer is the independent floor underneath them. Setting either
+to `0` disables it (discouraged — it reopens the hang).
+
+A wait that trips its timer throws, and the connection it owns is **poisoned and
+rebuilt** — but on different schedules. PG rebuilds *eagerly*: the next `acquire()`
+reconnects transparently. Redis rebuilds *lazily*, off the cache self-heal pass — the
+deferred retry that a failed L2 eviction schedules, which reconnects the dead client
+before replaying. A read-only workload that never evicts never schedules one; its L2
+reads simply keep degrading to L3 (a plain miss) until a write triggers the heal.
+(Self-heal needs a way to dial a fresh connection: `IoPool` and `RedisPool::create`
+wire it; `RedisPool::fromClients` only if you pass a reconnect factory, else a dead
+client stays down.)
+
+### The cache never goes stale under failure
+
+The rule is one line: **a failure whose database effect is unknown evicts the cache
+by precaution; a failure that provably changed nothing leaves it untouched.** It
+plays out in three cases:
+
+- **Reads propagate the error — they never fake an answer.** A failed entity or list
+  read *throws*; it is never reported as "not found" or an empty page (a false 404).
+  The one degradation is a Redis read timeout: L2 is only a cache, so the read falls
+  through to L3 (PostgreSQL) instead of throwing.
+- **A deterministic write failure** — the DB rolled back (connection refused, query
+  rejected) — returns `nullopt`, leaving the cache as-is. The call is safe to retry.
+- **An uncertain write** — a timeout, or a connection dropped *after* the request was
+  flushed — may have committed. relais throws `io::PgUncertainError` and **evicts the
+  affected entries first** (L2 before L1, by construction), so the next read
+  re-fetches the truth. Because the outcome is an exception, not an ambiguous
+  `nullopt`, a caller never mistakes "maybe committed" for "definitely failed" and
+  double-writes.
+
+> The error *type* is the signal: `io::PgUncertainError` (base of `PgQueryTimeout`
+> and `PgConnectionLost`) is the "maybe committed" category; a plain `io::PgError`
+> means the DB is unchanged. See
+> [api-reference.md › errors](api-reference.md#pgprovider--pgresult--row--errors).

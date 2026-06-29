@@ -276,6 +276,11 @@ never coincides with the declaration site and is a footgun.
   an out-of-range limit (HTTP), but a hand-built `ListQuery` passes `limit`
   straight into SQL. For "load everything", set `limit` above the row count
   yourself — exceeding `maxLimit` silently yields a truncated page, no error.
+- **A failed query throws — it is not an empty page.** A DB error (timeout,
+  connection lost) propagates out of `query()`/`queryJson()`/`queryBinary()`; only a
+  *successful* query with no matching rows yields an empty page. Don't read an empty
+  result as "the query failed". A Redis L2 timeout is not an error here — the page is
+  rebuilt from L3. (See [runtime.md › Liveness & failure semantics](runtime.md#liveness--failure-semantics).)
 - **At least one `sortable` field is required.** The generator embeds a
   `ListDescriptor` **only when the entity has ≥1 sort**; `filterable` alone
   yields a `FilterSet` but no `ListDescriptor`, so `HasListDescriptor` fails and

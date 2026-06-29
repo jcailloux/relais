@@ -2,6 +2,58 @@
 
 ## [Unreleased]
 
+### Added
+
+- **Client-side liveness timeouts (`query_timeout`, `acquire_timeout`).** Every I/O
+  wait (PostgreSQL *and* Redis) and every connection acquire is now bounded by a
+  client-side timer — `IoPoolConfig`/`PgPoolConfig`/`RedisPoolConfig` fields, defaults
+  30 s / 5 s. A liveness backstop, not an SLA: it bounds a silently blackholed socket
+  (dead network with no RST, frozen VM, firewall drop) that no server-side timeout
+  catches. `0` disables it (discouraged). Prefer the `conninfo`
+  `connect_timeout`/`keepalives`/`statement_timeout` for the normal cases; the client
+  timer is the independent floor underneath them.
+
+- **Automatic connection recovery.** A wait that trips its timer — or a connection
+  that takes an RST — poisons that connection, and it is rebuilt. PG rebuilds
+  *eagerly*: the next `acquire()` reconnects. Redis rebuilds *lazily*, off the cache
+  self-heal pass a failed L2 eviction schedules (it reconnects the dead client before
+  replaying); a read-only workload that never evicts keeps degrading its L2 reads to
+  L3 until a write triggers the heal. Self-heal needs a reconnect factory: `IoPool`
+  and `RedisPool::create` wire it; `RedisPool::fromClients` only if you pass one, else
+  a dead client stays down.
+
+- **Uncertain-write error category (`io::PgUncertainError`).** Base of
+  `io::PgQueryTimeout` and `io::PgConnectionLost` (the connection dropped after the
+  request was flushed). It marks a write whose database effect is *unknown* — it may
+  have committed. The write path evicts the affected cache entries (L2 before L1) and
+  rethrows, so no stale value survives an uncertain write. `io::RedisQueryTimeout` and
+  `io::PgPoolTimeout` round out the typed error set.
+
+### Changed (Breaking)
+
+- **A failed read now throws instead of reporting "absent".** An entity or list read
+  that hits a DB error (timeout, connection lost) propagates the exception; only a
+  *successful* empty result means "not found" / an empty page. Previously a DB error
+  was swallowed into `nullopt` / an empty page — a false 404. A Redis L2 read timeout
+  is the sole degradation: it falls through to L3, not an error.
+
+- **An uncertain write throws `io::PgUncertainError` instead of reporting failure as a
+  value.** `update`/`patch`/`erase` reserve `nullopt` (and `insert` an empty view) for
+  a *deterministic* failure (DB provably unchanged, retry-safe); a timeout or mid-write
+  connection loss throws, with the affected caches already evicted. Migration: a caller
+  that read `nullopt` as "the write failed, nothing changed" must now also catch
+  `PgUncertainError` — under it, the write *may* have landed, so do not blindly retry a
+  non-idempotent write.
+
+- **`PgPool::create` takes a `PgPoolConfig` instead of `(min, max)`.** Only affects a
+  bring-your-own-loop bootstrap (`IoPool` users are unaffected): pass
+  `PgPool::create(io, conninfo, PgPoolConfig{.min_connections = …, .max_connections =
+  …})`. This config is the seam where a foreign adapter wires its
+  `acquire_timeout`/`query_timeout` — without it the adapter has no liveness backstop.
+  `RedisPool::create` and `RedisPool::fromClients` gained an optional trailing
+  `RedisPoolConfig` / reconnect factory (additive — existing calls still compile; pass
+  the factory to enable Redis self-heal).
+
 ## [1.0.0] - 2026-06-24
 
 ### Added

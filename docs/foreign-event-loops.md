@@ -46,7 +46,7 @@ and enforced by the harness:
 | `void updateWatch(WatchHandle, IoEvent mask)` | change the active mask on that handle |
 | `void removeWatch(WatchHandle)` | stop all callbacks for that handle; **must be safe to call from inside that handle's own callback** — defer teardown of loop-owned state |
 | `void post(std::function<void()>)` | run once, on the loop thread, FIFO; thread-safe; **wake a blocked loop promptly** |
-| `TimerToken postDelayed(duration, cb)` | run `cb` once, on the loop thread, after the delay; return a cancellable token. Used to flush a batch on an adaptive deadline |
+| `TimerToken postDelayed(duration, cb)` | run `cb` once, on the loop thread, after the delay; return a cancellable token. Drives both the adaptive batch flush **and** the per-I/O-wait `query_timeout` — a timer that never fires means no liveness protection |
 | `void cancelTimer(TimerToken)` | cancel a pending `postDelayed`; no-op if already fired or unknown |
 
 > The exact concept signatures and member types, plus the
@@ -223,7 +223,8 @@ void initRelaisOnLoop(trantor::EventLoop* loop, const char* conninfo,
     auto fut = ready.get_future();
 
     relais::spawnOn(*io_ptr,
-        PgPool<TrantorIoContext>::create(*io_ptr, conninfo, min, max),
+        PgPool<TrantorIoContext>::create(*io_ptr, conninfo,
+            PgPoolConfig{.min_connections = min, .max_connections = max}),
         [&ready, io_ptr](relais::Outcome<std::shared_ptr<PgPool<TrantorIoContext>>> r) {
             // ON the loop thread: bind THIS loop's thread_local providers.
             if (r) { relais::PgProvider::init(*io_ptr, *r); ready.set_value(*r); }
@@ -243,6 +244,16 @@ sizing pools, remember total connections = N × per-loop max; keep it under the
 database's `max_connections`. (relais ships `io::IoPool` as a reference N-loop
 runtime for its own `EpollIoContext`; external routers follow the same
 init-per-loop-thread contract shown above.)
+
+> **Wire your timeouts here.** `PgPoolConfig` also carries `acquire_timeout` and
+> `query_timeout` (and `RedisPoolConfig` the Redis `query_timeout`) — a foreign
+> adapter gets the liveness backstop **only if you pass them**, exactly as `IoPool`
+> does for its own loops. They are armed via your `postDelayed`/`cancelTimer`, so a
+> correct timer subsystem (conformance C8/C9/C11) is the prerequisite. For Redis
+> *self-heal* after an outage, build the pool with
+> `RedisPool::fromClients(clients, reconnectFactory)`; with no factory a dead client
+> degrades to L3 instead of rebuilding. See
+> [runtime.md › Liveness & failure semantics](runtime.md#liveness--failure-semantics).
 
 Expose `isInLoopThread()` on your adapter and `PgProvider::init` will assert it
 runs on the loop thread — the same safety net `EpollIoContext` gets. The sketch

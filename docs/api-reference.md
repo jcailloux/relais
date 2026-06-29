@@ -52,7 +52,18 @@ Single-key reads resolve to an **epoch-guarded `cache::CacheView<E>`** (defined 
 
 > `Immediate<T>` is awaitable, so `co_await Repo::find(id)` compiles uniformly whatever `Cfg` selects — an L1 hit is synchronous and frameless, an L2/L3 miss suspends. See [caching.md](caching.md) for the epoch/eviction model.
 
-> **Reads collapse DB errors into not-found.** `find`/`findJson`/`findBinary`/`findMany` catch `io::PgError` and return the empty result (empty `CacheView`/`MultiView`, empty string, empty vector) — a DB error is **indistinguishable from a genuine miss**, and reads never throw. To distinguish the two, query through the raw `PgProvider` path (`PgProvider::queryParams`, below), which rethrows `PgError` from `await_resume`. The write side is the inverse: `update`/`erase`/`eraseMany`/`eraseWhere` return `optional<size_t>` with `nullopt` for a DB error — error visibility is a write-side guarantee, not a read-side one.
+> **Reads throw on a DB error; a write reports a *deterministic* one as a value.**
+> `find`/`findJson`/`findBinary`/`findMany` **propagate** an L3 error (timeout,
+> connection lost) — only a *successful* empty result means "not found" (empty
+> `CacheView`/`MultiView`, empty string/vector), so a read never disguises a failure
+> as a miss (no false 404). The lone exception is a Redis L2 read timeout: L2 is only
+> a cache, so it degrades to a miss and falls through to L3. On the write side,
+> `nullopt` (and `insert`'s empty view) means a **deterministic** failure — the DB
+> provably rolled back, safe to retry; an **uncertain** write (a timeout, or a
+> connection dropped mid-request) instead **throws `io::PgUncertainError`** after
+> evicting the affected caches, because it may have committed. So every `nullopt`
+> below is the deterministic-failure sentinel, never the maybe-committed one. See
+> [runtime.md › Liveness & failure semantics](runtime.md#liveness--failure-semantics).
 
 ### Writes
 
@@ -722,6 +733,7 @@ Repository calls don't reach PostgreSQL/Redis directly — they route through `P
 static std::unique_ptr<IoPool> create(const IoPoolConfig& config);   // io/IoPool.h
 ```
 - **returns**: `std::unique_ptr<IoPool>`, **synchronously** — `create` blocks the calling thread until every worker has connected and bound its providers. It is **not** a coroutine/`Task`. Call it from outside any event loop (e.g. `main`).
+- **throws**: `io::IoPoolStartupError` if a worker fails to report ready within `startup_timeout` (a dependency blackholed at boot); a worker whose own init throws rethrows that verbatim (e.g. an unreachable DB surfaces `PgPoolTimeout`). Either way `create()` fails fast instead of hanging.
 - **other members**: `void stop()` (idempotent; also runs in `~IoPool`), `int numWorkers() const noexcept`, `Io& workerIo(int idx) noexcept` (the worker's `EpollIoContext`, for posting work / testing). `using Io = EpollIoContext`.
 - **semantics**: each worker binds `PgProvider`'s `thread_local` providers to its own `BatchScheduler` on its own thread during `create()` — a coroutine running on a worker routes to that worker's resources with no cross-thread hop.
 
@@ -742,6 +754,9 @@ static std::unique_ptr<IoPool> create(const IoPoolConfig& config);   // io/IoPoo
 | `max_concurrent_per_worker` | `int` | `8` | Shared I/O budget per worker (PG + Redis combined). |
 | `pin_to_cores` | `bool` | `true` | Pin each worker thread to a CPU core. |
 | `first_core` | `int` | `1` | First core index for pinning (worker `i` → `first_core + i`); `1` avoids core 0 (OS/IRQ). |
+| `acquire_timeout` | `std::chrono::milliseconds` | `5000` | Bounds each connection acquire, including the startup warm-up connect — an unreachable DB fails `create()` instead of hanging. |
+| `query_timeout` | `std::chrono::milliseconds` | `30000` | Bounds each per-connection I/O wait (PG *and* Redis). A liveness backstop, not an SLA; `0` disables it (discouraged). See [runtime.md › Liveness & failure semantics](runtime.md#liveness--failure-semantics). |
+| `startup_timeout` | `std::chrono::milliseconds` | `30000` | Bounds `create()`'s wait for all workers to report ready — a worker that hangs at boot (e.g. an unreachable dependency) makes `create()` throw `io::IoPoolStartupError` rather than block forever. |
 
 ### Task / Immediate / DetachedTask
 
@@ -839,7 +854,7 @@ static void runAll(Io& io, Drive drive);   // testing/IoContextConformance.h
 ```
 - **role**: an *executable contract* for the `IoContext` extension point — runnable checks for the semantics the concept can only describe. An adapter author instantiates `runAll` against their type to prove the shim is correct before wiring relais pools onto it; relais CI runs it against `EpollIoContext`.
 - **`drive`**: the one author-supplied primitive — `drive(io, pred)` pumps the loop **on the calling thread** until `pred()` returns true, re-checking `pred` between iterations (the loop's internal wait must be bounded). For `EpollIoContext`: `[](auto& c, auto pred){ c.runUntil(pred); }`.
-- **checks (C1-C10)**: post executes exactly once (C1) / FIFO order (C2) / re-post from a callback (C3); watch fires readable with the right mask (C4) / `updateWatch` remask (C5) / `removeWatch` stops delivery (C6) / **reentrant self-`removeWatch`** (C10, an ASan use-after-free trap); **cross-thread `post`** runs on the loop thread and wakes it (C7); `postDelayed` fires once (C8); `cancelTimer` cancels (C9). (The harness numbers the last four out of run order — `runAll` executes reentrant-removeWatch seventh but labels it C10.)
+- **checks (C1-C11)**: post executes exactly once (C1) / FIFO order (C2) / re-post from a callback (C3); watch fires readable with the right mask (C4) / `updateWatch` remask (C5) / `removeWatch` stops delivery (C6) / **reentrant self-`removeWatch`** (C10, an ASan use-after-free trap); **cross-thread `post`** runs on the loop thread and wakes it (C7); `postDelayed` fires once (C8); `cancelTimer` cancels (C9); **arm-then-cancel at scale** — many timers armed then all cancelled must leave none firing, i.e. a `cancelTimer` *removes* the timer rather than tombstoning it until its deadline (C11, the property the per-I/O-wait `query_timeout` relies on: a timer is armed and cancelled on every I/O wait, so an adapter that defers cancellation would accumulate them). (The harness numbers some checks out of run order — `runAll` runs reentrant-removeWatch seventh but labels it C10, and arm-then-cancel last as C11.)
 - **framework-agnostic**: Catch-free — throws `ConformanceError` (a `std::runtime_error`) on failure, so it drops into any test framework.
 
 > Modifying the `IoContext` concept and not re-running `runAll` against every foreign adapter is how a co-located consumer silently breaks. The harness is the gate.
@@ -902,11 +917,16 @@ static void init(
 |---|---|---|
 | `io::PgError` | `std::runtime_error` | Any PostgreSQL-layer error. |
 | `io::PgNoRows` | `PgError` | Query returned no rows. |
-| `io::PgConnectionError` | `PgError` | Connection-level PG failure. |
+| `io::PgConnectionError` | `PgError` | Connection-level PG failure (deterministic — DB untouched). |
+| `io::PgPoolTimeout` | `PgError` | `acquire_timeout` exceeded (queue wait or connect handshake). Deterministic — DB never touched, retry-safe. |
+| `io::PgUncertainError` | `PgError` | **Category** — the request was in flight when the wait failed, so the DB *may* have committed. The write path evicts the affected caches before rethrowing. |
+| `io::PgQueryTimeout` | `PgUncertainError` | A per-connection I/O wait exceeded `query_timeout`. |
+| `io::PgConnectionLost` | `PgUncertainError` | The connection dropped (RST/EOF) after the request was flushed or while its result was read. |
 | `io::RedisError` | `std::runtime_error` | Any Redis-layer error. |
 | `io::RedisConnectionError` | `RedisError` | Connection-level Redis failure. |
+| `io::RedisQueryTimeout` | `RedisError` | A Redis I/O wait exceeded `query_timeout`. A read degrades to an L2 miss (→ L3); a write/evict is best-effort + self-heal. |
 
-> Catch `PgError`/`RedisError` to handle a whole layer; catch `PgNoRows` etc. for the specific case. There is no `error_code`-style enum — branch on type.
+> Catch `PgError`/`RedisError` to handle a whole layer; catch `PgNoRows` etc. for the specific case. There is no `error_code`-style enum — branch on type. The one category that carries semantics is `PgUncertainError`: a write that throws it *may* have committed (relais has already evicted the affected caches); a write that throws a plain `PgError` provably did not. See [runtime.md › Liveness & failure semantics](runtime.md#liveness--failure-semantics).
 
 → Guides: [runtime.md](runtime.md), [foreign-event-loops.md](foreign-event-loops.md)
 
