@@ -60,14 +60,14 @@ struct IoPoolConfig {
     // Liveness timeouts threaded into the per-worker pools.
     //   - acquire_timeout bounds each PG acquire, including the warm-up connect
     //     at boot, so an unreachable PostgreSQL fails startup instead of hanging.
-    //   - query_timeout bounds each per-connection I/O wait (PG and Redis). On
-    //     Redis it also bounds the boot connect handshake. 0 = no client bound
-    //     (PG delegates to the server's statement_timeout; Redis is unbounded —
-    //     then startup_timeout is the only backstop for a blackholed boot).
+    //   - query_timeout bounds each per-connection I/O wait (PG and Redis; also the
+    //     Redis boot connect). A generous liveness backstop, not an SLA: it bounds a
+    //     silently blackholed socket, which statement_timeout (PG) and Redis (no
+    //     server bound) miss. 0 disables it (discouraged); set tighter for an SLA.
     //   - startup_timeout bounds the wait for all workers to report ready, so a
     //     worker stuck in a connect that never returns cannot freeze create().
     std::chrono::milliseconds acquire_timeout{5000};
-    std::chrono::milliseconds query_timeout{0};
+    std::chrono::milliseconds query_timeout{30000};
     std::chrono::milliseconds startup_timeout{30000};
 
     // Core pinning

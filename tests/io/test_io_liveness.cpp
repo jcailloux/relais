@@ -22,6 +22,7 @@
 #include <jcailloux/relais/io/redis/RedisError.h>
 #include <jcailloux/relais/io/batch/BatchScheduler.h>
 #include <jcailloux/relais/io/IoPool.h>
+#include <jcailloux/relais/io/SelfHealQueue.h>
 #include <jcailloux/relais/io/WhenAll.h>
 
 #include <fixtures/ControllableIoContext.h>
@@ -353,7 +354,7 @@ TEST_CASE("liveness: repeated connect failures never freeze the pool",
         REQUIRE_THROWS_AS(driveBounded(io, pool->acquire(), 2s), PgPoolTimeout);
 
     // total_ returns to 0 each time (scope guard), so `total_ < max` stays true
-    // and the pool is never wedged at max with phantom slots.
+    // and the pool is never wedged at max with dead slots.
     REQUIRE(pool->totalConnections() == 0);
     REQUIRE(pool->waiterCount() == 0);
 }
@@ -378,6 +379,7 @@ TEST_CASE("liveness: a mid-query RST resolves in error without a stray timer",
     // resolves in error, routing through removeCurrentWatch (cancel timer +
     // removeWatch). The timer must not fire later on the released connection.
     bool killed = false;
+    bool threw = false;
     auto runner = [&]() -> Task<void> {
         // Defer the kill to the loop so it lands while the read is suspended.
         io.post([&] {
@@ -386,12 +388,17 @@ TEST_CASE("liveness: a mid-query RST resolves in error without a stray timer",
         });
         try {
             co_await conn.query("SELECT pg_sleep(2)");
-        } catch (...) {
-            // PgError on RST — the point is liveness, not the exact type.
+        } catch (const PgError&) {
+            // A terminated backend sends a FATAL result, so this is a deterministic
+            // "query failed" — distinct from a raw socket drop, which surfaces as
+            // the uncertain PgConnectionLost (covered by the static_assert + the
+            // scenario-A tests). The point here is liveness, not the exact type.
+            threw = true;
         }
     };
     REQUIRE_NOTHROW(driveBounded(io, runner(), 4s));
     REQUIRE(killed);
+    REQUIRE(threw);
     pump(io);  // a stray timer would fire (and UAF under ASan) here
     SUCCEED("error-path resolution cancelled the watch-bound timer");
 }
@@ -762,4 +769,27 @@ TEST_CASE("liveness: an unreachable dependency fails startup within a bound, nev
     REQUIRE_THROWS(IoPool::create(cfg));
     auto elapsed = std::chrono::steady_clock::now() - t0;
     REQUIRE(elapsed < 4s);  // bounded boot, no deadlock on ready_cv
+}
+
+// =============================================================================
+// SelfHealQueue accounting — dedup and overflow cap. No PG/Redis: only the
+// queue's bookkeeping is exercised, with a retry that never confirms.
+// =============================================================================
+
+TEST_CASE("liveness: the self-heal queue dedups by key and caps its footprint",
+          "[io][selfheal]") {
+    Io io;
+    SelfHealQueue<Io> q(io, nullptr);  // no pool: exercise the accounting only
+    auto never = []() -> Task<bool> { co_return false; };
+
+    // The same key enqueued twice is one pending entry — a refresh, not growth.
+    q.enqueue("k", never);
+    q.enqueue("k", never);
+    REQUIRE(q.pending() == 1);
+
+    // Past the distinct-key cap the surplus is dropped: the footprint is the
+    // number of distinct stale keys, not the number of attempts (anti-OOM).
+    for (int i = 0; i < 100'001; ++i)
+        q.enqueue("key-" + std::to_string(i), never);
+    REQUIRE(q.pending() == 100'000);  // kMaxKeys, including the "k" above
 }

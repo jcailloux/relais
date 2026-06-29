@@ -58,7 +58,7 @@ public:
         std::exception_ptr timeout;
         try {
             result = co_await Base::insert(entity);
-        } catch (const io::PgQueryTimeout&) {
+        } catch (const io::PgUncertainError&) {
             timeout = std::current_exception();
         }
         if (timeout) {
@@ -105,7 +105,7 @@ public:
             } else {
                 affected = co_await Base::update(id, entity);
             }
-        } catch (const io::PgQueryTimeout&) {
+        } catch (const io::PgUncertainError&) {
             timeout = std::current_exception();
         }
         if (timeout) {
@@ -149,7 +149,7 @@ public:
             } else {
                 result = co_await Base::erase(id);
             }
-        } catch (const io::PgQueryTimeout&) {
+        } catch (const io::PgUncertainError&) {
             timeout = std::current_exception();
         }
         if (timeout) {
@@ -194,7 +194,7 @@ public:
             } else {
                 result = co_await Base::patch(id, std::forward<Updates>(updates)...);
             }
-        } catch (const io::PgQueryTimeout&) {
+        } catch (const io::PgUncertainError&) {
             timeout = std::current_exception();
         }
         if (timeout) {

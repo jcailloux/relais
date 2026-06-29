@@ -373,16 +373,36 @@ public:
     // CRUD interception — invalidates list caches on entity changes
     // =========================================================================
 
-    /// Insert entity and invalidate list caches.
+    /// Insert and invalidate list caches. On an uncertain timeout (the INSERT may
+    /// have committed) the own-list tier is invalidated from the input entity.
     static io::Task<cache::CacheView<Entity>> insert(const Entity& entity)
         requires MutableEntity<Entity> && (!Base::config.read_only)
     {
-        auto result = co_await Base::insert(entity);
-        if (result) {
-            if constexpr (kHasL1) { listCache().onEntityCreated(*result); }
-            if constexpr (kHasL2) { co_await invalidateL2Created(*result); }
+        std::exception_ptr timeout;
+        try {
+            auto result = co_await Base::insert(entity);
+            if (result) {
+                // L2 EVAL is best-effort (RedisCache swallows its own I/O errors).
+                if constexpr (kHasL1) { listCache().onEntityCreated(*result); }
+                if constexpr (kHasL2) { co_await invalidateL2Created(*result); }
+            }
+            co_return result;
+        } catch (const io::PgUncertainError&) {
+            timeout = std::current_exception();  // co_await is illegal in a catch
         }
-        co_return result;
+        // Uncertain: invalidate the own-list tier from the input entity (L1 bump
+        // cannot fail, L2 EVAL best-effort), then rethrow.
+        if constexpr (kHasL1) { listCache().onEntityCreated(entity); }
+        if constexpr (kHasL2) {
+            try {
+                co_await invalidateL2Created(entity);
+            } catch (const std::exception& e) {
+                RELAIS_LOG_ERROR << name()
+                    << ": L2 list precautionary invalidate failed (insert timeout) - "
+                    << e.what();
+            }
+        }
+        std::rethrow_exception(timeout);
     }
 
     /// Update entity and invalidate list caches.
@@ -591,7 +611,7 @@ protected:
         std::exception_ptr timeout;
         try {
             affected = co_await Base::update(id, entity);
-        } catch (const io::PgQueryTimeout&) {
+        } catch (const io::PgUncertainError&) {
             timeout = std::current_exception();
         }
         if (timeout) {
@@ -639,7 +659,7 @@ protected:
         std::exception_ptr timeout;
         try {
             result = co_await Base::erase(id);
-        } catch (const io::PgQueryTimeout&) {
+        } catch (const io::PgUncertainError&) {
             timeout = std::current_exception();
         }
         if (timeout) {
@@ -676,7 +696,7 @@ protected:
         std::exception_ptr timeout;
         try {
             result = co_await Base::patch(id, std::forward<Updates>(updates)...);
-        } catch (const io::PgQueryTimeout&) {
+        } catch (const io::PgUncertainError&) {
             timeout = std::current_exception();
         }
         if (timeout) {
@@ -1126,8 +1146,10 @@ protected:
             co_return entities;
 
         } catch (const io::PgError& e) {
+            // Propagate: caching {} here would negative-cache a false "no results"
+            // until TTL (permanent under l1_ttl=0). Mirrors the entity read path.
             RELAIS_LOG_ERROR << name() << ": queryFromDb error - " << e.what();
-            co_return {};
+            throw;
         }
     }
 };

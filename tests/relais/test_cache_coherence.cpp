@@ -57,6 +57,22 @@ using Io = io::test::ControllableIoContext;
 
 using ::entity::generated::TestItemEntity;
 
+// ThreadSanitizer slows the loop ~5x, so the self-heal retry/backoff cadence
+// needs a wider convergence window than the plain build.
+#if defined(__has_feature)
+#  if __has_feature(thread_sanitizer)
+#    define RELAIS_TSAN_BUILD 1
+#  endif
+#endif
+#if defined(__SANITIZE_THREAD__)
+#  define RELAIS_TSAN_BUILD 1
+#endif
+#ifdef RELAIS_TSAN_BUILD
+static constexpr auto kSelfHealBudget = std::chrono::seconds(8);
+#else
+static constexpr auto kSelfHealBudget = std::chrono::seconds(2);
+#endif
+
 // =============================================================================
 // Connection strings
 // =============================================================================
@@ -81,7 +97,7 @@ static const char* probeConnInfo() {
 
 using CohItemL1 = Repo<TestItemEntity, "coh:item:l1">;           // cfg::Local (L1 only)
 using CohItemBoth = Repo<TestItemEntity, "coh:item:both", cfg::Both>;  // L1 + L2
-// l1_ttl=0: the read-fill copy never TTL-heals, so an L2 ghost would persist —
+// l1_ttl=0: the read-fill copy never TTL-heals, so a stale L2 entry would persist —
 // this is the config that exposes the staleness bound and proves the self-heal closes it.
 using CohItemTtl0 =
     Repo<TestItemEntity, "coh:item:ttl0", cfg::Both.with_l1_ttl(std::chrono::seconds{0})>;
@@ -388,7 +404,7 @@ TEST_CASE("coherence: A erase — committed but withheld evicts the deleted entr
     REQUIRE_FALSE(static_cast<bool>(v1));  // not served from a stale L1 entry
 }
 
-TEST_CASE("coherence: A insert — committed but withheld leaves no cache phantom",
+TEST_CASE("coherence: A insert — committed but withheld leaves no stray cache entry",
           "[coherence][scenarioA][integration]") {
     CohEnv env(300ms);
     resetItems(env);
@@ -404,7 +420,7 @@ TEST_CASE("coherence: A insert — committed but withheld leaves no cache phanto
     auto r = env.probe.query(
         "SELECT count(*) FROM relais_test_items WHERE name='A-insert'");
     REQUIRE(r.get(0, 0) == "1");
-    // … but nothing was write-through cached (no phantom under a bogus key).
+    // … but nothing was write-through cached (no stray entry under a bogus key).
     REQUIRE(CohItemL1::size() == 0);
 }
 
@@ -538,12 +554,12 @@ TEST_CASE("coherence: a down L2 degrades reads to L3, order preserved",
 
 // =============================================================================
 // l1_ttl=0 — the executable proof that the self-heal bounds staleness. An erase whose L2 eviction
-// fails (Redis down) leaves a ghost in L2; with l1_ttl=0 a read-fill copy never
+// fails (Redis down) leaves a stale entry in L2; with l1_ttl=0 a read-fill copy never
 // TTL-heals, so without the self-heal the deleted row would be served forever.
-// The deferred retry must revive Redis and converge the ghost away.
+// The deferred retry must revive Redis and converge the stale entry away.
 // =============================================================================
 
-TEST_CASE("coherence: self-heal converges an L2 ghost from a down-window erase",
+TEST_CASE("coherence: self-heal converges a stale L2 entry from a down-window erase",
           "[coherence][selfheal][redis][integration]") {
     CohEnv env(300ms, /*with_redis=*/true, 200ms);
     env.probe.query("DELETE FROM relais_test_items");
@@ -551,22 +567,22 @@ TEST_CASE("coherence: self-heal converges an L2 ghost from a down-window erase",
     driveBounded(env.io, env.redis->exec("FLUSHDB"));
     auto id = env.seedItem("SH-erase", 7);
 
-    // Warm L1 + L2 with the row (the future ghost), then let the L2 fill land.
+    // Warm L1 + L2 with the row (the future stale entry), then let the L2 fill land.
     REQUIRE(driveBounded(env.io, CohItemTtl0::find(id)));
     pump(env.io, 100ms);
 
     // L2 goes dark exactly at the erase: the UNLINK times out and is swallowed
-    // best-effort, leaving the row as a ghost in L2 and enqueueing a self-heal.
+    // best-effort, leaving the row as a stale entry in L2 and enqueueing a self-heal.
     env.holdRedis();
     auto erased = driveBounded(env.io, CohItemTtl0::erase(id));
     REQUIRE(erased.has_value());                  // committed delete
     REQUIRE(probeValue(env, id) == "<absent>");   // DB row is gone
 
     // Drive the loop: the self-heal drain revives a fresh Redis connection (a new
-    // fd, not the held one) and retries the eviction → the ghost leaves L2.
-    pump(env.io, 2s);
+    // fd, not the held one) and retries the eviction → the stale entry leaves L2.
+    pump(env.io, kSelfHealBudget);
 
-    // The read now refetches the DB and finds the row gone — not the ghost.
+    // The read now refetches the DB and finds the row gone — not the stale entry.
     REQUIRE_FALSE(static_cast<bool>(driveBounded(env.io, CohItemTtl0::find(id))));
 }
 
