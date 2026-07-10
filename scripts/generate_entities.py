@@ -662,6 +662,8 @@ class MappingGenerator:
         else:
             lines.append(f'    static constexpr const char* primary_key_column = "{self._col(entity, a.primary_key)}";')
 
+        lines.append(f"    static constexpr bool supports_upsert = {'true' if self._supports_upsert(entity) else 'false'};")
+
         lines.append("")
 
         # Col enum — column indices for O(1) access in fromRow
@@ -781,6 +783,24 @@ class MappingGenerator:
             lines.append(
                 f'            "UPDATE {table_name} SET {update_set} '
                 f'WHERE {pk_where}";')
+
+        # UPSERT: INSERT ... ON CONFLICT (pk) DO UPDATE SET col=EXCLUDED.col.
+        # Only for caller-assigned PKs (PK not db_managed) with at least one
+        # non-PK column to SET — see _supports_upsert. Same params/placeholders
+        # as insert ($1..$n); the ON CONFLICT target is the PK columns and the
+        # SET list reuses update_cols but pulls values from the proposed row
+        # (EXCLUDED), so no extra parameters. RETURNING projects all columns for
+        # fromRow, identical to insert.
+        if self._supports_upsert(entity):
+            upsert_set = ", ".join(f"{col}=EXCLUDED.{col}" for col in update_cols)
+            conflict_target = ", ".join(pk_cols)
+            lines.append(f"        static constexpr const char* upsert =")
+            lines.append(
+                f'            "INSERT INTO {table_name} ({insert_cols_str}) '
+                f'VALUES ({insert_params}) '
+                f'ON CONFLICT ({conflict_target}) '
+                f'DO UPDATE SET {upsert_set} '
+                f'RETURNING {all_cols_str}";')
 
         # SELECT ... WHERE pk = ANY($1) for batch reads
         if pk_count == 1:
@@ -1605,6 +1625,25 @@ class MappingGenerator:
         pk_set = set(a.primary_keys) if a.primary_keys else {"id"}
         return any(m.name not in pk_set and m.name not in a.db_managed
                    for m in entity.members)
+
+    def _supports_upsert(self, entity: ParsedEntity) -> bool:
+        """True if the entity can back a native INSERT ... ON CONFLICT DO UPDATE.
+
+        Three conditions:
+          - writable (not read_only) — an upsert is a write;
+          - at least one non-PK, non-db_managed column to SET (_has_update_columns),
+            otherwise the DO UPDATE SET clause is empty (pure all-PK junctions fall
+            here — they would want DO NOTHING, out of scope);
+          - a caller-assigned PK: no PK column may be db_managed. The INSERT does
+            not list db_managed columns, so a serial PK is absent from the values
+            and cannot be the ON CONFLICT target — upsert-on-PK only makes sense
+            when the caller supplies the key.
+        """
+        a = entity.annotation
+        if a.read_only or not self._has_update_columns(entity):
+            return False
+        pk_set = set(a.primary_keys) if a.primary_keys else {"id"}
+        return pk_set.isdisjoint(a.db_managed)
 
     def _find_enum_mapping(self, a: EntityAnnotation, field_name: str) -> Optional[EnumMapping]:
         for em in a.enums:
