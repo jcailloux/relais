@@ -46,6 +46,13 @@ concept HasFullUpdate = requires(const E& e) {
     E::toUpdateParams(e);
 };
 
+/// E can back a native INSERT ... ON CONFLICT DO UPDATE: creatable (read + write
+/// + keyed) with a full-row update (at least one non-PK column to SET). Pairs
+/// with HasUpsertSql (the Mapping actually emitted SQL::upsert) to gate every
+/// upsert method — the entity shape here, the emitted SQL there.
+template<typename E, typename Key>
+concept UpsertableEntity = CreatableEntity<E, Key> && HasFullUpdate<E>;
+
 // =========================================================================
 // SQL helper for UPDATE ... RETURNING
 // =========================================================================
@@ -233,6 +240,21 @@ public:
         requires MutableEntity<E> && (!Cfg.read_only)
     {
         auto result = co_await insertRaw(entity);
+        if (!result) co_return {};
+        co_return makeView(std::move(*result));
+    }
+
+    // =====================================================================
+    // Upsert (INSERT ... ON CONFLICT DO UPDATE)
+    // =====================================================================
+
+    /// Upsert entity in database. Returns epoch-guarded CacheView of the row as
+    /// it stands after conflict resolution (empty on error). Emitted only for
+    /// caller-assigned-PK entities (HasUpsertSql).
+    static io::Task<cache::CacheView<E>> upsert(const E& entity)
+        requires UpsertableEntity<E, Key> && HasUpsertSql<E> && (!Cfg.read_only)
+    {
+        auto result = co_await upsertRaw(entity);
         if (!result) co_return {};
         co_return makeView(std::move(*result));
     }
@@ -604,6 +626,31 @@ protected:
             throw;
         } catch (const io::PgError& e) {
             RELAIS_LOG_ERROR << name() << ": insert error - " << e.what();
+            co_return std::nullopt;
+        }
+    }
+
+    /// Upsert entity in database, returning entity by value. Same params as
+    /// insert ($1..$n); the ON CONFLICT SET pulls its values from the proposed
+    /// row (EXCLUDED), so no extra parameters. RETURNING projects all columns —
+    /// the returned entity is the row after conflict resolution (create OR
+    /// update), reconstructed by fromRow exactly like insert.
+    static io::Task<std::optional<E>> upsertRaw(const E& entity)
+        requires UpsertableEntity<E, Key> && HasUpsertSql<E> && (!Cfg.read_only)
+    {
+        try {
+            auto params = E::toInsertParams(entity);
+            auto w = co_await PgProvider::queryWrite(
+                Mapping::SQL::upsert, params);
+            if (w.result.empty()) co_return std::nullopt;
+            co_return E::fromRow(w.result[0]);
+        } catch (const io::PgUncertainError&) {
+            // Uncertain: the upsert may have committed (RETURNING lost). Propagate
+            // so upper tiers evict by precaution — resilience follows the UPDATE
+            // model (the key may pre-exist with a now-stale value), not insert.
+            throw;
+        } catch (const io::PgError& e) {
+            RELAIS_LOG_ERROR << name() << ": upsert error - " << e.what();
             co_return std::nullopt;
         }
     }

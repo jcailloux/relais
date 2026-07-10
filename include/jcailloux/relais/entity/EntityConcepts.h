@@ -122,6 +122,17 @@ concept HasPartitionHint = requires(const E& e) {
     { E::MappingType::makePartitionHintParams(e) } -> std::convertible_to<io::PgParams>;
 };
 
+/// E's Mapping emitted a native upsert (INSERT ... ON CONFLICT DO UPDATE). The
+/// generator emits SQL::upsert only for writable, caller-assigned-PK entities
+/// with at least one non-PK column to SET (see the generator's _supports_upsert):
+/// serial-PK, all-PK junctions and read-only views have no such member. Gates
+/// every upsert path so the method is cleanly absent (SFINAE) rather than
+/// referencing a suppressed SQL::upsert at the call site.
+template<typename E>
+concept HasUpsertSql = requires {
+    { E::MappingType::SQL::upsert } -> std::convertible_to<const char*>;
+};
+
 }  // namespace jcailloux::relais
 
 #endif  // JCX_RELAIS_ENTITY_CONCEPTS_H
