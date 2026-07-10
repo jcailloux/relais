@@ -149,6 +149,16 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
             co_return Base::makeView(std::move(*result));
         }
 
+        /// Upsert entity in database with L2 store-through of the committed row.
+        /// Returns epoch-guarded CacheView (empty on error).
+        static io::Task<cache::CacheView<E>> upsert(const E& entity)
+            requires UpsertableEntity<E, Key> && HasUpsertSql<E> && (!Cfg.read_only)
+        {
+            auto result = co_await upsertRaw(entity);
+            if (!result) co_return {};
+            co_return Base::makeView(std::move(*result));
+        }
+
         /// Update entity in database with L2 cache handling.
         /// Returns: rows affected (0 if not found), or nullopt on DB error.
         static io::Task<std::optional<size_t>> update(const Key& id, const E& entity)
@@ -627,6 +637,48 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
             requires CreatableEntity<E, Key> && (!Cfg.read_only)
         {
             auto result = co_await Base::insertRaw(entity);
+            if (result) {
+                co_await bumpGen(result->key());
+                co_await setInCache(makeRedisKey(result->key()), *result);
+            }
+            co_return result;
+        }
+
+        /// Upsert with L2 store-through, returning entity by value.
+        ///
+        /// Resilience = UPDATE model, NOT insert: on an uncertain outcome the
+        /// key may already exist with a now-stale L2 value, so evict L2 by
+        /// precaution (bump gen + UNLINK, best-effort self-heal) — unlike
+        /// insertRaw, which evicts nothing because nothing pre-exists. co_await
+        /// is illegal in a catch handler, so the uncertain outcome is captured
+        /// and the evict runs after the try (RedisRepo unwinds before LocalRepo).
+        ///
+        /// On success, store-through the committed RETURNING row unconditionally
+        /// (bumpGen + setInCache, like insertRaw): we hold the authoritative row,
+        /// so writing it is valid whether the conflict resolved to create or
+        /// update, and the bumpGen invalidates other instances' stale copies in
+        /// the update case. No update_strategy branch — this is not a blind SET
+        /// of the input, it is the row PostgreSQL returned.
+        static io::Task<std::optional<E>> upsertRaw(const E& entity)
+            requires UpsertableEntity<E, Key> && HasUpsertSql<E> && (!Cfg.read_only)
+        {
+            std::exception_ptr timeout;
+            std::optional<E> result;
+            try {
+                result = co_await Base::upsertRaw(entity);
+            } catch (const io::PgUncertainError&) {
+                timeout = std::current_exception();
+            }
+            if (timeout) {
+                try {
+                    co_await evictL2OrSelfHeal(entity.key());
+                } catch (const std::exception& e) {
+                    RELAIS_LOG_ERROR << Base::name()
+                        << ": L2 precautionary evict failed (uncertain upsert) - "
+                        << e.what();
+                }
+                std::rethrow_exception(timeout);
+            }
             if (result) {
                 co_await bumpGen(result->key());
                 co_await setInCache(makeRedisKey(result->key()), *result);

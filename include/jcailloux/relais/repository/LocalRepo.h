@@ -211,6 +211,29 @@ public:
         co_return {};
     }
 
+    /// Upsert entity and cache it (store-through the committed row). Returns
+    /// epoch-guarded view. Unlike insert, a pre-existing L1 value must be
+    /// superseded cleanly: onMutation drives the read-fill recheck and
+    /// bumpGeneration rejects a straddling stale fetch — this is upsert-L1 =
+    /// update-L1, not insert. On an uncertain outcome, evict L1 by precaution
+    /// (local, cannot fail); L2 was already evicted as RedisRepo unwound.
+    static io::Task<cache::CacheView<E>> upsert(const E& entity)
+        requires UpsertableEntity<E, Key> && HasUpsertSql<E> && (!Cfg.read_only)
+    {
+        try {
+            auto result = co_await Base::upsertRaw(entity);
+            if (result) {
+                tier().onMutation(result->key());
+                bumpGeneration(result->key());
+                co_return storeAndView(result->key(), std::move(*result));
+            }
+            co_return {};
+        } catch (const io::PgUncertainError&) {
+            evict(entity.key());
+            throw;
+        }
+    }
+
     /// Update entity in database with L1 cache handling.
     /// Returns: rows affected (0 if not found), or nullopt on DB error.
     static io::Task<std::optional<size_t>> update(const Key& id, const E& entity)
