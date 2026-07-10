@@ -405,6 +405,18 @@ public:
         std::rethrow_exception(timeout);
     }
 
+    /// Insert-or-update and invalidate list caches. The create/update discriminant
+    /// is the pre-image: an existing row migrates its list pages (old position →
+    /// new), an absent one appends (create). The pre-read is best-effort and paid
+    /// only because this entity has lists; it is threaded into upsertWithContext so
+    /// a stacked InvalidationMixin reuses it instead of reading the row twice.
+    static io::Task<cache::CacheView<Entity>> upsert(const Entity& entity)
+        requires UpsertableEntity<Entity, Key> && HasUpsertSql<Entity> && (!Base::config.read_only)
+    {
+        std::optional<Entity> old = co_await findOldBestEffort(entity.key());
+        co_return co_await upsertWithContext(entity, old ? &*old : nullptr);
+    }
+
     /// Update entity and invalidate list caches.
     static io::Task<std::optional<size_t>> update(const Key& id, const Entity& entity)
         requires MutableEntity<Entity> && HasFullUpdate<Entity> && (!Base::config.read_only)
@@ -729,6 +741,61 @@ protected:
             if constexpr (kHasL2) {
                 co_await invalidateL2Updated(
                     old_entity ? *old_entity : *result, *result);
+            }
+        }
+        co_return result;
+    }
+
+    static io::Task<cache::CacheView<Entity>> upsertWithContext(
+        const Entity& entity, const Entity* old_entity)
+        requires UpsertableEntity<Entity, Key> && HasUpsertSql<Entity> && (!Base::config.read_only)
+    {
+        // co_await is illegal in a catch handler: capture the uncertain timeout,
+        // run the precautionary list invalidation after the try, then rethrow.
+        cache::CacheView<Entity> result;
+        std::exception_ptr timeout;
+        try {
+            result = co_await Base::upsert(entity);
+        } catch (const io::PgUncertainError&) {
+            timeout = std::current_exception();
+        }
+        if (timeout) {
+            // Uncertain: the ON CONFLICT statement may have committed as either
+            // branch. Keyed on the pre-image — a known old migrates to the input
+            // entity (its fields fully known), an unknown old appends. The L1
+            // tracker bump cannot fail; the L2 selective EVAL is best-effort. An
+            // update from an unknown old leaves that old position bounded by l*_ttl
+            // — the same residual update already tolerates.
+            if constexpr (kHasL1) {
+                if (old_entity) listCache().onEntityUpdated(*old_entity, entity);
+                else listCache().onEntityCreated(entity);
+            }
+            if constexpr (kHasL2) {
+                try {
+                    co_await invalidateL2Updated(
+                        old_entity ? *old_entity : entity, entity);
+                } catch (const std::exception& e) {
+                    RELAIS_LOG_ERROR << name()
+                        << ": L2 list precautionary invalidate failed (upsert timeout) - "
+                        << e.what();
+                }
+            }
+            std::rethrow_exception(timeout);
+        }
+        if (result) {
+            // Committed: an existing row migrates (old → the RETURNING row), an
+            // absent one appends. The RETURNING row carries DB-computed columns, so
+            // it — not the input — is the authoritative new list position.
+            if constexpr (kHasL1) {
+                if (old_entity) listCache().onEntityUpdated(*old_entity, *result);
+                else listCache().onEntityCreated(*result);
+            }
+            // L1 bump is RAM-only; the L2 selective EVAL is best-effort by
+            // construction (RedisCache swallows its own I/O failure → no-op), so a
+            // Redis outage here cannot throw past this success path. No try needed.
+            if constexpr (kHasL2) {
+                if (old_entity) co_await invalidateL2Updated(*old_entity, *result);
+                else co_await invalidateL2Created(*result);
             }
         }
         co_return result;

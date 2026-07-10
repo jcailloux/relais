@@ -89,6 +89,54 @@ public:
         co_return result;
     }
 
+    /// Insert-or-update and propagate cross-invalidation. A single best-effort
+    /// pre-image is the create/update discriminant and is threaded to the list tier
+    /// via upsertWithContext, so the row is read once for both tiers. Cross-targets
+    /// are invalidated old→new on the update branch and from the committed row on
+    /// the create branch — the same propagate primitives as insert/update.
+    static io::Task<cache::CacheView<Entity>> upsert(const Entity& entity)
+        requires UpsertableEntity<Entity, Key> && HasUpsertSql<Entity> && (!Base::config.read_only)
+    {
+        std::optional<Entity> old = co_await findOldBestEffort(entity.key());
+
+        cache::CacheView<Entity> result;
+        std::exception_ptr timeout;
+        try {
+            if constexpr (detail::HasListMixin<Base>) {
+                result = co_await Base::upsertWithContext(entity, old ? &*old : nullptr);
+            } else {
+                result = co_await Base::upsert(entity);
+            }
+        } catch (const io::PgUncertainError&) {
+            timeout = std::current_exception();
+        }
+        if (timeout) {
+            // Uncertain: cross-invalidate by precaution, keyed on the pre-image —
+            // old→input on the update branch, the input on the create branch. The
+            // list/entity tiers already evicted themselves as the exception unwound
+            // through the inner layers. Best-effort.
+            try {
+                if (old) co_await propagateUpdate<Entity, InvList>(&*old, entity);
+                else co_await propagateCreate<Entity, InvList>(entity);
+            } catch (const std::exception& e) {
+                RELAIS_LOG_ERROR << name()
+                    << ": cross-invalidation failed (upsert timeout) - " << e.what();
+            }
+            std::rethrow_exception(timeout);
+        }
+        if (result) {
+            // Best-effort: a committed write never fails on cross-invalidation.
+            try {
+                if (old) co_await propagateUpdate<Entity, InvList>(&*old, *result);
+                else co_await propagateCreate<Entity, InvList>(*result);
+            } catch (const std::exception& e) {
+                RELAIS_LOG_ERROR << name()
+                    << ": cross-invalidation failed (upsert committed) - " << e.what();
+            }
+        }
+        co_return result;
+    }
+
     /// Update entity and propagate cross-invalidation with old/new data.
     /// When Base is ListMixin, reuses the pre-fetched old entity via WithContext
     /// to avoid a redundant L1 lookup.
