@@ -25,6 +25,7 @@
  *  10. Concurrent list CRUD + list cache cleanup
  *  11a. ModificationTracker drains after concurrent storm
  *  11b. Progressive tracker reduction via trySweep
+ *  16. Concurrent upsert on a shared assigned-PK key (+ upsert‖update‖erase)
  */
 
 #include <catch2/catch_test_macros.hpp>
@@ -1478,4 +1479,105 @@ TEST_CASE("Concurrency - eraseWhere RangeModification vs concurrent sweep",
     TestInternals::forceFullListCleanup<TestArticleListRepo>();
     REQUIRE(TestInternals::pendingRangeCount<TestArticleListRepo>() == 0);
     REQUIRE(TestInternals::pendingModificationCount<TestArticleListRepo>() == 0);
+}
+
+
+// #############################################################################
+//
+//  16. Concurrent upsert on a shared assigned-PK key
+//
+//  Upsert composes the update-model primitives on the shared static caches:
+//  a pre-image discriminant, then L1 onMutation+bumpGeneration+storeAndView and
+//  (Both) L2 bumpGen+setInCache of the committed RETURNING row. N threads upsert
+//  the SAME key — the first resolves to INSERT, the rest to in-place UPDATE, each
+//  racing the others' store-through and generation bump on that one slot. Worker
+//  threads assert only robustness (the `parallel` error counter); correctness is
+//  a post-quiescence deterministic settle: a final single-threaded upsert must
+//  supersede whatever the storm left, visible identically in the cached tier and
+//  in the DB (probed via the uncached repo — the ON CONFLICT PK guarantees a
+//  single row, so cache and DB must agree, no torn value, no stale survivor).
+//
+//  The second scenario interleaves upsert ‖ update ‖ erase on the same key: any
+//  legal serialization is admissible, so the only invariant is no crash / no
+//  phantom — the settle proves the tier is still coherent with the DB afterward.
+//
+// #############################################################################
+
+// Ground-truth read straight from L3 (no cache), same table as the cached repos.
+static std::optional<int64_t> dbAkeyPayload(int64_t key) {
+    auto v = sync(UncachedTestAssignedKeyRepo::find(key));
+    return v ? std::optional<int64_t>(v->payload) : std::nullopt;
+}
+
+template<typename Repo>
+static void runConcurrentUpsertSameKey(int64_t key) {
+    parallel(NUM_THREADS, [&](int t) {
+        for (int j = 0; j < OPS_PER_THREAD; ++j) {
+            sync(Repo::upsert(makeTestAssignedKey(key, t * 1000 + j)));
+        }
+    });
+
+    // The row exists (upsert never leaves the slot absent) and the tier is live.
+    REQUIRE(sync(Repo::find(key)) != nullptr);
+
+    // Deterministic settle: a single-threaded upsert supersedes the storm's
+    // residue in both the cached tier and L3 — they must agree.
+    constexpr int64_t SENTINEL = 987654;
+    sync(Repo::upsert(makeTestAssignedKey(key, SENTINEL)));
+
+    auto cached = sync(Repo::find(key));
+    REQUIRE(cached != nullptr);
+    REQUIRE(cached->payload == SENTINEL);
+    REQUIRE(dbAkeyPayload(key) == SENTINEL);
+}
+
+template<typename Repo>
+static void runUpsertUpdateEraseSameKey(int64_t key) {
+    // Seed so update/erase have a row to act on from the first iteration.
+    sync(Repo::upsert(makeTestAssignedKey(key, 1)));
+
+    parallel(NUM_THREADS, [&](int t) {
+        for (int j = 0; j < OPS_PER_THREAD; ++j) {
+            switch (t % 3) {
+                case 0:
+                    sync(Repo::upsert(makeTestAssignedKey(key, t * 1000 + j)));
+                    break;
+                case 1:
+                    // 0 rows affected if a concurrent erase removed it — no throw.
+                    sync(Repo::update(key, makeTestAssignedKey(key, t * 1000 + j)));
+                    break;
+                default:
+                    sync(Repo::erase(key));
+                    break;
+            }
+        }
+    });
+
+    // Any legal serialization is fine; the settle proves post-storm coherence.
+    constexpr int64_t SENTINEL = 987654;
+    sync(Repo::upsert(makeTestAssignedKey(key, SENTINEL)));
+
+    auto cached = sync(Repo::find(key));
+    REQUIRE(cached != nullptr);
+    REQUIRE(cached->payload == SENTINEL);
+    REQUIRE(dbAkeyPayload(key) == SENTINEL);
+}
+
+TEST_CASE("Concurrency - concurrent upsert on shared key",
+          "[integration][db][redis][concurrency][tsan][upsert]")
+{
+    TransactionGuard tx;
+
+    SECTION("[L1] N threads upsert the same key") {
+        runConcurrentUpsertSameKey<L1TestAssignedKeyRepo>(700001);
+    }
+    SECTION("[L1+L2] N threads upsert the same key") {
+        runConcurrentUpsertSameKey<FullCacheTestAssignedKeyRepo>(700002);
+    }
+    SECTION("[L1] upsert || update || erase on the same key") {
+        runUpsertUpdateEraseSameKey<L1TestAssignedKeyRepo>(700003);
+    }
+    SECTION("[L1+L2] upsert || update || erase on the same key") {
+        runUpsertUpdateEraseSameKey<FullCacheTestAssignedKeyRepo>(700004);
+    }
 }
