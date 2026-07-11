@@ -37,6 +37,7 @@
 #include <fixtures/PgProbe.h>
 #include <fixtures/RelaisTestAccessors.h>
 #include "fixtures/generated/TestItemEntity.h"
+#include "fixtures/generated/TestAssignedKeyEntity.h"
 
 #include <algorithm>
 #include <chrono>
@@ -56,6 +57,7 @@ namespace cfg = jcailloux::relais::config;
 using Io = io::test::ControllableIoContext;
 
 using ::entity::generated::TestItemEntity;
+using ::entity::generated::TestAssignedKeyEntity;
 
 // ThreadSanitizer slows the loop ~5x, so the self-heal retry/backoff cadence
 // needs a wider convergence window than the plain build.
@@ -101,6 +103,9 @@ using CohItemBoth = Repo<TestItemEntity, "coh:item:both", cfg::Both>;  // L1 + L
 // this is the config that exposes the staleness bound and proves the self-heal closes it.
 using CohItemTtl0 =
     Repo<TestItemEntity, "coh:item:ttl0", cfg::Both.with_l1_ttl(std::chrono::seconds{0})>;
+// Assigned-PK, L1 only — the shape upsert applies to. The key is known before the
+// call, so the uncertain-timeout handler evicts by precaution on the update model.
+using CohAkeyL1 = Repo<TestAssignedKeyEntity, "coh:akey:l1">;
 
 // =============================================================================
 // Bounded synchronous driver (mirrors test_io_liveness): a coherence suite must
@@ -311,6 +316,35 @@ static void prewarmWriteStmts(CohEnv& env) {
     clearL1();
 }
 
+// -- assigned-key helpers (upsert applies to caller-assigned PKs) --------------
+
+static TestAssignedKeyEntity akey(int64_t id, int64_t payload, std::string note = "") {
+    TestAssignedKeyEntity e;
+    e.key_id = id;
+    e.payload = payload;
+    e.note = std::move(note);
+    return e;
+}
+static void resetAkey(CohEnv& env) {
+    env.probe.query("DELETE FROM relais_test_assigned_keys");
+    relais_test::TestInternals::resetEntityCacheState<CohAkeyL1>();
+}
+static void seedAkey(CohEnv& env, int64_t id, int64_t payload) {
+    env.probe.query("INSERT INTO relais_test_assigned_keys (key_id, payload) VALUES ("
+                    + std::to_string(id) + ", " + std::to_string(payload) + ")");
+}
+static std::string probeAkey(CohEnv& env, int64_t id) {
+    auto r = env.probe.query(
+        "SELECT payload FROM relais_test_assigned_keys WHERE key_id=" + std::to_string(id));
+    return r.empty() ? std::string("<absent>") : r.get(0, 0);
+}
+// The upsert statement is a distinct prepared statement — run it once unheld so a
+// later held call exercises only its result wait, not the Parse round-trip.
+static void prewarmAkeyUpsert(CohEnv& env) {
+    driveBounded(env.io, CohAkeyL1::upsert(akey(999'999, 0, "prewarm")));
+    resetAkey(env);
+}
+
 // =============================================================================
 // Read path — the most visible contract change: no more false 404.
 // =============================================================================
@@ -422,6 +456,50 @@ TEST_CASE("coherence: A insert — committed but withheld leaves no stray cache 
     REQUIRE(r.get(0, 0) == "1");
     // … but nothing was write-through cached (no stray entry under a bogus key).
     REQUIRE(CohItemL1::size() == 0);
+}
+
+TEST_CASE("coherence: A upsert (update branch) — committed but withheld evicts the stale entry",
+          "[coherence][scenarioA][upsert][integration]") {
+    CohEnv env(300ms);
+    resetAkey(env);
+    prewarmAkeyUpsert(env);
+    seedAkey(env, 1, 1);
+
+    // Warm L1 with the old value, so a missing eviction would surface as stale.
+    auto v0 = driveBounded(env.io, CohAkeyL1::find(int64_t{1}));
+    REQUIRE(v0);
+    REQUIRE(v0->payload == 1);
+
+    // The ON CONFLICT statement flushes and the server commits the DO UPDATE; its
+    // ACK is withheld → the client gives up uncertain. Upsert follows the update
+    // model: the key may now hold a stale value, so L1 is evicted by precaution.
+    env.holdPg();
+    REQUIRE_THROWS_AS(
+        driveBounded(env.io, CohAkeyL1::upsert(akey(1, 2))),
+        io::PgQueryTimeout);
+
+    REQUIRE(probeAkey(env, 1) == "2");   // committed server-side
+
+    env.releasePg();
+    auto v1 = driveBounded(env.io, CohAkeyL1::find(int64_t{1}));
+    REQUIRE(v1);
+    REQUIRE(v1->payload == 2);           // a stale cache would answer 1 here
+}
+
+TEST_CASE("coherence: A upsert (insert branch) — committed but withheld leaves no stray entry",
+          "[coherence][scenarioA][upsert][integration]") {
+    CohEnv env(300ms);
+    resetAkey(env);
+    prewarmAkeyUpsert(env);
+
+    env.holdPg();
+    REQUIRE_THROWS_AS(
+        driveBounded(env.io, CohAkeyL1::upsert(akey(9, 99))),
+        io::PgQueryTimeout);
+
+    REQUIRE(probeAkey(env, 9) == "99");  // row committed server-side
+    // The precautionary evict targets the known key; no stray/partial entry sticks.
+    REQUIRE(CohAkeyL1::size() == 0);
 }
 
 TEST_CASE("coherence: B update — rolled back keeps the old value, never stale",
