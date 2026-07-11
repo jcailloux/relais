@@ -42,11 +42,13 @@ thread_local — init() must run on each loop thread)`. `init()` itself also ass
 `isInLoopThread()` on adapters that expose it (relais's `EpollIoContext` does),
 catching an `init()` on the wrong thread.
 
-## Easy path: the built-in `IoPool`
+## Built-in standalone runtime: `IoPool`
 
 `io::IoPool` is the reference shared-nothing runtime — N epoll loops, each pinned
 to a core with its own pools/batcher, each binding its own providers
-automatically. You don't call `init()` yourself.
+automatically, so you never call `init()` yourself. Reach for it when relais drives
+the process: a standalone service, a batch job, or background workers with no other
+framework owning your loops.
 
 ```cpp
 #include <jcailloux/relais/io/IoPool.h>
@@ -55,13 +57,13 @@ using namespace jcailloux::relais;
 io::IoPoolConfig cfg;
 cfg.num_workers   = 4;                       // N loops (one per core)
 cfg.pg_conninfo   = "host=localhost dbname=app user=app";  // empty → libpq PG* env
-cfg.redis_host    = "127.0.0.1";
-cfg.redis_port    = 6379;
+// cfg.redis defaults to an enabled localhost:6379 pool.
+// L1-only (no Redis):  cfg.redis = std::nullopt;
 cfg.pg_max_conns_per_worker = 8;             // total PG conns = N × this — keep < max_connections
 
 auto pool = io::IoPool::create(cfg);         // blocks until all workers connected + bound
 
-// Run repo work on a worker loop (e.g. a job; a web server runs handlers here):
+// Run repo work on a worker loop (e.g. a job or a standalone service):
 pool->workerIo(0).post([] {
     [] () -> io::DetachedTask {
         auto user = co_await UserRepo::find(123);
@@ -81,18 +83,18 @@ because `post()` takes a plain callable, not an awaitable (see
 > list with defaults is in
 > [api-reference.md › Runtime and I/O](api-reference.md#runtime-and-io).
 
-## Bring your own loop (Drogon, asio, libuv, …)
+## Co-locate on your framework's loops (Drogon, asio, libuv, …)
 
-**Do you need this?** Only if a web framework already owns the event loops your
-requests run on. Bridging each call from a framework thread to `IoPool` then costs
-a thread hop (~3 µs, two syscalls) — even on an L1 hit — and co-locating relais on
-those existing loops removes it. If relais drives your runtime (jobs, or a server
-built on `IoPool`), skip this section: no adapter needed.
+When a web framework already owns the event loops your requests run on, that is
+where relais should run too — **inline on those loops**, not bridged to a separate
+`IoPool`. This is the path for a service built on an existing framework. Bridging
+each call to an `IoPool` thread would instead cost a hop (~3 µs, two syscalls) on
+every call, even an L1 hit; co-located, that same hit stays a pure in-process
+lookup (~50 ns, zero hops).
 
-If your framework already runs one epoll loop per core, run relais **inline on
-those loops** instead — an L1 cache hit is then a pure in-process lookup
-(~50 ns, zero hops). Write a small `IoContext` adapter for your loop, verify it
-with the conformance harness, then `init()` per loop thread.
+If your framework runs one epoll loop per core, write a small `IoContext` adapter
+for its loop, verify it with the conformance harness, then `init()` per loop
+thread.
 
 See **[foreign-event-loops.md](foreign-event-loops.md)** for the full recipe
 (adapter sketch, the conformance harness, the per-loop bootstrap with `spawnOn`).
