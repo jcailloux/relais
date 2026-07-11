@@ -631,6 +631,44 @@ TEST_CASE("coherence: a down L2 degrades reads to L3, order preserved",
 }
 
 // =============================================================================
+// Redis unconfigured (hasRedis()==false) — the mono-loop mirror of IoPool
+// redis=nullopt. A config::Both repo whose batcher was bound WITHOUT Redis
+// (bindBatcher(false)) must treat the L2 tier as a clean no-op: reads degrade to
+// L3, writes commit, and nothing throws from an unbound Redis. Same
+// redis_exec_==nullptr binding IoPool's L1-only path produces — proven here
+// end-to-end through the full mixin chain, where the down-L2 tests above only
+// cover a bound-but-timing-out Redis.
+// =============================================================================
+
+TEST_CASE("coherence: a config::Both repo with Redis unconfigured no-ops L2, serves L3",
+          "[coherence][degrade][integration]") {
+    CohEnv env(300ms);  // with_redis=false → bindBatcher(false)
+    REQUIRE_FALSE(PgProvider::hasRedis());
+
+    env.probe.query("DELETE FROM relais_test_items");
+    relais_test::TestInternals::resetEntityCacheState<CohItemBoth>();
+    auto id = env.seedItem("noredis", 42);
+
+    // Read: L1 miss → the L2 GET early-returns (hasRedis()==false) → L3 value.
+    // Not a false miss, not a throw.
+    auto v = driveBounded(env.io, CohItemBoth::find(id));
+    REQUIRE(v);
+    REQUIRE(v->value == 42);
+
+    // Write: commits through L3; the L2 invalidation is skipped, no throw.
+    auto affected =
+        driveBounded(env.io, CohItemBoth::update(id, item(id, "noredis", 43)));
+    REQUIRE(affected.has_value());
+    REQUIRE(*affected == 1);
+
+    // A fresh read (L1 cleared) still degrades to L3 and reflects the new value.
+    relais_test::TestInternals::resetEntityCacheState<CohItemBoth>();
+    auto v2 = driveBounded(env.io, CohItemBoth::find(id));
+    REQUIRE(v2);
+    REQUIRE(v2->value == 43);
+}
+
+// =============================================================================
 // l1_ttl=0 — the executable proof that the self-heal bounds staleness. An erase whose L2 eviction
 // fails (Redis down) leaves a stale entry in L2; with l1_ttl=0 a read-fill copy never
 // TTL-heals, so without the self-heal the deleted row would be served forever.
