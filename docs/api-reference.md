@@ -76,8 +76,10 @@ Available only when `!Cfg.read_only`. Each write flows down the full chain: L3 c
 | `updateJson(const Key&, std::string_view)` | `Task<std::optional<size_t>>` | `MutableEntity<E> && HasFullUpdate<E> && !Cfg.read_only` | Parses JSON → `update`. `nullopt` on parse failure or DB error. |
 | `updateBinary(const Key&, std::span<const uint8_t>)` | `Task<std::optional<size_t>>` | `… && HasBinarySerialization<E> && !Cfg.read_only` | Parses BEVE → `update`. `nullopt` on parse failure or DB error. |
 | `patch(const Key&, Updates&&...)` | `Task<CacheView<E>>` | `HasFieldUpdate<E> && !Cfg.read_only` | Variadic field updates (`UPDATE … RETURNING`); ≥1 update required. Evicts then re-fills cache; returns the refreshed view. |
+| `upsert(const E& e)` | `Task<CacheView<E>>` | `UpsertableEntity<E,Key> && HasUpsertSql<E> && !Cfg.read_only` | Insert-or-update on the PK (`ON CONFLICT DO UPDATE … RETURNING`). **Assigned-PK entities only** (absent for serial PK). Store-through of the committed row; coherence & list/cross-invalidation identical to `update`. |
 
 > `HasFullUpdate<E>` = generator emitted `toUpdateParams` (false for all-PK junction tables, so `update`/`updateJson`/`updateBinary` are cleanly *absent* there — `patch` still works via `HasFieldUpdate`).
+> `upsert` additionally needs a **caller-assigned** PK: a serial/`db_managed` PK isn't in the INSERT column list, so `HasUpsertSql` is unsatisfied and `upsert` is cleanly *absent*. Guide: [caching.md › Insert-or-update](caching.md#insert-or-update-with-upsert).
 
 ### Deletes & invalidation
 
@@ -708,6 +710,8 @@ The building blocks live in `EntityConcepts.h` / `SerializationTraits.h`; the up
 | `MutableEntity<E>` | `ReadableEntity<E> && Writable<E>` | `insert()` / `update()` (read + DB write). |
 | `CreatableEntity<E, Key>` | `MutableEntity<E> && Keyed<E, Key>` | `insert()` with cache population (write + key). |
 | `HasFullUpdate<E>` | `E::toUpdateParams(e)` well-formed | Gates every full-row `update()` path; absent for all-PK junctions where no column is updatable. |
+| `UpsertableEntity<E, Key>` | `CreatableEntity<E, Key> && HasFullUpdate<E>` | One arm of the `upsert()` gate: creatable **and** full-row-updatable. |
+| `HasUpsertSql<E>` | `E::MappingType::SQL::upsert → const char*` | The other arm: the generator emitted `ON CONFLICT` SQL — true only for an **assigned-PK** entity with ≥1 non-PK column. Together they gate `upsert()`. |
 | `HasFieldUpdate<E>` | `E::TraitsType` and `E::TraitsType::Field` exist | Gates the `patch()` / partial-update path (`set<F>` / `setNull<F>`). |
 | `HasListDescriptor<E>` | `E::MappingType::ListDescriptor` exists | Inserts **ListMixin** into the chain (declarative list caching). |
 | `HasFilterSet<E>` | `E::MappingType::FilterSet` and `::FilterSet::Values` exist | Gates the where-variants `eraseWhere()` / `invalidateWhere()`; exposes the `FilterSet<E>` named-optionals aggregate. Decoupled from `HasListDescriptor`. |

@@ -150,6 +150,73 @@ Cache handling: L1 (and L2 if present) is evicted *before* the `UPDATE` runs;
 `patch` then re-stores the fresh `RETURNING` row into L1 synchronously, so the
 view it returns is already warm. Other tiers re-fill on the next read.
 
+## Insert-or-update with `upsert`
+
+`upsert(entity)` writes a row that may or may not already exist, in **one atomic
+statement**: `INSERT … ON CONFLICT (pk) DO UPDATE SET <non-pk cols>=EXCLUDED.<col>
+RETURNING <all cols>`. It returns the `CacheView<E>` of the row as it stands once
+the conflict resolves — the database decides insert vs. update, not a prior read.
+
+```cpp
+using AccountRepo = Repo<AccountEntity, "Account", config::Both>;
+
+auto view = co_await AccountRepo::upsert(makeAccount(id, balance));
+// PK absent → INSERT; PK present → UPDATE of every non-PK column
+```
+
+### Applicability — caller-assigned primary keys only
+
+The conflict target is the primary key, so the PK must be part of the INSERT —
+**assigned by the caller**, never `db_managed`. A serial/identity PK is excluded:
+its column isn't in the INSERT list, so there is nothing to conflict on. The
+generator emits the `ON CONFLICT` SQL (and sets `Mapping::supports_upsert = true`)
+only for an assigned-PK entity with at least one non-PK column; otherwise
+`HasUpsertSql` is unsatisfied and **`upsert` is absent from the repository type** —
+a compile error at the call site, not a runtime check.
+
+| Entity shape | `upsert` |
+|---|---|
+| Assigned PK + ≥1 non-PK column | available |
+| Serial / `db_managed` PK | absent — nothing to conflict on |
+| All-PK junction (no non-PK column) | absent — nothing to `SET` |
+| `read_only` repo | absent |
+
+The PK is the only conflict target in this version; a UNIQUE-constraint target and
+`ON CONFLICT DO NOTHING` for pure junctions are out of scope.
+
+### Coherence and invalidation — identical to `update`
+
+`upsert` **stores the committed `RETURNING` row through** every active tier,
+unconditionally: it holds the authoritative row, so caching it is correct on both
+branches. It is the one write that ignores `UpdateStrategy` — there is no
+invalidate-then-reload variant, because the value to cache is already in hand. A
+pre-existing L1/L2 entry is superseded with the same generation bump `update` uses,
+so a concurrent read-fill cannot reinstate the stale value (cross-instance via the
+Redis-side generation under `l2_shared_across_instances`).
+
+List and cross-invalidation match `update` exactly. Membership is reconciled from a
+**pre-image** (the row's prior state, read just before the statement): an insert
+appends to matching pages and fires `propagateCreate`; an update **migrates** the
+row between old and new pages when a filter/sort column changed and fires
+`propagateUpdate(old, new)`. The pre-image read happens only when the chain carries
+lists or cross-invalidation — a plain cached config is one SQL round-trip plus
+store-through, no read.
+
+### Failure — the `update` model, not `insert`'s
+
+An **uncertain** write (timeout, mid-request connection loss) may have committed
+over a key that already held a value, so on `io::PgUncertainError` `upsert` **evicts
+the affected L1/L2 entries and invalidates the possibly-affected pages by
+precaution**, then rethrows — no stale value survives. (`insert` evicts nothing on
+an uncertain write; there was no prior value to go stale.) A *deterministic* failure
+returns an empty view with nothing cached.
+
+The insert-vs-update decision is read a moment before the statement runs, so a row
+inserted concurrently in that window resolves as an update in SQL but propagates as
+a create. **The write stays atomic**; only the list cleanup of the vanished old
+state is skipped — exactly what `update` already tolerates when its pre-image is
+absent, bounded by `l1_ttl`/`l2_ttl`, timing not scope.
+
 ## Partition-key repositories
 
 For PostgreSQL partitioned tables with a composite PK

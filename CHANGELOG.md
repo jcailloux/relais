@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Added
+
+- **Native `upsert(entity)`.** Atomic `INSERT … ON CONFLICT (pk) DO UPDATE …
+  RETURNING` — insert when the primary key is absent, update every non-PK column
+  when present, returning the committed row. Cache coherence and automatic
+  list/cross-invalidation are identical to `update`. **Assigned-PK entities only**:
+  a serial/`db_managed` PK has nothing to conflict on, so `upsert` is absent from
+  the repository type.
+
 ## [2.0.0] - 2026-06-30
 
 ### Added

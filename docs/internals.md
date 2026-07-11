@@ -454,6 +454,35 @@ Database Update --> {Invalidate | Write} L2 --> {Invalidate | Write} L1
 Propagate cross-invalidations with old/new data
 ```
 
+### Write: `upsert(entity)`
+
+`INSERT … ON CONFLICT (pk) DO UPDATE SET …=EXCLUDED.… RETURNING *` in one
+statement. Unlike `update`, the committed `RETURNING` row is **stored through**
+every tier unconditionally (it is authoritative), so there is no `UpdateStrategy`
+branch:
+
+```
+Fetch old entity (pre-image; only if lists/cross-inval in the chain)
+      |
+      v
+INSERT … ON CONFLICT DO UPDATE … RETURNING
+      |
+      +-- success ------> store-through L2 (bumpGen + SET)
+      |                    store-through L1 (onMutation + bumpGeneration + storeAndView)
+      |                    lists: old ? onEntityUpdated(old,new) : onEntityCreated(new)
+      |                    cross: old ? propagateUpdate(old,new)  : propagateCreate(new)
+      |
+      +-- uncertain ----> evict L2, evict L1, invalidate lists from old∪input,
+      |   (PgUncertainError) propagate from old/input, then rethrow   (the update model)
+      |
+      +-- deterministic error --> empty view, nothing cached
+```
+
+The create/update discriminant is `old.has_value()` from the pre-image — the same
+machinery `update` uses. `onMutation` + `bumpGeneration` on the L1 store (both
+absent from `insert`) let a pre-existing L1 slot be superseded without a concurrent
+read-fill reinstating the old value.
+
 ## ListMixin — Automatic List Caching
 
 The `ListMixin` is an optional layer activated when `Entity::MappingType::ListDescriptor` exists (detected via the `HasListDescriptor` concept). It sits between the cache layer and `InvalidationMixin`.
