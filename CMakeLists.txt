@@ -278,6 +278,7 @@ if(RELAIS_BUILD_TESTS)
     relais_add_test(test_relais_where_predicate tests/relais/test_where_predicate.cpp     DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;redis;list;where"   RESOURCE_LOCK)
     relais_add_test(test_relais_cache_coherence tests/relais/test_cache_coherence.cpp     DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;redis;coherence"    RESOURCE_LOCK)
     relais_add_test(test_relais_assigned_key   tests/relais/test_simple_assigned_key.cpp  DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;assigned-key"     RESOURCE_LOCK)
+    relais_add_test(test_relais_upsert         tests/relais/test_upsert.cpp               DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;redis;upsert"       RESOURCE_LOCK)
     relais_add_test(test_relais_gdsf          tests/relais/test_gdsf.cpp                DEFINITIONS RELAIS_BUILDING_TESTS "RELAIS_GDSF_ENABLED=1" LABELS "relais;integration;db;gdsf"             RESOURCE_LOCK)
     if(NOT RELAIS_GDSF_ENABLED)
         relais_add_test(test_relais_gdsf_disabled tests/relais/test_gdsf_disabled.cpp       DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;gdsf")
@@ -328,6 +329,7 @@ if(RELAIS_BUILD_TESTS)
             test_relais_concurrency
             test_relais_composite_key
             test_relais_assigned_key
+            test_relais_upsert
             test_relais_gdsf
             test_relais_gdsf_disabled
         COMMENT "Build all relais integration tests"
@@ -355,6 +357,7 @@ if(RELAIS_BUILD_TESTS)
         tests/relais/test_concurrency.cpp
         tests/relais/test_composite_key.cpp
         tests/relais/test_simple_assigned_key.cpp
+        tests/relais/test_upsert.cpp
     )
     target_include_directories(test_relais_all PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
     target_compile_definitions(test_relais_all PRIVATE RELAIS_BUILDING_TESTS RELAIS_COMBINED_TESTS)

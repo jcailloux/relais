@@ -402,7 +402,9 @@ private:
         try { sync(pg->query("DELETE FROM relais_test_items")); } catch (...) {}
         try { sync(pg->query("DELETE FROM relais_test_products")); } catch (...) {}
         try { sync(pg->query("DELETE FROM relais_test_memberships")); } catch (...) {}
+        try { sync(pg->query("DELETE FROM relais_test_assigned_keys")); } catch (...) {}
         try { sync(pg->query("DELETE FROM relais_test_composite_list")); } catch (...) {}
+        try { sync(pg->query("DELETE FROM relais_test_upsert_list")); } catch (...) {}
         try { sync(pg->query("DELETE FROM relais_test_array_src")); } catch (...) {}
         try { sync(pg->query("DELETE FROM relais_test_array_rw")); } catch (...) {}
 

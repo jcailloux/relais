@@ -26,6 +26,7 @@
 #include "generated/TestArrayViewEntity.h"
 #include "generated/TestArrayRwEntity.h"
 #include "generated/TestCompositeKeyListEntity.h"
+#include "generated/TestUpsertListEntity.h"
 
 namespace relais_test {
 
@@ -55,9 +56,15 @@ using entity::generated::TestReadOnlyViewEntity;
 using entity::generated::TestArrayViewEntity;
 using entity::generated::TestArrayRwEntity;
 using entity::generated::TestCompositeKeyListEntity;
+using entity::generated::TestUpsertListEntity;
 
 // Cross-invalidation key extractors
 inline constexpr auto purchaseUserId = [](const auto& p) -> int64_t { return p.user_id; };
+
+/// Upsert cross-invalidation: the assigned-key entity's `payload` doubles as a
+/// foreign key into an item repo, so an upsert that changes it invalidates the
+/// old and new target under propagateUpdate.
+inline constexpr auto assignedKeyPayload = [](const auto& e) -> int64_t { return e.payload; };
 
 // =============================================================================
 // Entity Construction Helpers
@@ -372,5 +379,36 @@ using L1TestArrayRwRepo = Repo<TestArrayRwEntity, "test:arrrw:l1">;
 // =============================================================================
 
 using L1TestCompositeKeyListRepo = Repo<TestCompositeKeyListEntity, "test:complist:l1">;
+
+// =============================================================================
+// Upsert list Repositories (assigned PK + ListDescriptor + updatable column)
+// The one shape that drives upsert's list-invalidation path: an assigned key
+// makes it upsertable, `owner_id` is the filter/sort dimension a page migration
+// moves across, `label` is a plain column so DO UPDATE SET is non-empty.
+// =============================================================================
+
+using L1TestUpsertListRepo = Repo<TestUpsertListEntity, "test:upsertlist:l1">;
+
+inline TestUpsertListEntity makeTestUpsertList(
+    int64_t id,
+    int64_t owner_id = 0,
+    const std::string& label = ""
+) {
+    TestUpsertListEntity entity;
+    entity.id = id;
+    entity.owner_id = owner_id;
+    entity.label = label;
+    return entity;
+}
+
+// Dedicated cross-invalidation target — owned solely by the upsert suite. Uses a
+// distinct repo name (its own static L1) so no other test sharing L1TestItemRepo
+// can seed or evict the keys these assertions probe.
+using L1UpsertInvTargetRepo = Repo<TestItemEntity, "test:upsertinv:target:l1">;
+
+// Assigned-key source that cross-invalidates the target through its `payload`
+// foreign key — exercises upsert's InvalidationMixin branch (no list).
+using InvalidatingTestAssignedKeyRepo = Repo<TestAssignedKeyEntity, "test:akey:inv:l1",
+    cfg::Local, Invalidate<L1UpsertInvTargetRepo, assignedKeyPayload>>;
 
 } // namespace relais_test
