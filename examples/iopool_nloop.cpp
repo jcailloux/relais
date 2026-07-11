@@ -58,12 +58,11 @@ int main() {
     IoPoolConfig cfg;
     cfg.num_workers = 3;
     cfg.pg_conninfo = "";          // empty → libpq reads PG* env
-    cfg.redis_host  = "127.0.0.1";
-    cfg.redis_port  = 6379;
+    cfg.redis = RedisWorkerConfig{.host = "127.0.0.1", .port = 6379,
+                                  .conns_per_worker = 1};
     cfg.pin_to_cores = false;      // don't pin in a demo
     cfg.pg_min_conns_per_worker = 1;
     cfg.pg_max_conns_per_worker = 2;
-    cfg.redis_conns_per_worker  = 1;
 
     std::cout << "Starting IoPool with " << cfg.num_workers << " loops...\n";
     std::unique_ptr<IoPool> pool;
