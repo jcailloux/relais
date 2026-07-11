@@ -17,8 +17,14 @@ jobs:
         run: |
           version="${GITHUB_REF_NAME#v}"
           awk "/^## \\[${version}\\]/{found=1; next} /^## \\[/{if(found) exit} found{print}" CHANGELOG.md > release_notes.md
+          if [ ! -s release_notes.md ]; then
+            echo "::error::No '## [${version}]' section in CHANGELOG at this tag — refusing to publish empty release notes. Tag the release commit, not an earlier one."
+            exit 1
+          fi
 
-      - name: Create GitHub Release
-        run: gh release create "${{ github.ref_name }}" --notes-file release_notes.md
+      - name: Create or update GitHub Release
+        run: |
+          gh release create "${GITHUB_REF_NAME}" --notes-file release_notes.md \
+            || gh release edit "${GITHUB_REF_NAME}" --notes-file release_notes.md
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
