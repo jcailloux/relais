@@ -2,14 +2,16 @@
 
 ## [Unreleased]
 
-### Changed
+## [3.0.0] - 2026-07-11
+
+### Changed (Breaking)
 
 - **`IoPoolConfig` Redis settings grouped into `std::optional<RedisWorkerConfig>
   redis`.** `std::nullopt` selects L1-only — no `RedisPool` is built, no boot
   connect is attempted, `hasRedis()` reports `false`, and the L2 tier is bypassed
-  (not stubbed to throw). The default stays an enabled localhost pool. Replaces the
-  flat `redis_host` / `redis_port` / `redis_unix_path` / `redis_conns_per_worker`
-  fields.
+  (not stubbed to throw). The default stays an enabled localhost pool. Migration:
+  `cfg.redis_host = h; cfg.redis_port = p` → `cfg.redis = {.host = h, .port = p}`;
+  for L1-only, `cfg.redis = std::nullopt`.
 
 ### Fixed
 
