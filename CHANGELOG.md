@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-07-11
+
 ### Added
 
 - **Native `upsert(entity)`.** Atomic `INSERT … ON CONFLICT (pk) DO UPDATE …
