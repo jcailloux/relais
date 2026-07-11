@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+### Changed
+
+- **`IoPoolConfig` Redis settings grouped into `std::optional<RedisWorkerConfig>
+  redis`.** `std::nullopt` selects L1-only — no `RedisPool` is built, no boot
+  connect is attempted, `hasRedis()` reports `false`, and the L2 tier is bypassed
+  (not stubbed to throw). The default stays an enabled localhost pool. Replaces the
+  flat `redis_host` / `redis_port` / `redis_unix_path` / `redis_conns_per_worker`
+  fields.
+
+### Fixed
+
+- **`IoPool` L1-only now reports `hasRedis()==false`.** It previously always built
+  a Redis pool and reported `hasRedis()==true`, forcing an L1-only deployment to
+  reach a live Redis and misrouting the L2 tier when none was configured.
+
 ## [2.1.0] - 2026-07-11
 
 ### Added

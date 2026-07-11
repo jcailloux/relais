@@ -42,8 +42,9 @@ config and the entity's traits — you pay for exactly what you enable.
   into far fewer round-trips — no code to write, and a win even with caching off.
 - **Shared-nothing runtime, on your loop or ours.** Async I/O over epoll
   coroutines; per-loop connection pools, no cross-thread hops on the hot path. The
-  event loop is an extension point (`IoContext`): the bundled `IoPool` is the easy
-  path, but relais runs inline on a framework loop (Drogon/asio/libuv) just as well.
+  event loop is an extension point (`IoContext`): the bundled `IoPool` is a
+  standalone runtime for when relais drives the process, and relais runs inline on
+  a framework loop (Drogon/asio/libuv) when one already owns your loops.
 
 ## When relais fits
 
@@ -176,7 +177,7 @@ Key is auto-deduced from `Entity::key()` — the accessor relais exposes over yo
 ### 4 — Stand up the runtime, then call
 
 Repo calls run **on an event loop** and route through per-loop connection pools.
-The built-in `IoPool` is the easy path:
+The built-in `IoPool` stands one up when relais drives the process:
 
 ```cpp
 #include <jcailloux/relais/io/IoPool.h>

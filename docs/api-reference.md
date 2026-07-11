@@ -749,18 +749,24 @@ static std::unique_ptr<IoPool> create(const IoPoolConfig& config);   // io/IoPoo
 |---|---|---|---|
 | `num_workers` | `int` | `1` | Number of event loops / worker threads (one per core). |
 | `pg_conninfo` | `std::string` | `""` | libpq conninfo; empty → libpq `PG*` env vars. |
-| `redis_unix_path` | `std::string` | `""` | Redis Unix socket path. Empty → use TCP (`redis_host`/`redis_port`). |
-| `redis_host` | `std::string` | `"127.0.0.1"` | Redis TCP host (used when `redis_unix_path` empty). |
-| `redis_port` | `int` | `6379` | Redis TCP port. |
+| `redis` | `std::optional<RedisWorkerConfig>` | `RedisWorkerConfig{}` | L2 Redis endpoint + per-worker sizing (fields below); the default is an enabled localhost pool. `std::nullopt` → L1-only: no pool is built, no boot connect is attempted, `hasRedis()==false` on every worker, and the L2 tier is bypassed (not stubbed to throw). |
 | `pg_min_conns_per_worker` | `size_t` | `2` | PG pool floor per worker. |
 | `pg_max_conns_per_worker` | `size_t` | `8` | PG pool ceiling per worker. Total PG conns = `num_workers × this` — keep under the DB's `max_connections`. |
-| `redis_conns_per_worker` | `size_t` | `4` | Redis connections per worker. |
 | `max_concurrent_per_worker` | `int` | `8` | Shared I/O budget per worker (PG + Redis combined). |
 | `pin_to_cores` | `bool` | `true` | Pin each worker thread to a CPU core. |
 | `first_core` | `int` | `1` | First core index for pinning (worker `i` → `first_core + i`); `1` avoids core 0 (OS/IRQ). |
 | `acquire_timeout` | `std::chrono::milliseconds` | `5000` | Bounds each connection acquire, including the startup warm-up connect — an unreachable DB fails `create()` instead of hanging. |
 | `query_timeout` | `std::chrono::milliseconds` | `30000` | Bounds each per-connection I/O wait (PG *and* Redis). A liveness backstop, not an SLA; `0` disables it (discouraged). See [runtime.md › Liveness & failure semantics](runtime.md#liveness--failure-semantics). |
 | `startup_timeout` | `std::chrono::milliseconds` | `30000` | Bounds `create()`'s wait for all workers to report ready — a worker that hangs at boot (e.g. an unreachable dependency) makes `create()` throw `io::IoPoolStartupError` rather than block forever. |
+
+`RedisWorkerConfig` — the L2 endpoint and per-worker Redis sizing carried in `IoPoolConfig::redis`. Set `redis = std::nullopt` for an L1-only pool that reaches no Redis at all.
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `unix_path` | `std::string` | `""` | Redis Unix socket path. Empty → use TCP (`host`/`port`). |
+| `host` | `std::string` | `"127.0.0.1"` | Redis TCP host (used when `unix_path` is empty). |
+| `port` | `int` | `6379` | Redis TCP port. |
+| `conns_per_worker` | `size_t` | `4` | Redis connections opened per worker (each worker owns its own pool). |
 
 ### Task / Immediate / DetachedTask
 
