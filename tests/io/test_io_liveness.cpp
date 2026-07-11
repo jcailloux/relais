@@ -38,6 +38,7 @@
 #include <chrono>
 #include <coroutine>
 #include <exception>
+#include <future>
 #include <memory>
 #include <optional>
 #include <string>
@@ -93,6 +94,36 @@ struct SilentTcpServer {
         return "host=127.0.0.1 port=" + std::to_string(port_) +
                " dbname=relais_test user=relais_test password=x";
     }
+};
+
+// A loopback port bound but NOT listening: a connect() to it is refused (the
+// kernel replies RST → ECONNREFUSED), so it drives the "a connect was attempted
+// and failed fast" path deterministically. Distinct from SilentTcpServer, which
+// listens and accepts the (handshake-less) TCP connect — a Redis connect against
+// a blackhole SUCCEEDS at TCP level, so only a refused port makes the connect throw.
+struct RefusedTcpPort {
+    int fd = -1;
+    int port_ = 0;
+
+    RefusedTcpPort() {
+        fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        REQUIRE(fd >= 0);
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = 0;  // ephemeral
+        REQUIRE(::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
+        socklen_t len = sizeof(addr);
+        REQUIRE(::getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len) == 0);
+        port_ = ntohs(addr.sin_port);
+        // Deliberately NOT listen(): holding the fd reserves the port, and an
+        // incoming SYN with no listener → RST → ECONNREFUSED.
+    }
+    ~RefusedTcpPort() { if (fd >= 0) ::close(fd); }
+    RefusedTcpPort(const RefusedTcpPort&) = delete;
+    RefusedTcpPort& operator=(const RefusedTcpPort&) = delete;
+
+    int port() const { return port_; }
 };
 
 // Count process fds. Used as a leak tripwire: the offset (., .., the opendir fd)
@@ -769,6 +800,87 @@ TEST_CASE("liveness: an unreachable dependency fails startup within a bound, nev
     REQUIRE_THROWS(IoPool::create(cfg));
     auto elapsed = std::chrono::steady_clock::now() - t0;
     REQUIRE(elapsed < 4s);  // bounded boot, no deadlock on ready_cv
+}
+
+// =============================================================================
+// L1-only (redis=nullopt): no Redis pool, no boot connect, clean teardown. The
+// differential D1/D2 isolates that the `if (config.redis)` guard is what stops
+// the connect — not IoPool never connecting Redis anyway.
+// =============================================================================
+
+// Read hasRedis() ON worker `w`'s loop thread (thread_local — must be observed
+// on that thread, not the test thread).
+static bool workerHasRedis(IoPool& pool, int w) {
+    std::promise<bool> p;
+    auto fut = p.get_future();
+    pool.workerIo(w).post(
+        [&p] { p.set_value(jcailloux::relais::PgProvider::hasRedis()); });
+    REQUIRE(fut.wait_for(2s) == std::future_status::ready);
+    return fut.get();
+}
+
+TEST_CASE("liveness: L1-only IoPool attempts no Redis connect and starts clean",
+          "[io][iopool][integration]") {
+    // D2: redis=nullopt → no RedisPool is built and no boot connect is attempted,
+    // so startup succeeds with no reachable Redis and hasRedis()==false.
+    IoPoolConfig cfg;
+    cfg.num_workers = 1;
+    cfg.pg_conninfo = getConnInfo();
+    cfg.redis = std::nullopt;
+    cfg.pin_to_cores = false;
+    cfg.pg_min_conns_per_worker = 1;
+    cfg.pg_max_conns_per_worker = 1;
+
+    auto pool = IoPool::create(cfg);
+    REQUIRE(pool->numWorkers() == 1);
+    REQUIRE_FALSE(workerHasRedis(*pool, 0));
+    pool->stop();
+}
+
+TEST_CASE("liveness: IoPool with Redis set attempts the connect (refused → fails fast)",
+          "[io][iopool][integration]") {
+    // D1, the differential to D2: with redis set, the boot DOES attempt a Redis
+    // connect. Pointed at a refused port it fails fast, failing startup. PG boots
+    // first (real conninfo, succeeds), so the throw is the Redis connect — proving
+    // a connect is attempted, which redis=nullopt skips entirely.
+    RefusedTcpPort refused;
+    IoPoolConfig cfg;
+    cfg.num_workers = 1;
+    cfg.pg_conninfo = getConnInfo();
+    cfg.redis = RedisWorkerConfig{.host = "127.0.0.1", .port = refused.port(),
+                                  .conns_per_worker = 1};
+    cfg.pin_to_cores = false;
+    cfg.pg_min_conns_per_worker = 1;
+    cfg.pg_max_conns_per_worker = 1;
+    cfg.query_timeout = 300ms;
+
+    auto t0 = std::chrono::steady_clock::now();
+    REQUIRE_THROWS(IoPool::create(cfg));
+    auto elapsed = std::chrono::steady_clock::now() - t0;
+    REQUIRE(elapsed < 2s);  // refused is immediate; never hangs on the connect
+}
+
+TEST_CASE("liveness: an L1-only IoPool tears down with no fd leak",
+          "[io][iopool][integration][teardown]") {
+    // E: the redis_pool==nullptr path must dismantle cleanly — batcher trivially
+    // quiescent (no Redis batch), SelfHealQueue null-guarded, no suspended Redis
+    // frame. A before/after fd delta would surface any leaked socket or pipe.
+    int fds_before = countOpenFds();
+    {
+        IoPoolConfig cfg;
+        cfg.num_workers = 2;
+        cfg.pg_conninfo = getConnInfo();
+        cfg.redis = std::nullopt;
+        cfg.pin_to_cores = false;
+        cfg.pg_min_conns_per_worker = 1;
+        cfg.pg_max_conns_per_worker = 1;
+
+        auto pool = IoPool::create(cfg);
+        REQUIRE(pool->numWorkers() == 2);
+        pool->stop();
+    }
+    int fds_after = countOpenFds();
+    REQUIRE(fds_after <= fds_before);
 }
 
 // =============================================================================
