@@ -10,6 +10,7 @@
 #include <exception>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -36,23 +37,37 @@ struct IoPoolStartupError : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
+// RedisWorkerConfig — L2 Redis endpoint and per-worker pool sizing for IoPool.
+// Held in an optional on IoPoolConfig: its ABSENCE (std::nullopt) is the
+// canonical "no Redis" (L1-only) signal — no pool is built and no boot connect
+// is attempted.
+struct RedisWorkerConfig {
+    // Endpoint: prefer Unix socket, fall back to TCP.
+    std::string unix_path;            // Empty = use TCP (host/port below)
+    std::string host = "127.0.0.1";
+    int         port = 6379;
+
+    // Connections opened per worker (each worker owns its own pool).
+    size_t conns_per_worker = 4;
+};
+
 // IoPoolConfig — configuration for the multi-core I/O pool.
 
 struct IoPoolConfig {
     int num_workers = 1;
     std::string pg_conninfo;
 
-    // Redis: prefer Unix socket, fall back to TCP
-    std::string redis_unix_path;              // Empty = use TCP
-    std::string redis_host = "127.0.0.1";
-    int redis_port = 6379;
+    // L2 Redis endpoint + per-worker sizing. std::nullopt → L1-only: no
+    // RedisPool is built, no Redis connect is attempted at boot, and
+    // PgProvider::hasRedis() reports false on every worker (the L2 tier is
+    // cleanly bypassed, not stubbed to throw). A config::Local deployment then
+    // needs no reachable Redis. Defaults to an enabled localhost pool,
+    // preserving the prior behaviour.
+    std::optional<RedisWorkerConfig> redis = RedisWorkerConfig{};
 
     // PG pool sizing per worker
     size_t pg_min_conns_per_worker = 2;
     size_t pg_max_conns_per_worker = 8;
-
-    // Redis pool sizing per worker
-    size_t redis_conns_per_worker = 4;
 
     // Shared I/O budget per worker (PG + Redis combined)
     int max_concurrent_per_worker = 8;
@@ -129,7 +144,7 @@ struct BootTask {
 // Each worker owns:
 // - An EpollIoContext (event loop)
 // - A PgPool (PostgreSQL connection pool)
-// - A RedisPool (Redis connection pool)
+// - A RedisPool (Redis connection pool; absent for an L1-only pool)
 // - A BatchScheduler (adaptive batching)
 // - A std::jthread (the actual OS thread)
 //
@@ -210,20 +225,25 @@ public:
                              .acquire_timeout = config.acquire_timeout,
                              .query_timeout = config.query_timeout});
 
-                        // Redis pool — query_timeout bounds the connect handshake.
-                        if (!config.redis_unix_path.empty()) {
-                            w.redis_pool = std::make_shared<RedisPool<Io>>(
-                                co_await RedisPool<Io>::createUnix(
-                                    *w.io, config.redis_unix_path.c_str(),
-                                    config.redis_conns_per_worker,
-                                    {.query_timeout = config.query_timeout}));
-                        } else {
-                            w.redis_pool = std::make_shared<RedisPool<Io>>(
-                                co_await RedisPool<Io>::create(
-                                    *w.io, config.redis_host.c_str(),
-                                    config.redis_port,
-                                    config.redis_conns_per_worker,
-                                    {.query_timeout = config.query_timeout}));
+                        // Redis pool — query_timeout bounds the connect
+                        // handshake. Absent (std::nullopt) → L1-only: no pool,
+                        // no boot connect; w.redis_pool stays null and the
+                        // batcher binds without Redis (hasRedis()==false).
+                        if (config.redis) {
+                            const auto& r = *config.redis;
+                            if (!r.unix_path.empty()) {
+                                w.redis_pool = std::make_shared<RedisPool<Io>>(
+                                    co_await RedisPool<Io>::createUnix(
+                                        *w.io, r.unix_path.c_str(),
+                                        r.conns_per_worker,
+                                        {.query_timeout = config.query_timeout}));
+                            } else {
+                                w.redis_pool = std::make_shared<RedisPool<Io>>(
+                                    co_await RedisPool<Io>::create(
+                                        *w.io, r.host.c_str(), r.port,
+                                        r.conns_per_worker,
+                                        {.query_timeout = config.query_timeout}));
+                            }
                         }
 
                         // Batch scheduler — owned per worker (shared so the
