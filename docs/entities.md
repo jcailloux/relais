@@ -267,6 +267,11 @@ For each entity the generator produces, inside `entity::generated`:
   `patch`), and — only when the entity has a heap field (string/vector/raw_json)
   — `dynamicSize` for memory accounting.
 - **`{Class}Entity`** — the `Entity<Struct, Mapping>` alias (public API type).
+- **Assigned-PK entities (PK not `db_managed`, ≥1 non-PK column)** — `SQL::upsert`
+  (`INSERT … ON CONFLICT (pk) DO UPDATE SET …=EXCLUDED.… RETURNING …`) and
+  `supports_upsert = true`, enabling `Repo::upsert`. A serial-PK entity gets
+  `supports_upsert = false` and no `SQL::upsert`. See
+  [caching.md › Insert-or-update](caching.md#insert-or-update-with-upsert).
 - **Partition-key entities** — `SQL::delete_with_partition` +
   `makePartitionHintParams()`.
 - **Filterable entities (≥1 `filterable`)** — an embedded `FilterSet` (with a
