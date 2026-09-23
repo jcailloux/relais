@@ -2,6 +2,7 @@
 #define JCX_RELAIS_PGREPO_H
 
 #include <atomic>
+#include <concepts>
 #include <optional>
 #include <span>
 #include <string>
@@ -59,11 +60,54 @@ concept UpsertableEntity = CreatableEntity<E, Key> && HasFullUpdate<E>;
 
 namespace detail {
 
-/// Build: UPDATE "table" SET "col1"=$1, "col2"=$2 WHERE "pk"=$N RETURNING cols
+/// One SET assignment: the quoted column and how it takes its bound value.
+/// Implicit from a column name for the plain `col=$n` form.
+struct SetColumn {
+    std::string_view column;
+    entity::SetOp op = entity::SetOp::Assign;
+
+    template<typename S>
+        requires std::convertible_to<const S&, std::string_view>
+    SetColumn(const S& col, entity::SetOp o = entity::SetOp::Assign)
+        : column(col), op(o) {}
+};
+
+/// Append the SET list, numbering values $1..$N in order. Returns the next
+/// free parameter index.
+inline size_t appendSetClause(std::string& sql, std::initializer_list<SetColumn> sets) {
+    size_t param = 1;
+    bool first = true;
+    for (const auto& s : sets) {
+        if (!first) sql += ',';
+        first = false;
+        sql += s.column;
+        sql += '=';
+        switch (s.op) {
+            case entity::SetOp::Assign:
+                break;
+            case entity::SetOp::Add:
+                sql += s.column;
+                sql += '+';
+                break;
+            case entity::SetOp::Subtract:
+                sql += s.column;
+                sql += '-';
+                break;
+            case entity::SetOp::NowPlus:
+                sql += "now()+interval '1 microsecond'*";
+                break;
+        }
+        sql += '$';
+        sql += std::to_string(param++);
+    }
+    return param;
+}
+
+/// Build: UPDATE "table" SET "col1"=$1, "col2"="col2"+$2 WHERE "pk"=$N RETURNING cols
 inline std::string buildUpdateReturning(
     std::string_view table_name,
     std::string_view pk_column,
-    std::initializer_list<std::string_view> columns,
+    std::initializer_list<SetColumn> sets,
     std::string_view returning_columns)
 {
     std::string sql;
@@ -71,15 +115,7 @@ inline std::string buildUpdateReturning(
     sql += "UPDATE ";
     sql += table_name;
     sql += " SET ";
-    size_t param = 1;
-    bool first = true;
-    for (auto col : columns) {
-        if (!first) sql += ',';
-        first = false;
-        sql += col;
-        sql += "=$";
-        sql += std::to_string(param++);
-    }
+    size_t param = appendSetClause(sql, sets);
     sql += " WHERE \"";
     sql += pk_column;
     sql += "\"=$";
@@ -94,7 +130,7 @@ template<size_t N>
 inline std::string buildUpdateReturning(
     std::string_view table_name,
     const std::array<const char*, N>& pk_columns,
-    std::initializer_list<std::string_view> columns,
+    std::initializer_list<SetColumn> sets,
     std::string_view returning_columns)
 {
     std::string sql;
@@ -102,15 +138,7 @@ inline std::string buildUpdateReturning(
     sql += "UPDATE ";
     sql += table_name;
     sql += " SET ";
-    size_t param = 1;
-    bool first = true;
-    for (auto col : columns) {
-        if (!first) sql += ',';
-        first = false;
-        sql += col;
-        sql += "=$";
-        sql += std::to_string(param++);
-    }
+    size_t param = appendSetClause(sql, sets);
     sql += " WHERE ";
     for (size_t i = 0; i < N; ++i) {
         if (i > 0) sql += " AND ";
@@ -661,27 +689,37 @@ protected:
         requires HasFieldUpdate<E> && (!Cfg.read_only)
     {
         static_assert(sizeof...(Updates) > 0, "patch requires at least one field update");
+        using Traits = typename E::TraitsType;
+        // A relative update re-applies on every execution: two identical ones
+        // must both run, so the write opts out of coalescing.
+        constexpr auto mode =
+            (entity::is_relative_update_v<Updates> || ...)
+                ? io::batch::WriteMode::Exclusive
+                : io::batch::WriteMode::Idempotent;
         try {
             static const auto sql = []{
                 if constexpr (is_tuple_v<Key>) {
                     return detail::buildUpdateReturning(
                         Mapping::table_name,
                         Mapping::primary_key_columns,
-                        {entity::fieldColumnName<typename E::TraitsType>(Updates{})...},
+                        {detail::SetColumn(
+                            entity::fieldColumnName<Traits>(std::remove_cvref_t<Updates>{}),
+                            entity::set_op_v<std::remove_cvref_t<Updates>>)...},
                         Mapping::SQL::returning_columns);
                 } else {
                     return detail::buildUpdateReturning(
                         Mapping::table_name,
                         Mapping::primary_key_column,
-                        {entity::fieldColumnName<typename E::TraitsType>(Updates{})...},
+                        {detail::SetColumn(
+                            entity::fieldColumnName<Traits>(std::remove_cvref_t<Updates>{}),
+                            entity::set_op_v<std::remove_cvref_t<Updates>>)...},
                         Mapping::SQL::returning_columns);
                 }
             }();
 
             io::PgParams params;
             auto fieldParams = io::PgParams::make(
-                entity::fieldValue<typename E::TraitsType>(
-                    std::forward<Updates>(updates))...);
+                entity::fieldValue<Traits>(std::forward<Updates>(updates))...);
             auto keyParams = io::PgParams::fromKey(id);
             params.params.reserve(fieldParams.params.size() + keyParams.params.size());
             for (auto& p : fieldParams.params)
@@ -690,9 +728,10 @@ protected:
                 params.params.push_back(std::move(p));
 
             // Write path (seq-ordered): keeps patch in seq with update/erase of
-            // the same PK. coalesced ignored — an identical patch is idempotent
-            // (absolute SET), so a coalesced follower observes the same row.
-            auto w = co_await PgProvider::queryWrite(sql.c_str(), params);
+            // the same PK. An absolute patch is idempotent, so a coalesced
+            // follower observes the same row; a relative one is Exclusive and
+            // always runs on its own.
+            auto w = co_await PgProvider::queryWrite(sql.c_str(), params, mode);
             if (w.result.empty()) co_return std::nullopt;
             co_return E::fromRow(w.result[0]);
         } catch (const io::PgUncertainError&) {
