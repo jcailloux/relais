@@ -389,27 +389,46 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
         /// strictly-after stale entry would survive past a detached UNLINK).
         template<bool WithLists = true>
         static io::Task<void> invalidateManyCritical(std::span<const E> entities) {
+            std::vector<Key> ids;
+            ids.reserve(entities.size());
+            for (const auto& e : entities) ids.push_back(e.key());
+            co_await evictManyL2(std::span<const Key>(ids));
+            co_await Base::template invalidateManyCritical<WithLists>(entities);
+        }
+
+        /// Rows changed in place: the same batch eviction. A field update never
+        /// touches the primary key, so each row keeps its key.
+        static io::Task<void> invalidateManyUpdatedCritical(std::span<const Change<E>> changes) {
+            std::vector<Key> ids;
+            ids.reserve(changes.size());
+            for (const auto& c : changes) ids.push_back(c.after.key());
+            co_await evictManyL2(std::span<const Key>(ids));
+            co_await Base::invalidateManyUpdatedCritical(changes);
+        }
+
+        static io::Task<void> invalidateManyUpdatedDeferred(std::span<const Change<E>> changes) {
+            co_await Base::invalidateManyUpdatedDeferred(changes);
+        }
+
+        /// One variadic UNLINK batch for `ids`, their generations bumped first:
+        /// the same ordering invariant as the mono path (a straddling fill must
+        /// see the moved gen). Multi-instance: one EVAL of HINCRBYs; single-
+        /// instance L2-only: the process-local array.
+        static io::Task<void> evictManyL2(std::span<const Key> ids) {
             std::vector<std::string> keys;
-            keys.reserve(entities.size());
-            for (const auto& e : entities) {
-                keys.push_back(makeRedisKey(e.key()));
-            }
-            // Bump the whole affected set's generations BEFORE the UNLINK batch,
-            // same ordering invariant as the mono path (a straddling fill must
-            // see the moved gen). Multi-instance: one EVAL of HINCRBYs; single-
-            // instance L2-only: the process-local array.
+            keys.reserve(ids.size());
+            for (const auto& id : ids) keys.push_back(makeRedisKey(id));
             if constexpr (Cfg.l2_shared_across_instances) {
                 std::vector<std::size_t> slots;
-                slots.reserve(entities.size());
-                for (const auto& e : entities) slots.push_back(Recheck::slotOf(e.key()));
+                slots.reserve(ids.size());
+                for (const auto& id : ids) slots.push_back(Recheck::slotOf(id));
                 co_await cache::RedisCache::bumpGenMany(
                     genHashKey(), std::span<const std::size_t>(slots));
             } else if constexpr (Cfg.cache_level == config::CacheLevel::L2) {
-                for (const auto& e : entities) Recheck::bump(e.key());
+                for (const auto& id : ids) Recheck::bump(id);
             }
             co_await cache::RedisCache::invalidateMany(
                 std::span<const std::string>(keys));
-            co_await Base::template invalidateManyCritical<WithLists>(entities);
         }
 
         /// L2 entity tier has no deferred work — the UNLINK is critical. Pass the

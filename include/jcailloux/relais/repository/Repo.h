@@ -426,6 +426,53 @@ public:
         fireInvalidateManyDeferred<false>(std::move(*entities));
     }
 
+    // =======================================================================
+    // Predicate conditional update (typed guards)
+    // =======================================================================
+
+    /// Apply `updates` to every row matching `pred`, evaluated by the database
+    /// at write time in one statement (rows locked by a concurrent writer are
+    /// waited on, then re-checked). Returns, per `O.returns`, the number of rows
+    /// changed, each committed row, or each row before and after the write;
+    /// nullopt on a DB error. The changed rows are known only after the write:
+    /// the entity tier and the L1 list pages are evicted before returning, the
+    /// L2 list pages and cross-targets right after, detached.
+    template<WhereOptions O = {}, typename... Gs, typename... Updates>
+    static io::Task<ResultFor<E, O.returns>> patchWhere(
+        const entity::Guards<Gs...>& pred, Updates&&... updates)
+        requires HasFieldUpdate<E> && (!Cfg.read_only)
+    {
+        constexpr Returns kReturns = O.returns;
+        std::optional<std::vector<Change<E>>> changes;
+        try {
+            changes = co_await Base::patchWhereRaw(pred, std::forward<Updates>(updates)...);
+        } catch (const io::PgUncertainError&) {
+            // The changed rows are unknowable after a lost ACK, and the
+            // predicate may still match them: nothing to invalidate by.
+            RELAIS_LOG_ERROR << name()
+                << ": patchWhere timeout — changed rows unknowable, entity and "
+                   "list tiers left to l*_ttl";
+            throw;
+        }
+        if (!changes) co_return std::nullopt;  // DB error
+
+        co_await Base::invalidateManyUpdatedCritical(std::span<const Change<E>>(*changes));
+
+        ResultFor<E, kReturns> result;
+        if constexpr (kReturns == Returns::Count) {
+            result = changes->size();
+        } else if constexpr (kReturns == Returns::After) {
+            std::vector<E> after;
+            after.reserve(changes->size());
+            for (const auto& c : *changes) after.push_back(c.after);
+            result = std::move(after);
+        } else {
+            result = *changes;
+        }
+        fireInvalidateManyUpdatedDeferred(std::move(*changes));
+        co_return result;
+    }
+
 private:
     // ----------------------------------------------------------------------
     // Fire-and-forget deferred cleanup (commit 13). The detached coroutine owns
@@ -441,6 +488,13 @@ private:
         try {
             co_await Base::template invalidateManyDeferred<WithLists>(
                 std::span<const E>(entities));
+        } catch (...) {}
+    }
+
+    static io::DetachedTask fireInvalidateManyUpdatedDeferred(std::vector<Change<E>> changes) {
+        try {
+            co_await Base::invalidateManyUpdatedDeferred(
+                std::span<const Change<E>>(changes));
         } catch (...) {}
     }
 

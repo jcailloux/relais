@@ -28,6 +28,15 @@
  *
  *   J. patchIf — SQL shape, every cache preset, identical guarded writes never
  *      coalesced, list pages and cross-invalidation touched on commit only.
+ *
+ * Predicate update: patchWhere<{.returns}>(when(...), updates...) changes every
+ * row matching the predicate in one statement and returns the count, the
+ * committed rows, or each row before and after. The changed rows are known
+ * only after the write, so every tier is invalidated from them.
+ *
+ *   K. patchWhere — SQL shape, the three return forms on every cache preset,
+ *      the predicate re-checked under contention, composite key, list pages of
+ *      the old and the new group, cross-invalidation of both targets.
  */
 
 #include <catch2/catch_test_macros.hpp>
@@ -944,10 +953,10 @@ size_t groupSize(int64_t group) {
     return sync(List::query(groupPage<List>(group)))->size();
 }
 
-int64_t insertGroupedSlot(int64_t group) {
+int64_t insertGroupedSlot(int64_t group, int32_t priority = 0) {
     return execQueryArgs(
-        "INSERT INTO relais_test_slots (group_id) VALUES ($1) RETURNING id",
-        group)[0].get<int64_t>(0);
+        "INSERT INTO relais_test_slots (group_id, priority) VALUES ($1, $2) RETURNING id",
+        group, priority)[0].get<int64_t>(0);
 }
 
 }  // namespace
@@ -1022,6 +1031,291 @@ TEMPLATE_TEST_CASE("[patchIf] cross-invalidation on commit only",
         auto v = move(0);
         REQUIRE(v);
         REQUIRE(*v);
+        CHECK_FALSE(TestInternals::getFromCache<Target>(int64_t{5000}));
+        CHECK_FALSE(TestInternals::getFromCache<Target>(int64_t{6000}));
+    }
+}
+
+// #############################################################################
+//
+//  K. Predicate update (patchWhere)
+//
+// #############################################################################
+
+TEST_CASE("[patchWhere] SQL: locking CTE, qualified SET, before and after returned",
+          "[patchWhere][sql]")
+{
+    namespace d = jr::detail;
+
+    SECTION("single key: SET values first, then the predicate") {
+        using P = decltype(when(eq<SlotF::group_id>(int64_t{1}), lt<SlotF::expires_at>(dbNow)));
+        auto sql = d::buildPatchWhereSql<SlotTraits, P>(
+            SlotMapping::table_name, SlotMapping::primary_key_column,
+            {d::SetColumn(std::string_view("\"holder\"")),
+             d::SetColumn(std::string_view("\"counter\""), jr::entity::SetOp::Add)},
+            "id, holder, counter");
+        REQUIRE(sql ==
+            "WITH o AS (SELECT id, holder, counter FROM relais_test_slots "
+            "WHERE \"group_id\"=$3 AND \"expires_at\"<now() FOR UPDATE) "
+            "UPDATE relais_test_slots AS t SET \"holder\"=$1,\"counter\"=t.\"counter\"+$2 "
+            "FROM o WHERE t.\"id\"=o.\"id\" "
+            "RETURNING o.id,o.holder,o.counter,t.id,t.holder,t.counter");
+        STATIC_REQUIRE(d::countColumns("id, holder, counter") == 3);
+    }
+
+    SECTION("composite key: the join covers every key column") {
+        using TallyTraits = TestSlotTallyEntity::TraitsType;
+        using TallyMapping = entity::generated::TestSlotTallyMapping;
+        using P = decltype(when(lt<TallyF::hits>(int64_t{3})));
+        auto sql = d::buildPatchWhereSql<TallyTraits, P>(
+            TallyMapping::table_name, TallyMapping::primary_key_columns,
+            {d::SetColumn(std::string_view("\"hits\""), jr::entity::SetOp::Add)},
+            TallyMapping::SQL::returning_columns);
+        REQUIRE(sql ==
+            "WITH o AS (SELECT group_id, bucket, hits FROM relais_test_slot_tallies "
+            "WHERE \"hits\"<$2 FOR UPDATE) "
+            "UPDATE relais_test_slot_tallies AS t SET \"hits\"=t.\"hits\"+$1 "
+            "FROM o WHERE t.\"group_id\"=o.\"group_id\" AND t.\"bucket\"=o.\"bucket\" "
+            "RETURNING o.group_id,o.bucket,o.hits,t.group_id,t.bucket,t.hits");
+    }
+}
+
+namespace {
+
+constexpr jr::WhereOptions kAfter{.returns = jr::Returns::After};
+constexpr jr::WhereOptions kChanges{.returns = jr::Returns::Changes};
+
+template<typename T, typename Proj>
+void sortBy(std::vector<T>& v, Proj proj) {
+    std::sort(v.begin(), v.end(), [&](const T& a, const T& b) { return proj(a) < proj(b); });
+}
+
+}  // namespace
+
+TEMPLATE_TEST_CASE("[patchWhere] count, committed rows, before and after",
+                   "[patchWhere][integration]",
+                   UncachedTestSlotRepo, L1TestSlotRepo, L2TestSlotRepo,
+                   FullCacheTestSlotRepo)
+{
+    using Repo = TestType;
+    TransactionGuard guard;
+    auto a = insertGroupedSlot(1);
+    auto b = insertGroupedSlot(1);
+    auto other = insertGroupedSlot(2);
+    for (auto id : {a, b, other}) REQUIRE(sync(Repo::find(id)));  // warm
+
+    auto inGroup1 = when(eq<SlotF::group_id>(int64_t{1}));
+
+    SECTION("Count: the number of rows changed, and every tier sees the change") {
+        auto n = sync(Repo::patchWhere(inGroup1, increment<SlotF::counter>(3)));
+        REQUIRE(n == std::optional<size_t>{2});
+        CHECK(dbCounter(a) == 3);
+        CHECK(dbCounter(b) == 3);
+        CHECK(dbCounter(other) == 0);
+        CHECK(sync(Repo::find(a))->counter == 3);
+        CHECK(sync(Repo::find(b))->counter == 3);
+        CHECK(sync(Repo::find(other))->counter == 0);
+    }
+
+    SECTION("After: each committed row") {
+        auto rows = sync(Repo::template patchWhere<kAfter>(inGroup1,
+            set<SlotF::holder>(int64_t{42}), increment<SlotF::version>(1)));
+        REQUIRE(rows);
+        REQUIRE(rows->size() == 2);
+        sortBy(*rows, [](const auto& e) { return e.id; });
+        CHECK((*rows)[0].id == a);
+        CHECK((*rows)[1].id == b);
+        for (const auto& e : *rows) {
+            CHECK(e.holder == std::optional<int64_t>{42});
+            CHECK(e.version == 1);
+        }
+    }
+
+    SECTION("Changes: each row as locked, then as committed") {
+        execQueryArgs("UPDATE relais_test_slots SET holder = 7 WHERE id = $1", a);
+        auto changes = sync(Repo::template patchWhere<kChanges>(inGroup1,
+            set<SlotF::holder>(int64_t{42}), increment<SlotF::counter>(1)));
+        REQUIRE(changes);
+        REQUIRE(changes->size() == 2);
+        sortBy(*changes, [](const auto& c) { return c.before.id; });
+        CHECK((*changes)[0].before.holder == std::optional<int64_t>{7});
+        CHECK_FALSE((*changes)[1].before.holder);
+        for (const auto& c : *changes) {
+            CHECK(c.after.id == c.before.id);
+            CHECK(c.before.counter == 0);
+            CHECK(c.after.counter == 1);
+            CHECK(c.after.holder == std::optional<int64_t>{42});
+        }
+    }
+
+    SECTION("no row matches: zero, an empty vector, nothing written") {
+        auto none = when(eq<SlotF::group_id>(int64_t{3}));
+        CHECK(sync(Repo::patchWhere(none, increment<SlotF::counter>(1)))
+              == std::optional<size_t>{0});
+        auto rows = sync(Repo::template patchWhere<kAfter>(none, increment<SlotF::counter>(1)));
+        REQUIRE(rows);
+        CHECK(rows->empty());
+        CHECK(dbCounter(a) == 0);
+    }
+
+    SECTION("DB error: nullopt, and the statement changed no row") {
+        execQueryArgs("UPDATE relais_test_slots SET counter = 2147483000 WHERE id = $1", b);
+        auto n = sync(Repo::patchWhere(inGroup1, increment<SlotF::counter>(1'000)));
+        CHECK_FALSE(n);
+        CHECK(dbCounter(a) == 0);
+        CHECK(dbCounter(b) == 2'147'483'000);
+        CHECK(sync(Repo::find(a))->counter == 0);
+    }
+}
+
+TEMPLATE_TEST_CASE("[patchWhere] expired holds released by the database clock",
+                   "[patchWhere][integration]",
+                   UncachedTestSlotRepo, FullCacheTestSlotRepo)
+{
+    using Repo = TestType;
+    TransactionGuard guard;
+    auto s = insertSlotSet();
+    REQUIRE(sync(Repo::find(s.b))->state == SlotState::Held);  // warm
+
+    auto released = sync(Repo::template patchWhere<kAfter>(
+        when(eq<SlotF::state>(SlotState::Held), lt<SlotF::expires_at>(dbNow)),
+        set<SlotF::state>(SlotState::Free)));
+    REQUIRE(released);
+    REQUIRE(released->size() == 1);
+    CHECK(released->front().id == s.b);
+    CHECK(sync(Repo::find(s.b))->state == SlotState::Free);
+    CHECK(sync(Repo::find(s.c))->state == SlotState::Held);   // not expired yet
+}
+
+TEMPLATE_TEST_CASE("[patchWhere] concurrent identical writes change each row once",
+                   "[patchWhere][integration][concurrency]",
+                   UncachedTestSlotRepo, FullCacheTestSlotRepo)
+{
+    using Repo = TestType;
+    TransactionGuard guard;
+    std::vector<int64_t> ids;
+    for (int i = 0; i < 3; ++i) ids.push_back(insertGroupedSlot(9));
+    constexpr int N = 16;
+
+    // Same SQL, same params: each statement waits on the rows another locked,
+    // re-checks the predicate, and skips the rows already moved to version 1.
+    auto counts = sync([]() -> io::Task<std::vector<long>> {
+        std::vector<long> out(N, -1);
+        std::vector<io::Task<void>> tasks;
+        tasks.reserve(N);
+        for (int i = 0; i < N; ++i) {
+            tasks.push_back([](long& slot) -> io::Task<void> {
+                auto n = co_await Repo::patchWhere(
+                    when(eq<SlotF::group_id>(int64_t{9}), eq<SlotF::version>(int64_t{0})),
+                    increment<SlotF::version>(1));
+                slot = n ? static_cast<long>(*n) : -1;
+            }(out[i]));
+        }
+        co_await io::whenAll(std::move(tasks));
+        co_return out;
+    }());
+
+    CHECK(std::count(counts.begin(), counts.end(), -1) == 0);
+    long total = 0;
+    for (auto c : counts) total += c;
+    CHECK(total == 3);
+    for (auto id : ids) CHECK(dbVersion(id) == 1);
+}
+
+TEMPLATE_TEST_CASE("[patchWhere] composite key", "[patchWhere][integration]",
+                   UncachedTestSlotTallyRepo, FullCacheTestSlotTallyRepo)
+{
+    using Repo = TestType;
+    TransactionGuard guard;
+    execQuery("INSERT INTO relais_test_slot_tallies (group_id, bucket, hits) VALUES "
+              "(1, 1, 1), (1, 2, 3), (1, 3, 0), (2, 1, 0)");
+    auto k2 = std::tuple{int64_t{1}, int64_t{3}};
+    REQUIRE(sync(Repo::find(k2))->hits == 0);  // warm
+
+    // A capped counter: every bucket below the cap moves up by one.
+    auto changes = sync(Repo::template patchWhere<kChanges>(
+        when(lt<TallyF::hits>(int64_t{3})), increment<TallyF::hits>(1)));
+    REQUIRE(changes);
+    REQUIRE(changes->size() == 3);
+    sortBy(*changes, [](const auto& c) { return c.before.key(); });
+    CHECK((*changes)[0].before.key() == std::tuple{int64_t{1}, int64_t{1}});
+    CHECK((*changes)[0].after.hits == 2);
+    CHECK((*changes)[1].before.key() == k2);
+    CHECK((*changes)[1].before.hits == 0);
+    CHECK((*changes)[1].after.hits == 1);
+    CHECK((*changes)[2].after.key() == std::tuple{int64_t{2}, int64_t{1}});
+    CHECK(sync(Repo::find(k2))->hits == 1);
+
+    auto r = execQuery("SELECT hits FROM relais_test_slot_tallies ORDER BY group_id, bucket");
+    CHECK(r[1].get<int64_t>(0) == 3);  // at the cap: not matched
+}
+
+TEMPLATE_TEST_CASE("[patchWhere] a row changing group moves between list pages",
+                   "[patchWhere][integration][list]",
+                   L1TestSlotListRepo, FullCacheTestSlotListRepo, InvalidatingTestSlotListRepo)
+{
+    using List = TestType;
+    using ListF = TestSlotListEntity::Field;
+    TransactionGuard guard;
+    TestInternals::resetEntityCacheState<List>();
+    TestInternals::resetListCacheState<List>();
+
+    insertGroupedSlot(100, 7);             // the row the predicate selects
+    insertGroupedSlot(200);
+    REQUIRE(groupSize<List>(100) == 1);   // cache page group=100
+    REQUIRE(groupSize<List>(200) == 1);   // cache page group=200
+
+    // Bypass relais: a row joins group 100 behind the cached page. Only an
+    // invalidation of that page can reveal it.
+    insertGroupedSlot(100);
+
+    SECTION("no row matches: the pages are not invalidated") {
+        auto n = sync(List::patchWhere(
+            when(eq<ListF::priority>(7), eq<ListF::version>(int64_t{1})),
+            set<ListF::group_id>(int64_t{200})));
+        REQUIRE(n == std::optional<size_t>{0});
+        CHECK(groupSize<List>(100) == 1);   // still the cached page
+        CHECK(groupSize<List>(200) == 1);
+    }
+
+    SECTION("changed: the old and the new group are both invalidated") {
+        auto n = sync(List::patchWhere(when(eq<ListF::priority>(7)),
+            set<ListF::group_id>(int64_t{200})));
+        REQUIRE(n == std::optional<size_t>{1});
+        CHECK(groupSize<List>(100) == 1);   // re-fetched: the bypass row, not ours
+        CHECK(groupSize<List>(200) == 2);
+    }
+}
+
+TEMPLATE_TEST_CASE("[patchWhere] cross-invalidation of the old and the new target",
+                   "[patchWhere][integration][cross-invalidation]",
+                   InvalidatingTestSlotRepo, InvalidatingTestSlotListRepo)
+{
+    using Src = TestType;
+    using SrcF = typename Src::EntityType::Field;
+    using Target = L1SlotInvTargetRepo;
+    TransactionGuard guard;
+    TestInternals::resetEntityCacheState<Src>();
+    TestInternals::resetEntityCacheState<Target>();
+
+    insertGroupedSlot(5000, 7);
+    TestInternals::putInCache<Target>(int64_t{5000}, makeTestItem("old", 0, "", true, 5000));
+    TestInternals::putInCache<Target>(int64_t{6000}, makeTestItem("new", 0, "", true, 6000));
+
+    auto move = [&](int64_t expected_version) {
+        return sync(Src::patchWhere(
+            when(eq<SrcF::priority>(7), eq<SrcF::version>(expected_version)),
+            set<SrcF::group_id>(int64_t{6000})));
+    };
+
+    SECTION("no row matches: both targets stay cached") {
+        REQUIRE(move(1) == std::optional<size_t>{0});
+        CHECK(TestInternals::getFromCache<Target>(int64_t{5000}));
+        CHECK(TestInternals::getFromCache<Target>(int64_t{6000}));
+    }
+
+    SECTION("changed: the old and the new target drop") {
+        REQUIRE(move(0) == std::optional<size_t>{1});
         CHECK_FALSE(TestInternals::getFromCache<Target>(int64_t{5000}));
         CHECK_FALSE(TestInternals::getFromCache<Target>(int64_t{6000}));
     }

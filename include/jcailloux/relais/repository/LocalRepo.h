@@ -343,6 +343,17 @@ public:
         for (const auto& e : entities) evict(e.key());
     }
 
+    /// Rows changed in place: L2 first, then the L1 point-evicts (same ordering
+    /// invariant). No store-through: the eviction suffices.
+    static io::Task<void> invalidateManyUpdatedCritical(std::span<const Change<E>> changes) {
+        co_await Base::invalidateManyUpdatedCritical(changes);
+        for (const auto& c : changes) evict(c.after.key());
+    }
+
+    static io::Task<void> invalidateManyUpdatedDeferred(std::span<const Change<E>> changes) {
+        co_await Base::invalidateManyUpdatedDeferred(changes);
+    }
+
     /// L1 entity tier has no deferred work — the point-evict is critical RAM.
     /// Pass the deferred cascade down to the own-list / cross-target tiers.
     template<bool WithLists = true>
