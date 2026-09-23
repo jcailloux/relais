@@ -99,13 +99,17 @@ public:
     /// returned PgResult carries RETURNING rows; affectedRows() gives the count.
     /// coalesced=true means an identical write was already batched and this
     /// caller received the leader's result without a DB round-trip.
+    /// `mode` declares whether the write may be coalesced at all: pass
+    /// WriteMode::Exclusive for any write that is not idempotent (relative SET,
+    /// guarded write, claim, `now()`-dependent value).
     /// Sole write entry point — read counts/rows from the returned PgResult.
     /// @note sql and params must remain valid until the co_await completes.
     static io::Task<io::batch::PgWriteResult> queryWrite(
-        const char* sql, const io::PgParams& params)
+        const char* sql, const io::PgParams& params,
+        const io::batch::WriteMode mode = io::batch::WriteMode::Idempotent)
     {
         if (!pg_write_) throw std::logic_error("PgProvider::queryWrite() called before init() on this thread (providers are thread_local — init() must run on each loop thread)");
-        return pg_write_(sql, params);
+        return pg_write_(sql, params, mode);
     }
 
     /// Execute a parameterized SQL query with inline args.
@@ -271,8 +275,9 @@ public:
         };
         // Return-direct: submitPgWrite already returns Task<io::batch::PgWriteResult>,
         // so no co_await/co_return wrapper — zero added coroutine frame on the write path.
-        pg_write_ = [batcher](const char* sql, const io::PgParams& params) {
-            return batcher->submitPgWrite(sql, io::PgParams{params});
+        pg_write_ = [batcher](const char* sql, const io::PgParams& params,
+                              io::batch::WriteMode mode) {
+            return batcher->submitPgWrite(sql, io::PgParams{params}, mode);
         };
 
         if (with_redis) {
@@ -319,7 +324,7 @@ public:
     using PgEntityQueryManyFn = std::function<io::Task<io::PgResult>(
         const char*, const char*, std::vector<io::PgParams>)>;
     using PgWriteFn = std::function<io::Task<io::batch::PgWriteResult>(
-        const char*, const io::PgParams&)>;
+        const char*, const io::PgParams&, io::batch::WriteMode)>;
     using RedisExecFn = std::function<io::Task<io::RedisResult>(
         int, const char**, const size_t*)>;
     using SelfHealEnqueueFn = std::function<void(

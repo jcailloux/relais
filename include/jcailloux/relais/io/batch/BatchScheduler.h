@@ -55,6 +55,18 @@ struct PgWriteResult {
     bool coalesced = false;
 };
 
+/// Whether a PG write may be coalesced with an identical write (same SQL +
+/// same params) already pending in the batch.
+/// - Idempotent: applying the write once or N times yields the same final
+///   state and the same result (absolute `col=$n` SET, DELETE by key), so N-1
+///   identical writes can be dropped and their callers handed the leader's
+///   result.
+/// - Exclusive: the write must run once per caller — relative SET
+///   (`col=col+$n`), guarded write whose second execution would affect 0 rows,
+///   row claim, `now()`-dependent value. Still batched and pipelined in `seq`
+///   order; only the fusion is disabled.
+enum class WriteMode : uint8_t { Idempotent, Exclusive };
+
 template<IoContext Io>
 class BatchScheduler : public std::enable_shared_from_this<BatchScheduler<Io>> {
     using Clock = std::chrono::steady_clock;
@@ -138,7 +150,8 @@ public:
     /// Submit a PG write (INSERT/UPDATE/DELETE RETURNING).
     /// Returns {PgResult, coalesced}. coalesced=true means an identical
     /// write (same SQL + same params) was already in the batch and this
-    /// caller received the leader's result without a DB round-trip.
+    /// caller received the leader's result without a DB round-trip. Only
+    /// WriteMode::Idempotent writes coalesce, and only onto an Idempotent leader.
     ///
     /// Ordering: each write takes a monotonic `seq` here, at submit time, and a
     /// batch fires its writes in `seq` order (firePgWriteBatch's sort). So two
@@ -147,11 +160,13 @@ public:
     /// BETWEEN batches is the caller's responsibility, carried by `co_await`
     /// (read-your-writes intra-flow). The scheduler does NOT track write
     /// dependencies across concurrent coroutines. See docs/runtime.md.
-    Task<WriteResult> submitPgWrite(const char* sql, PgParams params) {
+    Task<WriteResult> submitPgWrite(const char* sql, PgParams params,
+                                    WriteMode mode = WriteMode::Idempotent) {
         PgWriteEntry entry;
         entry.sql = sql;
         entry.params = std::move(params);
         entry.seq = next_write_seq_++;
+        entry.coalescable = mode == WriteMode::Idempotent;
 
         co_return co_await submitPgWriteEntry(std::move(entry));
     }
@@ -280,6 +295,7 @@ private:
         std::coroutine_handle<> continuation{};
         PgResult result;
         int64_t processing_time_us = 0;
+        bool coalescable = true;   // WriteMode::Idempotent
         bool coalesced = false;
         std::vector<PgWriteEntry*> followers;
 
@@ -627,17 +643,21 @@ private:
         // is already in the batch, attach as follower instead of adding
         // a new entry. The follower will receive the leader's result.
         //
-        // Coalescing is sound ONLY for idempotent (absolute-SET) writes:
-        // dropping N-1 identical writes is equivalent to keeping one iff the
-        // write yields the same final state applied once or N times. The entity
-        // generator guarantees this — it only emits absolute `col=$n` SETs,
-        // never self-referential `col=col+$n`. Locked by test_relais_gen_sql
-        // ("no self-referential SET"). Do not coalesce relative writes here.
-        for (auto* existing : pg_write_batch_.entries) {
-            if (existing->sql == entry->sql && existing->params == entry->params) {
-                entry->coalesced = true;
-                existing->followers.push_back(entry);
-                return;
+        // Coalescing is sound ONLY for idempotent writes: dropping N-1
+        // identical writes is equivalent to keeping one iff the write yields
+        // the same final state and the same result applied once or N times.
+        // The submitter declares it per write (WriteMode): a non-coalescable
+        // entry neither joins a leader nor serves as one, so an Exclusive
+        // write always executes exactly once for its own caller.
+        if (entry->coalescable) {
+            for (auto* existing : pg_write_batch_.entries) {
+                if (existing->coalescable && existing->sql == entry->sql
+                    && existing->params == entry->params)
+                {
+                    entry->coalesced = true;
+                    existing->followers.push_back(entry);
+                    return;
+                }
             }
         }
 

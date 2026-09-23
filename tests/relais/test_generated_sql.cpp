@@ -209,11 +209,12 @@ TEST_CASE("delete_where - ctid-bounded form", "[generator][sql][batch][where]") 
 // #############################################################################
 //
 // Le write-coalescing du BatchScheduler (addToPgWriteBatch) déduplique les
-// écritures sur (sql ptr ==, params ==) et ne conserve qu'un PgWriteEntry. Cette
-// fusion n'est CORRECTE que si chaque écriture est idempotente : un SET absolu
-// (col=$n) appliqué N fois == appliqué 1 fois. Un SET relatif (col=col+$n)
-// casserait l'équivalence. Garde porteuse : le générateur ne doit JAMAIS émettre
-// d'auto-référence dans un SET/VALUES.
+// écritures WriteMode::Idempotent sur (sql ptr ==, params ==) et ne conserve
+// qu'un PgWriteEntry. Cette fusion n'est CORRECTE que si chaque écriture est
+// idempotente : un SET absolu (col=$n) appliqué N fois == appliqué 1 fois. Un
+// SET relatif (col=col+$n) casserait l'équivalence et doit passer en
+// WriteMode::Exclusive. Les SQL générés partent en Idempotent : le générateur ne
+// doit donc JAMAIS y émettre d'auto-référence dans un SET/VALUES.
 TEST_CASE("generated writes are idempotent - no self-referential SET",
           "[generator][sql][coalescing]") {
     // `col = col + ...` / `col = col - ...` : un membre droit qui référence une

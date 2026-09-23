@@ -878,7 +878,7 @@ static void runAll(Io& io, Drive drive);   // testing/IoContextConformance.h
 | `query(const char* sql)` | `Task<PgResult>` | Parameterless query. `sql` must outlive the `co_await`. |
 | `queryParams(const char* sql, const PgParams& params)` | `Task<PgResult>` | Parameterized; `sql` + `params` must outlive the `co_await`. |
 | `template<typename... Args> queryArgs(const char* sql, Args&&...)` | `Task<PgResult>` | Builds a `PgParams` kept in the coroutine frame; forwards to `queryParams`. |
-| `queryWrite(const char* sql, const PgParams&)` | `Task<batch::PgWriteResult>` | Sole write entry point (seq-ordered write batch). Result carries RETURNING rows + `affectedRows()`; `coalesced=true` ⇒ an identical write was already batched, no DB round-trip. |
+| `queryWrite(const char* sql, const PgParams&, batch::WriteMode mode = Idempotent)` | `Task<batch::PgWriteResult>` | Sole write entry point (seq-ordered write batch). Result carries RETURNING rows + `affectedRows()`; `coalesced=true` ⇒ an identical `Idempotent` write was already batched, no DB round-trip. `WriteMode::Exclusive` (relative SET, guarded write, claim, `now()`-dependent value) is never coalesced: it runs once per caller, still batched. |
 | `template<typename... Args> redis(Args&&...)` | `Task<RedisResult>` | Variadic Redis command; args stringified, binary-safe. |
 | `redisDynamic(std::vector<std::string> args)` | `Task<RedisResult>` | Runtime-sized argv (verb first), e.g. MGET over N keys. |
 | `hasRedis()` / `initialized()` | `bool` (noexcept) | Whether Redis is configured / providers bound on this thread. |
