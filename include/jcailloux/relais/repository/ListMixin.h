@@ -443,6 +443,17 @@ public:
             std::forward<Updates>(updates)...);
     }
 
+    /// Guarded partial update and invalidate list caches (only if committed).
+    template<typename... Gs, typename... Updates>
+    static io::Task<std::optional<cache::CacheView<Entity>>> patchIf(
+        const Key& id, const entity::Guards<Gs...>& guard, Updates&&... updates)
+        requires HasFieldUpdate<Entity> && (!Base::config.read_only)
+    {
+        std::optional<Entity> old = co_await findOldBestEffort(id);
+        co_return co_await patchIfWithContext(id, old ? &*old : nullptr, guard,
+            std::forward<Updates>(updates)...);
+    }
+
     // =========================================================================
     // Warmup — primes entity and list L1 caches
     // =========================================================================
@@ -741,6 +752,52 @@ protected:
             if constexpr (kHasL2) {
                 co_await invalidateL2Updated(
                     old_entity ? *old_entity : *result, *result);
+            }
+        }
+        co_return result;
+    }
+
+    template<typename... Gs, typename... Updates>
+    static io::Task<std::optional<cache::CacheView<Entity>>> patchIfWithContext(
+        const Key& id, const Entity* old_entity,
+        const entity::Guards<Gs...>& guard, Updates&&... updates)
+        requires HasFieldUpdate<Entity> && (!Base::config.read_only)
+    {
+        std::optional<cache::CacheView<Entity>> result;
+        std::exception_ptr timeout;
+        try {
+            result = co_await Base::patchIf(id, guard, std::forward<Updates>(updates)...);
+        } catch (const io::PgUncertainError&) {
+            timeout = std::current_exception();
+        }
+        if (timeout) {
+            // Uncertain: same precautionary invalidation as patch, keyed on old.
+            if (old_entity) {
+                if constexpr (kHasL1) { listCache().onEntityDeleted(*old_entity); }
+                if constexpr (kHasL2) {
+                    try {
+                        co_await invalidateL2Deleted(*old_entity);
+                    } catch (const std::exception& e) {
+                        RELAIS_LOG_ERROR << name()
+                            << ": L2 list precautionary invalidate failed (patchIf timeout) - "
+                            << e.what();
+                    }
+                }
+            }
+            std::rethrow_exception(timeout);
+        }
+        // A refused guard changed nothing: the pages stay valid.
+        if (result && *result) {
+            const Entity& updated = **result;
+            if constexpr (kHasL1) {
+                if (old_entity) {
+                    listCache().onEntityUpdated(*old_entity, updated);
+                } else {
+                    listCache().onEntityCreated(updated);
+                }
+            }
+            if constexpr (kHasL2) {
+                co_await invalidateL2Updated(old_entity ? *old_entity : updated, updated);
             }
         }
         co_return result;

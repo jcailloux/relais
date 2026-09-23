@@ -273,6 +273,52 @@ public:
         co_return result;
     }
 
+    /// Guarded partial update with cross-invalidation (only if committed).
+    template<typename... Gs, typename... Updates>
+    static io::Task<std::optional<cache::CacheView<Entity>>> patchIf(
+        const Key& id, const entity::Guards<Gs...>& guard, Updates&&... updates)
+        requires HasFieldUpdate<Entity> && (!Base::config.read_only)
+    {
+        std::optional<Entity> old = co_await findOldBestEffort(id);
+
+        std::optional<cache::CacheView<Entity>> result;
+        std::exception_ptr timeout;
+        try {
+            if constexpr (detail::HasListMixin<Base>) {
+                result = co_await Base::patchIfWithContext(
+                    id, old ? &*old : nullptr, guard, std::forward<Updates>(updates)...);
+            } else {
+                result = co_await Base::patchIf(id, guard, std::forward<Updates>(updates)...);
+            }
+        } catch (const io::PgUncertainError&) {
+            timeout = std::current_exception();
+        }
+        if (timeout) {
+            // Uncertain: same precautionary cross-invalidation as patch, keyed on old.
+            if (old) {
+                try {
+                    co_await propagateUpdate<Entity, InvList>(&*old, *old);
+                } catch (const std::exception& e) {
+                    RELAIS_LOG_ERROR << name()
+                        << ": cross-invalidation failed (patchIf timeout) - " << e.what();
+                }
+            }
+            std::rethrow_exception(timeout);
+        }
+        // A refused guard changed nothing: no target to invalidate.
+        if (result && *result) {
+            // Best-effort: a committed patch never fails on cross-invalidation.
+            try {
+                co_await propagateUpdate<Entity, InvList>(
+                    old ? &*old : nullptr, **result);
+            } catch (const std::exception& e) {
+                RELAIS_LOG_ERROR << name()
+                    << ": cross-invalidation failed (patchIf committed) - " << e.what();
+            }
+        }
+        co_return result;
+    }
+
     /// Invalidate all caches (L1 + L2) and propagate cross-invalidation.
     static io::Task<void> invalidate(const Key& id) {
         std::optional<Entity> old = co_await findOldBestEffort(id);

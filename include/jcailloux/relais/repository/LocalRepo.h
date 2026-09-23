@@ -278,6 +278,23 @@ public:
         co_return {};
     }
 
+    /// Guarded partial update: invalidates L1, delegates to Base::patchIfRaw,
+    /// then moves the committed row into cache. A refused guard leaves L1
+    /// evicted: the next read re-fetches.
+    template<typename... Gs, typename... Updates>
+    static io::Task<std::optional<cache::CacheView<E>>> patchIf(
+        const Key& id, const entity::Guards<Gs...>& guard, Updates&&... updates)
+        requires HasFieldUpdate<E> && (!Cfg.read_only)
+    {
+        tier().onMutation(id);
+        bumpGeneration(id);
+        tier().evict(id);
+        auto outcome = co_await Base::patchIfRaw(id, guard, std::forward<Updates>(updates)...);
+        if (outcome.error) co_return std::nullopt;
+        if (!outcome.entity) co_return cache::CacheView<E>{};
+        co_return storeAndView(id, std::move(*outcome.entity));
+    }
+
     /// Erase entity by ID.
     static io::Task<std::optional<size_t>> erase(const Key& id)
         requires (!Cfg.read_only)

@@ -21,6 +21,13 @@
  *   H. guards and orderings evaluated by PostgreSQL — NULL, empty sets, enums.
  *   I. row column offset — one result row carrying the old and the new version,
  *      each decoded by the generated fromRow.
+ *
+ * Guarded patch: patchIf(id, when(...), updates...) writes one row only if the
+ * guard holds in the database at write time. nullopt is a DB error; an empty
+ * view is a refusal (guard false or row absent) and changes nothing downstream.
+ *
+ *   J. patchIf — SQL shape, every cache preset, identical guarded writes never
+ *      coalesced, list pages and cross-invalidation touched on commit only.
  */
 
 #include <catch2/catch_test_macros.hpp>
@@ -34,12 +41,14 @@
 
 #include "fixtures/test_helper.h"
 #include "fixtures/TestRepositories.h"
+#include "fixtures/RelaisTestAccessors.h"
 #include "jcailloux/relais/io/WhenAll.h"
 
 using namespace relais_test;
 using namespace std::chrono_literals;
 
 namespace jr = jcailloux::relais;
+namespace rspec = jcailloux::relais::list::spec;
 using jr::entity::set;
 using jr::entity::increment;
 using jr::entity::decrement;
@@ -716,5 +725,304 @@ TEST_CASE("[row-offset] decode RETURNING o.*, t.* at both offsets", "[row-offset
         CHECK(row.shifted(width).get<int64_t>(0) == 42);       // t.holder
         CHECK(row.shifted(width - 3).get<int64_t>(0) == id);   // t.id
         CHECK(r[0].rawValue(0) == row.shifted(-3).rawValue(0));
+    }
+}
+
+// #############################################################################
+//
+//  J. Guarded patch (patchIf)
+//
+// #############################################################################
+
+TEST_CASE("[patchIf] SQL: SET values, then the key, then the guard", "[patchIf][sql]")
+{
+    namespace d = jr::detail;
+
+    SECTION("single key") {
+        using G = decltype(when(eq<SlotF::version>(int64_t{0}),
+            anyOf(isNull<SlotF::holder>(), lt<SlotF::expires_at>(dbNow))));
+        auto sql = d::buildGuardedUpdateReturning<SlotTraits, G>(
+            SlotMapping::table_name, SlotMapping::primary_key_column,
+            {d::SetColumn(std::string_view("\"holder\"")),
+             d::SetColumn(std::string_view("\"version\""), jr::entity::SetOp::Add)},
+            "id");
+        REQUIRE(sql ==
+            "UPDATE relais_test_slots SET \"holder\"=$1,\"version\"=\"version\"+$2 "
+            "WHERE \"id\"=$3 AND \"version\"=$4 AND (\"holder\" IS NULL OR \"expires_at\"<now()) "
+            "RETURNING id");
+    }
+
+    SECTION("composite key") {
+        using TallyTraits = TestSlotTallyEntity::TraitsType;
+        using TallyMapping = entity::generated::TestSlotTallyMapping;
+        using G = decltype(when(lt<TallyF::hits>(int64_t{0})));
+        auto sql = d::buildGuardedUpdateReturning<TallyTraits, G>(
+            TallyMapping::table_name, TallyMapping::primary_key_columns,
+            {d::SetColumn(std::string_view("\"hits\""), jr::entity::SetOp::Add)},
+            "hits");
+        REQUIRE(sql ==
+            "UPDATE relais_test_slot_tallies SET \"hits\"=\"hits\"+$1 "
+            "WHERE \"group_id\"=$2 AND \"bucket\"=$3 AND \"hits\"<$4 RETURNING hits");
+    }
+}
+
+TEMPLATE_TEST_CASE("[patchIf] success, refusal, absence and error",
+                   "[patchIf][integration]",
+                   UncachedTestSlotRepo, L1TestSlotRepo, L2TestSlotRepo,
+                   FullCacheTestSlotRepo)
+{
+    using Repo = TestType;
+    TransactionGuard guard;
+    auto id = insertSlot(5, 10);
+
+    SECTION("guard holds: the committed row is returned, cached and in the DB") {
+        auto v = sync(Repo::patchIf(id, when(eq<SlotF::version>(int64_t{10})),
+            set<SlotF::holder>(int64_t{42}), increment<SlotF::version>(1)));
+        REQUIRE(v);
+        REQUIRE(*v);
+        CHECK((*v)->holder == std::optional<int64_t>{42});
+        CHECK((*v)->version == 11);
+        CHECK(dbVersion(id) == 11);
+
+        auto after = sync(Repo::find(id));
+        REQUIRE(after);
+        CHECK(after->version == 11);
+        CHECK(after->holder == std::optional<int64_t>{42});
+    }
+
+    SECTION("guard false: an empty view, nothing written") {
+        REQUIRE(sync(Repo::find(id)));  // warm
+        auto v = sync(Repo::patchIf(id, when(eq<SlotF::version>(int64_t{9})),
+            set<SlotF::holder>(int64_t{42}), increment<SlotF::version>(1)));
+        REQUIRE(v);
+        CHECK_FALSE(*v);
+        CHECK(dbVersion(id) == 10);
+
+        auto after = sync(Repo::find(id));
+        REQUIRE(after);
+        CHECK(after->version == 10);
+        CHECK_FALSE(after->holder);
+    }
+
+    SECTION("the guard reads the committed row, not a cached copy") {
+        REQUIRE(sync(Repo::find(id))->version == 10);  // cache version = 10
+        // Bypass relais: the cached copy is now stale.
+        execQueryArgs("UPDATE relais_test_slots SET version = 11 WHERE id = $1", id);
+
+        auto v = sync(Repo::patchIf(id, when(eq<SlotF::version>(int64_t{10})),
+            increment<SlotF::version>(1)));
+        REQUIRE(v);
+        CHECK_FALSE(*v);
+        CHECK(dbVersion(id) == 11);
+    }
+
+    SECTION("absent row: an empty view, like a refusal") {
+        auto v = sync(Repo::patchIf(id + 1'000'000, when(eq<SlotF::version>(int64_t{10})),
+            increment<SlotF::counter>(1)));
+        REQUIRE(v);
+        CHECK_FALSE(*v);
+        CHECK(dbCounter(id) == 5);
+    }
+
+    SECTION("DB error: nullopt, distinct from a refusal") {
+        execQueryArgs("UPDATE relais_test_slots SET counter = 2147483000 WHERE id = $1", id);
+        auto v = sync(Repo::patchIf(id, when(eq<SlotF::version>(int64_t{10})),
+            increment<SlotF::counter>(1'000)));
+        CHECK_FALSE(v);
+        CHECK(dbCounter(id) == 2'147'483'000);
+    }
+}
+
+TEMPLATE_TEST_CASE("[patchIf] state transitions and expiring holds",
+                   "[patchIf][integration]",
+                   UncachedTestSlotRepo, FullCacheTestSlotRepo)
+{
+    using Repo = TestType;
+    TransactionGuard guard;
+    auto s = insertSlotSet();
+    auto taken = [](int64_t id) -> std::optional<bool> {
+        auto v = sync(Repo::patchIf(id,
+            when(in<SlotF::state>({SlotState::Free, SlotState::Held})),
+            set<SlotF::state>(SlotState::Taken)));
+        if (!v) return std::nullopt;
+        return static_cast<bool>(*v);
+    };
+    auto held = [](int64_t id) -> std::optional<bool> {
+        auto v = sync(Repo::patchIf(id,
+            when(anyOf(isNull<SlotF::holder>(), lt<SlotF::expires_at>(dbNow))),
+            set<SlotF::holder>(int64_t{100}), nowPlus<SlotF::expires_at>(1min)));
+        if (!v) return std::nullopt;
+        return static_cast<bool>(*v);
+    };
+
+    SECTION("in: only a free or held slot can be taken") {
+        CHECK(taken(s.a) == std::optional{true});
+        CHECK(taken(s.b) == std::optional{true});
+        CHECK(taken(s.d) == std::optional{false});   // already taken
+        CHECK(taken(s.a) == std::optional{false});   // taken on the first call
+        CHECK(sync(Repo::find(s.a))->state == SlotState::Taken);
+    }
+
+    SECTION("anyOf + dbNow: a hold goes to a free slot or an expired one") {
+        CHECK(held(s.a) == std::optional{true});    // no holder
+        CHECK(held(s.b) == std::optional{true});    // expired a minute ago
+        CHECK(held(s.c) == std::optional{false});   // held for another hour
+        CHECK(held(s.a) == std::optional{false});   // now held for a minute
+        auto c = sync(Repo::find(s.c));
+        REQUIRE(c);
+        CHECK(c->holder == std::optional<int64_t>{8});
+    }
+}
+
+TEMPLATE_TEST_CASE("[patchIf] identical compare-and-set writes: exactly one wins",
+                   "[patchIf][integration][concurrency]",
+                   UncachedTestSlotRepo, FullCacheTestSlotRepo)
+{
+    using Repo = TestType;
+    TransactionGuard guard;
+    auto id = insertSlot(0, 0);
+    constexpr int N = 32;
+
+    // Same SQL, same params: coalescing them would report N wins.
+    auto outcomes = sync([](int64_t id) -> io::Task<std::vector<int>> {
+        std::vector<int> out(N, -1);  // -1 error, 0 refused, 1 won
+        std::vector<io::Task<void>> tasks;
+        tasks.reserve(N);
+        for (int i = 0; i < N; ++i) {
+            tasks.push_back([](int64_t id, int& slot) -> io::Task<void> {
+                auto v = co_await Repo::patchIf(id, when(eq<SlotF::version>(int64_t{0})),
+                    increment<SlotF::version>(1));
+                slot = !v ? -1 : (*v ? 1 : 0);
+            }(id, out[i]));
+        }
+        co_await io::whenAll(std::move(tasks));
+        co_return out;
+    }(id));
+
+    CHECK(std::count(outcomes.begin(), outcomes.end(), 1) == 1);
+    CHECK(std::count(outcomes.begin(), outcomes.end(), 0) == N - 1);
+    CHECK(dbVersion(id) == 1);
+}
+
+TEMPLATE_TEST_CASE("[patchIf] composite key", "[patchIf][integration]",
+                   UncachedTestSlotTallyRepo, FullCacheTestSlotTallyRepo)
+{
+    using Repo = TestType;
+    TransactionGuard guard;
+    execQuery("INSERT INTO relais_test_slot_tallies (group_id, bucket, hits) VALUES "
+              "(1, 1, 2), (1, 2, 2)");
+    auto key = std::tuple{int64_t{1}, int64_t{2}};
+
+    // A bounded counter: the increment applies while below the cap.
+    auto bump = [&] {
+        auto v = sync(Repo::patchIf(key, when(lt<TallyF::hits>(int64_t{3})),
+            increment<TallyF::hits>(1)));
+        REQUIRE(v);
+        return static_cast<bool>(*v);
+    };
+    CHECK(bump());
+    CHECK_FALSE(bump());
+    auto r = execQuery("SELECT bucket, hits FROM relais_test_slot_tallies "
+                       "WHERE group_id = 1 ORDER BY bucket");
+    CHECK(r[0].get<int64_t>(1) == 2);  // the other bucket is untouched
+    CHECK(r[1].get<int64_t>(1) == 3);
+}
+
+namespace {
+
+template<typename List>
+typename List::ListQuery groupPage(int64_t group) {
+    using Desc = typename List::ListDescriptorType;
+    rspec::ListQueryParams<Desc> q;
+    q.limit = 50;
+    q.filters.template get<"group_id">() = group;
+    return rspec::seal<Desc>(std::move(q));
+}
+
+template<typename List>
+size_t groupSize(int64_t group) {
+    return sync(List::query(groupPage<List>(group)))->size();
+}
+
+int64_t insertGroupedSlot(int64_t group) {
+    return execQueryArgs(
+        "INSERT INTO relais_test_slots (group_id) VALUES ($1) RETURNING id",
+        group)[0].get<int64_t>(0);
+}
+
+}  // namespace
+
+TEMPLATE_TEST_CASE("[patchIf] list pages move on commit, stay on refusal",
+                   "[patchIf][integration][list]",
+                   L1TestSlotListRepo, FullCacheTestSlotListRepo, InvalidatingTestSlotListRepo)
+{
+    using List = TestType;
+    using ListF = TestSlotListEntity::Field;
+    TransactionGuard guard;
+    TestInternals::resetEntityCacheState<List>();
+    TestInternals::resetListCacheState<List>();
+
+    auto id = insertGroupedSlot(100);
+    insertGroupedSlot(200);
+    REQUIRE(groupSize<List>(100) == 1);   // cache page group=100
+    REQUIRE(groupSize<List>(200) == 1);   // cache page group=200
+
+    // Bypass relais: a row joins group 100 behind the cached page. Only an
+    // invalidation of that page can reveal it.
+    insertGroupedSlot(100);
+
+    SECTION("refused: the pages are not invalidated") {
+        auto v = sync(List::patchIf(id, when(eq<ListF::version>(int64_t{1})),
+            set<ListF::group_id>(int64_t{200})));
+        REQUIRE(v);
+        REQUIRE_FALSE(*v);
+        CHECK(groupSize<List>(100) == 1);   // still the cached page
+        CHECK(groupSize<List>(200) == 1);
+    }
+
+    SECTION("committed: the row leaves the old page and joins the new one") {
+        auto v = sync(List::patchIf(id, when(eq<ListF::version>(int64_t{0})),
+            set<ListF::group_id>(int64_t{200})));
+        REQUIRE(v);
+        REQUIRE(*v);
+        CHECK(groupSize<List>(100) == 1);   // re-fetched: the bypass row, not ours
+        CHECK(groupSize<List>(200) == 2);
+    }
+}
+
+TEMPLATE_TEST_CASE("[patchIf] cross-invalidation on commit only",
+                   "[patchIf][integration][cross-invalidation]",
+                   InvalidatingTestSlotRepo, InvalidatingTestSlotListRepo)
+{
+    using Src = TestType;
+    using SrcF = typename Src::EntityType::Field;
+    using Target = L1SlotInvTargetRepo;
+    TransactionGuard guard;
+    TestInternals::resetEntityCacheState<Src>();
+    TestInternals::resetEntityCacheState<Target>();
+
+    auto id = insertGroupedSlot(5000);
+    TestInternals::putInCache<Target>(int64_t{5000}, makeTestItem("old", 0, "", true, 5000));
+    TestInternals::putInCache<Target>(int64_t{6000}, makeTestItem("new", 0, "", true, 6000));
+
+    auto move = [&](int64_t expected_version) {
+        return sync(Src::patchIf(id, when(eq<SrcF::version>(expected_version)),
+            set<SrcF::group_id>(int64_t{6000})));
+    };
+
+    SECTION("refused: both targets stay cached") {
+        auto v = move(1);
+        REQUIRE(v);
+        REQUIRE_FALSE(*v);
+        CHECK(TestInternals::getFromCache<Target>(int64_t{5000}));
+        CHECK(TestInternals::getFromCache<Target>(int64_t{6000}));
+    }
+
+    SECTION("committed: the old and the new target drop") {
+        auto v = move(0);
+        REQUIRE(v);
+        REQUIRE(*v);
+        CHECK_FALSE(TestInternals::getFromCache<Target>(int64_t{5000}));
+        CHECK_FALSE(TestInternals::getFromCache<Target>(int64_t{6000}));
     }
 }
