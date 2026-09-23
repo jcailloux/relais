@@ -455,25 +455,84 @@ public:
             throw;
         }
         if (!changes) co_return std::nullopt;  // DB error
+        co_return co_await settleChanges<kReturns>(std::move(*changes));
+    }
 
-        co_await Base::invalidateManyUpdatedCritical(std::span<const Change<E>>(*changes));
+    /// Take the first `n` rows matching `pred` and apply `updates` to them, in
+    /// one statement. Rows come in primary-key order, or in `order` (closed by
+    /// the primary key) with the overload below. Per `O.mode`, exactly n rows
+    /// or nothing (Exact), or up to n (UpTo); per `O.lock`, a candidate locked
+    /// by a concurrent writer is passed over (SkipLocked) or waited on, then
+    /// re-checked (Wait). Returns, per `O.returns`, the number of rows taken,
+    /// each committed row, or each row before and after the write, in the
+    /// ordering; nullopt on a DB error. A refusal is an empty result.
+    ///
+    /// SkipLocked passes over rows a concurrent writer holds even if it then
+    /// fails: retry on refusal. Wait re-checks a waited-on row and passes over
+    /// it if it no longer matches, but candidates are selected by the values
+    /// they had before the wait; two Wait claims locking rows in different
+    /// orders can deadlock (a DB error).
+    template<ClaimOptions O = {}, typename... Gs, typename... Updates>
+    static io::Task<ResultFor<E, O.returns>> claim(
+        const entity::Guards<Gs...>& pred, size_t n, Updates&&... updates)
+        requires HasFieldUpdate<E> && (!Cfg.read_only)
+    {
+        co_return co_await claimOrdered<O, void>(
+            pred, nullptr, n, std::forward<Updates>(updates)...);
+    }
 
-        ResultFor<E, kReturns> result;
-        if constexpr (kReturns == Returns::Count) {
-            result = changes->size();
-        } else if constexpr (kReturns == Returns::After) {
-            std::vector<E> after;
-            after.reserve(changes->size());
-            for (const auto& c : *changes) after.push_back(c.after);
-            result = std::move(after);
-        } else {
-            result = *changes;
-        }
-        fireInvalidateManyUpdatedDeferred(std::move(*changes));
-        co_return result;
+    template<ClaimOptions O = {}, typename... Gs, typename... Ks, typename... Updates>
+    static io::Task<ResultFor<E, O.returns>> claim(
+        const entity::Guards<Gs...>& pred, const entity::OrderBy<Ks...>& order,
+        size_t n, Updates&&... updates)
+        requires HasFieldUpdate<E> && (!Cfg.read_only)
+    {
+        co_return co_await claimOrdered<O, entity::OrderBy<Ks...>>(
+            pred, &order, n, std::forward<Updates>(updates)...);
     }
 
 private:
+    template<ClaimOptions O, typename Order, typename... Gs, typename... Updates>
+    static io::Task<ResultFor<E, O.returns>> claimOrdered(
+        const entity::Guards<Gs...>& pred, const Order* order, size_t n,
+        Updates&&... updates)
+    {
+        std::optional<std::vector<Change<E>>> changes;
+        try {
+            changes = co_await Base::template claimRaw<O, Order>(
+                pred, order, n, std::forward<Updates>(updates)...);
+        } catch (const io::PgUncertainError&) {
+            RELAIS_LOG_ERROR << name()
+                << ": claim timeout — rows taken unknowable, entity and "
+                   "list tiers left to l*_ttl";
+            throw;
+        }
+        if (!changes) co_return std::nullopt;  // DB error
+        co_return co_await settleChanges<O.returns>(std::move(*changes));
+    }
+
+    /// Cache tail of a predicate write, from the rows it changed: the entity
+    /// tier and the L1 list pages are evicted before returning, the L2 list
+    /// pages and cross-targets right after, detached.
+    template<Returns R>
+    static io::Task<ResultFor<E, R>> settleChanges(std::vector<Change<E>> changes) {
+        co_await Base::invalidateManyUpdatedCritical(std::span<const Change<E>>(changes));
+
+        ResultFor<E, R> result;
+        if constexpr (R == Returns::Count) {
+            result = changes.size();
+        } else if constexpr (R == Returns::After) {
+            std::vector<E> after;
+            after.reserve(changes.size());
+            for (const auto& c : changes) after.push_back(c.after);
+            result = std::move(after);
+        } else {
+            result = changes;
+        }
+        fireInvalidateManyUpdatedDeferred(std::move(changes));
+        co_return result;
+    }
+
     // ----------------------------------------------------------------------
     // Fire-and-forget deferred cleanup (commit 13). The detached coroutine owns
     // the affected set / predicate by value, so the lazy deferred tasks'
