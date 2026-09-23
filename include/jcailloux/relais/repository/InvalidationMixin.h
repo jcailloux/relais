@@ -372,6 +372,19 @@ protected:
             Base::template invalidateManyDeferred<WithLists>(entities));
     }
 
+    /// Rows changed in place: no cross-target in the critical pass, as above.
+    static io::Task<void> invalidateManyUpdatedCritical(std::span<const Change<Entity>> changes) {
+        co_await Base::invalidateManyUpdatedCritical(changes);
+    }
+
+    /// Deduplicated cross-target invalidation of every row before and after the
+    /// write, co-pipelined with the own L2 list EVALs.
+    static io::Task<void> invalidateManyUpdatedDeferred(std::span<const Change<Entity>> changes) {
+        co_await io::whenAll(
+            propagateUpdateMany<Entity, InvList>(changes),
+            Base::invalidateManyUpdatedDeferred(changes));
+    }
+
     friend struct ::relais_test::TestInternals;
 };
 

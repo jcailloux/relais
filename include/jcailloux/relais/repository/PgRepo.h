@@ -20,6 +20,7 @@
 #include "jcailloux/relais/entity/EntityConcepts.h"
 #include "jcailloux/relais/cache/CacheView.h"
 #include "jcailloux/relais/entity/FieldUpdate.h"
+#include "jcailloux/relais/repository/ConditionalWrite.h"
 #include "jcailloux/relais/repository/GuardSql.h"
 #include "jcailloux/relais/list/spec/GeneratedCriteria.h"
 
@@ -187,6 +188,85 @@ std::string buildGuardedUpdateReturning(
     GuardSql<Traits, Guard>::emit(sql, param, {});
     sql += " RETURNING ";
     sql += returning_columns;
+    return sql;
+}
+
+/// Append a comma-separated column list ("a, b, c"), each column prefixed by `qual`.
+inline void appendQualifiedColumns(std::string& sql, std::string_view columns,
+                                   std::string_view qual) {
+    bool first = true;
+    while (!columns.empty()) {
+        auto comma = columns.find(',');
+        auto col = columns.substr(0, comma);
+        columns = comma == std::string_view::npos ? std::string_view{} : columns.substr(comma + 1);
+        while (!col.empty() && col.front() == ' ') col.remove_prefix(1);
+        while (!col.empty() && col.back() == ' ') col.remove_suffix(1);
+        if (!first) sql += ',';
+        first = false;
+        sql += qual;
+        sql += col;
+    }
+}
+
+/// Number of columns in a comma-separated column list.
+[[nodiscard]] constexpr int countColumns(std::string_view columns) {
+    int n = columns.empty() ? 0 : 1;
+    for (char c : columns) n += c == ',';
+    return n;
+}
+
+/// Append `t."pk"=o."pk"` for each key column (joined by AND).
+inline void appendPkJoin(std::string& sql, std::string_view pk_column) {
+    sql += "t.\"";
+    sql += pk_column;
+    sql += "\"=o.\"";
+    sql += pk_column;
+    sql += '"';
+}
+
+template<size_t N>
+void appendPkJoin(std::string& sql, const std::array<const char*, N>& pk_columns) {
+    for (size_t i = 0; i < N; ++i) {
+        if (i > 0) sql += " AND ";
+        appendPkJoin(sql, pk_columns[i]);
+    }
+}
+
+/// Build the predicate UPDATE that returns every changed row before and after:
+///   WITH o AS (SELECT <cols> FROM tbl WHERE <pred> FOR UPDATE)
+///   UPDATE tbl AS t SET <sets> FROM o WHERE t.pk=o.pk RETURNING o.<cols>, t.<cols>
+/// The CTE locks the matching rows and projects their committed version (a row
+/// waited on is re-checked against the predicate). Parameters: SET values, then
+/// the predicate values. The SET right-hand sides are qualified with `t.`: an
+/// unqualified column would be ambiguous between the target and the CTE.
+template<typename Traits, typename Pred, typename Pk>
+std::string buildPatchWhereSql(
+    std::string_view table_name,
+    const Pk& pk,
+    std::initializer_list<SetColumn> sets,
+    std::string_view columns)
+{
+    std::string set_clause;
+    size_t param = appendSetClause(set_clause, sets, "t.");
+
+    std::string sql;
+    sql.reserve(256 + 3 * columns.size());
+    sql += "WITH o AS (SELECT ";
+    sql += columns;
+    sql += " FROM ";
+    sql += table_name;
+    sql += " WHERE ";
+    GuardSql<Traits, Pred>::emit(sql, param, {});
+    sql += " FOR UPDATE) UPDATE ";
+    sql += table_name;
+    sql += " AS t SET ";
+    sql += set_clause;
+    sql += " FROM o WHERE ";
+    appendPkJoin(sql, pk);
+    sql += " RETURNING ";
+    appendQualifiedColumns(sql, columns, "o.");
+    sql += ',';
+    appendQualifiedColumns(sql, columns, "t.");
     return sql;
 }
 
@@ -451,6 +531,20 @@ protected:
     template<bool WithLists = true>
     static io::Task<void> invalidateManyDeferred(
         [[maybe_unused]] std::span<const E> entities) {
+        co_return;
+    }
+
+    /// Batch cascade for rows changed in place (patchWhere): same critical /
+    /// deferred split as above, fed with each row before and after the write.
+    /// The row still exists, so its own lists move from the old version's
+    /// pages to the new one's. L3 has no cache: terminal no-ops.
+    static io::Task<void> invalidateManyUpdatedCritical(
+        [[maybe_unused]] std::span<const Change<E>> changes) {
+        co_return;
+    }
+
+    static io::Task<void> invalidateManyUpdatedDeferred(
+        [[maybe_unused]] std::span<const Change<E>> changes) {
         co_return;
     }
 
@@ -858,6 +952,72 @@ protected:
         } catch (const io::PgError& e) {
             RELAIS_LOG_ERROR << name() << ": patchIf error - " << e.what();
             co_return GuardedPatchOutcome{.error = true};
+        }
+    }
+
+    /// Predicate partial update, returning every changed row before and after.
+    /// nullopt on a deterministic DB error; an empty vector when no row matched.
+    /// One statement, never chunked: a changed row may still match the
+    /// predicate, so a chunked loop would not terminate.
+    template<typename... Gs, typename... Updates>
+    static io::Task<std::optional<std::vector<Change<E>>>> patchWhereRaw(
+        const entity::Guards<Gs...>& pred, Updates&&... updates)
+        requires HasFieldUpdate<E> && (!Cfg.read_only)
+    {
+        static_assert(sizeof...(Gs) > 0,
+            "patchWhere requires a predicate: an empty one would change the whole table");
+        static_assert(sizeof...(Updates) > 0, "patchWhere requires at least one field update");
+        using Traits = typename E::TraitsType;
+        using Pred = entity::Guards<Gs...>;
+        constexpr int width = detail::countColumns(Mapping::SQL::returning_columns);
+        try {
+            static const auto sql = []{
+                if constexpr (is_tuple_v<Key>) {
+                    return detail::buildPatchWhereSql<Traits, Pred>(
+                        Mapping::table_name,
+                        Mapping::primary_key_columns,
+                        {detail::SetColumn(
+                            entity::fieldColumnName<Traits>(std::remove_cvref_t<Updates>{}),
+                            entity::set_op_v<std::remove_cvref_t<Updates>>)...},
+                        Mapping::SQL::returning_columns);
+                } else {
+                    return detail::buildPatchWhereSql<Traits, Pred>(
+                        Mapping::table_name,
+                        Mapping::primary_key_column,
+                        {detail::SetColumn(
+                            entity::fieldColumnName<Traits>(std::remove_cvref_t<Updates>{}),
+                            entity::set_op_v<std::remove_cvref_t<Updates>>)...},
+                        Mapping::SQL::returning_columns);
+                }
+            }();
+
+            auto params = io::PgParams::make(
+                entity::fieldValue<Traits>(std::forward<Updates>(updates))...);
+            params.params.reserve(params.params.size() + detail::GuardSql<Traits, Pred>::params);
+            detail::GuardSql<Traits, Pred>::bind(params, pred);
+
+            // The predicate is re-evaluated by the database on each execution:
+            // two identical writes must both run, never coalesced.
+            auto w = co_await PgProvider::queryWrite(
+                sql.c_str(), params, io::batch::WriteMode::Exclusive);
+
+            std::vector<Change<E>> out;
+            out.reserve(static_cast<size_t>(w.result.rows()));
+            for (int r = 0; r < w.result.rows(); ++r) {
+                auto row = w.result[r];
+                auto before = E::fromRow(row);
+                auto after = E::fromRow(row.shifted(width));
+                if (before && after)
+                    out.push_back(Change<E>{std::move(*before), std::move(*after)});
+            }
+            co_return out;
+        } catch (const io::PgUncertainError&) {
+            // Uncertain: the UPDATE may have committed, and the changed rows are
+            // unknowable. Propagate; the facade logs the residual staleness.
+            throw;
+        } catch (const io::PgError& e) {
+            RELAIS_LOG_ERROR << name() << ": patchWhere error - " << e.what();
+            co_return std::nullopt;
         }
     }
 

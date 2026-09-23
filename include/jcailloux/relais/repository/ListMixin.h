@@ -574,6 +574,27 @@ protected:
         co_await Base::template invalidateManyDeferred<WithLists>(entities);
     }
 
+    /// Rows changed in place (patchWhere): each row leaves the pages of its
+    /// version before the write and joins those of the committed one. The L1
+    /// tracker bump is awaited (it guards L1 list read-fills), the L2 EVALs are
+    /// deferred, as for the deletion cascade.
+    static io::Task<void> invalidateManyUpdatedCritical(std::span<const Change<Entity>> changes) {
+        if constexpr (kHasL1) {
+            for (const auto& c : changes) listCache().onEntityUpdated(c.before, c.after);
+        }
+        co_await Base::invalidateManyUpdatedCritical(changes);
+    }
+
+    static io::Task<void> invalidateManyUpdatedDeferred(std::span<const Change<Entity>> changes) {
+        if constexpr (kHasL2) {
+            std::vector<io::Task<size_t>> tasks;
+            tasks.reserve(changes.size());
+            for (const auto& c : changes) tasks.push_back(invalidateL2Updated(c.before, c.after));
+            co_await io::whenAll(std::move(tasks));
+        }
+        co_await Base::invalidateManyUpdatedDeferred(changes);
+    }
+
     /// Predicate list invalidation (eraseWhere fast-path). Replaces the per-entity
     /// blob-array list work with ONE RangeModification (L1) + ONE predicate EVAL
     /// (L2) for the whole deleted set — O(1)/O(groups) instead of O(N). The caller

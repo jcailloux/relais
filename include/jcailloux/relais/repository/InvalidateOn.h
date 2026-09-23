@@ -7,6 +7,7 @@
 #include <utility>
 #include <vector>
 #include "jcailloux/relais/io/Task.h"
+#include "jcailloux/relais/repository/ConditionalWrite.h"
 
 namespace jcailloux::relais {
 
@@ -155,9 +156,27 @@ struct Invalidate {
     /// A target without the facade falls back to the per-key loop.
     template<typename E>
     static io::Task<void> invalidateManyForDelete(std::span<const E> entities) {
-        auto keys = targetKeysForDelete<E>(entities);
-        if (keys.empty()) co_return;
+        co_await invalidateKeys(targetKeysForDelete<E>(entities));
+    }
+
+    /// Batch update: the target keys of every row before and after the write,
+    /// deduplicated, each invalidated once (mono update invalidates both).
+    template<typename E>
+    static io::Task<void> invalidateManyForUpdate(std::span<const Change<E>> changes) {
         using KeyT = decltype(extractKey(std::declval<E>()));
+        std::vector<KeyT> keys;
+        keys.reserve(2 * changes.size());
+        for (const auto& c : changes) {
+            keys.push_back(extractKey(c.before));
+            keys.push_back(extractKey(c.after));
+        }
+        co_await invalidateKeys(detail::dedupSorted(std::move(keys)));
+    }
+
+private:
+    template<typename KeyT>
+    static io::Task<void> invalidateKeys(std::vector<KeyT> keys) {
+        if (keys.empty()) co_return;
         if constexpr (requires(std::span<const KeyT> s) { Cache::invalidateMany(s); }) {
             co_await Cache::invalidateMany(std::span<const KeyT>(keys));
         } else {
@@ -165,7 +184,6 @@ struct Invalidate {
         }
     }
 
-private:
     template<typename E>
     static auto extractKey(const E& entity) {
         if constexpr (requires { KeyExtractor(entity); }) {
@@ -253,6 +271,16 @@ struct InvalidateList {
             co_await invalidateWithData(data);
         }
     }
+
+    /// Batch update: per-row loop, each row moving from its old pages to its
+    /// new ones exactly as a mono update.
+    template<typename E>
+    static io::Task<void> invalidateManyForUpdate(std::span<const Change<E>> changes) {
+        for (const auto& c : changes) {
+            auto data = InvalidationData<E>::forUpdate(&c.before, c.after);
+            co_await invalidateWithData(data);
+        }
+    }
 };
 
 // =============================================================================
@@ -303,8 +331,26 @@ struct InvalidateVia {
         std::vector<KeyT> sources;
         sources.reserve(entities.size());
         for (const auto& e : entities) sources.push_back(extractKey(e));
-        sources = detail::dedupSorted(std::move(sources));
+        co_await invalidateSources(detail::dedupSorted(std::move(sources)));
+    }
 
+    /// Batch update: the sources of every row before and after the write,
+    /// deduplicated, then resolved and invalidated like a batch delete.
+    template<typename E>
+    static io::Task<void> invalidateManyForUpdate(std::span<const Change<E>> changes) {
+        using KeyT = decltype(extractKey(std::declval<E>()));
+        std::vector<KeyT> sources;
+        sources.reserve(2 * changes.size());
+        for (const auto& c : changes) {
+            sources.push_back(extractKey(c.before));
+            sources.push_back(extractKey(c.after));
+        }
+        co_await invalidateSources(detail::dedupSorted(std::move(sources)));
+    }
+
+private:
+    template<typename KeyT>
+    static io::Task<void> invalidateSources(std::vector<KeyT> sources) {
         if constexpr (requires { Resolver(std::span<const KeyT>(sources)); }) {
             // Opt-in batch resolver: one call collapses N source lookups.
             auto targets = co_await Resolver(std::span<const KeyT>(sources));
@@ -322,7 +368,6 @@ struct InvalidateVia {
         }
     }
 
-private:
     template<typename E>
     static auto extractKey(const E& entity) {
         if constexpr (requires { SourceKeyExtractor(entity); })
@@ -385,8 +430,26 @@ struct InvalidateListVia {
         std::vector<KeyT> sources;
         sources.reserve(entities.size());
         for (const auto& e : entities) sources.push_back(extractKey(e));
-        sources = detail::dedupSorted(std::move(sources));
+        co_await invalidateSources(detail::dedupSorted(std::move(sources)));
+    }
 
+    /// Batch update: the sources of every row before and after the write,
+    /// deduplicated, then resolved and invalidated like a batch delete.
+    template<typename E>
+    static io::Task<void> invalidateManyForUpdate(std::span<const Change<E>> changes) {
+        using KeyT = decltype(extractKey(std::declval<E>()));
+        std::vector<KeyT> sources;
+        sources.reserve(2 * changes.size());
+        for (const auto& c : changes) {
+            sources.push_back(extractKey(c.before));
+            sources.push_back(extractKey(c.after));
+        }
+        co_await invalidateSources(detail::dedupSorted(std::move(sources)));
+    }
+
+private:
+    template<typename KeyT>
+    static io::Task<void> invalidateSources(std::vector<KeyT> sources) {
         if constexpr (requires { Resolver(std::span<const KeyT>(sources)); }) {
             co_await invalidateResolved(co_await Resolver(std::span<const KeyT>(sources)));
         } else {
@@ -395,7 +458,6 @@ struct InvalidateListVia {
         }
     }
 
-private:
     template<typename Resolved>
     static io::Task<void> invalidateResolved(Resolved resolved) {
         using ResolvedType = std::decay_t<Resolved>;
@@ -449,6 +511,13 @@ struct InvalidateOn {
     static io::Task<void> propagateDeleteMany(std::span<const E> entities) {
         (co_await Dependencies::template invalidateManyForDelete<E>(entities), ...);
     }
+
+    /// Batch update propagation: each dependency folds the rows before and
+    /// after the write (cf. per-variant invalidateManyForUpdate).
+    template<typename E>
+    static io::Task<void> propagateUpdateMany(std::span<const Change<E>> changes) {
+        (co_await Dependencies::template invalidateManyForUpdate<E>(changes), ...);
+    }
 };
 
 template<>
@@ -465,6 +534,11 @@ struct InvalidateOn<> {
 
     template<typename E>
     static io::Task<void> propagateDeleteMany(std::span<const E>) {
+        co_return;
+    }
+
+    template<typename E>
+    static io::Task<void> propagateUpdateMany(std::span<const Change<E>>) {
         co_return;
     }
 };
@@ -499,6 +573,11 @@ io::Task<void> propagateDelete(const E& entity) {
 template<typename E, typename InvalidatesType>
 io::Task<void> propagateDeleteMany(std::span<const E> entities) {
     co_await InvalidatesType::template propagateDeleteMany<E>(entities);
+}
+
+template<typename E, typename InvalidatesType>
+io::Task<void> propagateUpdateMany(std::span<const Change<E>> changes) {
+    co_await InvalidatesType::template propagateUpdateMany<E>(changes);
 }
 
 // =============================================================================
