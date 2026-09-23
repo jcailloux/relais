@@ -280,6 +280,7 @@ if(RELAIS_BUILD_TESTS)
     relais_add_test(test_relais_assigned_key   tests/relais/test_simple_assigned_key.cpp  DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;assigned-key"     RESOURCE_LOCK)
     relais_add_test(test_relais_upsert         tests/relais/test_upsert.cpp               DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;redis;upsert"       RESOURCE_LOCK)
     relais_add_test(test_relais_conditional_writes tests/relais/test_conditional_writes.cpp DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;redis;conditional" RESOURCE_LOCK)
+    relais_add_test(test_relais_conditional_contention tests/relais/test_conditional_writes_contention.cpp DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;redis;conditional;concurrency" RESOURCE_LOCK)
     relais_add_test(test_relais_gdsf          tests/relais/test_gdsf.cpp                DEFINITIONS RELAIS_BUILDING_TESTS "RELAIS_GDSF_ENABLED=1" LABELS "relais;integration;db;gdsf"             RESOURCE_LOCK)
     if(NOT RELAIS_GDSF_ENABLED)
         relais_add_test(test_relais_gdsf_disabled tests/relais/test_gdsf_disabled.cpp       DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;gdsf")
@@ -301,6 +302,11 @@ if(RELAIS_BUILD_TESTS)
         target_compile_options(test_io_liveness PRIVATE
             -fsanitize=thread -fno-omit-frame-pointer)
         target_link_options(test_io_liveness PRIVATE -fsanitize=thread)
+        # Conditional writes raced from several IoPool loops sharing the repos'
+        # L1: TSan validates the cache cascade of claim / patchIf across threads.
+        target_compile_options(test_relais_conditional_contention PRIVATE
+            -fsanitize=thread -fno-omit-frame-pointer)
+        target_link_options(test_relais_conditional_contention PRIVATE -fsanitize=thread)
         # NB: the cache-coherence suite is single-loop (one event-loop thread), so
         # its concurrency-relevant surface — the shared static L1 under concurrent
         # find/update/erase, and the coroutine resume chains — is TSan-validated by
