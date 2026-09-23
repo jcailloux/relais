@@ -20,6 +20,7 @@
 #include "jcailloux/relais/entity/EntityConcepts.h"
 #include "jcailloux/relais/cache/CacheView.h"
 #include "jcailloux/relais/entity/FieldUpdate.h"
+#include "jcailloux/relais/repository/GuardSql.h"
 #include "jcailloux/relais/list/spec/GeneratedCriteria.h"
 
 namespace relais_test { struct TestInternals; }
@@ -73,8 +74,10 @@ struct SetColumn {
 };
 
 /// Append the SET list, numbering values $1..$N in order. Returns the next
-/// free parameter index.
-inline size_t appendSetClause(std::string& sql, std::initializer_list<SetColumn> sets) {
+/// free parameter index. `qual` prefixes the column read on the right-hand side
+/// ("t." when the target is aliased); the assigned column is never qualified.
+inline size_t appendSetClause(std::string& sql, std::initializer_list<SetColumn> sets,
+                              std::string_view qual = {}) {
     size_t param = 1;
     bool first = true;
     for (const auto& s : sets) {
@@ -86,10 +89,12 @@ inline size_t appendSetClause(std::string& sql, std::initializer_list<SetColumn>
             case entity::SetOp::Assign:
                 break;
             case entity::SetOp::Add:
+                sql += qual;
                 sql += s.column;
                 sql += '+';
                 break;
             case entity::SetOp::Subtract:
+                sql += qual;
                 sql += s.column;
                 sql += '-';
                 break;

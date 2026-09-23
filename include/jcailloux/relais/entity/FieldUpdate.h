@@ -133,16 +133,35 @@ std::string fieldColumnName(const FieldNowPlus<F>&) {
     return std::string(Traits::template FieldInfo<F>::column_name);
 }
 
-/// Extract properly-typed value for SQL binding from a FieldUpdate.
-/// Timestamps are stored as strings — no conversion needed.
+namespace detail {
+
+/// True when V is the C++ enum a column maps to database strings.
+template<typename Info, typename V>
+inline constexpr bool is_mapped_enum_v = false;
+template<typename Info, typename V>
+    requires requires { typename Info::enum_type; }
+inline constexpr bool is_mapped_enum_v<Info, V> = std::is_same_v<V, typename Info::enum_type>;
+
+/// Convert a typed value to what the column binds. Timestamps are stored as
+/// strings; a mapped C++ enum binds its database string.
 template<typename Traits, auto F, typename V>
-auto fieldValue(const FieldUpdate<F, V>& update) {
+auto columnValue(const V& value) {
     using Info = typename Traits::template FieldInfo<F>;
     if constexpr (Info::is_timestamp) {
-        return std::string(update.value);
+        return std::string(value);
+    } else if constexpr (is_mapped_enum_v<Info, V>) {
+        return std::string(Info::toDb(value));
     } else {
-        return static_cast<typename Info::value_type>(update.value);
+        return static_cast<typename Info::value_type>(value);
     }
+}
+
+}  // namespace detail
+
+/// Extract properly-typed value for SQL binding from a FieldUpdate.
+template<typename Traits, auto F, typename V>
+auto fieldValue(const FieldUpdate<F, V>& update) {
+    return detail::columnValue<Traits, F>(update.value);
 }
 
 /// Extract NULL value for SQL binding from a FieldSetNull.

@@ -1472,6 +1472,19 @@ class MappingGenerator:
             lines.append(f'    static constexpr const char* column_name = "\\"{m.col_name}\\"";')
             lines.append(f"    static constexpr bool is_timestamp = {'true' if is_timestamp else 'false'};")
             lines.append(f"    static constexpr bool is_nullable = {'true' if is_nullable else 'false'};")
+            if enum_mapping and enum_mapping.pairs:
+                # C++ enum -> DB string, so a typed value (set, guards) binds the
+                # stored string. Same pairs as toInsertParams: the DB mapping, not
+                # the JSON names a user-provided glz::meta may carry.
+                enum_fqn = self._qualify_type(entity, enum_mapping.cpp_type)
+                lines.append(f"    using enum_type = {enum_fqn};")
+                lines.append("    static constexpr std::string_view toDb(enum_type v) noexcept {")
+                lines.append("        switch (v) {")
+                for db_val, enum_val in enum_mapping.pairs:
+                    lines.append(f'            case enum_type::{enum_val}: return "{db_val}";')
+                lines.append("        }")
+                lines.append("        return {};")
+                lines.append("    }")
             lines.append("};")
             lines.append("")
 
