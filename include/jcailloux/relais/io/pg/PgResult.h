@@ -21,7 +21,9 @@ namespace jcailloux::relais::io {
 
 class PgResult {
 public:
-    // Row — lightweight proxy for a single row (no ownership)
+    // Row — lightweight proxy for a single row (no ownership). Column indices
+    // are relative to a column offset (0 by default), so a decoder that reads
+    // fixed indices can read a group of columns placed further in the row.
 
     class Row {
     public:
@@ -41,22 +43,34 @@ public:
 
         /// Check if a column value is NULL.
         [[nodiscard]] bool isNull(int col) const noexcept {
-            return PQgetisnull(result_->raw(), row_, col) == 1;
+            return PQgetisnull(result_->raw(), row_, col_offset_ + col) == 1;
         }
 
         /// Raw string value of a column.
         [[nodiscard]] std::string_view rawValue(int col) const noexcept {
-            const char* v = PQgetvalue(result_->raw(), row_, col);
-            int len = PQgetlength(result_->raw(), row_, col);
+            const int c = col_offset_ + col;
+            const char* v = PQgetvalue(result_->raw(), row_, c);
+            int len = PQgetlength(result_->raw(), row_, c);
             return {v, static_cast<size_t>(len)};
         }
 
         [[nodiscard]] int index() const noexcept { return row_; }
 
+        /// The same row, with column `n` read as column 0. Offsets accumulate.
+        [[nodiscard]] Row shifted(int n) const noexcept {
+            Row r = *this;
+            r.col_offset_ += n;
+            return r;
+        }
+
     private:
         const PgResult* result_;
         int row_;
+        int col_offset_ = 0;
     };
+
+    // The offset fills what was padding after row_: Row keeps its size.
+    static_assert(sizeof(Row) == 16);
 
     // Construction / ownership
 

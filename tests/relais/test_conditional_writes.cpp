@@ -19,6 +19,8 @@
  *   F. errors — overflow is a DB error (nullopt), the row is untouched.
  *   G. guard and ordering SQL — each form, structure rules, binding order.
  *   H. guards and orderings evaluated by PostgreSQL — NULL, empty sets, enums.
+ *   I. row column offset — one result row carrying the old and the new version,
+ *      each decoded by the generated fromRow.
  */
 
 #include <catch2/catch_test_macros.hpp>
@@ -666,4 +668,53 @@ TEST_CASE("[guard] set<F>(enum) binds the database string", "[guard][integration
     REQUIRE(v->state == SlotState::Taken);
     auto r = execQueryArgs("SELECT state FROM relais_test_slots WHERE id = $1", id);
     REQUIRE(r[0].get<std::string>(0) == "taken");
+}
+
+// #############################################################################
+//
+//  I. Row column offset: before and after in one row
+//
+// #############################################################################
+
+TEST_CASE("[row-offset] decode RETURNING o.*, t.* at both offsets", "[row-offset][integration]")
+{
+    TransactionGuard guard;
+    auto id = insertSlot(4, 10);
+
+    // Locked old version, then the update: one row holds both, old first.
+    auto r = execQueryArgs(
+        "WITH o AS (SELECT * FROM relais_test_slots WHERE id = $1 FOR UPDATE) "
+        "UPDATE relais_test_slots AS t "
+        "SET state = 'held', holder = 42, expires_at = now(), counter = t.counter + 1 "
+        "FROM o WHERE t.id = o.id RETURNING o.*, t.*", id);
+    REQUIRE(r.rows() == 1);
+    const int width = r.cols() / 2;
+    REQUIRE(width == 8);
+
+    auto before = SlotMapping::fromRow<TestSlotEntity>(r[0]);
+    auto after = SlotMapping::fromRow<TestSlotEntity>(r[0].shifted(width));
+    REQUIRE(before);
+    REQUIRE(after);
+
+    CHECK(before->id == id);
+    CHECK(before->state == SlotState::Free);
+    CHECK_FALSE(before->holder);
+    CHECK_FALSE(before->expires_at);
+    CHECK(before->counter == 4);
+    CHECK(before->version == 10);
+
+    CHECK(after->id == id);
+    CHECK(after->state == SlotState::Held);
+    CHECK(after->holder == std::optional<int64_t>{42});
+    CHECK(after->expires_at);
+    CHECK(after->counter == 5);
+    CHECK(after->version == 10);
+
+    SECTION("offsets accumulate, and NULL tests follow the offset") {
+        auto row = r[0].shifted(3);
+        CHECK(row.isNull(0));                                  // o.holder
+        CHECK(row.shifted(width).get<int64_t>(0) == 42);       // t.holder
+        CHECK(row.shifted(width - 3).get<int64_t>(0) == id);   // t.id
+        CHECK(r[0].rawValue(0) == row.shifted(-3).rawValue(0));
+    }
 }
