@@ -37,6 +37,16 @@
  *   K. patchWhere — SQL shape, the three return forms on every cache preset,
  *      the predicate re-checked under contention, composite key, list pages of
  *      the old and the new group, cross-invalidation of both targets.
+ *
+ * Claim: claim<{.mode, .lock, .returns}>(when(...), [orderBy(...)], n, updates...)
+ * takes the first n matching rows of an ordering (primary key by default) in
+ * one statement: exactly n or nothing (Exact), or up to n (UpTo), passing over
+ * rows a concurrent writer holds (SkipLocked) or waiting on them (Wait). The
+ * rows come back in the ordering.
+ *
+ *   L. claim — SQL shape, Exact and UpTo on every cache preset, result order
+ *      follows the ordering (first(), NULL placement), previous holder exposed,
+ *      locked rows skipped or waited on, composite key, list pages.
  */
 
 #include <catch2/catch_test_macros.hpp>
@@ -44,6 +54,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <future>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -52,6 +64,7 @@
 #include "fixtures/TestRepositories.h"
 #include "fixtures/RelaisTestAccessors.h"
 #include "jcailloux/relais/io/WhenAll.h"
+#include "jcailloux/relais/io/pg/PgConnection.h"
 
 using namespace relais_test;
 using namespace std::chrono_literals;
@@ -1318,5 +1331,363 @@ TEMPLATE_TEST_CASE("[patchWhere] cross-invalidation of the old and the new targe
         REQUIRE(move(0) == std::optional<size_t>{1});
         CHECK_FALSE(TestInternals::getFromCache<Target>(int64_t{5000}));
         CHECK_FALSE(TestInternals::getFromCache<Target>(int64_t{6000}));
+    }
+}
+
+// #############################################################################
+//
+//  L. Claim
+//
+// #############################################################################
+
+TEST_CASE("[claim] SQL: locked candidates ranked, count check, both versions and rank",
+          "[claim][sql]")
+{
+    namespace d = jr::detail;
+
+    SECTION("Exact, SkipLocked, ordered: SET, n, predicate, then ordering values") {
+        auto pred = when(eq<SlotF::group_id>(int64_t{1}), eq<SlotF::state>(SlotState::Free));
+        auto order = orderBy(first(eq<SlotF::holder>(int64_t{5})), desc<SlotF::priority>());
+        auto sql = d::buildClaimSql<SlotTraits, decltype(pred), decltype(order)>(
+            SlotMapping::table_name, SlotMapping::primary_key_column,
+            {d::SetColumn(std::string_view("\"holder\"")),
+             d::SetColumn(std::string_view("\"expires_at\""), jr::entity::SetOp::NowPlus)},
+            "id, holder, priority", jr::ClaimMode::Exact, jr::Lock::SkipLocked);
+        const std::string ord =
+            "ORDER BY CASE WHEN \"holder\"=$6 THEN 0 ELSE 1 END,\"priority\" DESC,\"id\"";
+        REQUIRE(sql ==
+            "WITH l AS (SELECT id, holder, priority FROM relais_test_slots "
+            "WHERE \"group_id\"=$4 AND \"state\"=$5 " + ord +
+            " LIMIT $3 FOR UPDATE SKIP LOCKED), "
+            "c AS (SELECT l.*,row_number() OVER (" + ord + ") AS relais_claim_rank FROM l) "
+            "UPDATE relais_test_slots AS t SET \"holder\"=$1,"
+            "\"expires_at\"=now()+interval '1 microsecond'*$2 "
+            "FROM c WHERE t.\"id\"=c.\"id\" AND (SELECT count(*) FROM c)=$3 "
+            "RETURNING c.id,c.holder,c.priority,t.id,t.holder,t.priority,c.relais_claim_rank");
+    }
+
+    SECTION("UpTo, Wait, composite key: no count check, the key closes the ordering") {
+        using TallyTraits = TestSlotTallyEntity::TraitsType;
+        using TallyMapping = entity::generated::TestSlotTallyMapping;
+        using P = decltype(when(lt<TallyF::hits>(int64_t{3})));
+        auto sql = d::buildClaimSql<TallyTraits, P, void>(
+            TallyMapping::table_name, TallyMapping::primary_key_columns,
+            {d::SetColumn(std::string_view("\"hits\""), jr::entity::SetOp::Add)},
+            TallyMapping::SQL::returning_columns, jr::ClaimMode::UpTo, jr::Lock::Wait);
+        REQUIRE(sql ==
+            "WITH l AS (SELECT group_id, bucket, hits FROM relais_test_slot_tallies "
+            "WHERE \"hits\"<$3 ORDER BY \"group_id\",\"bucket\" LIMIT $2 FOR UPDATE), "
+            "c AS (SELECT l.*,row_number() OVER (ORDER BY \"group_id\",\"bucket\") "
+            "AS relais_claim_rank FROM l) "
+            "UPDATE relais_test_slot_tallies AS t SET \"hits\"=t.\"hits\"+$1 "
+            "FROM c WHERE t.\"group_id\"=c.\"group_id\" AND t.\"bucket\"=c.\"bucket\" "
+            "RETURNING c.group_id,c.bucket,c.hits,t.group_id,t.bucket,t.hits,"
+            "c.relais_claim_rank");
+    }
+}
+
+namespace {
+
+constexpr jr::ClaimOptions kUpTo{.mode = jr::ClaimMode::UpTo};
+constexpr jr::ClaimOptions kClaimCount{.returns = jr::Returns::Count};
+constexpr jr::ClaimOptions kClaimChanges{.returns = jr::Returns::Changes};
+constexpr jr::ClaimOptions kWaitChanges{.lock = jr::Lock::Wait, .returns = jr::Returns::Changes};
+
+template<typename E>
+Ids idsOf(const std::vector<E>& rows) {
+    Ids ids;
+    for (const auto& e : rows) ids.push_back(e.id);
+    return ids;
+}
+
+/// Four free slots in group 1 (priorities 2, 8, 5, 8) and one in group 2.
+struct FreeSlots { int64_t f0, f1, f2, f3, other; };
+
+FreeSlots insertFreeSlots() {
+    FreeSlots s;
+    s.f0 = insertGroupedSlot(1, 2);
+    s.f1 = insertGroupedSlot(1, 8);
+    s.f2 = insertGroupedSlot(1, 5);
+    s.f3 = insertGroupedSlot(1, 8);
+    s.other = insertGroupedSlot(2, 9);
+    return s;
+}
+
+auto freeInGroup1() {
+    return when(eq<SlotF::group_id>(int64_t{1}), eq<SlotF::state>(SlotState::Free));
+}
+
+size_t freeCount() {
+    return static_cast<size_t>(execQuery(
+        "SELECT count(*) FROM relais_test_slots WHERE state = 'free'")[0].get<int64_t>(0));
+}
+
+/// A second session, outside relais, holding row locks in its own transaction.
+/// Created and destroyed on the event loop; closing it rolls back.
+class LockSession {
+public:
+    using Conn = io::PgConnection<IoCtx>;
+
+    LockSession() {
+        conn_ = sync([]() -> io::Task<std::shared_ptr<Conn>> {
+            co_return std::make_shared<Conn>(
+                co_await Conn::connect(relais_test::detail::testIo(), getConnInfo()));
+        }());
+    }
+
+    ~LockSession() {
+        try {
+            sync([](std::shared_ptr<Conn> c) -> io::Task<void> { c.reset(); co_return; }(
+                std::move(conn_)));
+        } catch (...) {}
+    }
+
+    LockSession(const LockSession&) = delete;
+    LockSession& operator=(const LockSession&) = delete;
+
+    void exec(const std::string& sql) { sync(conn_->query(sql.c_str())); }
+
+    void lockRow(int64_t id) {
+        exec("BEGIN");
+        exec("SELECT 1 FROM relais_test_slots WHERE id = " + std::to_string(id) + " FOR UPDATE");
+    }
+
+private:
+    std::shared_ptr<Conn> conn_;
+};
+
+}  // namespace
+
+TEMPLATE_TEST_CASE("[claim] Exact and UpTo",
+                   "[claim][integration]",
+                   UncachedTestSlotRepo, L1TestSlotRepo, L2TestSlotRepo,
+                   FullCacheTestSlotRepo)
+{
+    using Repo = TestType;
+    TransactionGuard guard;
+    auto s = insertFreeSlots();
+    for (auto id : {s.f0, s.f1, s.f2, s.f3, s.other}) REQUIRE(sync(Repo::find(id)));  // warm
+
+    SECTION("Exact with enough candidates: n rows, primary-key order, every tier sees them") {
+        auto rows = sync(Repo::claim(freeInGroup1(), 2,
+            set<SlotF::state>(SlotState::Held), set<SlotF::holder>(int64_t{42})));
+        REQUIRE(rows);
+        CHECK(idsOf(*rows) == Ids{s.f0, s.f1});
+        for (const auto& e : *rows) {
+            CHECK(e.state == SlotState::Held);
+            CHECK(e.holder == std::optional<int64_t>{42});
+        }
+        CHECK(sync(Repo::find(s.f0))->holder == std::optional<int64_t>{42});
+        CHECK(sync(Repo::find(s.f1))->state == SlotState::Held);
+        CHECK(sync(Repo::find(s.f2))->state == SlotState::Free);
+        CHECK(freeCount() == 3);
+    }
+
+    SECTION("Exact without enough candidates: empty, nothing written") {
+        auto rows = sync(Repo::claim(freeInGroup1(), 5, set<SlotF::state>(SlotState::Held)));
+        REQUIRE(rows);
+        CHECK(rows->empty());
+        CHECK(freeCount() == 5);
+        CHECK(sync(Repo::find(s.f0))->state == SlotState::Free);
+    }
+
+    SECTION("UpTo: every available candidate, at most n") {
+        auto rows = sync(Repo::template claim<kUpTo>(freeInGroup1(), 5,
+            set<SlotF::state>(SlotState::Held)));
+        REQUIRE(rows);
+        CHECK(idsOf(*rows) == Ids{s.f0, s.f1, s.f2, s.f3});
+        CHECK(sync(Repo::find(s.f3))->state == SlotState::Held);
+        CHECK(sync(Repo::find(s.other))->state == SlotState::Free);
+
+        auto none = sync(Repo::template claim<kUpTo>(freeInGroup1(), 5,
+            set<SlotF::state>(SlotState::Held)));
+        REQUIRE(none);
+        CHECK(none->empty());
+    }
+
+    SECTION("Count") {
+        CHECK(sync(Repo::template claim<kClaimCount>(freeInGroup1(), 3,
+            increment<SlotF::counter>(1))) == std::optional<size_t>{3});
+        CHECK(sync(Repo::template claim<kClaimCount>(freeInGroup1(), 0,
+            increment<SlotF::counter>(1))) == std::optional<size_t>{0});
+    }
+
+    SECTION("the rows come back in the ordering, the primary key breaking ties") {
+        auto rows = sync(Repo::claim(freeInGroup1(), orderBy(desc<SlotF::priority>()), 3,
+            set<SlotF::state>(SlotState::Held)));
+        REQUIRE(rows);
+        CHECK(idsOf(*rows) == Ids{s.f1, s.f3, s.f2});
+        CHECK(sync(Repo::find(s.f0))->state == SlotState::Free);
+    }
+
+    SECTION("DB error: nullopt, and the statement changed no row") {
+        execQueryArgs("UPDATE relais_test_slots SET counter = 2147483000 WHERE id = $1", s.f1);
+        auto rows = sync(Repo::claim(freeInGroup1(), 2, increment<SlotF::counter>(1'000)));
+        CHECK_FALSE(rows);
+        CHECK(dbCounter(s.f0) == 0);
+        CHECK(sync(Repo::find(s.f0))->counter == 0);
+    }
+}
+
+TEMPLATE_TEST_CASE("[claim] orderings and the previous holder",
+                   "[claim][integration][order]",
+                   UncachedTestSlotRepo, FullCacheTestSlotRepo)
+{
+    using Repo = TestType;
+    TransactionGuard guard;
+    auto s = insertSlotSet();  // a free p1, b held expired p5, c held p5, d taken p3
+    auto open = when(in<SlotF::state>({SlotState::Free, SlotState::Held}));
+
+    SECTION("first(): free or expired slots ahead, then by priority") {
+        // Without first(): b, c. The takeable ones go first: b (p5), then a (p1).
+        auto rows = sync(Repo::claim(open,
+            orderBy(first(anyOf(eq<SlotF::state>(SlotState::Free),
+                                lt<SlotF::expires_at>(dbNow))),
+                    desc<SlotF::priority>()),
+            2, set<SlotF::holder>(int64_t{42})));
+        REQUIRE(rows);
+        CHECK(idsOf(*rows) == Ids{s.b, s.a});
+    }
+
+    SECTION("NULL placement overridden: desc with NULLs last") {
+        auto rows = sync(Repo::template claim<kUpTo>(when(ge<SlotF::priority>(0)),
+            orderBy(desc<SlotF::expires_at, Nulls::Last>()), 3,
+            set<SlotF::holder>(int64_t{42})));
+        REQUIRE(rows);
+        CHECK(idsOf(*rows) == Ids{s.c, s.b, s.a});
+    }
+
+    SECTION("Changes: preempting the latest hold exposes its previous holder") {
+        REQUIRE(sync(Repo::find(s.c))->holder == std::optional<int64_t>{8});  // warm
+        auto changes = sync(Repo::template claim<kClaimChanges>(
+            when(eq<SlotF::state>(SlotState::Held)),
+            orderBy(desc<SlotF::expires_at>()), 1,
+            set<SlotF::state>(SlotState::Taken), set<SlotF::holder>(int64_t{99})));
+        REQUIRE(changes);
+        REQUIRE(changes->size() == 1);
+        const auto& c = changes->front();
+        CHECK(c.before.id == s.c);
+        CHECK(c.before.holder == std::optional<int64_t>{8});
+        CHECK(c.before.state == SlotState::Held);
+        CHECK(c.after.holder == std::optional<int64_t>{99});
+        CHECK(c.after.state == SlotState::Taken);
+        CHECK(sync(Repo::find(s.c))->holder == std::optional<int64_t>{99});
+    }
+}
+
+TEMPLATE_TEST_CASE("[claim] rows locked by a concurrent transaction",
+                   "[claim][integration][concurrency]",
+                   UncachedTestSlotRepo, FullCacheTestSlotRepo)
+{
+    using Repo = TestType;
+    TransactionGuard guard;
+    auto s = insertFreeSlots();
+    LockSession lock;   // declared after the guard: released before its cleanup
+    lock.lockRow(s.f0);
+
+    SECTION("SkipLocked passes over the locked row") {
+        auto rows = sync(Repo::claim(freeInGroup1(), 1, set<SlotF::holder>(int64_t{42})));
+        REQUIRE(rows);
+        CHECK(idsOf(*rows) == Ids{s.f1});
+
+        // Four candidates, one locked: an Exact claim of four is refused.
+        auto all = sync(Repo::claim(freeInGroup1(), 4, set<SlotF::holder>(int64_t{42})));
+        REQUIRE(all);
+        CHECK(all->empty());
+        lock.exec("ROLLBACK");
+        CHECK_FALSE(sync(Repo::find(s.f2))->holder);
+    }
+
+    SECTION("Wait takes the locked row once its transaction commits, as committed") {
+        auto pending = std::async(std::launch::async, [] {
+            return sync(Repo::template claim<kWaitChanges>(freeInGroup1(), 1,
+                set<SlotF::holder>(int64_t{42})));
+        });
+        CHECK(pending.wait_for(300ms) == std::future_status::timeout);
+
+        lock.exec("UPDATE relais_test_slots SET priority = 7 WHERE id = " + std::to_string(s.f0));
+        lock.exec("COMMIT");
+
+        auto changes = pending.get();
+        REQUIRE(changes);
+        REQUIRE(changes->size() == 1);
+        CHECK(changes->front().before.id == s.f0);
+        CHECK(changes->front().before.priority == 7);   // the committed version
+        CHECK(changes->front().after.holder == std::optional<int64_t>{42});
+    }
+
+    SECTION("Wait re-checks the row: no longer matching, the next candidate is taken") {
+        auto pending = std::async(std::launch::async, [] {
+            return sync(Repo::template claim<kWaitChanges>(freeInGroup1(), 1,
+                set<SlotF::holder>(int64_t{42})));
+        });
+        CHECK(pending.wait_for(300ms) == std::future_status::timeout);
+
+        lock.exec("UPDATE relais_test_slots SET state = 'taken' WHERE id = " + std::to_string(s.f0));
+        lock.exec("COMMIT");
+
+        auto changes = pending.get();
+        REQUIRE(changes);
+        REQUIRE(changes->size() == 1);
+        CHECK(changes->front().before.id == s.f1);
+        CHECK(sync(Repo::find(s.f1))->holder == std::optional<int64_t>{42});
+        CHECK_FALSE(sync(Repo::find(s.f0))->holder);
+    }
+}
+
+TEMPLATE_TEST_CASE("[claim] composite key", "[claim][integration]",
+                   UncachedTestSlotTallyRepo, FullCacheTestSlotTallyRepo)
+{
+    using Repo = TestType;
+    TransactionGuard guard;
+    execQuery("INSERT INTO relais_test_slot_tallies (group_id, bucket, hits) VALUES "
+              "(1, 1, 1), (1, 2, 3), (1, 3, 0), (2, 1, 0)");
+    auto k = std::tuple{int64_t{2}, int64_t{1}};
+    REQUIRE(sync(Repo::find(k))->hits == 0);  // warm
+
+    // The two least-used buckets below the cap, fewest hits first.
+    auto changes = sync(Repo::template claim<kClaimChanges>(
+        when(lt<TallyF::hits>(int64_t{3})), orderBy(asc<TallyF::hits>()), 2,
+        increment<TallyF::hits>(1)));
+    REQUIRE(changes);
+    REQUIRE(changes->size() == 2);
+    CHECK((*changes)[0].before.key() == std::tuple{int64_t{1}, int64_t{3}});
+    CHECK((*changes)[1].before.key() == k);
+    CHECK((*changes)[1].after.hits == 1);
+    CHECK(sync(Repo::find(k))->hits == 1);
+}
+
+TEMPLATE_TEST_CASE("[claim] a claimed row moves between list pages",
+                   "[claim][integration][list]",
+                   L1TestSlotListRepo, FullCacheTestSlotListRepo, InvalidatingTestSlotListRepo)
+{
+    using List = TestType;
+    using ListF = TestSlotListEntity::Field;
+    TransactionGuard guard;
+    TestInternals::resetEntityCacheState<List>();
+    TestInternals::resetListCacheState<List>();
+
+    insertGroupedSlot(100, 7);
+    insertGroupedSlot(200);
+    REQUIRE(groupSize<List>(100) == 1);
+    REQUIRE(groupSize<List>(200) == 1);
+    insertGroupedSlot(100);   // behind the cached page
+
+    SECTION("refused: the pages are not invalidated") {
+        auto rows = sync(List::claim(when(eq<ListF::priority>(7)), 2,
+            set<ListF::group_id>(int64_t{200})));
+        REQUIRE(rows);
+        REQUIRE(rows->empty());
+        CHECK(groupSize<List>(100) == 1);
+        CHECK(groupSize<List>(200) == 1);
+    }
+
+    SECTION("taken: the old and the new group are both invalidated") {
+        auto rows = sync(List::claim(when(eq<ListF::priority>(7)), 1,
+            set<ListF::group_id>(int64_t{200})));
+        REQUIRE(rows);
+        REQUIRE(rows->size() == 1);
+        CHECK(groupSize<List>(100) == 1);   // re-fetched: the bypass row, not ours
+        CHECK(groupSize<List>(200) == 2);
     }
 }

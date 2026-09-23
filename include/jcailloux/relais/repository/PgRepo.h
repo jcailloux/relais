@@ -1,11 +1,13 @@
 #ifndef JCX_RELAIS_PGREPO_H
 #define JCX_RELAIS_PGREPO_H
 
+#include <algorithm>
 #include <atomic>
 #include <concepts>
 #include <optional>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "jcailloux/relais/io/Task.h"
@@ -215,20 +217,24 @@ inline void appendQualifiedColumns(std::string& sql, std::string_view columns,
     return n;
 }
 
-/// Append `t."pk"=o."pk"` for each key column (joined by AND).
-inline void appendPkJoin(std::string& sql, std::string_view pk_column) {
+/// Append `t."pk"=<cte>."pk"` for each key column (joined by AND).
+inline void appendPkJoin(std::string& sql, std::string_view pk_column,
+                         std::string_view cte = "o") {
     sql += "t.\"";
     sql += pk_column;
-    sql += "\"=o.\"";
+    sql += "\"=";
+    sql += cte;
+    sql += ".\"";
     sql += pk_column;
     sql += '"';
 }
 
 template<size_t N>
-void appendPkJoin(std::string& sql, const std::array<const char*, N>& pk_columns) {
+void appendPkJoin(std::string& sql, const std::array<const char*, N>& pk_columns,
+                  std::string_view cte = "o") {
     for (size_t i = 0; i < N; ++i) {
         if (i > 0) sql += " AND ";
-        appendPkJoin(sql, pk_columns[i]);
+        appendPkJoin(sql, pk_columns[i], cte);
     }
 }
 
@@ -267,6 +273,76 @@ std::string buildPatchWhereSql(
     appendQualifiedColumns(sql, columns, "o.");
     sql += ',';
     appendQualifiedColumns(sql, columns, "t.");
+    return sql;
+}
+
+/// Name of the rank column a claim returns after both row versions; unusual
+/// enough not to collide with an entity column.
+inline constexpr std::string_view kClaimRankColumn = "relais_claim_rank";
+
+/// Build the claim UPDATE that takes the first n candidates of an ordering:
+///   WITH l AS (SELECT <cols> FROM tbl WHERE <pred> ORDER BY <order> LIMIT $n
+///              FOR UPDATE [SKIP LOCKED]),
+///        c AS (SELECT l.*, row_number() OVER (ORDER BY <order>) AS rank FROM l)
+///   UPDATE tbl AS t SET <sets> FROM c WHERE t.pk=c.pk [AND (SELECT count(*) FROM c)=$n]
+///   RETURNING c.<cols>, t.<cols>, c.rank
+/// PostgreSQL rejects a window function next to FOR UPDATE, hence the second
+/// CTE ranking the locked rows; RETURNING order is unspecified, the rank
+/// restores the ordering. The count check (Exact) writes nothing unless all n
+/// rows were obtained. Parameters: SET values, then n, then the predicate
+/// values, then the ordering values; the ordering is emitted once and pasted
+/// twice, so both copies share their placeholders.
+template<typename Traits, typename Pred, typename Order, typename Pk>
+std::string buildClaimSql(
+    std::string_view table_name,
+    const Pk& pk,
+    std::initializer_list<SetColumn> sets,
+    std::string_view columns,
+    ClaimMode mode,
+    Lock lock)
+{
+    std::string set_clause;
+    size_t param = appendSetClause(set_clause, sets, "t.");
+    const std::string n_param = "$" + std::to_string(param++);
+
+    std::string where;
+    GuardSql<Traits, Pred>::emit(where, param, {});
+    std::string order;
+    OrderBySql<Traits, Order>::emit(order, param, {}, pk);
+
+    std::string sql;
+    sql.reserve(320 + 3 * columns.size() + 2 * order.size());
+    sql += "WITH l AS (SELECT ";
+    sql += columns;
+    sql += " FROM ";
+    sql += table_name;
+    sql += " WHERE ";
+    sql += where;
+    sql += ' ';
+    sql += order;
+    sql += " LIMIT ";
+    sql += n_param;
+    sql += lock == Lock::SkipLocked ? " FOR UPDATE SKIP LOCKED)" : " FOR UPDATE)";
+    sql += ", c AS (SELECT l.*,row_number() OVER (";
+    sql += order;
+    sql += ") AS ";
+    sql += kClaimRankColumn;
+    sql += " FROM l) UPDATE ";
+    sql += table_name;
+    sql += " AS t SET ";
+    sql += set_clause;
+    sql += " FROM c WHERE ";
+    appendPkJoin(sql, pk, "c");
+    if (mode == ClaimMode::Exact) {
+        sql += " AND (SELECT count(*) FROM c)=";
+        sql += n_param;
+    }
+    sql += " RETURNING ";
+    appendQualifiedColumns(sql, columns, "c.");
+    sql += ',';
+    appendQualifiedColumns(sql, columns, "t.");
+    sql += ",c.";
+    sql += kClaimRankColumn;
     return sql;
 }
 
@@ -1017,6 +1093,84 @@ protected:
             throw;
         } catch (const io::PgError& e) {
             RELAIS_LOG_ERROR << name() << ": patchWhere error - " << e.what();
+            co_return std::nullopt;
+        }
+    }
+
+    /// Claim: change the first `n` rows of `order` (void = primary key) among
+    /// those matching `pred`, returning each before and after, in that order.
+    /// nullopt on a deterministic DB error; an empty vector when no row was
+    /// taken (Exact: fewer than n candidates, nothing written).
+    template<ClaimOptions O, typename Order, typename... Gs, typename... Updates>
+    static io::Task<std::optional<std::vector<Change<E>>>> claimRaw(
+        const entity::Guards<Gs...>& pred, const Order* order, size_t n,
+        Updates&&... updates)
+        requires HasFieldUpdate<E> && (!Cfg.read_only)
+    {
+        static_assert(sizeof...(Gs) > 0,
+            "claim requires a predicate: an empty one would take any row of the table");
+        static_assert(sizeof...(Updates) > 0, "claim requires at least one field update");
+        using Traits = typename E::TraitsType;
+        using Pred = entity::Guards<Gs...>;
+        constexpr int width = detail::countColumns(Mapping::SQL::returning_columns);
+        if (n == 0) co_return std::vector<Change<E>>{};
+        try {
+            static const auto sql = []{
+                if constexpr (is_tuple_v<Key>) {
+                    return detail::buildClaimSql<Traits, Pred, Order>(
+                        Mapping::table_name,
+                        Mapping::primary_key_columns,
+                        {detail::SetColumn(
+                            entity::fieldColumnName<Traits>(std::remove_cvref_t<Updates>{}),
+                            entity::set_op_v<std::remove_cvref_t<Updates>>)...},
+                        Mapping::SQL::returning_columns, O.mode, O.lock);
+                } else {
+                    return detail::buildClaimSql<Traits, Pred, Order>(
+                        Mapping::table_name,
+                        Mapping::primary_key_column,
+                        {detail::SetColumn(
+                            entity::fieldColumnName<Traits>(std::remove_cvref_t<Updates>{}),
+                            entity::set_op_v<std::remove_cvref_t<Updates>>)...},
+                        Mapping::SQL::returning_columns, O.mode, O.lock);
+                }
+            }();
+
+            auto params = io::PgParams::make(
+                entity::fieldValue<Traits>(std::forward<Updates>(updates))...,
+                static_cast<int64_t>(n));
+            params.params.reserve(params.params.size()
+                + detail::GuardSql<Traits, Pred>::params
+                + detail::OrderBySql<Traits, Order>::params);
+            detail::GuardSql<Traits, Pred>::bind(params, pred);
+            if constexpr (!std::is_void_v<Order>)
+                detail::OrderBySql<Traits, Order>::bind(params, *order);
+
+            // Two identical claims must take distinct rows: never coalesced.
+            auto w = co_await PgProvider::queryWrite(
+                sql.c_str(), params, io::batch::WriteMode::Exclusive);
+
+            std::vector<std::pair<int64_t, Change<E>>> ranked;
+            ranked.reserve(static_cast<size_t>(w.result.rows()));
+            for (int r = 0; r < w.result.rows(); ++r) {
+                auto row = w.result[r];
+                auto before = E::fromRow(row);
+                auto after = E::fromRow(row.shifted(width));
+                if (before && after)
+                    ranked.emplace_back(row.shifted(2 * width).template get<int64_t>(0),
+                                        Change<E>{std::move(*before), std::move(*after)});
+            }
+            std::sort(ranked.begin(), ranked.end(),
+                      [](const auto& a, const auto& b) { return a.first < b.first; });
+            std::vector<Change<E>> out;
+            out.reserve(ranked.size());
+            for (auto& [rank, c] : ranked) out.push_back(std::move(c));
+            co_return out;
+        } catch (const io::PgUncertainError&) {
+            // Uncertain: the claim may have committed, and the rows taken are
+            // unknowable. Propagate; the facade logs the residual staleness.
+            throw;
+        } catch (const io::PgError& e) {
+            RELAIS_LOG_ERROR << name() << ": claim error - " << e.what();
             co_return std::nullopt;
         }
     }
