@@ -29,6 +29,7 @@
 #include "generated/TestUpsertListEntity.h"
 #include "generated/TestSlotEntity.h"
 #include "generated/TestSlotTallyEntity.h"
+#include "generated/TestSlotListEntity.h"
 
 namespace relais_test {
 
@@ -61,6 +62,7 @@ using entity::generated::TestCompositeKeyListEntity;
 using entity::generated::TestUpsertListEntity;
 using entity::generated::TestSlotEntity;
 using entity::generated::TestSlotTallyEntity;
+using entity::generated::TestSlotListEntity;
 
 // Cross-invalidation key extractors
 inline constexpr auto purchaseUserId = [](const auto& p) -> int64_t { return p.user_id; };
@@ -427,5 +429,18 @@ using FullCacheTestSlotRepo = Repo<TestSlotEntity, "test:slot:both", cfg::Both>;
 
 using UncachedTestSlotTallyRepo = Repo<TestSlotTallyEntity, "test:tally:uncached", cfg::Uncached>;
 using FullCacheTestSlotTallyRepo = Repo<TestSlotTallyEntity, "test:tally:both", cfg::Both>;
+
+/// Slots paged by group (ListMixin), on L1 lists and on L1+L2 lists.
+using L1TestSlotListRepo = Repo<TestSlotListEntity, "test:slotlist:l1">;
+using FullCacheTestSlotListRepo = Repo<TestSlotListEntity, "test:slotlist:both", cfg::Both>;
+
+/// A slot's group_id doubles as a foreign key into a dedicated item repo, so a
+/// guarded write that moves it cross-invalidates the old and new target.
+inline constexpr auto slotGroupId = [](const auto& s) -> int64_t { return s.group_id; };
+using L1SlotInvTargetRepo = Repo<TestItemEntity, "test:slotinv:target:l1">;
+using InvalidatingTestSlotRepo = Repo<TestSlotEntity, "test:slot:inv:l1",
+    cfg::Local, Invalidate<L1SlotInvTargetRepo, slotGroupId>>;
+using InvalidatingTestSlotListRepo = Repo<TestSlotListEntity, "test:slotlist:inv:l1",
+    cfg::Local, Invalidate<L1SlotInvTargetRepo, slotGroupId>>;
 
 } // namespace relais_test

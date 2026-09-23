@@ -179,6 +179,19 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
             co_return Base::makeView(std::move(*entity));
         }
 
+        /// Guarded partial update: invalidates Redis then delegates to
+        /// Base::patchIfRaw. nullopt on DB error, empty view when refused.
+        template<typename... Gs, typename... Updates>
+        static io::Task<std::optional<cache::CacheView<E>>> patchIf(
+            const Key& id, const entity::Guards<Gs...>& guard, Updates&&... updates)
+            requires HasFieldUpdate<E> && (!Cfg.read_only)
+        {
+            auto outcome = co_await patchIfRaw(id, guard, std::forward<Updates>(updates)...);
+            if (outcome.error) co_return std::nullopt;
+            if (!outcome.entity) co_return cache::CacheView<E>{};
+            co_return Base::makeView(std::move(*outcome.entity));
+        }
+
         /// Erase entity by ID.
         /// Returns: rows deleted (0 if not found), or nullopt on DB error.
         /// Invalidates Redis cache unless DB error occurred.
@@ -696,6 +709,18 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
             // outlive a Redis outage.
             co_await evictL2OrSelfHeal(id);
             co_return co_await Base::patchRaw(id, std::forward<Updates>(updates)...);
+        }
+
+        /// Guarded partial update: invalidates Redis, returning the outcome.
+        /// A refused guard still costs the eviction: the refusal is only known
+        /// after the write.
+        template<typename... Gs, typename... Updates>
+        static io::Task<typename Base::GuardedPatchOutcome> patchIfRaw(
+            const Key& id, const entity::Guards<Gs...>& guard, Updates&&... updates)
+            requires HasFieldUpdate<E> && (!Cfg.read_only)
+        {
+            co_await evictL2OrSelfHeal(id);
+            co_return co_await Base::patchIfRaw(id, guard, std::forward<Updates>(updates)...);
         }
 
         // =====================================================================
