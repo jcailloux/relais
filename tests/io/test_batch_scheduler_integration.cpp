@@ -124,6 +124,24 @@ DetachedTask coalescedExecute(
     ++completed;
 }
 
+// Mode-aware write helper — records the coalesced flag and the first returned
+// int column of its own result.
+DetachedTask modeWrite(
+    std::shared_ptr<BatchScheduler<Io>> batcher,
+    std::atomic<int>& completed,
+    WriteMode mode,
+    bool& coalesced_out,
+    int& returned_out,
+    const char* sql,
+    PgParams params)
+{
+    auto [result, coalesced] = co_await batcher->submitPgWrite(
+        sql, std::move(params), mode);
+    coalesced_out = coalesced;
+    if (result.rows() > 0) returned_out = result[0].get<int32_t>(0);
+    ++completed;
+}
+
 // Ordered-write helper — submits one write, records its affectedRows and, if it
 // has a RETURNING row, the first returned int column. Used to prove intra-batch
 // write→write order (INSERT-then-UPDATE same PK).
@@ -1117,6 +1135,128 @@ TEST_CASE("Write coalescing: N absolute SETs are idempotent in final state",
         REQUIRE(check.ok());
         REQUIRE(check.rows() == 1);
         REQUIRE(check[0].get<int32_t>(0) == kVal);
+
+        done = true;
+    };
+    task();
+
+    io.runUntil([&] { return done || timeout.timed_out; });
+    REQUIRE_FALSE(timeout.timed_out);
+    REQUIRE(done);
+}
+
+// A relative write is not idempotent: coalescing N identical `val = val + 1`
+// would apply one increment and report N successes. WriteMode::Exclusive keeps
+// each write on its own entry, so the final state counts every caller.
+TEST_CASE("Write coalescing: identical Exclusive writes all execute",
+          "[io][batch][integration][coalesce]")
+{
+    Io io;
+    bool done = false;
+    TimeoutGuard timeout(io);
+
+    auto task = [&]() -> DetachedTask {
+        auto pool = co_await PgPool<Io>::create(io, CONNINFO, {.min_connections = 1, .max_connections = 1});
+        auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, nullptr, 8);
+
+        co_await bootstrapPg(batcher);
+
+        co_await batcher->directQuery(
+            "CREATE TEMP TABLE IF NOT EXISTS coal_excl (id INT PRIMARY KEY, val INT)");
+        co_await batcher->directQuery(
+            "INSERT INTO coal_excl VALUES (1, 0)");
+
+        constexpr int N = 10;
+        std::atomic<int> completed{0};
+        bool coalesced[N] = {};
+        int returned[N] = {};
+        static constexpr const char* SQL =
+            "UPDATE coal_excl SET val = val + 1 WHERE id = $1 RETURNING val";
+
+        for (int i = 0; i < N; ++i) {
+            modeWrite(batcher, completed, WriteMode::Exclusive,
+                      coalesced[i], returned[i], SQL, PgParams::make(1));
+        }
+
+        while (completed.load() < N) {
+            co_await YieldAwaiter{io};
+        }
+
+        // No caller was handed another's result: each saw its own increment.
+        for (int i = 0; i < N; ++i) REQUIRE_FALSE(coalesced[i]);
+        std::vector<int> seen(returned, returned + N);
+        std::sort(seen.begin(), seen.end());
+        for (int i = 0; i < N; ++i) REQUIRE(seen[i] == i + 1);
+
+        auto check = co_await batcher->directQuery(
+            "SELECT val FROM coal_excl WHERE id = 1");
+        REQUIRE(check.ok());
+        REQUIRE(check[0].get<int32_t>(0) == N);
+
+        done = true;
+    };
+    task();
+
+    io.runUntil([&] { return done || timeout.timed_out; });
+    REQUIRE_FALSE(timeout.timed_out);
+    REQUIRE(done);
+}
+
+// The opt-out is two-sided: an Exclusive entry never joins an identical
+// Idempotent leader, and never serves as a leader for an identical Idempotent
+// write. Idempotent writes still coalesce among themselves in the same batch.
+TEST_CASE("Write coalescing: Exclusive neither joins nor leads Idempotent",
+          "[io][batch][integration][coalesce]")
+{
+    Io io;
+    bool done = false;
+    TimeoutGuard timeout(io);
+
+    auto task = [&]() -> DetachedTask {
+        auto pool = co_await PgPool<Io>::create(io, CONNINFO, {.min_connections = 1, .max_connections = 1});
+        auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, nullptr, 8);
+
+        co_await bootstrapPg(batcher);
+
+        co_await batcher->directQuery(
+            "CREATE TEMP TABLE IF NOT EXISTS coal_mixed (id INT PRIMARY KEY, val INT)");
+        co_await batcher->directQuery(
+            "INSERT INTO coal_mixed VALUES (1, 0), (2, 0)");
+
+        static constexpr const char* SQL =
+            "UPDATE coal_mixed SET val = $2 WHERE id = $1 RETURNING id";
+
+        // Submission order (all but the first land in one pending batch):
+        //   0: distinct write, goes direct (Nagle leader)
+        //   1: Exclusive X   — first X in the batch
+        //   2: Idempotent X  — must not join the Exclusive entry
+        //   3: Idempotent X  — coalesces onto entry 2
+        //   4: Exclusive X   — must not join the Idempotent entry
+        constexpr int N = 5;
+        const WriteMode modes[N] = {
+            WriteMode::Idempotent, WriteMode::Exclusive, WriteMode::Idempotent,
+            WriteMode::Idempotent, WriteMode::Exclusive};
+        std::atomic<int> completed{0};
+        bool coalesced[N] = {};
+        int returned[N] = {};
+
+        for (int i = 0; i < N; ++i) {
+            const int id = i == 0 ? 2 : 1;
+            modeWrite(batcher, completed, modes[i], coalesced[i], returned[i],
+                      SQL, PgParams::make(id, 7));
+        }
+
+        while (completed.load() < N) {
+            co_await YieldAwaiter{io};
+        }
+
+        REQUIRE_FALSE(coalesced[0]);
+        REQUIRE_FALSE(coalesced[1]);
+        REQUIRE_FALSE(coalesced[2]);
+        REQUIRE(coalesced[3]);
+        REQUIRE_FALSE(coalesced[4]);
+        REQUIRE(returned[0] == 2);
+        for (int i = 1; i < N; ++i) REQUIRE(returned[i] == 1);
 
         done = true;
     };
