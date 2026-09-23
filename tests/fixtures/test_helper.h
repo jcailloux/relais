@@ -407,6 +407,8 @@ private:
         try { sync(pg->query("DELETE FROM relais_test_upsert_list")); } catch (...) {}
         try { sync(pg->query("DELETE FROM relais_test_array_src")); } catch (...) {}
         try { sync(pg->query("DELETE FROM relais_test_array_rw")); } catch (...) {}
+        try { sync(pg->query("DELETE FROM relais_test_slots")); } catch (...) {}
+        try { sync(pg->query("DELETE FROM relais_test_slot_tallies")); } catch (...) {}
 
         // Reset GDSF global state for test isolation
         jcailloux::relais::cache::GDSFPolicy::instance().resetForTesting();

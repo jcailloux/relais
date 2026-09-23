@@ -27,6 +27,8 @@
 #include "generated/TestArrayRwEntity.h"
 #include "generated/TestCompositeKeyListEntity.h"
 #include "generated/TestUpsertListEntity.h"
+#include "generated/TestSlotEntity.h"
+#include "generated/TestSlotTallyEntity.h"
 
 namespace relais_test {
 
@@ -57,6 +59,8 @@ using entity::generated::TestArrayViewEntity;
 using entity::generated::TestArrayRwEntity;
 using entity::generated::TestCompositeKeyListEntity;
 using entity::generated::TestUpsertListEntity;
+using entity::generated::TestSlotEntity;
+using entity::generated::TestSlotTallyEntity;
 
 // Cross-invalidation key extractors
 inline constexpr auto purchaseUserId = [](const auto& p) -> int64_t { return p.user_id; };
@@ -410,5 +414,18 @@ using L1UpsertInvTargetRepo = Repo<TestItemEntity, "test:upsertinv:target:l1">;
 // foreign key — exercises upsert's InvalidationMixin branch (no list).
 using InvalidatingTestAssignedKeyRepo = Repo<TestAssignedKeyEntity, "test:akey:inv:l1",
     cfg::Local, Invalidate<L1UpsertInvTargetRepo, assignedKeyPayload>>;
+
+// =============================================================================
+// Slot Repositories (conditional and relative writes)
+// One row per claimable resource; TestSlotTally is the composite-key variant.
+// =============================================================================
+
+using UncachedTestSlotRepo = Repo<TestSlotEntity, "test:slot:uncached", cfg::Uncached>;
+using L1TestSlotRepo = Repo<TestSlotEntity, "test:slot:l1">;
+using L2TestSlotRepo = Repo<TestSlotEntity, "test:slot:l2", cfg::Redis>;
+using FullCacheTestSlotRepo = Repo<TestSlotEntity, "test:slot:both", cfg::Both>;
+
+using UncachedTestSlotTallyRepo = Repo<TestSlotTallyEntity, "test:tally:uncached", cfg::Uncached>;
+using FullCacheTestSlotTallyRepo = Repo<TestSlotTallyEntity, "test:tally:both", cfg::Both>;
 
 } // namespace relais_test
