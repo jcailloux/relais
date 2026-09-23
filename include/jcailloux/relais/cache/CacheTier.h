@@ -214,9 +214,11 @@ public:
     ///
     /// Fetcher: () -> Task<optional<Value>>
     /// MetaBuilder: (const Value&, float elapsed_us) -> Metadata
-    /// AdmitGate: () -> bool — evaluated once, right before the store. Returning
-    ///   false returns the fetched value to the caller WITHOUT caching it (the
-    ///   read-fill recheck: a mutation landed during the fetch). Defaults to
+    /// AdmitGate: () -> bool — evaluated right before the store, and again
+    ///   right after it. False before: the fetched value goes to the caller
+    ///   WITHOUT being cached (the read-fill recheck: a mutation landed during
+    ///   the fetch). False after: the key is evicted again (a mutation landed
+    ///   between the check and the store). Defaults to
     ///   always-admit.
     ///
     /// Returns Hit pointing to the cached entry, or empty if not found.
@@ -606,6 +608,26 @@ private:
         return Hit{ptr, nullptr, std::move(guard)};
     }
 
+    /// Second half of the read-fill recheck, once the fetched value is stored.
+    /// The gate checked before the store is a check-then-act: a writer on
+    /// another thread can bump and evict between that check and the store, and
+    /// the store then outlives the evict. Re-evaluating the gate after the
+    /// store closes the gap: either it sees the bump and evicts the key, or the
+    /// bump comes after the store and the writer's evict, sequenced after its
+    /// bump, removes it. The fence orders the store before the reload; the
+    /// writer's bump carries the matching fence. The returned Hit's guard keeps
+    /// the value readable.
+    ///
+    /// The evict is unconditional: it may drop a newer entry stored meanwhile
+    /// (one extra miss). A conditional removal (remove_if) is not atomic — it
+    /// removes, tests, then re-inserts, and a writer's evict landing in between
+    /// would miss the entry it re-inserts.
+    template<typename AdmitGate>
+    void recheckStored(const Key& key, AdmitGate& gate) {
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        if (!gate()) evict(key);
+    }
+
     template<typename Fetcher, typename MetaBuilder, typename AdmitGate>
     io::Task<Hit> fetchAndAdmit(const Key& key, Fetcher&& f, MetaBuilder&& mb,
                                 AdmitGate gate) {
@@ -675,6 +697,7 @@ private:
                         count, std::memory_order_relaxed);
                 }
                 auto* ce = r.asReal();
+                recheckStored(key, gate);
                 co_return Hit{&ce->value, &ce->metadata, std::move(r.guard)};
             } else {
                 // === GHOST (create or keep) ===
@@ -704,6 +727,7 @@ private:
             auto meta = mb(*opt, 0.0f);
             auto r = map_.upsert(Map::make_key(key), std::move(*opt), std::move(meta));
             auto* ce = r.asReal();
+            recheckStored(key, gate);
             co_return Hit{&ce->value, &ce->metadata, std::move(r.guard)};
         }
     }

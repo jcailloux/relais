@@ -22,10 +22,12 @@ namespace jcailloux::relais {
 /// inter-thread write.
 ///
 /// Mechanism (hit cost = 0): a filling reader snapshots its key's slot at
-/// fetch-start, then recompares right before it stores. If a mutation bumped
-/// the slot in between, the value straddled a write → return it to the caller
-/// but do NOT cache it (the next read re-fetches). Hits never touch the
-/// counter, so already-cached entries are immune.
+/// fetch-start, recompares right before it stores, and once more right after.
+/// If a mutation bumped the slot before the store, the value straddled a write
+/// → return it to the caller but do NOT cache it (the next read re-fetches). If
+/// the bump lands between the first check and the store, the second check sees
+/// it and the reader evicts the key again. Hits never touch the counter, so
+/// already-cached entries are immune.
 ///
 /// Sharded, not per-key: the recheck fires during a MISS (entry absent), so
 /// the slot must exist when the key is not cached — it cannot live in the
@@ -63,23 +65,30 @@ struct RecheckGuard {
 
     /// True if the slot moved since `snap` — a mutation landed during the fetch.
     ///
-    /// Acquire (paired with bump's release): if this load does NOT observe a
-    /// concurrent bump, then that bump — and everything sequenced after it on
-    /// the writer (its cache evict / Redis UNLINK) — had not yet become
-    /// globally visible. Combined with the seq_cst total order of the ChunkMap
-    /// and Redis ops, that forces the reader's store to be ordered BEFORE the
-    /// writer's evict (the evict then removes it) — so a missed bump can never
-    /// leave a surviving phantom. This makes correctness hold in the C++
-    /// abstract machine and on weak HW (ARM/POWER), not just on x86-TSO where
-    /// the seq_cst map ops would incidentally cover it. Free on x86 (plain mov).
+    /// Checked before the store, it only spares a store that would be stale.
+    /// Missing a bump there proves nothing: the reader may be preempted between
+    /// the check and its store while the writer bumps and evicts. The guarantee
+    /// comes from the check after the store, with a seq_cst fence between the
+    /// two on the reader and one after the bump on the writer (store → load on
+    /// both sides): either the reader's reload sees the bump and it evicts the
+    /// key again, or the writer's evict, which follows the bump, sees the entry.
     static bool changed(const Key& id, uint64_t snap) {
         return slots_[slotOf(id)].load(std::memory_order_acquire) != snap;
     }
 
+    /// changed(), once the fetched value is stored: fences the store before
+    /// the reload (see changed()).
+    static bool changedAfterStore(const Key& id, uint64_t snap) {
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        return changed(id, snap);
+    }
+
     /// Bump on every confirmed mutation (create/update/patch/erase/invalidate).
-    /// Synchronous, write-only, monotonic. Release: see changed().
+    /// Synchronous, write-only, monotonic. The fence orders the bump before the
+    /// writer's evict that follows (see changed()).
     static void bump(const Key& id) {
-        slots_[slotOf(id)].fetch_add(1, std::memory_order_release);
+        slots_[slotOf(id)].fetch_add(1, std::memory_order_seq_cst);
+        std::atomic_thread_fence(std::memory_order_seq_cst);
     }
 };
 

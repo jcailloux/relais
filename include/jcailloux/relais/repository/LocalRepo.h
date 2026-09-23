@@ -596,6 +596,11 @@ private:
             if (!Recheck::changed(missIds[j], snaps[j])) {
                 auto hit = tier().store(unique[missU[j]], std::move(*fetched[j]),
                                         buildMetadata());
+                // A mutation between the check and the store: evict the key
+                // again (unconditionally, see CacheTier::recheckStored). The
+                // view's guard keeps the value readable.
+                if (Recheck::changedAfterStore(missIds[j], snaps[j]))
+                    tier().evict(missIds[j]);
                 uniqueHit[missU[j]] = static_cast<const E*>(hit.value);
             } else {
                 // A mutation straddled the batch fetch → return the value to

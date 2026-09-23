@@ -32,10 +32,9 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
     using Mapping = typename E::MappingType;
 
     /// Read-fill recheck guard — shared with LocalRepo for the same repo (same
-    /// Name/Key/SlotsLog2 → one static slot array seen by both tiers). In an
-    /// L2-only config LocalRepo is absent, so this layer both bumps (on its
-    /// mutation paths) and rechecks; in L1+L2 LocalRepo's bump is on the same
-    /// array, so the L2 recheck here observes it.
+    /// Name/Key/SlotsLog2 → one static slot array seen by both tiers). This
+    /// layer bumps before each L2 eviction and rechecks its L2 fills; in L1+L2
+    /// LocalRepo bumps the same array again after the eviction, for the L1 fills.
     using Recheck = RecheckGuard<Name, Key, Cfg.recheck_slots_log2>;
 
     static constexpr bool useL2Binary =
@@ -413,7 +412,7 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
         /// One variadic UNLINK batch for `ids`, their generations bumped first:
         /// the same ordering invariant as the mono path (a straddling fill must
         /// see the moved gen). Multi-instance: one EVAL of HINCRBYs; single-
-        /// instance L2-only: the process-local array.
+        /// instance: the process-local array (see bumpGen).
         static io::Task<void> evictManyL2(std::span<const Key> ids) {
             std::vector<std::string> keys;
             keys.reserve(ids.size());
@@ -424,7 +423,7 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
                 for (const auto& id : ids) slots.push_back(Recheck::slotOf(id));
                 co_await cache::RedisCache::bumpGenMany(
                     genHashKey(), std::span<const std::size_t>(slots));
-            } else if constexpr (Cfg.cache_level == config::CacheLevel::L2) {
+            } else {
                 for (const auto& id : ids) Recheck::bump(id);
             }
             co_await cache::RedisCache::invalidateMany(
@@ -456,13 +455,15 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
         ///    observe this invalidation. Awaited; it MUST land before the entity
         ///    UNLINK that follows (a fill straddling the UNLINK must see the
         ///    moved gen and reject), mirroring 12a's bump-before-evict invariant.
-        ///  - single-instance (default): the process-local recheck counter, and
-        ///    only when L2 is the TOP layer (L2-only). In L1+L2 LocalRepo above
-        ///    already bumps the same array, so the L2 recheck observes it.
+        ///  - single-instance (default): the process-local recheck counter, for
+        ///    the same reason. In L1+L2 LocalRepo bumps it again after the
+        ///    UNLINK, for the L1 fills; that later bump does not cover the L2
+        ///    fills: a SET that runs after the UNLINK can finish its recheck
+        ///    before it.
         static io::Task<void> bumpGen(const Key& id) {
             if constexpr (Cfg.l2_shared_across_instances) {
                 co_await cache::RedisCache::bumpGen(genHashKey(), Recheck::slotOf(id));
-            } else if constexpr (Cfg.cache_level == config::CacheLevel::L2) {
+            } else {
                 Recheck::bump(id);
             }
             co_return;
