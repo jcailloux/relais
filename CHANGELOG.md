@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [3.1.0] - 2026-09-24
+
 ### Added
 
 - **Conditional writes: `patchIf`, `claim`, `patchWhere`.** A typed guard
@@ -15,6 +17,9 @@
   concurrent write.
 - **Mapped enums in `set<F>`.** A `@relais enum=` field accepts its C++ enum value,
   as in guards; the DB string stays accepted.
+- **`WriteMode` on `PgProvider::queryWrite`.** `Exclusive` runs a raw write once
+  per caller; the default, `Idempotent`, may share the result of an identical
+  concurrent write.
 
 ### Changed
 
