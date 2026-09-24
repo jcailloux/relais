@@ -439,8 +439,9 @@ public:
     static io::Task<cache::CacheView<E>> patch(const Key& id, Updates&&... updates)
         requires HasFieldUpdate<E> && (!Cfg.read_only)
     {
-        co_return (co_await Base::template patchRow<kTailReadsBefore>(
-            id, std::forward<Updates>(updates)...)).after;
+        auto row = co_await Base::template patchRow<kTailReadsBefore>(
+            id, std::forward<Updates>(updates)...);
+        co_return std::move(row.after);
     }
 
     /// Apply `updates` to the row `id` only if it satisfies `guard` at write
