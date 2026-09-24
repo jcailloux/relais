@@ -437,13 +437,14 @@ public:
     /// before and after, both returned by the write itself: the row leaves the
     /// pages of its old position and enters those of its new one. Uncertain:
     /// neither version is known, the pages are left to l*_ttl (logged).
-    template<typename... Updates>
+    template<bool WithBefore, typename... Updates>
     static io::Task<typename Base::PatchedRow> patchRow(const Key& id, Updates&&... updates)
         requires HasFieldUpdate<Entity> && (!Base::config.read_only)
     {
+        static_assert(WithBefore, "this cascade reads the row before the write");
         typename Base::PatchedRow row;
         try {
-            row = co_await Base::patchRow(id, std::forward<Updates>(updates)...);
+            row = co_await Base::template patchRow<true>(id, std::forward<Updates>(updates)...);
         } catch (const io::PgUncertainError&) {
             logUncertainPatch("patch");
             throw;
@@ -454,14 +455,16 @@ public:
 
     /// Guarded partial update, then the same list invalidation as patchRow. A
     /// refused guard changed nothing: the pages stay valid.
-    template<typename... Gs, typename... Updates>
+    template<bool WithBefore, typename... Gs, typename... Updates>
     static io::Task<std::optional<typename Base::PatchedRow>> patchIfRow(
         const Key& id, const entity::Guards<Gs...>& guard, Updates&&... updates)
         requires HasFieldUpdate<Entity> && (!Base::config.read_only)
     {
+        static_assert(WithBefore, "this cascade reads the row before the write");
         std::optional<typename Base::PatchedRow> row;
         try {
-            row = co_await Base::patchIfRow(id, guard, std::forward<Updates>(updates)...);
+            row = co_await Base::template patchIfRow<true>(
+                id, guard, std::forward<Updates>(updates)...);
         } catch (const io::PgUncertainError&) {
             logUncertainPatch("patchIf");
             throw;
@@ -749,7 +752,7 @@ protected:
 
     /// List invalidation of a committed patch (nothing if nothing was written).
     static io::Task<void> invalidateListsPatched(const typename Base::PatchedRow& row) {
-        if (!row.before) co_return;
+        if (!row.after) co_return;
         const Entity& after = *row.after;
         if constexpr (kHasL1) { listCache().onEntityUpdated(*row.before, after); }
         if constexpr (kHasL2) { co_await invalidateL2Updated(*row.before, after); }

@@ -228,13 +228,14 @@ public:
     /// Partial update with cross-invalidation (only if committed), keyed on the
     /// row before and after, both returned by the write itself. Uncertain:
     /// neither version is known, the targets are left to l*_ttl (logged).
-    template<typename... Updates>
+    template<bool WithBefore, typename... Updates>
     static io::Task<typename Base::PatchedRow> patchRow(const Key& id, Updates&&... updates)
         requires HasFieldUpdate<Entity> && (!Base::config.read_only)
     {
+        static_assert(WithBefore, "this cascade reads the row before the write");
         typename Base::PatchedRow row;
         try {
-            row = co_await Base::patchRow(id, std::forward<Updates>(updates)...);
+            row = co_await Base::template patchRow<true>(id, std::forward<Updates>(updates)...);
         } catch (const io::PgUncertainError&) {
             logUncertainPatch("patch");
             throw;
@@ -245,14 +246,16 @@ public:
 
     /// Guarded partial update with the same cross-invalidation as patchRow. A
     /// refused guard changed nothing: no target to invalidate.
-    template<typename... Gs, typename... Updates>
+    template<bool WithBefore, typename... Gs, typename... Updates>
     static io::Task<std::optional<typename Base::PatchedRow>> patchIfRow(
         const Key& id, const entity::Guards<Gs...>& guard, Updates&&... updates)
         requires HasFieldUpdate<Entity> && (!Base::config.read_only)
     {
+        static_assert(WithBefore, "this cascade reads the row before the write");
         std::optional<typename Base::PatchedRow> row;
         try {
-            row = co_await Base::patchIfRow(id, guard, std::forward<Updates>(updates)...);
+            row = co_await Base::template patchIfRow<true>(
+                id, guard, std::forward<Updates>(updates)...);
         } catch (const io::PgUncertainError&) {
             logUncertainPatch("patchIf");
             throw;
@@ -282,7 +285,7 @@ protected:
     /// Best-effort: a committed patch never fails on cross-invalidation.
     static io::Task<void> propagatePatched(const typename Base::PatchedRow& row,
                                            const char* op) {
-        if (!row.before) co_return;
+        if (!row.after) co_return;
         try {
             co_await propagateUpdate<Entity, InvList>(&*row.before, *row.after);
         } catch (const std::exception& e) {

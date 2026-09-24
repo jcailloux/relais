@@ -694,21 +694,23 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
             co_return result;
         }
 
-        /// Partial update, returning the row before and after. L2 is invalidated
+        /// Partial update (WithBefore: see PgRepo::patchRaw). L2 is invalidated
         /// once the row is committed (bump gen + UNLINK), not before the write:
         /// a reader that fetches the pre-patch row between an early bump and the
         /// commit would pass its read-fill recheck and leave that row in L2.
         /// After the commit, its fill lands before the UNLINK (removed) or its
         /// recheck sees the bump (compensated). A failed UNLINK enqueues a
         /// deferred self-heal.
-        template<typename... Updates>
-        static io::Task<std::optional<Change<E>>> patchRaw(const Key& id, Updates&&... updates)
+        template<bool WithBefore, typename... Updates>
+        static io::Task<std::optional<typename Base::Patched>> patchRaw(
+            const Key& id, Updates&&... updates)
             requires HasFieldUpdate<E> && (!Cfg.read_only)
         {
-            std::optional<Change<E>> change;
+            std::optional<typename Base::Patched> patched;
             std::exception_ptr uncertain;
             try {
-                change = co_await Base::patchRaw(id, std::forward<Updates>(updates)...);
+                patched = co_await Base::template patchRaw<WithBefore>(
+                    id, std::forward<Updates>(updates)...);
             } catch (const io::PgUncertainError&) {
                 uncertain = std::current_exception();
             }
@@ -716,14 +718,14 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
                 co_await evictL2Uncertain(id, "patch");
                 std::rethrow_exception(uncertain);
             }
-            if (change) co_await evictL2OrSelfHeal(id);
-            co_return change;
+            if (patched) co_await evictL2OrSelfHeal(id);
+            co_return patched;
         }
 
         /// Guarded partial update, returning the outcome. Same invalidation as
         /// patchRaw, after the commit; a refused guard wrote nothing and leaves
         /// L2 untouched.
-        template<typename... Gs, typename... Updates>
+        template<bool WithBefore, typename... Gs, typename... Updates>
         static io::Task<typename Base::GuardedPatchOutcome> patchIfRaw(
             const Key& id, const entity::Guards<Gs...>& guard, Updates&&... updates)
             requires HasFieldUpdate<E> && (!Cfg.read_only)
@@ -731,7 +733,8 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
             typename Base::GuardedPatchOutcome outcome;
             std::exception_ptr uncertain;
             try {
-                outcome = co_await Base::patchIfRaw(id, guard, std::forward<Updates>(updates)...);
+                outcome = co_await Base::template patchIfRaw<WithBefore>(
+                    id, guard, std::forward<Updates>(updates)...);
             } catch (const io::PgUncertainError&) {
                 uncertain = std::current_exception();
             }
@@ -739,33 +742,34 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
                 co_await evictL2Uncertain(id, "patchIf");
                 std::rethrow_exception(uncertain);
             }
-            if (outcome.change) co_await evictL2OrSelfHeal(id);
+            if (outcome.patched) co_await evictL2OrSelfHeal(id);
             co_return outcome;
         }
 
         /// Partial update as the tiers above see it (see PgRepo::PatchedRow).
-        template<typename... Updates>
+        template<bool WithBefore, typename... Updates>
         static io::Task<typename Base::PatchedRow> patchRow(const Key& id, Updates&&... updates)
             requires HasFieldUpdate<E> && (!Cfg.read_only)
         {
-            auto change = co_await patchRaw(id, std::forward<Updates>(updates)...);
-            if (!change) co_return typename Base::PatchedRow{};
+            auto patched = co_await patchRaw<WithBefore>(id, std::forward<Updates>(updates)...);
+            if (!patched) co_return typename Base::PatchedRow{};
             co_return typename Base::PatchedRow{
-                std::move(change->before), Base::makeView(std::move(change->after))};
+                std::move(patched->before), Base::makeView(std::move(patched->after))};
         }
 
         /// Guarded partial update as the tiers above see it. nullopt on DB error.
-        template<typename... Gs, typename... Updates>
+        template<bool WithBefore, typename... Gs, typename... Updates>
         static io::Task<std::optional<typename Base::PatchedRow>> patchIfRow(
             const Key& id, const entity::Guards<Gs...>& guard, Updates&&... updates)
             requires HasFieldUpdate<E> && (!Cfg.read_only)
         {
-            auto outcome = co_await patchIfRaw(id, guard, std::forward<Updates>(updates)...);
+            auto outcome = co_await patchIfRaw<WithBefore>(
+                id, guard, std::forward<Updates>(updates)...);
             if (outcome.error) co_return std::nullopt;
-            if (!outcome.change) co_return typename Base::PatchedRow{};
+            if (!outcome.patched) co_return typename Base::PatchedRow{};
             co_return typename Base::PatchedRow{
-                std::move(outcome.change->before),
-                Base::makeView(std::move(outcome.change->after))};
+                std::move(outcome.patched->before),
+                Base::makeView(std::move(outcome.patched->after))};
         }
 
         /// Uncertain write (timeout or lost connection): the row may have

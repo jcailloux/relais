@@ -1,6 +1,7 @@
 #ifndef JCX_RELAIS_REPO_H
 #define JCX_RELAIS_REPO_H
 
+#include <algorithm>
 #include <concepts>
 #include <optional>
 #include <span>
@@ -438,7 +439,8 @@ public:
     static io::Task<cache::CacheView<E>> patch(const Key& id, Updates&&... updates)
         requires HasFieldUpdate<E> && (!Cfg.read_only)
     {
-        co_return (co_await Base::patchRow(id, std::forward<Updates>(updates)...)).after;
+        co_return (co_await Base::template patchRow<kTailReadsBefore>(
+            id, std::forward<Updates>(updates)...)).after;
     }
 
     /// Apply `updates` to the row `id` only if it satisfies `guard` at write
@@ -451,7 +453,8 @@ public:
         const Key& id, const entity::Guards<Gs...>& guard, Updates&&... updates)
         requires HasFieldUpdate<E> && (!Cfg.read_only)
     {
-        auto row = co_await Base::patchIfRow(id, guard, std::forward<Updates>(updates)...);
+        auto row = co_await Base::template patchIfRow<kTailReadsBefore>(
+            id, guard, std::forward<Updates>(updates)...);
         if (!row) co_return std::nullopt;
         co_return std::move(row->after);
     }
@@ -472,10 +475,11 @@ public:
         const entity::Guards<Gs...>& pred, Updates&&... updates)
         requires HasFieldUpdate<E> && (!Cfg.read_only)
     {
-        constexpr Returns kReturns = O.returns;
-        std::optional<std::vector<Change<E>>> changes;
+        constexpr Returns kRows = tailRows(O.returns);
+        ResultFor<E, kRows> rows;
         try {
-            changes = co_await Base::patchWhereRaw(pred, std::forward<Updates>(updates)...);
+            rows = co_await Base::template patchWhereRaw<kRows>(
+                pred, std::forward<Updates>(updates)...);
         } catch (const io::PgUncertainError&) {
             // The changed rows are unknowable after a lost ACK, and the
             // predicate may still match them: nothing to invalidate by.
@@ -484,8 +488,8 @@ public:
                    "list tiers left to l*_ttl";
             throw;
         }
-        if (!changes) co_return std::nullopt;  // DB error
-        co_return co_await settleChanges<kReturns>(std::move(*changes));
+        if (!rows) co_return std::nullopt;  // DB error
+        co_return co_await settleRows<O.returns, kRows>(std::move(*rows));
     }
 
     /// Take the first `n` rows matching `pred` and apply `updates` to them, in
@@ -522,14 +526,32 @@ public:
     }
 
 private:
+    /// Whether the cache tail of a write reads each changed row as it was
+    /// before the write: only the own list pages and the cross-targets do (a
+    /// row leaves the pages and targets of its old values). Otherwise the
+    /// statement skips the second read that returning that version costs.
+    static constexpr bool kTailReadsBefore =
+        HasListDescriptor<E> || (sizeof...(Invalidations) > 0);
+
+    /// Rows a predicate write returns for a caller asking `r`: at least what
+    /// its cache tail reads (each version for the cascades above, the
+    /// committed rows' keys for the entity tiers, nothing without a cache).
+    static constexpr Returns tailRows(Returns r) {
+        constexpr Returns kTail = kTailReadsBefore ? Returns::Changes
+            : Cfg.cache_level != config::CacheLevel::None ? Returns::After
+            : Returns::Count;
+        return std::max(r, kTail);
+    }
+
     template<ClaimOptions O, typename Order, typename... Gs, typename... Updates>
     static io::Task<ResultFor<E, O.returns>> claimOrdered(
         const entity::Guards<Gs...>& pred, const Order* order, size_t n,
         Updates&&... updates)
     {
-        std::optional<std::vector<Change<E>>> changes;
+        constexpr Returns kRows = tailRows(O.returns);
+        ResultFor<E, kRows> rows;
         try {
-            changes = co_await Base::template claimRaw<O, Order>(
+            rows = co_await Base::template claimRaw<O, kRows, Order>(
                 pred, order, n, std::forward<Updates>(updates)...);
         } catch (const io::PgUncertainError&) {
             RELAIS_LOG_ERROR << name()
@@ -537,30 +559,43 @@ private:
                    "list tiers left to l*_ttl";
             throw;
         }
-        if (!changes) co_return std::nullopt;  // DB error
-        co_return co_await settleChanges<O.returns>(std::move(*changes));
+        if (!rows) co_return std::nullopt;  // DB error
+        co_return co_await settleRows<O.returns, kRows>(std::move(*rows));
     }
 
-    /// Cache tail of a predicate write, from the rows it changed: the entity
-    /// tier and the L1 list pages are evicted before returning, the L2 list
-    /// pages and cross-targets right after, detached.
-    template<Returns R>
-    static io::Task<ResultFor<E, R>> settleChanges(std::vector<Change<E>> changes) {
-        co_await Base::invalidateManyUpdatedCritical(std::span<const Change<E>>(changes));
-
-        ResultFor<E, R> result;
-        if constexpr (R == Returns::Count) {
-            result = changes.size();
-        } else if constexpr (R == Returns::After) {
-            std::vector<E> after;
-            after.reserve(changes.size());
-            for (const auto& c : changes) after.push_back(c.after);
-            result = std::move(after);
+    /// Cache tail of a predicate write, from the rows it returned (`Rows`,
+    /// see tailRows), then the caller's `R` out of them: the entity tier and
+    /// the L1 list pages are evicted before returning, the L2 list pages and
+    /// cross-targets right after, detached. The rows are copied for the
+    /// detached tail only when it reads them and the caller keeps them too.
+    template<Returns R, Returns Rows>
+    static io::Task<ResultFor<E, R>> settleRows(RowsFor<E, Rows> rows) {
+        if constexpr (Rows == Returns::Count) {
+            co_return rows;  // no cache
         } else {
-            result = changes;
+            if constexpr (Rows == Returns::After) {
+                co_await Base::template invalidateManyCritical<false>(
+                    std::span<const E>(rows));
+            } else {
+                co_await Base::invalidateManyUpdatedCritical(
+                    std::span<const Change<E>>(rows));
+            }
+
+            ResultFor<E, R> result;
+            if constexpr (R == Returns::Count) {
+                result = rows.size();
+            } else if constexpr (R == Rows) {
+                if constexpr (kTailReadsBefore) result = rows;
+                else result = std::move(rows);
+            } else {  // After out of Changes: the tail reads both versions
+                std::vector<E> after;
+                after.reserve(rows.size());
+                for (const auto& c : rows) after.push_back(c.after);
+                result = std::move(after);
+            }
+            if constexpr (kTailReadsBefore) fireInvalidateManyUpdatedDeferred(std::move(rows));
+            co_return result;
         }
-        fireInvalidateManyUpdatedDeferred(std::move(changes));
-        co_return result;
     }
 
     // ----------------------------------------------------------------------

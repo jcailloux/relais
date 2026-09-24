@@ -26,6 +26,7 @@
 
 #include <algorithm>
 #include <coroutine>
+#include <cstdio>
 #include <cstdint>
 #include <future>
 #include <latch>
@@ -72,6 +73,21 @@ extern "C" const char* __tsan_default_suppressions() {
 #endif
 
 using namespace relais_test;
+
+namespace {
+
+// Library errors (a failed statement's PostgreSQL message) go to stderr: a
+// contention failure then shows why an operation errored, not only that it did.
+const bool kLogErrors = [] {
+    jcailloux::relais::log::setCallback(
+        [](jcailloux::relais::log::Level level, const char* msg, size_t len) {
+            if (level == jcailloux::relais::log::Level::Error)
+                std::fprintf(stderr, "relais: %.*s\n", static_cast<int>(len), msg);
+        });
+    return true;
+}();
+
+}  // namespace
 
 namespace jr = jcailloux::relais;
 using jr::entity::set;

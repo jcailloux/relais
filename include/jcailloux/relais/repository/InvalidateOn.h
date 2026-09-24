@@ -7,6 +7,7 @@
 #include <utility>
 #include <vector>
 #include "jcailloux/relais/io/Task.h"
+#include "jcailloux/relais/io/WhenAll.h"
 #include "jcailloux/relais/repository/ConditionalWrite.h"
 
 namespace jcailloux::relais {
@@ -260,26 +261,38 @@ struct InvalidateList {
         }
     }
 
-    /// Batch delete: per-entity loop. A list cache has no scalar key to
-    /// deduplicate (the predicate/blob match is the unit of work); the foreign
-    /// list cache batches its own tracker internally. Correct, not yet
-    /// single-bump-collapsed.
+    /// Batch delete: one mono invalidation per entity. A list cache has no
+    /// scalar key to deduplicate (the predicate/blob match is the unit of
+    /// work); the foreign list cache batches its own tracker internally. Not
+    /// yet single-bump-collapsed.
     template<typename E>
     static io::Task<void> invalidateManyForDelete(std::span<const E> entities) {
-        for (const auto& e : entities) {
-            auto data = InvalidationData<E>::forDelete(e);
-            co_await invalidateWithData(data);
-        }
+        std::vector<InvalidationData<E>> data;
+        data.reserve(entities.size());
+        for (const auto& e : entities) data.push_back(InvalidationData<E>::forDelete(e));
+        co_await invalidateAll(std::move(data));
     }
 
-    /// Batch update: per-row loop, each row moving from its old pages to its
-    /// new ones exactly as a mono update.
+    /// Batch update: one mono update per row, moving it from its old pages to
+    /// its new ones.
     template<typename E>
     static io::Task<void> invalidateManyForUpdate(std::span<const Change<E>> changes) {
-        for (const auto& c : changes) {
-            auto data = InvalidationData<E>::forUpdate(&c.before, c.after);
-            co_await invalidateWithData(data);
-        }
+        std::vector<InvalidationData<E>> data;
+        data.reserve(changes.size());
+        for (const auto& c : changes)
+            data.push_back(InvalidationData<E>::forUpdate(&c.before, c.after));
+        co_await invalidateAll(std::move(data));
+    }
+
+private:
+    /// The mono invalidations run concurrently: their L2 commands share one
+    /// flush instead of one round trip each.
+    template<typename E>
+    static io::Task<void> invalidateAll(std::vector<InvalidationData<E>> data) {
+        std::vector<io::Task<void>> tasks;
+        tasks.reserve(data.size());
+        for (const auto& d : data) tasks.push_back(invalidateWithData(d));
+        co_await io::whenAll(std::move(tasks));
     }
 };
 
