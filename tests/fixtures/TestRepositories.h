@@ -443,4 +443,9 @@ using InvalidatingTestSlotRepo = Repo<TestSlotEntity, "test:slot:inv:l1",
 using InvalidatingTestSlotListRepo = Repo<TestSlotListEntity, "test:slotlist:inv:l1",
     cfg::Local, Invalidate<L1SlotInvTargetRepo, slotGroupId>>;
 
+/// Slots whose writes reach the group pages of L1TestSlotListRepo through
+/// InvalidateList: the per-row list cascade of batch writes.
+using ListInvalidatingTestSlotRepo = Repo<TestSlotListEntity, "test:slotlist:listinv:l1",
+    cfg::Local, InvalidateList<L1TestSlotListRepo>>;
+
 } // namespace relais_test
