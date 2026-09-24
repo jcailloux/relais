@@ -523,7 +523,8 @@ public:
     static io::Task<cache::CacheView<E>> patch(const Key& id, Updates&&... updates)
         requires HasFieldUpdate<E> && (!Cfg.read_only)
     {
-        co_return (co_await patchRow<false>(id, std::forward<Updates>(updates)...)).after;
+        auto row = co_await patchRow<false>(id, std::forward<Updates>(updates)...);
+        co_return std::move(row.after);
     }
 
     /// Guarded partial update: applies `updates` only if the row satisfies
