@@ -314,7 +314,7 @@ TEST_CASE("buildKeyedPatchSql", "[base_repo][sql]") {
 
     SECTION("single column") {
         auto sql = detail::buildKeyedPatchSql<Traits, void>(
-            "my_table", "id", {"\"name\""}, "id, name");
+            "my_table", "id", {"\"name\""}, "id, name", Returns::Changes);
         REQUIRE(sql ==
             "WITH o AS (SELECT id, name FROM my_table WHERE \"id\"=$2 FOR UPDATE) "
             "UPDATE my_table AS t SET \"name\"=$1 FROM o WHERE t.\"id\"=o.\"id\" "
@@ -324,7 +324,7 @@ TEST_CASE("buildKeyedPatchSql", "[base_repo][sql]") {
     SECTION("multiple columns: SET values first, then the key") {
         auto sql = detail::buildKeyedPatchSql<Traits, void>(
             "my_table", "id", {"\"name\"", "\"value\"", "\"active\""},
-            "id, name, value, active");
+            "id, name, value, active", Returns::Changes);
         REQUIRE(sql.find("WHERE \"id\"=$4 FOR UPDATE") != std::string::npos);
         REQUIRE(sql.find("SET \"name\"=$1,\"value\"=$2,\"active\"=$3 FROM o")
                 != std::string::npos);
@@ -332,11 +332,20 @@ TEST_CASE("buildKeyedPatchSql", "[base_repo][sql]") {
                 != std::string::npos);
     }
 
+    SECTION("without the row before: a plain UPDATE, SET values unqualified") {
+        auto sql = detail::buildKeyedPatchSql<Traits, void>(
+            "my_table", "id", {"\"name\"", detail::SetColumn("\"value\"", jcailloux::relais::entity::SetOp::Add)},
+            "id, name, value", Returns::After);
+        REQUIRE(sql ==
+            "UPDATE my_table SET \"name\"=$1,\"value\"=\"value\"+$2 WHERE \"id\"=$3 "
+            "RETURNING id, name, value");
+    }
+
     SECTION("with real mapping returning_columns, never RETURNING *") {
         using M = ::entity::generated::TestItemMapping;
         auto sql = detail::buildKeyedPatchSql<Traits, void>(
             M::table_name, M::primary_key_column,
-            {"\"name\"", "\"value\""}, M::SQL::returning_columns);
+            {"\"name\"", "\"value\""}, M::SQL::returning_columns, Returns::Changes);
         REQUIRE(sql.find("WITH o AS (SELECT id, name, value, description, is_active, "
                          "created_at FROM relais_test_items WHERE \"id\"=$3 FOR UPDATE)")
                 == 0);
@@ -623,7 +632,7 @@ TEST_CASE("buildKeyedPatchSql with column= mapping", "[base_repo][sql][column_ma
             M::table_name, M::primary_key_column,
             {fieldColumnName<Traits>(update1),
              fieldColumnName<Traits>(update2)},
-            M::SQL::returning_columns);
+            M::SQL::returning_columns, Returns::Changes);
 
         // SET clause uses DB names
         REQUIRE(sql.find("\"product_name\"=$1") != std::string::npos);

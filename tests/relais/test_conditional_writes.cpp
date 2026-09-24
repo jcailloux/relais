@@ -146,7 +146,7 @@ TEST_CASE("[relative] SET fragments and write-mode trait", "[relative][sql]")
              d::SetColumn("\"b\"", Op::Add),
              d::SetColumn("\"c\"", Op::Subtract),
              d::SetColumn("\"d\"", Op::NowPlus)},
-            "id");
+            "id", jr::Returns::Changes);
         REQUIRE(sql ==
             "WITH o AS (SELECT id FROM tb WHERE \"id\"=$5 FOR UPDATE) "
             "UPDATE tb AS t SET \"a\"=$1,\"b\"=t.\"b\"+$2,\"c\"=t.\"c\"-$3,"
@@ -159,7 +159,7 @@ TEST_CASE("[relative] SET fragments and write-mode trait", "[relative][sql]")
         using TallyTraits = TestSlotTallyEntity::TraitsType;
         auto sql = d::buildKeyedPatchSql<TallyTraits, void>(
             M::table_name, M::primary_key_columns,
-            {d::SetColumn("\"hits\"", Op::Add)}, M::SQL::returning_columns);
+            {d::SetColumn("\"hits\"", Op::Add)}, M::SQL::returning_columns, jr::Returns::Changes);
         REQUIRE(sql.find("WHERE \"group_id\"=$2 AND \"bucket\"=$3 FOR UPDATE")
                 != std::string::npos);
         REQUIRE(sql.find("SET \"hits\"=t.\"hits\"+$1 FROM o") != std::string::npos);
@@ -771,7 +771,7 @@ TEST_CASE("[patchIf] SQL: SET values, then the key, then the guard", "[patchIf][
             SlotMapping::table_name, SlotMapping::primary_key_column,
             {d::SetColumn(std::string_view("\"holder\"")),
              d::SetColumn(std::string_view("\"version\""), jr::entity::SetOp::Add)},
-            "id, version");
+            "id, version", jr::Returns::Changes);
         REQUIRE(sql ==
             "WITH o AS (SELECT id, version FROM relais_test_slots WHERE \"id\"=$3 "
             "AND \"version\"=$4 AND (\"holder\" IS NULL OR \"expires_at\"<now()) FOR UPDATE) "
@@ -786,13 +786,24 @@ TEST_CASE("[patchIf] SQL: SET values, then the key, then the guard", "[patchIf][
         auto sql = d::buildKeyedPatchSql<TallyTraits, G>(
             TallyMapping::table_name, TallyMapping::primary_key_columns,
             {d::SetColumn(std::string_view("\"hits\""), jr::entity::SetOp::Add)},
-            "group_id, bucket, hits");
+            "group_id, bucket, hits", jr::Returns::Changes);
         REQUIRE(sql ==
             "WITH o AS (SELECT group_id, bucket, hits FROM relais_test_slot_tallies "
             "WHERE \"group_id\"=$2 AND \"bucket\"=$3 AND \"hits\"<$4 FOR UPDATE) "
             "UPDATE relais_test_slot_tallies AS t SET \"hits\"=t.\"hits\"+$1 FROM o "
             "WHERE t.\"group_id\"=o.\"group_id\" AND t.\"bucket\"=o.\"bucket\" "
             "RETURNING o.group_id,o.bucket,o.hits,t.group_id,t.bucket,t.hits");
+    }
+
+    SECTION("without the row before: the guard joins the key in a plain UPDATE") {
+        using G = decltype(when(eq<SlotF::version>(int64_t{0})));
+        auto sql = d::buildKeyedPatchSql<SlotTraits, G>(
+            SlotMapping::table_name, SlotMapping::primary_key_column,
+            {d::SetColumn(std::string_view("\"version\""), jr::entity::SetOp::Add)},
+            "id, version", jr::Returns::After);
+        REQUIRE(sql ==
+            "UPDATE relais_test_slots SET \"version\"=\"version\"+$1 "
+            "WHERE \"id\"=$2 AND \"version\"=$3 RETURNING id, version");
     }
 }
 
@@ -1074,7 +1085,7 @@ TEST_CASE("[patchWhere] SQL: locking CTE, qualified SET, before and after return
             SlotMapping::table_name, SlotMapping::primary_key_column,
             {d::SetColumn(std::string_view("\"holder\"")),
              d::SetColumn(std::string_view("\"counter\""), jr::entity::SetOp::Add)},
-            "id, holder, counter");
+            "id, holder, counter", jr::Returns::Changes);
         REQUIRE(sql ==
             "WITH o AS (SELECT id, holder, counter FROM relais_test_slots "
             "WHERE \"group_id\"=$3 AND \"expires_at\"<now() FOR UPDATE) "
@@ -1091,13 +1102,31 @@ TEST_CASE("[patchWhere] SQL: locking CTE, qualified SET, before and after return
         auto sql = d::buildPatchWhereSql<TallyTraits, P>(
             TallyMapping::table_name, TallyMapping::primary_key_columns,
             {d::SetColumn(std::string_view("\"hits\""), jr::entity::SetOp::Add)},
-            TallyMapping::SQL::returning_columns);
+            TallyMapping::SQL::returning_columns, jr::Returns::Changes);
         REQUIRE(sql ==
             "WITH o AS (SELECT group_id, bucket, hits FROM relais_test_slot_tallies "
             "WHERE \"hits\"<$2 FOR UPDATE) "
             "UPDATE relais_test_slot_tallies AS t SET \"hits\"=t.\"hits\"+$1 "
             "FROM o WHERE t.\"group_id\"=o.\"group_id\" AND t.\"bucket\"=o.\"bucket\" "
             "RETURNING o.group_id,o.bucket,o.hits,t.group_id,t.bucket,t.hits");
+    }
+
+    SECTION("committed rows only, or none: a plain UPDATE") {
+        using P = decltype(when(lt<SlotF::expires_at>(dbNow)));
+        const auto after = d::buildPatchWhereSql<SlotTraits, P>(
+            SlotMapping::table_name, SlotMapping::primary_key_column,
+            {d::SetColumn(std::string_view("\"counter\""), jr::entity::SetOp::Add)},
+            "id, counter", jr::Returns::After);
+        REQUIRE(after ==
+            "UPDATE relais_test_slots SET \"counter\"=\"counter\"+$1 "
+            "WHERE \"expires_at\"<now() RETURNING id, counter");
+        const auto count = d::buildPatchWhereSql<SlotTraits, P>(
+            SlotMapping::table_name, SlotMapping::primary_key_column,
+            {d::SetColumn(std::string_view("\"counter\""), jr::entity::SetOp::Add)},
+            "id, counter", jr::Returns::Count);
+        REQUIRE(count ==
+            "UPDATE relais_test_slots SET \"counter\"=\"counter\"+$1 "
+            "WHERE \"expires_at\"<now()");
     }
 }
 
@@ -1360,7 +1389,7 @@ TEST_CASE("[claim] SQL: locked candidates ranked, count check, both versions and
             SlotMapping::table_name, SlotMapping::primary_key_column,
             {d::SetColumn(std::string_view("\"holder\"")),
              d::SetColumn(std::string_view("\"expires_at\""), jr::entity::SetOp::NowPlus)},
-            "id, holder, priority", jr::ClaimMode::Exact, jr::Lock::SkipLocked);
+            "id, holder, priority", jr::ClaimMode::Exact, jr::Lock::SkipLocked, jr::Returns::Changes);
         const std::string ord =
             "ORDER BY CASE WHEN \"holder\"=$6 THEN 0 ELSE 1 END,\"priority\" DESC,\"id\"";
         REQUIRE(sql ==
@@ -1381,7 +1410,7 @@ TEST_CASE("[claim] SQL: locked candidates ranked, count check, both versions and
         auto sql = d::buildClaimSql<TallyTraits, P, void>(
             TallyMapping::table_name, TallyMapping::primary_key_columns,
             {d::SetColumn(std::string_view("\"hits\""), jr::entity::SetOp::Add)},
-            TallyMapping::SQL::returning_columns, jr::ClaimMode::UpTo, jr::Lock::Wait);
+            TallyMapping::SQL::returning_columns, jr::ClaimMode::UpTo, jr::Lock::Wait, jr::Returns::Changes);
         REQUIRE(sql ==
             "WITH l AS (SELECT group_id, bucket, hits FROM relais_test_slot_tallies "
             "WHERE \"hits\"<$3 ORDER BY \"group_id\",\"bucket\" LIMIT $2 FOR UPDATE), "
@@ -1391,6 +1420,23 @@ TEST_CASE("[claim] SQL: locked candidates ranked, count check, both versions and
             "FROM c WHERE t.\"group_id\"=c.\"group_id\" AND t.\"bucket\"=c.\"bucket\" "
             "RETURNING c.group_id,c.bucket,c.hits,t.group_id,t.bucket,t.hits,"
             "c.relais_claim_rank");
+    }
+
+    SECTION("committed rows then the rank, or nothing returned") {
+        using P = decltype(when(eq<SlotF::group_id>(int64_t{1})));
+        auto build = [](jr::Returns rows) {
+            return d::buildClaimSql<SlotTraits, P, void>(
+                SlotMapping::table_name, SlotMapping::primary_key_column,
+                {d::SetColumn(std::string_view("\"holder\""))},
+                "id, holder", jr::ClaimMode::UpTo, jr::Lock::SkipLocked, rows);
+        };
+        const std::string body =
+            "WITH l AS (SELECT id, holder FROM relais_test_slots WHERE \"group_id\"=$3 "
+            "ORDER BY \"id\" LIMIT $2 FOR UPDATE SKIP LOCKED), "
+            "c AS (SELECT l.*,row_number() OVER (ORDER BY \"id\") AS relais_claim_rank FROM l) "
+            "UPDATE relais_test_slots AS t SET \"holder\"=$1 FROM c WHERE t.\"id\"=c.\"id\"";
+        REQUIRE(build(jr::Returns::After) == body + " RETURNING t.id,t.holder,c.relais_claim_rank");
+        REQUIRE(build(jr::Returns::Count) == body);
     }
 }
 

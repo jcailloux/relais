@@ -262,51 +262,39 @@ public:
         }
     }
 
-    /// Partial update as the tiers above see it: invalidates L1, delegates to
-    /// Base::patchRaw, then moves the committed row into cache and returns it
-    /// with the row it replaced. The generation is bumped again once the row
-    /// is committed, before the store-through: a reader that fetched the
-    /// pre-patch row after the first bump would otherwise pass its read-fill
-    /// recheck and overwrite the committed row. Uncertain: evict L1 by
-    /// precaution (L2 was already evicted as RedisRepo unwound).
-    template<typename... Updates>
+    /// Partial update as the tiers above see it (WithBefore: see
+    /// PgRepo::patchRaw). L1 is left as is until the commit, as for update:
+    /// the committed row is then stored through (see settlePatched). Uncertain:
+    /// evict L1 by precaution (L2 was already evicted as RedisRepo unwound).
+    template<bool WithBefore, typename... Updates>
     static io::Task<typename Base::PatchedRow> patchRow(const Key& id, Updates&&... updates)
         requires HasFieldUpdate<E> && (!Cfg.read_only)
     {
-        tier().onMutation(id);
-        bumpGeneration(id);
-        tier().evict(id);
         try {
-            auto change = co_await Base::patchRaw(id, std::forward<Updates>(updates)...);
-            if (!change) co_return typename Base::PatchedRow{};
-            bumpGeneration(id);
-            co_return typename Base::PatchedRow{
-                std::move(change->before), storeAndView(id, std::move(change->after))};
+            auto patched = co_await Base::template patchRaw<WithBefore>(
+                id, std::forward<Updates>(updates)...);
+            if (!patched) co_return typename Base::PatchedRow{};
+            co_return settlePatched(id, std::move(*patched));
         } catch (const io::PgUncertainError&) {
             evict(id);
             throw;
         }
     }
 
-    /// Guarded partial update as the tiers above see it, with the same second
-    /// bump and uncertain eviction as patchRow. nullopt on DB error. A refused
-    /// guard leaves L1 evicted: the next read re-fetches.
-    template<typename... Gs, typename... Updates>
+    /// Guarded partial update as the tiers above see it, stored through and
+    /// evicted on uncertainty as patchRow. nullopt on DB error. A refused
+    /// guard wrote nothing: L1 keeps its entry.
+    template<bool WithBefore, typename... Gs, typename... Updates>
     static io::Task<std::optional<typename Base::PatchedRow>> patchIfRow(
         const Key& id, const entity::Guards<Gs...>& guard, Updates&&... updates)
         requires HasFieldUpdate<E> && (!Cfg.read_only)
     {
-        tier().onMutation(id);
-        bumpGeneration(id);
-        tier().evict(id);
         try {
-            auto outcome = co_await Base::patchIfRaw(id, guard, std::forward<Updates>(updates)...);
+            auto outcome = co_await Base::template patchIfRaw<WithBefore>(
+                id, guard, std::forward<Updates>(updates)...);
             if (outcome.error) co_return std::nullopt;
-            if (!outcome.change) co_return typename Base::PatchedRow{};
-            bumpGeneration(id);
-            co_return typename Base::PatchedRow{
-                std::move(outcome.change->before),
-                storeAndView(id, std::move(outcome.change->after))};
+            if (!outcome.patched) co_return typename Base::PatchedRow{};
+            co_return settlePatched(id, std::move(*outcome.patched));
         } catch (const io::PgUncertainError&) {
             evict(id);
             throw;
@@ -517,6 +505,16 @@ private:
     // =========================================================================
     // Store + view helper
     // =========================================================================
+
+    /// Store a committed patch through, after a generation bump: a read-fill
+    /// that fetched the previous version (its snapshot predates the bump)
+    /// fails its recheck, before its store or right after it.
+    static typename Base::PatchedRow settlePatched(const Key& id,
+                                                   typename Base::Patched&& patched) {
+        tier().onMutation(id);
+        bumpGeneration(id);
+        return {std::move(patched.before), storeAndView(id, std::move(patched.after))};
+    }
 
     /// Store entity in cache and return CacheView.
     static cache::CacheView<E> storeAndView(const Key& key, E&& src) {

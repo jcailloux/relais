@@ -617,10 +617,13 @@ private:
     /// the store and the writer's evict, sequenced after its bump, removes it.
     /// The fence orders the store before the reload; the writer's bump carries
     /// the matching fence. The returned Hit's guard keeps the value readable.
+    /// Nothing to recheck (not even the fence) without a gate.
     template<typename AdmitGate>
     void recheckStored(const Key& key, const Value* stored, AdmitGate& gate) {
-        std::atomic_thread_fence(std::memory_order_seq_cst);
-        if (!gate()) evictIfSame(key, stored);
+        if constexpr (!std::is_same_v<AdmitGate, AlwaysAdmit>) {
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            if (!gate()) evictIfSame(key, stored);
+        }
     }
 
     template<typename Fetcher, typename MetaBuilder, typename AdmitGate>

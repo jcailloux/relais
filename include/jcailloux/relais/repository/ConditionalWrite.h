@@ -53,12 +53,18 @@ struct Change {
     E after;
 };
 
+/// One row of a conditional write returning `R` (After or Changes).
+template<typename E, Returns R>
+using RowFor = std::conditional_t<R == Returns::Changes, Change<E>, E>;
+
+/// Rows of a conditional write returning `R`: a count, or one entry per row.
+template<typename E, Returns R>
+using RowsFor = std::conditional_t<R == Returns::Count, size_t, std::vector<RowFor<E, R>>>;
+
 /// Result of a conditional write returning `R`. nullopt is a DB error; a zero
 /// count or an empty vector means no row matched.
 template<typename E, Returns R>
-using ResultFor = std::optional<std::conditional_t<
-    R == Returns::Count, size_t,
-    std::conditional_t<R == Returns::After, std::vector<E>, std::vector<Change<E>>>>>;
+using ResultFor = std::optional<RowsFor<E, R>>;
 
 }  // namespace jcailloux::relais
 
