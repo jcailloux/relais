@@ -262,37 +262,55 @@ public:
         }
     }
 
-    /// Partial update: invalidates L1, delegates to Base::patchRaw,
-    /// then moves result into cache.
+    /// Partial update as the tiers above see it: invalidates L1, delegates to
+    /// Base::patchRaw, then moves the committed row into cache and returns it
+    /// with the row it replaced. The generation is bumped again once the row
+    /// is committed, before the store-through: a reader that fetched the
+    /// pre-patch row after the first bump would otherwise pass its read-fill
+    /// recheck and overwrite the committed row. Uncertain: evict L1 by
+    /// precaution (L2 was already evicted as RedisRepo unwound).
     template<typename... Updates>
-    static io::Task<cache::CacheView<E>> patch(const Key& id, Updates&&... updates)
+    static io::Task<typename Base::PatchedRow> patchRow(const Key& id, Updates&&... updates)
         requires HasFieldUpdate<E> && (!Cfg.read_only)
     {
         tier().onMutation(id);
         bumpGeneration(id);
         tier().evict(id);
-        auto entity = co_await Base::patchRaw(id, std::forward<Updates>(updates)...);
-        if (entity) {
-            co_return storeAndView(id, std::move(*entity));
+        try {
+            auto change = co_await Base::patchRaw(id, std::forward<Updates>(updates)...);
+            if (!change) co_return typename Base::PatchedRow{};
+            bumpGeneration(id);
+            co_return typename Base::PatchedRow{
+                std::move(change->before), storeAndView(id, std::move(change->after))};
+        } catch (const io::PgUncertainError&) {
+            evict(id);
+            throw;
         }
-        co_return {};
     }
 
-    /// Guarded partial update: invalidates L1, delegates to Base::patchIfRaw,
-    /// then moves the committed row into cache. A refused guard leaves L1
-    /// evicted: the next read re-fetches.
+    /// Guarded partial update as the tiers above see it, with the same second
+    /// bump and uncertain eviction as patchRow. nullopt on DB error. A refused
+    /// guard leaves L1 evicted: the next read re-fetches.
     template<typename... Gs, typename... Updates>
-    static io::Task<std::optional<cache::CacheView<E>>> patchIf(
+    static io::Task<std::optional<typename Base::PatchedRow>> patchIfRow(
         const Key& id, const entity::Guards<Gs...>& guard, Updates&&... updates)
         requires HasFieldUpdate<E> && (!Cfg.read_only)
     {
         tier().onMutation(id);
         bumpGeneration(id);
         tier().evict(id);
-        auto outcome = co_await Base::patchIfRaw(id, guard, std::forward<Updates>(updates)...);
-        if (outcome.error) co_return std::nullopt;
-        if (!outcome.entity) co_return cache::CacheView<E>{};
-        co_return storeAndView(id, std::move(*outcome.entity));
+        try {
+            auto outcome = co_await Base::patchIfRaw(id, guard, std::forward<Updates>(updates)...);
+            if (outcome.error) co_return std::nullopt;
+            if (!outcome.change) co_return typename Base::PatchedRow{};
+            bumpGeneration(id);
+            co_return typename Base::PatchedRow{
+                std::move(outcome.change->before),
+                storeAndView(id, std::move(outcome.change->after))};
+        } catch (const io::PgUncertainError&) {
+            evict(id);
+            throw;
+        }
     }
 
     /// Erase entity by ID.
@@ -596,11 +614,10 @@ private:
             if (!Recheck::changed(missIds[j], snaps[j])) {
                 auto hit = tier().store(unique[missU[j]], std::move(*fetched[j]),
                                         buildMetadata());
-                // A mutation between the check and the store: evict the key
-                // again (unconditionally, see CacheTier::recheckStored). The
-                // view's guard keeps the value readable.
+                // A mutation between the check and the store: evict this entry
+                // again. The view's guard keeps the value readable.
                 if (Recheck::changedAfterStore(missIds[j], snaps[j]))
-                    tier().evict(missIds[j]);
+                    tier().evictIfSame(missIds[j], hit.value);
                 uniqueHit[missU[j]] = static_cast<const E*>(hit.value);
             } else {
                 // A mutation straddled the batch fetch → return the value to

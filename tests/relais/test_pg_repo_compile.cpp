@@ -306,44 +306,42 @@ TEST_CASE("FieldUpdate with nullable fields", "[base_repo][field_update]") {
 }
 
 // =========================================================================
-// buildUpdateReturning tests
+// buildKeyedPatchSql tests
 // =========================================================================
 
-TEST_CASE("buildUpdateReturning", "[base_repo][sql]") {
+TEST_CASE("buildKeyedPatchSql", "[base_repo][sql]") {
+    using Traits = ::entity::generated::TestItemMapping::TraitsType;
+
     SECTION("single column") {
-        auto sql = detail::buildUpdateReturning(
+        auto sql = detail::buildKeyedPatchSql<Traits, void>(
             "my_table", "id", {"\"name\""}, "id, name");
-        REQUIRE(sql == "UPDATE my_table SET \"name\"=$1 WHERE \"id\"=$2 RETURNING id, name");
+        REQUIRE(sql ==
+            "WITH o AS (SELECT id, name FROM my_table WHERE \"id\"=$2 FOR UPDATE) "
+            "UPDATE my_table AS t SET \"name\"=$1 FROM o WHERE t.\"id\"=o.\"id\" "
+            "RETURNING o.id,o.name,t.id,t.name");
     }
 
-    SECTION("multiple columns") {
-        auto sql = detail::buildUpdateReturning(
+    SECTION("multiple columns: SET values first, then the key") {
+        auto sql = detail::buildKeyedPatchSql<Traits, void>(
             "my_table", "id", {"\"name\"", "\"value\"", "\"active\""},
             "id, name, value, active");
-        REQUIRE(sql.find("UPDATE my_table SET") == 0);
-        REQUIRE(sql.find("\"name\"=$1") != std::string::npos);
-        REQUIRE(sql.find("\"value\"=$2") != std::string::npos);
-        REQUIRE(sql.find("\"active\"=$3") != std::string::npos);
-        REQUIRE(sql.find("WHERE \"id\"=$4") != std::string::npos);
-        REQUIRE(sql.find("RETURNING id, name, value, active") != std::string::npos);
+        REQUIRE(sql.find("WHERE \"id\"=$4 FOR UPDATE") != std::string::npos);
+        REQUIRE(sql.find("SET \"name\"=$1,\"value\"=$2,\"active\"=$3 FROM o")
+                != std::string::npos);
+        REQUIRE(sql.find("RETURNING o.id,o.name,o.value,o.active,t.id,t.name,t.value,t.active")
+                != std::string::npos);
     }
 
-    SECTION("with real mapping returning_columns") {
+    SECTION("with real mapping returning_columns, never RETURNING *") {
         using M = ::entity::generated::TestItemMapping;
-        auto sql = detail::buildUpdateReturning(
+        auto sql = detail::buildKeyedPatchSql<Traits, void>(
             M::table_name, M::primary_key_column,
             {"\"name\"", "\"value\""}, M::SQL::returning_columns);
-        REQUIRE(sql.find("UPDATE relais_test_items SET") == 0);
-        REQUIRE(sql.find("WHERE \"id\"=$3") != std::string::npos);
-        REQUIRE(sql.find("RETURNING id, name, value, description, is_active, created_at") != std::string::npos);
-    }
-
-    SECTION("never produces RETURNING *") {
-        using M = ::entity::generated::TestItemMapping;
-        auto sql = detail::buildUpdateReturning(
-            M::table_name, M::primary_key_column,
-            {"\"name\""}, M::SQL::returning_columns);
+        REQUIRE(sql.find("WITH o AS (SELECT id, name, value, description, is_active, "
+                         "created_at FROM relais_test_items WHERE \"id\"=$3 FOR UPDATE)")
+                == 0);
         REQUIRE(sql.find("RETURNING *") == std::string::npos);
+        REQUIRE(sql.find("o.*") == std::string::npos);
     }
 }
 
@@ -612,7 +610,7 @@ TEST_CASE("FieldInfo column_name uses DB name with column= mapping", "[base_repo
     }
 }
 
-TEST_CASE("buildUpdateReturning with column= mapping", "[base_repo][sql][column_mapping]") {
+TEST_CASE("buildKeyedPatchSql with column= mapping", "[base_repo][sql][column_mapping]") {
     using M = ::entity::generated::TestProductMapping;
     using Traits = M::TraitsType;
     using Field = Traits::Field;
@@ -621,7 +619,7 @@ TEST_CASE("buildUpdateReturning with column= mapping", "[base_repo][sql][column_
         auto update1 = set<Field::productName>(std::string("x"));
         auto update2 = set<Field::stockLevel>(10);
 
-        auto sql = detail::buildUpdateReturning(
+        auto sql = detail::buildKeyedPatchSql<Traits, void>(
             M::table_name, M::primary_key_column,
             {fieldColumnName<Traits>(update1),
              fieldColumnName<Traits>(update2)},
@@ -630,8 +628,9 @@ TEST_CASE("buildUpdateReturning with column= mapping", "[base_repo][sql][column_
         // SET clause uses DB names
         REQUIRE(sql.find("\"product_name\"=$1") != std::string::npos);
         REQUIRE(sql.find("\"stock_level\"=$2") != std::string::npos);
-        // RETURNING uses DB names
-        REQUIRE(sql.find("RETURNING id, product_name, stock_level") != std::string::npos);
+        // Both returned versions use DB names
+        REQUIRE(sql.find("RETURNING o.id,o.product_name,o.stock_level") != std::string::npos);
+        REQUIRE(sql.find("t.id,t.product_name,t.stock_level") != std::string::npos);
         // No C++ names in SQL
         REQUIRE(sql.find("productName") == std::string::npos);
         REQUIRE(sql.find("stockLevel") == std::string::npos);

@@ -95,6 +95,19 @@ struct TestInternals {
         return Repo::listCache().generation_.load(std::memory_order_relaxed);
     }
 
+    /// Fetch a list page from the database, then store it as if its fetch had
+    /// started at generation `fetch_gen`: every modification notified since
+    /// straddles the fetch. Returns whether the page is left in the L1 list
+    /// cache. Requires sync() from test_helper.h.
+    template<typename Repo, typename Query>
+    static bool putPageFetchedAt(const Query& query, uint32_t fetch_gen) {
+        typename Repo::ListWrapperType wrapper;
+        wrapper.items = sync(Repo::queryFromDb(query));
+        auto cache_query = Repo::toCacheQuery(query);
+        Repo::listCache().put(cache_query, std::move(wrapper), fetch_gen);
+        return static_cast<bool>(Repo::listCache().get(cache_query));
+    }
+
     /// Direct L1 cache get — bypasses coroutine overhead.
     /// Same path as find L1 hit, but synchronous (no sync_wait thread).
     template<typename Repo, typename Key>

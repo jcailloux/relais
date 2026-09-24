@@ -427,6 +427,36 @@ public:
     }
 
     // =======================================================================
+    // Keyed partial update
+    // =======================================================================
+
+    /// Apply `updates` to the row `id`, in one statement that also returns the
+    /// row it replaced: every tier, list page and cross-target is invalidated
+    /// from both versions, with no read before the write. Returns the committed
+    /// row as epoch-guarded view; empty if the row is absent or on a DB error.
+    template<typename... Updates>
+    static io::Task<cache::CacheView<E>> patch(const Key& id, Updates&&... updates)
+        requires HasFieldUpdate<E> && (!Cfg.read_only)
+    {
+        co_return (co_await Base::patchRow(id, std::forward<Updates>(updates)...)).after;
+    }
+
+    /// Apply `updates` to the row `id` only if it satisfies `guard` at write
+    /// time, evaluated by the database in the same statement (a row locked by a
+    /// concurrent writer is waited on, then re-checked). nullopt on DB error; an
+    /// empty view when the guard is false or the row is absent (nothing is
+    /// invalidated); otherwise the committed row, invalidated as by patch.
+    template<typename... Gs, typename... Updates>
+    static io::Task<std::optional<cache::CacheView<E>>> patchIf(
+        const Key& id, const entity::Guards<Gs...>& guard, Updates&&... updates)
+        requires HasFieldUpdate<E> && (!Cfg.read_only)
+    {
+        auto row = co_await Base::patchIfRow(id, guard, std::forward<Updates>(updates)...);
+        if (!row) co_return std::nullopt;
+        co_return std::move(row->after);
+    }
+
+    // =======================================================================
     // Predicate conditional update (typed guards)
     // =======================================================================
 

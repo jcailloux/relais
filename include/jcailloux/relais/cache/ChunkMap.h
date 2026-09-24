@@ -258,8 +258,9 @@ public:
             });
         bool inserted = !old.has_value();
         if constexpr (HasGhost) {
-            // new entry is always real: +1 if insert or replacing ghost
-            if (inserted || old->isGhost())
+            // new entry is always real: +1 unless it replaces a real one (a
+            // ghost or update_ghost's empty placeholder counts as absent)
+            if (inserted || !old->isReal())
                 live_count_.fetch_add(1, std::memory_order_relaxed);
         }
         if (!inserted && old->isReal()) {
@@ -285,7 +286,7 @@ public:
             });
         bool inserted = !old.has_value();
         if constexpr (HasGhost) {
-            if (inserted || old->isGhost())
+            if (inserted || !old->isReal())
                 live_count_.fetch_add(1, std::memory_order_relaxed);
         }
         if (!inserted && old->isReal()) {
@@ -316,8 +317,14 @@ public:
                 if (opt && opt->isGhost()) return mutator(*opt);
                 return opt.value_or(TaggedEntry{});
             });
-        // If key didn't exist, we inserted an empty TaggedEntry — remove it
-        if (!old.has_value()) map_.Remove(key);
+        // If key didn't exist, we inserted an empty TaggedEntry — remove it, and
+        // only it: a real entry stored meanwhile must stay (removing it would
+        // also skip its Retire).
+        if (!old.has_value()) {
+            map_.Remove_if(key,
+                [](const auto& kv) { return kv.second.empty(); },
+                [](const auto&) { return true; });
+        }
     }
 
     /// Insert entry only if key doesn't exist.
@@ -342,7 +349,7 @@ public:
         if (!old.has_value()) return false;
         auto te = *old;
         if constexpr (HasGhost) {
-            if (!te.isGhost())
+            if (te.isReal())
                 live_count_.fetch_sub(1, std::memory_order_relaxed);
         }
         if (te.isReal()) {
@@ -355,38 +362,25 @@ public:
     /// Used for eviction: prevents removing an entry that was concurrently
     /// replaced by Upsert between a Find and this Remove.
     ///
-    /// Implementation: atomic Remove then check pred. If pred fails,
-    /// re-Insert the entry (brief cache-miss window, acceptable for a cache).
-    /// Predicate receives EntryHeader* (only called for real entries).
+    /// Atomic: pred is evaluated on the bucket state the removal commits
+    /// against, so the key never leaves the map when pred fails (a remove then
+    /// re-insert would hide it from a concurrent evict, and re-insert a value
+    /// that evict meant to drop). Predicate receives EntryHeader* (only called
+    /// for real entries; ghosts are never removed here).
     template<typename Pred>
     bool remove_if(const K& key, Pred&& pred) {
-        auto old = map_.Remove(key);
+        auto old = map_.Remove_if(key,
+            [&](const auto& kv) {
+                const TaggedEntry& te = kv.second;
+                return te.isReal() && pred(te.template asReal<EntryHeader>());
+            },
+            [](const auto& kv) { return kv.second; });
         if (!old.has_value()) return false;
-        auto te = *old;
-
-        if (te.isReal()) {
-            auto* entry = te.template asReal<EntryHeader>();
-            if (pred(entry)) {
-                if constexpr (HasGhost) {
-                    live_count_.fetch_sub(1, std::memory_order_relaxed);
-                }
-                pool_.Retire(static_cast<CacheEntry*>(entry));
-                return true;
-            }
+        if constexpr (HasGhost) {
+            live_count_.fetch_sub(1, std::memory_order_relaxed);
         }
-
-        // Predicate failed or ghost entry — re-insert (best-effort)
-        auto existing = map_.Insert(key, te);
-        if (existing.has_value()) {
-            // Race: another thread inserted between our Remove and Insert
-            if (te.isReal()) {
-                if constexpr (HasGhost) {
-                    live_count_.fetch_sub(1, std::memory_order_relaxed);
-                }
-                pool_.Retire(static_cast<CacheEntry*>(te.template asReal<EntryHeader>()));
-            }
-        }
-        return false;
+        pool_.Retire(static_cast<CacheEntry*>(old->template asReal<EntryHeader>()));
+        return true;
     }
 
     /// Convenience alias for remove().

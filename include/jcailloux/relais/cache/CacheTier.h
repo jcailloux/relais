@@ -191,8 +191,8 @@ public:
         map_.invalidate(key);
     }
 
-    /// Conditional eviction: remove entry only if the value pointer matches.
-    /// Used by ListCache for stale-entry removal after modification checks.
+    /// Conditional eviction: remove entry only if the value pointer matches,
+    /// atomically (a newer entry stored meanwhile stays).
     void evictIfSame(const Key& key, const Value* expected) {
         map_.remove_if(key, [expected](auto* header) {
             auto* ce = static_cast<typename Map::CacheEntry*>(header);
@@ -217,8 +217,8 @@ public:
     /// AdmitGate: () -> bool — evaluated right before the store, and again
     ///   right after it. False before: the fetched value goes to the caller
     ///   WITHOUT being cached (the read-fill recheck: a mutation landed during
-    ///   the fetch). False after: the key is evicted again (a mutation landed
-    ///   between the check and the store). Defaults to
+    ///   the fetch). False after: the entry just stored is evicted again (a
+    ///   mutation landed between the check and the store). Defaults to
     ///   always-admit.
     ///
     /// Returns Hit pointing to the cached entry, or empty if not found.
@@ -612,20 +612,15 @@ private:
     /// The gate checked before the store is a check-then-act: a writer on
     /// another thread can bump and evict between that check and the store, and
     /// the store then outlives the evict. Re-evaluating the gate after the
-    /// store closes the gap: either it sees the bump and evicts the key, or the
-    /// bump comes after the store and the writer's evict, sequenced after its
-    /// bump, removes it. The fence orders the store before the reload; the
-    /// writer's bump carries the matching fence. The returned Hit's guard keeps
-    /// the value readable.
-    ///
-    /// The evict is unconditional: it may drop a newer entry stored meanwhile
-    /// (one extra miss). A conditional removal (remove_if) is not atomic — it
-    /// removes, tests, then re-inserts, and a writer's evict landing in between
-    /// would miss the entry it re-inserts.
+    /// store closes the gap: either it sees the bump and removes this entry
+    /// (only this one: a newer store-through is kept), or the bump comes after
+    /// the store and the writer's evict, sequenced after its bump, removes it.
+    /// The fence orders the store before the reload; the writer's bump carries
+    /// the matching fence. The returned Hit's guard keeps the value readable.
     template<typename AdmitGate>
-    void recheckStored(const Key& key, AdmitGate& gate) {
+    void recheckStored(const Key& key, const Value* stored, AdmitGate& gate) {
         std::atomic_thread_fence(std::memory_order_seq_cst);
-        if (!gate()) evict(key);
+        if (!gate()) evictIfSame(key, stored);
     }
 
     template<typename Fetcher, typename MetaBuilder, typename AdmitGate>
@@ -697,7 +692,7 @@ private:
                         count, std::memory_order_relaxed);
                 }
                 auto* ce = r.asReal();
-                recheckStored(key, gate);
+                recheckStored(key, &ce->value, gate);
                 co_return Hit{&ce->value, &ce->metadata, std::move(r.guard)};
             } else {
                 // === GHOST (create or keep) ===
@@ -727,7 +722,7 @@ private:
             auto meta = mb(*opt, 0.0f);
             auto r = map_.upsert(Map::make_key(key), std::move(*opt), std::move(meta));
             auto* ce = r.asReal();
-            recheckStored(key, gate);
+            recheckStored(key, &ce->value, gate);
             co_return Hit{&ce->value, &ce->metadata, std::move(r.guard)};
         }
     }

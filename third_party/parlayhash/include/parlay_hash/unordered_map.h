@@ -168,6 +168,15 @@ namespace parlay {
       return m.Remove(Entry::make_key(k), g);
     }
 
+    // relais addition: atomic conditional Remove (see the underlying Remove_if).
+    template <typename P, typename F>
+    auto Remove_if(const K& k, const P& p, const F& f)
+    {
+      auto gp = [&] (const Entry& e) {return p(e.get_entry());};
+      auto g = [&] (const Entry& e) {return f(e.get_entry());};
+      return m.Remove_if(Entry::make_key(k), gp, g);
+    }
+
     iterator find(const K& k) { return m.find(Entry::make_key(k)); }
 
     std::pair<iterator,bool> insert(const value_type& entry) {

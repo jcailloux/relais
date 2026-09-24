@@ -156,41 +156,56 @@ public:
     // Track modifications
     // =========================================================================
 
-    void notifyCreated(const E& entity, uint32_t gen) {
-        track(Modification::created(entity, gen));
+    // Each notification takes the next value of `counter` (the owning cache's
+    // generation) under the exclusive lock, and cutoff() reads it under the
+    // shared lock: a generation a sweep reads as its cutoff always belongs to a
+    // modification already in the tracker, so the sweep's scan evaluates it
+    // before the drain clears its chunk bit. Returns the generation taken.
+
+    uint32_t notifyCreated(const E& entity, std::atomic<uint32_t>& counter) {
+        return track(Modification::created(entity, 0), counter);
     }
 
-    void notifyUpdated(const E& old_entity, const E& new_entity, uint32_t gen) {
-        track(Modification::updated(old_entity, new_entity, gen));
+    uint32_t notifyUpdated(const E& old_entity, const E& new_entity,
+                           std::atomic<uint32_t>& counter) {
+        return track(Modification::updated(old_entity, new_entity, 0), counter);
     }
 
-    void notifyDeleted(const E& entity, uint32_t gen) {
-        track(Modification::deleted(entity, gen));
+    uint32_t notifyDeleted(const E& entity, std::atomic<uint32_t>& counter) {
+        return track(Modification::deleted(entity, 0), counter);
     }
 
     /// Record a predicate range delete (eraseWhere). One entry covers every row
     /// matching `predicate`; consumed lazily like entity modifications.
-    void notifyRangeDeleted(RangePayload predicate, uint32_t gen) {
-        bumpLatest(gen);
+    uint32_t notifyRangeDeleted(RangePayload predicate, std::atomic<uint32_t>& counter) {
         std::unique_lock lock(mutex_);
+        uint32_t gen = counter.fetch_add(1, std::memory_order_seq_cst) + 1;
+        bumpLatest(gen);
         ranges_.push_back(TrackedRange{
             .predicate = std::move(predicate),
             .generation = gen,
             .pending_segments = initial_bitmap_
         });
+        return gen;
+    }
+
+    /// The owning cache's generation, read as a sweep cutoff (see above).
+    [[nodiscard]] uint32_t cutoff(const std::atomic<uint32_t>& counter) const {
+        std::shared_lock lock(mutex_);
+        return counter.load(std::memory_order_seq_cst);
     }
 
 private:
-    void track(Modification mod) {
+    uint32_t track(Modification mod, std::atomic<uint32_t>& counter) {
+        std::unique_lock lock(mutex_);
+        mod.generation = counter.fetch_add(1, std::memory_order_seq_cst) + 1;
         bumpLatest(mod.generation);
-
-        {
-            std::unique_lock lock(mutex_);
-            modifications_.push_back(TrackedModification{
-                .modification = std::move(mod),
-                .pending_segments = initial_bitmap_
-            });
-        }
+        uint32_t gen = mod.generation;
+        modifications_.push_back(TrackedModification{
+            .modification = std::move(mod),
+            .pending_segments = initial_bitmap_
+        });
+        return gen;
     }
 
 public:

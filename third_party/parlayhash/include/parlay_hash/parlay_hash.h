@@ -1001,6 +1001,67 @@ struct parlay_hash {
     });
   }
 
+  // relais addition: conditional Remove. Removes the entry with the given key
+  // only if p(e) holds for it, evaluated on the same bucket snapshot the
+  // removing sc() commits against, so the test and the removal are one atomic
+  // step. Returns an empty optional if the key is absent or p(e) is false, and
+  // f(e) otherwise.
+  template <typename P, typename F>
+  auto Remove_if(const K& key, const P& p, const F& f)
+    -> std::optional<typename std::invoke_result<F,Entry>::type>
+  {
+    using rtype = std::optional<typename std::invoke_result<F,Entry>::type>;
+    table_version* ht = current_table_version.load();
+    long idx = ht->get_index(key);
+    auto b = &(ht->buckets[idx].v);
+    return epoch::with_epoch([&] () -> rtype {
+      int delay = 200;
+      while (true) {
+        auto [s, tag] = b->ll();
+	copy_if_needed(ht, idx);
+	check_bucket_and_state(ht, key, b, s, tag, idx);
+	int i = find_in_buffer(s, key);
+	if (i >= 0) { // found in buffer
+	  if (!p(s.buffer[i])) return std::nullopt;
+	  if (s.buffer_cnt() > buffer_size) { // need to backfill from list
+	    link* l = s.overflow_list();
+	    if (b->sc(tag, state(s, l, i))) {
+	      rtype r = f(s.buffer[i]);
+	      entries_->retire_entry(s.buffer[i]);
+	      retire_link(l);
+	      return r;
+	    } // if sc failed, will need to try again
+	  } else { // buffer not overfull, can backfill within buffer
+	    if (b->sc(tag, state(s, i))) {
+	      rtype r = f(s.buffer[i]);
+	      entries_->retire_entry(s.buffer[i]);
+	      return r;
+	    } // if sc failed, will need to try again
+	  }
+	} else { // not found in buffer
+	  if (s.buffer_cnt() <= buffer_size) // if not overful, then done
+	    return std::nullopt;
+	  auto [cnt, new_list, removed] = remove_from_list(s.overflow_list(), key);
+	  if (cnt == 0) // if not found in list then done
+	    return std::nullopt;
+	  if (!p(removed->entry)) {
+	    retire_list_n(new_list, cnt - 1);
+	    return std::nullopt;
+	  }
+	  if (b->sc(tag, state(s, new_list))) {
+	    rtype r = f(removed->entry);
+	    entries_->retire_entry(removed->entry);
+	    retire_list_n(s.overflow_list(), cnt); // retire old list
+	    return r;
+	  } // if sc failed, will need to try again
+	  retire_list_n(new_list, cnt - 1); // failed, retire new list
+	}
+	for (volatile int i=0; i < delay; ) i = i + 1;
+	delay = std::min(2*delay, 5000);
+      }
+    });
+  }
+
   // Same as Remove but without epoch protection.
   // Caller must already hold epoch protection (e.g., EpochGuard ticket).
   template <typename F>
