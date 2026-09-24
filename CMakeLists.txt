@@ -270,6 +270,7 @@ if(RELAIS_BUILD_TESTS)
     relais_add_test(test_relais_composite_key  tests/relais/test_composite_key.cpp        DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;composite-key"    RESOURCE_LOCK)
     relais_add_test(test_relais_multiview      tests/relais/test_multiview.cpp            LABELS "relais;multiview")
     relais_add_test(test_relais_recheck_guard  tests/relais/test_recheck_guard.cpp        LABELS "relais;recheck")
+    relais_add_test(test_relais_chunk_map      tests/relais/test_chunk_map.cpp            LABELS "relais;chunkmap")
     relais_add_test(test_relais_l2_gen         tests/relais/test_l2_gen.cpp               DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;redis;l2gen"       RESOURCE_LOCK)
     relais_add_test(test_relais_find_many      tests/relais/test_find_many.cpp            DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;redis;findmany"    RESOURCE_LOCK)
     relais_add_test(test_relais_erase_batch    tests/relais/test_erase_batch.cpp          DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;erasemany"        RESOURCE_LOCK)
@@ -307,6 +308,11 @@ if(RELAIS_BUILD_TESTS)
         target_compile_options(test_relais_conditional_contention PRIVATE
             -fsanitize=thread -fno-omit-frame-pointer)
         target_link_options(test_relais_conditional_contention PRIVATE -fsanitize=thread)
+        # ChunkMap mutations raced from plain threads: TSan validates the
+        # conditional removal and the ghost placeholder cleanup.
+        target_compile_options(test_relais_chunk_map PRIVATE
+            -fsanitize=thread -fno-omit-frame-pointer)
+        target_link_options(test_relais_chunk_map PRIVATE -fsanitize=thread)
         # NB: the cache-coherence suite is single-loop (one event-loop thread), so
         # its concurrency-relevant surface — the shared static L1 under concurrent
         # find/update/erase, and the coroutine resume chains — is TSan-validated by

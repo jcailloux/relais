@@ -100,6 +100,10 @@ using TallyF = TestSlotTallyEntity::Field;
 
 namespace {
 
+/// A repo keeping a cached copy of the row (L1, L2 or both).
+template<typename Repo>
+constexpr bool kCached = Repo::config.cache_level != jr::config::CacheLevel::None;
+
 int64_t insertSlot(int32_t counter = 0, int64_t version = 0) {
     auto r = execQueryArgs(
         "INSERT INTO relais_test_slots (counter, version) VALUES ($1, $2) RETURNING id",
@@ -831,8 +835,11 @@ TEMPLATE_TEST_CASE("[patchIf] success, refusal, absence and error",
         CHECK(after->holder == std::optional<int64_t>{42});
     }
 
-    SECTION("guard false: an empty view, nothing written") {
+    SECTION("guard false: an empty view, nothing written, the cached copy kept") {
         REQUIRE(sync(Repo::find(id)));  // warm
+        // Bypass relais: only the cached copy still reads counter 5.
+        execQueryArgs("UPDATE relais_test_slots SET counter = 6 WHERE id = $1", id);
+
         auto v = sync(Repo::patchIf(id, when(eq<SlotF::version>(int64_t{9})),
             set<SlotF::holder>(int64_t{42}), increment<SlotF::version>(1)));
         REQUIRE(v);
@@ -843,6 +850,7 @@ TEMPLATE_TEST_CASE("[patchIf] success, refusal, absence and error",
         REQUIRE(after);
         CHECK(after->version == 10);
         CHECK_FALSE(after->holder);
+        CHECK(after->counter == (kCached<Repo> ? 5 : 6));
     }
 
     SECTION("the guard reads the committed row, not a cached copy") {
@@ -865,12 +873,18 @@ TEMPLATE_TEST_CASE("[patchIf] success, refusal, absence and error",
         CHECK(dbCounter(id) == 5);
     }
 
-    SECTION("DB error: nullopt, distinct from a refusal") {
+    SECTION("DB error: nullopt, distinct from a refusal, the cached copy kept") {
+        REQUIRE(sync(Repo::find(id)));  // warm
+        // Bypass relais: only the cached copy still reads counter 5.
         execQueryArgs("UPDATE relais_test_slots SET counter = 2147483000 WHERE id = $1", id);
         auto v = sync(Repo::patchIf(id, when(eq<SlotF::version>(int64_t{10})),
             increment<SlotF::counter>(1'000)));
         CHECK_FALSE(v);
         CHECK(dbCounter(id) == 2'147'483'000);
+
+        auto after = sync(Repo::find(id));
+        REQUIRE(after);
+        CHECK(after->counter == (kCached<Repo> ? 5 : 2'147'483'000));
     }
 }
 
@@ -980,10 +994,18 @@ typename List::ListQuery groupPage(int64_t group) {
     return rspec::seal<Desc>(std::move(q));
 }
 
+/// The ids a group's page lists, ascending. Comparing ids, not sizes, tells a
+/// cached page from a re-fetched one of the same length.
 template<typename List>
-size_t groupSize(int64_t group) {
-    return sync(List::query(groupPage<List>(group)))->size();
+std::vector<int64_t> groupIds(int64_t group) {
+    auto page = sync(List::query(groupPage<List>(group)));
+    std::vector<int64_t> ids;
+    for (const auto& e : page->items) ids.push_back(e.id);
+    std::ranges::sort(ids);
+    return ids;
 }
+
+using Ids = std::vector<int64_t>;
 
 int64_t insertGroupedSlot(int64_t group, int32_t priority = 0) {
     return execQueryArgs(
@@ -1004,21 +1026,22 @@ TEMPLATE_TEST_CASE("[patchIf] list pages move on commit, stay on refusal",
     TestInternals::resetListCacheState<List>();
 
     auto id = insertGroupedSlot(100);
-    insertGroupedSlot(200);
-    REQUIRE(groupSize<List>(100) == 1);   // cache page group=100
-    REQUIRE(groupSize<List>(200) == 1);   // cache page group=200
+    auto other = insertGroupedSlot(200);
+    REQUIRE(groupIds<List>(100) == Ids{id});      // cache page group=100
+    REQUIRE(groupIds<List>(200) == Ids{other});   // cache page group=200
 
-    // Bypass relais: a row joins group 100 behind the cached page. Only an
+    // Bypass relais: a row joins each group behind its cached page. Only an
     // invalidation of that page can reveal it.
-    insertGroupedSlot(100);
+    auto late100 = insertGroupedSlot(100);
+    auto late200 = insertGroupedSlot(200);
 
     SECTION("refused: the pages are not invalidated") {
         auto v = sync(List::patchIf(id, when(eq<ListF::version>(int64_t{1})),
             set<ListF::group_id>(int64_t{200})));
         REQUIRE(v);
         REQUIRE_FALSE(*v);
-        CHECK(groupSize<List>(100) == 1);   // still the cached page
-        CHECK(groupSize<List>(200) == 1);
+        CHECK(groupIds<List>(100) == Ids{id});   // still the cached pages
+        CHECK(groupIds<List>(200) == Ids{other});
     }
 
     SECTION("committed: the row leaves the old page and joins the new one") {
@@ -1026,8 +1049,8 @@ TEMPLATE_TEST_CASE("[patchIf] list pages move on commit, stay on refusal",
             set<ListF::group_id>(int64_t{200})));
         REQUIRE(v);
         REQUIRE(*v);
-        CHECK(groupSize<List>(100) == 1);   // re-fetched: the bypass row, not ours
-        CHECK(groupSize<List>(200) == 2);
+        CHECK(groupIds<List>(100) == Ids{late100});
+        CHECK(groupIds<List>(200) == Ids{id, other, late200});
     }
 }
 
@@ -1310,30 +1333,31 @@ TEMPLATE_TEST_CASE("[patchWhere] a row changing group moves between list pages",
     TestInternals::resetEntityCacheState<List>();
     TestInternals::resetListCacheState<List>();
 
-    insertGroupedSlot(100, 7);             // the row the predicate selects
-    insertGroupedSlot(200);
-    REQUIRE(groupSize<List>(100) == 1);   // cache page group=100
-    REQUIRE(groupSize<List>(200) == 1);   // cache page group=200
+    auto id = insertGroupedSlot(100, 7);   // the row the predicate selects
+    auto other = insertGroupedSlot(200);
+    REQUIRE(groupIds<List>(100) == Ids{id});      // cache page group=100
+    REQUIRE(groupIds<List>(200) == Ids{other});   // cache page group=200
 
-    // Bypass relais: a row joins group 100 behind the cached page. Only an
+    // Bypass relais: a row joins each group behind its cached page. Only an
     // invalidation of that page can reveal it.
-    insertGroupedSlot(100);
+    auto late100 = insertGroupedSlot(100);
+    auto late200 = insertGroupedSlot(200);
 
     SECTION("no row matches: the pages are not invalidated") {
         auto n = sync(List::patchWhere(
             when(eq<ListF::priority>(7), eq<ListF::version>(int64_t{1})),
             set<ListF::group_id>(int64_t{200})));
         REQUIRE(n == std::optional<size_t>{0});
-        CHECK(groupSize<List>(100) == 1);   // still the cached page
-        CHECK(groupSize<List>(200) == 1);
+        CHECK(groupIds<List>(100) == Ids{id});   // still the cached pages
+        CHECK(groupIds<List>(200) == Ids{other});
     }
 
     SECTION("changed: the old and the new group are both invalidated") {
         auto n = sync(List::patchWhere(when(eq<ListF::priority>(7)),
             set<ListF::group_id>(int64_t{200})));
         REQUIRE(n == std::optional<size_t>{1});
-        CHECK(groupSize<List>(100) == 1);   // re-fetched: the bypass row, not ours
-        CHECK(groupSize<List>(200) == 2);
+        CHECK(groupIds<List>(100) == Ids{late100});
+        CHECK(groupIds<List>(200) == Ids{id, other, late200});
     }
 }
 
@@ -1368,6 +1392,58 @@ TEMPLATE_TEST_CASE("[patchWhere] cross-invalidation of the old and the new targe
         REQUIRE(move(0) == std::optional<size_t>{1});
         CHECK_FALSE(TestInternals::getFromCache<Target>(int64_t{5000}));
         CHECK_FALSE(TestInternals::getFromCache<Target>(int64_t{6000}));
+    }
+}
+
+TEST_CASE("[patchWhere] InvalidateList: each changed row refreshes its old and new pages",
+          "[patchWhere][claim][integration][list]")
+{
+    using Src = ListInvalidatingTestSlotRepo;
+    using List = L1TestSlotListRepo;
+    using ListF = TestSlotListEntity::Field;
+    TransactionGuard guard;
+    TestInternals::resetEntityCacheState<Src>();
+    TestInternals::resetListCacheState<Src>();
+    TestInternals::resetListCacheState<List>();
+
+    auto a = insertGroupedSlot(100, 7);    // two rows the predicate selects,
+    auto b = insertGroupedSlot(300, 7);    // in two groups
+    auto other = insertGroupedSlot(200);
+    REQUIRE(groupIds<List>(100) == Ids{a});
+    REQUIRE(groupIds<List>(200) == Ids{other});
+    REQUIRE(groupIds<List>(300) == Ids{b});
+
+    // Bypass relais: a row joins each group behind its cached page. Only an
+    // invalidation of that page can reveal it.
+    auto late100 = insertGroupedSlot(100);
+    auto late200 = insertGroupedSlot(200);
+    auto late300 = insertGroupedSlot(300);
+
+    SECTION("patchWhere: every row leaves its old page and joins the new one") {
+        auto n = sync(Src::patchWhere(when(eq<ListF::priority>(7)),
+            set<ListF::group_id>(int64_t{200})));
+        REQUIRE(n == std::optional<size_t>{2});
+        CHECK(groupIds<List>(100) == Ids{late100});
+        CHECK(groupIds<List>(300) == Ids{late300});
+        CHECK(groupIds<List>(200) == Ids{a, b, other, late200});
+    }
+
+    SECTION("claim: the same cascade over the claimed rows") {
+        auto rows = sync(Src::claim(when(eq<ListF::priority>(7)), 2,
+            set<ListF::group_id>(int64_t{200})));
+        REQUIRE(rows);
+        REQUIRE(rows->size() == 2);
+        CHECK(groupIds<List>(100) == Ids{late100});
+        CHECK(groupIds<List>(300) == Ids{late300});
+        CHECK(groupIds<List>(200) == Ids{a, b, other, late200});
+    }
+
+    SECTION("eraseMany: every deleted row leaves its page, and only its page") {
+        const std::vector<int64_t> ids{a, b};
+        REQUIRE(sync(Src::eraseMany(ids)) == std::optional<size_t>{2});
+        CHECK(groupIds<List>(100) == Ids{late100});
+        CHECK(groupIds<List>(300) == Ids{late300});
+        CHECK(groupIds<List>(200) == Ids{other});   // still the cached page
     }
 }
 
@@ -1721,19 +1797,20 @@ TEMPLATE_TEST_CASE("[claim] a claimed row moves between list pages",
     TestInternals::resetEntityCacheState<List>();
     TestInternals::resetListCacheState<List>();
 
-    insertGroupedSlot(100, 7);
-    insertGroupedSlot(200);
-    REQUIRE(groupSize<List>(100) == 1);
-    REQUIRE(groupSize<List>(200) == 1);
-    insertGroupedSlot(100);   // behind the cached page
+    auto id = insertGroupedSlot(100, 7);
+    auto other = insertGroupedSlot(200);
+    REQUIRE(groupIds<List>(100) == Ids{id});
+    REQUIRE(groupIds<List>(200) == Ids{other});
+    auto late100 = insertGroupedSlot(100);   // behind the cached pages
+    auto late200 = insertGroupedSlot(200);
 
     SECTION("refused: the pages are not invalidated") {
         auto rows = sync(List::claim(when(eq<ListF::priority>(7)), 2,
             set<ListF::group_id>(int64_t{200})));
         REQUIRE(rows);
         REQUIRE(rows->empty());
-        CHECK(groupSize<List>(100) == 1);
-        CHECK(groupSize<List>(200) == 1);
+        CHECK(groupIds<List>(100) == Ids{id});   // still the cached pages
+        CHECK(groupIds<List>(200) == Ids{other});
     }
 
     SECTION("taken: the old and the new group are both invalidated") {
@@ -1741,7 +1818,8 @@ TEMPLATE_TEST_CASE("[claim] a claimed row moves between list pages",
             set<ListF::group_id>(int64_t{200})));
         REQUIRE(rows);
         REQUIRE(rows->size() == 1);
-        CHECK(groupSize<List>(100) == 1);   // re-fetched: the bypass row, not ours
-        CHECK(groupSize<List>(200) == 2);
+        CHECK((*rows)[0].group_id == 200);   // the committed row, not the locked one
+        CHECK(groupIds<List>(100) == Ids{late100});
+        CHECK(groupIds<List>(200) == Ids{id, other, late200});
     }
 }
