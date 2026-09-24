@@ -122,13 +122,14 @@ static io::Task<bool> update(const Key& id, const E& entity)
 ## Partial updates with `patch`
 
 Generated entities expose a `Field` enum for type-safe partial updates. Only the
-named columns are written (dynamic `UPDATE ... SET` from
-`FieldInfo::column_name`), then the full entity is re-fetched.
+named columns are written (`UPDATE … SET` from `FieldInfo::column_name`), and the
+same statement returns the committed row.
 
 ```cpp
 using F = UserEntity::Field;
 using jcailloux::relais::entity::set;
 using jcailloux::relais::entity::setNull;
+using jcailloux::relais::entity::increment;
 
 auto updated = co_await UserRepo::patch(id, set<F::balance>(999));
 
@@ -137,7 +138,14 @@ auto updated = co_await UserRepo::patch(id,
     set<F::username>("alice"));
 
 co_await ArticleRepo::patch(id, setNull<F::view_count>());   // nullable → NULL
+
+co_await UserRepo::patch(id, increment<F::balance>(10));     // col = col + 10, in the DB
 ```
+
+`increment` / `decrement` / `nowPlus` compute the value in the database, so
+concurrent writers never lose each other's change. To write only when a condition
+holds, or to pick rows by a predicate, see
+[conditional-writes.md](conditional-writes.md).
 
 Requirements:
 
@@ -146,9 +154,13 @@ Requirements:
 - Hand-written entities without `TraitsType` don't support `patch` — gated by
   the `HasFieldUpdate` concept.
 
-Cache handling: L1 (and L2 if present) is evicted *before* the `UPDATE` runs;
-`patch` then re-stores the fresh `RETURNING` row into L1 synchronously, so the
-view it returns is already warm. Other tiers re-fill on the next read.
+Cache handling: after the commit, the returned row is stored through L1, so the
+view `patch` returns is already warm, and L2 is invalidated (it re-fills on the
+next read). With lists or cross-invalidation, the statement also returns the row
+as it was before, so pages and targets are updated from both versions without a
+prior read.
+On an uncertain outcome (`io::PgUncertainError`), the entry is evicted from L2 and
+L1 before the exception propagates.
 
 ## Insert-or-update with `upsert`
 

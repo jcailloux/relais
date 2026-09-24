@@ -10,11 +10,11 @@ New to relais? Read [concepts.md](concepts.md) first for the mental model, then 
 
 ## Contents
 
-1. [Repository API](#repository-api) — every method on the final `Repo` (reads, writes, deletes/invalidation, list, maintenance, metrics) and its type aliases.
+1. [Repository API](#repository-api) — every method on the final `Repo` (reads, writes, conditional writes, deletes/invalidation, list, maintenance, metrics) and its type aliases.
 2. [CacheConfig](#cacheconfig) — tier selection, TTLs, sizing, L2 format, update strategy: all fields, presets, `consteval with_*()` modifiers, and `RELAIS_L1_MAX_MEMORY`.
 3. [Invalidation descriptors](#invalidation-descriptors) — the four `Invalidate*` templates, resolver contracts, `InvalidationData`, `ListInvalidationTarget`, and wiring.
 4. [List and query API](#list-and-query-api) — `ListDescriptor`, filter operators, sort directions, the fluent builder, `ListQuery`/`ListQueryParams`/`TypedCursor`, HTTP parsers, and `FilterSet`.
-5. [Entity and concepts](#entity-and-concepts) — the `Entity<Struct, Mapping>` surface, partial-update factories, and the full concept hierarchy (what each requires, what each enables).
+5. [Entity and concepts](#entity-and-concepts) — the `Entity<Struct, Mapping>` surface, partial-update factories, guards and ordering, and the full concept hierarchy (what each requires, what each enables).
 6. [Runtime and I/O](#runtime-and-io) — `IoPool`/`IoPoolConfig`, the `Task`/`Immediate`/`DetachedTask` family, `Outcome`, `spawnOn`, the `IoContext` concept and its conformance harness, and `PgProvider` with its result/error types.
 7. [Annotations](#annotations) — index of `@relais` annotations (canonical home: [entities.md](entities.md)).
 
@@ -67,7 +67,7 @@ Single-key reads resolve to an **epoch-guarded `cache::CacheView<E>`** (defined 
 
 ### Writes
 
-Available only when `!Cfg.read_only`. Each write flows down the full chain: L3 commit → L2 SET/evict → L1 store/evict → list invalidation → cross-invalidation. Write coalescing (identical SQL+params) propagates a `coalesced` flag so upper layers skip redundant cache ops.
+Available only when `!Cfg.read_only`. Each write flows down the full chain: L3 commit → L2 SET/evict → L1 store/evict → list invalidation → cross-invalidation. Write coalescing (identical SQL+params) propagates a `coalesced` flag so upper layers skip redundant cache ops; relative and conditional writes are never coalesced.
 
 | Method | Returns | Constraints | Notes |
 |---|---|---|---|
@@ -75,11 +75,61 @@ Available only when `!Cfg.read_only`. Each write flows down the full chain: L3 c
 | `update(const Key&, const E&)` | `Task<std::optional<size_t>>` | `MutableEntity<E> && HasFullUpdate<E> && !Cfg.read_only` | Rows affected (`0` = not found), `nullopt` = DB error. Strategy via `Cfg.update_strategy`: `InvalidateAndLazyReload` (evict) vs optimistic write-through. |
 | `updateJson(const Key&, std::string_view)` | `Task<std::optional<size_t>>` | `MutableEntity<E> && HasFullUpdate<E> && !Cfg.read_only` | Parses JSON → `update`. `nullopt` on parse failure or DB error. |
 | `updateBinary(const Key&, std::span<const uint8_t>)` | `Task<std::optional<size_t>>` | `… && HasBinarySerialization<E> && !Cfg.read_only` | Parses BEVE → `update`. `nullopt` on parse failure or DB error. |
-| `patch(const Key&, Updates&&...)` | `Task<CacheView<E>>` | `HasFieldUpdate<E> && !Cfg.read_only` | Variadic field updates (`UPDATE … RETURNING`); ≥1 update required. Evicts then re-fills cache; returns the refreshed view. |
+| `patch(const Key&, Updates&&...)` | `Task<CacheView<E>>` | `HasFieldUpdate<E> && !Cfg.read_only` | Variadic field updates ([factories](#partial-updates)), ≥1 required, in one statement. Empty view if absent or on DB error. Stores the committed row through L1 and invalidates L2 after the commit; with lists or cross-invalidation the statement also returns the prior row, so both versions are invalidated without a pre-read. |
 | `upsert(const E& e)` | `Task<CacheView<E>>` | `UpsertableEntity<E,Key> && HasUpsertSql<E> && !Cfg.read_only` | Insert-or-update on the PK (`ON CONFLICT DO UPDATE … RETURNING`). **Assigned-PK entities only** (absent for serial PK). Store-through of the committed row; coherence & list/cross-invalidation identical to `update`. |
 
 > `HasFullUpdate<E>` = generator emitted `toUpdateParams` (false for all-PK junction tables, so `update`/`updateJson`/`updateBinary` are cleanly *absent* there — `patch` still works via `HasFieldUpdate`).
 > `upsert` additionally needs a **caller-assigned** PK: a serial/`db_managed` PK isn't in the INSERT column list, so `HasUpsertSql` is unsatisfied and `upsert` is cleanly *absent*. Guide: [caching.md › Insert-or-update](caching.md#insert-or-update-with-upsert).
+
+### Conditional writes
+
+The database checks a guard and writes in one statement, under the row lock; the
+result distinguishes a refusal (empty) from a DB error (`nullopt`). All require
+`HasFieldUpdate<E> && !Cfg.read_only`, run as `WriteMode::Exclusive` (never
+coalesced), and propagate `io::PgUncertainError`. `Guards` and `OrderBy` are built
+by the factories of [Guards and ordering](#guards-and-ordering) (namespace
+`jcailloux::relais::entity`); options and results live in
+`repository/ConditionalWrite.h` (namespace `jcailloux::relais`).
+
+```cpp
+template<typename... Gs, typename... Us>
+static Task<std::optional<CacheView<E>>> patchIf(const Key& id, const Guards<Gs...>& guard, Us&&... updates);
+
+template<WhereOptions O = {}, typename... Gs, typename... Us>
+static Task<ResultFor<E, O.returns>> patchWhere(const Guards<Gs...>& pred, Us&&... updates);
+
+template<ClaimOptions O = {}, typename... Gs, typename... Us>
+static Task<ResultFor<E, O.returns>> claim(const Guards<Gs...>& pred, size_t n, Us&&... updates);
+
+template<ClaimOptions O = {}, typename... Gs, typename... Ks, typename... Us>
+static Task<ResultFor<E, O.returns>> claim(const Guards<Gs...>& pred, const OrderBy<Ks...>& order,
+                                           size_t n, Us&&... updates);
+```
+
+| Method | `nullopt` | Empty / `0` | Value |
+|---|---|---|---|
+| `patchIf` | DB error | empty view: guard false or row absent (not distinguished) | the committed row (view) |
+| `patchWhere` | DB error | no row matched | per `O.returns` (default `Count`) |
+| `claim` `Exact` | DB error | fewer than `n` candidates: nothing written | exactly `n` rows, in order |
+| `claim` `UpTo` | DB error | no candidate | 1 to `n` rows, in order |
+
+| Type | Definition |
+|---|---|
+| `Returns` | `Count` (row count) · `After` (each committed row) · `Changes` (each row before and after) |
+| `ClaimMode` | `Exact` (n rows or none) · `UpTo` (at most n) |
+| `Lock` | `SkipLocked` (pass over a locked candidate) · `Wait` (wait, re-check, pass over if no longer matching) |
+| `WhereOptions` | `{ Returns returns = Count; }` |
+| `ClaimOptions` | `{ ClaimMode mode = Exact; Lock lock = SkipLocked; Returns returns = After; }` |
+| `Change<E>` | `{ E before; E after; }` |
+| `ResultFor<E, R>` | `optional<size_t>` (`Count`) · `optional<vector<E>>` (`After`) · `optional<vector<Change<E>>>` (`Changes`) |
+
+- **options**: NTTPs with designated initializers, e.g. `claim<{.mode = ClaimMode::UpTo, .lock = Lock::Wait}>(…)`.
+- **ordering**: `claim` without `order` takes rows in primary-key order; `order` is always closed by the primary key, and results come back in the order.
+- **`n == 0`**: `claim` returns empty without a query.
+- **rows**: `patchWhere`/`claim` return entities by value, not views.
+- **cache**: `patchIf` settles like `patch`; a refusal or DB error leaves the cache untouched. `patchWhere`/`claim` evict the entity tiers and L1 list pages before returning, L2 list pages and cross-targets detached. Uncertain: `patchIf` evicts its row; the rows of `patchWhere`/`claim` are unknowable and left to `l*_ttl` (logged).
+
+Guide: [conditional-writes.md](conditional-writes.md).
 
 ### Deletes & invalidation
 
@@ -119,7 +169,7 @@ Present only when the entity declares a `ListDescriptor` (the `ListMixin` layer)
 | `queryBuilder()` | `QueryBuilder` (noexcept) | Fluent, name-checked builder: `.filter<"...">().sortDesc<"...">().limit(n).after(cursor).build()` seals a `ListQuery`. |
 | `listSize()` | `size_t` (noexcept) | L1 list-cache entry count (`0` when no L1). |
 
-> CRUD methods (`insert`/`update`/`erase`/`patch`) are intercepted here to invalidate list caches automatically (L1 `ModificationTracker` bump — the list cache's monotonic generation counter — + selective L2 Lua EVAL).
+> CRUD methods (`insert`/`update`/`erase`/`patch`) and the conditional writes (`patchIf`/`patchWhere`/`claim`) are intercepted here to invalidate list caches automatically (L1 `ModificationTracker` bump — the list cache's monotonic generation counter — + selective L2 Lua EVAL).
 
 ### Maintenance & metrics
 
@@ -687,11 +737,47 @@ namespace jcailloux::relais::entity {
 }
 ```
 
+Relative updates compute the new value in the database (`entity/FieldUpdate.h`):
+
 ```cpp
-repo.patch(id, set<Field::title>("hi"), setNull<Field::deleted_at>());
+namespace jcailloux::relais::entity {
+    template<auto F> auto increment(auto&& n);   // col = col + n
+    template<auto F> auto decrement(auto&& n);   // col = col - n
+    template<auto F, typename Rep, typename Period>
+    auto nowPlus(std::chrono::duration<Rep, Period> d);   // col = now() + d (µs resolution)
+}
 ```
 
-> `setNull<F>()` is `static_assert`-rejected at SQL-binding time unless `FieldInfo<F>::is_nullable`. Timestamp fields bind their value as `std::string` (no conversion); other fields are `static_cast` to `FieldInfo<F>::value_type`.
+```cpp
+repo.patch(id, set<Field::title>("hi"), setNull<Field::deleted_at>());
+repo.patch(id, increment<Field::views>(1), nowPlus<Field::seen_at>(0s));
+```
+
+> `setNull<F>()` is `static_assert`-rejected at SQL-binding time unless `FieldInfo<F>::is_nullable`. `increment`/`decrement` require a numeric, non-`bool`, `NOT NULL` field; `nowPlus` a timestamp field. Timestamp fields bind their value as `std::string` (no conversion); a mapped-enum field (`@relais enum=`) binds either its C++ enum value (converted by the generated mapping) or a DB string; other fields are `static_cast` to `FieldInfo<F>::value_type`.
+
+> A write containing a relative update is `WriteMode::Exclusive`: never coalesced with an identical concurrent write.
+
+#### Guards and ordering
+
+Guards (`entity/FieldGuard.h`) build the predicate of the [conditional writes](#conditional-writes), evaluated by the database. Namespace `jcailloux::relais::entity`.
+
+| Factory | SQL | Constraint |
+|---|---|---|
+| `eq<F>(v)` · `ne` · `gt` · `ge` · `lt` · `le` | `col = $n`, `!=`, `>`, `>=`, `<`, `<=` | `v` not `nullopt`/`nullptr` (use `isNull`) |
+| `eq<F>(dbNow)` (any comparison) | `col = now()` | timestamp field |
+| `in<F>(values)` · `notIn<F>(values)` | `col = ANY($n)` · `col != ALL($n)` | input range or `{…}`; empty set → false / true |
+| `isNull<F>()` · `isNotNull<F>()` | `col IS [NOT] NULL` | nullable field |
+| `allOf(g…)` | `(a AND b …)` | children: leaves |
+| `anyOf(g…)` | `(a OR b …)` | children: leaves or `allOf` |
+| `when(g…)` → `Guards<…>` | `a AND b …` | children: leaves or `anyOf`; ≥1 |
+
+| Factory | SQL | Notes |
+|---|---|---|
+| `asc<F, Nulls N = Default>()` · `desc<F, N>()` | `col ASC\|DESC [NULLS FIRST\|LAST]` | `Nulls::{Default, First, Last}`; `Default` follows PostgreSQL |
+| `first(guard)` | `CASE WHEN guard THEN 0 ELSE 1 END` | rows satisfying `guard` first; NULL counts as not satisfied |
+| `orderBy(k…)` → `OrderBy<…>` | `ORDER BY k…, pk` | `claim` only; the primary key always closes the order |
+
+> `F` ranges over `TraitsType::Field`: the primary key, `db_managed` and JSON fields are neither guardable nor writable. Structure violations (`allOf` inside `allOf`, `anyOf` directly inside `anyOf`, empty `when`) are `static_assert` errors. Comparisons follow SQL NULL semantics.
 
 ### Concept hierarchy
 
@@ -712,7 +798,7 @@ The building blocks live in `EntityConcepts.h` / `SerializationTraits.h`; the up
 | `HasFullUpdate<E>` | `E::toUpdateParams(e)` well-formed | Gates every full-row `update()` path; absent for all-PK junctions where no column is updatable. |
 | `UpsertableEntity<E, Key>` | `CreatableEntity<E, Key> && HasFullUpdate<E>` | One arm of the `upsert()` gate: creatable **and** full-row-updatable. |
 | `HasUpsertSql<E>` | `E::MappingType::SQL::upsert → const char*` | The other arm: the generator emitted `ON CONFLICT` SQL — true only for an **assigned-PK** entity with ≥1 non-PK column. Together they gate `upsert()`. |
-| `HasFieldUpdate<E>` | `E::TraitsType` and `E::TraitsType::Field` exist | Gates the `patch()` / partial-update path (`set<F>` / `setNull<F>`). |
+| `HasFieldUpdate<E>` | `E::TraitsType` and `E::TraitsType::Field` exist | Gates `patch()` and the conditional writes `patchIf()` / `patchWhere()` / `claim()` (field updates and guards). |
 | `HasListDescriptor<E>` | `E::MappingType::ListDescriptor` exists | Inserts **ListMixin** into the chain (declarative list caching). |
 | `HasFilterSet<E>` | `E::MappingType::FilterSet` and `::FilterSet::Values` exist | Gates the where-variants `eraseWhere()` / `invalidateWhere()`; exposes the `FilterSet<E>` named-optionals aggregate. Decoupled from `HasListDescriptor`. |
 | `HasPartitionHint<E>` | `MappingType::SQL::delete_with_partition → const char*` and `MappingType::makePartitionHintParams(e) → io::PgParams` | Enables single-partition pruned DELETE when the entity is cached; falls back to PK-only scan otherwise. |

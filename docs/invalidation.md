@@ -194,11 +194,16 @@ This section describes the **mono (single-key) path**, which awaits the full
 cascade; the batch ops above split it into an awaited critical pass and a
 detached deferred pass.
 
-**Modification ops** (`insert`, `update`, `patch`, `erase`):
+**Modification ops** (`insert`, `update`, `patch`, `patchIf`, `erase`):
 
-1. Fetch the old value first (for updates/deletes).
+1. Fetch the old value first (`update`, `erase`); `patch` and `patchIf` get it from
+   the write statement itself.
 2. Run the DB operation.
-3. Propagate to dependent caches with old/new entity data.
+3. Propagate to dependent caches with old/new entity data (a refused `patchIf`
+   propagates nothing).
+
+`patchWhere` and `claim` follow the batch path: their rows, old and new, come back
+from the statement and propagate like `eraseMany`'s.
 
 **Explicit `invalidate(id)`:**
 

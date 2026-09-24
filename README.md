@@ -230,6 +230,7 @@ Each file owns one subject and reads on its own. Pick by what you're trying to d
 | **Understand** the model | [docs/concepts.md](docs/concepts.md) | How the pieces fit: entity/mapping split, the compile-time mixin tower, read/write flow, shared-nothing runtime, type-safety by concepts. |
 | **Do** a task — entities | [docs/entities.md](docs/entities.md) | Struct, `@relais` annotations, the generator. |
 | **Do** a task — caching | [docs/caching.md](docs/caching.md) | `CacheConfig`, presets, `patch`, partition keys. |
+| **Do** a task — decisions under concurrency | [docs/conditional-writes.md](docs/conditional-writes.md) | `patchIf`, `claim`, `patchWhere`: guarded and relative writes (optimistic locking, job queues, reservations). |
 | **Do** a task — invalidation | [docs/invalidation.md](docs/invalidation.md) | The four `Invalidate*` mechanisms, resolvers. |
 | **Do** a task — lists | [docs/lists.md](docs/lists.md) | `filterable`/`sortable`, paginated `query()`, cursors. |
 | **Do** a task — runtime | [docs/runtime.md](docs/runtime.md) | `IoPool`, N-loop scaling, the threading rule. |

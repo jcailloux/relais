@@ -2,6 +2,31 @@
 
 ## [Unreleased]
 
+### Added
+
+- **Conditional writes: `patchIf`, `claim`, `patchWhere`.** A typed guard
+  (`when(…)`) is checked by the database in the same statement as the write: on
+  one row by key, on the first n matching rows (`Exact`/`UpTo`,
+  `SkipLocked`/`Wait`, `orderBy`), or on every matching row. `nullopt` is a DB
+  error, an empty result a refusal.
+- **Relative updates: `increment`, `decrement`, `nowPlus`.** The value is computed
+  in the database (`nowPlus` on its clock), in `patch` and in the conditional
+  writes. Relative and conditional writes are never coalesced with an identical
+  concurrent write.
+- **Mapped enums in `set<F>`.** A `@relais enum=` field accepts its C++ enum value,
+  as in guards; the DB string stays accepted.
+
+### Changed
+
+- **`patch` no longer reads the row before writing.** With lists or
+  cross-invalidation, the write statement itself returns the prior row.
+
+### Fixed
+
+- **Stale cache entries after concurrent writes across loops.** A read-fill racing
+  a write on another loop, a `patch` racing a read, or a list page fetched during
+  a write could leave the pre-write value cached until its TTL.
+
 ## [3.0.0] - 2026-07-11
 
 ### Changed (Breaking)

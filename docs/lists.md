@@ -303,8 +303,9 @@ never coincides with the declaration site and is a footgun.
 
 ## CRUD → list notification (automatic)
 
-ListMixin intercepts `insert`, `update`, `erase`, and `patch` to notify the list
-cache of entity changes. The `ModificationTracker` records them; cached pages are
+ListMixin intercepts `insert`, `update`, `erase`, `patch` and the conditional
+writes (`patchIf`, `patchWhere`, `claim`) to notify the list cache of entity
+changes. The `ModificationTracker` records them; cached pages are
 validated **lazily** on the next `query()`. No manual
 `notifyCreated`/`notifyUpdated`/`notifyDeleted` for same-repo entities.
 
