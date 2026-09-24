@@ -167,30 +167,6 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
             co_return outcome.affected;
         }
 
-        /// Partial update: invalidates Redis then delegates to Base::patchRaw.
-        /// Returns the re-fetched entity as epoch-guarded view.
-        template<typename... Updates>
-        static io::Task<cache::CacheView<E>> patch(const Key& id, Updates&&... updates)
-            requires HasFieldUpdate<E> && (!Cfg.read_only)
-        {
-            auto entity = co_await patchRaw(id, std::forward<Updates>(updates)...);
-            if (!entity) co_return {};
-            co_return Base::makeView(std::move(*entity));
-        }
-
-        /// Guarded partial update: invalidates Redis then delegates to
-        /// Base::patchIfRaw. nullopt on DB error, empty view when refused.
-        template<typename... Gs, typename... Updates>
-        static io::Task<std::optional<cache::CacheView<E>>> patchIf(
-            const Key& id, const entity::Guards<Gs...>& guard, Updates&&... updates)
-            requires HasFieldUpdate<E> && (!Cfg.read_only)
-        {
-            auto outcome = co_await patchIfRaw(id, guard, std::forward<Updates>(updates)...);
-            if (outcome.error) co_return std::nullopt;
-            if (!outcome.entity) co_return cache::CacheView<E>{};
-            co_return Base::makeView(std::move(*outcome.entity));
-        }
-
         /// Erase entity by ID.
         /// Returns: rows deleted (0 if not found), or nullopt on DB error.
         /// Invalidates Redis cache unless DB error occurred.
@@ -559,9 +535,8 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
                 if (entity && !Recheck::changed(id, snap)) {
                     co_await setInCache(redisKey, *entity);
                     if (Recheck::changed(id, snap)) {
-                        // Mutation slipped in during the async SET → undo. Raw
-                        // invalidate (not evictRedis) to avoid a spurious bump.
-                        co_await cache::RedisCache::invalidate(redisKey);
+                        // Mutation slipped in during the async SET → undo.
+                        co_await undoStraddledFill(id, redisKey);
                     }
                 }
                 co_return entity;
@@ -719,28 +694,90 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
             co_return result;
         }
 
-        /// Partial update: invalidates Redis, returning entity by value.
+        /// Partial update, returning the row before and after. L2 is invalidated
+        /// once the row is committed (bump gen + UNLINK), not before the write:
+        /// a reader that fetches the pre-patch row between an early bump and the
+        /// commit would pass its read-fill recheck and leave that row in L2.
+        /// After the commit, its fill lands before the UNLINK (removed) or its
+        /// recheck sees the bump (compensated). A failed UNLINK enqueues a
+        /// deferred self-heal.
         template<typename... Updates>
-        static io::Task<std::optional<E>> patchRaw(const Key& id, Updates&&... updates)
+        static io::Task<std::optional<Change<E>>> patchRaw(const Key& id, Updates&&... updates)
             requires HasFieldUpdate<E> && (!Cfg.read_only)
         {
-            // Invalidate-first: evict L2 before the DB write. A failed UNLINK
-            // enqueues a deferred self-heal so the pre-patch value does not
-            // outlive a Redis outage.
-            co_await evictL2OrSelfHeal(id);
-            co_return co_await Base::patchRaw(id, std::forward<Updates>(updates)...);
+            std::optional<Change<E>> change;
+            std::exception_ptr uncertain;
+            try {
+                change = co_await Base::patchRaw(id, std::forward<Updates>(updates)...);
+            } catch (const io::PgUncertainError&) {
+                uncertain = std::current_exception();
+            }
+            if (uncertain) {
+                co_await evictL2Uncertain(id, "patch");
+                std::rethrow_exception(uncertain);
+            }
+            if (change) co_await evictL2OrSelfHeal(id);
+            co_return change;
         }
 
-        /// Guarded partial update: invalidates Redis, returning the outcome.
-        /// A refused guard still costs the eviction: the refusal is only known
-        /// after the write.
+        /// Guarded partial update, returning the outcome. Same invalidation as
+        /// patchRaw, after the commit; a refused guard wrote nothing and leaves
+        /// L2 untouched.
         template<typename... Gs, typename... Updates>
         static io::Task<typename Base::GuardedPatchOutcome> patchIfRaw(
             const Key& id, const entity::Guards<Gs...>& guard, Updates&&... updates)
             requires HasFieldUpdate<E> && (!Cfg.read_only)
         {
-            co_await evictL2OrSelfHeal(id);
-            co_return co_await Base::patchIfRaw(id, guard, std::forward<Updates>(updates)...);
+            typename Base::GuardedPatchOutcome outcome;
+            std::exception_ptr uncertain;
+            try {
+                outcome = co_await Base::patchIfRaw(id, guard, std::forward<Updates>(updates)...);
+            } catch (const io::PgUncertainError&) {
+                uncertain = std::current_exception();
+            }
+            if (uncertain) {
+                co_await evictL2Uncertain(id, "patchIf");
+                std::rethrow_exception(uncertain);
+            }
+            if (outcome.change) co_await evictL2OrSelfHeal(id);
+            co_return outcome;
+        }
+
+        /// Partial update as the tiers above see it (see PgRepo::PatchedRow).
+        template<typename... Updates>
+        static io::Task<typename Base::PatchedRow> patchRow(const Key& id, Updates&&... updates)
+            requires HasFieldUpdate<E> && (!Cfg.read_only)
+        {
+            auto change = co_await patchRaw(id, std::forward<Updates>(updates)...);
+            if (!change) co_return typename Base::PatchedRow{};
+            co_return typename Base::PatchedRow{
+                std::move(change->before), Base::makeView(std::move(change->after))};
+        }
+
+        /// Guarded partial update as the tiers above see it. nullopt on DB error.
+        template<typename... Gs, typename... Updates>
+        static io::Task<std::optional<typename Base::PatchedRow>> patchIfRow(
+            const Key& id, const entity::Guards<Gs...>& guard, Updates&&... updates)
+            requires HasFieldUpdate<E> && (!Cfg.read_only)
+        {
+            auto outcome = co_await patchIfRaw(id, guard, std::forward<Updates>(updates)...);
+            if (outcome.error) co_return std::nullopt;
+            if (!outcome.change) co_return typename Base::PatchedRow{};
+            co_return typename Base::PatchedRow{
+                std::move(outcome.change->before),
+                Base::makeView(std::move(outcome.change->after))};
+        }
+
+        /// Uncertain write (timeout or lost connection): the row may have
+        /// committed. Evict L2 by precaution; log an I/O failure rather than mask
+        /// the uncertain exception the caller rethrows.
+        static io::Task<void> evictL2Uncertain(const Key& id, const char* op) {
+            try {
+                co_await evictL2OrSelfHeal(id);
+            } catch (const std::exception& e) {
+                RELAIS_LOG_ERROR << Base::name() << ": L2 precautionary evict failed (uncertain "
+                    << op << ") - " << e.what();
+            }
         }
 
         // =====================================================================
@@ -833,6 +870,17 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
             E entity;
         };
 
+        /// Undo an L2 fill that straddled a mutation: UNLINK it, then bump and
+        /// evict L1. Until the UNLINK lands, an L1 filler may read the stale
+        /// entry with a snapshot taken after the writer's own bumps; this bump
+        /// is the one its recheck can still see, and the evict removes an entry
+        /// it stored first.
+        static io::Task<void> undoStraddledFill(const Key& id, const std::string& key) {
+            co_await cache::RedisCache::invalidate(key);
+            if (l1SelfHealHook_) l1SelfHealHook_(id);
+            else Recheck::bump(id);
+        }
+
         /// Fire-and-forget L2 warming for a batch of fetched entities. Mirrors
         /// setInCache but off the return path (DetachedTask), so the caller
         /// never blocks on the SET RTT. Owns its arguments by value.
@@ -846,7 +894,7 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
                     if (Recheck::changed(e.id, e.snap)) continue;
                     co_await setInCache(e.key, e.entity);
                     if (Recheck::changed(e.id, e.snap)) {
-                        co_await cache::RedisCache::invalidate(e.key);
+                        co_await undoStraddledFill(e.id, e.key);
                     }
                 }
             } catch (...) {}

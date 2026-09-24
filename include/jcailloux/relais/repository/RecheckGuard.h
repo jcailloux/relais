@@ -26,7 +26,7 @@ namespace jcailloux::relais {
 /// If a mutation bumped the slot before the store, the value straddled a write
 /// → return it to the caller but do NOT cache it (the next read re-fetches). If
 /// the bump lands between the first check and the store, the second check sees
-/// it and the reader evicts the key again. Hits never touch the counter, so
+/// it and the reader evicts its own entry. Hits never touch the counter, so
 /// already-cached entries are immune.
 ///
 /// Sharded, not per-key: the recheck fires during a MISS (entry absent), so
@@ -70,8 +70,8 @@ struct RecheckGuard {
     /// the check and its store while the writer bumps and evicts. The guarantee
     /// comes from the check after the store, with a seq_cst fence between the
     /// two on the reader and one after the bump on the writer (store → load on
-    /// both sides): either the reader's reload sees the bump and it evicts the
-    /// key again, or the writer's evict, which follows the bump, sees the entry.
+    /// both sides): either the reader's reload sees the bump and it evicts its
+    /// own entry, or the writer's evict, which follows the bump, sees the entry.
     static bool changed(const Key& id, uint64_t snap) {
         return slots_[slotOf(id)].load(std::memory_order_acquire) != snap;
     }

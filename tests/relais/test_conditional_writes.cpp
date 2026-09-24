@@ -140,25 +140,29 @@ TEST_CASE("[relative] SET fragments and write-mode trait", "[relative][sql]")
     using Op = jr::entity::SetOp;
 
     SECTION("each op emits its own right-hand side, values numbered in order") {
-        auto sql = d::buildUpdateReturning(
-            "t", "id",
+        auto sql = d::buildKeyedPatchSql<TestSlotEntity::TraitsType, void>(
+            "tb", "id",
             {d::SetColumn("\"a\""),
              d::SetColumn("\"b\"", Op::Add),
              d::SetColumn("\"c\"", Op::Subtract),
              d::SetColumn("\"d\"", Op::NowPlus)},
             "id");
         REQUIRE(sql ==
-            "UPDATE t SET \"a\"=$1,\"b\"=\"b\"+$2,\"c\"=\"c\"-$3,"
-            "\"d\"=now()+interval '1 microsecond'*$4 WHERE \"id\"=$5 RETURNING id");
+            "WITH o AS (SELECT id FROM tb WHERE \"id\"=$5 FOR UPDATE) "
+            "UPDATE tb AS t SET \"a\"=$1,\"b\"=t.\"b\"+$2,\"c\"=t.\"c\"-$3,"
+            "\"d\"=now()+interval '1 microsecond'*$4 FROM o WHERE t.\"id\"=o.\"id\" "
+            "RETURNING o.id,t.id");
     }
 
     SECTION("composite key: PK values follow the SET values") {
         using M = entity::generated::TestSlotTallyMapping;
-        auto sql = d::buildUpdateReturning(
+        using TallyTraits = TestSlotTallyEntity::TraitsType;
+        auto sql = d::buildKeyedPatchSql<TallyTraits, void>(
             M::table_name, M::primary_key_columns,
             {d::SetColumn("\"hits\"", Op::Add)}, M::SQL::returning_columns);
-        REQUIRE(sql.find("SET \"hits\"=\"hits\"+$1 WHERE \"group_id\"=$2 AND \"bucket\"=$3")
+        REQUIRE(sql.find("WHERE \"group_id\"=$2 AND \"bucket\"=$3 FOR UPDATE")
                 != std::string::npos);
+        REQUIRE(sql.find("SET \"hits\"=t.\"hits\"+$1 FROM o") != std::string::npos);
     }
 
     SECTION("only relative updates are marked non-idempotent") {
@@ -760,31 +764,35 @@ TEST_CASE("[patchIf] SQL: SET values, then the key, then the guard", "[patchIf][
 {
     namespace d = jr::detail;
 
-    SECTION("single key") {
+    SECTION("single key: the guard is checked on the locked row, both versions returned") {
         using G = decltype(when(eq<SlotF::version>(int64_t{0}),
             anyOf(isNull<SlotF::holder>(), lt<SlotF::expires_at>(dbNow))));
-        auto sql = d::buildGuardedUpdateReturning<SlotTraits, G>(
+        auto sql = d::buildKeyedPatchSql<SlotTraits, G>(
             SlotMapping::table_name, SlotMapping::primary_key_column,
             {d::SetColumn(std::string_view("\"holder\"")),
              d::SetColumn(std::string_view("\"version\""), jr::entity::SetOp::Add)},
-            "id");
+            "id, version");
         REQUIRE(sql ==
-            "UPDATE relais_test_slots SET \"holder\"=$1,\"version\"=\"version\"+$2 "
-            "WHERE \"id\"=$3 AND \"version\"=$4 AND (\"holder\" IS NULL OR \"expires_at\"<now()) "
-            "RETURNING id");
+            "WITH o AS (SELECT id, version FROM relais_test_slots WHERE \"id\"=$3 "
+            "AND \"version\"=$4 AND (\"holder\" IS NULL OR \"expires_at\"<now()) FOR UPDATE) "
+            "UPDATE relais_test_slots AS t SET \"holder\"=$1,\"version\"=t.\"version\"+$2 "
+            "FROM o WHERE t.\"id\"=o.\"id\" RETURNING o.id,o.version,t.id,t.version");
     }
 
     SECTION("composite key") {
         using TallyTraits = TestSlotTallyEntity::TraitsType;
         using TallyMapping = entity::generated::TestSlotTallyMapping;
         using G = decltype(when(lt<TallyF::hits>(int64_t{0})));
-        auto sql = d::buildGuardedUpdateReturning<TallyTraits, G>(
+        auto sql = d::buildKeyedPatchSql<TallyTraits, G>(
             TallyMapping::table_name, TallyMapping::primary_key_columns,
             {d::SetColumn(std::string_view("\"hits\""), jr::entity::SetOp::Add)},
-            "hits");
+            "group_id, bucket, hits");
         REQUIRE(sql ==
-            "UPDATE relais_test_slot_tallies SET \"hits\"=\"hits\"+$1 "
-            "WHERE \"group_id\"=$2 AND \"bucket\"=$3 AND \"hits\"<$4 RETURNING hits");
+            "WITH o AS (SELECT group_id, bucket, hits FROM relais_test_slot_tallies "
+            "WHERE \"group_id\"=$2 AND \"bucket\"=$3 AND \"hits\"<$4 FOR UPDATE) "
+            "UPDATE relais_test_slot_tallies AS t SET \"hits\"=t.\"hits\"+$1 FROM o "
+            "WHERE t.\"group_id\"=o.\"group_id\" AND t.\"bucket\"=o.\"bucket\" "
+            "RETURNING o.group_id,o.bucket,o.hits,t.group_id,t.bucket,t.hits");
     }
 }
 

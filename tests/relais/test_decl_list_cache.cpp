@@ -809,6 +809,55 @@ TEST_CASE("[DeclListRepo] Modification cutoff safety",
 
 // #############################################################################
 //
+//  A page fetched across a modification
+//
+// #############################################################################
+//
+// A page is stamped with the generation read before its fetch. Modifications
+// notified during the fetch are checked when the page is stored: the page is
+// kept only if each of them is still tracked and none affects it. A drained one
+// cannot be checked, so the page is dropped.
+
+TEST_CASE("[DeclListRepo] Page fetched across a modification",
+          "[integration][db][list][straddle]")
+{
+    TransactionGuard guard;
+    TestInternals::resetListCacheState<TestArticleListRepo>();
+
+    auto alice_id = insertTestUser("alice_straddle", "alice_straddle@test.com", 0);
+    for (int vc = 10; vc <= 50; vc += 10) {
+        insertTestArticle("tech", alice_id, "straddle_" + std::to_string(vc), vc);
+    }
+    auto q = makeViewCountQuery("tech", 10);
+    auto fetch_gen = TestInternals::listCacheGeneration<TestArticleListRepo>();
+
+    SECTION("an affecting modification during the fetch: not cached") {
+        TestArticleListRepo::notifyCreated(makeArticle(9101, "tech", alice_id, "mid", 25));
+        CHECK_FALSE(TestInternals::putPageFetchedAt<TestArticleListRepo>(q, fetch_gen));
+    }
+
+    SECTION("an unrelated modification during the fetch: cached") {
+        TestArticleListRepo::notifyCreated(makeArticle(9102, "science", alice_id, "other", 25));
+        CHECK(TestInternals::putPageFetchedAt<TestArticleListRepo>(q, fetch_gen));
+    }
+
+    SECTION("a modification drained before the store: not cached") {
+        TestArticleListRepo::notifyCreated(makeArticle(9103, "science", alice_id, "other", 25));
+        TestInternals::drainAllModificationChunks<TestArticleListRepo>(
+            TestInternals::listCacheGeneration<TestArticleListRepo>());
+        REQUIRE(TestInternals::pendingModificationCount<TestArticleListRepo>() == 0);
+        CHECK_FALSE(TestInternals::putPageFetchedAt<TestArticleListRepo>(q, fetch_gen));
+    }
+
+    SECTION("a modification before the fetch: cached") {
+        TestArticleListRepo::notifyCreated(makeArticle(9104, "tech", alice_id, "before", 25));
+        CHECK(TestInternals::putPageFetchedAt<TestArticleListRepo>(
+            q, TestInternals::listCacheGeneration<TestArticleListRepo>()));
+    }
+}
+
+// #############################################################################
+//
 //  TEST CASE 8: Bitmap skip optimization
 //
 // #############################################################################

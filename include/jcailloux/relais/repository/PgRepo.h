@@ -127,72 +127,6 @@ void appendPkMatch(std::string& sql, const std::array<const char*, N>& pk_column
     }
 }
 
-/// Build: UPDATE "table" SET "col1"=$1, "col2"="col2"+$2 WHERE "pk"=$N RETURNING cols
-inline std::string buildUpdateReturning(
-    std::string_view table_name,
-    std::string_view pk_column,
-    std::initializer_list<SetColumn> sets,
-    std::string_view returning_columns)
-{
-    std::string sql;
-    sql.reserve(128);
-    sql += "UPDATE ";
-    sql += table_name;
-    sql += " SET ";
-    size_t param = appendSetClause(sql, sets);
-    sql += " WHERE ";
-    appendPkMatch(sql, pk_column, param);
-    sql += " RETURNING ";
-    sql += returning_columns;
-    return sql;
-}
-
-/// Build UPDATE ... RETURNING for composite primary keys.
-template<size_t N>
-inline std::string buildUpdateReturning(
-    std::string_view table_name,
-    const std::array<const char*, N>& pk_columns,
-    std::initializer_list<SetColumn> sets,
-    std::string_view returning_columns)
-{
-    std::string sql;
-    sql.reserve(128);
-    sql += "UPDATE ";
-    sql += table_name;
-    sql += " SET ";
-    size_t param = appendSetClause(sql, sets);
-    sql += " WHERE ";
-    appendPkMatch(sql, pk_columns, param);
-    sql += " RETURNING ";
-    sql += returning_columns;
-    return sql;
-}
-
-/// Build: UPDATE "table" SET <sets> WHERE <pk>=$k AND <guard> RETURNING cols.
-/// Parameters: SET values, then the key column(s), then the guard values.
-/// `pk` is a single column name or a std::array of them (composite key).
-template<typename Traits, typename Guard, typename Pk>
-std::string buildGuardedUpdateReturning(
-    std::string_view table_name,
-    const Pk& pk,
-    std::initializer_list<SetColumn> sets,
-    std::string_view returning_columns)
-{
-    std::string sql;
-    sql.reserve(192);
-    sql += "UPDATE ";
-    sql += table_name;
-    sql += " SET ";
-    size_t param = appendSetClause(sql, sets);
-    sql += " WHERE ";
-    appendPkMatch(sql, pk, param);
-    sql += " AND ";
-    GuardSql<Traits, Guard>::emit(sql, param, {});
-    sql += " RETURNING ";
-    sql += returning_columns;
-    return sql;
-}
-
 /// Append a comma-separated column list ("a, b, c"), each column prefixed by `qual`.
 inline void appendQualifiedColumns(std::string& sql, std::string_view columns,
                                    std::string_view qual) {
@@ -263,6 +197,50 @@ std::string buildPatchWhereSql(
     sql += table_name;
     sql += " WHERE ";
     GuardSql<Traits, Pred>::emit(sql, param, {});
+    sql += " FOR UPDATE) UPDATE ";
+    sql += table_name;
+    sql += " AS t SET ";
+    sql += set_clause;
+    sql += " FROM o WHERE ";
+    appendPkJoin(sql, pk);
+    sql += " RETURNING ";
+    appendQualifiedColumns(sql, columns, "o.");
+    sql += ',';
+    appendQualifiedColumns(sql, columns, "t.");
+    return sql;
+}
+
+/// Build the keyed partial UPDATE that returns the row before and after:
+///   WITH o AS (SELECT <cols> FROM tbl WHERE <pk>=$k [AND <guard>] FOR UPDATE)
+///   UPDATE tbl AS t SET <sets> FROM o WHERE t.pk=o.pk RETURNING o.<cols>, t.<cols>
+/// The shape of buildPatchWhereSql, the key standing for the predicate: the
+/// before version is read under the row lock, so it is the version the write
+/// replaced, and a guard on a row locked by a concurrent writer is re-checked
+/// on its committed version. Parameters: SET values, then the key column(s),
+/// then the guard values. `pk` is a single column name or a std::array of them
+/// (composite key); `Guard` is void for an unguarded patch.
+template<typename Traits, typename Guard, typename Pk>
+std::string buildKeyedPatchSql(
+    std::string_view table_name,
+    const Pk& pk,
+    std::initializer_list<SetColumn> sets,
+    std::string_view columns)
+{
+    std::string set_clause;
+    size_t param = appendSetClause(set_clause, sets, "t.");
+
+    std::string sql;
+    sql.reserve(256 + 3 * columns.size());
+    sql += "WITH o AS (SELECT ";
+    sql += columns;
+    sql += " FROM ";
+    sql += table_name;
+    sql += " WHERE ";
+    appendPkMatch(sql, pk, param);
+    if constexpr (!std::is_void_v<Guard>) {
+        sql += " AND ";
+        GuardSql<Traits, Guard>::emit(sql, param, {});
+    }
     sql += " FOR UPDATE) UPDATE ";
     sql += table_name;
     sql += " AS t SET ";
@@ -527,9 +505,7 @@ public:
     static io::Task<cache::CacheView<E>> patch(const Key& id, Updates&&... updates)
         requires HasFieldUpdate<E> && (!Cfg.read_only)
     {
-        auto entity = co_await patchRaw(id, std::forward<Updates>(updates)...);
-        if (!entity) co_return {};
-        co_return makeView(std::move(*entity));
+        co_return (co_await patchRow(id, std::forward<Updates>(updates)...)).after;
     }
 
     /// Guarded partial update: applies `updates` only if the row satisfies
@@ -541,10 +517,9 @@ public:
         const Key& id, const entity::Guards<Gs...>& guard, Updates&&... updates)
         requires HasFieldUpdate<E> && (!Cfg.read_only)
     {
-        auto outcome = co_await patchIfRaw(id, guard, std::forward<Updates>(updates)...);
-        if (outcome.error) co_return std::nullopt;
-        if (!outcome.entity) co_return cache::CacheView<E>{};
-        co_return makeView(std::move(*outcome.entity));
+        auto row = co_await patchIfRow(id, guard, std::forward<Updates>(updates)...);
+        if (!row) co_return std::nullopt;
+        co_return std::move(row->after);
     }
 
     // =====================================================================
@@ -906,9 +881,45 @@ protected:
         }
     }
 
-    /// Partial update, returning entity by value.
+    /// The keyed patch statement for these updates (and guard, unless void).
+    template<typename Guard, typename... Updates>
+    static std::string keyedPatchSql() {
+        using Traits = typename E::TraitsType;
+        auto build = [](const auto& pk) {
+            return detail::buildKeyedPatchSql<Traits, Guard>(
+                Mapping::table_name, pk,
+                {detail::SetColumn(
+                    entity::fieldColumnName<Traits>(std::remove_cvref_t<Updates>{}),
+                    entity::set_op_v<std::remove_cvref_t<Updates>>)...},
+                Mapping::SQL::returning_columns);
+        };
+        if constexpr (is_tuple_v<Key>) return build(Mapping::primary_key_columns);
+        else return build(Mapping::primary_key_column);
+    }
+
+    /// The single row of a keyed patch: the version before, then the one after.
+    static std::optional<Change<E>> decodeChange(const io::PgResult& result) {
+        constexpr int width = detail::countColumns(Mapping::SQL::returning_columns);
+        if (result.empty()) return std::nullopt;
+        auto row = result[0];
+        auto before = E::fromRow(row);
+        auto after = E::fromRow(row.shifted(width));
+        if (!before || !after) return std::nullopt;
+        return Change<E>{std::move(*before), std::move(*after)};
+    }
+
+    /// A keyed patch as the tiers above see it: the row the write replaced and
+    /// a view of the committed row. Both empty when nothing was written (row
+    /// absent, guard false, or DB error).
+    struct PatchedRow {
+        std::optional<E> before;
+        cache::CacheView<E> after;
+    };
+
+    /// Partial update, returning the row before and after the write. nullopt
+    /// when the row is absent or on a DB error.
     template<typename... Updates>
-    static io::Task<std::optional<E>> patchRaw(const Key& id, Updates&&... updates)
+    static io::Task<std::optional<Change<E>>> patchRaw(const Key& id, Updates&&... updates)
         requires HasFieldUpdate<E> && (!Cfg.read_only)
     {
         static_assert(sizeof...(Updates) > 0, "patch requires at least one field update");
@@ -920,47 +931,24 @@ protected:
                 ? io::batch::WriteMode::Exclusive
                 : io::batch::WriteMode::Idempotent;
         try {
-            static const auto sql = []{
-                if constexpr (is_tuple_v<Key>) {
-                    return detail::buildUpdateReturning(
-                        Mapping::table_name,
-                        Mapping::primary_key_columns,
-                        {detail::SetColumn(
-                            entity::fieldColumnName<Traits>(std::remove_cvref_t<Updates>{}),
-                            entity::set_op_v<std::remove_cvref_t<Updates>>)...},
-                        Mapping::SQL::returning_columns);
-                } else {
-                    return detail::buildUpdateReturning(
-                        Mapping::table_name,
-                        Mapping::primary_key_column,
-                        {detail::SetColumn(
-                            entity::fieldColumnName<Traits>(std::remove_cvref_t<Updates>{}),
-                            entity::set_op_v<std::remove_cvref_t<Updates>>)...},
-                        Mapping::SQL::returning_columns);
-                }
-            }();
+            static const auto sql = keyedPatchSql<void, Updates...>();
 
-            io::PgParams params;
-            auto fieldParams = io::PgParams::make(
+            auto params = io::PgParams::make(
                 entity::fieldValue<Traits>(std::forward<Updates>(updates))...);
             auto keyParams = io::PgParams::fromKey(id);
-            params.params.reserve(fieldParams.params.size() + keyParams.params.size());
-            for (auto& p : fieldParams.params)
-                params.params.push_back(std::move(p));
+            params.params.reserve(params.params.size() + keyParams.params.size());
             for (auto& p : keyParams.params)
                 params.params.push_back(std::move(p));
 
             // Write path (seq-ordered): keeps patch in seq with update/erase of
             // the same PK. An absolute patch is idempotent, so a coalesced
-            // follower observes the same row; a relative one is Exclusive and
+            // follower observes the same change; a relative one is Exclusive and
             // always runs on its own.
             auto w = co_await PgProvider::queryWrite(sql.c_str(), params, mode);
-            if (w.result.empty()) co_return std::nullopt;
-            co_return E::fromRow(w.result[0]);
+            co_return decodeChange(w.result);
         } catch (const io::PgUncertainError&) {
-            // Uncertain: the UPDATE may have committed. Propagate; the entity
-            // tiers were already evicted before this await (invalidate-first
-            // patch), so the precautionary eviction is already in place.
+            // Uncertain: the UPDATE may have committed. Propagate; the cache
+            // tiers above evict by precaution as it unwinds.
             throw;
         } catch (const io::PgError& e) {
             RELAIS_LOG_ERROR << name() << ": patch error - " << e.what();
@@ -971,8 +959,8 @@ protected:
     /// Outcome of a guarded patch. Refusal and DB error must stay apart: a
     /// false guard is a business answer, an error is a failure.
     struct GuardedPatchOutcome {
-        std::optional<E> entity;  ///< the committed row; empty if refused or absent
-        bool error = false;       ///< deterministic DB error
+        std::optional<Change<E>> change;  ///< empty if refused or absent
+        bool error = false;               ///< deterministic DB error
     };
 
     /// Guarded partial update, returning the outcome by value.
@@ -986,25 +974,7 @@ protected:
         using Traits = typename E::TraitsType;
         using Guard = entity::Guards<Gs...>;
         try {
-            static const auto sql = []{
-                if constexpr (is_tuple_v<Key>) {
-                    return detail::buildGuardedUpdateReturning<Traits, Guard>(
-                        Mapping::table_name,
-                        Mapping::primary_key_columns,
-                        {detail::SetColumn(
-                            entity::fieldColumnName<Traits>(std::remove_cvref_t<Updates>{}),
-                            entity::set_op_v<std::remove_cvref_t<Updates>>)...},
-                        Mapping::SQL::returning_columns);
-                } else {
-                    return detail::buildGuardedUpdateReturning<Traits, Guard>(
-                        Mapping::table_name,
-                        Mapping::primary_key_column,
-                        {detail::SetColumn(
-                            entity::fieldColumnName<Traits>(std::remove_cvref_t<Updates>{}),
-                            entity::set_op_v<std::remove_cvref_t<Updates>>)...},
-                        Mapping::SQL::returning_columns);
-                }
-            }();
+            static const auto sql = keyedPatchSql<Guard, Updates...>();
 
             auto params = io::PgParams::make(
                 entity::fieldValue<Traits>(std::forward<Updates>(updates))...);
@@ -1019,16 +989,38 @@ protected:
             // identical guarded writes must both be evaluated, never coalesced.
             auto w = co_await PgProvider::queryWrite(
                 sql.c_str(), params, io::batch::WriteMode::Exclusive);
-            if (w.result.empty()) co_return GuardedPatchOutcome{};
-            co_return GuardedPatchOutcome{E::fromRow(w.result[0])};
+            co_return GuardedPatchOutcome{decodeChange(w.result)};
         } catch (const io::PgUncertainError&) {
-            // Uncertain: the UPDATE may have committed. Propagate; the entity
-            // tiers were evicted before this await, as for patch.
+            // Uncertain: the UPDATE may have committed. Propagate; the cache
+            // tiers above evict by precaution as it unwinds, as for patch.
             throw;
         } catch (const io::PgError& e) {
             RELAIS_LOG_ERROR << name() << ": patchIf error - " << e.what();
             co_return GuardedPatchOutcome{.error = true};
         }
+    }
+
+    /// Partial update as the tiers above see it (see PatchedRow).
+    template<typename... Updates>
+    static io::Task<PatchedRow> patchRow(const Key& id, Updates&&... updates)
+        requires HasFieldUpdate<E> && (!Cfg.read_only)
+    {
+        auto change = co_await patchRaw(id, std::forward<Updates>(updates)...);
+        if (!change) co_return PatchedRow{};
+        co_return PatchedRow{std::move(change->before), makeView(std::move(change->after))};
+    }
+
+    /// Guarded partial update as the tiers above see it. nullopt on DB error.
+    template<typename... Gs, typename... Updates>
+    static io::Task<std::optional<PatchedRow>> patchIfRow(
+        const Key& id, const entity::Guards<Gs...>& guard, Updates&&... updates)
+        requires HasFieldUpdate<E> && (!Cfg.read_only)
+    {
+        auto outcome = co_await patchIfRaw(id, guard, std::forward<Updates>(updates)...);
+        if (outcome.error) co_return std::nullopt;
+        if (!outcome.change) co_return PatchedRow{};
+        co_return PatchedRow{std::move(outcome.change->before),
+                             makeView(std::move(outcome.change->after))};
     }
 
     /// Predicate partial update, returning every changed row before and after.

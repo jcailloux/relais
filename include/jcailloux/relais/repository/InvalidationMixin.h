@@ -225,98 +225,40 @@ public:
         co_return result;
     }
 
-    /// Partial update with cross-invalidation.
-    /// When Base is ListMixin, reuses the pre-fetched old entity via WithContext.
+    /// Partial update with cross-invalidation (only if committed), keyed on the
+    /// row before and after, both returned by the write itself. Uncertain:
+    /// neither version is known, the targets are left to l*_ttl (logged).
     template<typename... Updates>
-    static io::Task<cache::CacheView<Entity>> patch(const Key& id, Updates&&... updates)
+    static io::Task<typename Base::PatchedRow> patchRow(const Key& id, Updates&&... updates)
         requires HasFieldUpdate<Entity> && (!Base::config.read_only)
     {
-        std::optional<Entity> old = co_await findOldBestEffort(id);
-
-        cache::CacheView<Entity> result;
-        std::exception_ptr timeout;
+        typename Base::PatchedRow row;
         try {
-            if constexpr (detail::HasListMixin<Base>) {
-                result = co_await Base::patchWithContext(
-                    id, old ? &*old : nullptr, std::forward<Updates>(updates)...);
-            } else {
-                result = co_await Base::patch(id, std::forward<Updates>(updates)...);
-            }
+            row = co_await Base::patchRow(id, std::forward<Updates>(updates)...);
         } catch (const io::PgUncertainError&) {
-            timeout = std::current_exception();
+            logUncertainPatch("patch");
+            throw;
         }
-        if (timeout) {
-            // Uncertain: the patched new value is unknown (no RETURNING). Cross-
-            // invalidate keyed on old only (old as both old and new ⇒ old's target
-            // keys). A patch that moved a cross key leaves that target bounded by
-            // l*_ttl (documented residual). Best-effort.
-            if (old) {
-                try {
-                    co_await propagateUpdate<Entity, InvList>(&*old, *old);
-                } catch (const std::exception& e) {
-                    RELAIS_LOG_ERROR << name()
-                        << ": cross-invalidation failed (patch timeout) - " << e.what();
-                }
-            }
-            std::rethrow_exception(timeout);
-        }
-        if (result) {
-            // Best-effort: a committed patch never fails on cross-invalidation.
-            try {
-                co_await propagateUpdate<Entity, InvList>(
-                    old ? &*old : nullptr, *result);
-            } catch (const std::exception& e) {
-                RELAIS_LOG_ERROR << name()
-                    << ": cross-invalidation failed (patch committed) - " << e.what();
-            }
-        }
-        co_return result;
+        co_await propagatePatched(row, "patch");
+        co_return row;
     }
 
-    /// Guarded partial update with cross-invalidation (only if committed).
+    /// Guarded partial update with the same cross-invalidation as patchRow. A
+    /// refused guard changed nothing: no target to invalidate.
     template<typename... Gs, typename... Updates>
-    static io::Task<std::optional<cache::CacheView<Entity>>> patchIf(
+    static io::Task<std::optional<typename Base::PatchedRow>> patchIfRow(
         const Key& id, const entity::Guards<Gs...>& guard, Updates&&... updates)
         requires HasFieldUpdate<Entity> && (!Base::config.read_only)
     {
-        std::optional<Entity> old = co_await findOldBestEffort(id);
-
-        std::optional<cache::CacheView<Entity>> result;
-        std::exception_ptr timeout;
+        std::optional<typename Base::PatchedRow> row;
         try {
-            if constexpr (detail::HasListMixin<Base>) {
-                result = co_await Base::patchIfWithContext(
-                    id, old ? &*old : nullptr, guard, std::forward<Updates>(updates)...);
-            } else {
-                result = co_await Base::patchIf(id, guard, std::forward<Updates>(updates)...);
-            }
+            row = co_await Base::patchIfRow(id, guard, std::forward<Updates>(updates)...);
         } catch (const io::PgUncertainError&) {
-            timeout = std::current_exception();
+            logUncertainPatch("patchIf");
+            throw;
         }
-        if (timeout) {
-            // Uncertain: same precautionary cross-invalidation as patch, keyed on old.
-            if (old) {
-                try {
-                    co_await propagateUpdate<Entity, InvList>(&*old, *old);
-                } catch (const std::exception& e) {
-                    RELAIS_LOG_ERROR << name()
-                        << ": cross-invalidation failed (patchIf timeout) - " << e.what();
-                }
-            }
-            std::rethrow_exception(timeout);
-        }
-        // A refused guard changed nothing: no target to invalidate.
-        if (result && *result) {
-            // Best-effort: a committed patch never fails on cross-invalidation.
-            try {
-                co_await propagateUpdate<Entity, InvList>(
-                    old ? &*old : nullptr, **result);
-            } catch (const std::exception& e) {
-                RELAIS_LOG_ERROR << name()
-                    << ": cross-invalidation failed (patchIf committed) - " << e.what();
-            }
-        }
-        co_return result;
+        if (row) co_await propagatePatched(*row, "patchIf");
+        co_return row;
     }
 
     /// Invalidate all caches (L1 + L2) and propagate cross-invalidation.
@@ -336,6 +278,25 @@ public:
     }
 
 protected:
+    /// Cross-invalidation of a committed patch (nothing if nothing was written).
+    /// Best-effort: a committed patch never fails on cross-invalidation.
+    static io::Task<void> propagatePatched(const typename Base::PatchedRow& row,
+                                           const char* op) {
+        if (!row.before) co_return;
+        try {
+            co_await propagateUpdate<Entity, InvList>(&*row.before, *row.after);
+        } catch (const std::exception& e) {
+            RELAIS_LOG_ERROR << name() << ": cross-invalidation failed (" << op
+                << " committed) - " << e.what();
+        }
+    }
+
+    static void logUncertainPatch(const char* op) {
+        RELAIS_LOG_ERROR << name() << ": " << op
+            << " timeout — row versions unknowable, cross-invalidation targets "
+               "left to l*_ttl";
+    }
+
     /// Best-effort pre-read for cross-invalidation context. The read path no
     /// longer swallows L3 errors, so this pre-read can throw; a failure is
     /// treated as "old unknown" and the caller proceeds with the write +

@@ -433,25 +433,41 @@ public:
         co_return co_await eraseWithContext(id, old ? &*old : nullptr);
     }
 
-    /// Partial update and invalidate list caches.
+    /// Partial update, then list invalidation (only if committed) from the row
+    /// before and after, both returned by the write itself: the row leaves the
+    /// pages of its old position and enters those of its new one. Uncertain:
+    /// neither version is known, the pages are left to l*_ttl (logged).
     template<typename... Updates>
-    static io::Task<cache::CacheView<Entity>> patch(const Key& id, Updates&&... updates)
+    static io::Task<typename Base::PatchedRow> patchRow(const Key& id, Updates&&... updates)
         requires HasFieldUpdate<Entity> && (!Base::config.read_only)
     {
-        std::optional<Entity> old = co_await findOldBestEffort(id);
-        co_return co_await patchWithContext(id, old ? &*old : nullptr,
-            std::forward<Updates>(updates)...);
+        typename Base::PatchedRow row;
+        try {
+            row = co_await Base::patchRow(id, std::forward<Updates>(updates)...);
+        } catch (const io::PgUncertainError&) {
+            logUncertainPatch("patch");
+            throw;
+        }
+        co_await invalidateListsPatched(row);
+        co_return row;
     }
 
-    /// Guarded partial update and invalidate list caches (only if committed).
+    /// Guarded partial update, then the same list invalidation as patchRow. A
+    /// refused guard changed nothing: the pages stay valid.
     template<typename... Gs, typename... Updates>
-    static io::Task<std::optional<cache::CacheView<Entity>>> patchIf(
+    static io::Task<std::optional<typename Base::PatchedRow>> patchIfRow(
         const Key& id, const entity::Guards<Gs...>& guard, Updates&&... updates)
         requires HasFieldUpdate<Entity> && (!Base::config.read_only)
     {
-        std::optional<Entity> old = co_await findOldBestEffort(id);
-        co_return co_await patchIfWithContext(id, old ? &*old : nullptr, guard,
-            std::forward<Updates>(updates)...);
+        std::optional<typename Base::PatchedRow> row;
+        try {
+            row = co_await Base::patchIfRow(id, guard, std::forward<Updates>(updates)...);
+        } catch (const io::PgUncertainError&) {
+            logUncertainPatch("patchIf");
+            throw;
+        }
+        if (row) co_await invalidateListsPatched(*row);
+        co_return row;
     }
 
     // =========================================================================
@@ -731,97 +747,17 @@ protected:
         co_return result;
     }
 
-    template<typename... Updates>
-    static io::Task<cache::CacheView<Entity>> patchWithContext(
-        const Key& id, const Entity* old_entity, Updates&&... updates)
-        requires HasFieldUpdate<Entity> && (!Base::config.read_only)
-    {
-        cache::CacheView<Entity> result;
-        std::exception_ptr timeout;
-        try {
-            result = co_await Base::patch(id, std::forward<Updates>(updates)...);
-        } catch (const io::PgUncertainError&) {
-            timeout = std::current_exception();
-        }
-        if (timeout) {
-            // Uncertain: the patched row's new position is unknown (no RETURNING),
-            // so invalidate the pages keyed on `old` only — bump old's groups so a
-            // later list read re-fetches. A patch that moved the row to a new
-            // group leaves that one group bounded by l*_ttl (documented residual).
-            if (old_entity) {
-                if constexpr (kHasL1) { listCache().onEntityDeleted(*old_entity); }
-                if constexpr (kHasL2) {
-                    try {
-                        co_await invalidateL2Deleted(*old_entity);
-                    } catch (const std::exception& e) {
-                        RELAIS_LOG_ERROR << name()
-                            << ": L2 list precautionary invalidate failed (patch timeout) - "
-                            << e.what();
-                    }
-                }
-            }
-            std::rethrow_exception(timeout);
-        }
-        if (result) {
-            if constexpr (kHasL1) {
-                if (old_entity) {
-                    listCache().onEntityUpdated(*old_entity, *result);
-                } else {
-                    listCache().onEntityCreated(*result);
-                }
-            }
-            if constexpr (kHasL2) {
-                co_await invalidateL2Updated(
-                    old_entity ? *old_entity : *result, *result);
-            }
-        }
-        co_return result;
+    /// List invalidation of a committed patch (nothing if nothing was written).
+    static io::Task<void> invalidateListsPatched(const typename Base::PatchedRow& row) {
+        if (!row.before) co_return;
+        const Entity& after = *row.after;
+        if constexpr (kHasL1) { listCache().onEntityUpdated(*row.before, after); }
+        if constexpr (kHasL2) { co_await invalidateL2Updated(*row.before, after); }
     }
 
-    template<typename... Gs, typename... Updates>
-    static io::Task<std::optional<cache::CacheView<Entity>>> patchIfWithContext(
-        const Key& id, const Entity* old_entity,
-        const entity::Guards<Gs...>& guard, Updates&&... updates)
-        requires HasFieldUpdate<Entity> && (!Base::config.read_only)
-    {
-        std::optional<cache::CacheView<Entity>> result;
-        std::exception_ptr timeout;
-        try {
-            result = co_await Base::patchIf(id, guard, std::forward<Updates>(updates)...);
-        } catch (const io::PgUncertainError&) {
-            timeout = std::current_exception();
-        }
-        if (timeout) {
-            // Uncertain: same precautionary invalidation as patch, keyed on old.
-            if (old_entity) {
-                if constexpr (kHasL1) { listCache().onEntityDeleted(*old_entity); }
-                if constexpr (kHasL2) {
-                    try {
-                        co_await invalidateL2Deleted(*old_entity);
-                    } catch (const std::exception& e) {
-                        RELAIS_LOG_ERROR << name()
-                            << ": L2 list precautionary invalidate failed (patchIf timeout) - "
-                            << e.what();
-                    }
-                }
-            }
-            std::rethrow_exception(timeout);
-        }
-        // A refused guard changed nothing: the pages stay valid.
-        if (result && *result) {
-            const Entity& updated = **result;
-            if constexpr (kHasL1) {
-                if (old_entity) {
-                    listCache().onEntityUpdated(*old_entity, updated);
-                } else {
-                    listCache().onEntityCreated(updated);
-                }
-            }
-            if constexpr (kHasL2) {
-                co_await invalidateL2Updated(old_entity ? *old_entity : updated, updated);
-            }
-        }
-        co_return result;
+    static void logUncertainPatch(const char* op) {
+        RELAIS_LOG_ERROR << name() << ": " << op
+            << " timeout — row versions unknowable, list pages left to l*_ttl";
     }
 
     static io::Task<cache::CacheView<Entity>> upsertWithContext(
@@ -1086,6 +1022,11 @@ protected:
 
         auto start = Clock::now();
 
+        // Generation before any fetch: every modification notified from here on
+        // is checked against the page when it is stored.
+        [[maybe_unused]] uint32_t fetch_gen = 0;
+        if constexpr (kHasL1) fetch_gen = listCache().generation();
+
         // 2. L2 check — binary (BEVE) with auto header skip
         if constexpr (kHasL2) {
             auto pageKey = redisPageKey(query.cacheKey());
@@ -1116,7 +1057,7 @@ protected:
                         bounds.is_valid = true;
                     }
                     co_return listCache().put(toCacheQuery(query), std::move(*cached),
-                                              bounds, elapsed_us);
+                                              fetch_gen, bounds, elapsed_us);
                 } else {
                     co_return makeListView(std::move(*cached));
                 }
@@ -1179,7 +1120,7 @@ protected:
         // 5. Store in L1 cache or epoch pool
         if constexpr (kHasL1) {
             co_return listCache().put(toCacheQuery(query), std::move(wrapper),
-                                      bounds, elapsed_us);
+                                      fetch_gen, bounds, elapsed_us);
         } else {
             co_return makeListView(std::move(wrapper));
         }
