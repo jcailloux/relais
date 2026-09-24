@@ -293,9 +293,23 @@ learn what you hold; left alone, they are released at their expiry.
 
 ## Beyond one table
 
-A decision that must write several tables atomically is outside relais: run it in
-an application transaction with raw SQL
-([`PgProvider`](api-reference.md#runtime-and-io)), then call
-`invalidateMany(ids)` on each affected repository after the `COMMIT`. It evicts the
+The repositories write one table per statement, and relais opens no transactions:
+each statement it sends may run on a different connection. A decision that writes
+several tables atomically is a single raw statement whose data-modifying CTEs
+write each table, sent with
+[`PgProvider::queryWrite`](api-reference.md#pgprovider--pgresult--row--errors):
+
+```cpp
+static constexpr const char* kCheckout = R"(
+    WITH taken AS (UPDATE stock SET qty = qty - $2 WHERE sku = $1 AND qty >= $2 RETURNING sku)
+    INSERT INTO order_lines (order_id, sku, qty) SELECT $3, sku, $2 FROM taken
+    RETURNING id)";
+auto r = co_await PgProvider::queryWrite(kCheckout, params, io::batch::WriteMode::Exclusive);
+// no row → the stock check failed, nothing was written
+```
+
+Pass `WriteMode::Exclusive`, otherwise an identical concurrent statement shares
+this one's result instead of running. The repositories do not see this write:
+call `invalidateMany(ids)` on each affected repository afterwards. It evicts the
 entities; their list pages, and the cross-invalidation targets of their new
 values, refresh at their TTL.
