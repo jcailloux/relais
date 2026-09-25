@@ -187,7 +187,7 @@ constexpr uint64_t kHighBit = uint64_t{1} << 63;
 // #############################################################################
 
 TEST_CASE("[ListWidths] the filter schema gives each value its width and signedness",
-          "[list][widths][unit][!shouldfail]") {
+          "[list][widths][unit]") {
     CHECK(decl::filterSchema<DescFlag>() == "1=8=");
     CHECK(decl::filterSchema<DescTemp>() == "2=8=");
     CHECK(decl::filterSchema<DescLevel>() == "1=2G8=");
@@ -210,7 +210,7 @@ TEST_CASE("[ListWidths] the entity blob carries every byte of each value",
 // #############################################################################
 
 TEST_CASE("[ListWidths][L2] create compares both bytes of a 2-byte value and stays aligned",
-          "[integration][redis][list][widths][l2][!shouldfail]") {
+          "[integration][redis][list][widths][l2]") {
     TransactionGuard tx;
 
     auto gMatch     = registerGroup(tempParams(7, 1));
@@ -225,7 +225,7 @@ TEST_CASE("[ListWidths][L2] create compares both bytes of a 2-byte value and sta
 }
 
 TEST_CASE("[ListWidths][L2] update compares both bytes of a 2-byte value and stays aligned",
-          "[integration][redis][list][widths][l2][!shouldfail]") {
+          "[integration][redis][list][widths][l2]") {
     TransactionGuard tx;
 
     auto gOld       = registerGroup(tempParams(7, 1));
@@ -242,7 +242,7 @@ TEST_CASE("[ListWidths][L2] update compares both bytes of a 2-byte value and sta
 }
 
 TEST_CASE("[ListWidths][L2] a predicate compares both bytes of a 2-byte value and stays aligned",
-          "[integration][redis][list][widths][l2][!shouldfail]") {
+          "[integration][redis][list][widths][l2]") {
     TransactionGuard tx;
 
     auto gMatch     = registerGroup(tempParams(7, 1));
@@ -287,7 +287,7 @@ TEST_CASE("[ListWidths][L2] a 1-byte enum keeps the filters that follow it align
 // #############################################################################
 
 TEST_CASE("[ListWidths][L2] a range filter on a signed 2-byte enum follows its sign",
-          "[integration][redis][list][widths][l2][!shouldfail]") {
+          "[integration][redis][list][widths][l2]") {
     TransactionGuard tx;
 
     auto gLow   = registerGroup(levelParams(Flag::On, Level::Low, 1));
@@ -308,7 +308,7 @@ TEST_CASE("[ListWidths][L2] a range filter on a signed 2-byte enum follows its s
 }
 
 TEST_CASE("[ListWidths][L2] range filters on unsigned values follow unsigned order",
-          "[integration][redis][list][widths][l2][!shouldfail]") {
+          "[integration][redis][list][widths][l2]") {
     TransactionGuard tx;
 
     auto portParams = [](uint16_t v) {
@@ -350,7 +350,7 @@ TEST_CASE("[ListWidths][L2] range filters on unsigned values follow unsigned ord
 }
 
 TEST_CASE("[ListWidths][L2] a range filter on a floating-point value never keeps a page it may hold",
-          "[integration][redis][list][widths][l2][!shouldfail]") {
+          "[integration][redis][list][widths][l2]") {
     TransactionGuard tx;
 
     auto ratioParams = [](float v) {
