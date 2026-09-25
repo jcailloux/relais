@@ -522,13 +522,14 @@ A filter is declared as:
 ```cpp
 Filter<"author_id", &Article::author_id, "author_id">                  // Op::EQ (default)
 Filter<"severity", &Article::severity, "severity", Op::EQ, AsString>   // enum → toString() (ADL)
+Filter<"state", &Ticket::state, "state", Op::GE, Via<TicketMapping::StateCodec>>  // mapped enum
 Filter<"created_at", &Article::created_at, "created_at", Op::GE>       // range bound
 Filter<"category", &Article::category, "category", Op::IN>             // set membership
 ```
 
-Template: `Filter<FixedString Name, auto EntityMemberPtr, FixedString ColumnName, Op = EQ, typename Converter = NoConvert, InvalidationStrategy = defaultInvalidationStrategy(Op)>`. `Name` is the HTTP query-param key; `EntityMemberPtr` may be a data member **or** a const member function. Converters: `NoConvert` (default) and `AsString` (enum via ADL `toString`).
+Template: `Filter<FixedString Name, auto EntityMemberPtr, FixedString ColumnName, Op = EQ, typename Converter = NoConvert, InvalidationStrategy = defaultInvalidationStrategy(Op)>`. `Name` is the HTTP query-param key; `EntityMemberPtr` may be a data member **or** a const member function. Converters: `NoConvert` (default), `AsString` (enum via ADL `toString`) and `Via<Codec>` (a mapped enum through its generated codec: `EQ`/`NE`/`IN`/`NIN` bind the database string, ordering operators compare the codec's rank with the underlying value, HTTP values parse with `Codec::fromDb`). `Codec::enum_type` must be the field's enum type (`static_assert`). The generator emits `Via<>` on every filter of a `@relais enum` field; a hand-written descriptor must declare it, otherwise the enum binds as an integer against a text column. See [lists.md › Enum fields](lists.md#enum-fields).
 
-> **IN/NIN v1 guard-rails (compile-time).** A set-op filter rejects an enum element type and any converter other than `NoConvert` (a mis-sized element or `AsString` would silently desync the binary group-vs-entity blob). `is_set_op` is the single `(op == IN || op == NIN)` switch every consumer keys off.
+> **IN/NIN guard-rails (compile-time).** A set-op filter rejects `AsString` and an enum element without `Via<Codec>` (the element would bind as an integer against a text column, or its encoding would not match the Redis-side blob). `is_set_op` is the single `(op == IN || op == NIN)` switch every consumer keys off.
 
 <details><summary>InvalidationStrategy — when a filter triggers list invalidation</summary>
 
@@ -537,12 +538,15 @@ Template: `Filter<FixedString Name, auto EntityMemberPtr, FixedString ColumnName
 
 ### Sort directions
 
-`SortDirection` (`list/SortDirection.h`, `enum class : uint8_t { Asc, Desc }`). A sortable field is declared with `Sort<FixedString Name, auto EntityMemberPtr, FixedString ColumnName, SortDirection DefaultDir = Asc>`:
+`SortDirection` (`list/SortDirection.h`, `enum class : uint8_t { Asc, Desc }`). A sortable field is declared with `Sort<FixedString Name, auto EntityMemberPtr, FixedString ColumnName, SortDirection DefaultDir = Asc, typename Converter = NoConvert>`:
 
 ```cpp
 Sort<"created_at", &Article::created_at_us, "created_at", SortDirection::Desc>
 Sort<"id", &Article::id, "id">   // default Asc
+Sort<"state", &Ticket::state, "state", SortDirection::Asc, Via<TicketMapping::StateCodec>>
 ```
+
+`Converter` is `NoConvert` or `Via<Codec>`. With `Via<>`, SQL orders a mapped enum by the codec's rank, so the order is the underlying value, as in L1 and in the cursor. Without it, a sort on a text-stored enum is a PostgreSQL error.
 
 > **Sort fields must be cursor-encodable.** `CursorEncodable<T>` requires an integral or enum type (optionally `optional<>`-wrapped) — string sorts are a **compile error**, because keyset cursors encode each sort value as `int64_t`. Use an integer timestamp (microseconds since epoch) instead of a string date.
 
@@ -639,9 +643,10 @@ std::expected<ListQuery<Descriptor>, QueryValidationError>
 | `limit` handling | grid-normalized via `normalizeLimit<D>` (rounds up to next `allowedLimits` step) | must be a member of the grid (`isLimitAllowed<D>`), else `InvalidLimit` |
 | missing `limit` | `defaultLimit<D>()` | `defaultLimit<D>()` |
 | cursor + offset | offset ignored if cursor present | rejected → `ConflictingPagination` |
+| Unparsable filter value | filter inactive (set: element dropped) | rejected → `InvalidValue` |
 | Malformed cursor | dropped (first page) | dropped (no validation, decode-only) |
 
-`QueryValidationError` (`GeneratedTraits.h`): `{ Type type; std::string field; uint16_t limit; }` with `Type ∈ { InvalidFilter, InvalidSort, InvalidLimit, ConflictingPagination }` and a `message()` formatter.
+`QueryValidationError` (`GeneratedTraits.h`): `{ Type type; std::string field; uint16_t limit; }` with `Type ∈ { InvalidFilter, InvalidSort, InvalidLimit, ConflictingPagination, InvalidValue }` and a `message()` formatter.
 
 Descriptor-side limit helpers (`GeneratedTraits.h`): `normalizeLimit<D>(requested)` (round up to grid), `defaultLimit<D>()` (declared default or `20`), `isLimitAllowed<D>(limit)` (exact grid membership), `kDefaultLimits = {10, 25, 50, 100}` fallback.
 
