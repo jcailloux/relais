@@ -622,6 +622,9 @@ class MappingGenerator:
         # Entity (always needed)
         lines.append("#include <jcailloux/relais/entity/Entity.h>")
 
+        if self._mapped_enum_members(entity):
+            lines.append("#include <jcailloux/relais/entity/EnumCodec.h>")
+
         # Struct header (relative path from generated file to source)
         struct_include = self._find_struct_include(entity, output_file)
         lines.append(f'#include "{struct_include}"')
@@ -671,6 +674,12 @@ class MappingGenerator:
             f"{m.name} = {i}" for i, m in enumerate(entity.members))
         lines.append(f"    enum Col : uint8_t {{ {col_entries} }};")
         lines.append("")
+
+        # One codec per enum field stored as text
+        codecs = self._generate_enum_codecs(entity)
+        if codecs:
+            lines.extend(codecs)
+            lines.append("")
 
         # SQL struct — pre-built SQL strings
         lines.extend(self._generate_sql_struct(entity, table_name))
@@ -917,20 +926,7 @@ class MappingGenerator:
                 # Raw JSON: store as glz::raw_json
                 lines.append(f"        e.{m.name}.str = row.get<std::string>(Col::{m.name});")
             elif enum_mapping:
-                # Enum: convert string -> enum
-                enum_fqn = self._qualify_type(entity, enum_mapping.cpp_type)
-                if m.is_optional:
-                    lines.append(f"        if (!row.isNull(Col::{m.name})) {{")
-                    lines.append(f"            auto s = row.get<std::string>(Col::{m.name});")
-                    for db_val, enum_val in enum_mapping.pairs:
-                        lines.append(f'            if (s == "{db_val}") e.{m.name} = {enum_fqn}::{enum_val};')
-                    lines.append(f"        }}")
-                else:
-                    lines.append(f"        {{")
-                    lines.append(f"            auto s = row.get<std::string>(Col::{m.name});")
-                    for db_val, enum_val in enum_mapping.pairs:
-                        lines.append(f'            if (s == "{db_val}") e.{m.name} = {enum_fqn}::{enum_val};')
-                    lines.append(f"        }}")
+                lines.extend(self._enum_decode(m, "e"))
             elif m.is_optional:
                 # Nullable: use getOpt<T>
                 lines.append(f"        e.{m.name} = row.getOpt<{m.inner_type}>(Col::{m.name});")
@@ -997,21 +993,7 @@ class MappingGenerator:
                 elif m.is_raw_json:
                     lines.append(f"        p.push(e.{m.name}.str);")
                 elif enum_mapping:
-                    enum_fqn = self._qualify_type(entity, enum_mapping.cpp_type)
-                    if m.is_optional:
-                        lines.append(f"        if (e.{m.name}.has_value()) {{")
-                        lines.append(f"            switch (*e.{m.name}) {{")
-                        for db_val, enum_val in enum_mapping.pairs:
-                            lines.append(f'                case {enum_fqn}::{enum_val}: p.push("{db_val}"); break;')
-                        lines.append(f"            }}")
-                        lines.append(f"        }} else {{")
-                        lines.append(f"            p.pushNull();")
-                        lines.append(f"        }}")
-                    else:
-                        lines.append(f"        switch (e.{m.name}) {{")
-                        for db_val, enum_val in enum_mapping.pairs:
-                            lines.append(f'            case {enum_fqn}::{enum_val}: p.push("{db_val}"); break;')
-                        lines.append(f"        }}")
+                    lines.extend(self._enum_push(m))
                 else:
                     lines.append(f"        p.push(e.{m.name});")
             lines.append("        return p;")
@@ -1074,21 +1056,7 @@ class MappingGenerator:
                 elif m.is_raw_json:
                     lines.append(f"        p.push(e.{m.name}.str);")
                 elif enum_mapping:
-                    enum_fqn = self._qualify_type(entity, enum_mapping.cpp_type)
-                    if m.is_optional:
-                        lines.append(f"        if (e.{m.name}.has_value()) {{")
-                        lines.append(f"            switch (*e.{m.name}) {{")
-                        for db_val, enum_val in enum_mapping.pairs:
-                            lines.append(f'                case {enum_fqn}::{enum_val}: p.push("{db_val}"); break;')
-                        lines.append(f"            }}")
-                        lines.append(f"        }} else {{")
-                        lines.append(f"            p.pushNull();")
-                        lines.append(f"        }}")
-                    else:
-                        lines.append(f"        switch (e.{m.name}) {{")
-                        for db_val, enum_val in enum_mapping.pairs:
-                            lines.append(f'            case {enum_fqn}::{enum_val}: p.push("{db_val}"); break;')
-                        lines.append(f"        }}")
+                    lines.extend(self._enum_push(m))
                 else:
                     lines.append(f"        p.push(e.{m.name});")
             lines.append("        return p;")
@@ -1257,20 +1225,7 @@ class MappingGenerator:
                 # Raw JSON: zero-copy string_view into raw_json_view
                 lines.append(f"        {var}.{m.name}.str = row.get<std::string_view>(Col::{m.name});")
             elif enum_mapping:
-                # Enum: compare string_view (zero alloc)
-                enum_fqn = self._qualify_type(entity, enum_mapping.cpp_type)
-                if m.is_optional:
-                    lines.append(f"        if (!row.isNull(Col::{m.name})) {{")
-                    lines.append(f"            auto s = row.get<std::string_view>(Col::{m.name});")
-                    for db_val, enum_val in enum_mapping.pairs:
-                        lines.append(f'            if (s == "{db_val}") {var}.{m.name} = {enum_fqn}::{enum_val};')
-                    lines.append(f"        }}")
-                else:
-                    lines.append(f"        {{")
-                    lines.append(f"            auto s = row.get<std::string_view>(Col::{m.name});")
-                    for db_val, enum_val in enum_mapping.pairs:
-                        lines.append(f'            if (s == "{db_val}") {var}.{m.name} = {enum_fqn}::{enum_val};')
-                    lines.append(f"        }}")
+                lines.extend(self._enum_decode(m, var))
             elif m.is_optional:
                 # Optional: use getOpt with RowView-appropriate inner type
                 inner = m.inner_type
@@ -1478,16 +1433,12 @@ class MappingGenerator:
             lines.append(f"    static constexpr bool is_nullable = {'true' if is_nullable else 'false'};")
             if enum_mapping and enum_mapping.pairs:
                 # C++ enum -> DB string, so a typed value (set, guards) binds the
-                # stored string. Same pairs as toInsertParams: the DB mapping, not
-                # the JSON names a user-provided glz::meta may carry.
-                enum_fqn = self._qualify_type(entity, enum_mapping.cpp_type)
-                lines.append(f"    using enum_type = {enum_fqn};")
+                # stored string. The field's codec holds the DB mapping, not the
+                # JSON names a user-provided glz::meta may carry.
+                lines.append(f"    using codec = {mapping_name}::{self._codec_name(m.name)};")
+                lines.append("    using enum_type = codec::enum_type;")
                 lines.append("    static constexpr std::string_view toDb(enum_type v) noexcept {")
-                lines.append("        switch (v) {")
-                for db_val, enum_val in enum_mapping.pairs:
-                    lines.append(f'            case enum_type::{enum_val}: return "{db_val}";')
-                lines.append("        }")
-                lines.append("        return {};")
+                lines.append("        return codec::toDb(v);")
                 lines.append("    }")
             lines.append("};")
             lines.append("")
@@ -1661,6 +1612,59 @@ class MappingGenerator:
             return False
         pk_set = set(a.primary_keys) if a.primary_keys else {"id"}
         return pk_set.isdisjoint(a.db_managed)
+
+    # =========================================================================
+    # Mapped enum codecs
+    # =========================================================================
+
+    @staticmethod
+    def _codec_name(field_name: str) -> str:
+        """Codec struct of a field: `queue_state` -> `QueueStateCodec`."""
+        return "".join(p[:1].upper() + p[1:] for p in field_name.split("_") if p) + "Codec"
+
+    def _mapped_enum_members(self, entity: ParsedEntity) -> list[tuple[DataMember, EnumMapping]]:
+        a = entity.annotation
+        result = []
+        for m in entity.members:
+            em = self._find_enum_mapping(a, m.name)
+            if em and em.pairs:
+                result.append((m, em))
+        return result
+
+    def _generate_enum_codecs(self, entity: ParsedEntity) -> list[str]:
+        """One codec per enum field stored as text, primary keys and db_managed
+        fields included: the only place the enumerator <-> string mapping lives."""
+        lines = []
+        for m, em in self._mapped_enum_members(entity):
+            enum_fqn = self._qualify_type(entity, em.cpp_type)
+            name = self._codec_name(m.name)
+            lines.append(f"    struct {name} : jcailloux::relais::entity::MappedEnumCodec<{name}, {enum_fqn}> {{")
+            lines.append(f"        static constexpr std::array<std::pair<enum_type, std::string_view>, {len(em.pairs)}> pairs{{{{")
+            for i, (db_val, enum_val) in enumerate(em.pairs):
+                comma = "," if i < len(em.pairs) - 1 else ""
+                lines.append(f'            {{enum_type::{enum_val}, "{db_val}"}}{comma}')
+            lines.append("        }};")
+            lines.append("    };")
+        return lines
+
+    def _enum_decode(self, m: DataMember, var: str) -> list[str]:
+        """Read a mapped enum column into `var.<field>`; an unknown string
+        leaves the field untouched."""
+        codec = self._codec_name(m.name)
+        read = f"{codec}::fromDb(row.get<std::string_view>(Col::{m.name}))"
+        if m.is_optional:
+            return [
+                f"        if (!row.isNull(Col::{m.name})) {{",
+                f"            if (auto db = {read}) {var}.{m.name} = *db;",
+                f"        }}",
+            ]
+        return [f"        if (auto db = {read}) {var}.{m.name} = *db;"]
+
+    def _enum_push(self, m: DataMember) -> list[str]:
+        codec = self._codec_name(m.name)
+        if m.is_optional:
+            return [f"        if (e.{m.name}) p.push({codec}::toDb(*e.{m.name})); else p.pushNull();"]
+        return [f"        p.push({codec}::toDb(e.{m.name}));"]
 
     def _find_enum_mapping(self, a: EntityAnnotation, field_name: str) -> Optional[EnumMapping]:
         for em in a.enums:
