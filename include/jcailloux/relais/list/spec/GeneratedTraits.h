@@ -8,6 +8,7 @@
 #include <cstring>
 #include <limits>
 #include <optional>
+#include <string>
 #include <string_view>
 #include <tuple>
 #include <type_traits>
@@ -285,17 +286,22 @@ template<typename Descriptor>
     return result;
 }
 
-/// Get sort column name from index (for DB query)
+/// Append the SQL expression a sort orders by: the quoted column, or the rank
+/// expression of a mapped enum.
 template<typename Descriptor>
     requires ValidListDescriptor<Descriptor>
-[[nodiscard]] std::string_view sortColumnName(size_t field_index) noexcept {
-    std::string_view result;
-
+void appendSortExpression(std::string& sql, size_t field_index) {
     [&]<size_t... Is>(std::index_sequence<Is...>) {
-        ((field_index == Is ? (result = sort_at<Descriptor, Is>::column(), true) : false) || ...);
+        ((field_index == Is ? ([&] {
+            using S = sort_at<Descriptor, Is>;
+            constexpr bool ranked = is_via_v<typename S::converter>;
+            if constexpr (ranked) sql += "CASE ";
+            sql += '"';
+            sql += S::column();
+            sql += '"';
+            if constexpr (ranked) sql += S::converter::codec::rankCases();
+        }(), true) : false) || ...);
     }(std::make_index_sequence<sort_count<Descriptor>>{});
-
-    return result;
 }
 
 // =============================================================================

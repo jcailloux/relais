@@ -698,15 +698,15 @@ list/                            # namespace jcailloux::relais::list
     ├── ListDescriptor.h        # descriptor-shape concepts (HasSorts/HasFilters/ValidListDescriptor) — note: HasListDescriptor itself lives in entity/EntityConcepts.h
     ├── ListDescriptorQuery.h   # ListDescriptorQuery<Descriptor> — query type for parsers
     ├── FilterDescriptor.h      # Filter<Name, MemberPtr, ColumnName, Op, ...> template
-    ├── SortDescriptor.h        # Sort<Name, MemberPtr, ColumnName, Dir> template
+    ├── SortDescriptor.h        # Sort<Name, MemberPtr, ColumnName, Dir, Converter> template
     ├── ListQueryBuilder.h      # typed self-sealing query builder
     ├── TypedCursor.h           # phantom-typed keyset cursor
     ├── CanonicalEncoding.h     # canonical binary query-key encoding
     ├── HttpQueryParser.h       # parseListQuery (tolerant) / parseListQueryStrict<Descriptor>
     ├── ParseUtils.h            # parsing helpers
     ├── GeneratedFilters.h      # buildCriteria, matchesFilters, extractTags
-    ├── GeneratedTraits.h       # extractSortValue, extractCursor, compare
-    └── GeneratedCriteria.h     # sortColumnName, parseSortField
+    ├── GeneratedTraits.h       # extractSortValue, extractCursor, compare, parseSortField, appendSortExpression
+    └── GeneratedCriteria.h     # buildWhereClause
 ```
 
 The high-level `ListMixin` itself lives in `repository/ListMixin.h` (part of the

@@ -43,20 +43,31 @@ concept CursorEncodable =
 /// @tparam EntityMemberPtr Pointer to entity member (&Entity::field)
 /// @tparam ColumnName      SQL column name as FixedString ("column_name")
 /// @tparam DefaultDir      Default sort direction (default: Asc)
+/// @tparam Converter       NoConvert, or Via<Codec> for an enum stored as text:
+///                         SQL then orders by the codec's rank expression
 ///
 /// Example:
 ///   Sort<"created_at", &Entity::created_at_us, "created_at">{}
 ///   Sort<"id", &Entity::id, "id">{}
+///   Sort<"state", &Entity::state, "state", SortDirection::Asc, Via<StateCodec>>{}
 ///
 template<
     FixedString Name,
     auto EntityMemberPtr,
     FixedString ColumnName,
-    SortDirection DefaultDir = SortDirection::Asc
+    SortDirection DefaultDir = SortDirection::Asc,
+    typename Converter = NoConvert
 >
 struct Sort {
     /// The value type for cursor encoding, deduced from the Entity member.
     using value_type = detail::member_pointer_type_t<decltype(EntityMemberPtr)>;
+    using converter = Converter;
+
+    static_assert(std::is_same_v<Converter, NoConvert> || is_via_v<Converter>,
+        "Sort converter must be NoConvert or Via<Codec>");
+    static_assert(detail::via_codec_matches<Converter,
+                      detail::unwrap_optional_t<std::remove_cvref_t<value_type>>>,
+        "Via<Codec> on a sort requires Codec::enum_type to be the field's enum type");
 
     static_assert(CursorEncodable<value_type>,
         "Sort field type must be integral or enum. String types cannot be "
