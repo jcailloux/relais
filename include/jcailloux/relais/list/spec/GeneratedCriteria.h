@@ -88,6 +88,19 @@ void addArrayParamForDb(io::PgParams& params, const std::vector<T>& values) {
     }
 }
 
+/// A mapped enum under an ordering operator compares its rank, not its text.
+template<typename FilterType>
+inline constexpr bool compares_rank = is_via_v<typename FilterType::converter>
+    && FilterType::op != Op::EQ && FilterType::op != Op::NE && !FilterType::is_set_op;
+
+template<typename FilterType>
+void appendRankedColumn(std::string& sql) {
+    sql += "CASE \"";
+    sql += FilterType::column();
+    sql += '"';
+    sql += FilterType::converter::codec::rankCases();
+}
+
 }  // namespace detail
 
 // =============================================================================
@@ -121,9 +134,13 @@ template<typename Descriptor>
 
             if (filter_value.has_value()) {
                 if (!result.sql.empty()) result.sql += " AND ";
-                result.sql += "\"";
-                result.sql += FilterType::column();
-                result.sql += "\"";
+                if constexpr (detail::compares_rank<FilterType>) {
+                    detail::appendRankedColumn<FilterType>(result.sql);
+                } else {
+                    result.sql += "\"";
+                    result.sql += FilterType::column();
+                    result.sql += "\"";
+                }
 
                 if constexpr (FilterType::is_set_op) {
                     // Set op → "col" = ANY($n) (IN) | "col" != ALL($n) (NIN). One

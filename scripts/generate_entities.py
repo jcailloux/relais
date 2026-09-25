@@ -1391,10 +1391,14 @@ class MappingGenerator:
                 s_col = self._col(entity, s.field)
                 direction = ("SortDirection::Desc" if s.direction == "desc"
                              else "SortDirection::Asc")
+                em = self._find_enum_mapping(a, s.field)
+                # Mapped enum: SQL orders by the codec's rank expression.
+                via = (f', {decl_ns}::Via<{self._codec_name(s.field)}>'
+                       if em and em.pairs else '')
                 lines.append(
                     f'            {decl_ns}::Sort<'
                     f'"{s.param}", &{struct_fqn}::{s.field}, "{s_col}", '
-                    f'{decl_ns}::{direction}'
+                    f'{decl_ns}::{direction}{via}'
                     f'>{{}}{comma}')
             lines.append("        };")
 
