@@ -30,6 +30,7 @@
 #include "generated/TestSlotEntity.h"
 #include "generated/TestSlotTallyEntity.h"
 #include "generated/TestSlotListEntity.h"
+#include "generated/TestTicketEntity.h"
 
 namespace relais_test {
 
@@ -63,6 +64,7 @@ using entity::generated::TestUpsertListEntity;
 using entity::generated::TestSlotEntity;
 using entity::generated::TestSlotTallyEntity;
 using entity::generated::TestSlotListEntity;
+using entity::generated::TestTicketEntity;
 
 // Cross-invalidation key extractors
 inline constexpr auto purchaseUserId = [](const auto& p) -> int64_t { return p.user_id; };
@@ -447,5 +449,12 @@ using InvalidatingTestSlotListRepo = Repo<TestSlotListEntity, "test:slotlist:inv
 /// InvalidateList: the per-row list cascade of batch writes.
 using ListInvalidatingTestSlotRepo = Repo<TestSlotListEntity, "test:slotlist:listinv:l1",
     cfg::Local, InvalidateList<L1TestSlotListRepo>>;
+
+// =============================================================================
+// Ticket Repositories (list filters and sorts on a mapped enum)
+// =============================================================================
+
+using L1TestTicketRepo = Repo<TestTicketEntity, "test:ticket:l1">;
+using L2TestTicketRepo = Repo<TestTicketEntity, "test:ticket:l2", cfg::Redis>;
 
 } // namespace relais_test

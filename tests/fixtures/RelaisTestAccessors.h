@@ -41,6 +41,12 @@ struct TestInternals {
         return Repo::listCache().modifications_.size();
     }
 
+    /// Number of pages held by the L1 list cache.
+    template<typename Repo>
+    static size_t listCacheSize() {
+        return Repo::listCache().size();
+    }
+
     /// Number of pending predicate range modifications (eraseWhere fast-path).
     /// One eraseWhere should add exactly one — proves O(1), not N per-entity mods.
     template<typename Repo>
