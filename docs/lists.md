@@ -108,11 +108,11 @@ Column names are derived from the field name (override with `column=`).
 
 An enum field is ordered by its underlying value, as `operator<` orders an
 `enum class`. Range filters, sorts, cursors and cache invalidation all follow
-this order, never the alphabetical order of the stored strings.
+this order, whatever strings the database stores.
 
-An enum stored as an integer, in a hand-written descriptor, is compared
-directly: filters and sorts use the column. `in` and `nin` are not available on
-it.
+In a hand-written descriptor, an enum stored as an integer is compared
+directly: filters and sorts use the column. `in` and `nin` require a mapped
+enum.
 
 A mapped enum (`@relais enum` or `enum=db:Variant,…`) is stored as text. The
 generator declares its filters and sorts with the field's codec,
@@ -126,15 +126,15 @@ generator declares its filters and sorts with the field's codec,
   plain index on the column serves them.
 - `gt`, `ge`, `lt`, `le` and sorts compare the rank of the column: an
   expression that maps each database string to its underlying value. A string
-  absent from the mapping, like NULL, has no rank.
+  absent from the mapping ranks NULL, as a NULL column does.
 
 ```sql
 CASE "state" WHEN 'open' THEN 5 WHEN 'blocked' THEN 20 WHEN 'closed' THEN 10 WHEN 'archived' THEN 0 END
 ```
 
-PostgreSQL uses an index for a range filter or a sort on a mapped enum only
-if the index is built on the same expression. A sort orders by
-`COALESCE(<rank>, 0)` and then by the primary key:
+An index serves a range filter or a sort on a mapped enum when it is built on
+the same expression. A sort orders by `COALESCE(<rank>, 0)` and then by the
+primary key:
 
 ```sql
 CREATE INDEX tickets_state_rank ON tickets ((COALESCE(
