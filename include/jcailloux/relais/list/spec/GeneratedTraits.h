@@ -598,7 +598,8 @@ struct QueryValidationError {
         InvalidFilter,
         InvalidSort,
         InvalidLimit,
-        ConflictingPagination
+        ConflictingPagination,
+        InvalidValue
     };
 
     Type type;
@@ -615,6 +616,8 @@ struct QueryValidationError {
                 return "Invalid limit: " + std::to_string(limit);
             case Type::ConflictingPagination:
                 return "Cannot use both 'after' (cursor) and 'offset' simultaneously";
+            case Type::InvalidValue:
+                return "Invalid value for filter: " + field;
         }
         return "Unknown validation error";
     }

@@ -2,6 +2,7 @@
 #define JCX_RELAIS_LIST_SPEC_GENERATEDCRITERIA_H
 
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -39,7 +40,17 @@ namespace detail {
 /// Convert filter value for DB query and add to params
 template<typename FilterType, typename T>
 void addParamForDb(io::PgParams& params, const T& value) {
-    if constexpr (std::is_same_v<typename FilterType::converter, AsString>) {
+    using Converter = typename FilterType::converter;
+    if constexpr (is_via_v<Converter>) {
+        // Equality compares the stored text; an ordering operator binds the
+        // underlying value.
+        if constexpr (FilterType::op == Op::EQ || FilterType::op == Op::NE) {
+            params.params.push_back(io::PgParam::text(Converter::codec::toDb(value)));
+        } else {
+            params.params.push_back(io::PgParam::bigint(
+                static_cast<int64_t>(std::to_underlying(value))));
+        }
+    } else if constexpr (std::is_same_v<Converter, AsString>) {
         using std::to_string;
         params.params.push_back(io::PgParam::text(toString(value)));
     } else if constexpr (std::is_integral_v<std::remove_cvref_t<T>>) {
@@ -66,7 +77,15 @@ void addParamForDb(io::PgParams& params, const T& value) {
 /// quoted on delimiters). An empty set yields `{}` → `= ANY('{}')` → zero rows.
 template<typename FilterType, typename T>
 void addArrayParamForDb(io::PgParams& params, const std::vector<T>& values) {
-    params.params.push_back(io::PgParams::arrayLiteral(values));
+    using Converter = typename FilterType::converter;
+    if constexpr (is_via_v<Converter>) {
+        std::vector<std::string_view> db;
+        db.reserve(values.size());
+        for (const auto& v : values) db.push_back(Converter::codec::toDb(v));
+        params.params.push_back(io::PgParams::arrayLiteral(db));
+    } else {
+        params.params.push_back(io::PgParams::arrayLiteral(values));
+    }
 }
 
 }  // namespace detail
