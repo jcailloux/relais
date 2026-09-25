@@ -93,14 +93,6 @@ template<typename FilterType>
 inline constexpr bool compares_rank = is_via_v<typename FilterType::converter>
     && FilterType::op != Op::EQ && FilterType::op != Op::NE && !FilterType::is_set_op;
 
-template<typename FilterType>
-void appendRankedColumn(std::string& sql) {
-    sql += "CASE \"";
-    sql += FilterType::column();
-    sql += '"';
-    sql += FilterType::converter::codec::rankCases();
-}
-
 }  // namespace detail
 
 // =============================================================================
@@ -134,13 +126,9 @@ template<typename Descriptor>
 
             if (filter_value.has_value()) {
                 if (!result.sql.empty()) result.sql += " AND ";
-                if constexpr (detail::compares_rank<FilterType>) {
-                    detail::appendRankedColumn<FilterType>(result.sql);
-                } else {
-                    result.sql += "\"";
-                    result.sql += FilterType::column();
-                    result.sql += "\"";
-                }
+                detail::appendColumnSql<typename FilterType::converter,
+                                        detail::compares_rank<FilterType>>(
+                    result.sql, FilterType::column());
 
                 if constexpr (FilterType::is_set_op) {
                     // Set op → "col" = ANY($n) (IN) | "col" != ALL($n) (NIN). One
