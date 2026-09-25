@@ -59,9 +59,9 @@ std::string created_at;  // @relais timestamp filterable:date_from:gte filterabl
 `filterable:in` matches a column against a set of values. The HTTP param is a
 comma-separated list (`?authors=1,2,3`); the set is canonicalized
 (deduplicated, sorted) before use. Element types are `int64`, `int32`,
-`std::string`, and `bool`; `enum` and field converters are rejected at compile
-time. An empty or all-invalid set leaves the filter inactive. The set is bounded
-at 256 elements.
+`std::string`, `bool` and [mapped enums](#enum-fields); an enum stored as an
+integer is rejected at compile time. An empty or all-invalid set leaves the
+filter inactive. The set is bounded at 256 elements.
 
 Boolean filter values — for `in` and scalar `eq` alike — accept the standard
 HTTP / HTML-form conventions, case-insensitively: `true/1/t/yes/y/on` and
@@ -104,6 +104,48 @@ identical to `in` (same `cmpin`/`skipset`, same Redis round-trip).
 
 Column names are derived from the field name (override with `column=`).
 
+### Enum fields
+
+An enum field is ordered by its underlying value, as `operator<` orders an
+`enum class`. Range filters, sorts, cursors and cache invalidation all follow
+this order, never the alphabetical order of the stored strings.
+
+An enum stored as an integer, in a hand-written descriptor, is compared
+directly: filters and sorts use the column. `in` and `nin` are not available on
+it.
+
+A mapped enum (`@relais enum` or `enum=db:Variant,…`) is stored as text. The
+generator declares its filters and sorts with the field's codec,
+`{Class}Mapping::{Field}Codec`, and every operator is available:
+
+- Over HTTP, the value is the database string: `?state=open`,
+  `?state_in=open,blocked`. An unknown string makes the strict parser return
+  `InvalidValue`; the tolerant parser leaves the filter inactive, or drops the
+  element from a set.
+- `eq`, `ne`, `in` and `nin` compare the column with the database string. A
+  plain index on the column serves them.
+- `gt`, `ge`, `lt`, `le` and sorts compare the rank of the column: an
+  expression that maps each database string to its underlying value. A string
+  absent from the mapping, like NULL, has no rank.
+
+```sql
+CASE "state" WHEN 'open' THEN 5 WHEN 'blocked' THEN 20 WHEN 'closed' THEN 10 WHEN 'archived' THEN 0 END
+```
+
+PostgreSQL uses an index for a range filter or a sort on a mapped enum only
+if the index is built on the same expression. A sort orders by
+`COALESCE(<rank>, 0)` and then by the primary key:
+
+```sql
+CREATE INDEX tickets_state_rank ON tickets ((COALESCE(
+    CASE "state" WHEN 'open' THEN 5 WHEN 'blocked' THEN 20
+                 WHEN 'closed' THEN 10 WHEN 'archived' THEN 0 END, 0)), id);
+```
+
+`{Field}Codec::rankCases()` returns the part after `CASE "column"`, in the
+exact text relais sends. Changing the mapping changes the expression: recreate
+the index with it.
+
 ### `limits` syntax
 
 `@relais_list limits=…` declares the page-size grid for the model — a
@@ -125,6 +167,10 @@ read it differently:
 |---|---|---|
 | `parseListQuery` (tolerant) | `defaultLimit` | rounds up to the next step, caps at `maxLimit` |
 | `parseListQueryStrict` (strict) | `defaultLimit` | `InvalidLimit` error |
+
+The strict parser also rejects a filter value that does not parse
+(`InvalidValue`: an unknown enum string, an invalid boolean…), where the
+tolerant parser leaves the filter inactive.
 
 The strict parser additionally rejects a request carrying **both** `after` (a
 cursor) and a non-zero `offset` (`ConflictingPagination`); the tolerant parser

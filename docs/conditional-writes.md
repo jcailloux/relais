@@ -108,6 +108,12 @@ when(eq<F::state>(State::Held))   // converted by the generated mapping, typo-pr
 when(eq<F::state>("held"))        // as it arrives from a request or a file
 ```
 
+`lt`, `le`, `gt`, `ge` and `asc`/`desc` in `orderBy` follow the underlying value
+of the enum, as lists do, not the alphabetical order of the strings. An ordering
+guard takes the C++ value only: `gt<F::state>("held")` does not compile. See
+[lists.md › Enum fields](lists.md#enum-fields) for the rank expression and its
+index.
+
 On a `TEXT` column, an invalid string is stored as is, and `fromRow` reads it back
 as the enum's default value. A PostgreSQL `ENUM` type or a `CHECK (col IN (…))`
 turns it into a database error, for every writer, raw SQL included.

@@ -2,6 +2,34 @@
 
 ## [Unreleased]
 
+### Added
+
+- **Every list operator on mapped enums.** A `@relais enum` field supports every
+  filter operator (`in`/`nin` included) and `sortable`. Over HTTP the value is the
+  database string; the strict parser rejects an unknown one.
+- **`Via<Codec>` converter** for hand-written `Filter<>` and `Sort<>` on a mapped
+  enum, with the generated `{Class}Mapping::{Field}Codec`.
+- **`QueryValidationError::Type::InvalidValue`.** `parseListQueryStrict` rejects
+  any filter value that does not parse; the tolerant parser still ignores it.
+
+### Changed
+
+- **Enums order by their underlying value everywhere.** Range filters, sorts,
+  guards and `orderBy` on a mapped enum compare the underlying value, no longer
+  the database string. Range filters and sorts on a mapped enum use an index only
+  if it is built on the rank expression (see `docs/lists.md › Enum fields`).
+- **List cache keys of enum filters change.** Existing Redis list entries filtered
+  on an enum are no longer read and expire with their TTL.
+
+### Fixed
+
+- **Enum list filters shared one cache entry.** Two queries that differed only by
+  an enum filter value were served the same page, in L1 and L2.
+- **Mapped enum list filters returned no rows**, silently, and sorting on a
+  mapped enum failed in PostgreSQL.
+- **Redis list invalidation misread 2-byte filter values** and misordered
+  unsigned and negative floating-point ones; a stale page could be kept.
+
 ## [3.1.0] - 2026-09-24
 
 ### Added
