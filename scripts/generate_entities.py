@@ -1319,7 +1319,16 @@ class MappingGenerator:
             for i, f in enumerate(a.filters):
                 comma = "," if i < len(a.filters) - 1 else ""
                 f_col = self._col(entity, f.field)
-                if f.op == "eq":
+                em = self._find_enum_mapping(a, f.field)
+                if em and em.pairs:
+                    # Mapped enum: the column holds the codec's strings.
+                    lines.append(
+                        f'            {decl_ns}::Filter<'
+                        f'"{f.param}", &{struct_fqn}::{f.field}, "{f_col}", '
+                        f'{decl_ns}::Op::{f.op.upper()}, '
+                        f'{decl_ns}::Via<{self._codec_name(f.field)}>'
+                        f'>{{}}{comma}')
+                elif f.op == "eq":
                     lines.append(
                         f'            {decl_ns}::Filter<'
                         f'"{f.param}", &{struct_fqn}::{f.field}, "{f_col}"'

@@ -69,6 +69,35 @@ struct NoConvert {};
 /// Convert enum to string via toString() (using ADL)
 struct AsString {};
 
+/// Enum stored as text through a codec (`toDb`/`fromDb`, e.g. a generated
+/// `Mapping::<Field>Codec`). Equality and set filters compare the column with
+/// the codec's database strings; parsing a query value goes through `fromDb`.
+template<typename Codec>
+struct Via {
+    using codec = Codec;
+};
+
+namespace detail {
+
+template<typename T>
+struct is_via : std::false_type {};
+
+template<typename Codec>
+struct is_via<Via<Codec>> : std::true_type {};
+
+/// A Via<Codec> converter must decode to the filtered member's enum type.
+template<typename Converter, typename E>
+inline constexpr bool via_codec_matches = true;
+
+template<typename Codec, typename E>
+inline constexpr bool via_codec_matches<Via<Codec>, E> =
+    std::is_same_v<typename Codec::enum_type, E>;
+
+}  // namespace detail
+
+template<typename T>
+inline constexpr bool is_via_v = detail::is_via<T>::value;
+
 // =============================================================================
 // Type traits helpers
 // =============================================================================
@@ -306,14 +335,18 @@ struct Filter {
     /// storage from filter_type so IN's vector slot does not leak into tag extraction.
     using tag_type = std::optional<element_type>;
 
-    // --- v1 set-op guard-rails: a converter or a mis-sized element silently desyncs
-    // the binary blob (group set vs entity scalar), so reject them at compile time. ---
-    static_assert(!(is_set_op && std::is_enum_v<element_type>),
-        "IN/NOT IN filter: enum element type not supported in v1");
-    static_assert(!(is_set_op && !std::is_same_v<Converter, NoConvert>),
-        "IN/NOT IN filter: value converter (e.g. AsString) not supported in v1");
+    // --- Set-op guard-rails: the SQL array must hold what the column stores. A
+    // bare enum would bind its integer against a text column, and AsString has
+    // no array form; only Via<Codec> converts every element. ---
+    static_assert(!(is_set_op && std::is_enum_v<element_type> && !is_via_v<Converter>),
+        "IN/NOT IN filter: an enum element type requires a Via<Codec> converter");
+    static_assert(!(is_set_op && !std::is_same_v<Converter, NoConvert> && !is_via_v<Converter>),
+        "IN/NOT IN filter: value converter (e.g. AsString) not supported");
     static_assert(sizeof(bool) == 1,
         "IN/NOT IN filter: schema assumes 1-byte bool encoding");
+
+    static_assert(detail::via_codec_matches<Converter, element_type>,
+        "Via<Codec> filter: the codec's enum_type must be the member's enum type");
 
     /// Whether the entity member is optional
     static constexpr bool is_optional_member = detail::is_optional_v<member_type>;

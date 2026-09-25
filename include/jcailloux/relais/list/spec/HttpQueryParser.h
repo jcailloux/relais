@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <charconv>
 #include <expected>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -72,21 +73,47 @@ std::optional<T> parseInElement(const std::string& str) {
     }
 }
 
+/// Parse a filter's scalar query value. A Via<Codec> filter takes the codec's
+/// database strings; any other goes by the value type.
+template<typename FilterType>
+std::optional<typename FilterType::element_type> parseFilterValue(const std::string& str) {
+    using Converter = typename FilterType::converter;
+    if constexpr (is_via_v<Converter>) {
+        return Converter::codec::fromDb(str);
+    } else {
+        return parseValue<typename FilterType::element_type>(str);
+    }
+}
+
+/// Parse one element of a filter's IN/NOT IN set (see parseFilterValue).
+template<typename FilterType>
+std::optional<typename FilterType::element_type> parseFilterElement(const std::string& str) {
+    using Converter = typename FilterType::converter;
+    if constexpr (is_via_v<Converter>) {
+        return Converter::codec::fromDb(str);
+    } else {
+        return parseInElement<typename FilterType::element_type>(str);
+    }
+}
+
 /// Parse a comma-separated query value into a canonical set for an IN filter:
-/// split on ',' → parseInElement<T> per element (silently dropping invalid ones)
-/// → sort → unique → truncate to kMaxInListElements. The truncation happens AFTER
-/// sort+unique so the resulting group key is deterministic regardless of the
-/// arrival order or duplicate count — `tech,science` and `science,tech,tech`
-/// yield byte-identical keys.
-template<typename T>
-std::vector<T> parseInList(const std::string& str) {
-    std::vector<T> out;
+/// split on ',' → parseFilterElement per element (dropping invalid ones, and
+/// setting `rejected` if there were any) → sort → unique → truncate to
+/// kMaxInListElements. The truncation happens AFTER sort+unique so the
+/// resulting group key is deterministic regardless of the arrival order or
+/// duplicate count — `tech,science` and `science,tech,tech` yield
+/// byte-identical keys.
+template<typename FilterType>
+std::vector<typename FilterType::element_type> parseInList(const std::string& str, bool& rejected) {
+    std::vector<typename FilterType::element_type> out;
     size_t start = 0;
     while (true) {
         size_t comma = str.find(',', start);
         size_t end = (comma == std::string::npos) ? str.size() : comma;
-        if (auto val = parseInElement<T>(str.substr(start, end - start))) {
+        if (auto val = parseFilterElement<FilterType>(str.substr(start, end - start))) {
             out.push_back(std::move(*val));
+        } else {
+            rejected = true;
         }
         if (comma == std::string::npos) break;
         start = comma + 1;
@@ -126,13 +153,13 @@ ListQuery<Descriptor> parseListQuery(const Map& params) {
                     // leaves the filter inactive → list stays unfiltered. For NIN
                     // this coincides with the intended "NOT IN {} = universe"
                     // (§1.2): inactive ≡ unfiltered ≡ universe. No HTTP empty-set.
-                    auto vals = detail::parseInList<typename FilterType::element_type>(it->second);
+                    bool rejected = false;
+                    auto vals = detail::parseInList<FilterType>(it->second, rejected);
                     if (!vals.empty()) {
                         std::get<Is>(query.filters.values) = std::move(vals);
                     }
                 } else {
-                    using ValueType = typename FilterType::value_type;
-                    if (auto val = detail::parseValue<ValueType>(it->second)) {
+                    if (auto val = detail::parseFilterValue<FilterType>(it->second)) {
                         std::get<Is>(query.filters.values) = std::move(*val);
                     }
                 }
@@ -188,7 +215,8 @@ ListQuery<Descriptor> parseListQuery(const Map& params) {
 // =============================================================================
 
 /// Parse and validate ListQuery from HTTP request parameters
-/// Returns error if any parameter is invalid (unknown filter, invalid sort, bad limit)
+/// Returns error if any parameter is invalid (unknown filter, filter value that
+/// does not parse, invalid sort, bad limit)
 template<typename Descriptor, typename Map = std::unordered_map<std::string, std::string>>
     requires ValidListDescriptor<Descriptor>
 std::expected<ListQuery<Descriptor>, QueryValidationError> parseListQueryStrict(
@@ -227,27 +255,40 @@ std::expected<ListQuery<Descriptor>, QueryValidationError> parseListQueryStrict(
         }
     }
 
-    // Parse filters (we know they're all valid now)
+    // Parse filters (every name is declared now); a value that does not parse,
+    // or a set holding such an element, rejects the query.
+    std::optional<std::string_view> invalid_value;
     [&]<size_t... Is>(std::index_sequence<Is...>) {
         ([&] {
             using FilterType = filter_at<Descriptor, Is>;
             auto name = std::string(FilterType::name.view());
 
             if (auto it = params.find(name); it != params.end()) {
+                bool rejected = false;
                 if constexpr (FilterType::is_set_op) {
-                    auto vals = detail::parseInList<typename FilterType::element_type>(it->second);
+                    auto vals = detail::parseInList<FilterType>(it->second, rejected);
                     if (!vals.empty()) {
                         std::get<Is>(query.filters.values) = std::move(vals);
                     }
                 } else {
-                    using ValueType = typename FilterType::value_type;
-                    if (auto val = detail::parseValue<ValueType>(it->second)) {
+                    if (auto val = detail::parseFilterValue<FilterType>(it->second)) {
                         std::get<Is>(query.filters.values) = std::move(*val);
+                    } else {
+                        rejected = true;
                     }
                 }
+                if (rejected && !invalid_value) invalid_value = FilterType::name.view();
             }
         }(), ...);
     }(std::make_index_sequence<filter_count<Descriptor>>{});
+
+    if (invalid_value) {
+        return std::unexpected(QueryValidationError{
+            .type = QueryValidationError::Type::InvalidValue,
+            .field = std::string(*invalid_value),
+            .limit = 0
+        });
+    }
 
     // Parse and validate sort
     if (auto it = params.find("sort"); it != params.end()) {
