@@ -10,9 +10,9 @@
  *   2. Alignment — a 2-byte value is compared on both of its bytes and keeps
  *      the filters that follow it aligned, in the create, update and
  *      predicate scripts.
- *   3. Order — range filters on signed 2-byte values (enum included) and on
- *      unsigned values follow the numeric order; a range filter the matcher
- *      cannot order never keeps a page it may hold.
+ *   3. Order — range filters on signed values (2-byte enum, 8-byte integer
+ *      near zero) and on unsigned values follow the numeric order; a range
+ *      filter the matcher cannot order never keeps a page it may hold.
  *
  * Each group is registered with a 1-byte page "x" — shorter than the bounds
  * header, so the Lua range check short-circuits to "delete". Whether a page
@@ -97,6 +97,15 @@ struct DescUnsigned {
         decl::Filter<"port_min", &Wide::port, "port", decl::Op::GE>{},
         decl::Filter<"count_min", &Wide::count, "count", decl::Op::GE>{},
         decl::Filter<"big_min", &Wide::big, "big", decl::Op::GE>{}
+    };
+    static constexpr auto sorts = std::tuple{IdSort{}};
+};
+
+// [owner int64 GE]
+struct DescSigned {
+    using Entity = Wide;
+    static constexpr auto filters = std::tuple{
+        decl::Filter<"owner_min", &Wide::owner, "owner", decl::Op::GE>{}
     };
     static constexpr auto sorts = std::tuple{IdSort{}};
 };
@@ -305,6 +314,31 @@ TEST_CASE("[ListWidths][L2] a range filter on a signed 2-byte enum follows its s
     CHECK_FALSE(alive(gMid));    // 5 ≥ 5
     CHECK(alive(gHigh));         // 5 < 300
     CHECK(alive(gOwner));        // the owner after the 2-byte value is read aligned
+}
+
+TEST_CASE("[ListWidths][L2] a range filter on a negative 8-byte value reads it exactly",
+          "[integration][redis][list][widths][l2]") {
+    TransactionGuard tx;
+
+    auto ownerParams = [](int64_t v) {
+        decl::ListQueryParams<DescSigned> q;
+        q.filters.get<"owner_min">() = v;
+        return q;
+    };
+
+    auto gMinusTwo = registerGroup(ownerParams(-2));
+    auto gMinusOne = registerGroup(ownerParams(-1));
+    auto gZero     = registerGroup(ownerParams(0));
+
+    Wide e;
+    e.owner = -2;
+    fireCreate<DescSigned>(e);
+
+    // Summed as a double, the eight bytes of -1 and -2 both round to 2^64,
+    // read back as 0.
+    CHECK_FALSE(alive(gMinusTwo));  // -2 ≥ -2
+    CHECK(alive(gMinusOne));        // -2 < -1
+    CHECK(alive(gZero));            // -2 < 0
 }
 
 TEST_CASE("[ListWidths][L2] range filters on unsigned values follow unsigned order",

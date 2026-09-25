@@ -1083,15 +1083,22 @@ local function u32(s, p)
     return b1 + b2*256 + b3*65536 + b4*16777216
 end
 
-local function i64(s, p)
-    local b1,b2,b3,b4,b5,b6,b7,b8 = string.byte(s, p, p+7)
-    if not b8 then return 0 end
-    local val = b1 + b2*256 + b3*65536 + b4*16777216
-              + b5*4294967296 + b6*1099511627776
-              + b7*281474976710656 + b8*72057594037927936
-    if val >= 2^63 then val = val - 2^64 end
-    return val
+-- Little-endian integer of `w` bytes. A negative one is summed from its
+-- complement, so it stays exact down to -2^53, as a positive one up to 2^53.
+local function int(s, p, w, signed)
+    local neg = signed and (string.byte(s, p + w - 1) or 0) >= 128
+    local v = 0
+    for i = p + w - 1, p, -1 do
+        local b = string.byte(s, i)
+        if not b then return 0 end
+        if neg then b = 255 - b end
+        v = v * 256 + b
+    end
+    if neg then return -v - 1 end
+    return v
 end
+
+local function i64(s, p) return int(s, p, 8, true) end
 
 -- Byte width of a fixed-size schema type (any type but 's').
 local function width(ft)
@@ -1106,23 +1113,12 @@ local function skip(s, pos, ft)
     return pos + width(ft)
 end
 
--- Little-endian integer of an ordered schema type ('2' 'w' '4' 'u' '8' 'U'),
--- signed or not as the type says. nil for a type the matcher does not order
--- ('1' 'f' 'd'): an ordering filter on it always matches.
+-- Integer of an ordered schema type ('2' 'w' '4' 'u' '8' 'U'), signed or not
+-- as the type says. The matcher orders these types only: for '1' 'f' 'd' this
+-- returns nil and an ordering filter matches, so the page is invalidated.
 local function num(s, p, ft)
-    local w
-    if ft == 56 or ft == 85 then w = 8
-    elseif ft == 52 or ft == 117 then w = 4
-    elseif ft == 50 or ft == 119 then w = 2
-    else return nil end
-    local v = 0
-    for i = p + w - 1, p, -1 do
-        local b = string.byte(s, i)
-        if not b then return 0 end
-        v = v * 256 + b
-    end
-    if (ft == 56 or ft == 52 or ft == 50) and v >= 2^(8*w - 1) then v = v - 2^(8*w) end
-    return v
+    if ft == 49 or ft == 102 or ft == 100 then return nil end
+    return int(s, p, width(ft), ft == 56 or ft == 52 or ft == 50)
 end
 
 -- Skip a group-side IN set: [count:u32][elem×count]. gp points at the count.
@@ -1311,15 +1307,22 @@ local function u32(s, p)
     return b1 + b2*256 + b3*65536 + b4*16777216
 end
 
-local function i64(s, p)
-    local b1,b2,b3,b4,b5,b6,b7,b8 = string.byte(s, p, p+7)
-    if not b8 then return 0 end
-    local val = b1 + b2*256 + b3*65536 + b4*16777216
-              + b5*4294967296 + b6*1099511627776
-              + b7*281474976710656 + b8*72057594037927936
-    if val >= 2^63 then val = val - 2^64 end
-    return val
+-- Little-endian integer of `w` bytes. A negative one is summed from its
+-- complement, so it stays exact down to -2^53, as a positive one up to 2^53.
+local function int(s, p, w, signed)
+    local neg = signed and (string.byte(s, p + w - 1) or 0) >= 128
+    local v = 0
+    for i = p + w - 1, p, -1 do
+        local b = string.byte(s, i)
+        if not b then return 0 end
+        if neg then b = 255 - b end
+        v = v * 256 + b
+    end
+    if neg then return -v - 1 end
+    return v
 end
+
+local function i64(s, p) return int(s, p, 8, true) end
 
 -- Byte width of a fixed-size schema type (any type but 's').
 local function width(ft)
@@ -1508,15 +1511,22 @@ local function u32(s, p)
     return b1 + b2*256 + b3*65536 + b4*16777216
 end
 
-local function i64(s, p)
-    local b1,b2,b3,b4,b5,b6,b7,b8 = string.byte(s, p, p+7)
-    if not b8 then return 0 end
-    local val = b1 + b2*256 + b3*65536 + b4*16777216
-              + b5*4294967296 + b6*1099511627776
-              + b7*281474976710656 + b8*72057594037927936
-    if val >= 2^63 then val = val - 2^64 end
-    return val
+-- Little-endian integer of `w` bytes. A negative one is summed from its
+-- complement, so it stays exact down to -2^53, as a positive one up to 2^53.
+local function int(s, p, w, signed)
+    local neg = signed and (string.byte(s, p + w - 1) or 0) >= 128
+    local v = 0
+    for i = p + w - 1, p, -1 do
+        local b = string.byte(s, i)
+        if not b then return 0 end
+        if neg then b = 255 - b end
+        v = v * 256 + b
+    end
+    if neg then return -v - 1 end
+    return v
 end
+
+local function i64(s, p) return int(s, p, 8, true) end
 
 -- Byte width of a fixed-size schema type (any type but 's').
 local function width(ft)
@@ -1531,23 +1541,12 @@ local function skip(s, pos, ft)
     return pos + width(ft)
 end
 
--- Little-endian integer of an ordered schema type ('2' 'w' '4' 'u' '8' 'U'),
--- signed or not as the type says. nil for a type the matcher does not order
--- ('1' 'f' 'd'): an ordering filter on it always matches.
+-- Integer of an ordered schema type ('2' 'w' '4' 'u' '8' 'U'), signed or not
+-- as the type says. The matcher orders these types only: for '1' 'f' 'd' this
+-- returns nil and an ordering filter matches, so the page is invalidated.
 local function num(s, p, ft)
-    local w
-    if ft == 56 or ft == 85 then w = 8
-    elseif ft == 52 or ft == 117 then w = 4
-    elseif ft == 50 or ft == 119 then w = 2
-    else return nil end
-    local v = 0
-    for i = p + w - 1, p, -1 do
-        local b = string.byte(s, i)
-        if not b then return 0 end
-        v = v * 256 + b
-    end
-    if (ft == 56 or ft == 52 or ft == 50) and v >= 2^(8*w - 1) then v = v - 2^(8*w) end
-    return v
+    if ft == 49 or ft == 102 or ft == 100 then return nil end
+    return int(s, p, width(ft), ft == 56 or ft == 52 or ft == 50)
 end
 
 -- Skip a group-side IN set: [count:u32][elem×count]. gp points at the count.

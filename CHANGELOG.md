@@ -16,8 +16,8 @@
 
 - **Enums order by their underlying value everywhere.** Range filters, sorts,
   guards and `orderBy` on a mapped enum compare the underlying value, no longer
-  the database string. Range filters and sorts on a mapped enum use an index only
-  if it is built on the rank expression (see `docs/lists.md › Enum fields`).
+  the database string. Range filters and sorts on a mapped enum use an index
+  built on the rank expression (see `docs/lists.md › Enum fields`).
 - **List cache keys of enum filters change.** Existing Redis list entries filtered
   on an enum are no longer read and expire with their TTL.
 
@@ -27,8 +27,9 @@
   an enum filter value were served the same page, in L1 and L2.
 - **Mapped enum list filters returned no rows**, silently, and sorting on a
   mapped enum failed in PostgreSQL.
-- **Redis list invalidation misread 2-byte filter values** and misordered
-  unsigned and negative floating-point ones; a stale page could be kept.
+- **Redis list invalidation misread 2-byte and negative 8-byte values**, in
+  filters and sort bounds, and misordered unsigned and negative floating-point
+  ones; a stale page could be kept.
 
 ## [3.1.0] - 2026-09-24
 
