@@ -93,6 +93,17 @@ template<typename Codec, typename E>
 inline constexpr bool via_codec_matches<Via<Codec>, E> =
     std::is_same_v<typename Codec::enum_type, E>;
 
+/// Appends the quoted column or, when `Ranked`, the rank expression of the
+/// Via<Codec> converter over it: `CASE "col" WHEN 'db' THEN u ... END`.
+template<typename Converter, bool Ranked>
+void appendColumnSql(std::string& sql, std::string_view column) {
+    if constexpr (Ranked) sql += "CASE ";
+    sql += '"';
+    sql += column;
+    sql += '"';
+    if constexpr (Ranked) sql += Converter::codec::rankCases();
+}
+
 }  // namespace detail
 
 template<typename T>

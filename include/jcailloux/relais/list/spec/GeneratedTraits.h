@@ -294,12 +294,8 @@ void appendSortExpression(std::string& sql, size_t field_index) {
     [&]<size_t... Is>(std::index_sequence<Is...>) {
         ((field_index == Is ? ([&] {
             using S = sort_at<Descriptor, Is>;
-            constexpr bool ranked = is_via_v<typename S::converter>;
-            if constexpr (ranked) sql += "CASE ";
-            sql += '"';
-            sql += S::column();
-            sql += '"';
-            if constexpr (ranked) sql += S::converter::codec::rankCases();
+            detail::appendColumnSql<typename S::converter, is_via_v<typename S::converter>>(
+                sql, S::column());
         }(), true) : false) || ...);
     }(std::make_index_sequence<sort_count<Descriptor>>{});
 }

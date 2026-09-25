@@ -527,9 +527,9 @@ Filter<"created_at", &Article::created_at, "created_at", Op::GE>       // range 
 Filter<"category", &Article::category, "category", Op::IN>             // set membership
 ```
 
-Template: `Filter<FixedString Name, auto EntityMemberPtr, FixedString ColumnName, Op = EQ, typename Converter = NoConvert, InvalidationStrategy = defaultInvalidationStrategy(Op)>`. `Name` is the HTTP query-param key; `EntityMemberPtr` may be a data member **or** a const member function. Converters: `NoConvert` (default), `AsString` (enum via ADL `toString`) and `Via<Codec>` (a mapped enum through its generated codec: `EQ`/`NE`/`IN`/`NIN` bind the database string, ordering operators compare the codec's rank with the underlying value, HTTP values parse with `Codec::fromDb`). `Codec::enum_type` must be the field's enum type (`static_assert`). The generator emits `Via<>` on every filter of a `@relais enum` field; a hand-written descriptor must declare it, otherwise the enum binds as an integer against a text column. See [lists.md › Enum fields](lists.md#enum-fields).
+Template: `Filter<FixedString Name, auto EntityMemberPtr, FixedString ColumnName, Op = EQ, typename Converter = NoConvert, InvalidationStrategy = defaultInvalidationStrategy(Op)>`. `Name` is the HTTP query-param key; `EntityMemberPtr` may be a data member **or** a const member function. Converters: `NoConvert` (default), `AsString` (enum via ADL `toString`) and `Via<Codec>` (a mapped enum through its generated codec: `EQ`/`NE`/`IN`/`NIN` bind the database string, ordering operators compare the codec's rank with the underlying value, HTTP values parse with `Codec::fromDb`). `Codec::enum_type` must be the field's enum type (`static_assert`). The generator emits `Via<>` on every filter of a `@relais enum` field; a hand-written descriptor declares it too, so that the enum binds as its database string. See [lists.md › Enum fields](lists.md#enum-fields).
 
-> **IN/NIN guard-rails (compile-time).** A set-op filter rejects `AsString` and an enum element without `Via<Codec>` (the element would bind as an integer against a text column, or its encoding would not match the Redis-side blob). `is_set_op` is the single `(op == IN || op == NIN)` switch every consumer keys off.
+> **IN/NIN guard-rails (compile-time).** A set-op filter takes `NoConvert`, or `Via<Codec>` for an enum element: every element then binds as the column stores it and encodes as the Redis-side blob reads it. `is_set_op` is the single `(op == IN || op == NIN)` switch every consumer keys off.
 
 <details><summary>InvalidationStrategy — when a filter triggers list invalidation</summary>
 
@@ -546,7 +546,7 @@ Sort<"id", &Article::id, "id">   // default Asc
 Sort<"state", &Ticket::state, "state", SortDirection::Asc, Via<TicketMapping::StateCodec>>
 ```
 
-`Converter` is `NoConvert` or `Via<Codec>`. With `Via<>`, SQL orders a mapped enum by the codec's rank, so the order is the underlying value, as in L1 and in the cursor. Without it, a sort on a text-stored enum is a PostgreSQL error.
+`Converter` is `NoConvert` or `Via<Codec>`. With `Via<>`, SQL orders a mapped enum by the codec's rank, so the order is the underlying value, as in L1 and in the cursor. A sort on a mapped enum requires it.
 
 > **Sort fields must be cursor-encodable.** `CursorEncodable<T>` requires an integral or enum type (optionally `optional<>`-wrapped) — string sorts are a **compile error**, because keyset cursors encode each sort value as `int64_t`. Use an integer timestamp (microseconds since epoch) instead of a string date.
 

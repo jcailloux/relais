@@ -26,8 +26,7 @@ namespace jcailloux::relais::entity {
 // Order follows the underlying value, as `operator<` does on the enum. SQL
 // compares the rank expression `CASE "col" WHEN 'open' THEN 5 ... END`, built
 // at compile time from `pairs`; a value outside the mapping, or NULL, ranks
-// NULL. An index serves ordering only when it is built on that same
-// expression.
+// NULL. An index serves ordering when it is built on that same expression.
 // =============================================================================
 
 namespace detail {
@@ -40,7 +39,7 @@ constexpr std::size_t decimalWidth(T v) noexcept {
     return n;
 }
 
-/// Writes `v` in decimal ending just before `end`; returns the new end.
+/// Writes `v` in decimal at `out`; returns one past its last digit.
 template<typename T>
 constexpr char* writeDecimal(char* out, T v) noexcept {
     char* end = out + decimalWidth(v);
@@ -113,7 +112,7 @@ struct MappedEnumCodec {
         return {cases.data(), cases.size()};
     }
 
-    /// Appends the rank expression of `column`, already quoted and qualified.
+    /// Appends the rank expression of `qual` + `column` (`column` already quoted).
     static void appendRank(std::string& sql, std::string_view qual, std::string_view column) {
         sql += "CASE ";
         sql += qual;

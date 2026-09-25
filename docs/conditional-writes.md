@@ -109,8 +109,8 @@ when(eq<F::state>("held"))        // as it arrives from a request or a file
 ```
 
 `lt`, `le`, `gt`, `ge` and `asc`/`desc` in `orderBy` follow the underlying value
-of the enum, as lists do, not the alphabetical order of the strings. An ordering
-guard takes the C++ value only: `gt<F::state>("held")` does not compile. See
+of the enum, as lists do. An ordering guard takes the C++ value,
+`gt<F::state>(State::Held)`; a string there is a compile error. See
 [lists.md › Enum fields](lists.md#enum-fields) for the rank expression and its
 index.
 
