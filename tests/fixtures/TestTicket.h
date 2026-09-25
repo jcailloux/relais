@@ -28,7 +28,7 @@ enum class TicketState {
 struct TestTicket {
     int64_t id = 0;                         // @relais primary_key db_managed sortable:asc
     int64_t queue_id = 0;                   // @relais filterable:queue
-    TicketState state = TicketState::Open;  // @relais enum=open:Open,blocked:Blocked,closed:Closed,archived:Archived filterable filterable:state_min:ge sortable:state:asc
+    TicketState state = TicketState::Open;  // @relais enum=open:Open,blocked:Blocked,closed:Closed,archived:Archived filterable filterable:state_min:ge filterable:state_ne:ne filterable:state_in:in filterable:state_nin:nin sortable:state:asc
     int32_t weight = 0;                     // @relais filterable
     std::string title;
 };
