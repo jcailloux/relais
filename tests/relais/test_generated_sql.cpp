@@ -18,6 +18,7 @@
 #include <regex>
 #include <string>
 #include <string_view>
+#include <type_traits>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -26,6 +27,7 @@
 #include "fixtures/generated/TestCompositeKeyListEntity.h"
 #include "fixtures/generated/TestAllPkJunctionEntity.h"
 #include "fixtures/generated/TestArticleInEntity.h"
+#include "fixtures/generated/TestTicketEntity.h"
 
 #include <jcailloux/relais/list/spec/GeneratedCriteria.h>
 #include <jcailloux/relais/repository/PgRepo.h>
@@ -270,4 +272,43 @@ TEST_CASE("delete_where - $n survives buildWhereClause -> assembly",
     CHECK(sql.ends_with(std::string("RETURNING ")
                         + entity::generated::TestArticleInMapping::SQL::returning_columns));
     CHECK(sql.find("$1") < sql.find("LIMIT"));
+}
+
+// #############################################################################
+//  Codec d'enum mappé — une seule source du mapping par champ
+// #############################################################################
+
+TEST_CASE("mapped enum codec - one mapping per field", "[generator][enum]") {
+    using Mapping = entity::generated::TestTicketMapping;
+    using Codec = Mapping::StateCodec;
+    using State = relais_test::TicketState;
+    using Info = Mapping::TraitsType::FieldInfo<Mapping::TraitsType::Field::state>;
+
+    SECTION("[codec] toDb / fromDb are constant expressions and round-trip") {
+        static_assert(Codec::toDb(State::Closed) == "closed");
+        static_assert(Codec::fromDb("blocked") == State::Blocked);
+        static_assert(!Codec::fromDb("Blocked").has_value());
+        static_assert(Codec::toDb(static_cast<State>(99)).empty());
+        for (const auto& [e, db] : Codec::pairs) {
+            CHECK(Codec::toDb(e) == db);
+            CHECK(Codec::fromDb(db) == e);
+        }
+    }
+
+    SECTION("[FieldInfo] forwards to the field's codec") {
+        STATIC_CHECK(std::is_same_v<Info::codec, Codec>);
+        STATIC_CHECK(std::is_same_v<Info::enum_type, State>);
+        STATIC_CHECK(Info::toDb(State::Archived) == "archived");
+    }
+
+    SECTION("[params] insert and update bind the database string") {
+        relais_test::TestTicket t;
+        t.state = State::Closed;
+        const auto ins = Mapping::toInsertParams(t);
+        const auto upd = Mapping::toUpdateParams(t);
+        REQUIRE(ins.params.size() == 4);
+        REQUIRE(upd.params.size() == 4);
+        CHECK(ins.params[1] == jcailloux::relais::io::PgParam::text("closed"));
+        CHECK(upd.params[1] == jcailloux::relais::io::PgParam::text("closed"));
+    }
 }
