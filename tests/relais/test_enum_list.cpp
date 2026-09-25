@@ -21,10 +21,12 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
 #include <cstdint>
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -92,12 +94,13 @@ TEST_CASE("[EnumList] distinct enum filter values give distinct page keys",
 
 TEST_CASE("[EnumList] entity blob carries the enum bytes the schema announces",
           "[list][enum][unit]") {
-    // queue int64 '8=' | state '4=' | state_in '4@' | state_min '4G' |
-    // state_ne '4!' | state_nin '4#' | weight int32 '4='
-    REQUIRE(decl::filterSchema<Desc>() == "8=4=4@4G4!4#4=");
+    // queue int64 '8=' | state '4=' | state_gt '4>' | state_in '4@' |
+    // state_lt '4<' | state_max '4L' | state_min '4G' | state_ne '4!' |
+    // state_nin '4#' | weight int32 '4='
+    REQUIRE(decl::filterSchema<Desc>() == "8=4=4>4@4<4L4G4!4#4=");
 
     auto blob = decl::encodeEntityFilterBlob<Desc>(makeTicket(TicketState::Open, 3, 7));
-    CHECK(blob.size() == (1 + 8) + 6 * (1 + 4));
+    CHECK(blob.size() == (1 + 8) + 9 * (1 + 4));
     CHECK(blob != decl::encodeEntityFilterBlob<Desc>(makeTicket(TicketState::Closed, 3, 7)));
 }
 
@@ -126,12 +129,40 @@ TEST_CASE("[EnumList] equality and set filters bind the codec's strings",
         CHECK(w.params.params[1] == PgParam::text("{archived}"));
     }
 
-    SECTION("an ordering operator binds the underlying value") {
+    SECTION("an ordering operator compares the rank with the underlying value") {
         q.filters.get<"state_min">() = TicketState::Closed;
         auto w = decl::buildWhereClause<Desc>(q.filters);
+        CHECK(w.sql == "CASE \"state\" WHEN 'open' THEN 5 WHEN 'blocked' THEN 20 "
+                       "WHEN 'closed' THEN 10 WHEN 'archived' THEN 0 END>=$1");
         REQUIRE(w.params.params.size() == 1);
         CHECK(w.params.params[0] == PgParam::bigint(10));
     }
+}
+
+namespace {
+
+enum class Quoted : int16_t { Neg = -300, Zero = 0, Big = 32000 };
+
+struct QuotedCodec : jcailloux::relais::entity::MappedEnumCodec<QuotedCodec, Quoted> {
+    static constexpr std::array<std::pair<enum_type, std::string_view>, 3>
+        pairs{{{enum_type::Neg, "it's"}, {enum_type::Zero, ""}, {enum_type::Big, "''"}}};
+};
+
+}  // namespace
+
+TEST_CASE("[EnumList] the rank expression is built at compile time from the codec",
+          "[list][enum][unit]") {
+    static_assert(::entity::generated::TestTicketMapping::StateCodec::rankCases()
+        == " WHEN 'open' THEN 5 WHEN 'blocked' THEN 20 WHEN 'closed' THEN 10 "
+           "WHEN 'archived' THEN 0 END");
+    // Quotes doubled, negative and empty values kept.
+    static_assert(QuotedCodec::rankCases()
+        == " WHEN 'it''s' THEN -300 WHEN '' THEN 0 WHEN '''''' THEN 32000 END");
+
+    std::string sql;
+    QuotedCodec::appendRank(sql, "t.", "\"q\"");
+    CHECK(sql == "CASE t.\"q\" WHEN 'it''s' THEN -300 WHEN '' THEN 0 "
+                 "WHEN '''''' THEN 32000 END");
 }
 
 TEST_CASE("[EnumList] HTTP parsing reads the codec's strings",
@@ -483,7 +514,7 @@ TEST_CASE("[EnumList][L2] a write invalidates only the pages its enum value matc
 // #############################################################################
 
 TEST_CASE("[EnumList][L1] a range filter compares underlying values",
-          "[integration][db][list][enum][l1][!shouldfail]") {
+          "[integration][db][list][enum][l1]") {
     TransactionGuard tx;
     TestInternals::resetListCacheState<L1TestTicketRepo>();
     auto t = seedTickets();
@@ -496,8 +527,35 @@ TEST_CASE("[EnumList][L1] a range filter compares underlying values",
           == Ids{t.open, t.blocked, t.closed});
 }
 
+TEST_CASE("[EnumList][L1] strict and upper range filters compare underlying values",
+          "[integration][db][list][enum][l1]") {
+    TransactionGuard tx;
+    TestInternals::resetListCacheState<L1TestTicketRepo>();
+    auto t = seedTickets();
+
+    auto range = [](auto set) {
+        auto q = ticketParams(std::nullopt);
+        set(q.filters);
+        return queryIds<L1TestTicketRepo>(std::move(q));
+    };
+    // state > open (5): closed (10) and blocked (20).
+    CHECK(range([](auto& f) { f.template get<"state_gt">() = TicketState::Open; })
+          == Ids{t.blocked, t.closed});
+    // state < closed (10): open (5) and archived (0).
+    CHECK(range([](auto& f) { f.template get<"state_lt">() = TicketState::Closed; })
+          == Ids{t.open, t.archived});
+    // state ≤ open (5): open and archived; blocked sorts before open as text.
+    CHECK(range([](auto& f) { f.template get<"state_max">() = TicketState::Open; })
+          == Ids{t.open, t.archived});
+    // open (5) < state ≤ closed (10): closed only.
+    CHECK(range([](auto& f) {
+              f.template get<"state_gt">() = TicketState::Open;
+              f.template get<"state_max">() = TicketState::Closed;
+          }) == Ids{t.closed});
+}
+
 TEST_CASE("[EnumList][L1] a sort on a mapped enum follows underlying values",
-          "[integration][db][list][enum][l1][!shouldfail]") {
+          "[integration][db][list][enum][l1]") {
     TransactionGuard tx;
     TestInternals::resetListCacheState<L1TestTicketRepo>();
     auto t = seedTickets();
@@ -517,8 +575,60 @@ TEST_CASE("[EnumList][L1] a sort on a mapped enum follows underlying values",
     }
 }
 
+namespace {
+
+/// Every page of a sort on `state`, three rows at a time, each page after the
+/// first reached through the previous page's cursor.
+template<typename Repo>
+Ids walkStatePages(jcailloux::relais::list::SortDirection dir) {
+    using D = typename Repo::ListDescriptorType;
+    Ids all;
+    decl::TypedCursor<D> cursor;
+    for (int page = 0; page < 10; ++page) {
+        auto q = ticketParams<D>(std::nullopt);
+        q.limit = 3;
+        q.sort = jr::list::SortSpec<size_t>{1, dir};
+        q.cursor = cursor;
+        auto r = sync(Repo::query(decl::seal<D>(std::move(q))));
+        for (const auto& e : r->items) all.push_back(e.id);
+        if (r->cursor().empty()) break;
+        cursor = decl::TypedCursor<D>::decode(r->cursor()).value();
+    }
+    return all;
+}
+
+/// Two rows per state but archived: ties are broken by primary key, and each
+/// page boundary falls between or inside a run of equal states.
+template<typename Repo>
+void checkStatePagination() {
+    auto t = seedTickets();
+    auto open2 = insertTicket("open");
+    auto closed2 = insertTicket("closed");
+    auto blocked2 = insertTicket("blocked");
+
+    CHECK(walkStatePages<Repo>(jr::list::SortDirection::Asc)
+          == Ids{t.archived, t.open, open2, t.closed, closed2, t.blocked, blocked2});
+    CHECK(walkStatePages<Repo>(jr::list::SortDirection::Desc)
+          == Ids{blocked2, t.blocked, closed2, t.closed, open2, t.open, t.archived});
+}
+
+}  // namespace
+
+TEST_CASE("[EnumList][L1] keyset pages on a mapped enum follow underlying values",
+          "[integration][db][list][enum][l1]") {
+    TransactionGuard tx;
+    TestInternals::resetListCacheState<L1TestTicketRepo>();
+    checkStatePagination<L1TestTicketRepo>();
+}
+
+TEST_CASE("[EnumList][L2] keyset pages on a mapped enum follow underlying values",
+          "[integration][db][redis][list][enum][l2]") {
+    TransactionGuard tx;
+    checkStatePagination<L2TestTicketRepo>();
+}
+
 TEST_CASE("[EnumList] an ordering guard compares underlying values",
-          "[integration][db][guard][enum][!shouldfail]") {
+          "[integration][db][guard][enum]") {
     using jr::entity::when;
     using jr::entity::gt;
     using jr::entity::le;
@@ -552,7 +662,7 @@ TEST_CASE("[EnumList] an ordering guard compares underlying values",
 }
 
 TEST_CASE("[EnumList] a claim ordered on a mapped enum follows underlying values",
-          "[integration][db][claim][enum][!shouldfail]") {
+          "[integration][db][claim][enum]") {
     using jr::entity::when;
     using jr::entity::eq;
     using jr::entity::set;

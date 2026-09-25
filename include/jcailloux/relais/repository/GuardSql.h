@@ -3,6 +3,7 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -44,6 +45,32 @@ void appendColumn(std::string& sql, std::string_view qual) {
     sql += Traits::template FieldInfo<F>::column_name;
 }
 
+/// A column whose enum is stored as text orders by its codec's rank.
+template<typename Info>
+inline constexpr bool has_codec_v = requires { typename Info::codec; };
+
+/// An ordering guard on such a column compares ranks: its value must be an
+/// enumerator.
+template<typename Info, typename V>
+inline constexpr bool ranks_enumerator_v = false;
+template<typename Info, typename V>
+    requires has_codec_v<Info>
+inline constexpr bool ranks_enumerator_v<Info, V> = std::is_same_v<V, typename Info::enum_type>;
+
+template<typename Traits, auto F>
+void appendOrderedColumn(std::string& sql, std::string_view qual) {
+    using Info = typename Traits::template FieldInfo<F>;
+    if constexpr (has_codec_v<Info>) {
+        Info::codec::appendRank(sql, qual, Info::column_name);
+    } else {
+        appendColumn<Traits, F>(sql, qual);
+    }
+}
+
+[[nodiscard]] constexpr bool isOrdering(entity::Cmp c) noexcept {
+    return c != entity::Cmp::Eq && c != entity::Cmp::Ne;
+}
+
 inline void appendPlaceholder(std::string& sql, size_t& param) {
     sql += '$';
     sql += std::to_string(param++);
@@ -54,16 +81,30 @@ struct GuardSql;
 
 template<typename Traits, auto F, entity::Cmp C, typename V>
 struct GuardSql<Traits, entity::FieldGuard<F, C, V>> {
+    using Info = typename Traits::template FieldInfo<F>;
+    static constexpr bool ranked = has_codec_v<Info> && isOrdering(C);
     static constexpr size_t params = 1;
 
+    static_assert(!ranked || ranks_enumerator_v<Info, V>,
+        "an ordering guard on a mapped enum field takes an enumerator");
+
     static void emit(std::string& sql, size_t& param, std::string_view qual) {
-        appendColumn<Traits, F>(sql, qual);
+        if constexpr (ranked) {
+            appendOrderedColumn<Traits, F>(sql, qual);
+        } else {
+            appendColumn<Traits, F>(sql, qual);
+        }
         sql += cmpToSql(C);
         appendPlaceholder(sql, param);
     }
 
     static void bind(io::PgParams& p, const entity::FieldGuard<F, C, V>& g) {
-        p.push(entity::detail::columnValue<Traits, F>(g.value));
+        if constexpr (ranked) {
+            p.params.push_back(io::PgParam::bigint(
+                static_cast<int64_t>(std::to_underlying(g.value))));
+        } else {
+            p.push(entity::detail::columnValue<Traits, F>(g.value));
+        }
     }
 };
 
@@ -191,7 +232,7 @@ struct OrderKeySql<Traits, entity::OrderKey<F, Desc, N>> {
     static constexpr size_t params = 0;
 
     static void emit(std::string& sql, size_t&, std::string_view qual) {
-        appendColumn<Traits, F>(sql, qual);
+        appendOrderedColumn<Traits, F>(sql, qual);
         sql += Desc ? " DESC" : " ASC";
         if constexpr (N == entity::Nulls::First) sql += " NULLS FIRST";
         if constexpr (N == entity::Nulls::Last) sql += " NULLS LAST";

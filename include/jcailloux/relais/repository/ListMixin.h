@@ -1140,7 +1140,6 @@ protected:
 
             // Parse sort
             auto sort = query.sort().value_or(defaultSortAsListSpec());
-            auto sort_col = list::spec::sortColumnName<Descriptor>(sort.field);
             const bool is_desc = (sort.direction == list::SortDirection::Desc);
 
             // Primary-key tiebreaker columns (one for a scalar key, N for a
@@ -1177,9 +1176,9 @@ protected:
                 }
 
                 if (!where.sql.empty()) where.sql += " AND ";
-                where.sql += "(COALESCE(\"";
-                where.sql += sort_col;
-                where.sql += "\", 0)";
+                where.sql += "(COALESCE(";
+                list::spec::appendSortExpression<Descriptor>(where.sql, sort.field);
+                where.sql += ", 0)";
                 appendKeyColumns(where.sql, nullptr);
                 where.sql += ") ";
                 where.sql += is_desc ? "< " : "> ";
@@ -1206,9 +1205,9 @@ protected:
                 sql += " WHERE ";
                 sql += where.sql;
             }
-            sql += " ORDER BY COALESCE(\"";
-            sql += sort_col;
-            sql += "\", 0) ";
+            sql += " ORDER BY COALESCE(";
+            list::spec::appendSortExpression<Descriptor>(sql, sort.field);
+            sql += ", 0) ";
             sql += is_desc ? "DESC" : "ASC";
             appendKeyColumns(sql, is_desc ? "DESC" : "ASC");
             sql += " LIMIT ";
