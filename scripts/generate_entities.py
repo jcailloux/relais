@@ -1388,6 +1388,10 @@ class MappingGenerator:
             for f in a.filters:
                 m = members_by_name.get(f.field)
                 element = m.inner_type if m else "int64_t"
+                # The Values struct lives in the generated namespace: an enum
+                # declared next to the entity must be named with its namespace.
+                if m and self._find_enum_mapping(a, m.name):
+                    element = self._qualify_type(entity, element)
                 if f.op in ("in", "nin"):
                     opt_type = f"std::optional<std::vector<{element}>>"
                 else:
