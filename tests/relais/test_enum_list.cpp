@@ -10,7 +10,8 @@
  *      stays aligned on the filters that follow the enum.
  *   3. End to end — two queries on different enum values do not share an L1
  *      page, nor an L2 group.
- *   4. Rows — an equality filter on the enum selects the rows of that value.
+ *   4. Rows — an equality filter on the enum selects the rows of that value,
+ *      and every row reader decodes the enum through the field codec.
  *   5. Order — range filters, sorts, ordering guards and claim orderings on
  *      the enum all follow the underlying value, never the database strings.
  */
@@ -18,6 +19,8 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstdint>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include "fixtures/test_helper.h"
@@ -271,6 +274,29 @@ TEST_CASE("[EnumList][L2] an equality filter returns the rows of that enum value
 
     CHECK(queryIds<L2TestTicketRepo>(ticketParams<L2Desc>(TicketState::Closed)) == Ids{t.closed});
     CHECK(queryIds<L2TestTicketRepo>(ticketParams<L2Desc>(TicketState::Open)) == Ids{t.open});
+}
+
+TEST_CASE("[EnumList] rows decode the enum through the field codec",
+          "[integration][db][enum][rowview]") {
+    TransactionGuard tx;
+    using Mapping = entity::generated::TestTicketMapping;
+    auto t = seedTickets();
+
+    const std::pair<int64_t, TicketState> expected[] = {
+        {t.open, TicketState::Open}, {t.blocked, TicketState::Blocked},
+        {t.closed, TicketState::Closed}, {t.archived, TicketState::Archived}};
+    for (const auto& [id, state] : expected) {
+        auto r = execQueryArgs(
+            (std::string("SELECT ") + Mapping::SQL::returning_columns
+             + " FROM relais_test_tickets WHERE id = $1").c_str(), id);
+        REQUIRE(r.rows() == 1);
+
+        auto e = Mapping::fromRow<TestTicketEntity>(r[0]);
+        REQUIRE(e.has_value());
+        CHECK(e->state == state);
+        CHECK(*Mapping::rowToJson(r[0]) == e->json());
+        CHECK(*Mapping::rowToBeve(r[0]) == e->binary());
+    }
 }
 
 // #############################################################################
