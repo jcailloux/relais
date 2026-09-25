@@ -230,9 +230,43 @@ std::string encodeFilterSet(const Filters<Descriptor>& filters) {
     return std::string(reinterpret_cast<const char*>(buf.data()), buf.size());
 }
 
+namespace detail {
+
+/// Schema type char of a filter value: it tells the Lua parser how many bytes
+/// appendToBuffer wrote and how to order them. An enum reads as its underlying
+/// integer. A type without a char is a compile error, never a guessed width.
+template<typename T>
+consteval char schemaTypeChar() {
+    if constexpr (std::is_same_v<T, std::string>) {
+        return 's';
+    } else if constexpr (std::is_enum_v<T>) {
+        return schemaTypeChar<std::underlying_type_t<T>>();
+    } else if constexpr (std::is_integral_v<T> && sizeof(T) == 1) {
+        return '1';
+    } else if constexpr (std::is_integral_v<T> && sizeof(T) == 2) {
+        return std::is_signed_v<T> ? '2' : 'w';
+    } else if constexpr (std::is_integral_v<T> && sizeof(T) == 4) {
+        return std::is_signed_v<T> ? '4' : 'u';
+    } else if constexpr (std::is_integral_v<T> && sizeof(T) == 8) {
+        return std::is_signed_v<T> ? '8' : 'U';
+    } else if constexpr (std::is_same_v<T, float> && sizeof(T) == 4) {
+        return 'f';
+    } else if constexpr (std::is_same_v<T, double> && sizeof(T) == 8) {
+        return 'd';
+    } else {
+        static_assert(sizeof(T) == 0, "filterSchema: unsupported filter value type");
+    }
+}
+
+}  // namespace detail
+
 /// Generate a compact filter schema string for Lua binary parsing.
 /// 2 characters per filter: type char + operator char.
-/// Type: 's'=string, '8'=int64_t, '4'=int32_t, '1'=bool/uint8_t.
+/// Type: 's'=string; '1'=any 1-byte integer or bool; '2'/'w'=int16/uint16;
+/// '4'/'u'=int32/uint32; '8'/'U'=int64/uint64; 'f'=float; 'd'=double.
+/// An enum takes the char of its underlying type. The Lua matchers order the
+/// 2-, 4- and 8-byte integers; on the other fixed-size types an ordering
+/// operator always matches, so a page is invalidated rather than kept stale.
 /// Operator: '='=EQ, '!'=NE, '>'=GT, 'G'=GE, '<'=LT, 'L'=LE, '@'=IN, '#'=NIN.
 template<typename Descriptor>
     requires ValidFilterSet<Descriptor>
@@ -245,11 +279,7 @@ std::string filterSchema() {
             using FilterType = filter_at<Descriptor, Is>;
             using ValueType = typename FilterType::value_type;
 
-            if constexpr (std::is_same_v<ValueType, std::string>)
-                schema += 's';
-            else if constexpr (sizeof(ValueType) == 8) schema += '8';
-            else if constexpr (sizeof(ValueType) == 4) schema += '4';
-            else schema += '1';
+            schema += detail::schemaTypeChar<ValueType>();
 
             constexpr Op op = FilterType::op;
             if constexpr (op == Op::EQ) schema += '=';

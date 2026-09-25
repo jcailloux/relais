@@ -1093,11 +1093,36 @@ local function i64(s, p)
     return val
 end
 
+-- Byte width of a fixed-size schema type (any type but 's').
+local function width(ft)
+    if ft == 56 or ft == 85 or ft == 100 then return 8        -- '8' 'U' 'd'
+    elseif ft == 52 or ft == 117 or ft == 102 then return 4   -- '4' 'u' 'f'
+    elseif ft == 50 or ft == 119 then return 2                -- '2' 'w'
+    else return 1 end                                         -- '1'
+end
+
 local function skip(s, pos, ft)
-    if ft == 115 then return pos + 4 + u32(s, pos)
-    elseif ft == 56 then return pos + 8
-    elseif ft == 52 then return pos + 4
-    else return pos + 1 end
+    if ft == 115 then return pos + 4 + u32(s, pos) end
+    return pos + width(ft)
+end
+
+-- Little-endian integer of an ordered schema type ('2' 'w' '4' 'u' '8' 'U'),
+-- signed or not as the type says. nil for a type the matcher does not order
+-- ('1' 'f' 'd'): an ordering filter on it always matches.
+local function num(s, p, ft)
+    local w
+    if ft == 56 or ft == 85 then w = 8
+    elseif ft == 52 or ft == 117 then w = 4
+    elseif ft == 50 or ft == 119 then w = 2
+    else return nil end
+    local v = 0
+    for i = p + w - 1, p, -1 do
+        local b = string.byte(s, i)
+        if not b then return 0 end
+        v = v * 256 + b
+    end
+    if (ft == 56 or ft == 52 or ft == 50) and v >= 2^(8*w - 1) then v = v - 2^(8*w) end
+    return v
 end
 
 -- Skip a group-side IN set: [count:u32][elem×count]. gp points at the count.
@@ -1112,9 +1137,9 @@ local function eqval(bin, gp, blob, ep, ft)
     if ft == 115 then
         local gl = u32(bin, gp); local el = u32(blob, ep)
         return gl == el and (gl == 0 or string.sub(bin, gp+4, gp+3+gl) == string.sub(blob, ep+4, ep+3+el))
-    elseif ft == 56 then return string.sub(bin, gp, gp+7) == string.sub(blob, ep, ep+7)
-    elseif ft == 52 then return string.sub(bin, gp, gp+3) == string.sub(blob, ep, ep+3)
-    else return string.byte(bin, gp) == string.byte(blob, ep) end
+    end
+    local w = width(ft)
+    return string.sub(bin, gp, gp+w-1) == string.sub(blob, ep, ep+w-1)
 end
 
 -- IN membership: entity scalar (at ep) ∈ group set (at gp = count). Mirrors the
@@ -1137,38 +1162,17 @@ local function cmp(bin, gp, blob, ep, ft, fo)
             return gl ~= el or (gl > 0 and string.sub(bin, gp+4, gp+3+gl) ~= string.sub(blob, ep+4, ep+3+el))
         end
         return true
-    elseif ft == 56 then
-        if fo == 61 then return string.sub(bin, gp, gp+7) == string.sub(blob, ep, ep+7)
-        elseif fo == 33 then return string.sub(bin, gp, gp+7) ~= string.sub(blob, ep, ep+7)
-        else
-            local gv = i64(bin, gp); local ev = i64(blob, ep)
-            if fo == 62 then return ev > gv
-            elseif fo == 71 then return ev >= gv
-            elseif fo == 60 then return ev < gv
-            elseif fo == 76 then return ev <= gv end
-        end
-    elseif ft == 52 then
-        if fo == 61 then return string.sub(bin, gp, gp+3) == string.sub(blob, ep, ep+3)
-        elseif fo == 33 then return string.sub(bin, gp, gp+3) ~= string.sub(blob, ep, ep+3)
-        else
-            local function r32(s, p)
-                local a,b,c,d = string.byte(s, p, p+3)
-                if not d then return 0 end
-                local v = a + b*256 + c*65536 + d*16777216
-                if v >= 2^31 then v = v - 2^32 end; return v
-            end
-            local gv = r32(bin, gp); local ev = r32(blob, ep)
-            if fo == 62 then return ev > gv
-            elseif fo == 71 then return ev >= gv
-            elseif fo == 60 then return ev < gv
-            elseif fo == 76 then return ev <= gv end
-        end
-    else
-        local gv = string.byte(bin, gp); local ev = string.byte(blob, ep)
-        if fo == 61 then return gv == ev
-        elseif fo == 33 then return gv ~= ev end
-        return true
     end
+    local w = width(ft)
+    if fo == 61 then return string.sub(bin, gp, gp+w-1) == string.sub(blob, ep, ep+w-1)
+    elseif fo == 33 then return string.sub(bin, gp, gp+w-1) ~= string.sub(blob, ep, ep+w-1) end
+    local gv = num(bin, gp, ft)
+    if gv == nil then return true end
+    local ev = num(blob, ep, ft)
+    if fo == 62 then return ev > gv
+    elseif fo == 71 then return ev >= gv
+    elseif fo == 60 then return ev < gv
+    elseif fo == 76 then return ev <= gv end
     return true
 end
 
@@ -1317,11 +1321,17 @@ local function i64(s, p)
     return val
 end
 
+-- Byte width of a fixed-size schema type (any type but 's').
+local function width(ft)
+    if ft == 56 or ft == 85 or ft == 100 then return 8        -- '8' 'U' 'd'
+    elseif ft == 52 or ft == 117 or ft == 102 then return 4   -- '4' 'u' 'f'
+    elseif ft == 50 or ft == 119 then return 2                -- '2' 'w'
+    else return 1 end                                         -- '1'
+end
+
 local function skip(s, pos, ft)
-    if ft == 115 then return pos + 4 + u32(s, pos)
-    elseif ft == 56 then return pos + 8
-    elseif ft == 52 then return pos + 4
-    else return pos + 1 end
+    if ft == 115 then return pos + 4 + u32(s, pos) end
+    return pos + width(ft)
 end
 
 -- Skip a set: [count:u32][elem×count]. pos points at the count.
@@ -1336,9 +1346,9 @@ local function eqval(s1, p1, s2, p2, ft)
     if ft == 115 then
         local l1 = u32(s1, p1); local l2 = u32(s2, p2)
         return l1 == l2 and (l1 == 0 or string.sub(s1, p1+4, p1+3+l1) == string.sub(s2, p2+4, p2+3+l2))
-    elseif ft == 56 then return string.sub(s1, p1, p1+7) == string.sub(s2, p2, p2+7)
-    elseif ft == 52 then return string.sub(s1, p1, p1+3) == string.sub(s2, p2, p2+3)
-    else return string.byte(s1, p1) == string.byte(s2, p2) end
+    end
+    local w = width(ft)
+    return string.sub(s1, p1, p1+w-1) == string.sub(s2, p2, p2+w-1)
 end
 
 -- Two sets (both [count][elem×count]) share no element?
@@ -1508,11 +1518,36 @@ local function i64(s, p)
     return val
 end
 
+-- Byte width of a fixed-size schema type (any type but 's').
+local function width(ft)
+    if ft == 56 or ft == 85 or ft == 100 then return 8        -- '8' 'U' 'd'
+    elseif ft == 52 or ft == 117 or ft == 102 then return 4   -- '4' 'u' 'f'
+    elseif ft == 50 or ft == 119 then return 2                -- '2' 'w'
+    else return 1 end                                         -- '1'
+end
+
 local function skip(s, pos, ft)
-    if ft == 115 then return pos + 4 + u32(s, pos)
-    elseif ft == 56 then return pos + 8
-    elseif ft == 52 then return pos + 4
-    else return pos + 1 end
+    if ft == 115 then return pos + 4 + u32(s, pos) end
+    return pos + width(ft)
+end
+
+-- Little-endian integer of an ordered schema type ('2' 'w' '4' 'u' '8' 'U'),
+-- signed or not as the type says. nil for a type the matcher does not order
+-- ('1' 'f' 'd'): an ordering filter on it always matches.
+local function num(s, p, ft)
+    local w
+    if ft == 56 or ft == 85 then w = 8
+    elseif ft == 52 or ft == 117 then w = 4
+    elseif ft == 50 or ft == 119 then w = 2
+    else return nil end
+    local v = 0
+    for i = p + w - 1, p, -1 do
+        local b = string.byte(s, i)
+        if not b then return 0 end
+        v = v * 256 + b
+    end
+    if (ft == 56 or ft == 52 or ft == 50) and v >= 2^(8*w - 1) then v = v - 2^(8*w) end
+    return v
 end
 
 -- Skip a group-side IN set: [count:u32][elem×count]. gp points at the count.
@@ -1527,9 +1562,9 @@ local function eqval(bin, gp, blob, ep, ft)
     if ft == 115 then
         local gl = u32(bin, gp); local el = u32(blob, ep)
         return gl == el and (gl == 0 or string.sub(bin, gp+4, gp+3+gl) == string.sub(blob, ep+4, ep+3+el))
-    elseif ft == 56 then return string.sub(bin, gp, gp+7) == string.sub(blob, ep, ep+7)
-    elseif ft == 52 then return string.sub(bin, gp, gp+3) == string.sub(blob, ep, ep+3)
-    else return string.byte(bin, gp) == string.byte(blob, ep) end
+    end
+    local w = width(ft)
+    return string.sub(bin, gp, gp+w-1) == string.sub(blob, ep, ep+w-1)
 end
 
 -- IN membership: entity scalar (at ep) ∈ group set (at gp = count). Mirrors the
@@ -1552,38 +1587,17 @@ local function cmp(bin, gp, blob, ep, ft, fo)
             return gl ~= el or (gl > 0 and string.sub(bin, gp+4, gp+3+gl) ~= string.sub(blob, ep+4, ep+3+el))
         end
         return true
-    elseif ft == 56 then
-        if fo == 61 then return string.sub(bin, gp, gp+7) == string.sub(blob, ep, ep+7)
-        elseif fo == 33 then return string.sub(bin, gp, gp+7) ~= string.sub(blob, ep, ep+7)
-        else
-            local gv = i64(bin, gp); local ev = i64(blob, ep)
-            if fo == 62 then return ev > gv
-            elseif fo == 71 then return ev >= gv
-            elseif fo == 60 then return ev < gv
-            elseif fo == 76 then return ev <= gv end
-        end
-    elseif ft == 52 then
-        if fo == 61 then return string.sub(bin, gp, gp+3) == string.sub(blob, ep, ep+3)
-        elseif fo == 33 then return string.sub(bin, gp, gp+3) ~= string.sub(blob, ep, ep+3)
-        else
-            local function r32(s, p)
-                local a,b,c,d = string.byte(s, p, p+3)
-                if not d then return 0 end
-                local v = a + b*256 + c*65536 + d*16777216
-                if v >= 2^31 then v = v - 2^32 end; return v
-            end
-            local gv = r32(bin, gp); local ev = r32(blob, ep)
-            if fo == 62 then return ev > gv
-            elseif fo == 71 then return ev >= gv
-            elseif fo == 60 then return ev < gv
-            elseif fo == 76 then return ev <= gv end
-        end
-    else
-        local gv = string.byte(bin, gp); local ev = string.byte(blob, ep)
-        if fo == 61 then return gv == ev
-        elseif fo == 33 then return gv ~= ev end
-        return true
     end
+    local w = width(ft)
+    if fo == 61 then return string.sub(bin, gp, gp+w-1) == string.sub(blob, ep, ep+w-1)
+    elseif fo == 33 then return string.sub(bin, gp, gp+w-1) ~= string.sub(blob, ep, ep+w-1) end
+    local gv = num(bin, gp, ft)
+    if gv == nil then return true end
+    local ev = num(blob, ep, ft)
+    if fo == 62 then return ev > gv
+    elseif fo == 71 then return ev >= gv
+    elseif fo == 60 then return ev < gv
+    elseif fo == 76 then return ev <= gv end
     return true
 end
 
