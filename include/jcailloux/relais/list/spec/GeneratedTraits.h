@@ -457,7 +457,8 @@ namespace detail {
 template<typename Descriptor, size_t I>
 void narrowSortRange(SortRange& r, const Filters<Descriptor>& pred) noexcept {
     using FT = filter_at<Descriptor, I>;
-    if constexpr (std::is_arithmetic_v<typename FT::element_type>) {
+    if constexpr (std::is_arithmetic_v<typename FT::element_type>
+                  || std::is_enum_v<typename FT::element_type>) {
         const auto& v = std::get<I>(pred.values);
         if (!v.has_value()) return;
         constexpr Op op = FT::op;
