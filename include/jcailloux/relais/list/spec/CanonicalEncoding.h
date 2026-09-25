@@ -28,12 +28,18 @@ namespace jcailloux::relais::list::spec {
 
 namespace detail {
 
-/// Append a value to a hash buffer
+/// Append a value to a hash buffer. Every supported type emits at least one
+/// byte; an unsupported type is a compile error, never an empty encoding (two
+/// distinct values would otherwise share a cache key).
 template<typename T>
 void appendToBuffer(std::vector<uint8_t>& buf, const T& value) {
     if constexpr (std::is_arithmetic_v<T>) {
         const auto* ptr = reinterpret_cast<const uint8_t*>(&value);
         buf.insert(buf.end(), ptr, ptr + sizeof(value));
+    } else if constexpr (std::is_enum_v<T>) {
+        // Same bytes as the underlying integer: the Lua schema reads an enum
+        // as an integer of sizeof(T) bytes.
+        appendToBuffer(buf, static_cast<std::underlying_type_t<T>>(value));
     } else if constexpr (std::is_same_v<T, std::string>) {
         // Append length + data
         uint32_t len = static_cast<uint32_t>(value.size());
@@ -43,6 +49,8 @@ void appendToBuffer(std::vector<uint8_t>& buf, const T& value) {
         uint32_t len = static_cast<uint32_t>(value.size());
         appendToBuffer(buf, len);
         buf.insert(buf.end(), value.begin(), value.end());
+    } else {
+        static_assert(sizeof(T) == 0, "appendToBuffer: unsupported filter value type");
     }
 }
 
