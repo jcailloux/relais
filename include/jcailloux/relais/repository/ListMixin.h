@@ -167,7 +167,7 @@ class ListMixin : public Base {
         // Bucketed page sizes for cache key normalization. Sourced from the
         // descriptor's allowedLimits grid (the generator's single point of
         // truth, exposed under the `limitSteps` name at this Traits layer for
-        // external consumers — see per-model-limits plan #5) when the model
+        // external consumers) when the model
         // declared a `limits=` annotation, else the shared kDefaultLimits
         // fallback. Arbitrary length — no fixed-size-4 assumption.
         static constexpr auto limitSteps = [] {
