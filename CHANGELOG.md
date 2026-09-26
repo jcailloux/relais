@@ -20,6 +20,10 @@
   built on the rank expression (see `docs/lists.md › Enum fields`).
 - **List cache keys of enum filters change.** Existing Redis list entries filtered
   on an enum are no longer read and expire with their TTL.
+- **A list L1 hit allocates nothing.** `seal()` no longer builds the cache keys;
+  `query()`, `queryJson()` and `queryBinary()` encode the page key per call.
+- **`ListQuery::groupKey()`/`cacheKey()` return a `std::string`** encoded on each
+  call, no longer a `const std::string&`. The key format is unchanged.
 
 ### Fixed
 
