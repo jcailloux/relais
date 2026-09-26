@@ -18,9 +18,9 @@ namespace jcailloux::relais::list::spec {
 //
 // Accumulates a mutable ListQueryParams<Descriptor>; build() seals it into the
 // immutable ListQuery<Descriptor> — the sole type query()/queryJson()/
-// queryBinary() accept. A query reaching query() therefore always carries cache
-// keys consistent with its contents: there is exactly one sealing moment,
-// terminal by construction, and the mutable form holds no keys to go stale.
+// queryBinary() accept. A query reaching query() therefore always carries
+// canonical params: there is exactly one sealing moment, terminal by
+// construction, and no stored key can go stale.
 //
 // Filters and sort are set BY NAME, verified at compile time (find_filter_index
 // / find_sort_index static_assert on an unknown name) — no positional index, no
@@ -101,7 +101,7 @@ public:
     }
 
     /// Seal into the immutable ListQuery — the single sealing point of the fluent
-    /// path. Computes both canonical keys once from the final params.
+    /// path. Canonicalizes the IN/NIN sets of the final params.
     [[nodiscard]] ListQuery<Descriptor> build() const {
         return seal<Descriptor>(params_);
     }

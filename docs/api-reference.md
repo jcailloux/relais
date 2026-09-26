@@ -455,7 +455,7 @@ Per descriptor, batch delete folds N source events into M ≤ N distinct target 
 
 ## List and query API
 
-The list subsystem turns a declarative `ListDescriptor` (filters + sorts + page-size grid, emitted by the generator from `@relais` annotations) into a paginated, L1/L2-cached query API on the `ListMixin` layer. A query is built by name — `Repo::queryBuilder().filter<"...">(v).sortDesc<"...">().limit(n).after(cursor).build()` — and **sealed** into an immutable `ListQuery` that carries its own canonical cache keys by construction. HTTP query strings parse into the same type via `parseListQuery` (tolerant) or `parseListQueryStrict` (validating). Everything below lives in `jcailloux::relais::list` / `jcailloux::relais::list::spec` and is re-exported by a list-enabled `Repo`.
+The list subsystem turns a declarative `ListDescriptor` (filters + sorts + page-size grid, emitted by the generator from `@relais` annotations) into a paginated, L1/L2-cached query API on the `ListMixin` layer. A query is built by name — `Repo::queryBuilder().filter<"...">(v).sortDesc<"...">().limit(n).after(cursor).build()` — and **sealed** into an immutable `ListQuery` whose canonical params determine its cache keys. HTTP query strings parse into the same type via `parseListQuery` (tolerant) or `parseListQueryStrict` (validating). Everything below lives in `jcailloux::relais::list` / `jcailloux::relais::list::spec` and is re-exported by a list-enabled `Repo`.
 
 ### ListDescriptor — what the entity declares
 
@@ -498,7 +498,7 @@ struct ListDescriptor : FilterSet {                          // auto-detected by
 };
 ```
 
-> **Group key vs cache key.** There is no separately *declared* group key. The **group key** is the canonical encoding of `filters + sort` (same group regardless of pagination — used for Redis group tracking and selective invalidation); the **cache key** is `group_key + limit + cursor + offset` (identifies one page). Both are computed once at `seal()` (`CanonicalEncoding.h`), never hashed.
+> **Group key vs cache key.** There is no separately *declared* group key. The **group key** is the canonical encoding of `filters + sort` (same group regardless of pagination — used for Redis group tracking and selective invalidation); the **cache key** is `group_key + limit + cursor + offset` (identifies one page). Both are encoded from the sealed params (`CanonicalEncoding.h`), never hashed.
 
 Helpers over a descriptor (`ListDescriptor.h`): `filter_count<D>`, `sort_count<D>`, `filter_at<D, I>`, `sort_at<D, I>`.
 
@@ -582,10 +582,10 @@ co_await Repo::query(q);
 
 ### ListQuery / ListQueryParams — the type-state seal
 
-Two types enforce one invariant: *a query reaching `query()` always carries cache keys consistent with its contents* (`ListDescriptorQuery.h`).
+Two types enforce one invariant: *a query reaching `query()` always carries validated, canonical params* (`ListDescriptorQuery.h`).
 
 - **`ListQueryParams<Descriptor>`** — the mutable form. Public fields: `Filters<D> filters`, `optional<SortSpec<size_t>> sort`, `uint16_t limit{20}`, `TypedCursor<D> cursor`, `uint32_t offset{0}`. Holds **no** keys. This is what you fill (by hand or via the builder).
-- **`ListQuery<Descriptor>`** — the sealed, immutable form. `ListQuery() = delete`; constructible **only** via `seal()` (friend) or `Builder::build()`. Read-only accessors: `filters()`, `sort()`, `limit()`, `cursor()`, `offset()`, `params()`, plus the two canonical keys `groupKey()` and `cacheKey()` (both `const std::string&`). It is the **sole** type `query()` / `queryJson()` / `queryBinary()` accept.
+- **`ListQuery<Descriptor>`** — the sealed, immutable form. `ListQuery() = delete`; constructible **only** via `seal()` (friend) or `Builder::build()`. Read-only accessors: `filters()`, `sort()`, `limit()`, `cursor()`, `offset()`, `params()`, plus the two canonical keys `groupKey()` and `cacheKey()`, each encoded on every call and returned as a `std::string`. It is the **sole** type `query()` / `queryJson()` / `queryBinary()` accept.
 
 ```cpp
 template<typename Descriptor>
@@ -593,7 +593,7 @@ template<typename Descriptor>
 ListQuery<Descriptor> seal(ListQueryParams<Descriptor> params);   // CanonicalEncoding.h
 ```
 
-`seal()` computes `groupKey` (from `filters + sort`) and `cacheKey` (from `groupKey + limit + cursor + offset`) exactly once from the final params; the sealed type is then immutable, so its keys always reflect its contents and the hot path carries no empty-key branch.
+`seal()` sorts and deduplicates every IN/NIN set in place — `filters()` returns them in that canonical form — then the type is immutable. The sealed query stores no key: `groupKey` (from `filters + sort`) and `cacheKey` (from `groupKey + limit + cursor + offset`) are encoded from its params where they are needed, so they always reflect its contents. An L1 lookup encodes the page key into a reused per-thread buffer: a hit allocates nothing.
 
 > **Two `ListQuery`s exist; this section is about `spec::ListQuery<Descriptor>`.** `list::ListQuery<FilterSet, SortFieldEnum>` (in `ListQuery.h`) is the lower-level cache-key struct the L1 `ListCache` consumes; `ListMixin::toCacheQuery` adapts the sealed `spec::ListQuery<D>` into it. Public callers use `spec::ListQuery<D>` (the `Repo::ListQuery` alias).
 
