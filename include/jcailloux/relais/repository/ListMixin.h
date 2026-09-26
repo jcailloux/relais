@@ -30,6 +30,27 @@ namespace relais_test { struct TestInternals; }
 
 namespace jcailloux::relais {
 
+namespace detail {
+
+/// Per-thread buffer the L1 lookup of a list query encodes its page key into,
+/// shared by every repository. It is valid only from the encoding to the
+/// lookup, with no suspension in between: a key that must outlive the lookup
+/// (L2 access, store) is encoded into its own string.
+inline std::string& listKeyScratch() noexcept {
+    thread_local std::string key;
+    key.clear();
+    return key;
+}
+
+/// Release the buffer after a lookup once an oversized key (a large IN set)
+/// has grown it, so that a thread does not retain that memory.
+inline void trimListKeyScratch(std::string& key) noexcept {
+    constexpr size_t kMaxRetained = 4096;
+    if (key.capacity() > kMaxRetained) std::string().swap(key);
+}
+
+}  // namespace detail
+
 /**
  * Optional mixin layer for declarative list caching.
  *
@@ -221,18 +242,19 @@ class ListMixin : public Base {
         return cache::CacheView<ListWrapperType>(ptr, std::move(guard));
     }
 
-    // Redis key helpers for declarative list caching
-    static std::string redisPageKey(const std::string& cache_key) {
+    // Redis key helpers for declarative list caching: the canonical key is
+    // encoded straight behind its prefix.
+    static std::string redisPageKey(const list::spec::ListQuery<Descriptor>& q) {
         std::string key(Base::name());
         key += ":dlist:p:";
-        key.append(cache_key);
+        list::spec::appendPageKey<Descriptor>(key, q);
         return key;
     }
 
-    static std::string redisGroupKey(const std::string& group_key) {
+    static std::string redisGroupKey(const list::spec::ListQuery<Descriptor>& q) {
         std::string key(Base::name());
         key += ":dlist:g:";
-        key.append(group_key);
+        list::spec::appendGroupKey<Descriptor>(key, q);
         return key;
     }
 
@@ -246,16 +268,29 @@ class ListMixin : public Base {
 
     using CacheQuery = list::ListQuery<DescriptorFilters, size_t>;
 
-    static CacheQuery toCacheQuery(const auto& q) {
+    static CacheQuery toCacheQuery(const auto& q, std::string page_key) {
         CacheQuery cq;
         cq.filters = q.filters();
         cq.limit = q.limit();
         cq.cursor = q.cursor().raw();
-        cq.cache_key = q.cacheKey();
+        cq.cache_key = std::move(page_key);
         if (q.sort()) {
             cq.sort = *q.sort();
         }
         return cq;
+    }
+
+    /// L1 lookup of a query's page, keyed through the per-thread buffer. Not a
+    /// coroutine: nothing can suspend between the encoding and the lookup, so
+    /// no other query can overwrite the buffer while it is in use. The view
+    /// returned points to the cache entry, never to the key.
+    static cache::CacheView<ListWrapperType> findInL1(
+            const list::spec::ListQuery<Descriptor>& q) {
+        auto& key = detail::listKeyScratch();
+        list::spec::appendPageKey<Descriptor>(key, q);
+        auto cached = listCache().getByKey(key);
+        detail::trimListKeyScratch(key);
+        return cached;
     }
 
     /// Convert spec::defaultSort → list::SortSpec<size_t>
@@ -317,7 +352,7 @@ public:
     /// L1 hit: zero overhead (Immediate holds ListResult directly, no Task).
     static io::Immediate<ListResult> query(const ListQuery& q) {
         if constexpr (kHasL1) {
-            if (auto cached = listCache().getByKey(q.cacheKey())) {
+            if (auto cached = findInL1(q)) {
                 RELAIS_METRICS_INC(list_l1_counters_.hits);
                 return std::move(cached);
             }
@@ -333,7 +368,7 @@ public:
     static io::Immediate<std::string> queryJson(const ListQuery& q) {
         // L1 check: serialize from cached entities
         if constexpr (kHasL1) {
-            if (auto cached = listCache().getByKey(q.cacheKey())) {
+            if (auto cached = findInL1(q)) {
                 RELAIS_METRICS_INC(list_l1_counters_.hits);
                 return cached->json();
             }
@@ -351,7 +386,7 @@ public:
     {
         // L1 check: serialize from cached entities
         if constexpr (kHasL1) {
-            if (auto cached = listCache().getByKey(q.cacheKey())) {
+            if (auto cached = findInL1(q)) {
                 RELAIS_METRICS_INC(list_l1_counters_.hits);
                 return cached->binary();
             }
@@ -949,7 +984,7 @@ protected:
     static io::Task<std::string> queryJsonSlow(const ListQuery& q) {
         // L2 check: BEVE → JSON transcode (skip ListBoundsHeader)
         if constexpr (kHasL2) {
-            auto pageKey = redisPageKey(q.cacheKey());
+            auto pageKey = redisPageKey(q);
 
             std::optional<std::vector<uint8_t>> beve;
             if constexpr (Base::config.l2_refresh_on_get) {
@@ -984,7 +1019,7 @@ protected:
     {
         // L2 check: raw binary from Redis (skip ListBoundsHeader)
         if constexpr (kHasL2) {
-            auto pageKey = redisPageKey(q.cacheKey());
+            auto pageKey = redisPageKey(q);
 
             std::optional<std::vector<uint8_t>> beve;
             if constexpr (Base::config.l2_refresh_on_get) {
@@ -1017,9 +1052,13 @@ protected:
     static io::Task<ListResult> cachedListQuery(const ListQuery& query) {
         using Clock = std::chrono::steady_clock;
 
+        // Owned page key, encoded before the first suspension: L1 check and store.
+        [[maybe_unused]] std::string page_key;
+
         // 1. L1 check — epoch-guarded view, zero-copy
         if constexpr (kHasL1) {
-            if (auto cached = listCache().getByKey(query.cacheKey()))
+            list::spec::appendPageKey<Descriptor>(page_key, query);
+            if (auto cached = listCache().getByKey(page_key))
                 co_return std::move(cached);
         }
 
@@ -1032,7 +1071,7 @@ protected:
 
         // 2. L2 check — binary (BEVE) with auto header skip
         if constexpr (kHasL2) {
-            auto pageKey = redisPageKey(query.cacheKey());
+            auto pageKey = redisPageKey(query);
 
             std::optional<ListWrapperType> cached;
             if constexpr (Base::config.l2_refresh_on_get) {
@@ -1059,8 +1098,8 @@ protected:
                             cached->items.back(), sort.field);
                         bounds.is_valid = true;
                     }
-                    co_return listCache().put(toCacheQuery(query), std::move(*cached),
-                                              fetch_gen, bounds, elapsed_us);
+                    co_return listCache().put(toCacheQuery(query, std::move(page_key)),
+                                              std::move(*cached), fetch_gen, bounds, elapsed_us);
                 } else {
                     co_return makeListView(std::move(*cached));
                 }
@@ -1109,8 +1148,8 @@ protected:
                 ? list::PaginationMode::Offset
                 : list::PaginationMode::Cursor;
 
-            auto pageKey = redisPageKey(query.cacheKey());
-            auto groupKey = redisGroupKey(query.groupKey());
+            auto pageKey = redisPageKey(query);
+            auto groupKey = redisGroupKey(query);
 
             // Store page binary with header prepended (reads wrapper, does not consume)
             co_await cache::RedisCache::setListBinary(pageKey, wrapper, l2Ttl(), header);
@@ -1122,8 +1161,8 @@ protected:
 
         // 5. Store in L1 cache or epoch pool
         if constexpr (kHasL1) {
-            co_return listCache().put(toCacheQuery(query), std::move(wrapper),
-                                      fetch_gen, bounds, elapsed_us);
+            co_return listCache().put(toCacheQuery(query, std::move(page_key)),
+                                      std::move(wrapper), fetch_gen, bounds, elapsed_us);
         } else {
             co_return makeListView(std::move(wrapper));
         }

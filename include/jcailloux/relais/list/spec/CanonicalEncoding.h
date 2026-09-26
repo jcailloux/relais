@@ -238,8 +238,8 @@ std::string groupKey(
     });
 }
 
-/// Build the full page-level canonical key from the precomputed `group_key`
-/// plus the pagination params — pure mechanics, no key storage.
+/// Build the full page-level canonical key from a `group_key` plus the
+/// pagination params.
 template<typename Descriptor>
     requires ValidListDescriptor<Descriptor>
 std::string cacheKey(const std::string& group_key, const ListQueryParams<Descriptor>& params) {
@@ -253,19 +253,14 @@ std::string cacheKey(const std::string& group_key, const ListQueryParams<Descrip
 }
 
 /// Seal a mutable params bundle into an immutable ListQuery: canonicalizes the
-/// IN/NIN sets in place, then computes both canonical keys exactly once from
-/// the final params. The sole producer of a ListQuery outside the fluent
-/// builder — query() accepts nothing else.
+/// IN/NIN sets in place, so that equal queries encode equal keys. The sole
+/// producer of a ListQuery outside the fluent builder — query() accepts
+/// nothing else.
 template<typename Descriptor>
     requires ValidListDescriptor<Descriptor>
 ListQuery<Descriptor> seal(ListQueryParams<Descriptor> params) {
     canonicalize<Descriptor>(params.filters);
-    auto gk = detail::encodeReserved([&](auto& out) {
-        detail::appendFilterSet<Descriptor>(out, params.filters);
-        detail::appendSort<Descriptor>(out, params.sort);
-    });
-    auto ck = cacheKey<Descriptor>(gk, params);
-    return ListQuery<Descriptor>(std::move(params), std::move(gk), std::move(ck));
+    return ListQuery<Descriptor>(std::move(params));
 }
 
 // =============================================================================
