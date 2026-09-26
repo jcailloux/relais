@@ -17,6 +17,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -26,6 +27,7 @@
 
 #include "fixtures/generated/TestTicketEntity.h"
 #include <jcailloux/relais/list/spec/CanonicalEncoding.h>
+#include <jcailloux/relais/list/spec/ListQueryBuilder.h>
 
 namespace decl = jcailloux::relais::list::spec;
 using jcailloux::relais::list::SortDirection;
@@ -135,10 +137,10 @@ void checkParams(const decl::ListQueryParams<D>& p,
 
     const std::string prefix = "p:";
     std::string appended = prefix;
-    decl::appendGroupKey<D>(appended, p.filters, p.sort);
+    decl::appendGroupKey<D>(appended, q);
     CHECK(hex(appended) == hex(prefix) + std::string(group));
     appended = prefix;
-    decl::appendPageKey<D>(appended, p);
+    decl::appendPageKey<D>(appended, q);
     CHECK(hex(appended) == hex(prefix) + std::string(page));
 }
 
@@ -293,6 +295,37 @@ TEST_CASE("[ListKeyGolden] mapped enum filters", "[list][golden][unit]") {
         "0001f8ffffff010100000000000000000a00",
         "01030000000000000000000102000000050000000a0000000000011400000000"
         "0001f8ffffff");
+}
+
+TEST_CASE("[ListKeyGolden] sealing canonicalizes the sets", "[list][golden][unit]") {
+    auto raw = decl::ListQueryBuilder<SetDesc>{}
+        .filter<"names">(std::vector<std::string>{"travel", "art", "", "art"})
+        .filter<"not_i64">(std::vector<int64_t>{30, -2, 30, 1LL << 40})
+        .filter<"flags_b">(std::vector<bool>{true, false, true})
+        .limit(20)
+        .build();
+    auto canonical = decl::ListQueryBuilder<SetDesc>{}
+        .filter<"names">(std::vector<std::string>{"", "art", "travel"})
+        .filter<"not_i64">(std::vector<int64_t>{-2, 30, 1LL << 40})
+        .filter<"flags_b">(std::vector<bool>{false, true})
+        .limit(20)
+        .build();
+
+    CHECK(raw.groupKey() == canonical.groupKey());
+    CHECK(raw.cacheKey() == canonical.cacheKey());
+    CHECK(raw == canonical);
+    CHECK(*raw.filters().get<"names">() == std::vector<std::string>{"", "art", "travel"});
+    CHECK(*raw.filters().get<"not_i64">() == std::vector<int64_t>{-2, 30, 1LL << 40});
+    CHECK(*raw.filters().get<"flags_b">() == std::vector<bool>{false, true});
+
+    // Past the stack index array: same canonical form.
+    std::vector<std::string> many, expected;
+    for (int i = 40; i-- > 0;) many.push_back("category " + std::to_string(i % 17));
+    for (int i = 0; i < 17; ++i) expected.push_back("category " + std::to_string(i));
+    std::sort(expected.begin(), expected.end());
+    const auto big = decl::ListQueryBuilder<SetDesc>{}.filter<"names">(many).build();
+    CHECK(*big.filters().get<"names">() == expected);
+    CHECK(big.groupKey() == decl::ListQueryBuilder<SetDesc>{}.filter<"names">(expected).build().groupKey());
 }
 
 // #############################################################################
