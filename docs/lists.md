@@ -234,10 +234,10 @@ for (const auto& e : view->items)              // items is std::vector<Entity>, 
 // (view->total_count is NOT populated by query() — it stays 0 on this path.)
 ```
 
-The cache keys (`groupKey`/`cacheKey`) are computed **once at seal time** from
-the final params — there is no manual key derivation and no way to forget it. A
-query that reaches `query()` always carries keys consistent with its contents,
-by construction.
+The cache keys (`groupKey`/`cacheKey`) are encoded from the sealed params
+wherever they are needed — there is no manual key derivation and no stored key
+to go stale. A query that reaches `query()` always maps to keys consistent with
+its contents, by construction.
 
 The full builder surface — every setter, its exact slot type, and
 `.build()`/`.params()` — is in
@@ -266,7 +266,7 @@ using Desc = AuditLogRepo::ListDescriptorType;
 AuditLogRepo::ListQueryParams p;          // mutable: filters, sort, limit, cursor, offset
 p.limit = 200;
 p.filters.get<"user_id">() = uid;
-auto q = ld::seal<Desc>(std::move(p));    // computes both keys, yields ListQuery
+auto q = ld::seal<Desc>(std::move(p));    // canonicalizes IN/NIN sets, yields ListQuery
 
 // Re-seal after mutating a sealed query (e.g. advancing the cursor):
 auto p2 = q.params();

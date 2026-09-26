@@ -125,7 +125,7 @@ TEST_CASE("[decl-sortby] unknown sort name", "[decl][sortby]") {
 
 // #############################################################################
 //
-//  Fluent builder — Repo::queryBuilder()…build() (plan step 3, no I/O)
+//  Fluent builder — Repo::queryBuilder()…build() (no I/O)
 //  The builder is the primary construction path; build() is the single seal.
 //
 // #############################################################################
@@ -317,7 +317,7 @@ TEST_CASE("[DeclListRepo] L1 hit keyed through the per-thread buffer",
         CHECK(TestArticleListRepo::queryJson(q).await_ready());
         CHECK(TestArticleListRepo::queryBinary(q).await_ready());
 
-        // Another page in between overwrites the buffer, not the stored key.
+        // Looking up another page reuses the buffer; the cached entry keeps its own key.
         CHECK_FALSE(TestArticleListRepo::query(makeArticleQuery("news")).await_ready());
         CHECK(TestArticleListRepo::query(q).await_ready());
     }
