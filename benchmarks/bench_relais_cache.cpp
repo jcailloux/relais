@@ -15,21 +15,26 @@
  *   ./bench_relais_cache                    # all benchmarks
  *   ./bench_relais_cache "[l1]"             # L1 only
  *   ./bench_relais_cache "[throughput]"      # multi-threaded only
+ *   ./bench_relais_cache "[list-seal]"       # list key construction + allocations
+ *   ./bench_relais_cache "[list-parse-hit]"  # parse + seal + L1 hit, 1-16 threads
  *   BENCH_SAMPLES=500 ./bench_relais_cache  # 500 samples per latency benchmark
  *   BENCH_DURATION_S=5 ./bench_relais_cache # custom duration for throughput
  */
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "AllocCounter.h"
 #include "BenchEngine.h"
 
 #include "fixtures/test_helper.h"
 #include "fixtures/TestRepositories.h"
 #include "fixtures/TestQueryHelpers.h"
 #include "fixtures/RelaisTestAccessors.h"
+#include "fixtures/generated/TestArticleInEntity.h"
 
 #include <random>
 #include <span>
+#include <unordered_map>
 
 using namespace relais_test;
 using namespace relais_bench;
@@ -366,6 +371,170 @@ TEST_CASE("Benchmark - list query", "[benchmark][list]")
         return ops;
     });
     WARN(formatDurationThroughput("list query (10 articles, L1 hit)", 1, result));
+}
+
+namespace {
+
+namespace ld = jcailloux::relais::list::spec;
+
+/// Descriptor of the generated TestArticleIn entity (IN filters on category and
+/// authors), augmented with its Entity alias as ListMixin does.
+struct ArticleInDesc : ::entity::generated::TestArticleInEntity::MappingType::ListDescriptor {
+    using Entity = ::entity::generated::TestArticleInEntity;
+};
+
+struct AllocRun {
+    DurationResult duration;
+    uint64_t allocs;
+};
+
+/// Runs `op(tid)` in a tight loop on `threads` threads and counts the
+/// allocations each thread performs meanwhile.
+template<typename Op>
+AllocRun measureWithAllocs(int threads, Op&& op) {
+    std::vector<uint64_t> allocs(threads, 0);
+    auto duration = measureDuration(threads, [&](int tid, std::atomic<bool>& running) -> int64_t {
+        const uint64_t before = threadAllocCount();
+        int64_t ops = 0;
+        while (running.load(std::memory_order_relaxed)) {
+            op(tid);
+            ++ops;
+        }
+        allocs[tid] = threadAllocCount() - before;
+        return ops;
+    });
+    uint64_t total = 0;
+    for (auto a : allocs) total += a;
+    return {duration, total};
+}
+
+/// One line: per-thread latency, aggregated throughput, allocations per op.
+std::string formatAllocRun(const std::string& label, int threads, const AllocRun& run) {
+    const double ns = static_cast<double>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(run.duration.elapsed).count());
+    const double ops = static_cast<double>(std::max<int64_t>(run.duration.total_ops, 1));
+    char line[128];
+    std::snprintf(line, sizeof(line), "\n  %-28s %2dT %7.1f ns %13s %5.2f alloc/op",
+                  label.c_str(), threads, ns * threads / ops,
+                  fmtOps(ops * 1e9 / ns).c_str(),
+                  static_cast<double>(run.allocs) / ops);
+    return line;
+}
+
+} // anonymous namespace
+
+// #############################################################################
+//
+//  6b. List key construction — seal() alone, per key shape
+//
+// #############################################################################
+
+TEST_CASE("Benchmark - list query seal", "[benchmark][list-seal]")
+{
+    using Desc = TestArticleListRepo::ListDescriptorType;
+    using jcailloux::relais::list::SortDirection;
+    using jcailloux::relais::list::SortSpec;
+
+    // Synthetic 12-byte keyset token: seal() treats the cursor as opaque bytes.
+    auto cursor = ld::TypedCursor<Desc>::decode("AAECAwQFBgcICQoL");
+    REQUIRE(cursor.has_value());
+
+    ld::ListQueryParams<Desc> bare;
+    bare.limit = 10;
+
+    ld::ListQueryParams<Desc> int_sorted;
+    int_sorted.limit = 10;
+    int_sorted.filters.template get<"author_id">() = int64_t{123456789};
+    int_sorted.sort = SortSpec<size_t>{1, SortDirection::Desc};
+
+    ld::ListQueryParams<Desc> page2 = int_sorted;
+    page2.filters.template get<"category">() = std::string("tech");
+    page2.cursor = *cursor;
+
+    ld::ListQueryParams<ArticleInDesc> in8;
+    in8.limit = 10;
+    in8.filters.template get<"category">() = std::vector<std::string>{
+        "sport", "tech", "art", "news", "music", "food", "travel", "books"};
+
+    std::string out;
+    auto run = [&]<typename D>(const std::string& shape, const ld::ListQueryParams<D>& params) {
+        const auto sealed = ld::seal<D>(params);
+        auto copy = measureWithAllocs(1, [&](int) {
+            auto p = params;
+            doNotOptimize(p);
+        });
+        auto seal = measureWithAllocs(1, [&](int) {
+            auto q = ld::seal<D>(params);
+            doNotOptimize(q);
+        });
+        out += "\n  " + shape + "  (group key " + std::to_string(sealed.groupKey().size())
+             + " B, page key " + std::to_string(sealed.cacheKey().size()) + " B)";
+        out += formatAllocRun("  params copy (baseline)", 1, copy);
+        out += formatAllocRun("  params copy + seal()", 1, seal);
+    };
+
+    run("no filter", bare);
+    run("int64 filter + sort", int_sorted);
+    run("int64 + string + sort + cursor", page2);
+    run("IN of 8 unsorted strings", in8);
+    WARN(out);
+}
+
+// #############################################################################
+//
+//  6c. List request path — parse + seal + query() L1 hit, under contention
+//
+// #############################################################################
+
+TEST_CASE("Benchmark - list parse + L1 hit", "[benchmark][list-parse-hit]")
+{
+    TransactionGuard tx;
+    TestInternals::resetListCacheState<TestArticleListRepo>();
+    using Desc = TestArticleListRepo::ListDescriptorType;
+    using Params = std::unordered_map<std::string, std::string>;
+
+    static constexpr int kThreadCounts[] = {1, 4, 8, 16};
+    static constexpr int kPages = 16;
+
+    // One page per potential thread; every page is primed in L1 before timing.
+    auto userId = insertTestUser("bench_author", "bench@test.com", 0);
+    std::vector<Params> pages;
+    for (int p = 0; p < kPages; ++p) {
+        auto category = "bench_page_" + std::to_string(p);
+        for (int i = 0; i < 10; ++i)
+            insertTestArticle(category, userId, "Article_" + std::to_string(i), i * 10);
+        pages.push_back(Params{{"category", category},
+                               {"author_id", std::to_string(userId)},
+                               {"sort", "view_count:desc"},
+                               {"limit", "10"}});
+        sync(TestArticleListRepo::query(ld::parseListQuery<Desc>(pages.back())));
+        REQUIRE(TestArticleListRepo::query(ld::parseListQuery<Desc>(pages.back())).await_ready());
+    }
+
+    const auto sample = ld::parseListQuery<Desc>(pages[0]);
+    std::string out = "\n  page key " + std::to_string(sample.cacheKey().size()) + " B";
+    std::atomic<int64_t> misses{0};
+
+    auto hit = [&](const Params& params) {
+        auto task = TestArticleListRepo::query(ld::parseListQuery<Desc>(params));
+        if (!task.await_ready()) [[unlikely]] {
+            misses.fetch_add(1, std::memory_order_relaxed);
+            sync(std::move(task));
+            return;
+        }
+        doNotOptimize(task.await_resume());
+    };
+
+    for (int threads : kThreadCounts) {
+        auto same = measureWithAllocs(threads, [&](int) { hit(pages[0]); });
+        out += formatAllocRun("same page (max contention)", threads, same);
+    }
+    for (int threads : kThreadCounts) {
+        auto distinct = measureWithAllocs(threads, [&](int tid) { hit(pages[tid % kPages]); });
+        out += formatAllocRun("distinct pages", threads, distinct);
+    }
+    CHECK(misses.load() == 0);
+    WARN(out);
 }
 
 
