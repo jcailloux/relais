@@ -2,12 +2,13 @@
 #define JCX_RELAIS_LIST_SPEC_CANONICALENCODING_H
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <type_traits>
-#include <vector>
 
 #include "FilterDescriptor.h"
 #include "SortDescriptor.h"
@@ -68,10 +69,12 @@ void appendOptional(Out& out, const std::optional<T>& opt) {
 
 /// Append the filter portion of a value set, in declaration order. This is the
 /// byte-exact prefix shared by every group key, the predicate blob, and the
-/// canonical hash — set ops emit [presence][count:u32][elem×count]
-/// (sorted+unique), scalars emit [presence][value]. Shared so groupKey and
-/// encodeFilterSet (eraseWhere predicate) stay byte-identical: the Lua matcher
-/// compares a group's bytes against the predicate's, so any divergence desyncs.
+/// canonical hash — set ops emit [presence][count:u32][elem×count], scalars
+/// emit [presence][value]. Shared so groupKey and encodeFilterSet (eraseWhere
+/// predicate) stay byte-identical: the Lua matcher compares a group's bytes
+/// against the predicate's, so any divergence desyncs.
+/// Precondition: every set is canonical (see canonicalize()); the elements are
+/// written in their stored order.
 template<typename Descriptor, typename Out>
 void appendFilterSet(Out& out, const Filters<Descriptor>& filters) {
     [&]<size_t... Is>(std::index_sequence<Is...>) {
@@ -81,9 +84,7 @@ void appendFilterSet(Out& out, const Filters<Descriptor>& filters) {
             if constexpr (FilterType::is_set_op) {
                 // Set op (IN/NIN): [presence][count:u32][elem×count]. Encoding is
                 // byte-identical for both — only the match verdict differs (L1/L2/
-                // L3), never the key. Canonicalize (sort+unique) defensively here,
-                // not only in the parser, so filters built programmatically also
-                // hash to a stable group_key.
+                // L3), never the key.
                 out.push_back(filter_value.has_value() ? 1 : 0);
                 if (filter_value) {
                     // Pin the element type: iterating std::vector<bool> yields a
@@ -92,18 +93,8 @@ void appendFilterSet(Out& out, const Filters<Descriptor>& filters) {
                     // group set from the (scalar) entity blob. Explicit T forces
                     // the proxy to materialize and keeps strings copy-free.
                     using ElemT = typename std::decay_t<decltype(*filter_value)>::value_type;
-                    if constexpr (std::is_same_v<Out, ByteCounter>) {
-                        // Duplicates only shrink the canonical set: counting the
-                        // raw elements bounds the size without sorting a copy.
-                        appendToBuffer(out, static_cast<uint32_t>(filter_value->size()));
-                        for (const auto& e : *filter_value) appendToBuffer<ElemT>(out, e);
-                    } else {
-                        auto sorted = *filter_value;
-                        std::sort(sorted.begin(), sorted.end());
-                        sorted.erase(std::unique(sorted.begin(), sorted.end()), sorted.end());
-                        appendToBuffer(out, static_cast<uint32_t>(sorted.size()));
-                        for (const auto& e : sorted) appendToBuffer<ElemT>(out, e);
-                    }
+                    appendToBuffer(out, static_cast<uint32_t>(filter_value->size()));
+                    for (const auto& e : *filter_value) appendToBuffer<ElemT>(out, e);
                 }
             } else {
                 appendOptional(out, filter_value);
@@ -141,6 +132,43 @@ void appendPagination(Out& out, const ListQueryParams<Descriptor>& params) {
     }
 }
 
+/// Sort and deduplicate one set in place. An already canonical set is left
+/// untouched after a single scan. Moving a std::string costs a buffer copy, so
+/// a small set of non-trivially-copyable elements is sorted through an index
+/// array on the stack and then permuted into place with at most n-1 swaps,
+/// instead of the O(n²) element moves of the insertion sort std::sort runs on
+/// small ranges.
+template<typename Set>
+void canonicalizeSet(Set& set) {
+    using T = typename Set::value_type;
+    if (std::adjacent_find(set.begin(), set.end(), std::greater_equal<>{}) == set.end()) return;
+
+    constexpr size_t kIndexedMax = 32;
+    if constexpr (!std::is_trivially_copyable_v<T>) {
+        if (const size_t n = set.size(); n <= kIndexedMax) {
+            // from[i]: position of the element that belongs at i.
+            std::array<uint8_t, kIndexedMax> from;
+            for (size_t i = 0; i < n; ++i) from[i] = static_cast<uint8_t>(i);
+            std::sort(from.begin(), from.begin() + n,
+                      [&](uint8_t a, uint8_t b) { return set[a] < set[b]; });
+            for (size_t i = 0; i < n; ++i) {
+                size_t hole = i;
+                while (from[hole] != i) {
+                    const size_t src = from[hole];
+                    std::swap(set[hole], set[src]);
+                    from[hole] = static_cast<uint8_t>(hole);
+                    hole = src;
+                }
+                from[hole] = static_cast<uint8_t>(hole);
+            }
+            set.erase(std::unique(set.begin(), set.end()), set.end());
+            return;
+        }
+    }
+    std::sort(set.begin(), set.end());
+    set.erase(std::unique(set.begin(), set.end()), set.end());
+}
+
 /// Encode into a string sized exactly once: `encode(sink)` runs first on a
 /// counter, then on the reserved string.
 template<typename Encode>
@@ -159,38 +187,51 @@ std::string encodeReserved(Encode&& encode) {
 // Canonical Cache Key Computation — deterministic binary encoding from values
 // =============================================================================
 
-/// Append the group-level canonical key (filters + sort) to `out`.
-/// Same filters+sort = same group, regardless of pagination.
+/// Sort and deduplicate every IN/NIN set in place. A set is a set: its order
+/// and repetitions must not split one group into several keys, and the Lua
+/// matchers expect the stored elements in ascending order.
 template<typename Descriptor>
     requires ValidFilterSet<Descriptor>
-void appendGroupKey(
-    std::string& out,
-    const Filters<Descriptor>& filters,
-    const std::optional<DescriptorSortSpec<Descriptor>>& sort
-) {
+void canonicalize(Filters<Descriptor>& filters) {
+    [&]<size_t... Is>(std::index_sequence<Is...>) {
+        ([&] {
+            if constexpr (filter_at<Descriptor, Is>::is_set_op) {
+                if (auto& set = std::get<Is>(filters.values)) detail::canonicalizeSet(*set);
+            }
+        }(), ...);
+    }(std::make_index_sequence<filter_count<Descriptor>>{});
+}
+
+/// Append the group-level canonical key (filters + sort) of a sealed query to
+/// `out`. Same filters+sort = same group, regardless of pagination.
+template<typename Descriptor>
+    requires ValidListDescriptor<Descriptor>
+void appendGroupKey(std::string& out, const ListQuery<Descriptor>& query) {
     // Filters in declaration order (alphabetically sorted by generator)
-    detail::appendFilterSet<Descriptor>(out, filters);
-    detail::appendSort<Descriptor>(out, sort);
+    detail::appendFilterSet<Descriptor>(out, query.filters());
+    detail::appendSort<Descriptor>(out, query.sort());
 }
 
 /// Append the full page-level canonical key (group key + limit + cursor/offset)
-/// to `out`. Uniquely identifies a specific page within a group.
+/// of a sealed query to `out`. Uniquely identifies a specific page within a group.
 template<typename Descriptor>
     requires ValidListDescriptor<Descriptor>
-void appendPageKey(std::string& out, const ListQueryParams<Descriptor>& params) {
-    appendGroupKey<Descriptor>(out, params.filters, params.sort);
-    detail::appendPagination<Descriptor>(out, params);
+void appendPageKey(std::string& out, const ListQuery<Descriptor>& query) {
+    appendGroupKey<Descriptor>(out, query);
+    detail::appendPagination<Descriptor>(out, query.params());
 }
 
 /// Build the group-level canonical key (filters + sort). Takes the filter
 /// values and the optional sort directly — invalidation has no cursor/offset to
 /// fabricate, so it must not be forced to build a full ListDescriptorQuery.
+/// Canonicalizes its own copy of the sets.
 template<typename Descriptor>
     requires ValidFilterSet<Descriptor>
 std::string groupKey(
-    const Filters<Descriptor>& filters,
+    Filters<Descriptor> filters,
     const std::optional<DescriptorSortSpec<Descriptor>>& sort
 ) {
+    canonicalize<Descriptor>(filters);
     return detail::encodeReserved([&](auto& out) {
         detail::appendFilterSet<Descriptor>(out, filters);
         detail::appendSort<Descriptor>(out, sort);
@@ -211,13 +252,18 @@ std::string cacheKey(const std::string& group_key, const ListQueryParams<Descrip
     return key;
 }
 
-/// Seal a mutable params bundle into an immutable ListQuery, computing both
-/// canonical keys exactly once from the final params. The sole producer of a
-/// ListQuery outside the fluent builder — query() accepts nothing else.
+/// Seal a mutable params bundle into an immutable ListQuery: canonicalizes the
+/// IN/NIN sets in place, then computes both canonical keys exactly once from
+/// the final params. The sole producer of a ListQuery outside the fluent
+/// builder — query() accepts nothing else.
 template<typename Descriptor>
     requires ValidListDescriptor<Descriptor>
 ListQuery<Descriptor> seal(ListQueryParams<Descriptor> params) {
-    auto gk = groupKey<Descriptor>(params.filters, params.sort);
+    canonicalize<Descriptor>(params.filters);
+    auto gk = detail::encodeReserved([&](auto& out) {
+        detail::appendFilterSet<Descriptor>(out, params.filters);
+        detail::appendSort<Descriptor>(out, params.sort);
+    });
     auto ck = cacheKey<Descriptor>(gk, params);
     return ListQuery<Descriptor>(std::move(params), std::move(gk), std::move(ck));
 }
@@ -255,10 +301,12 @@ std::string encodeEntityFilterBlob(const typename Descriptor::Entity& entity) {
 /// against each group's stored filter bytes (`bin`). It uses the SAME encoding
 /// as groupKey's filter portion, so a present predicate value and a present
 /// group value at the same filter are directly comparable; an absent predicate
-/// value (presence 0) is a wildcard that never prunes the group.
+/// value (presence 0) is a wildcard that never prunes the group. Canonicalizes
+/// its own copy of the sets.
 template<typename Descriptor>
     requires ValidFilterSet<Descriptor>
-std::string encodeFilterSet(const Filters<Descriptor>& filters) {
+std::string encodeFilterSet(Filters<Descriptor> filters) {
+    canonicalize<Descriptor>(filters);
     return detail::encodeReserved([&](auto& out) {
         detail::appendFilterSet<Descriptor>(out, filters);
     });

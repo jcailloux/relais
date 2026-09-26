@@ -643,7 +643,7 @@ protected:
         if constexpr (kHasL2) {
             DescriptorFilters local;
             local.values = predicate.values;
-            co_await invalidateWhereListsL2(local);
+            co_await invalidateWhereListsL2(std::move(local));
         }
         co_await Base::template invalidateWhereListsDeferred<Desc>(predicate);
     }
@@ -853,12 +853,12 @@ protected:
     }
 
     /// Predicate-driven L2 list invalidation (single EVAL, O(groups)).
-    static io::Task<size_t> invalidateWhereListsL2(const DescriptorFilters& predicate) {
+    static io::Task<size_t> invalidateWhereListsL2(DescriptorFilters predicate) {
         auto masterKey = redisMasterSetKey();
         auto prefixLen = std::string(Base::name()).size() + 9;  // ":dlist:g:"
         auto schema = list::spec::filterSchema<Descriptor>();
-        auto pblob = list::spec::encodeFilterSet<Descriptor>(predicate);
         auto [loCsv, hiCsv] = buildPredicateRangeCsv(predicate);
+        auto pblob = list::spec::encodeFilterSet<Descriptor>(std::move(predicate));
 
         co_return co_await cache::RedisCache::invalidateListGroupsByPredicate(
             masterKey, prefixLen, schema, pblob, loCsv, hiCsv);
