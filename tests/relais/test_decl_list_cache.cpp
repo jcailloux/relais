@@ -293,6 +293,48 @@ TEST_CASE("[DeclListRepo] Article list query",
     }
 }
 
+TEST_CASE("[DeclListRepo] L1 hit keyed through the per-thread buffer",
+          "[integration][db][list][query][article]")
+{
+    TransactionGuard tx;
+    TestInternals::resetListCacheState<TestArticleListRepo>();
+
+    SECTION("[hit] a stored page is served synchronously, for every result form") {
+        auto userId = insertTestUser("author", "author@example.com", 0);
+        insertTestArticle("tech", userId, "Tech 1", 10);
+        const auto q = makeArticleQuery("tech");
+
+        auto miss = TestArticleListRepo::query(q);
+        CHECK_FALSE(miss.await_ready());
+        REQUIRE(sync(std::move(miss))->size() == 1);
+
+        // Not notified to the list cache: only a hit keeps returning one item.
+        insertTestArticle("tech", userId, "Tech 2", 20);
+
+        auto hit = TestArticleListRepo::query(q);
+        REQUIRE(hit.await_ready());
+        CHECK(sync(std::move(hit))->size() == 1);
+        CHECK(TestArticleListRepo::queryJson(q).await_ready());
+        CHECK(TestArticleListRepo::queryBinary(q).await_ready());
+
+        // Another page in between overwrites the buffer, not the stored key.
+        CHECK_FALSE(TestArticleListRepo::query(makeArticleQuery("news")).await_ready());
+        CHECK(TestArticleListRepo::query(q).await_ready());
+    }
+
+    SECTION("[hit] a key larger than the retained buffer is released after the lookup") {
+        const auto q = makeArticleQuery(std::string(5000, 'x'));
+        REQUIRE(q.cacheKey().size() > 4096);
+
+        CHECK(sync(TestArticleListRepo::query(q))->empty());
+        CHECK(jcailloux::relais::detail::listKeyScratch().capacity() <= 4096);
+
+        auto hit = TestArticleListRepo::query(q);
+        CHECK(hit.await_ready());
+        CHECK(jcailloux::relais::detail::listKeyScratch().capacity() <= 4096);
+    }
+}
+
 // #############################################################################
 //
 //  TEST CASE 2: Article Item accessors

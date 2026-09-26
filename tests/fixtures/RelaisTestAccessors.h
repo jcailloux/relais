@@ -109,7 +109,7 @@ struct TestInternals {
     static bool putPageFetchedAt(const Query& query, uint32_t fetch_gen) {
         typename Repo::ListWrapperType wrapper;
         wrapper.items = sync(Repo::queryFromDb(query));
-        auto cache_query = Repo::toCacheQuery(query);
+        auto cache_query = Repo::toCacheQuery(query, query.cacheKey());
         Repo::listCache().put(cache_query, std::move(wrapper), fetch_gen);
         return static_cast<bool>(Repo::listCache().get(cache_query));
     }

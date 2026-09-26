@@ -15,20 +15,21 @@ namespace jcailloux::relais::list::spec {
 // =============================================================================
 // ListQueryParams / ListQuery — type-state for the declarative list system
 //
-// Two types, one invariant: a query passed to query() ALWAYS carries cache
-// keys that reflect its contents.
+// Two types, one invariant: a query passed to query() ALWAYS carries validated,
+// canonical params.
 //
-//   ListQueryParams<D> — mutable form (filters/sort/limit/cursor/offset). No
-//                        keys. This is what you fill, by hand or via the builder.
-//   ListQuery<D>       — sealed, immutable form. Carries group_key + cache_key,
-//                        produced ONLY by seal() (declared here, defined in
-//                        CanonicalEncoding.h) or Builder::build(). The sole type
+//   ListQueryParams<D> — mutable form (filters/sort/limit/cursor/offset). This
+//                        is what you fill, by hand or via the builder.
+//   ListQuery<D>       — sealed, immutable form, produced ONLY by seal()
+//                        (declared here, defined in CanonicalEncoding.h) or
+//                        Builder::build(). The sole type
 //                        query()/queryJson()/queryBinary() accept.
 //
 // seal() sorts and deduplicates every IN/NIN set (filters() returns them in
-// that canonical form), computes both keys once from the FINAL params, then
-// the type is immutable — the "cache_key that doesn't reflect the query" bug
-// is inexpressible, and there is no empty-key branch on the hot path.
+// that canonical form), then the type is immutable. It stores no key: the
+// canonical keys are encoded from the params where they are needed —
+// groupKey()/cacheKey() compute them on demand, and a cache lookup encodes the
+// page key into a reused per-thread buffer, so an L1 hit allocates nothing.
 // =============================================================================
 
 template<typename Descriptor>
@@ -53,8 +54,16 @@ template<typename Descriptor>
     requires ValidListDescriptor<Descriptor>
 ListQuery<Descriptor> seal(ListQueryParams<Descriptor> params);
 
+template<typename Descriptor>
+    requires ValidListDescriptor<Descriptor>
+void appendGroupKey(std::string& out, const ListQuery<Descriptor>& query);
+
+template<typename Descriptor>
+    requires ValidListDescriptor<Descriptor>
+void appendPageKey(std::string& out, const ListQuery<Descriptor>& query);
+
 /// Sealed, immutable list query. Constructible only via seal() — every
-/// instance carries cache keys consistent with its params by construction.
+/// instance carries canonical params, from which its keys are encoded.
 template<typename Descriptor>
 class ListQuery {
 public:
@@ -67,22 +76,29 @@ public:
     [[nodiscard]] uint32_t offset() const noexcept { return params_.offset; }
     [[nodiscard]] const ListQueryParams<Descriptor>& params() const noexcept { return params_; }
 
-    [[nodiscard]] const std::string& groupKey() const noexcept { return group_key_; }
-    [[nodiscard]] const std::string& cacheKey() const noexcept { return cache_key_; }
+    /// Canonical key for filters+sort (Redis group tracking), computed on each call.
+    [[nodiscard]] std::string groupKey() const {
+        std::string key;
+        appendGroupKey<Descriptor>(key, *this);
+        return key;
+    }
 
+    /// Full canonical key: group key + limit + cursor + offset, computed on each call.
+    [[nodiscard]] std::string cacheKey() const {
+        std::string key;
+        appendPageKey<Descriptor>(key, *this);
+        return key;
+    }
+
+    /// Equal params, hence equal keys: the sets are canonical.
     bool operator==(const ListQuery&) const = default;
 
 private:
-    ListQuery(ListQueryParams<Descriptor> params, std::string group_key, std::string cache_key)
-        : params_(std::move(params)),
-          group_key_(std::move(group_key)),
-          cache_key_(std::move(cache_key)) {}
+    explicit ListQuery(ListQueryParams<Descriptor> params) : params_(std::move(params)) {}
 
     friend ListQuery<Descriptor> seal<Descriptor>(ListQueryParams<Descriptor>);
 
     ListQueryParams<Descriptor> params_;
-    std::string group_key_;   ///< Canonical key for filters+sort (Redis group tracking)
-    std::string cache_key_;   ///< Full canonical key: group_key + limit + cursor + offset
 };
 
 }  // namespace jcailloux::relais::list::spec
