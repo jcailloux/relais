@@ -25,9 +25,10 @@ namespace jcailloux::relais::list::spec {
 //                        CanonicalEncoding.h) or Builder::build(). The sole type
 //                        query()/queryJson()/queryBinary() accept.
 //
-// seal() computes both keys once from the FINAL params, then the type is
-// immutable — the "cache_key that doesn't reflect the query" bug is
-// inexpressible, and there is no empty-key branch on the hot path.
+// seal() sorts and deduplicates every IN/NIN set (filters() returns them in
+// that canonical form), computes both keys once from the FINAL params, then
+// the type is immutable — the "cache_key that doesn't reflect the query" bug
+// is inexpressible, and there is no empty-key branch on the hot path.
 // =============================================================================
 
 template<typename Descriptor>
