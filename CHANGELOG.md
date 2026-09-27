@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+### Changed
+
+- **Low-level pipeline: `PgConnection::readPipelineResults(n)` reads `n`
+  executions.** The result of a statement prepared by `ensurePreparedPipelined`
+  is consumed with the execution it precedes; code that read it itself must
+  stop.
+
+### Fixed
+
+- **Concurrent queries could receive another query's result, or an empty one,
+  without error** (every version since 0.5.0-alpha.1). It took distinct queries
+  run concurrently on a connection that had not prepared them yet, typically
+  after startup or a reconnect, such as a `whenAll` of reads on different
+  repositories or list pages. The wrong result could be cached in L1 and L2,
+  and a write's `RETURNING` row or affected-row count could reach another
+  caller. After upgrading, such entries remain in Redis until `l2_ttl` or their
+  next invalidation; flush the repositories' keys to clear them at once.
+
 ## [3.2.0] - 2026-09-27
 
 ### Added
