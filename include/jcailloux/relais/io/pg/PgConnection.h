@@ -4,6 +4,7 @@
 #include <cassert>
 #include <chrono>
 #include <coroutine>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
@@ -52,6 +53,9 @@ public:
         , watch_(std::exchange(o.watch_, {}))
         , watch_active_(std::exchange(o.watch_active_, false))
         , prepared_(std::move(o.prepared_))
+        , pipeline_prepare_queued_(o.pipeline_prepare_queued_)
+        , pipeline_prepares_(std::move(o.pipeline_prepares_))
+        , pipeline_read_pos_(o.pipeline_read_pos_)
         // dead_ + timer token + stored continuation must travel with the
         // connection. release() takes ConnectionType *by value* → move-constructs;
         // dropping dead_ here would resurrect a poisoned connection (connected() ==
@@ -80,6 +84,9 @@ public:
             watch_ = std::exchange(o.watch_, {});
             watch_active_ = std::exchange(o.watch_active_, false);
             prepared_ = std::move(o.prepared_);
+            pipeline_prepare_queued_ = o.pipeline_prepare_queued_;
+            pipeline_prepares_ = std::move(o.pipeline_prepares_);
+            pipeline_read_pos_ = o.pipeline_read_pos_;
             dead_ = o.dead_;
             current_cont_ = std::exchange(o.current_cont_, {});
             timer_ = std::exchange(o.timer_, {});
@@ -177,19 +184,24 @@ public:
 
     /// Enter pipeline mode. Must be called before sendPreparedPipelined().
     void enterPipelineMode() {
+        resetPipelineBookkeeping();
         if (!PQenterPipelineMode(conn_))
             throw PgError(std::string("PQenterPipelineMode failed: ") + PQerrorMessage(conn_));
     }
 
     /// Exit pipeline mode. Call after all pipeline results have been read.
     void exitPipelineMode() {
+        resetPipelineBookkeeping();
         if (!PQexitPipelineMode(conn_))
             throw PgError(std::string("PQexitPipelineMode failed: ") + PQerrorMessage(conn_));
     }
 
     /// Ensure a statement is prepared in pipeline mode (non-blocking).
     /// If the statement is not yet prepared, queues a PQsendPrepare into the pipeline.
-    /// Returns true if a prepare was queued (caller must account for an extra result).
+    /// Returns true if a prepare was queued: the caller must follow it with
+    /// pipelineSync(). The prepare's result is then consumed by
+    /// readPipelineResults() together with the next sendPreparedPipelined(), so
+    /// callers only ever count executions.
     bool ensurePreparedPipelined(const char* sql, int nParams) {
         auto it = prepared_.find(sql);
         if (it != prepared_.end())
@@ -200,6 +212,7 @@ public:
             throw PgError(std::string("PQsendPrepare (pipeline) failed: ") + PQerrorMessage(conn_));
 
         prepared_.emplace(sql, std::move(name));
+        pipeline_prepare_queued_ = true;
         return true;
     }
 
@@ -227,6 +240,11 @@ public:
         {
             throw PgError(std::string("PQsendQueryPrepared (pipeline) failed: ") + PQerrorMessage(conn_));
         }
+        // Prepares and executions interleave on the wire ([P S] E S per
+        // segment); remember which executions carry a prepare ahead of them so
+        // the reader consumes results in send order.
+        pipeline_prepares_.push_back(pipeline_prepare_queued_);
+        pipeline_prepare_queued_ = false;
     }
 
     /// Insert a sync point in the pipeline. Separates segments for error isolation.
@@ -256,9 +274,10 @@ public:
         int64_t processing_time_us = 0;  // inter-result interval for GDSF cost
     };
 
-    /// Read n pipeline segment results (one per query, between syncs).
-    /// Each segment: read PQgetResult until NULL (= one query's result),
-    /// then read the sync result (PGRES_PIPELINE_SYNC).
+    /// Read n pipeline segment results (one per sendPreparedPipelined, between syncs).
+    /// Each segment: first discard the prepare queued ahead of it, if any, then
+    /// read PQgetResult until NULL (= one query's result), then read the sync
+    /// result (PGRES_PIPELINE_SYNC).
     /// Returns exactly n PipelineResults in pipeline order.
     Task<std::vector<PipelineResult>> readPipelineResults(int n) {
         std::vector<PipelineResult> results;
@@ -267,6 +286,15 @@ public:
         auto prev = std::chrono::steady_clock::now();
 
         for (int i = 0; i < n; ++i) {
+            assert(pipeline_read_pos_ < pipeline_prepares_.size()
+                   && "more results read than executions sent");
+            if (pipeline_prepares_[pipeline_read_pos_++]) {
+                co_await awaitPipelineResult();
+                co_await consumePipelineSync();
+                // One-off prepare cost stays out of the execution's timing.
+                prev = std::chrono::steady_clock::now();
+            }
+
             // Read the query result for this segment
             PgResult query_result = co_await awaitPipelineResult();
             auto now = std::chrono::steady_clock::now();
@@ -283,6 +311,12 @@ public:
     }
 
 private:
+    void resetPipelineBookkeeping() noexcept {
+        pipeline_prepare_queued_ = false;
+        pipeline_prepares_.clear();  // keeps capacity: no allocation per batch
+        pipeline_read_pos_ = 0;
+    }
+
     // Write-ready awaiter for pipeline flushing
     struct WriteAwaiter {
         PgConnection* self;
@@ -628,6 +662,13 @@ private:
     typename Io::WatchHandle watch_{};
     bool watch_active_ = false;
     std::unordered_map<std::string, std::string> prepared_;
+
+    // Pipeline bookkeeping: one entry per execution sent, true when a prepare
+    // precedes it on the wire. Reset on pipeline entry and exit, so an aborted
+    // batch leaves nothing behind.
+    bool pipeline_prepare_queued_ = false;
+    std::vector<uint8_t> pipeline_prepares_;
+    size_t pipeline_read_pos_ = 0;
 
     // Timeout machinery. current_cont_ is the single in-flight continuation
     // per connection (the pipeline chains co_awaits sequentially), set by every

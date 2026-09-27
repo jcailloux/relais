@@ -29,11 +29,8 @@ TEST_CASE("PgConnection pipeline: multiple SELECTs", "[io][pg][pipeline][integra
 
         const char* sql = "SELECT $1::int AS val";
 
-        int prepares = 0;
-        if (conn.ensurePreparedPipelined(sql, 1)) {
+        if (conn.ensurePreparedPipelined(sql, 1))
             conn.pipelineSync();
-            ++prepares;
-        }
 
         conn.sendPreparedPipelined(sql, p1);
         conn.pipelineSync();
@@ -44,13 +41,7 @@ TEST_CASE("PgConnection pipeline: multiple SELECTs", "[io][pg][pipeline][integra
 
         co_await conn.flushPipeline();
 
-        // Read prepare result
-        for (int i = 0; i < prepares; ++i) {
-            auto r = co_await conn.readPipelineResults(1);
-            // Prepare result — just consume
-        }
-
-        // Read 3 query results
+        // Read 3 query results (the prepare's result is consumed internally)
         auto results = co_await conn.readPipelineResults(3);
 
         conn.exitPipelineMode();
@@ -98,10 +89,7 @@ TEST_CASE("PgConnection pipeline: error in one segment doesn't affect others",
 
         co_await conn.flushPipeline();
 
-        // Consume prepare
-        co_await conn.readPipelineResults(1);
-
-        // Read good result
+        // Read good result (the prepare's result is consumed internally)
         auto results = co_await conn.readPipelineResults(1);
         REQUIRE(results.size() == 1);
         REQUIRE(results[0].result.ok());

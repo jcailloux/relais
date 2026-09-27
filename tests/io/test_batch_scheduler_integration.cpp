@@ -11,6 +11,7 @@
 #include <jcailloux/relais/PgProvider.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <vector>
@@ -927,6 +928,186 @@ TEST_CASE("Entity read fusion: concurrent find + findMany share one ANY",
     io.runUntil([&] { return done || timeout.timed_out; });
     REQUIRE_FALSE(timeout.timed_out);
     REQUIRE(done);
+}
+
+// =============================================================================
+// Pipelined batches whose statements are prepared mid-batch.
+//
+// A statement unknown to the connection is prepared inside the pipeline, just
+// before its execution. Every caller of a batch mixing several such statements
+// (or a known statement followed by an unknown one) must still receive the
+// result of its own query. Each SQL below returns a (tag, v) signature unique
+// to the caller, so a misrouted or empty result is visible.
+// =============================================================================
+
+namespace {
+
+struct TaggedOutcome {
+    int rows = -1;
+    int tag = 0;
+    int v = 0;
+    bool error = false;
+};
+
+void recordTagged(const PgResult& result, TaggedOutcome* out) {
+    out->rows = result.rows();
+    if (result.rows() > 0 && result.cols() == 2) {
+        out->tag = result[0].get<int32_t>(0);
+        out->v = result[0].get<int32_t>(1);
+    }
+}
+
+DetachedTask taggedRead(
+    std::shared_ptr<BatchScheduler<Io>> batcher,
+    std::atomic<int>& completed,
+    const char* sql, int v, TaggedOutcome* out)
+{
+    try {
+        auto result = co_await batcher->submitQueryRead(sql, PgParams::make(v));
+        recordTagged(result, out);
+    } catch (...) {
+        out->error = true;
+    }
+    ++completed;
+}
+
+DetachedTask taggedWrite(
+    std::shared_ptr<BatchScheduler<Io>> batcher,
+    std::atomic<int>& completed,
+    const char* sql, int v, TaggedOutcome* out)
+{
+    try {
+        auto [result, coalesced] = co_await batcher->submitPgWrite(
+            sql, PgParams::make(v), WriteMode::Exclusive);
+        (void)coalesced;
+        recordTagged(result, out);
+    } catch (...) {
+        out->error = true;
+    }
+    ++completed;
+}
+
+void checkTagged(const TaggedOutcome& o, int tag, int v) {
+    INFO("expected tag " << tag << " v " << v
+         << ", got rows " << o.rows << " tag " << o.tag << " v " << o.v
+         << (o.error ? " (error)" : ""));
+    CHECK_FALSE(o.error);
+    CHECK(o.rows == 1);
+    CHECK(o.tag == tag);
+    CHECK(o.v == v);
+}
+
+} // anonymous namespace
+
+TEST_CASE("Pipelined read batch: several statements prepared mid-batch",
+          "[io][batch][integration][pipeline-prepare]")
+{
+    Io io;
+    bool done = false;
+    TimeoutGuard timeout(io);
+    std::array<TaggedOutcome, 4> out{};
+
+    auto task = [&]() -> DetachedTask {
+        // Single connection: the batch runs on the connection the leader
+        // used, whose prepared-statement set is known.
+        auto pool = co_await PgPool<Io>::create(io, CONNINFO, {.min_connections = 1, .max_connections = 1});
+        auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, nullptr, 8);
+        co_await bootstrapPg(batcher);
+
+        std::atomic<int> completed{0};
+        // Submitted in the same loop turn: the first goes direct (Nagle
+        // leader), the other three form one batch of three unprepared SQLs.
+        taggedRead(batcher, completed, "SELECT 9101::int AS tag, $1::int AS v", 1, &out[0]);
+        taggedRead(batcher, completed, "SELECT 9102::int AS tag, $1::int AS v", 2, &out[1]);
+        taggedRead(batcher, completed, "SELECT 9103::int AS tag, $1::int AS v", 3, &out[2]);
+        taggedRead(batcher, completed, "SELECT 9104::int AS tag, $1::int AS v", 4, &out[3]);
+
+        while (completed.load() < 4) co_await YieldAwaiter{io};
+        done = true;
+    };
+    task();
+
+    io.runUntil([&] { return done || timeout.timed_out; });
+    REQUIRE_FALSE(timeout.timed_out);
+    REQUIRE(done);
+
+    checkTagged(out[0], 9101, 1);
+    checkTagged(out[1], 9102, 2);
+    checkTagged(out[2], 9103, 3);
+    checkTagged(out[3], 9104, 4);
+}
+
+TEST_CASE("Pipelined read batch: prepared statement ahead of an unprepared one",
+          "[io][batch][integration][pipeline-prepare]")
+{
+    Io io;
+    bool done = false;
+    TimeoutGuard timeout(io);
+    std::array<TaggedOutcome, 3> out{};
+
+    auto task = [&]() -> DetachedTask {
+        auto pool = co_await PgPool<Io>::create(io, CONNINFO, {.min_connections = 1, .max_connections = 1});
+        auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, nullptr, 8);
+        co_await bootstrapPg(batcher);
+
+        static constexpr const char* KNOWN = "SELECT 9201::int AS tag, $1::int AS v";
+        static constexpr const char* UNKNOWN = "SELECT 9202::int AS tag, $1::int AS v";
+
+        std::atomic<int> completed{0};
+        // The leader prepares KNOWN on the connection; the batch then holds
+        // KNOWN (already prepared) followed by UNKNOWN (prepared mid-batch).
+        taggedRead(batcher, completed, KNOWN, 1, &out[0]);
+        taggedRead(batcher, completed, KNOWN, 2, &out[1]);
+        taggedRead(batcher, completed, UNKNOWN, 3, &out[2]);
+
+        while (completed.load() < 3) co_await YieldAwaiter{io};
+        done = true;
+    };
+    task();
+
+    io.runUntil([&] { return done || timeout.timed_out; });
+    REQUIRE_FALSE(timeout.timed_out);
+    REQUIRE(done);
+
+    checkTagged(out[0], 9201, 1);
+    checkTagged(out[1], 9201, 2);
+    checkTagged(out[2], 9202, 3);
+}
+
+TEST_CASE("Pipelined write batch: several statements prepared mid-batch",
+          "[io][batch][integration][pipeline-prepare]")
+{
+    Io io;
+    bool done = false;
+    TimeoutGuard timeout(io);
+    std::array<TaggedOutcome, 4> out{};
+
+    auto task = [&]() -> DetachedTask {
+        auto pool = co_await PgPool<Io>::create(io, CONNINFO, {.min_connections = 1, .max_connections = 1});
+        auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, nullptr, 8);
+        co_await bootstrapPg(batcher);
+
+        std::atomic<int> completed{0};
+        // Exclusive: no coalescing. Same Nagle as reads: one direct leader,
+        // then a batch of three unprepared SQLs.
+        taggedWrite(batcher, completed, "SELECT 9301::int AS tag, $1::int AS v", 1, &out[0]);
+        taggedWrite(batcher, completed, "SELECT 9302::int AS tag, $1::int AS v", 2, &out[1]);
+        taggedWrite(batcher, completed, "SELECT 9303::int AS tag, $1::int AS v", 3, &out[2]);
+        taggedWrite(batcher, completed, "SELECT 9304::int AS tag, $1::int AS v", 4, &out[3]);
+
+        while (completed.load() < 4) co_await YieldAwaiter{io};
+        done = true;
+    };
+    task();
+
+    io.runUntil([&] { return done || timeout.timed_out; });
+    REQUIRE_FALSE(timeout.timed_out);
+    REQUIRE(done);
+
+    checkTagged(out[0], 9301, 1);
+    checkTagged(out[1], 9302, 2);
+    checkTagged(out[2], 9303, 3);
+    checkTagged(out[3], 9304, 4);
 }
 
 TEST_CASE("Write coalescing: identical writes in batch are coalesced",
