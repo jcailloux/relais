@@ -19,6 +19,10 @@
 #include "fixtures/TestRepositories.h"
 #include "fixtures/TestQueryHelpers.h"
 #include "fixtures/RelaisTestAccessors.h"
+#include "jcailloux/relais/io/WhenAll.h"
+
+#include <algorithm>
+
 using namespace relais_test;
 
 namespace decl = jcailloux::relais::list::spec;
@@ -956,4 +960,91 @@ TEST_CASE("[DeclListRepo] Bitmap skip optimization",
         auto r2 = sync(TestArticleListRepo::query(q));
         CHECK(r2->size() == 5);  // Cache HIT — bitmap skip prevented invalidation
     }
+}
+
+// #############################################################################
+//
+//  Concurrent list reads on different repositories (one pipelined batch)
+//
+// #############################################################################
+
+namespace {
+
+struct ListOutcome {
+    std::vector<int64_t> ids;
+    std::string error;
+};
+
+template<typename ListRepo>
+io::Task<ListOutcome> listIdsAtOffset(uint32_t offset) {
+    using Desc = typename ListRepo::ListDescriptorType;
+    decl::ListQueryParams<Desc> p;
+    p.limit = 10;
+    p.offset = offset;
+    auto q = decl::seal<Desc>(std::move(p));
+
+    ListOutcome out;
+    try {
+        auto result = co_await ListRepo::query(q);
+        for (const auto& item : result->items) out.ids.push_back(item.id);
+    } catch (const std::exception& e) {
+        out.error = e.what();
+    }
+    co_return out;
+}
+
+io::Task<std::vector<ListOutcome>> interleavedListReads() {
+    std::vector<io::Task<ListOutcome>> tasks;
+    tasks.push_back(listIdsAtOffset<TestArticleListRepo>(1));
+    tasks.push_back(listIdsAtOffset<TestPurchaseListRepo>(2));
+    tasks.push_back(listIdsAtOffset<TestArticleListRepo>(3));
+    tasks.push_back(listIdsAtOffset<TestPurchaseListRepo>(4));
+    co_return co_await io::whenAll(std::move(tasks));
+}
+
+/// Ids sorted by the default list sort (id DESC), from `offset` on.
+std::vector<int64_t> expectedPage(std::vector<int64_t> ids, size_t offset) {
+    std::sort(ids.rbegin(), ids.rend());
+    return {ids.begin() + static_cast<std::ptrdiff_t>(offset), ids.end()};
+}
+
+} // anonymous namespace
+
+// The four list reads below build SQL texts that no other test builds (their
+// OFFSETs are unique), so the connection has not prepared them yet. That is
+// only guaranteed when this test runs alone in its process:
+//   ./test_relais_decl_list_cache "[pipeline-prepare]"
+// In a full run it still guards against regressions, with weaker coverage.
+TEST_CASE("[DeclListRepo] whenAll of list reads on different repositories",
+          "[integration][db][list][pipeline-prepare]")
+{
+    TransactionGuard tx;
+    TestInternals::resetListCacheState<TestArticleListRepo>();
+    TestInternals::resetListCacheState<TestPurchaseListRepo>();
+
+    auto userId = insertTestUser("author", "author@example.com", 1000);
+    std::vector<int64_t> articles, purchases;
+    for (int i = 0; i < 6; ++i) {
+        articles.push_back(insertTestArticle("tech", userId, "A" + std::to_string(i), i));
+        purchases.push_back(insertTestPurchase(userId, "P" + std::to_string(i), 100 + i));
+    }
+
+    // Leave the scheduler's bootstrap (direct sends only): sequential reads,
+    // each an L1 miss thanks to a distinct offset.
+    for (uint32_t offset = 20; offset < 26; ++offset)
+        sync(listIdsAtOffset<TestArticleListRepo>(offset));
+
+    // Started in one loop turn: the first read leads, the other three form one
+    // pipelined batch mixing both repositories.
+    auto out = sync(interleavedListReads());
+    REQUIRE(out.size() == 4);
+
+    CHECK(out[0].error == "");
+    CHECK(out[1].error == "");
+    CHECK(out[2].error == "");
+    CHECK(out[3].error == "");
+    CHECK(out[0].ids == expectedPage(articles, 1));
+    CHECK(out[1].ids == expectedPage(purchases, 2));
+    CHECK(out[2].ids == expectedPage(articles, 3));
+    CHECK(out[3].ids == expectedPage(purchases, 4));
 }

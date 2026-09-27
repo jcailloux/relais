@@ -919,24 +919,16 @@ private:
             }
 
             // Pipeline all segments with sync between each
-            int n_prepares = 0;
             for (auto& seg : segments) {
-                if (conn.ensurePreparedPipelined(seg.sql, seg.params.count())) {
+                if (conn.ensurePreparedPipelined(seg.sql, seg.params.count()))
                     conn.pipelineSync();
-                    ++n_prepares;
-                }
                 conn.sendPreparedPipelined(seg.sql, seg.params);
                 conn.pipelineSync();
             }
 
             co_await conn.flushPipeline();
 
-            // Read prepare results
-            for (int i = 0; i < n_prepares; ++i) {
-                co_await readAndDiscardPipelineResult(conn);
-            }
-
-            // Read segment results
+            // Prepare results are consumed in send order by readPipelineResults
             auto results = co_await conn.readPipelineResults(
                 static_cast<int>(segments.size()));
 
@@ -1069,24 +1061,16 @@ private:
 
             conn.enterPipelineMode();
 
-            int n_prepares = 0;
             for (auto* e : entries) {
-                if (conn.ensurePreparedPipelined(e->sql, e->params.count())) {
+                if (conn.ensurePreparedPipelined(e->sql, e->params.count()))
                     conn.pipelineSync();
-                    ++n_prepares;
-                }
                 conn.sendPreparedPipelined(e->sql, e->params);
                 conn.pipelineSync();
             }
 
             co_await conn.flushPipeline();
 
-            // Read prepare results
-            for (int i = 0; i < n_prepares; ++i) {
-                co_await readAndDiscardPipelineResult(conn);
-            }
-
-            // Read write results
+            // Prepare results are consumed in send order by readPipelineResults
             auto results = co_await conn.readPipelineResults(
                 static_cast<int>(entries.size()));
 
@@ -1407,12 +1391,6 @@ private:
                 if (!matched) waiter->result = PgResult{};  // not found
             }
         }
-    }
-
-    Task<void> readAndDiscardPipelineResult(PgConnection<Io>& conn) {
-        // Read and discard a single pipeline result (prepare result)
-        auto results = co_await conn.readPipelineResults(1);
-        // Discard
     }
 
     // =========================================================================
