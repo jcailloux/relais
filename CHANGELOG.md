@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [3.2.0] - 2026-09-27
+
 ### Added
 
 - **Every list operator on mapped enums.** A `@relais enum` field supports every
