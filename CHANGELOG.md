@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [3.2.1] - 2026-09-27
+
 ### Changed
 
 - **Low-level pipeline: `PgConnection::readPipelineResults(n)` reads `n`
