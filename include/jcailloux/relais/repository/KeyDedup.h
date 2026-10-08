@@ -2,8 +2,11 @@
 #define JCX_RELAIS_REPOSITORY_KEYDEDUP_H
 
 #include <cstddef>
+#include <optional>
 #include <span>
 #include <vector>
+
+#include "jcailloux/relais/cache/MultiView.h"
 
 namespace jcailloux::relais::detail {
 
@@ -50,6 +53,27 @@ template<typename K>
         out.slot[i] = u;
     }
     return out;
+}
+
+/// Build a self-contained MultiView from a batch fetched without L1: `fetched`
+/// is aligned on the distinct keys, `slot` maps each request position to one of
+/// them. Each present value is moved once into the view; duplicate positions
+/// share its pointer. No epoch guard — every pointer targets the view's own
+/// storage.
+template<typename E>
+[[nodiscard]] cache::MultiView<E> ownedMultiView(std::vector<std::optional<E>> fetched,
+                                                 std::span<const size_t> slot) {
+    size_t present = 0;
+    for (const auto& f : fetched) present += f.has_value();
+
+    cache::MultiView<E> view(slot.size());
+    view.reserveOwned(present);
+    std::vector<const E*> unique(fetched.size(), nullptr);
+    for (size_t k = 0; k < fetched.size(); ++k) {
+        if (fetched[k]) unique[k] = view.adoptValue(std::move(*fetched[k]));
+    }
+    for (size_t i = 0; i < slot.size(); ++i) view.pointAt(i, unique[slot[i]]);
+    return view;
 }
 
 }  // namespace jcailloux::relais::detail
