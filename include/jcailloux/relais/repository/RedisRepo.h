@@ -61,81 +61,25 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
 
         /// Find by ID with L2 (Redis) -> L3 (DB) fallback.
         /// Returns epoch-guarded CacheView (empty if not found).
-        static io::Task<cache::CacheView<E>> find(const Key& id) {
-            auto entity = co_await findRaw(id);
-            if (!entity) co_return {};
-            co_return Base::makeView(std::move(*entity));
+        static io::Immediate<cache::CacheView<E>> find(const Key& id) {
+            return findTask(id);
         }
 
         /// Find by ID and return JSON string.
         /// L2 hit (BEVE): transcodes via glz::beve_to_json (no entity construction).
         /// L2 hit (JSON): returns raw string directly.
         /// L2 miss: delegates to find() then serializes.
-        static io::Task<std::string> findJson(const Key& id) {
-            auto redisKey = makeRedisKey(id);
-
-            if constexpr (useL2Binary) {
-                std::optional<std::vector<uint8_t>> beve;
-                if constexpr (Cfg.l2_refresh_on_get) {
-                    beve = co_await cache::RedisCache::getRawBinaryEx(redisKey, l2Ttl());
-                } else {
-                    beve = co_await cache::RedisCache::getRawBinary(redisKey);
-                }
-                if (beve) {
-                    std::string json;
-                    if (!glz::beve_to_json(*beve, json)) {
-                        co_return json;
-                    }
-                }
-            } else {
-                std::optional<std::string> cached;
-                if constexpr (Cfg.l2_refresh_on_get) {
-                    cached = co_await cache::RedisCache::getRawEx(redisKey, l2Ttl());
-                } else {
-                    cached = co_await cache::RedisCache::getRaw(redisKey);
-                }
-                if (cached) co_return std::move(*cached);
-            }
-
-            // L2 miss
-            auto view = co_await find(id);
-            if (!view) co_return {};
-            co_return view->json();
+        static io::Immediate<std::string> findJson(const Key& id) {
+            return findJsonTask(id);
         }
 
         /// Find by ID and return binary (BEVE) vector.
         /// L2 hit (Binary): returns raw bytes directly from Redis.
         /// L2 miss: delegates to find() then serializes.
-        static io::Task<std::vector<uint8_t>> findBinary(const Key& id)
+        static io::Immediate<std::vector<uint8_t>> findBinary(const Key& id)
             requires HasBinarySerialization<E>
         {
-            auto redisKey = makeRedisKey(id);
-
-            if constexpr (useL2Binary) {
-                std::optional<std::vector<uint8_t>> cached;
-                if constexpr (Cfg.l2_refresh_on_get) {
-                    cached = co_await cache::RedisCache::getRawBinaryEx(redisKey, l2Ttl());
-                } else {
-                    cached = co_await cache::RedisCache::getRawBinary(redisKey);
-                }
-                if (cached) co_return std::move(*cached);
-            } else {
-                std::optional<std::string> cached;
-                if constexpr (Cfg.l2_refresh_on_get) {
-                    cached = co_await cache::RedisCache::getRawEx(redisKey, l2Ttl());
-                } else {
-                    cached = co_await cache::RedisCache::getRaw(redisKey);
-                }
-                if (cached) {
-                    auto entity_opt = E::fromJson(*cached);
-                    if (entity_opt) co_return entity_opt->binary();
-                }
-            }
-
-            // L2 miss
-            auto view = co_await find(id);
-            if (!view) co_return {};
-            co_return view->binary();
+            return findBinaryTask(id);
         }
 
         /// Insert entity in database with L2 cache population.
@@ -482,6 +426,78 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
             bool ok = co_await evictRedis(id);
             if (!ok && PgProvider::hasRedis()) scheduleSelfHeal(id);
             co_return ok;
+        }
+
+        // Read coroutines behind the Immediate-returning find* wrappers.
+
+        static io::Task<cache::CacheView<E>> findTask(const Key& id) {
+            auto entity = co_await findRaw(id);
+            if (!entity) co_return {};
+            co_return Base::makeView(std::move(*entity));
+        }
+
+        static io::Task<std::string> findJsonTask(const Key& id) {
+            auto redisKey = makeRedisKey(id);
+
+            if constexpr (useL2Binary) {
+                std::optional<std::vector<uint8_t>> beve;
+                if constexpr (Cfg.l2_refresh_on_get) {
+                    beve = co_await cache::RedisCache::getRawBinaryEx(redisKey, l2Ttl());
+                } else {
+                    beve = co_await cache::RedisCache::getRawBinary(redisKey);
+                }
+                if (beve) {
+                    std::string json;
+                    if (!glz::beve_to_json(*beve, json)) {
+                        co_return json;
+                    }
+                }
+            } else {
+                std::optional<std::string> cached;
+                if constexpr (Cfg.l2_refresh_on_get) {
+                    cached = co_await cache::RedisCache::getRawEx(redisKey, l2Ttl());
+                } else {
+                    cached = co_await cache::RedisCache::getRaw(redisKey);
+                }
+                if (cached) co_return std::move(*cached);
+            }
+
+            // L2 miss
+            auto view = co_await findTask(id);
+            if (!view) co_return {};
+            co_return view->json();
+        }
+
+        static io::Task<std::vector<uint8_t>> findBinaryTask(const Key& id)
+            requires HasBinarySerialization<E>
+        {
+            auto redisKey = makeRedisKey(id);
+
+            if constexpr (useL2Binary) {
+                std::optional<std::vector<uint8_t>> cached;
+                if constexpr (Cfg.l2_refresh_on_get) {
+                    cached = co_await cache::RedisCache::getRawBinaryEx(redisKey, l2Ttl());
+                } else {
+                    cached = co_await cache::RedisCache::getRawBinary(redisKey);
+                }
+                if (cached) co_return std::move(*cached);
+            } else {
+                std::optional<std::string> cached;
+                if constexpr (Cfg.l2_refresh_on_get) {
+                    cached = co_await cache::RedisCache::getRawEx(redisKey, l2Ttl());
+                } else {
+                    cached = co_await cache::RedisCache::getRaw(redisKey);
+                }
+                if (cached) {
+                    auto entity_opt = E::fromJson(*cached);
+                    if (entity_opt) co_return entity_opt->binary();
+                }
+            }
+
+            // L2 miss
+            auto view = co_await findTask(id);
+            if (!view) co_return {};
+            co_return view->binary();
         }
 
         /// Find with L2 -> L3 fallback, returning entity by value.
