@@ -450,6 +450,24 @@ public:
     }
 
     // =====================================================================
+    // L1 maintenance — neutral without an L1 tier
+    // =====================================================================
+    // LocalRepo hides these with the real L1 operations; without L1 there is
+    // nothing to count, purge or prime, so the API stays the same on every preset.
+
+    /// Number of L1 entries: always 0 without L1.
+    [[nodiscard]] static constexpr size_t size() noexcept { return 0; }
+
+    /// Purge every L1 entry: nothing to purge without L1, returns 0.
+    static constexpr size_t purge() noexcept { return 0; }
+
+    /// Prime the L1 cache: no-op without L1.
+    static constexpr void warmup() noexcept {}
+
+    /// Sweep one L1 chunk: nothing to sweep without L1, returns false.
+    static constexpr bool sweep(long) noexcept { return false; }
+
+    // =====================================================================
     // insert
     // =====================================================================
 
