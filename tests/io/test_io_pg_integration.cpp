@@ -1,4 +1,5 @@
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 
 #include <jcailloux/relais/io/pg/PgConnection.h>
 #include <jcailloux/relais/io/pg/PgPool.h>
@@ -116,6 +117,47 @@ TEST_CASE("PgConnection floating-point params round-trip bit for bit", "[pg][int
         CHECK(std::bit_cast<uint32_t>(*f) == std::bit_cast<uint32_t>(floats[i]));
     }
     CHECK(std::isnan(read.nan));
+}
+
+TEST_CASE("PgResult reads numeric columns strictly", "[pg][integration]") {
+    using Catch::Matchers::ContainsSubstring;
+    EpollIoContext io;
+
+    auto r = runTask(io, [](EpollIoContext& io) -> Task<PgResult> {
+        auto conn = co_await PgConnection<EpollIoContext>::connect(io, getConnInfo());
+        co_return co_await conn.query(
+            "SELECT 0.1::real, '{0.1,1.5,-0}'::real[], 32767::int2,"
+            " 18446744073709551615::numeric, 12.5::numeric, 3000000000::int8,"
+            " '1.5x'::text, '{1,2.5}'::numeric[], 'Infinity'::float8");
+    }(io));
+    REQUIRE(r.ok());
+    const auto row = r[0];
+
+    SECTION("every number type reads its column exactly") {
+        CHECK(std::bit_cast<uint32_t>(row.get<float>(0)) == std::bit_cast<uint32_t>(0.1f));
+        const auto reals = row.get<std::vector<float>>(1);
+        REQUIRE(reals.size() == 3);
+        CHECK(std::bit_cast<uint32_t>(reals[0]) == std::bit_cast<uint32_t>(0.1f));
+        CHECK(reals[1] == 1.5f);
+        CHECK(std::bit_cast<uint32_t>(reals[2]) == std::bit_cast<uint32_t>(-0.0f));
+        CHECK(row.get<int16_t>(2) == 32767);
+        CHECK(row.get<uint64_t>(3) == std::numeric_limits<uint64_t>::max());
+        CHECK(row.get<double>(4) == 12.5);
+        CHECK(row.get<int64_t>(5) == 3000000000);
+        CHECK(row.get<double>(8) == std::numeric_limits<double>::infinity());
+    }
+
+    SECTION("a token that is not exactly the requested type throws") {
+        CHECK_THROWS_WITH(row.get<int64_t>(4), ContainsSubstring("column 4")
+                                                   && ContainsSubstring("'12.5'")
+                                                   && ContainsSubstring("int64"));
+        CHECK_THROWS_WITH(row.get<int32_t>(5), ContainsSubstring("is not a valid int32"));
+        CHECK_THROWS_WITH(row.get<int16_t>(5), ContainsSubstring("is not a valid int16"));
+        CHECK_THROWS_WITH(row.get<double>(6), ContainsSubstring("'1.5x' is not a valid double"));
+        CHECK_THROWS_WITH(row.get<std::vector<int32_t>>(7),
+                          ContainsSubstring("array element: '2.5' is not a valid int32"));
+        CHECK_THROWS_AS(row.get<uint32_t>(8), PgError);
+    }
 }
 
 // =============================================================================
