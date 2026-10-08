@@ -6,6 +6,7 @@
 #include <fixtures/EpollIoContext.h>
 #include <fixtures/TestRunner.h>
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -83,6 +84,26 @@ TEST_CASE("Log: char and string_view types", "[log]") {
     REQUIRE(captured_logs[0].message == "X = hello");
 
     log::setCallback(nullptr);
+}
+
+TEST_CASE("Log: numbers are exact, bool is spelled out", "[log]") {
+    captured_logs.clear();
+    log::setCallback(testLogCallback);
+
+    RELAIS_LOG_ERROR << 0.1234567891 << ' ' << 1e-7 << ' ' << 0.1f << ' '
+                     << int8_t{-128} << ' ' << UINT64_MAX << ' ' << true << ' ' << false;
+    REQUIRE(captured_logs[0].message == "0.1234567891 1e-07 0.1 -128 18446744073709551615 true false");
+
+    log::setCallback(nullptr);
+}
+
+template<typename T>
+constexpr bool loggable = requires(log::LogStream& s, T v) { s << v; };
+
+TEST_CASE("Log: a pointer does not log as bool", "[log]") {
+    STATIC_REQUIRE(loggable<bool>);
+    STATIC_REQUIRE(loggable<const char*>);
+    STATIC_REQUIRE_FALSE(loggable<int*>);
 }
 
 // =============================================================================

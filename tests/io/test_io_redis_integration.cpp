@@ -6,8 +6,14 @@
 #include <fixtures/EpollIoContext.h>
 #include <fixtures/TestRunner.h>
 
+#include <cstdint>
 #include <cstdlib>
+#include <limits>
+#include <optional>
 #include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
 
 using namespace jcailloux::relais::io;
 using namespace jcailloux::relais::io::test;
@@ -92,6 +98,77 @@ TEST_CASE("RedisClient INCR", "[redis][integration]") {
     }(io));
 
     REQUIRE(value == 11);
+}
+
+// =============================================================================
+// Arguments
+// =============================================================================
+
+namespace {
+
+template<typename T>
+constexpr bool redisArg = RedisArg<T>;
+
+enum Plain { PlainValue };
+enum class Scoped : int64_t { Value };
+
+struct ConvertibleToString {
+    operator std::string() const { return "x"; }
+};
+
+}  // namespace
+
+TEST_CASE("RedisArg accepts numbers and text only", "[redis]") {
+    STATIC_REQUIRE(redisArg<int>);
+    STATIC_REQUIRE(redisArg<int16_t>);
+    STATIC_REQUIRE(redisArg<uint64_t>);
+    STATIC_REQUIRE(redisArg<float>);
+    STATIC_REQUIRE(redisArg<const double&>);
+    STATIC_REQUIRE(redisArg<const char*>);
+    STATIC_REQUIRE(redisArg<const char (&)[4]>);
+    STATIC_REQUIRE(redisArg<std::string>);
+    STATIC_REQUIRE(redisArg<const std::string&>);
+    STATIC_REQUIRE(redisArg<std::string_view>);
+
+    STATIC_REQUIRE_FALSE(redisArg<Plain>);
+    STATIC_REQUIRE_FALSE(redisArg<Scoped>);
+    STATIC_REQUIRE_FALSE(redisArg<bool>);
+    STATIC_REQUIRE_FALSE(redisArg<char>);
+    STATIC_REQUIRE_FALSE(redisArg<std::nullptr_t>);
+    STATIC_REQUIRE_FALSE(redisArg<std::optional<int>>);
+    STATIC_REQUIRE_FALSE(redisArg<std::vector<int>>);
+    STATIC_REQUIRE_FALSE(redisArg<ConvertibleToString>);
+}
+
+TEST_CASE("RedisClient sends numbers as their exact text", "[redis][integration]") {
+    EpollIoContext io;
+
+    auto values = runTask(io, [](EpollIoContext& io) -> Task<std::vector<std::string>> {
+        auto client = co_await RedisClient<EpollIoContext>::connect(io, redisHost(), redisPort());
+        std::vector<std::string> out;
+        auto roundTrip = [&](auto v) -> Task<void> {
+            co_await client->exec("SET", "relais:io:test:number", v);
+            out.push_back((co_await client->exec("GET", "relais:io:test:number")).asString());
+        };
+        co_await roundTrip(0.1234567891);
+        co_await roundTrip(0.1f);
+        co_await roundTrip(std::numeric_limits<uint64_t>::max());
+        co_await roundTrip(int16_t{-32768});
+
+        // Redis reads the argument as a number: 1e-7 must not arrive as 0.
+        co_await client->exec("SET", "relais:io:test:number", 0);
+        out.push_back((co_await client->exec("INCRBYFLOAT", "relais:io:test:number", 1e-7)).asString());
+
+        co_await client->exec("DEL", "relais:io:test:number");
+        co_return out;
+    }(io));
+
+    REQUIRE(values.size() == 5);
+    CHECK(values[0] == "0.1234567891");
+    CHECK(values[1] == "0.1");
+    CHECK(values[2] == "18446744073709551615");
+    CHECK(values[3] == "-32768");
+    CHECK(values[4] == "0.0000001");
 }
 
 TEST_CASE("RedisClient TTL (SET EX)", "[redis][integration]") {

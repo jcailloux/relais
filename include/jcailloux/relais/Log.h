@@ -7,6 +7,8 @@
 #include <string>
 #include <string_view>
 
+#include "jcailloux/relais/detail/NumberText.h"
+
 namespace jcailloux::relais::log {
 
 // =============================================================================
@@ -81,14 +83,16 @@ public:
         return *this;
     }
 
-    template<typename T> requires std::integral<T> && (!std::same_as<T, char>)
+    template<relais::detail::TextNumber T>
     LogStream& operator<<(T val) {
-        buf_ += std::to_string(val);
+        relais::detail::appendNumber(buf_, val);
         return *this;
     }
 
-    LogStream& operator<<(double val) {
-        buf_ += std::to_string(val);
+    // Exactly bool: a pointer must not log as "true".
+    template<std::same_as<bool> B>
+    LogStream& operator<<(B val) {
+        buf_ += val ? "true" : "false";
         return *this;
     }
 

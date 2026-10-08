@@ -2,14 +2,17 @@
 #define JCX_RELAIS_IO_REDIS_CLIENT_H
 
 #include <chrono>
+#include <concepts>
 #include <cstdint>
 #include <deque>
 #include <memory>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
+#include "jcailloux/relais/detail/NumberText.h"
 #include "jcailloux/relais/io/Task.h"
 #include "jcailloux/relais/io/IoContext.h"
 #include "jcailloux/relais/io/redis/RedisError.h"
@@ -17,6 +20,32 @@
 #include "jcailloux/relais/io/redis/RedisConnection.h"
 
 namespace jcailloux::relais::io {
+
+// RedisArg — the closed set of types a Redis command argument accepts
+//
+//   number (any arithmetic type but bool and characters)  exact decimal text
+//   std::string, std::string_view, const char*            bytes as is
+//
+// Redis has no boolean and no null: such an argument must be spelled out.
+
+template<typename T>
+concept RedisArg =
+    !std::is_enum_v<std::decay_t<T>>  // pass an enum explicitly: std::to_underlying(e) for its integer, or its codec's toDb(e) for its text
+    && (relais::detail::TextNumber<std::decay_t<T>> || std::same_as<std::decay_t<T>, std::string>
+        || std::same_as<std::decay_t<T>, std::string_view> || std::same_as<std::decay_t<T>, const char*>
+        || std::same_as<std::decay_t<T>, char*>);
+
+namespace detail {
+
+/// The bytes a RedisArg is sent as.
+inline std::string redisArgText(std::string&& s) noexcept { return std::move(s); }
+inline std::string redisArgText(const std::string& s) { return s; }
+inline std::string redisArgText(std::string_view s) { return std::string(s); }
+inline std::string redisArgText(const char* s) { return s; }
+template<relais::detail::TextNumber T>
+inline std::string redisArgText(T v) { return relais::detail::toText(v); }
+
+}  // namespace detail
 
 // RedisClient — async Redis client using custom RESP2 protocol + IoContext.
 //
@@ -59,11 +88,11 @@ public:
 
     // Execute a Redis command (variadic, converts args to strings)
 
-    template<typename... Args>
+    template<RedisArg... Args>
     Task<RedisResult> exec(Args&&... args) {
         std::vector<std::string> arg_strs;
         arg_strs.reserve(sizeof...(args));
-        (arg_strs.push_back(toString(std::forward<Args>(args))), ...);
+        (arg_strs.push_back(detail::redisArgText(std::forward<Args>(args))), ...);
 
         std::vector<const char*> argv;
         std::vector<size_t> argvlen;
@@ -161,13 +190,6 @@ public:
 private:
     explicit RedisClient(Io& io, RedisConnection<Io> conn) noexcept
         : io_(&io), conn_(std::move(conn)) {}
-
-    static std::string toString(const char* s) { return s; }
-    static std::string toString(std::string_view s) { return std::string(s); }
-    static std::string toString(const std::string& s) { return s; }
-    static std::string toString(int64_t v) { return std::to_string(v); }
-    static std::string toString(int32_t v) { return std::to_string(v); }
-    static std::string toString(double v) { return std::to_string(v); }
 
     // Coroutine mutex — serializes command execution
 
