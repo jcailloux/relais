@@ -2,6 +2,31 @@
 
 ## [Unreleased]
 
+### Added
+
+- **Every number type is accepted** as a query or Redis argument, unsigned
+  integers included, and read by `get<T>`/`getOpt<T>` (`float`, `int16_t`,
+  `uint64_t`…).
+
+### Changed (Breaking)
+
+- **Query arguments form a closed set**, checked by `io::PgArg` (`queryArgs`,
+  `PgParams::make`) and `io::RedisArg` (`redis`); see `docs/api-reference.md ›
+  Arguments`. An enum, alone or in an `optional`/`vector`, no longer compiles:
+  pass `std::to_underlying(e)` or its database text. `redis` no longer accepts
+  `bool`.
+- **Numeric columns are read strictly.** The whole value must parse as `T`:
+  `get<int64_t>` on `12.5` (e.g. `avg()`) throws `PgError` instead of returning
+  `12`. Read a `double` or cast in SQL.
+
+### Fixed
+
+- **Floating-point values sent to PostgreSQL and Redis were rounded to 6
+  decimals** (`1e-7` became `0`), silently, while L1 and L2 kept the exact
+  value; under a non-C `LC_NUMERIC` they were written with a decimal comma.
+  Entity writes, filters, `queryArgs` and `redis` now send the shortest text
+  that reads back the same value. Values already stored are not repaired.
+
 ## [3.2.1] - 2026-09-27
 
 ### Changed
