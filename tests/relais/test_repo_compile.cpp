@@ -323,3 +323,243 @@ TEST_CASE("PartitionKey event repositories", "[repository][compile][partition_ke
         STATIC_REQUIRE(std::is_same_v<L1L2TestEventRepo::KeyType, int64_t>);
     }
 }
+
+// =============================================================================
+// API parity across cache presets
+// =============================================================================
+//
+// The public Repo API is the same whatever the CacheConfig: switching preset
+// never breaks a caller. exerciseApi calls every documented method, so each
+// body is instantiated (a requires-expression only checks the declaration);
+// apiSignatures records each method's return type, compared preset to preset.
+// Entity-dependent methods are gated on the entity's concepts, never on the
+// preset.
+
+namespace parity {
+
+namespace jr = jcailloux::relais;
+namespace jre = jcailloux::relais::entity;
+
+using BothTestArticleRepo = Repo<TestArticleEntity, "test:article:parity:both", cfg::Both>;
+using L2TestAssignedKeyRepo = Repo<TestAssignedKeyEntity, "test:akey:parity:l2", cfg::Redis>;
+
+/// Arguments for the field-update methods: one field written, guarded and
+/// ordered on.
+template<auto F, typename V>
+struct FieldArgs {
+    static auto update() { return jre::set<F>(V{1}); }
+    static auto guard() { return jre::when(jre::eq<F>(V{1})); }
+    static auto order() { return jre::orderBy(jre::asc<F>()); }
+};
+
+template<typename E> struct ApiArgs;
+template<> struct ApiArgs<TestItemEntity>
+    : FieldArgs<TestItemEntity::Field::value, int32_t> {};
+template<> struct ApiArgs<TestArticleEntity>
+    : FieldArgs<TestArticleEntity::Field::author_id, int64_t> {};
+template<> struct ApiArgs<TestAssignedKeyEntity>
+    : FieldArgs<TestAssignedKeyEntity::Field::payload, int64_t> {};
+
+/// One method's return type, tagged with the method name for diagnostics.
+template<cfg::FixedString Name, typename T>
+struct Sig {};
+
+template<typename R, typename E = typename R::EntityType, typename K = typename R::KeyType>
+auto apiSignatures(const K& key, const E& ent, std::span<const K> ids) {
+    using A = ApiArgs<E>;
+
+    auto core = std::tuple<
+        Sig<"name", decltype(R::name())>,
+        Sig<"config", decltype(R::config)>,
+        Sig<"find", decltype(R::find(key))>,
+        Sig<"findJson", decltype(R::findJson(key))>,
+        Sig<"findMany", decltype(R::findMany(ids))>,
+        Sig<"insert", decltype(R::insert(ent))>,
+        Sig<"erase", decltype(R::erase(key))>,
+        Sig<"eraseMany", decltype(R::eraseMany(ids))>,
+        Sig<"invalidate", decltype(R::invalidate(key))>,
+        Sig<"invalidateMany", decltype(R::invalidateMany(ids))>,
+        Sig<"size", decltype(R::size())>,
+        Sig<"purge", decltype(R::purge())>,
+        Sig<"warmup", decltype(R::warmup())>>{};
+
+    auto binary = [] {
+        if constexpr (jr::HasBinarySerialization<E>)
+            return std::tuple<Sig<"findBinary", decltype(R::findBinary(key))>>{};
+        else return std::tuple<>{};
+    }();
+
+    auto fullUpdate = [] {
+        if constexpr (jr::HasFullUpdate<E> && jr::HasBinarySerialization<E>)
+            return std::tuple<
+                Sig<"update", decltype(R::update(key, ent))>,
+                Sig<"updateJson", decltype(R::updateJson(key, std::string_view{}))>,
+                Sig<"updateBinary", decltype(R::updateBinary(key, std::span<const uint8_t>{}))>>{};
+        else if constexpr (jr::HasFullUpdate<E>)
+            return std::tuple<
+                Sig<"update", decltype(R::update(key, ent))>,
+                Sig<"updateJson", decltype(R::updateJson(key, std::string_view{}))>>{};
+        else return std::tuple<>{};
+    }();
+
+    auto upsert = [] {
+        if constexpr (jr::HasUpsertSql<E>)
+            return std::tuple<Sig<"upsert", decltype(R::upsert(ent))>>{};
+        else return std::tuple<>{};
+    }();
+
+    auto fieldUpdate = [] {
+        if constexpr (jr::HasFieldUpdate<E>)
+            return std::tuple<
+                Sig<"patch", decltype(R::patch(key, A::update()))>,
+                Sig<"patchIf", decltype(R::patchIf(key, A::guard(), A::update()))>,
+                Sig<"patchWhere", decltype(R::patchWhere(A::guard(), A::update()))>,
+                Sig<"claim", decltype(R::claim(A::guard(), size_t{1}, A::update()))>,
+                Sig<"claimOrdered", decltype(R::claim(A::guard(), A::order(), size_t{1}, A::update()))>>{};
+        else return std::tuple<>{};
+    }();
+
+    auto where = [] {
+        if constexpr (jr::HasFilterSet<E>) {
+            using P = typename E::MappingType::FilterSet::Values;
+            return std::tuple<
+                Sig<"eraseWhere", decltype(R::eraseWhere(P{}))>,
+                Sig<"invalidateWhere", decltype(R::invalidateWhere(P{}))>>{};
+        }
+        else return std::tuple<>{};
+    }();
+
+    auto list = [] {
+        if constexpr (jr::HasListDescriptor<E>) {
+            // The list query types are tagged per repo (a cursor from another
+            // repo is rejected), so they differ between presets by design;
+            // callers name them through the Repo aliases, which every preset
+            // provides.
+            using Q = typename R::ListQuery;
+            auto common = std::tuple<
+                Sig<"queryBuilder", std::bool_constant<
+                    std::is_same_v<decltype(R::queryBuilder()), typename R::QueryBuilder>>>,
+                Sig<"query", decltype(R::query(std::declval<const Q&>()))>,
+                Sig<"queryJson", decltype(R::queryJson(std::declval<const Q&>()))>,
+                Sig<"listSize", decltype(R::listSize())>>{};
+            if constexpr (jr::HasBinarySerialization<E>)
+                return std::tuple_cat(common,
+                    std::tuple<Sig<"queryBinary", decltype(R::queryBinary(std::declval<const Q&>()))>>{});
+            else return common;
+        }
+        else return std::tuple<>{};
+    }();
+
+#if RELAIS_ENABLE_METRICS
+    auto metrics = std::tuple<
+        Sig<"metrics", decltype(R::metrics())>,
+        Sig<"resetMetrics", decltype(R::resetMetrics())>>{};
+#else
+    auto metrics = std::tuple<>{};
+#endif
+
+    return std::tuple_cat(core, binary, fullUpdate, upsert, fieldUpdate, where, list, metrics);
+}
+
+template<typename R>
+using ApiSignatures = decltype(apiSignatures<R>(
+    std::declval<const typename R::KeyType&>(),
+    std::declval<const typename R::EntityType&>(),
+    std::declval<std::span<const typename R::KeyType>>()));
+
+/// Never run: taking its address instantiates every called method's body.
+template<typename R>
+jr::io::Task<void> exerciseApi() {
+    using E = typename R::EntityType;
+    using K = typename R::KeyType;
+    using A = ApiArgs<E>;
+    const K key{};
+    const E ent{};
+    const std::vector<K> keys;
+    const std::span<const K> ids{keys};
+
+    (void)R::name();
+    (void)co_await R::find(key);
+    (void)co_await R::findJson(key);
+    (void)co_await R::findMany(ids);
+    (void)co_await R::insert(ent);
+    (void)co_await R::erase(key);
+    (void)co_await R::eraseMany(ids);
+    co_await R::invalidate(key);
+    co_await R::invalidateMany(ids);
+    (void)R::size();
+    (void)R::purge();
+    R::warmup();
+
+    if constexpr (jr::HasBinarySerialization<E>) {
+        (void)co_await R::findBinary(key);
+    }
+    if constexpr (jr::HasFullUpdate<E>) {
+        (void)co_await R::update(key, ent);
+        (void)co_await R::updateJson(key, std::string_view{});
+        if constexpr (jr::HasBinarySerialization<E>) {
+            (void)co_await R::updateBinary(key, std::span<const uint8_t>{});
+        }
+    }
+    if constexpr (jr::HasUpsertSql<E>) {
+        (void)co_await R::upsert(ent);
+    }
+    if constexpr (jr::HasFieldUpdate<E>) {
+        (void)co_await R::patch(key, A::update());
+        (void)co_await R::patchIf(key, A::guard(), A::update());
+        (void)co_await R::patchWhere(A::guard(), A::update());
+        (void)co_await R::claim(A::guard(), 1, A::update());
+        (void)co_await R::claim(A::guard(), A::order(), 1, A::update());
+    }
+    if constexpr (jr::HasFilterSet<E>) {
+        using P = typename E::MappingType::FilterSet::Values;
+        (void)co_await R::eraseWhere(P{});
+        co_await R::invalidateWhere(P{});
+    }
+    if constexpr (jr::HasListDescriptor<E>) {
+        const auto q = R::queryBuilder().limit(10).build();
+        (void)co_await R::query(q);
+        (void)co_await R::queryJson(q);
+        if constexpr (jr::HasBinarySerialization<E>) {
+            (void)co_await R::queryBinary(q);
+        }
+        (void)R::listSize();
+    }
+#if RELAIS_ENABLE_METRICS
+    (void)R::metrics();
+    R::resetMetrics();
+#endif
+}
+
+/// Same signatures on every preset, return types included.
+template<typename Uncached, typename... Cached>
+constexpr bool kSameApi = (std::is_same_v<ApiSignatures<Uncached>, ApiSignatures<Cached>> && ...);
+
+}  // namespace parity
+
+TEMPLATE_TEST_CASE("API parity - every documented method instantiates",
+                   "[repository][compile][parity]",
+                   UncachedTestItemRepo, L1TestItemRepo, L2TestItemRepo, FullCacheTestItemRepo,
+                   UncachedTestArticleRepo, L1TestArticleRepo, L2TestArticleRepo,
+                   parity::BothTestArticleRepo,
+                   UncachedTestAssignedKeyRepo, L1TestAssignedKeyRepo,
+                   parity::L2TestAssignedKeyRepo, FullCacheTestAssignedKeyRepo) {
+    auto exercise = &parity::exerciseApi<TestType>;
+    STATIC_REQUIRE(std::is_same_v<decltype(exercise), jcailloux::relais::io::Task<void> (*)()>);
+    (void)exercise;
+}
+
+TEST_CASE("API parity - identical signatures across presets", "[repository][compile][parity]") {
+    SECTION("entity without list") {
+        STATIC_REQUIRE(parity::kSameApi<UncachedTestItemRepo,
+            L1TestItemRepo, L2TestItemRepo, FullCacheTestItemRepo>);
+    }
+    SECTION("entity with list") {
+        STATIC_REQUIRE(parity::kSameApi<UncachedTestArticleRepo,
+            L1TestArticleRepo, L2TestArticleRepo, parity::BothTestArticleRepo>);
+    }
+    SECTION("entity with upsert") {
+        STATIC_REQUIRE(parity::kSameApi<UncachedTestAssignedKeyRepo,
+            L1TestAssignedKeyRepo, parity::L2TestAssignedKeyRepo, FullCacheTestAssignedKeyRepo>);
+    }
+}
