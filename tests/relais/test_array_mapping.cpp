@@ -39,6 +39,18 @@ TEST_CASE("[array] parsePgArray on numeric int8[]", "[array][unit]")
 
     CHECK(parsePgArray<int32_t>("{10,20}") == std::vector<int32_t>{10, 20});
     CHECK(parsePgArray<double>("{1.5,2.25}") == std::vector<double>{1.5, 2.25});
+    CHECK(parsePgArray<float>("{0.1,-1e-7}") == std::vector<float>{0.1f, -1e-7f});
+}
+
+TEST_CASE("[array] parsePgArray rejects a token that is not exactly the element type",
+          "[array][unit]")
+{
+    using pg::detail::parsePgArray;
+
+    CHECK_THROWS_AS(parsePgArray<int32_t>("{1,2.5}"), pg::PgError);         // truncation
+    CHECK_THROWS_AS(parsePgArray<int32_t>("{3000000000}"), pg::PgError);    // overflow
+    CHECK_THROWS_AS(parsePgArray<double>("{1.5x}"), pg::PgError);           // trailing garbage
+    CHECK_THROWS_AS(parsePgArray<int64_t>(R"({"",1})"), pg::PgError);       // empty token
 }
 
 TEST_CASE("[array] parsePgArray on text[] with quoting", "[array][unit]")
