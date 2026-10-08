@@ -1229,9 +1229,9 @@ protected:
                 }
                 where.sql += ")";
 
-                where.params.params.push_back(io::PgParam::bigint(cursor_sort_value));
+                where.params.params.push_back(io::PgParam::number(cursor_sort_value));
                 for (size_t i = 0; i < kKeyN; ++i) {
-                    where.params.params.push_back(io::PgParam::bigint(cursor_keys[i]));
+                    where.params.params.push_back(io::PgParam::number(cursor_keys[i]));
                 }
             }
 

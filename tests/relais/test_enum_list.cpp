@@ -135,7 +135,7 @@ TEST_CASE("[EnumList] equality and set filters bind the codec's strings",
         CHECK(w.sql == "CASE \"state\" WHEN 'open' THEN 5 WHEN 'blocked' THEN 20 "
                        "WHEN 'closed' THEN 10 WHEN 'archived' THEN 0 END>=$1");
         REQUIRE(w.params.params.size() == 1);
-        CHECK(w.params.params[0] == PgParam::bigint(10));
+        CHECK(w.params.params[0] == PgParam::number(int64_t{10}));
     }
 }
 

@@ -114,7 +114,7 @@ public:
 
     /// Execute a parameterized SQL query with inline args.
     /// The PgParams object is kept alive in the coroutine frame.
-    template<typename... Args>
+    template<io::PgArg... Args>
     static io::Task<io::PgResult> queryArgs(const char* sql, Args&&... args) {
         auto params = io::PgParams::make(std::forward<Args>(args)...);
         co_return co_await queryParams(sql, params);

@@ -7,11 +7,18 @@
 #include <fixtures/EpollIoContext.h>
 #include <fixtures/TestRunner.h>
 
+#include <bit>
+#include <cfloat>
+#include <cmath>
+#include <cstdint>
 #include <cstdlib>
+#include <limits>
 #include <string>
+#include <vector>
 
 using namespace jcailloux::relais::io;
 using namespace jcailloux::relais::io::test;
+using jcailloux::relais::detail::parseNumber;
 
 // =============================================================================
 // Connection string from environment (same as relais tests)
@@ -58,6 +65,57 @@ TEST_CASE("PgConnection parameterized query", "[pg][integration]") {
     REQUIRE(result.ok());
     REQUIRE(result[0].get<int32_t>(0) == 42);
     REQUIRE(result[0].get<std::string>(1) == "world");
+}
+
+TEST_CASE("PgConnection floating-point params round-trip bit for bit", "[pg][integration]") {
+    constexpr double inf = std::numeric_limits<double>::infinity();
+    const std::vector<double> doubles{0.1234567891, 1e-7, 1e300, 5e-324, DBL_MAX, -0.0, inf, -inf};
+    const std::vector<float> floats{0.1f, FLT_MIN, FLT_MAX, -0.0f,
+                                    std::numeric_limits<float>::denorm_min()};
+
+    struct Read {
+        std::vector<double> doubles;
+        std::vector<std::string> floats;
+        std::vector<double> array;
+        double nan = 0;
+    };
+    EpollIoContext io;
+
+    auto read = runTask(io, [&](EpollIoContext& io) -> Task<Read> {
+        auto conn = co_await PgConnection<EpollIoContext>::connect(io, getConnInfo());
+        Read out;
+        for (double d : doubles) {
+            auto params = PgParams::make(d);
+            auto r = co_await conn.queryParams("SELECT $1::float8", params);
+            out.doubles.push_back(r[0].get<double>(0));
+        }
+        for (float f : floats) {
+            auto params = PgParams::make(f);
+            auto r = co_await conn.queryParams("SELECT $1::float4", params);
+            out.floats.push_back(r[0].get<std::string>(0));
+        }
+        auto params = PgParams::make(doubles, std::numeric_limits<double>::quiet_NaN());
+        auto r = co_await conn.queryParams("SELECT $1::float8[], $2::float8", params);
+        out.array = r[0].get<std::vector<double>>(0);
+        out.nan = r[0].get<double>(1);
+        co_return out;
+    }(io));
+
+    REQUIRE(read.doubles.size() == doubles.size());
+    REQUIRE(read.array.size() == doubles.size());
+    for (size_t i = 0; i < doubles.size(); ++i) {
+        INFO("double " << i);
+        CHECK(std::bit_cast<uint64_t>(read.doubles[i]) == std::bit_cast<uint64_t>(doubles[i]));
+        CHECK(std::bit_cast<uint64_t>(read.array[i]) == std::bit_cast<uint64_t>(doubles[i]));
+    }
+    REQUIRE(read.floats.size() == floats.size());
+    for (size_t i = 0; i < floats.size(); ++i) {
+        INFO("float " << i << ": " << read.floats[i]);
+        const auto f = parseNumber<float>(read.floats[i]);
+        REQUIRE(f.has_value());
+        CHECK(std::bit_cast<uint32_t>(*f) == std::bit_cast<uint32_t>(floats[i]));
+    }
+    CHECK(std::isnan(read.nan));
 }
 
 // =============================================================================

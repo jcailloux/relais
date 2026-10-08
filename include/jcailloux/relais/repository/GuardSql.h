@@ -100,8 +100,7 @@ struct GuardSql<Traits, entity::FieldGuard<F, C, V>> {
 
     static void bind(io::PgParams& p, const entity::FieldGuard<F, C, V>& g) {
         if constexpr (ranked) {
-            p.params.push_back(io::PgParam::bigint(
-                static_cast<int64_t>(std::to_underlying(g.value))));
+            p.push(static_cast<int64_t>(std::to_underlying(g.value)));
         } else {
             p.push(entity::detail::columnValue<Traits, F>(g.value));
         }

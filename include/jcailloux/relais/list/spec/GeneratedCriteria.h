@@ -47,26 +47,15 @@ void addParamForDb(io::PgParams& params, const T& value) {
         if constexpr (FilterType::op == Op::EQ || FilterType::op == Op::NE) {
             params.params.push_back(io::PgParam::text(Converter::codec::toDb(value)));
         } else {
-            params.params.push_back(io::PgParam::bigint(
-                static_cast<int64_t>(std::to_underlying(value))));
+            params.push(static_cast<int64_t>(std::to_underlying(value)));
         }
     } else if constexpr (std::is_same_v<Converter, AsString>) {
         using std::to_string;
         params.params.push_back(io::PgParam::text(toString(value)));
-    } else if constexpr (std::is_integral_v<std::remove_cvref_t<T>>) {
-        if constexpr (sizeof(T) <= 4) {
-            params.params.push_back(io::PgParam::integer(static_cast<int32_t>(value)));
-        } else {
-            params.params.push_back(io::PgParam::bigint(static_cast<int64_t>(value)));
-        }
-    } else if constexpr (std::is_enum_v<std::remove_cvref_t<T>>) {
-        using U = std::underlying_type_t<std::remove_cvref_t<T>>;
-        params.params.push_back(io::PgParam::bigint(static_cast<int64_t>(static_cast<U>(value))));
-    } else if constexpr (std::is_same_v<std::remove_cvref_t<T>, bool>) {
-        params.params.push_back(io::PgParam::boolean(value));
+    } else if constexpr (std::is_enum_v<T>) {
+        params.push(static_cast<int64_t>(std::to_underlying(value)));
     } else {
-        // String-like types
-        params.params.push_back(io::PgParam::text(std::string(value)));
+        params.push(value);
     }
 }
 
