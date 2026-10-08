@@ -9,6 +9,7 @@
 #include "jcailloux/relais/io/Task.h"
 #include "jcailloux/relais/io/WhenAll.h"
 #include "jcailloux/relais/repository/ConditionalWrite.h"
+#include "jcailloux/relais/repository/KeyDedup.h"
 
 namespace jcailloux::relais {
 
@@ -24,24 +25,6 @@ template<typename K>
     std::sort(keys.begin(), keys.end());
     keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
     return keys;
-}
-
-/// Stable dedup by equality only — first-seen order, O(N²) linear scan (N small,
-/// mirrors LocalRepo::findMany's choice). Unlike dedupSorted it needs no
-/// operator< , so it works on composite/partition Keys that only model equality.
-/// Used at the public batch entry to collapse duplicate Keys before erase/find.
-template<typename K>
-[[nodiscard]] std::vector<K> dedupStable(std::span<const K> keys) {
-    std::vector<K> out;
-    out.reserve(keys.size());
-    for (const auto& k : keys) {
-        bool seen = false;
-        for (const auto& u : out) {
-            if (u == k) { seen = true; break; }
-        }
-        if (!seen) out.push_back(k);
-    }
-    return out;
 }
 
 /// Awaited value type of an awaitable expression (Task<T>/Immediate<T> → T).

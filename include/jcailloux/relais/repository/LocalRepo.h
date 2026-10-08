@@ -12,6 +12,7 @@
 
 #include "jcailloux/relais/io/Task.h"
 #include "jcailloux/relais/repository/RedisRepo.h"
+#include "jcailloux/relais/repository/KeyDedup.h"
 #include "jcailloux/relais/repository/RecheckGuard.h"
 #include "jcailloux/relais/Log.h"
 #include "jcailloux/relais/cache/CacheTier.h"
@@ -126,19 +127,7 @@ public:
         const size_t n = ids.size();
         if (n == 0) return cache::MultiView<E>{};
 
-        // Dedup (small-N linear scan, the dominant case): unique[] holds the
-        // distinct ids in first-seen order, slot[i] maps ids[i] -> unique index.
-        std::vector<Key> unique;
-        unique.reserve(n);
-        std::vector<size_t> slot(n);
-        for (size_t i = 0; i < n; ++i) {
-            size_t u = unique.size();
-            for (size_t k = 0; k < unique.size(); ++k) {
-                if (unique[k] == ids[i]) { u = k; break; }
-            }
-            if (u == unique.size()) unique.push_back(ids[i]);
-            slot[i] = u;
-        }
+        auto [unique, slot] = detail::dedupWithSlots<Key>(ids);
 
         // One batch EpochGuard pins the global epoch for every L1-slot pointer
         // taken below — per-Hit guards are dropped, one ticket covers the N.
