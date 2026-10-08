@@ -3,7 +3,7 @@
  *
  * Performance benchmarks for the PostgreSQL I/O layer.
  *
- * Three flavors:
+ * Four flavors:
  *   - [latency]    : single coroutine, sequential round-trips (p50/p99 RTT).
  *   - [throughput] : N concurrent DetachedTask workers on the same epoll loop.
  *                    Exposes real pool/pipeline utilization. Without these,
@@ -12,6 +12,7 @@
  *   - [timer]      : per-operation deadline arm/cancel cost in isolation, plus
  *                    its zero-syscall / bounded-memory invariants. The
  *                    [timeout] cases re-measure the same overhead end to end.
+ *   - [number-text]: numeric parameter / column text conversion in isolation.
  *
  * Run with:
  *   ./bench_io_pg                                # all benchmarks
@@ -20,6 +21,7 @@
  *   ./bench_io_pg "[throughput][select]"         # throughput SELECT only
  *   ./bench_io_pg "[timer]"                      # timer subsystem (no DB)
  *   ./bench_io_pg "[timeout]"                    # query_timeout off vs on
+ *   ./bench_io_pg "[number-text]"                # numeric text conversion (no DB)
  *   BENCH_SAMPLES=1000 ./bench_io_pg "[latency]"
  *   BENCH_DURATION_S=10 ./bench_io_pg "[throughput]"
  */
@@ -33,12 +35,17 @@
 #include <jcailloux/relais/io/pg/PgResult.h>
 #include <jcailloux/relais/io/pg/PgParams.h>
 #include <jcailloux/relais/io/Task.h>
+#include <jcailloux/relais/detail/NumberText.h>
 
 #include <fixtures/EpollIoContext.h>
 #include <fixtures/TestRunner.h>
 
 #include <atomic>
+#include <cstdint>
+#include <limits>
 #include <memory>
+#include <string>
+#include <string_view>
 #include <vector>
 
 using namespace jcailloux::relais::io;
@@ -658,4 +665,77 @@ TEST_CASE("Benchmark - PG throughput: timeout off vs on", "[benchmark][pg][throu
     out << "    timeout adds " << std::fixed << std::setprecision(4)
         << wakeup_delta << " wakeups/1k ops (loop-local arm → no pipe write)";
     WARN(out.str());
+}
+
+// =============================================================================
+// NUMBER TEXT — numeric parameter and column conversion (no DB)
+//
+// Every numeric query argument is bound as its exact decimal text, and every
+// numeric column is parsed back from text. These cases measure the conversion
+// alone, which a round-trip otherwise drowns.
+// =============================================================================
+
+// A conversion takes tens of ns, close to the clock's own cost: each sample
+// times a batch and reports the per-call figure.
+template<typename Fn>
+static BenchResult benchPerCall(const std::string& name, int batch, Fn&& fn) {
+    auto r = bench(name, [&] { for (int i = 0; i < batch; ++i) fn(); });
+    for (double* f : {&r.median_us, &r.p99_us, &r.mean_us, &r.min_us, &r.max_us})
+        *f /= batch;
+    return r;
+}
+
+// The value as an unknown to the optimizer: the integer conversions are inline
+// templates that would otherwise fold a constant input at compile time.
+template<typename T>
+static T opaque(T v) {
+    asm volatile("" : "+m"(v));
+    return v;
+}
+
+TEST_CASE("Benchmark - number text conversion", "[benchmark][io][number-text]")
+{
+    namespace text = jcailloux::relais::detail;
+    constexpr int kBatch = 1000;
+
+    double short_d = 48.8566;                     // SSO-sized text
+    double long_d = 0.1234567891234567;           // 18 chars: heap-allocated text
+    float f = 0.1f;
+    int64_t i64 = std::numeric_limits<int64_t>::max();
+    std::vector<double> array(64);
+    for (size_t i = 0; i < array.size(); ++i) array[i] = 0.1 * static_cast<double>(i) + 1e-7;
+
+    std::vector<BenchResult> results;
+
+    results.push_back(benchPerCall("param double (short)", kBatch, [&] {
+        doNotOptimize(PgParam::number(opaque(short_d)));
+    }));
+    results.push_back(benchPerCall("param double (long)", kBatch, [&] {
+        doNotOptimize(PgParam::number(opaque(long_d)));
+    }));
+    results.push_back(benchPerCall("param float", kBatch, [&] {
+        doNotOptimize(PgParam::number(opaque(f)));
+    }));
+    results.push_back(benchPerCall("param int64", kBatch, [&] {
+        doNotOptimize(PgParam::number(opaque(i64)));
+    }));
+    results.push_back(benchPerCall("param double[64]", kBatch / 10, [&] {
+        doNotOptimize(PgParams::arrayLiteral(array));
+    }));
+
+    const std::string short_t = text::toText(short_d);
+    const std::string long_t = text::toText(long_d);
+    const std::string i64_t = text::toText(i64);
+
+    results.push_back(benchPerCall("parse double (short)", kBatch, [&] {
+        doNotOptimize(text::parseNumber<double>(opaque(std::string_view(short_t))));
+    }));
+    results.push_back(benchPerCall("parse double (long)", kBatch, [&] {
+        doNotOptimize(text::parseNumber<double>(opaque(std::string_view(long_t))));
+    }));
+    results.push_back(benchPerCall("parse int64", kBatch, [&] {
+        doNotOptimize(text::parseNumber<int64_t>(opaque(std::string_view(i64_t))));
+    }));
+
+    WARN(formatTable("Number text — per conversion", results));
 }
