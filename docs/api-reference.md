@@ -967,15 +967,30 @@ static void runAll(Io& io, Drive drive);   // testing/IoContextConformance.h
 | Method | Returns | Notes |
 |---|---|---|
 | `query(const char* sql)` | `Task<PgResult>` | Parameterless query. `sql` must outlive the `co_await`. |
-| `queryParams(const char* sql, const PgParams& params)` | `Task<PgResult>` | Parameterized; `sql` + `params` must outlive the `co_await`. |
-| `template<typename... Args> queryArgs(const char* sql, Args&&...)` | `Task<PgResult>` | Builds a `PgParams` kept in the coroutine frame; forwards to `queryParams`. |
+| `queryParams(const char* sql, const io::PgParams& params)` | `Task<PgResult>` | Parameterized; `sql` + `params` must outlive the `co_await`. Build `params` with `io::PgParams::make(args...)`, which takes the same arguments as `queryArgs`. |
+| `template<io::PgArg... Args> queryArgs(const char* sql, Args&&...)` | `Task<PgResult>` | Binds each argument as listed under **Arguments** below into a `PgParams` kept in the coroutine frame; forwards to `queryParams`. |
 | `queryWrite(const char* sql, const PgParams&, batch::WriteMode mode = Idempotent)` | `Task<batch::PgWriteResult>` | Sole write entry point (seq-ordered write batch). Result carries RETURNING rows + `affectedRows()`; `coalesced=true` ⇒ an identical `Idempotent` write was already batched, no DB round-trip. `WriteMode::Exclusive` (relative SET, guarded write, claim, `now()`-dependent value) is never coalesced: it runs once per caller, still batched. |
-| `template<typename... Args> redis(Args&&...)` | `Task<RedisResult>` | Variadic Redis command; args stringified, binary-safe. |
+| `template<io::RedisArg... Args> redis(Args&&...)` | `Task<RedisResult>` | Variadic Redis command (verb first); each argument is sent as listed under **Arguments** below, binary-safe. |
 | `redisDynamic(std::vector<std::string> args)` | `Task<RedisResult>` | Runtime-sized argv (verb first), e.g. MGET over N keys. |
 | `hasRedis()` / `initialized()` | `bool` (noexcept) | Whether Redis is configured / providers bound on this thread. |
 | `reset()` | `void` (noexcept) | Clear this thread's providers (testing). |
 
 `entityQueryParams` / `entityQueryParamsMany` also exist (entity-read paths routed through `submitEntityRead*` for `pk = ANY` batching/fusion) — repositories use these, not application code.
+
+**Arguments** — `queryArgs`, `PgParams::make` and `redis` accept a closed set of types, enforced by the `io::PgArg` and `io::RedisArg` concepts. Nothing converts implicitly: what is sent is exactly what is written.
+
+| Argument | PostgreSQL (`PgArg`) | Redis (`RedisArg`) |
+|---|---|---|
+| Number: any arithmetic type except `bool` and the character types (`int8_t`/`uint8_t` are numbers) | Exact decimal text | Exact decimal text |
+| `bool` | `t` / `f` | Refused (Redis has no boolean) |
+| `std::string`, `std::string_view`, `const char*` | Text | Bytes |
+| `std::nullptr_t` | `NULL` | Refused |
+| `std::optional<T>`, `T` a number, `bool` or text | `NULL` or `T` | Refused |
+| `std::vector<T>`, `T` a number, `bool`, text, or an `optional` of one | Array literal (`{1,2,3}`; text quoted when needed, `NULL` for an empty `optional`) | Refused (use `redisDynamic`) |
+| Enum, or any other type (including classes convertible to the above) | Compile error | Compile error |
+
+- **Floating point** is sent as the shortest text that reads back to the same value (`0.1` → `0.1`, `1e-7` → `1e-07`), independent of the C locale. NaN is sent as `NaN`, ±∞ as `Infinity`/`-Infinity`. Being text, the same value binds to a `real`, `double precision` or `numeric` column alike.
+- **An enum must say what it stands for**: its integer (`std::to_underlying(e)`) or its database text (a `std::string`). Binding it implicitly as an integer would hide a mismatch with a text or PostgreSQL `ENUM` column.
 
 **Initialization** (call once **per loop thread**, on that thread):
 
@@ -1006,11 +1021,25 @@ static void init(
 
 | Member | Returns | Notes |
 |---|---|---|
-| `get<T>(int col)` | `T` | Typed column. Specializations: `std::string`, `std::string_view`, `int32_t`, `int64_t`, `double`, `bool`, and `std::vector<Scalar>` (text-format PG arrays). Bad parse throws `PgError`. |
+| `get<T>(int col)` | `T` | Typed column (types below). A value that does not parse as `T` throws `PgError`. |
 | `getOpt<T>(int col)` | `std::optional<T>` | `nullopt` when the column is NULL. |
 | `isNull(int col)` | `bool` (noexcept) | NULL check. |
 | `rawValue(int col)` | `std::string_view` (noexcept) | Raw bytes (borrows the `PGresult`). |
 | `index()` | `int` (noexcept) | This row's index. |
+
+`get<T>` / `getOpt<T>` accept:
+
+| `T` | Reads |
+|---|---|
+| Number: any arithmetic type except `bool` and the character types | The whole value must be a `T` in range |
+| `bool` | `true` when the text starts with `t`, `T` or `1` (PostgreSQL sends `t`/`f`) |
+| `std::string` | A copy of the text |
+| `std::string_view` | The text, valid while the `PgResult` lives |
+| `std::vector<T>`, `T` a number, `bool` or `std::string` | A PostgreSQL array (`{1,2,3}`); a `NULL` element throws `PgError` |
+
+Any other `T` is a compile error.
+
+> **Numbers are parsed strictly.** `get<int64_t>` on `12.5` (e.g. `avg()`, which returns `numeric`) throws rather than truncating, and so does `get<int16_t>` on a value out of range. Read such a column as `double`, or cast it in SQL (`avg(x)::bigint`) to choose the rounding. The `PgError` message names the column, the value and the type: `column 2: '12.5' is not a valid int64`.
 
 **Errors** — no error enums; the I/O layer throws exception types (caught by the awaiter and rethrown from `await_resume`):
 
