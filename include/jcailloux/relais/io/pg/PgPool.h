@@ -294,7 +294,7 @@ public:
         co_return co_await guard.conn().queryParams(sql, params);
     }
 
-    template<typename... Args>
+    template<PgArg... Args>
     Task<PgResult> queryArgs(const char* sql, Args&&... args) {
         auto params = PgParams::make(std::forward<Args>(args)...);
         co_return co_await queryParams(sql, params);
@@ -305,7 +305,7 @@ public:
         co_return co_await guard.conn().execute(sql, params);
     }
 
-    template<typename... Args>
+    template<PgArg... Args>
     Task<int> executeArgs(const char* sql, Args&&... args) {
         auto params = PgParams::make(std::forward<Args>(args)...);
         co_return co_await execute(sql, params);
