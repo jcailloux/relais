@@ -21,6 +21,8 @@
 #include "jcailloux/relais/TypeTraits.h"
 #include "jcailloux/relais/entity/EntityConcepts.h"
 #include "jcailloux/relais/cache/CacheView.h"
+#include "jcailloux/relais/cache/MultiView.h"
+#include "jcailloux/relais/repository/KeyDedup.h"
 #include "jcailloux/relais/entity/FieldUpdate.h"
 #include "jcailloux/relais/repository/ConditionalWrite.h"
 #include "jcailloux/relais/repository/GuardSql.h"
@@ -436,6 +438,18 @@ public:
     }
 
     // =====================================================================
+    // Batched find (L3: database only)
+    // =====================================================================
+
+    /// Batched multi-id read: one WHERE pk = ANY($1) over the distinct ids.
+    /// view[i] maps to ids[i] (nullptr = absent); duplicate ids share one
+    /// entity. The view owns its entities. Empty ids → empty view, no I/O.
+    static io::Immediate<cache::MultiView<E>> findMany(std::span<const Key> ids) {
+        if (ids.empty()) return cache::MultiView<E>{};
+        return findManyTask(detail::dedupWithSlots<Key>(ids));
+    }
+
+    // =====================================================================
     // insert
     // =====================================================================
 
@@ -674,6 +688,11 @@ protected:
         auto entity = E::fromRow(result[0]);
         if (!entity) co_return {};
         co_return entity->binary();
+    }
+
+    static io::Task<cache::MultiView<E>> findManyTask(detail::DedupSlots<Key> keys) {
+        auto fetched = co_await findManyRaw(keys.unique);
+        co_return detail::ownedMultiView<E>(std::move(fetched), keys.slot);
     }
 
     // =====================================================================

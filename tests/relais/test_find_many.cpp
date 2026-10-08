@@ -438,7 +438,8 @@ TEMPLATE_TEST_CASE("findMany simple key: cold miss then zero-copy hot path",
 }
 
 TEMPLATE_TEST_CASE("findMany oracle: findMany[i] equals find(ids[i])",
-                   "[findmany][local]", L1TestUserRepo, FullCacheTestUserRepo) {
+                   "[findmany]", UncachedTestUserRepo, L2TestUserRepo,
+                   L1TestUserRepo, FullCacheTestUserRepo) {
     using Repo = TestType;
     TransactionGuard guard;
 
@@ -463,7 +464,8 @@ TEMPLATE_TEST_CASE("findMany oracle: findMany[i] equals find(ids[i])",
 }
 
 TEMPLATE_TEST_CASE("findMany dedup: duplicate ids share one entry",
-                   "[findmany][local]", L1TestUserRepo, FullCacheTestUserRepo) {
+                   "[findmany]", UncachedTestUserRepo, L2TestUserRepo,
+                   L1TestUserRepo, FullCacheTestUserRepo) {
     using Repo = TestType;
     TransactionGuard guard;
 
@@ -475,7 +477,7 @@ TEMPLATE_TEST_CASE("findMany dedup: duplicate ids share one entry",
     auto v = findManySync<Repo, int64_t>(ids);
     REQUIRE(v.size() == 5);
     REQUIRE(v[0]);
-    REQUIRE(v[0] == v[1]);          // same slot pointer → one unique key downstream
+    REQUIRE(v[0] == v[1]);          // same pointer → one unique key downstream
     REQUIRE(v[2] == nullptr);
     REQUIRE(v[3] == nullptr);       // duplicate absent → nullptr everywhere
     REQUIRE(v[4]);  REQUIRE(v[4]->username == "dup_b");
@@ -598,4 +600,89 @@ TEMPLATE_TEST_CASE("findMany partition key cross-partition end-to-end",
     REQUIRE(v[0]);  REQUIRE(v[0]->title == "yankee");  REQUIRE(v[0]->region == "us");
     REQUIRE(v[1]);  REQUIRE(v[1]->title == "euro");    REQUIRE(v[1]->region == "eu");
     REQUIRE(v[2] == nullptr);
+}
+
+// findMany without L1 (Uncached / Redis): self-contained MultiView owning its
+// entities, same signature as the L1 presets.
+// ---------------------------------------------------------------------------
+
+TEMPLATE_TEST_CASE("findMany without L1: edge cases", "[findmany][owned]",
+                   UncachedTestUserRepo, L2TestUserRepo) {
+    using Repo = TestType;
+    TransactionGuard guard;
+
+    SECTION("empty ids → empty view, synchronous, no frame") {
+        std::vector<int64_t> ids;
+        auto imm = Repo::findMany(std::span<const int64_t>(ids));
+        REQUIRE(imm.await_ready());
+        auto v = sync(std::move(imm));
+        REQUIRE(v.empty());
+    }
+
+    SECTION("N=1 present / absent") {
+        auto u = insertTestUser("own1", "own1@x", 1);
+        std::vector<int64_t> present = {u};
+        auto vp = findManySync<Repo, int64_t>(present);
+        REQUIRE(vp.size() == 1);  REQUIRE(vp[0]);  REQUIRE(vp[0]->username == "own1");
+
+        std::vector<int64_t> absent = {-7};
+        auto va = findManySync<Repo, int64_t>(absent);
+        REQUIRE(va.size() == 1);  REQUIRE(va[0] == nullptr);
+    }
+
+    SECTION("all absent → all nullptr") {
+        std::vector<int64_t> ids = {-1, -2, -3};
+        auto v = findManySync<Repo, int64_t>(ids);
+        REQUIRE(v.size() == 3);
+        for (const auto* p : v) REQUIRE(p == nullptr);
+    }
+
+    SECTION("request order with holes") {
+        auto u1 = insertTestUser("own_a", "owna@x", 1);
+        auto u2 = insertTestUser("own_b", "ownb@x", 2);
+        std::vector<int64_t> ids = {u2, -1, u1};
+        auto v = findManySync<Repo, int64_t>(ids);
+        REQUIRE(v.size() == 3);
+        REQUIRE(v[0]);  REQUIRE(v[0]->username == "own_b");
+        REQUIRE(v[1] == nullptr);
+        REQUIRE(v[2]);  REQUIRE(v[2]->username == "own_a");
+    }
+}
+
+TEST_CASE("findMany (Redis) served from MGET, no DB row", "[findmany][owned][l2]") {
+    TransactionGuard guard;
+
+    auto a = makeTestUser("own_l2a", "ownl2a@x", 11, -401);
+    auto b = makeTestUser("own_l2b", "ownl2b@x", 22, -402);
+    sync(relais_test::TestInternals::setInCache<L2TestUserRepo>(int64_t{-401}, a));
+    sync(relais_test::TestInternals::setInCache<L2TestUserRepo>(int64_t{-402}, b));
+
+    // Negative ids have no DB row → a present value can only come from L2.
+    std::vector<int64_t> ids = {-402, -401, -402};
+    auto v = findManySync<L2TestUserRepo, int64_t>(ids);
+    REQUIRE(v.size() == 3);
+    REQUIRE(v[0]);  REQUIRE(v[0]->username == "own_l2b");
+    REQUIRE(v[1]);  REQUIRE(v[1]->username == "own_l2a");
+    REQUIRE(v[2] == v[0]);
+}
+
+TEMPLATE_TEST_CASE("findMany without L1: composite key",
+                   "[findmany][owned][composite-key]",
+                   UncachedTestMembershipRepo, L2TestMembershipRepo) {
+    using Repo = TestType;
+    using MemKey = std::tuple<int64_t, int64_t>;
+    TransactionGuard guard;
+
+    insertTestMembership(1, 2, "ca");
+    insertTestMembership(2, 1, "cb");
+
+    std::vector<MemKey> ids;
+    ids.emplace_back(2, 1);
+    ids.emplace_back(20, 1);   // absent
+    ids.emplace_back(1, 2);
+    auto v = findManySync<Repo, MemKey>(ids);
+    REQUIRE(v.size() == 3);
+    REQUIRE(v[0]);  REQUIRE(v[0]->role == "cb");
+    REQUIRE(v[1] == nullptr);
+    REQUIRE(v[2]);  REQUIRE(v[2]->role == "ca");
 }
