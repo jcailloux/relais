@@ -409,10 +409,8 @@ public:
     // =====================================================================
 
     /// Find by ID. Returns epoch-guarded CacheView (empty if not found).
-    static io::Task<cache::CacheView<E>> find(const Key& id) {
-        auto entity = co_await findRaw(id);
-        if (!entity) co_return {};
-        co_return makeView(std::move(*entity));
+    static io::Immediate<cache::CacheView<E>> find(const Key& id) {
+        return findTask(id);
     }
 
     // =====================================================================
@@ -422,14 +420,8 @@ public:
     /// Find by ID and return JSON string (empty if not found). A successful but
     /// empty result is the only "absent" signal; every L3 error propagates (a
     /// read timeout or DB-down must not masquerade as a missing row).
-    static io::Task<std::string> findJson(const Key& id) {
-        auto params = io::PgParams::fromKey(id);
-        auto result = co_await PgProvider::queryParams(
-            Mapping::SQL::select_by_pk, params);
-        if (result.empty()) co_return {};
-        auto entity = E::fromRow(result[0]);
-        if (!entity) co_return {};
-        co_return entity->json();
+    static io::Immediate<std::string> findJson(const Key& id) {
+        return findJsonTask(id);
     }
 
     // =====================================================================
@@ -437,16 +429,10 @@ public:
     // =====================================================================
 
     /// Find by ID and return binary (BEVE) vector (empty if not found).
-    static io::Task<std::vector<uint8_t>> findBinary(const Key& id)
+    static io::Immediate<std::vector<uint8_t>> findBinary(const Key& id)
         requires HasBinarySerialization<E>
     {
-        auto params = io::PgParams::fromKey(id);
-        auto result = co_await PgProvider::queryParams(
-            Mapping::SQL::select_by_pk, params);
-        if (result.empty()) co_return {};
-        auto entity = E::fromRow(result[0]);
-        if (!entity) co_return {};
-        co_return entity->binary();
+        return findBinaryTask(id);
     }
 
     // =====================================================================
@@ -656,6 +642,38 @@ protected:
         auto* ptr = pool().New(std::move(entity));
         pool().Retire(ptr);
         return cache::CacheView<E>(ptr, std::move(guard));
+    }
+
+    // =====================================================================
+    // Read coroutines behind the Immediate-returning find* wrappers
+    // =====================================================================
+
+    static io::Task<cache::CacheView<E>> findTask(const Key& id) {
+        auto entity = co_await findRaw(id);
+        if (!entity) co_return {};
+        co_return makeView(std::move(*entity));
+    }
+
+    static io::Task<std::string> findJsonTask(const Key& id) {
+        auto params = io::PgParams::fromKey(id);
+        auto result = co_await PgProvider::queryParams(
+            Mapping::SQL::select_by_pk, params);
+        if (result.empty()) co_return {};
+        auto entity = E::fromRow(result[0]);
+        if (!entity) co_return {};
+        co_return entity->json();
+    }
+
+    static io::Task<std::vector<uint8_t>> findBinaryTask(const Key& id)
+        requires HasBinarySerialization<E>
+    {
+        auto params = io::PgParams::fromKey(id);
+        auto result = co_await PgProvider::queryParams(
+            Mapping::SQL::select_by_pk, params);
+        if (result.empty()) co_return {};
+        auto entity = E::fromRow(result[0]);
+        if (!entity) co_return {};
+        co_return entity->binary();
     }
 
     // =====================================================================
