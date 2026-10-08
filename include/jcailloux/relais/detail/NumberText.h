@@ -67,6 +67,23 @@ constexpr std::size_t maxChars() noexcept {
 template<TextNumber T>
 inline constexpr std::size_t kMaxNumberChars = number_text::maxChars<std::remove_cv_t<T>>();
 
+namespace number_text {
+
+/// Write the text of `v` into `buf`; returns the end of the text.
+template<TextNumber T>
+char* write(char (&buf)[kMaxNumberChars<T>], T v) noexcept {
+    if constexpr (std::is_floating_point_v<T>) {
+        if (!std::isfinite(v)) [[unlikely]] {
+            const std::string_view s = std::isnan(v) ? "NaN" : (v < 0 ? "-Infinity" : "Infinity");
+            return std::copy(s.begin(), s.end(), buf);
+        }
+    }
+    // Cannot fail: buf holds the longest representation of T.
+    return std::to_chars(buf, buf + sizeof(buf), v).ptr;
+}
+
+}  // namespace number_text
+
 /// Append the decimal text of `v` to `out`, independent of the C locale.
 ///
 /// Integers are written exactly. Floating-point values use the shortest text
@@ -76,24 +93,15 @@ inline constexpr std::size_t kMaxNumberChars = number_text::maxChars<std::remove
 /// `Infinity`, `-Infinity`.
 template<TextNumber T>
 void appendNumber(std::string& out, T v) {
-    if constexpr (std::is_floating_point_v<T>) {
-        if (!std::isfinite(v)) [[unlikely]] {
-            out += std::isnan(v) ? "NaN" : (v < 0 ? "-Infinity" : "Infinity");
-            return;
-        }
-    }
     char buf[kMaxNumberChars<T>];
-    // Cannot fail: buf holds the longest representation of T.
-    const auto res = std::to_chars(buf, buf + sizeof(buf), v);
-    out.append(buf, res.ptr);
+    out.append(buf, number_text::write(buf, v));
 }
 
-/// `appendNumber` into a fresh string.
+/// `appendNumber` into a fresh string, allocated at its exact size.
 template<TextNumber T>
 [[nodiscard]] std::string toText(T v) {
-    std::string out;
-    appendNumber(out, v);
-    return out;
+    char buf[kMaxNumberChars<T>];
+    return std::string(buf, number_text::write(buf, v));
 }
 
 /// Parse `text` as a `T`, strictly: the whole token must be consumed and the
