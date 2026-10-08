@@ -7,9 +7,19 @@
 - **Every number type is accepted** as a query or Redis argument, unsigned
   integers included, and read by `get<T>`/`getOpt<T>` (`float`, `int16_t`,
   `uint64_t`…).
+- **`findMany` on every preset.** `Uncached` and `Redis` repos gain it, same
+  signature; without L1 the returned view owns its entities.
 
 ### Changed (Breaking)
 
+- **The repository API no longer depends on the preset.** Every method has the
+  same signature, return type included, on `Uncached`, `Local`, `Redis` and
+  `Both`: changing `cache_level` never breaks compilation. `find`, `findJson`
+  and `findBinary` now return `io::Immediate<…>` on `Uncached` and `Redis` too;
+  code that names `io::Task<…>` for them switches to `io::Immediate<…>` or
+  `auto`.
+- **`sweep(chunk_id)` is no longer public API.** The library sweeps L1 itself;
+  `purge()` clears the caches.
 - **Query arguments form a closed set**, checked by `io::PgArg` (`queryArgs`,
   `PgParams::make`) and `io::RedisArg` (`redis`); see `docs/api-reference.md ›
   Arguments`. An enum, alone or in an `optional`/`vector`, no longer compiles:
@@ -26,6 +36,9 @@
   value; under a non-C `LC_NUMERIC` they were written with a decimal comma.
   Entity writes, filters, `queryArgs` and `redis` now send the shortest text
   that reads back the same value. Values already stored are not repaired.
+- **`size`, `purge` and `warmup` did not compile without L1**: absent on
+  `Uncached`/`Redis`, a hard error on a list repo. They now return `0` or do
+  nothing.
 
 ## [3.2.1] - 2026-09-27
 

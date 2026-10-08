@@ -24,7 +24,11 @@ New to relais? Read [concepts.md](concepts.md) first for the mental model, then 
 
 The `Repo<E, Name, Cfg, Invalidations...>` class is the single user-facing type. It assembles a compile-time mixin tower (`PgRepo` → `RedisRepo` → `LocalRepo` → `ListMixin` → `InvalidationMixin`) selected by `Cfg.cache_level` and entity traits; every method below is reached through name-hiding on this final class.
 
-Two contracts hold across the whole surface: every method is **`static`**, and every read/write **returns `io::Task<...>`** (or `io::Immediate<...>` on the L1 fast path, awaitable identically).
+Three contracts hold across the whole surface:
+
+- every method is **`static`**;
+- **the API does not depend on the preset**: every method below has the same signature, return type included, on `Uncached`, `Local`, `Redis` and `Both`, so changing `Cfg.cache_level` never breaks the caller's compilation. Only the entity (`HasListDescriptor`, `HasFieldUpdate`, …) and `Cfg.read_only` gate a method;
+- reads return **`io::Immediate<...>`** (resolved without a coroutine frame when L1 holds the value), writes return **`io::Task<...>`**; `co_await` consumes both.
 
 ### Type aliases
 
@@ -37,7 +41,7 @@ Two contracts hold across the whole surface: every method is **`static`**, and e
 | `WrapperType` | `E` | Same as `EntityType`. |
 | `FindResultType` | `cache::CacheView<E>` | The guarded view `find` resolves to. |
 
-> List configs additionally expose `ListQuery`, `ListQueryParams`, `QueryBuilder`, `Cursor`, `ListResult`, `ListTraits`, `ListDescriptorType` (see Lists).
+> List configs additionally expose `ListQuery`, `ListQueryParams`, `QueryBuilder`, `Cursor`, `ListResult`, `ListTraits`, `ListDescriptorType`; all but `ListResult` are distinct per repo (see [Repo re-exports](#repo-re-exports-list-enabled-config)).
 
 ### Reads
 
@@ -45,12 +49,12 @@ Single-key reads resolve to an **epoch-guarded `cache::CacheView<E>`** (defined 
 
 | Method | Returns | Constraints | Notes |
 |---|---|---|---|
-| `find(const Key& id)` | `Immediate<CacheView<E>>` (L1) / `Task<CacheView<E>>` (L2, L3) | — | L1 hit returns synchronously via `Immediate` (no coroutine frame); miss falls through L2→L3. |
-| `findJson(const Key& id)` | `Immediate<std::string>` / `Task<std::string>` | — | Empty string if absent. L2-BEVE hit transcodes via `glz::beve_to_json` (no entity build); L2-JSON hit returns raw. |
-| `findBinary(const Key& id)` | `Immediate<std::vector<uint8_t>>` / `Task<...>` | `HasBinarySerialization<E>` | Empty vector if absent. L2-Binary hit returns raw bytes. |
-| `findMany(std::span<const Key> ids)` | `Immediate<cache::MultiView<E>>` | **L1 only** (`LocalRepo`) | `view[i] ↔ ids[i]` (`nullptr` = absent). Dedups input; all-L1-hit is zero-copy & frameless; misses fold into one L2 MGET + one L3 `ANY`. |
+| `find(const Key& id)` | `Immediate<CacheView<E>>` | — | L1 hit resolves synchronously (no coroutine frame); miss falls through L2→L3. |
+| `findJson(const Key& id)` | `Immediate<std::string>` | — | Empty string if absent. L2-BEVE hit transcodes via `glz::beve_to_json` (no entity build); L2-JSON hit returns raw. |
+| `findBinary(const Key& id)` | `Immediate<std::vector<uint8_t>>` | `HasBinarySerialization<E>` | Empty vector if absent. L2-Binary hit returns raw bytes. |
+| `findMany(std::span<const Key> ids)` | `Immediate<cache::MultiView<E>>` | — | `view[i] ↔ ids[i]` (`nullptr` = absent). Dedups input; L1 hits are zero-copy (all-hit is frameless), the rest fold into one L2 MGET + one L3 `ANY`. Without L1, the view owns its entities. |
 
-> `Immediate<T>` is awaitable, so `co_await Repo::find(id)` compiles uniformly whatever `Cfg` selects — an L1 hit is synchronous and frameless, an L2/L3 miss suspends. See [caching.md](caching.md) for the epoch/eviction model.
+> `co_await Repo::find(id)` completes synchronously on an L1 hit and suspends on an L2/L3 read. See [caching.md](caching.md) for the epoch/eviction model.
 
 > **Reads throw on a DB error; a write reports a *deterministic* one as a value.**
 > `find`/`findJson`/`findBinary`/`findMany` **propagate** an L3 error (timeout,
@@ -71,7 +75,7 @@ Available only when `!Cfg.read_only`. Each write flows down the full chain: L3 c
 
 | Method | Returns | Constraints | Notes |
 |---|---|---|---|
-| `insert(const E& e)` | `Task<CacheView<E>>` | `CreatableEntity<E,Key>` (L1/L2) / `MutableEntity<E>` (L3) `&& !Cfg.read_only` | Empty view on error. Populates L1+L2; notifies lists. |
+| `insert(const E& e)` | `Task<CacheView<E>>` | `MutableEntity<E> && !Cfg.read_only` | Empty view on error. Populates L1+L2; notifies lists. |
 | `update(const Key&, const E&)` | `Task<std::optional<size_t>>` | `MutableEntity<E> && HasFullUpdate<E> && !Cfg.read_only` | Rows affected (`0` = not found), `nullopt` = DB error. Strategy via `Cfg.update_strategy`: `InvalidateAndLazyReload` (evict) vs optimistic write-through. |
 | `updateJson(const Key&, std::string_view)` | `Task<std::optional<size_t>>` | `MutableEntity<E> && HasFullUpdate<E> && !Cfg.read_only` | Parses JSON → `update`. `nullopt` on parse failure or DB error. |
 | `updateBinary(const Key&, std::span<const uint8_t>)` | `Task<std::optional<size_t>>` | `… && HasBinarySerialization<E> && !Cfg.read_only` | Parses BEVE → `update`. `nullopt` on parse failure or DB error. |
@@ -177,10 +181,9 @@ Present only when the entity declares a `ListDescriptor` (the `ListMixin` layer)
 |---|---|---|
 | `name()` | `const char*` (constexpr) | The compile-time repo name / Redis key prefix. |
 | `config` | `static constexpr CacheConfig` | The `Cfg` NTTP (data member, not a call). |
-| `size()` | `size_t` | L1 entity-cache entry count. (`LocalRepo`+ only.) |
-| `sweep(long chunk_id)` | `bool` | Sweep one chunk (entity + list); driven by `GDSFPolicy`. Returns whether anything was removed. |
-| `purge()` | `size_t` | Sweep/clear all chunks (entity + list); returns entries removed. |
-| `warmup()` | `void` | Prime L1 entity (and list) caches at startup. |
+| `size()` | `size_t` | L1 entity-cache entry count; `0` without L1. |
+| `purge()` | `size_t` | Clear the L1 entity (and list) caches; returns entries removed, `0` without L1. |
+| `warmup()` | `void` | Prime the L1 entity (and list) caches at startup; no-op without L1. |
 
 ```cpp
 #if RELAIS_ENABLE_METRICS
@@ -190,11 +193,9 @@ static void                  resetMetrics();
 ```
 - **availability**: `metrics`/`resetMetrics` exist **only** when compiled with `RELAIS_ENABLE_METRICS`. The snapshot fields populate per active tier (L1, L2, list L1/L2) plus the global sweep counters; absent tiers stay zero.
 
-> `size`, `sweep`, `purge`, `warmup` are L1-cache concepts (`LocalRepo`/`ListMixin`). On `Uncached`/`Redis`-only presets the chain terminates at `PgRepo`, which does not provide them.
-
 <details><summary>Public-but-internal members (not part of the supported surface)</summary>
 
-The mixin layers also expose a few `public` methods that exist for cross-invalidation wiring or debugging, not for application use: `invalidateAllListGroups()` / `invalidateListGroupByKey(key, sort_value)` (coarse/targeted list-group eviction primitives that a target repo's `invalidateByTarget` builds on), `makeGroupKey(...)` / `makeRedisKey(key)` (key derivation), `evictRedis(key)` (L2-only evict), and `avgConstructionTime()` (L1 timing, testing/debug). They are reachable on `Repo` by name-hiding but are not contract surface — prefer the documented methods above.
+The mixin layers also expose a few `public` methods that exist for cross-invalidation wiring or debugging, not for application use: `invalidateAllListGroups()` / `invalidateListGroupByKey(key, sort_value)` (coarse/targeted list-group eviction primitives that a target repo's `invalidateByTarget` builds on), `makeGroupKey(...)` / `makeRedisKey(key)` (key derivation), `evictRedis(key)` (L2-only evict), `sweep(chunk_id)` (one L1 chunk, called by `GDSFPolicy`), and `avgConstructionTime()` (L1 timing, testing/debug). They are reachable on `Repo` by name-hiding but are not contract surface — prefer the documented methods above.
 </details>
 
 → Guides: [caching.md](caching.md), [lists.md](lists.md), [invalidation.md](invalidation.md)
@@ -671,7 +672,7 @@ repo.invalidateWhere({.gallery_id = gid});
 
 ### Repo re-exports (list-enabled config)
 
-When the entity has a `ListDescriptor`, `Repo` exposes these aliases and types (from `ListMixin`):
+When the entity has a `ListDescriptor`, `Repo` exposes these aliases and types (from `ListMixin`). `Descriptor` is tagged with the repo, so every type below except `ListResult` differs between two repos, even of the same entity: a query or cursor built for one is rejected by the other at compile time. Name them through the repo (`Repo::ListQuery`) or `auto`; they then follow a preset change.
 
 | Alias | Definition |
 |---|---|
@@ -870,7 +871,7 @@ The awaitable family in `io/Task.h`. All repository reads/writes resolve to one 
 | `Immediate<T>` | Zero-overhead awaitable wrapping `variant<T, Task<T>>` (no extra discriminant). | Sync/async branch on the hot path: `Immediate(T)` is a ready value (no `Task` allocated); `Immediate(Task<T>)` delegates. Ready case: `await_ready()==true`, single move out of the variant, no coroutine frame. `take_task()` extracts the inner `Task` (valid only when `!await_ready()`). |
 | `DetachedTask` | Eager, fire-and-forget coroutine (`initial_suspend`/`final_suspend` = `suspend_never`); self-destructs on completion. | Starts immediately on call. **Exceptions are swallowed** (logged if `RELAIS_LOG_ERROR`). For async work nobody awaits. |
 
-> **`co_await` unifies `Task` and `Immediate`.** Both expose `await_ready`/`await_suspend`/`await_resume`, and a pre-resolved `Task` (`fromValue`/`ready`) or a ready `Immediate` short-circuits with `await_ready()==true` — no suspend, no frame. So `co_await Repo::find(id)` compiles and runs uniformly whether the active tier returns `Immediate<...>` (L1 fast path) or `Task<...>` (L2/L3).
+> **`co_await` unifies `Task` and `Immediate`.** Both expose `await_ready`/`await_suspend`/`await_resume`, and a pre-resolved `Task` (`fromValue`/`ready`) or a ready `Immediate` short-circuits with `await_ready()==true` — no suspend, no frame. Repository reads return `Immediate<...>` and writes `Task<...>`, whatever the preset.
 
 ### Outcome
 

@@ -218,7 +218,8 @@ and running relais on a foreign loop (Drogon/asio/…) are in
 | `config::Both` | L1 + L2 | High-read, feature flags |
 
 Start from a preset and override with `.with_*()` chaining. Read path:
-`L1 → L2 → DB`, back-filling each tier on the way up.
+`L1 → L2 → DB`, back-filling each tier on the way up. The API is identical on
+every preset: switching one never breaks compilation.
 
 ## Navigating this documentation
 

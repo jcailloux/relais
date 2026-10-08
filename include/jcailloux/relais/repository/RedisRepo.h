@@ -582,7 +582,7 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
         /// get their TTL refreshed in the same MGET round-trip (mgetRawEx); the
         /// detached fill resets TTL on the warmed misses.
         /// Precondition: ids deduplicated (dedup lives at the public entry,
-        /// LocalRepo::findMany); no re-dedup here.
+        /// findMany); no re-dedup here.
         static io::Task<std::vector<std::optional<E>>> findManyRaw(std::span<const Key> ids) {
             std::vector<std::optional<E>> out(ids.size());
             if (ids.empty()) co_return out;
