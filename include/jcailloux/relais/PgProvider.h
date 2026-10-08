@@ -2,14 +2,12 @@
 #define JCX_RELAIS_PG_PROVIDER_H
 
 #include <cassert>
-#include <concepts>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <type_traits>
 #include <vector>
 
 #include "jcailloux/relais/io/Task.h"
@@ -124,25 +122,25 @@ public:
     // Redis operations
     // =========================================================================
 
-    /// Execute a Redis command with variadic arguments.
-    /// Arguments are converted to strings. Binary data can be passed as
-    /// std::string_view (including embedded NUL bytes — all args are
+    /// Execute a Redis command with variadic arguments (see io::RedisArg).
+    /// Numbers are sent as their exact decimal text. Binary data can be passed
+    /// as std::string_view (including embedded NUL bytes — all args are
     /// binary-safe since RESP2 uses length-prefixed strings).
     ///
     /// Usage:
     ///   co_await PgProvider::redis("SET", "key", "value");
-    ///   co_await PgProvider::redis("SETEX", key, std::to_string(ttl), value);
+    ///   co_await PgProvider::redis("SETEX", key, ttl, value);
     ///   co_await PgProvider::redis("EVAL", lua_script, "1", tracking_key);
     ///   co_await PgProvider::redis("SETEX", key, ttl_str,
     ///       std::string_view(reinterpret_cast<const char*>(bin.data()), bin.size()));
-    template<typename... Args>
+    template<io::RedisArg... Args>
     static io::Task<io::RedisResult> redis(Args&&... args) {
         if (!redis_exec_) throw std::logic_error("PgProvider::redis() called before init() or Redis not configured");
 
         // Build argv in the coroutine frame — lifetime extends until co_await completes.
         std::vector<std::string> arg_strs;
         arg_strs.reserve(sizeof...(args));
-        (arg_strs.push_back(toStr(std::forward<Args>(args))), ...);
+        (arg_strs.push_back(io::detail::redisArgText(std::forward<Args>(args))), ...);
 
         std::vector<const char*> argv;
         std::vector<size_t> argvlen;
@@ -344,22 +342,6 @@ public:
 
     // IoPool needs to set these directly
     friend class io::IoPool;
-
-private:
-
-    // =========================================================================
-    // String conversion helpers for Redis args
-    // =========================================================================
-
-    static std::string toStr(const char* s) { return s; }
-    static std::string toStr(std::string_view s) { return std::string(s); }
-    static std::string toStr(const std::string& s) { return s; }
-    static std::string toStr(std::string&& s) { return std::move(s); }
-
-    template<typename T> requires std::integral<T>
-    static std::string toStr(T v) { return std::to_string(v); }
-
-    static std::string toStr(double v) { return std::to_string(v); }
 };
 
 }  // namespace jcailloux::relais
