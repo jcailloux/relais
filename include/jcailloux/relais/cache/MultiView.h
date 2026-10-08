@@ -59,7 +59,7 @@ public:
     [[nodiscard]] auto end() const noexcept { return items_.end(); }
 
     // -------------------------------------------------------------------------
-    // Builder API (driven by LocalRepo::findMany)
+    // Builder API (driven by findMany)
     // -------------------------------------------------------------------------
 
     /// Install the batch epoch guard covering every L1-slot pointer.

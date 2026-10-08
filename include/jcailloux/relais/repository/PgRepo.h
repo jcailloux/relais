@@ -464,7 +464,8 @@ public:
     /// Prime the L1 cache: no-op without L1.
     static constexpr void warmup() noexcept {}
 
-    /// Sweep one L1 chunk: nothing to sweep without L1, returns false.
+    /// Sweep one L1 chunk: nothing to sweep without L1, returns false. Not public
+    /// API (GDSFPolicy drives the real sweep); lets ListMixin::sweep compile.
     static constexpr bool sweep(long) noexcept { return false; }
 
     // =====================================================================
@@ -736,7 +737,7 @@ protected:
     /// concurrent single finds into a single deduplicated ANY (K segments → 1),
     /// while remaining one alloc / one frame for the isolated findMany.
     /// Precondition: ids already deduplicated (dedup lives at the public entry,
-    /// LocalRepo::findMany); no re-dedup here.
+    /// findMany); no re-dedup here.
     static io::Task<std::vector<std::optional<E>>> findManyRaw(std::span<const Key> ids) {
         std::vector<std::optional<E>> out(ids.size());
         if (ids.empty()) co_return out;

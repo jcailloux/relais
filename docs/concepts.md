@@ -67,7 +67,9 @@ The consequence is the single most important property of the library:
 > features you turned on.
 
 The presets name the common towers: `Uncached` (PgRepo only), `Local` (+ L1),
-`Redis` (+ L2), `Both` (L1 + L2).
+`Redis` (+ L2), `Both` (L1 + L2). The tower changes, the API does not: every
+preset exposes the same methods with the same signatures, so switching preset
+never breaks compilation.
 
 > The full layer-by-layer assembly is in
 > [internals.md](internals.md); the presets and every `CacheConfig` field are in

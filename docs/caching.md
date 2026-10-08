@@ -92,6 +92,10 @@ To cap L1 by *memory* (a hard ceiling with proactive eviction), build with
 > long L2). The `1h` L1 figure cited above is the struct default, which `Local` and
 > uncustomized configs use; `Both` overrides it.
 
+Switching preset never breaks compilation: every `Repo` method has the same
+signature, return type included, on all four presets. Without L1, the L1
+maintenance calls (`size`/`purge`/`warmup`) return `0` or do nothing.
+
 ### Composing
 
 ```cpp
@@ -281,9 +285,9 @@ auto updated = co_await EventRepo::patch(eventId,
 
 ## Batched reads with `findMany`
 
-`findMany(ids)` reads many keys in one shot. It is available on L1-bearing repos
-(`Local`, `Both`) and returns a `MultiView<E>` — a guarded, read-only view where
-`view[i]` corresponds to `ids[i]`:
+`findMany(ids)` reads many keys in one shot. It is available on every preset and
+returns a `MultiView<E>` — a read-only view where `view[i]` corresponds to
+`ids[i]`:
 
 ```cpp
 std::vector<int64_t> ids = {7, 7, 4, -1};
@@ -300,19 +304,24 @@ Contract:
 - **Order preserved, holes are absent.** `view[i]` maps positionally to `ids[i]`;
   a `nullptr` slot means the id was found in no tier. Duplicate ids collapse to a
   single downstream entry and share one pointer.
-- **One round-trip per tier.** The L1 misses are batched into a single `MGET`
-  (L2) and a single `WHERE pk = ANY($1)` (L3) — never N sequential lookups. The
-  saving scales with the miss count, not the request size.
+- **One round-trip per tier.** The ids L1 does not hold (all of them without L1)
+  are batched into a single `MGET` (L2) and a single `WHERE pk = ANY($1)` (L3) —
+  never N sequential lookups. The saving scales with the miss count, not the
+  request size.
 - **L1 hits are zero-copy.** Hits return the live L1 slot pointer; nothing is
   copied or rehydrated.
-- **Lifetime is the view's guard.** All slot pointers are pinned by one batch
-  `EpochGuard` held inside the `MultiView`. They stay dereferenceable for as long
-  as the view is alive — and must not outlive it.
-- **Detached L2 warming.** On `Both`, L3 hits that missed L2 are written back to
-  Redis fire-and-forget; the view returns without waiting for the fill.
-- **Fast paths.** Empty `ids` → empty view, no guard, no I/O. All ids hitting L1
-  → synchronous resolution with no coroutine frame (still allocates the dedup and
-  view buffers — the batch wins on misses, not on the all-hit micro-path).
+- **Lifetime is the view's.** L1 hit pointers are pinned by one batch
+  `EpochGuard` held inside the `MultiView`; entities read from L2/L3 that L1 does
+  not keep (all of them without L1) are moved into the view. Either way, every
+  pointer stays dereferenceable for as long as the view is alive — and must not
+  outlive it.
+- **Detached L2 warming.** On `Redis` and `Both`, L3 hits that missed L2 are
+  written back to Redis fire-and-forget; the view returns without waiting for
+  the fill.
+- **Fast paths.** Empty `ids` → empty view, no guard, no I/O, no coroutine
+  frame. All ids hitting L1 → synchronous resolution with no coroutine frame
+  (still allocates the dedup and view buffers — the batch wins on misses, not on
+  the all-hit micro-path).
 
 ## Method signatures
 
