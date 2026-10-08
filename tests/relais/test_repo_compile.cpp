@@ -18,6 +18,7 @@
  */
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/catch_template_test_macros.hpp>
 #include <type_traits>
 #include <tuple>
 
@@ -132,6 +133,23 @@ TEST_CASE("LocalRepo features", "[repository][compile][cached]") {
     SECTION("warmup") {
         L1TestItemRepo::warmup();
     }
+}
+
+// =============================================================================
+// L1 maintenance without L1: same API, neutral results
+// =============================================================================
+
+TEMPLATE_TEST_CASE("L1 maintenance without L1 is neutral", "[repository][compile][maintenance]",
+                   UncachedTestItemRepo, L2TestItemRepo,
+                   UncachedTestArticleRepo, L2TestArticleRepo) {
+    STATIC_REQUIRE(std::is_same_v<decltype(TestType::size()), size_t>);
+    STATIC_REQUIRE(std::is_same_v<decltype(TestType::purge()), size_t>);
+    STATIC_REQUIRE(std::is_same_v<decltype(TestType::warmup()), void>);
+
+    REQUIRE(TestType::size() == 0);
+    REQUIRE(TestType::purge() == 0);
+    TestType::warmup();
+    REQUIRE(TestType::size() == 0);
 }
 
 // =============================================================================
