@@ -406,7 +406,7 @@ only the entity caches; the rows still exist, so cached list pages stay valid
 ## List methods
 
 A list-enabled repo adds `query()` and `listSize()`, and its L1 maintenance
-calls (`sweep`/`purge`/`warmup`) cover both the entity and list caches;
+calls (`purge`/`warmup`) cover both the entity and list caches;
 `ListDescriptorType` is the alias you pass to `parseListQuery*<…>` and the
 builder. Exact signatures and the full set of `Repo` list aliases are in
 [api-reference.md › Repository API](api-reference.md#repository-api) and
