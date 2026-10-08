@@ -82,6 +82,15 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
             return findBinaryTask(id);
         }
 
+        /// Batched multi-id read: one MGET (L2) over the distinct ids, then one
+        /// ANY (L3) over the L2 misses. view[i] maps to ids[i] (nullptr =
+        /// absent); duplicate ids share one entity. The view owns its entities.
+        /// Empty ids → empty view, no I/O.
+        static io::Immediate<cache::MultiView<E>> findMany(std::span<const Key> ids) {
+            if (ids.empty()) return cache::MultiView<E>{};
+            return findManyTask(detail::dedupWithSlots<Key>(ids));
+        }
+
         /// Insert entity in database with L2 cache population.
         /// Returns epoch-guarded CacheView (empty on error).
         static io::Task<cache::CacheView<E>> insert(const E& entity)
@@ -498,6 +507,11 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
             auto view = co_await findTask(id);
             if (!view) co_return {};
             co_return view->binary();
+        }
+
+        static io::Task<cache::MultiView<E>> findManyTask(detail::DedupSlots<Key> keys) {
+            auto fetched = co_await findManyRaw(keys.unique);
+            co_return detail::ownedMultiView<E>(std::move(fetched), keys.slot);
         }
 
         /// Find with L2 -> L3 fallback, returning entity by value.
