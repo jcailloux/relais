@@ -13,6 +13,7 @@
 
 #include <libpq-fe.h>
 
+#include "jcailloux/relais/TypeTraits.h"
 #include "jcailloux/relais/io/pg/PgError.h"
 
 namespace jcailloux::relais::io {
@@ -179,14 +180,6 @@ namespace detail {
 template<typename>
 inline constexpr bool always_false_v = false;
 
-template<typename T> struct is_std_vector : std::false_type {};
-template<typename U, typename A> struct is_std_vector<std::vector<U, A>> : std::true_type {};
-template<typename T> inline constexpr bool is_std_vector_v = is_std_vector<T>::value;
-
-template<typename T> struct is_optional : std::false_type {};
-template<typename U> struct is_optional<std::optional<U>> : std::true_type {};
-template<typename T> inline constexpr bool is_optional_v = is_optional<T>::value;
-
 /// Parse one already-unquoted scalar token from a PostgreSQL array element.
 template<typename T>
 inline T parseArrayElement(std::string_view sv) {
@@ -261,7 +254,7 @@ inline std::vector<T> parsePgArray(std::string_view s) {
 // with a readable message instead of an opaque link error.
 template<typename T>
 inline T PgResult::Row::get(int col) const {
-    if constexpr (detail::is_std_vector_v<T>) {
+    if constexpr (is_std_vector_v<T>) {
         return detail::parsePgArray<typename T::value_type>(rawValue(col));
     } else {
         static_assert(detail::always_false_v<T>,

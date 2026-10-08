@@ -1,14 +1,17 @@
 #ifndef JCX_RELAIS_IO_PG_PARAMS_H
 #define JCX_RELAIS_IO_PG_PARAMS_H
 
-#include <cstdint>
+#include <concepts>
+#include <cstddef>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <tuple>
+#include <type_traits>
 #include <vector>
 
 #include "jcailloux/relais/TypeTraits.h"
+#include "jcailloux/relais/detail/NumberText.h"
 
 namespace jcailloux::relais::io {
 
@@ -51,36 +54,18 @@ public:
         return PgParam(std::string(s));
     }
 
-    static PgParam integer(int32_t v) {
-        return PgParam(std::to_string(v));
-    }
-
-    static PgParam bigint(int64_t v) {
-        return PgParam(std::to_string(v));
+    /// Exact decimal text of any number: the shortest text that reads back to
+    /// the same value for floating point, whatever the C locale.
+    template<relais::detail::TextNumber T>
+    static PgParam number(T v) {
+        return PgParam(relais::detail::toText(v));
     }
 
     static PgParam boolean(bool v) {
         return PgParam(std::string(v ? "t" : "f"));
     }
 
-    static PgParam floating(double v) {
-        return PgParam(std::to_string(v));
-    }
-
-    // Nullable variants
-    template<typename T>
-    static PgParam fromOptional(const std::optional<T>& opt) {
-        if (!opt) return null();
-        return fromValue(*opt);
-    }
-
 private:
-    static PgParam fromValue(int32_t v) { return integer(v); }
-    static PgParam fromValue(int64_t v) { return bigint(v); }
-    static PgParam fromValue(bool v) { return boolean(v); }
-    static PgParam fromValue(const std::string& v) { return text(v); }
-    static PgParam fromValue(std::string_view v) { return text(v); }
-
     std::string value_;
     bool null_ = true;
 
@@ -90,6 +75,47 @@ private:
         return a.value_ == b.value_;
     }
 };
+
+// PgArg — the closed set of types a query argument binds as
+//
+//   number (any arithmetic type but bool and characters)  exact decimal text
+//   bool                                                  t / f
+//   std::string, std::string_view, const char*            text
+//   std::nullptr_t                                        NULL
+//   std::optional<scalar>                                 NULL or the scalar
+//   std::vector<scalar or optional<scalar>>               PostgreSQL array literal
+//   PgParam                                               as is
+//
+// Nothing converts implicitly: what is bound is exactly what is written. An enum
+// may mean its integer or its database text, so it must say which.
+
+namespace detail {
+
+template<typename T>
+concept PgScalarArg = relais::detail::TextNumber<T> || std::same_as<T, bool>
+                      || std::same_as<T, std::string> || std::same_as<T, std::string_view>
+                      || std::same_as<T, const char*> || std::same_as<T, char*>;
+
+template<typename T>
+concept PgElementArg = PgScalarArg<T>
+                       || (is_optional_v<T> && PgScalarArg<typename T::value_type>);
+
+template<typename T>
+concept PgValueArg = PgElementArg<T> || std::same_as<T, std::nullptr_t>
+                     || std::same_as<T, PgParam>
+                     || (is_std_vector_v<T> && PgElementArg<typename T::value_type>);
+
+/// The type an argument holds once its optional/vector wrapper is removed.
+template<typename T> struct pg_arg_inner { using type = T; };
+template<typename T> struct pg_arg_inner<std::optional<T>> : pg_arg_inner<T> {};
+template<typename T, typename A> struct pg_arg_inner<std::vector<T, A>> : pg_arg_inner<T> {};
+
+}  // namespace detail
+
+template<typename T>
+concept PgArg =
+    !std::is_enum_v<typename detail::pg_arg_inner<std::decay_t<T>>::type>  // bind an enum explicitly: std::to_underlying(e) for its integer, or its codec's toDb(e) for its text
+    && detail::PgValueArg<std::decay_t<T>>;
 
 // PgParams — helper to build parameter arrays for PQsendQueryParams
 
@@ -135,7 +161,7 @@ struct PgParams {
     }
 
     // Variadic construction helper
-    template<typename... Args>
+    template<PgArg... Args>
     static PgParams make(Args&&... args) {
         PgParams result;
         result.params.reserve(sizeof...(args));
@@ -144,7 +170,7 @@ struct PgParams {
     }
 
     // Incremental construction helpers (for complex cases: enums, json)
-    template<typename T>
+    template<PgArg T>
     void push(T&& v) { params.push_back(toParam(std::forward<T>(v))); }
 
     void pushNull() { params.push_back(PgParam::null()); }
@@ -197,7 +223,12 @@ struct PgParams {
             std::string arr = "{";
             for (size_t i = 0; i < keys.size(); ++i) {
                 if (i > 0) arr += ',';
-                appendArrayElement(arr, keys[i].params[col]);
+                const PgParam& p = keys[i].params[col];
+                if (p.isNull()) {
+                    arr += "NULL";
+                } else {
+                    appendArrayText(arr, {p.data(), static_cast<size_t>(p.length())});
+                }
             }
             arr += '}';
             result.params.push_back(PgParam(std::move(arr)));
@@ -211,6 +242,7 @@ struct PgParams {
     /// `= ANY($n)` callers (e.g. list IN filters); numeric elements stay unquoted,
     /// strings are quoted/escaped when they contain a delimiter.
     template<typename T>
+        requires PgArg<std::vector<T>>
     static PgParam arrayLiteral(const std::vector<T>& v) {
         return toParam(v);
     }
@@ -227,11 +259,13 @@ struct PgParams {
     }
 
 private:
+    // Scalar binding. Only reached through PgArg-constrained entry points, so
+    // the overloads never see an enum or a convertible class.
     static PgParam toParam(PgParam p) { return p; }
-    static PgParam toParam(int32_t v) { return PgParam::integer(v); }
-    static PgParam toParam(int64_t v) { return PgParam::bigint(v); }
-    static PgParam toParam(double v) { return PgParam::floating(v); }
-    static PgParam toParam(bool v) { return PgParam::boolean(v); }
+    template<relais::detail::TextNumber T>
+    static PgParam toParam(T v) { return PgParam::number(v); }
+    template<std::same_as<bool> B>
+    static PgParam toParam(B v) { return PgParam::boolean(v); }
     static PgParam toParam(const char* v) { return PgParam::text(v); }
     static PgParam toParam(std::string_view v) { return PgParam::text(v); }
     static PgParam toParam(const std::string& v) { return PgParam::text(v); }
@@ -239,29 +273,47 @@ private:
 
     template<typename T>
     static PgParam toParam(const std::optional<T>& v) {
-        return PgParam::fromOptional(v);
+        if (!v) return PgParam::null();
+        return toParam(*v);
     }
 
     // Array column: serialize a vector into a PostgreSQL text-format array literal
-    // {e1,e2,...}. Each element reuses the scalar toParam (so numeric elements are
-    // never quoted) and is quoted/escaped when it contains a delimiter — the inverse
-    // of PgResult::Row::get<std::vector<T>>'s parser.
+    // {e1,e2,...}, written in place. Numbers and booleans never contain a
+    // delimiter and stay unquoted; text is quoted/escaped when it does — the
+    // inverse of PgResult::Row::get<std::vector<T>>'s parser.
     template<typename T>
     static PgParam toParam(const std::vector<T>& v) {
         std::string arr = "{";
-        for (size_t i = 0; i < v.size(); ++i) {
-            if (i > 0) arr += ',';
-            appendArrayElement(arr, toParam(v[i]));
+        bool first = true;
+        for (const T& e : v) {
+            if (!first) arr += ',';
+            first = false;
+            appendArrayElement(arr, e);
         }
         arr += '}';
         return PgParam(std::move(arr));
     }
 
-    // Append one already-serialized scalar param as an array element, quoting and
-    // backslash-escaping it when it contains a PG array delimiter.
-    static void appendArrayElement(std::string& arr, const PgParam& p) {
-        if (p.isNull()) { arr += "NULL"; return; }
-        std::string_view val(p.data(), static_cast<size_t>(p.length()));
+    template<typename T>
+    static void appendArrayElement(std::string& arr, const T& e) {
+        if constexpr (is_optional_v<T>) {
+            if (e) {
+                appendArrayElement(arr, *e);
+            } else {
+                arr += "NULL";
+            }
+        } else if constexpr (relais::detail::TextNumber<T>) {
+            relais::detail::appendNumber(arr, e);
+        } else if constexpr (std::same_as<T, bool>) {
+            arr += e ? 't' : 'f';
+        } else {
+            appendArrayText(arr, std::string_view(e));
+        }
+    }
+
+    // Append one text element, quoting and backslash-escaping it when it is
+    // empty or contains a PG array delimiter.
+    static void appendArrayText(std::string& arr, std::string_view val) {
         bool needs_quoting = val.empty();
         if (!needs_quoting) {
             for (char c : val) {
