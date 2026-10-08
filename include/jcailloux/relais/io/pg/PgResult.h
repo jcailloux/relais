@@ -1,7 +1,8 @@
 #ifndef JCX_RELAIS_IO_PG_RESULT_H
 #define JCX_RELAIS_IO_PG_RESULT_H
 
-#include <charconv>
+#include <bit>
+#include <concepts>
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
@@ -14,6 +15,7 @@
 #include <libpq-fe.h>
 
 #include "jcailloux/relais/TypeTraits.h"
+#include "jcailloux/relais/detail/NumberText.h"
 #include "jcailloux/relais/io/pg/PgError.h"
 
 namespace jcailloux::relais::io {
@@ -177,8 +179,27 @@ private:
 
 namespace detail {
 
-template<typename>
-inline constexpr bool always_false_v = false;
+template<typename T>
+consteval const char* numberTypeName() {
+    if constexpr (std::is_floating_point_v<T>) {
+        if constexpr (std::same_as<T, float>) return "float";
+        else if constexpr (std::same_as<T, double>) return "double";
+        else return "long double";
+    } else {
+        constexpr const char* names[2][4] = {{"uint8", "uint16", "uint32", "uint64"},
+                                             {"int8", "int16", "int32", "int64"}};
+        return names[std::is_signed_v<T>][std::countr_zero(sizeof(T))];
+    }
+}
+
+/// Parse a numeric token strictly: the whole token must be a `T`. `what` names
+/// the token in the error ("column 3", "array element").
+template<relais::detail::TextNumber T>
+inline T parsePgNumber(std::string_view token, auto&& what) {
+    if (auto v = relais::detail::parseNumber<T>(token)) [[likely]] return *v;
+    throw PgError(std::string(what()) + ": '" + std::string(token)
+                  + "' is not a valid " + numberTypeName<T>());
+}
 
 /// Parse one already-unquoted scalar token from a PostgreSQL array element.
 template<typename T>
@@ -187,14 +208,10 @@ inline T parseArrayElement(std::string_view sv) {
         return std::string(sv);
     } else if constexpr (std::is_same_v<T, bool>) {
         return !sv.empty() && (sv[0] == 't' || sv[0] == 'T' || sv[0] == '1');
-    } else if constexpr (std::is_arithmetic_v<T>) {
-        T val{};
-        auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), val);
-        if (ec != std::errc{}) [[unlikely]]
-            throw PgError("from_chars failed for array element '" + std::string(sv) + "'");
-        return val;
+    } else if constexpr (relais::detail::TextNumber<T>) {
+        return parsePgNumber<T>(sv, [] { return "array element"; });
     } else {
-        static_assert(always_false_v<T>, "Unsupported array element type");
+        static_assert(false, "Unsupported array element type");
     }
 }
 
@@ -249,16 +266,18 @@ inline std::vector<T> parsePgArray(std::string_view s) {
 
 // Type specializations for Row::get<T>
 
-// Primary template: only valid for std::vector<Scalar> (array columns); every
-// supported scalar has an explicit specialization below. Any other type fails here
-// with a readable message instead of an opaque link error.
+// Primary template: numbers (strict, exact) and std::vector<Scalar> (array
+// columns); text and bool have explicit specializations below. Any other type
+// fails here with a readable message instead of an opaque link error.
 template<typename T>
 inline T PgResult::Row::get(int col) const {
-    if constexpr (is_std_vector_v<T>) {
+    if constexpr (relais::detail::TextNumber<T>) {
+        return detail::parsePgNumber<T>(rawValue(col),
+                                        [col] { return "column " + std::to_string(col); });
+    } else if constexpr (is_std_vector_v<T>) {
         return detail::parsePgArray<typename T::value_type>(rawValue(col));
     } else {
-        static_assert(detail::always_false_v<T>,
-                      "PgResult::Row::get<T>: unsupported type");
+        static_assert(false, "PgResult::Row::get<T>: unsupported type");
     }
 }
 
@@ -270,36 +289,6 @@ inline std::string PgResult::Row::get<std::string>(int col) const {
 template<>
 inline std::string_view PgResult::Row::get<std::string_view>(int col) const {
     return rawValue(col);
-}
-
-template<>
-inline int32_t PgResult::Row::get<int32_t>(int col) const {
-    auto sv = rawValue(col);
-    int32_t val = 0;
-    auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), val);
-    if (ec != std::errc{}) [[unlikely]]
-        throw PgError("from_chars failed for int32 column " + std::to_string(col));
-    return val;
-}
-
-template<>
-inline int64_t PgResult::Row::get<int64_t>(int col) const {
-    auto sv = rawValue(col);
-    int64_t val = 0;
-    auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), val);
-    if (ec != std::errc{}) [[unlikely]]
-        throw PgError("from_chars failed for int64 column " + std::to_string(col));
-    return val;
-}
-
-template<>
-inline double PgResult::Row::get<double>(int col) const {
-    auto sv = rawValue(col);
-    double val = 0;
-    auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), val);
-    if (ec != std::errc{}) [[unlikely]]
-        throw PgError("from_chars failed for double column " + std::to_string(col));
-    return val;
 }
 
 template<>
