@@ -31,6 +31,8 @@
 #include <jcailloux/relais/io/redis/RedisPool.h>
 #include <jcailloux/relais/io/redis/RedisError.h>
 #include <jcailloux/relais/io/batch/BatchScheduler.h>
+#include <jcailloux/relais/io/batch/TimingEstimator.h>
+#include <jcailloux/relais/Log.h>
 #include <jcailloux/relais/io/WhenAll.h>
 
 #include <fixtures/ControllableIoContext.h>
@@ -47,6 +49,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <variant>
 #include <vector>
 
@@ -666,6 +669,121 @@ TEST_CASE("coherence: a list miss with a down L2 serves the PostgreSQL page",
     CohEnv env(300ms, /*with_redis=*/true, 200ms);
     SECTION("Redis preset") { listReadSurvivesDownL2<CohArticleRedis>(env); }
     SECTION("Both preset")  { listReadSurvivesDownL2<CohArticleBoth>(env); }
+}
+
+// -- Redis error replies under load ---------------------------------------------
+//
+// Under concurrency a Redis command leaves in a pipelined batch instead of going
+// direct. An error reply (here WRONGTYPE: the key holds another type) must fail
+// it the same way on both paths, so the cache degrades and logs instead of
+// reading the error as a value.
+
+// Captures warnings for the lifetime of the object.
+struct WarnCapture {
+    static inline std::vector<std::string> lines;
+    log::Callback previous;
+
+    WarnCapture() : previous(log::getCallback()) {
+        lines.clear();
+        log::setCallback([](log::Level level, const char* msg, size_t len) {
+            if (level == log::Level::Warn) lines.emplace_back(msg, len);
+        });
+    }
+    ~WarnCapture() { log::setCallback(previous); }
+
+    bool any(std::string_view a, std::string_view b) const {
+        return std::ranges::any_of(lines, [&](const std::string& l) {
+            return l.find(a) != std::string::npos && l.find(b) != std::string::npos;
+        });
+    }
+};
+
+// Successful sends past the batch scheduler's bootstrap threshold, so a command
+// sent while another is in flight joins a pipelined batch.
+static void bootstrapRedisBatching(CohEnv& env) {
+    for (int i = 0; i < io::batch::TimingEstimator::kBootstrapThreshold + 2; ++i)
+        driveBounded(env.io, PgProvider::redis("PING"));
+}
+
+// Runs `work` while a PING loop keeps a Redis command in flight, so each Redis
+// command `work` sends joins a pipelined batch.
+template<typename T>
+static io::Task<T> underRedisLoad(io::Immediate<T> work) {
+    bool stop = false;
+    auto noise = [](bool& stop) -> io::Task<void> {
+        while (!stop) co_await PgProvider::redis("PING");
+    };
+    auto run = [](io::Immediate<T> w, bool& stop) -> io::Task<T> {
+        try {
+            auto r = co_await std::move(w);
+            stop = true;
+            co_return r;
+        } catch (...) {
+            stop = true;
+            throw;
+        }
+    };
+    // whenAll starts its children in order: the PING loop first, so it is
+    // already in flight when `work` sends its first command.
+    auto [_, r] = co_await io::whenAll(noise(stop), run(std::move(work), stop));
+    co_return std::move(r);
+}
+
+template<typename ListRepo>
+static void listReadSurvivesL2ErrorReply(CohEnv& env) {
+    namespace ld = jcailloux::relais::list::spec;
+    using Desc = typename ListRepo::ListDescriptorType;
+
+    env.probe.query("DELETE FROM relais_test_articles");
+    if constexpr (requires { ListRepo::listCache(); })
+        relais_test::TestInternals::resetListCacheState<ListRepo>();
+    env.probe.query(
+        "INSERT INTO relais_test_articles (category, author_id, title) VALUES "
+        "('coh-l2err', 1, 'a'), ('coh-l2err', 1, 'b'), ('coh-l2err', 1, 'c')");
+    driveBounded(env.io, env.redis->exec("FLUSHDB"));
+    // The master hash of list groups held as a string: the store-back HSET
+    // answers WRONGTYPE.
+    driveBounded(env.io, env.redis->exec(
+        "SET", std::string(ListRepo::name()) + ":dlist_groups", "x"));
+    bootstrapRedisBatching(env);
+
+    ld::ListQueryParams<Desc> p;
+    p.limit = 10;
+    p.filters.template get<"category">() = std::string("coh-l2err");
+    auto query = ld::seal<Desc>(std::move(p));
+
+    WarnCapture warns;
+    auto before = env.batcher->redisPipelinedEntries();
+    auto page = driveBounded(env.io, underRedisLoad(ListRepo::query(std::move(query))));
+    REQUIRE(page->size() == 3);
+    CHECK(env.batcher->redisPipelinedEntries() > before);
+    CHECK(warns.any("list master HSET error", "WRONGTYPE"));
+}
+
+TEST_CASE("coherence: a list miss under load survives an L2 error reply",
+          "[coherence][degrade][list][redis][integration]") {
+    CohEnv env(300ms, /*with_redis=*/true, 200ms);
+    SECTION("Redis preset") { listReadSurvivesL2ErrorReply<CohArticleRedis>(env); }
+    SECTION("Both preset")  { listReadSurvivesL2ErrorReply<CohArticleBoth>(env); }
+}
+
+TEST_CASE("coherence: an entity read under load degrades an L2 error reply to L3",
+          "[coherence][degrade][redis][integration]") {
+    CohEnv env(300ms, /*with_redis=*/true, 200ms);
+    resetBoth(env);
+    auto id = env.seedItem("wrongtype", 42);
+    // The entity key held as a hash: the L2 GET answers WRONGTYPE.
+    driveBounded(env.io, env.redis->exec(
+        "HSET", std::string(CohItemBoth::name()) + ":" + std::to_string(id), "f", "v"));
+    bootstrapRedisBatching(env);
+
+    WarnCapture warns;
+    auto before = env.batcher->redisPipelinedEntries();
+    auto e = driveBounded(env.io, underRedisLoad(CohItemBoth::find(id)));
+    REQUIRE(e);
+    CHECK(e->value == 42);
+    CHECK(env.batcher->redisPipelinedEntries() > before);
+    CHECK(warns.any("getRawBinary error", "WRONGTYPE"));
 }
 
 // =============================================================================

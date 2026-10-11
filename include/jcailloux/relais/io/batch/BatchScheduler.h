@@ -210,6 +210,11 @@ public:
     /// Access the timing estimator (for testing/diagnostics).
     [[nodiscard]] const TimingEstimator& estimator() const noexcept { return estimator_; }
 
+    /// Redis commands sent inside a pipelined batch so far (for testing/diagnostics).
+    [[nodiscard]] uint64_t redisPipelinedEntries() const noexcept {
+        return redis_pipelined_entries_;
+    }
+
     // =========================================================================
     // Ordered teardown
     // =========================================================================
@@ -1175,6 +1180,7 @@ private:
             }
 
             // Pipeline: one lock, one flush, one read
+            redis_pipelined_entries_ += entries.size();
             auto start = Clock::now();
             auto results = co_await client.pipelineExec(
                 cmds.data(), static_cast<int>(cmds.size()));
@@ -1182,9 +1188,15 @@ private:
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
                     Clock::now() - start).count());
 
-            // Distribute results
-            for (size_t i = 0; i < entries.size(); ++i)
-                entries[i]->result = std::move(results[i]);
+            // Distribute results. An error reply fails its own entry only, with
+            // the exception the direct path throws; the rest of the batch keeps
+            // its results.
+            for (size_t i = 0; i < entries.size(); ++i) {
+                if (results[i].isError())
+                    entries[i]->error = redisReplyError(results[i].errorMessage());
+                else
+                    entries[i]->result = std::move(results[i]);
+            }
 
             // Update network time estimator on single-entry batches
             if (entries.size() == 1)
@@ -1448,6 +1460,10 @@ private:
     // its frame teardown --), and read only on that same thread by
     // quiescentForTeardown during ordered teardown — no synchronization needed.
     size_t detached_inflight_ = 0;
+
+    // Redis entries sent inside a pipelined batch (fireRedisBatch). Loop-thread
+    // only, like the latches above.
+    uint64_t redis_pipelined_entries_ = 0;
 
     // Write sequence counter
     uint64_t next_write_seq_ = 0;

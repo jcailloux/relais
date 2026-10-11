@@ -834,6 +834,314 @@ TEST_CASE("BatchScheduler: PgProvider redis routes through batcher",
 }
 
 // =============================================================================
+// Redis error replies: the same exception on the direct and the pipelined path
+//
+// A command goes direct while the estimator bootstraps or when nothing is in
+// flight, and joins a pipelined batch when another command is in flight. The
+// caller cannot tell which, so an error reply must throw the same way on both.
+// redisPipelinedEntries() proves which path a case took.
+// =============================================================================
+
+namespace {
+
+// An EVALSHA digest no server has cached.
+constexpr const char* kUnknownSha = "ffffffffffffffffffffffffffffffffffffffff";
+
+struct RedisOutcome {
+    enum class Kind { Pending, Ok, NoScript, Error, Other } kind = Kind::Pending;
+    std::string value;  // Ok: the reply as text (string or integer)
+    std::string what;   // NoScript / Error / Other: the exception message
+};
+
+void recordReply(const RedisResult& r, RedisOutcome& out) {
+    out.kind = RedisOutcome::Kind::Ok;
+    out.value = r.isInteger() ? std::to_string(r.asInteger()) : r.asString();
+}
+
+// Command argv. A function call, not a braced list: GCC ICEs on an
+// initializer-list temporary inside a co_await expression.
+template<typename... A>
+std::vector<std::string> cmd(A&&... a) {
+    return {std::string(std::forward<A>(a))...};
+}
+
+// Runs one command through the scheduler and records how it ended.
+Task<RedisOutcome> redisOutcome(std::shared_ptr<BatchScheduler<Io>> batcher,
+                                std::vector<std::string> args)
+{
+    std::vector<const char*> argv;
+    std::vector<size_t> argvlen;
+    for (const auto& a : args) {
+        argv.push_back(a.data());
+        argvlen.push_back(a.size());
+    }
+    RedisOutcome out;
+    try {
+        auto r = co_await batcher->submitRedis(
+            static_cast<int>(argv.size()), argv.data(), argvlen.data());
+        recordReply(r, out);
+    } catch (const RedisNoScriptError& e) {
+        out = {RedisOutcome::Kind::NoScript, {}, e.what()};
+    } catch (const RedisError& e) {
+        out = {RedisOutcome::Kind::Error, {}, e.what()};
+    } catch (const std::exception& e) {
+        out = {RedisOutcome::Kind::Other, {}, e.what()};
+    }
+    co_return out;
+}
+
+// Fire-and-forget form, for commands that must be in the scheduler together.
+DetachedTask launchRedis(std::shared_ptr<BatchScheduler<Io>> batcher,
+                         std::atomic<int>& completed,
+                         std::vector<std::string> args, RedisOutcome* out)
+{
+    *out = co_await redisOutcome(std::move(batcher), std::move(args));
+    ++completed;
+}
+
+// Same through PgProvider::redis, the public entry point.
+template<typename... Args>
+Task<RedisOutcome> providerOutcome(Args... args)
+{
+    using jcailloux::relais::PgProvider;
+    RedisOutcome out;
+    try {
+        auto r = co_await PgProvider::redis(args...);
+        recordReply(r, out);
+    } catch (const RedisNoScriptError& e) {
+        out = {RedisOutcome::Kind::NoScript, {}, e.what()};
+    } catch (const RedisError& e) {
+        out = {RedisOutcome::Kind::Error, {}, e.what()};
+    } catch (const std::exception& e) {
+        out = {RedisOutcome::Kind::Other, {}, e.what()};
+    }
+    co_return out;
+}
+
+template<typename... Args>
+DetachedTask launchProvider(std::atomic<int>& completed, RedisOutcome* out, Args... args)
+{
+    *out = co_await providerOutcome(args...);
+    ++completed;
+}
+
+// Successful sends past the bootstrap threshold, so the next command sent while
+// another is in flight joins a pipelined batch. An error reply does not count
+// toward the threshold.
+Task<void> bootstrapRedis(std::shared_ptr<BatchScheduler<Io>> batcher)
+{
+    for (int i = 0; i < TimingEstimator::kBootstrapThreshold + 2; ++i) {
+        auto out = co_await redisOutcome(batcher, cmd("PING"));
+        REQUIRE(out.kind == RedisOutcome::Kind::Ok);
+    }
+}
+
+bool contains(const std::string& haystack, std::string_view needle) {
+    return haystack.find(needle) != std::string::npos;
+}
+
+void checkNoScript(const RedisOutcome& o) {
+    INFO("what: " << o.what);
+    CHECK(o.kind == RedisOutcome::Kind::NoScript);
+    CHECK(contains(o.what, "NOSCRIPT"));
+}
+
+void checkWrongType(const RedisOutcome& o) {
+    INFO("what: " << o.what);
+    CHECK(o.kind == RedisOutcome::Kind::Error);
+    CHECK(contains(o.what, "WRONGTYPE"));
+}
+
+void checkOk(const RedisOutcome& o, std::string_view value) {
+    INFO("what: " << o.what);
+    CHECK(o.kind == RedisOutcome::Kind::Ok);
+    CHECK(o.value == value);
+}
+
+} // anonymous namespace
+
+TEST_CASE("Redis error reply: the direct path throws the classified error",
+          "[io][batch][integration][redis][redis-error]")
+{
+    Io io;
+    bool done = false;
+    TimeoutGuard timeout(io);
+    RedisOutcome noscript, wrongtype;
+    uint64_t pipelined = 1;
+
+    auto task = [&]() -> DetachedTask {
+        auto redis = co_await RedisClient<Io>::connect(io);
+        auto redis_pool = std::make_shared<RedisPool<Io>>(
+            RedisPool<Io>::fromClients({std::move(redis)}));
+        auto batcher = std::make_shared<BatchScheduler<Io>>(io, nullptr, redis_pool, 8);
+
+        co_await redisOutcome(batcher, cmd("SET", "redis_err_str", "x"));
+        noscript = co_await redisOutcome(batcher, cmd("EVALSHA", kUnknownSha, "0"));
+        wrongtype = co_await redisOutcome(batcher, cmd("HINCRBY", "redis_err_str", "f", "1"));
+        co_await redisOutcome(batcher, cmd("DEL", "redis_err_str"));
+        pipelined = batcher->redisPipelinedEntries();
+        done = true;
+    };
+    task();
+
+    io.runUntil([&] { return done || timeout.timed_out; });
+    REQUIRE_FALSE(timeout.timed_out);
+    REQUIRE(done);
+
+    CHECK(pipelined == 0);
+    checkNoScript(noscript);
+    checkWrongType(wrongtype);
+}
+
+TEST_CASE("Redis error reply: a pipelined batch fails only the faulty entries",
+          "[io][batch][integration][redis][redis-error]")
+{
+    Io io;
+    bool done = false;
+    TimeoutGuard timeout(io);
+    // [0] leader (direct), [1..4] one pipelined batch.
+    std::array<RedisOutcome, 5> out{};
+    uint64_t pipelined = 0;
+
+    auto task = [&]() -> DetachedTask {
+        auto redis = co_await RedisClient<Io>::connect(io);
+        auto redis_pool = std::make_shared<RedisPool<Io>>(
+            RedisPool<Io>::fromClients({std::move(redis)}));
+        auto batcher = std::make_shared<BatchScheduler<Io>>(io, nullptr, redis_pool, 8);
+        co_await bootstrapRedis(batcher);
+        co_await redisOutcome(batcher, cmd("SET", "redis_err_str", "x"));
+        auto before = batcher->redisPipelinedEntries();
+
+        // Submitted in the same loop turn: the first goes direct, the other
+        // four accumulate during its round trip and leave as one batch.
+        std::atomic<int> completed{0};
+        launchRedis(batcher, completed, cmd("PING"), &out[0]);
+        launchRedis(batcher, completed, cmd("SET", "redis_err_ok", "kept"), &out[1]);
+        launchRedis(batcher, completed, cmd("EVALSHA", kUnknownSha, "0"), &out[2]);
+        launchRedis(batcher, completed, cmd("HINCRBY", "redis_err_str", "f", "1"), &out[3]);
+        launchRedis(batcher, completed, cmd("GET", "redis_err_ok"), &out[4]);
+        while (completed.load() < 5) co_await YieldAwaiter{io};
+
+        pipelined = batcher->redisPipelinedEntries() - before;
+        co_await redisOutcome(batcher, cmd("DEL", "redis_err_str", "redis_err_ok"));
+        done = true;
+    };
+    task();
+
+    io.runUntil([&] { return done || timeout.timed_out; });
+    REQUIRE_FALSE(timeout.timed_out);
+    REQUIRE(done);
+
+    CHECK(pipelined == 4);
+    checkOk(out[0], "PONG");
+    checkOk(out[1], "OK");
+    checkNoScript(out[2]);
+    checkWrongType(out[3]);
+    checkOk(out[4], "kept");
+}
+
+TEST_CASE("Redis error reply: PgProvider::redis throws on both paths",
+          "[io][batch][integration][redis][redis-error]")
+{
+    using jcailloux::relais::PgProvider;
+
+    Io io;
+    bool done = false;
+    TimeoutGuard timeout(io);
+    RedisOutcome direct_noscript, direct_wrongtype;
+    std::array<RedisOutcome, 3> batch{};  // [0] leader, [1..2] pipelined
+    uint64_t direct_pipelined = 1, batch_pipelined = 0;
+
+    auto task = [&]() -> DetachedTask {
+        auto redis = co_await RedisClient<Io>::connect(io);
+        auto redis_pool = std::make_shared<RedisPool<Io>>(
+            RedisPool<Io>::fromClients({std::move(redis)}));
+        auto batcher = std::make_shared<BatchScheduler<Io>>(io, nullptr, redis_pool, 8);
+        PgProvider::bindBatcher<Io>(batcher, /*with_redis=*/true);
+
+        co_await PgProvider::redis("SET", "redis_err_str", "x");
+        direct_noscript = co_await providerOutcome("EVALSHA", kUnknownSha, 0);
+        direct_wrongtype = co_await providerOutcome("HINCRBY", "redis_err_str", "f", 1);
+        direct_pipelined = batcher->redisPipelinedEntries();
+
+        co_await bootstrapRedis(batcher);
+        auto before = batcher->redisPipelinedEntries();
+        std::atomic<int> completed{0};
+        launchProvider(completed, &batch[0], "PING");
+        launchProvider(completed, &batch[1], "EVALSHA", kUnknownSha, 0);
+        launchProvider(completed, &batch[2], "HINCRBY", "redis_err_str", "f", 1);
+        while (completed.load() < 3) co_await YieldAwaiter{io};
+        batch_pipelined = batcher->redisPipelinedEntries() - before;
+
+        co_await PgProvider::redis("DEL", "redis_err_str");
+        PgProvider::reset();
+        done = true;
+    };
+    task();
+
+    io.runUntil([&] { return done || timeout.timed_out; });
+    REQUIRE_FALSE(timeout.timed_out);
+    REQUIRE(done);
+
+    CHECK(direct_pipelined == 0);
+    checkNoScript(direct_noscript);
+    checkWrongType(direct_wrongtype);
+
+    CHECK(batch_pipelined == 2);
+    checkOk(batch[0], "PONG");
+    checkNoScript(batch[1]);
+    checkWrongType(batch[2]);
+}
+
+TEST_CASE("Redis I/O error: a connection lost mid-batch fails every entry",
+          "[io][batch][integration][redis][redis-error]")
+{
+    Io io;
+    bool done = false;
+    TimeoutGuard timeout(io);
+    // [0] leader (direct), [1..3] one pipelined batch whose middle command makes
+    // the server close the connection after replying.
+    std::array<RedisOutcome, 4> out{};
+    uint64_t pipelined = 0;
+
+    auto task = [&]() -> DetachedTask {
+        auto redis = co_await RedisClient<Io>::connect(io);
+        auto redis_pool = std::make_shared<RedisPool<Io>>(
+            RedisPool<Io>::fromClients({std::move(redis)}));
+        auto batcher = std::make_shared<BatchScheduler<Io>>(io, nullptr, redis_pool, 8);
+        co_await bootstrapRedis(batcher);
+        auto id = co_await redisOutcome(batcher, cmd("CLIENT", "ID"));
+        REQUIRE(id.kind == RedisOutcome::Kind::Ok);
+        auto before = batcher->redisPipelinedEntries();
+
+        std::atomic<int> completed{0};
+        launchRedis(batcher, completed, cmd("PING"), &out[0]);
+        launchRedis(batcher, completed, cmd("PING"), &out[1]);
+        launchRedis(batcher, completed,
+                    cmd("CLIENT", "KILL", "ID", id.value, "SKIPME", "no"), &out[2]);
+        launchRedis(batcher, completed, cmd("PING"), &out[3]);
+        while (completed.load() < 4) co_await YieldAwaiter{io};
+
+        pipelined = batcher->redisPipelinedEntries() - before;
+        done = true;
+    };
+    task();
+
+    io.runUntil([&] { return done || timeout.timed_out; });
+    REQUIRE_FALSE(timeout.timed_out);
+    REQUIRE(done);
+
+    checkOk(out[0], "PONG");
+    // A lost connection fails the whole batch, replies already received included.
+    CHECK(pipelined == 3);
+    for (size_t i = 1; i < out.size(); ++i) {
+        INFO("entry " << i << " what: " << out[i].what);
+        CHECK(out[i].kind != RedisOutcome::Kind::Ok);
+        CHECK(out[i].kind != RedisOutcome::Kind::Pending);
+    }
+}
+
+// =============================================================================
 // Write coalescing tests
 // =============================================================================
 
