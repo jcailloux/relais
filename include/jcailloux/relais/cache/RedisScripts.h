@@ -76,6 +76,27 @@ return count
 )lua");
 
 // =============================================================================
+// List page store
+// =============================================================================
+
+/// KEYS[1] page, KEYS[2] tracking set [, KEYS[3] master hash]; ARGV[1] payload,
+/// ARGV[2] TTL in seconds [, ARGV[3] group key, ARGV[4] sort index]. With a master
+/// hash, records the group's sort index there; adds the page to the tracking set,
+/// whose TTL is set only if it has none (a later page does not extend it); writes
+/// the page with its TTL. A script runs alone but is not rolled back: the page is
+/// written last, so a failed step leaves no page that an invalidation cannot find.
+/// Returns 1.
+inline constexpr io::RedisScript kListStore = io::makeRedisScript(R"lua(
+if #KEYS == 3 then
+    redis.call('HSET', KEYS[3], ARGV[3], ARGV[4])
+end
+redis.call('SADD', KEYS[2], KEYS[1])
+redis.call('EXPIRE', KEYS[2], ARGV[2], 'NX')
+redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
+return 1
+)lua");
+
+// =============================================================================
 // One list group (tracking set "<group>:_keys")
 // =============================================================================
 
@@ -688,6 +709,7 @@ inline constexpr std::array kAllScripts{
     &kBumpGenMany,
     &kSetIfGen,
     &kSetManyIfGen,
+    &kListStore,
     &kInvalidateListGroup,
     &kInvalidateListGroupSelective,
     &kInvalidateListGroupSelectiveUpdate,

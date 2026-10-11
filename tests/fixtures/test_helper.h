@@ -15,6 +15,7 @@
 #include <jcailloux/relais/io/pg/PgParams.h>
 #include <jcailloux/relais/io/redis/RedisClient.h>
 #include <jcailloux/relais/PgProvider.h>
+#include <jcailloux/relais/cache/RedisScripts.h>
 
 #include <fixtures/EpollIoContext.h>
 #include <fixtures/TestRunner.h>
@@ -325,6 +326,16 @@ inline void initTest() {
     }
     detail::testRedis() = redis;
 
+    // Load every script once. A detached L2 fill whose script is not cached falls
+    // back to EVAL one round trip later, after the test's next command on this
+    // connection: preloading keeps fills ordered before the reads that follow.
+    // The fallback itself is covered by test_redis_scripts.
+    for (const auto* script : jcailloux::relais::cache::scripts::kAllScripts) {
+        try {
+            io::test::runTask(io, redis->exec("SCRIPT", "LOAD", script->body));
+        } catch (...) {}
+    }
+
     // Phase 2: Start background event loop thread
     detail::testLoop().start();
 
@@ -352,6 +363,25 @@ inline void flushRedis() {
     } catch (...) {
         // Ignore flush errors
     }
+}
+
+/**
+ * Poll until a key written by a detached L2 fill is visible (bounded). The
+ * fire-and-forget write is not ordered against a later read on another pooled
+ * connection, so a single read races it. Returning also means the write landed,
+ * so it cannot leak past the test's Redis flush.
+ */
+inline io::Task<std::optional<std::string>> getRawKey(std::string key) {
+    auto r = co_await jcailloux::relais::PgProvider::redis("GET", key);
+    if (r.isNil()) co_return std::nullopt;
+    co_return r.asString();
+}
+
+inline std::optional<std::string> awaitL2Key(const std::string& key) {
+    for (int i = 0; i < 200; ++i) {
+        if (auto v = sync(getRawKey(key))) return v;
+    }
+    return std::nullopt;
 }
 
 /**
