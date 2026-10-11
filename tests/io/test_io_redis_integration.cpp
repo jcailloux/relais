@@ -211,3 +211,92 @@ TEST_CASE("RedisClient multiple sequential commands", "[redis][integration]") {
 
     REQUIRE(count == 3);
 }
+
+// =============================================================================
+// Error replies
+// =============================================================================
+
+namespace {
+
+// An EVALSHA digest no server has cached.
+constexpr const char* kUnknownSha = "ffffffffffffffffffffffffffffffffffffffff";
+
+struct ErrorReply {
+    bool no_script = false;  // caught as RedisNoScriptError
+    bool error = false;      // caught as RedisError
+    std::string what;
+};
+
+template<typename... Args>
+Task<ErrorReply> execError(std::shared_ptr<RedisClient<EpollIoContext>> client, Args... args) {
+    ErrorReply out;
+    try {
+        co_await client->exec(args...);
+    } catch (const RedisNoScriptError& e) {
+        out.no_script = true;
+        out.what = e.what();
+    } catch (const RedisError& e) {
+        out.error = true;
+        out.what = e.what();
+    }
+    co_return out;
+}
+
+}  // namespace
+
+TEST_CASE("RedisClient error reply throws the classified error", "[redis][integration]") {
+    EpollIoContext io;
+
+    struct Outcomes { ErrorReply noscript, wrongtype; };
+    auto o = runTask(io, [](EpollIoContext& io) -> Task<Outcomes> {
+        auto client = co_await RedisClient<EpollIoContext>::connect(io, redisHost(), redisPort());
+        co_await client->exec("SET", "relais:io:test:err_str", "x");
+
+        Outcomes out;
+        out.noscript = co_await execError(client, "EVALSHA", kUnknownSha, 0);
+        out.wrongtype = co_await execError(client, "HINCRBY", "relais:io:test:err_str", "f", 1);
+
+        co_await client->exec("DEL", "relais:io:test:err_str");
+        co_return out;
+    }(io));
+
+    INFO("noscript: " << o.noscript.what);
+    CHECK(o.noscript.no_script);
+    CHECK(o.noscript.what.starts_with("NOSCRIPT"));
+
+    INFO("wrongtype: " << o.wrongtype.what);
+    CHECK(o.wrongtype.error);
+    CHECK_FALSE(o.wrongtype.no_script);
+    CHECK(o.wrongtype.what.starts_with("WRONGTYPE"));
+}
+
+TEST_CASE("RedisClient pipelineExec returns error replies as results", "[redis][integration]") {
+    EpollIoContext io;
+
+    struct Replies { bool first_ok, second_error, third_ok; std::string second_msg; };
+    auto r = runTask(io, [](EpollIoContext& io) -> Task<Replies> {
+        auto client = co_await RedisClient<EpollIoContext>::connect(io, redisHost(), redisPort());
+
+        const char* a1[] = {"PING"};
+        const char* a2[] = {"EVALSHA", kUnknownSha, "0"};
+        const char* a3[] = {"PING"};
+        size_t l1[] = {4};
+        size_t l2[] = {7, 40, 1};
+        size_t l3[] = {4};
+        using PCmd = RedisClient<EpollIoContext>::PipelineCmd;
+        PCmd cmds[3] = {{1, a1, l1}, {3, a2, l2}, {1, a3, l3}};
+
+        auto results = co_await client->pipelineExec(cmds, 3);
+        co_return Replies{
+            results[0].asString() == "PONG",
+            results[1].isError(),
+            results[2].asString() == "PONG",
+            results[1].errorMessage()};
+    }(io));
+
+    // Raw primitive: the scheduler, not the client, turns these into exceptions.
+    CHECK(r.first_ok);
+    CHECK(r.second_error);
+    CHECK(r.second_msg.starts_with("NOSCRIPT"));
+    CHECK(r.third_ok);
+}
