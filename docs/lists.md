@@ -1,12 +1,20 @@
 # List cache — ListMixin
 
-Paginated query results, cached in L1 with lazy validation via modification
-tracking. **Auto-activated** when the entity's Mapping carries an embedded
-`ListDescriptor` (detected by the `HasListDescriptor` concept) — no extra
-configuration on the `Repo`. The generator emits a `ListDescriptor` only when the
-entity has **at least one `sortable` field**; `filterable` alone gives you
-`eraseWhere`/`invalidateWhere` (see [Behavior & gotchas](#behavior--gotchas)) but
-no cached list.
+Paginated query results, cached in the tiers of the repo's preset with the same
+`l1_ttl` / `l2_ttl` as entities. Lists have no setting of their own.
+
+| Preset | List pages |
+|---|---|
+| `Uncached` | not cached: every `query()` reads PostgreSQL |
+| `Local` | L1 |
+| `Redis` | L2 |
+| `Both` | L1 + L2 |
+
+**Auto-activated** when the entity's Mapping carries an embedded `ListDescriptor`
+(detected by the `HasListDescriptor` concept). The generator emits a
+`ListDescriptor` only when the entity has **at least one `sortable` field**;
+`filterable` alone gives you `eraseWhere`/`invalidateWhere` (see
+[Behavior & gotchas](#behavior--gotchas)) but no cached list.
 
 > **Prerequisite:** [concepts.md](concepts.md) and [entities.md](entities.md).
 > This guide teaches list declaration and querying; the exact builder,
@@ -351,9 +359,14 @@ never coincides with the declaration site and is a footgun.
 
 ListMixin intercepts `insert`, `update`, `erase`, `patch` and the conditional
 writes (`patchIf`, `patchWhere`, `claim`) to notify the list cache of entity
-changes. The `ModificationTracker` records them; cached pages are
-validated **lazily** on the next `query()`. No manual
-`notifyCreated`/`notifyUpdated`/`notifyDeleted` for same-repo entities.
+changes. No manual `notifyCreated`/`notifyUpdated`/`notifyDeleted` for same-repo
+entities.
+
+- **L1**: the `ModificationTracker` records the change; cached pages are
+  validated **lazily** on the next `query()`. Another instance's L1 is not
+  notified: its pages expire with `l1_ttl`.
+- **L2**: the write deletes the affected pages at once, with one selective
+  script. This is best-effort: if Redis fails, the pages expire with `l2_ttl`.
 
 ```cpp
 // Done for you by ListMixin's CRUD interception:
@@ -388,7 +401,7 @@ it is driven directly by the predicate, in O(1)/O(groups):
   on the next `query()` when the predicate is *range-affecting* — group-compatible
   **and** sort-range-overlapping. The per-entity check is the `lo == hi` special
   case of this range check.
-- **L2**: one predicate-driven `EVAL` over the cached groups (`pmatch` set-vs-set
+- **L2**: one predicate-driven script over the cached groups (`pmatch` set-vs-set
   + `chk_range` overlap), one Redis round-trip.
 
 This fast-path is **filter-aware and never-miss**: it prunes only groups the
