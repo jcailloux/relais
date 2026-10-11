@@ -103,6 +103,8 @@ std::vector<Invocation> invocations() {
         {&scripts::kBumpGenMany, {gen}, {"1", "2"}, "2"},
         {&scripts::kSetIfGen, {gen, "test:scripts:e1"}, {"9", "1", "payload", "60"}, "0"},
         {&scripts::kSetManyIfGen, {gen, "test:scripts:e2"}, {"60", "9", "0", "payload"}, "1"},
+        {&scripts::kListStore, {"test:scripts:lp", "test:scripts:lg:_keys", kMaster},
+         {"payload", "60", "test:scripts:lg", "3"}, "1"},
         {&scripts::kInvalidateListGroup, {kTracking}, {}, "1"},
         {&scripts::kInvalidateListGroupSelective, {kTracking}, {"5", hdr}, "1"},
         {&scripts::kInvalidateListGroupSelectiveUpdate, {kTracking}, {"1", "5", hdr}, "1"},
@@ -181,6 +183,22 @@ io::Task<int64_t> opSetManyIfGen() {
 }
 void effectSetManyIfGen() { CHECK(getText("test:scripts:e2") == "payload"); }
 
+const std::string kListPage = "test:scripts:lp";
+const std::string kListGroup = "test:scripts:lg";
+
+io::Task<int64_t> opListStore() {
+    co_return co_await RedisCache::storeListPage(kListPage, "payload", 60, kListGroup,
+                                                 kMaster, 3) ? 1 : 0;
+}
+void effectListStore() {
+    CHECK(getText(kListPage) == "payload");
+    const auto ttl = sync(run({"TTL", kListPage})).asInteger();
+    CHECK(ttl > 0);
+    CHECK(ttl <= 60);
+    CHECK(sync(run({"SISMEMBER", kListGroup + ":_keys", kListPage})).asInteger() == 1);
+    CHECK(hget(kMaster, kListGroup) == 3);
+}
+
 void effectPageDeleted() { CHECK_FALSE(exists(kPage)); }
 
 io::Task<int64_t> opGroup() {
@@ -210,6 +228,7 @@ const std::array kOps{
     Op{"bumpGenMany", &scripts::kBumpGenMany, opBumpGenMany, 0, effectBumpGenMany},
     Op{"setIfGen", &scripts::kSetIfGen, opSetIfGen, 1, effectSetIfGen},
     Op{"setManyIfGen", &scripts::kSetManyIfGen, opSetManyIfGen, 1, effectSetManyIfGen},
+    Op{"storeListPage", &scripts::kListStore, opListStore, 1, effectListStore},
     Op{"invalidateListGroup", &scripts::kInvalidateListGroup, opGroup, 1, effectPageDeleted},
     Op{"invalidateListGroupSelective", &scripts::kInvalidateListGroupSelective,
        opGroupSelective, 1, effectPageDeleted},

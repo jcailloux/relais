@@ -638,46 +638,6 @@ TEST_CASE("coherence: a down L2 degrades reads to L3, order preserved",
     REQUIRE(mv[1]->value == 10);
 }
 
-// A list miss stores the page back into L2 after PostgreSQL answered. That
-// store-back is best-effort: a Redis that stops answering at that point must not
-// turn a read PostgreSQL already served into an error.
-template<typename ListRepo>
-static void listReadSurvivesDownL2(CohEnv& env) {
-    namespace ld = jcailloux::relais::list::spec;
-    using Desc = typename ListRepo::ListDescriptorType;
-
-    // No L2 flush needed: Redis is cut before the read, so the L2 lookup misses.
-    env.probe.query("DELETE FROM relais_test_articles");
-    if constexpr (requires { ListRepo::listCache(); })
-        relais_test::TestInternals::resetListCacheState<ListRepo>();
-    env.probe.query(
-        "INSERT INTO relais_test_articles (category, author_id, title) VALUES "
-        "('coh-l2down', 1, 'a'), ('coh-l2down', 1, 'b'), ('coh-l2down', 1, 'c')");
-
-    ld::ListQueryParams<Desc> p;
-    p.limit = 10;
-    p.filters.template get<"category">() = std::string("coh-l2down");
-    auto query = ld::seal<Desc>(std::move(p));
-
-    env.holdRedis();
-    auto page = driveBounded(env.io, ListRepo::query(std::move(query)));
-    REQUIRE(page->size() == 3);
-}
-
-TEST_CASE("coherence: a list miss with a down L2 serves the PostgreSQL page",
-          "[coherence][degrade][list][redis][integration]") {
-    CohEnv env(300ms, /*with_redis=*/true, 200ms);
-    SECTION("Redis preset") { listReadSurvivesDownL2<CohArticleRedis>(env); }
-    SECTION("Both preset")  { listReadSurvivesDownL2<CohArticleBoth>(env); }
-}
-
-// -- Redis error replies under load ---------------------------------------------
-//
-// Under concurrency a Redis command leaves in a pipelined batch instead of going
-// direct. An error reply (here WRONGTYPE: the key holds another type) must fail
-// it the same way on both paths, so the cache degrades and logs instead of
-// reading the error as a value.
-
 // Captures warnings for the lifetime of the object.
 struct WarnCapture {
     static inline std::vector<std::string> lines;
@@ -697,6 +657,60 @@ struct WarnCapture {
         });
     }
 };
+
+// Runs the loop until `done` holds, bounded.
+template<typename Pred>
+static bool pumpUntil(CohEnv& env, Pred done, std::chrono::milliseconds budget = 2s) {
+    const auto deadline = std::chrono::steady_clock::now() + budget;
+    while (!done()) {
+        if (std::chrono::steady_clock::now() >= deadline) return false;
+        env.io.runOnce(10);
+    }
+    return true;
+}
+
+// A list miss stores the page back into L2 after PostgreSQL answered, without
+// awaiting it. That store-back is best-effort: a Redis that stops answering must
+// not turn a read PostgreSQL already served into an error, and its own failure is
+// logged, never thrown.
+template<typename ListRepo>
+static void listReadSurvivesDownL2(CohEnv& env) {
+    namespace ld = jcailloux::relais::list::spec;
+    using Desc = typename ListRepo::ListDescriptorType;
+
+    // No L2 flush needed: Redis is cut before the read, so the L2 lookup misses.
+    env.probe.query("DELETE FROM relais_test_articles");
+    if constexpr (requires { ListRepo::listCache(); })
+        relais_test::TestInternals::resetListCacheState<ListRepo>();
+    env.probe.query(
+        "INSERT INTO relais_test_articles (category, author_id, title) VALUES "
+        "('coh-l2down', 1, 'a'), ('coh-l2down', 1, 'b'), ('coh-l2down', 1, 'c')");
+
+    ld::ListQueryParams<Desc> p;
+    p.limit = 10;
+    p.filters.template get<"category">() = std::string("coh-l2down");
+    auto query = ld::seal<Desc>(std::move(p));
+
+    WarnCapture warns;
+    env.holdRedis();
+    auto page = driveBounded(env.io, ListRepo::query(std::move(query)));
+    REQUIRE(page->size() == 3);
+    CHECK(pumpUntil(env, [&] { return warns.any("storeListPage error", ""); }));
+}
+
+TEST_CASE("coherence: a list miss with a down L2 serves the PostgreSQL page",
+          "[coherence][degrade][list][redis][integration]") {
+    CohEnv env(300ms, /*with_redis=*/true, 200ms);
+    SECTION("Redis preset") { listReadSurvivesDownL2<CohArticleRedis>(env); }
+    SECTION("Both preset")  { listReadSurvivesDownL2<CohArticleBoth>(env); }
+}
+
+// -- Redis error replies under load ---------------------------------------------
+//
+// Under concurrency a Redis command leaves in a pipelined batch instead of going
+// direct. An error reply (here WRONGTYPE: the key holds another type) must fail
+// it the same way on both paths, so the cache degrades and logs instead of
+// reading the error as a value.
 
 // Successful sends past the batch scheduler's bootstrap threshold, so a command
 // sent while another is in flight joins a pipelined batch.
@@ -741,8 +755,8 @@ static void listReadSurvivesL2ErrorReply(CohEnv& env) {
         "INSERT INTO relais_test_articles (category, author_id, title) VALUES "
         "('coh-l2err', 1, 'a'), ('coh-l2err', 1, 'b'), ('coh-l2err', 1, 'c')");
     driveBounded(env.io, env.redis->exec("FLUSHDB"));
-    // The master hash of list groups held as a string: the store-back HSET
-    // answers WRONGTYPE.
+    // The master hash of list groups held as a string: the store-back script's
+    // HSET answers WRONGTYPE.
     driveBounded(env.io, env.redis->exec(
         "SET", std::string(ListRepo::name()) + ":dlist_groups", "x"));
     bootstrapRedisBatching(env);
@@ -757,7 +771,13 @@ static void listReadSurvivesL2ErrorReply(CohEnv& env) {
     auto page = driveBounded(env.io, underRedisLoad(ListRepo::query(std::move(query))));
     REQUIRE(page->size() == 3);
     CHECK(env.batcher->redisPipelinedEntries() > before);
-    CHECK(warns.any("list master HSET error", "WRONGTYPE"));
+    // The store-back is not awaited: its error arrives after the read returned.
+    CHECK(pumpUntil(env, [&] { return warns.any("storeListPage error", "WRONGTYPE"); }));
+    // The script writes the page last: the failed HSET left no page behind that
+    // no group-wide invalidation could reach.
+    auto pages = driveBounded(env.io, env.redis->exec(
+        "KEYS", std::string(ListRepo::name()) + ":dlist:p:*"));
+    CHECK(pages.arraySize() == 0);
 }
 
 TEST_CASE("coherence: a list miss under load survives an L2 error reply",

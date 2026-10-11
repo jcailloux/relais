@@ -199,37 +199,11 @@ namespace jcailloux::relais::cache {
                 co_return std::nullopt;
             }
 
-            template<typename E, typename Rep, typename Period>
-            static io::Task<bool> setList(const std::string& key,
-                                               const std::vector<E>& entities,
-                                               std::chrono::duration<Rep, Period> ttl,
-                                               std::optional<list::ListBoundsHeader> header = std::nullopt) {
-                if (!PgProvider::hasRedis()) {
-                    co_return false;
-                }
-
-                try {
-                    auto ttl_seconds = std::chrono::duration_cast<std::chrono::seconds>(ttl).count();
-                    auto json = serializeList(entities);
-
-                    if (header) {
-                        // Prepend 19-byte binary header before JSON payload
-                        std::string prefixed(list::kListBoundsHeaderSize + json.size(), '\0');
-                        header->writeTo(reinterpret_cast<uint8_t*>(prefixed.data()));
-                        std::memcpy(prefixed.data() + list::kListBoundsHeaderSize,
-                                    json.data(), json.size());
-                        co_await PgProvider::redis("SETEX", key,
-                            ttl_seconds,
-                            std::string_view(prefixed.data(), prefixed.size()));
-                    } else {
-                        co_await PgProvider::redis("SETEX", key,
-                            ttl_seconds, json);
-                    }
-                    co_return true;
-                } catch (const std::exception& e) {
-                    RELAIS_LOG_WARN << "RedisCache SET list error: " << e.what();
-                    co_return false;
-                }
+            /// A list page as JSON, in the layout getList reads back.
+            template<typename E>
+            static std::string encodeList(const std::vector<E>& entities,
+                                          const std::optional<list::ListBoundsHeader>& header) {
+                return withListHeader(serializeList(entities), header);
             }
 
             // =================================================================
@@ -253,23 +227,16 @@ namespace jcailloux::relais::cache {
                 co_return parseListBeveWithHeader<E>(*data);
             }
 
-            template<typename E, typename Rep, typename Period>
-            static io::Task<bool> setListBeve(const std::string& key,
-                                                   const std::vector<E>& entities,
-                                                   std::chrono::duration<Rep, Period> ttl,
-                                                   std::optional<list::ListBoundsHeader> header = std::nullopt) {
+            /// A list page as BEVE, in the layout getListBeve reads back; nullopt
+            /// when the list does not serialize.
+            template<typename E>
+            static std::optional<std::string> encodeListBeve(
+                const std::vector<E>& entities,
+                const std::optional<list::ListBoundsHeader>& header)
+            {
                 auto beve = serializeListBeve(entities);
-                if (beve.empty() && !entities.empty()) co_return false;
-
-                if (header) {
-                    std::vector<uint8_t> prefixed(list::kListBoundsHeaderSize + beve.size());
-                    header->writeTo(prefixed.data());
-                    std::memcpy(prefixed.data() + list::kListBoundsHeaderSize,
-                                beve.data(), beve.size());
-                    co_return co_await setRawBinary(key, prefixed, ttl);
-                } else {
-                    co_return co_await setRawBinary(key, beve, ttl);
-                }
+                if (beve.empty() && !entities.empty()) return std::nullopt;
+                return withListHeader(std::move(beve), header);
             }
 
             /// Get raw JSON string without deserialization.
@@ -465,24 +432,28 @@ namespace jcailloux::relais::cache {
                 co_return std::nullopt;
             }
 
-            /// Store a list entity as binary.
-            template<typename ListEntity, typename Rep, typename Period>
-            static io::Task<bool> setListBinary(
-                const std::string& key,
+            /// A list entity as binary, in the layout getListBinary reads back.
+            template<typename ListEntity>
+            static std::string encodeListBinary(
                 const ListEntity& listEntity,
-                std::chrono::duration<Rep, Period> ttl,
-                std::optional<list::ListBoundsHeader> header = std::nullopt)
+                const std::optional<list::ListBoundsHeader>& header)
                 requires HasBinarySerialization<ListEntity>
             {
-                auto binary = listEntity.binary();
-                if (header) {
-                    std::vector<uint8_t> prefixed(list::kListBoundsHeaderSize + binary.size());
-                    header->writeTo(prefixed.data());
-                    std::memcpy(prefixed.data() + list::kListBoundsHeaderSize,
-                                binary.data(), binary.size());
-                    co_return co_await setRawBinary(key, prefixed, ttl);
-                }
-                co_return co_await setRawBinary(key, binary, ttl);
+                const auto binary = listEntity.binary();
+                return withListHeader(
+                    std::string(reinterpret_cast<const char*>(binary.data()), binary.size()),
+                    header);
+            }
+
+            /// A list page in L2: the bounds header when given, then the list.
+            static std::string withListHeader(std::string body,
+                                              const std::optional<list::ListBoundsHeader>& header) {
+                if (!header) return body;
+                std::string prefixed(list::kListBoundsHeaderSize + body.size(), '\0');
+                header->writeTo(reinterpret_cast<uint8_t*>(prefixed.data()));
+                std::memcpy(prefixed.data() + list::kListBoundsHeaderSize,
+                            body.data(), body.size());
+                return prefixed;
             }
 
             /// Refresh TTL without modifying the value.
@@ -829,30 +800,57 @@ namespace jcailloux::relais::cache {
             // List Group Tracking - O(M) invalidation instead of O(N) KEYS scan
             // =================================================================
 
-            /// Track a list cache key in its group's tracking set.
-            template<typename Rep, typename Period>
-            static io::Task<bool> trackListKey(const std::string& groupKey,
-                                                    const std::string& listKey,
-                                                    std::chrono::duration<Rep, Period> ttl) {
-                if (!PgProvider::hasRedis()) {
-                    co_return false;
-                }
-
+            /// Write a list page and track it in its group ("<group>:_keys"), in
+            /// one script: the page is never present untracked. With a master
+            /// hash, also records the group's sort index there. The tracking
+            /// set's TTL is set only if it has none.
+            static io::Task<bool> storeListPage(const std::string& pageKey,
+                                                std::string payload,
+                                                int64_t ttlSeconds,
+                                                const std::string& groupKey,
+                                                const std::string& masterKey = {},
+                                                std::size_t sortIndex = 0)
+            {
+                if (!PgProvider::hasRedis()) co_return false;
                 try {
-                    const std::string trackingKey = groupKey + ":_keys";
-                    auto ttl_seconds = std::chrono::duration_cast<std::chrono::seconds>(ttl).count();
-
-                    // Add to tracking set (binary-safe via argvlen)
-                    co_await PgProvider::redis("SADD", trackingKey, listKey);
-
-                    // Set TTL on tracking set only if none exists (NX = don't renew)
-                    co_await PgProvider::redis("EXPIRE", trackingKey,
-                        ttl_seconds, "NX");
-
+                    if (masterKey.empty()) {
+                        co_await evalScript(scripts::kListStore, 2,
+                            pageKey, groupKey + ":_keys", std::move(payload), ttlSeconds);
+                    } else {
+                        co_await evalScript(scripts::kListStore, 3,
+                            pageKey, groupKey + ":_keys", masterKey,
+                            std::move(payload), ttlSeconds, groupKey, sortIndex);
+                    }
                     co_return true;
                 } catch (const std::exception& e) {
-                    RELAIS_LOG_WARN << "RedisCache trackListKey error: " << e.what();
+                    RELAIS_LOG_WARN << "RedisCache storeListPage error: " << e.what();
                     co_return false;
+                }
+            }
+
+            /// storeListPage off the caller's path: started now, never awaited,
+            /// owns its arguments. A Redis failure is logged, never thrown.
+            static io::DetachedTask storeListPageDetached(std::string pageKey,
+                                                          std::string payload,
+                                                          int64_t ttlSeconds,
+                                                          std::string groupKey,
+                                                          std::string masterKey = {},
+                                                          std::size_t sortIndex = 0)
+            {
+                co_await storeListPage(pageKey, std::move(payload), ttlSeconds,
+                                       groupKey, masterKey, sortIndex);
+            }
+
+            /// `SET key payload EX ttl` off the caller's path, for a list page no
+            /// group tracks. Owns its arguments; a Redis failure is logged.
+            static io::DetachedTask setDetached(std::string key, std::string payload,
+                                                int64_t ttlSeconds)
+            {
+                if (!PgProvider::hasRedis()) co_return;
+                try {
+                    co_await PgProvider::redis("SET", key, payload, "EX", ttlSeconds);
+                } catch (const std::exception& e) {
+                    RELAIS_LOG_WARN << "RedisCache SET list error: " << e.what();
                 }
             }
 
@@ -1088,8 +1086,8 @@ namespace jcailloux::relais::cache {
             // ----- BEVE list helpers -----
 
             template<typename E>
-            static std::vector<uint8_t> serializeListBeve(const std::vector<E>& entities) {
-                std::vector<uint8_t> buffer;
+            static std::string serializeListBeve(const std::vector<E>& entities) {
+                std::string buffer;
                 if (glz::write_beve(entities, buffer)) {
                     buffer.clear();
                 }
