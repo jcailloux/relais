@@ -684,7 +684,7 @@ When the entity has a `ListDescriptor`, `Repo` exposes these aliases and types (
 | `ListResult` | `cache::CacheView<list::ListWrapper<E>>` (epoch-guarded, zero-copy). |
 | `ListTraits` | the `Traits` adapter (sort parsing, limit normalization, etc., for controllers). |
 
-`ListResult` wraps a `ListWrapper<E>`: `items` (`vector<E>`), `total_count` (`int64_t`), `next_cursor` (base64 string), with on-demand `json()` / `binary()` (BEVE) and accessors `front()`/`back()` (`const Item*`, `nullptr` when empty), `size()` (`size_t`), `empty()` (`bool`), `count()` (`int64_t`), `cursor()` (`string_view`). `query()` returns `Immediate<ListResult>` (L1 hit is frameless); `queryJson`/`queryBinary` return serialized pages by value. See the Repository API for the query method signatures and constraints.
+`ListResult` wraps a `ListWrapper<E>`: `items` (`vector<E>`), `next_cursor` (base64 string), with on-demand `json()` / `binary()` (BEVE) and accessors `front()`/`back()` (`const Item*`, `nullptr` when empty), `size()` (`size_t`), `empty()` (`bool`), `cursor()` (`string_view`). `query()` returns `Immediate<ListResult>` (L1 hit is frameless); `queryJson`/`queryBinary` return serialized pages by value. See the Repository API for the query method signatures and constraints.
 
 → Guide: [lists.md](lists.md)
 

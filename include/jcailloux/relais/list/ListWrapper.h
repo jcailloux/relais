@@ -33,37 +33,7 @@ public:
     static constexpr bool read_only = true;
 
     std::vector<Item> items;
-    int64_t total_count = 0;
     std::string next_cursor;
-
-    ListWrapper() = default;
-    ~ListWrapper() = default;
-
-    ListWrapper(const ListWrapper& o)
-        : items(o.items), total_count(o.total_count), next_cursor(o.next_cursor) {}
-
-    ListWrapper(ListWrapper&& o) noexcept
-        : items(std::move(o.items)), total_count(o.total_count),
-          next_cursor(std::move(o.next_cursor))
-    {}
-
-    ListWrapper& operator=(const ListWrapper& o) {
-        if (this != &o) {
-            items = o.items;
-            total_count = o.total_count;
-            next_cursor = o.next_cursor;
-        }
-        return *this;
-    }
-
-    ListWrapper& operator=(ListWrapper&& o) noexcept {
-        if (this != &o) {
-            items = std::move(o.items);
-            total_count = o.total_count;
-            next_cursor = std::move(o.next_cursor);
-        }
-        return *this;
-    }
 
     // =========================================================================
     // Accessors
@@ -71,7 +41,6 @@ public:
 
     [[nodiscard]] size_t size() const noexcept { return items.size(); }
     [[nodiscard]] bool empty() const noexcept { return items.empty(); }
-    [[nodiscard]] int64_t count() const noexcept { return total_count; }
     [[nodiscard]] std::string_view cursor() const noexcept { return next_cursor; }
 
     [[nodiscard]] const Item* front() const noexcept {
@@ -147,7 +116,6 @@ public:
             if (auto item = Item::fromRow(result[i]))
                 list.items.push_back(std::move(*item));
         }
-        list.total_count = static_cast<int64_t>(list.items.size());
         return list;
     }
 
@@ -160,7 +128,6 @@ public:
         for (const auto& p : ptrs) {
             if (p) list.items.push_back(*p);
         }
-        list.total_count = static_cast<int64_t>(list.items.size());
         list.next_cursor = std::string(cursor);
         return list;
     }
@@ -177,7 +144,6 @@ struct glz::meta<jcailloux::relais::list::ListWrapper<Item>> {
     using T = jcailloux::relais::list::ListWrapper<Item>;
     static constexpr auto value = glz::object(
         "items", &T::items,
-        "total_count", &T::total_count,
         "next_cursor", &T::next_cursor
     );
 };
