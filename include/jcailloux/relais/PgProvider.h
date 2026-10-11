@@ -130,7 +130,7 @@ public:
     /// Usage:
     ///   co_await PgProvider::redis("SET", "key", "value");
     ///   co_await PgProvider::redis("SETEX", key, ttl, value);
-    ///   co_await PgProvider::redis("EVAL", lua_script, "1", tracking_key);
+    ///   co_await PgProvider::redis("EVALSHA", script_sha1, "1", tracking_key);
     ///   co_await PgProvider::redis("SETEX", key, ttl_str,
     ///       std::string_view(reinterpret_cast<const char*>(bin.data()), bin.size()));
     template<io::RedisArg... Args>
@@ -172,6 +172,15 @@ public:
 
         co_return co_await redis_exec_(
             static_cast<int>(argv.size()), argv.data(), argvlen.data());
+    }
+
+    /// Internal: send a prepared argv (verb first) as is. The pointers must stay
+    /// valid until the co_await completes. Used by RedisCache::evalScriptArgs,
+    /// which owns the strings and resends the same argv on its EVAL fallback.
+    static io::Task<io::RedisResult> redisArgv(int argc, const char** argv,
+                                               const size_t* argvlen) {
+        if (!redis_exec_) throw std::logic_error("PgProvider::redisArgv() called before init() or Redis not configured");
+        return redis_exec_(argc, argv, argvlen);
     }
 
     /// Register a deferred cache-eviction retry whose UNLINK could not reach

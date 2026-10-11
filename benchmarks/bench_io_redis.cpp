@@ -27,6 +27,7 @@
 #include <jcailloux/relais/io/redis/RedisPool.h>
 #include <jcailloux/relais/io/redis/RedisError.h>
 #include <jcailloux/relais/io/Task.h>
+#include <jcailloux/relais/cache/RedisScripts.h>
 
 #include <fixtures/EpollIoContext.h>
 #include <fixtures/TestRunner.h>
@@ -220,6 +221,44 @@ TEST_CASE("Benchmark - Redis EVAL", "[benchmark][redis][latency][eval]")
     }(io));
 
     WARN(formatTable("Redis EVAL (Lua) — latency", results));
+}
+
+// The largest script relais ships (list invalidation on an update, about
+// 8.4 KB), on an empty master hash so the run itself is minimal: what differs is
+// sending the body (EVAL) or its 40-byte digest (EVALSHA).
+namespace {
+const auto& kBigScript = jcailloux::relais::cache::scripts::kInvalidateListGroupsSelectiveUpdate;
+constexpr const char* kBigMaster = "bench:io:lua:master";
+
+Task<RedisResult> evalBig(RedisClient<Io>& c) {
+    co_return co_await c.exec("EVAL", kBigScript.body, "1", kBigMaster, "0", "0", "", "", "", "", "");
+}
+Task<RedisResult> evalshaBig(RedisClient<Io>& c) {
+    co_return co_await c.exec("EVALSHA", kBigScript.sha1(), "1", kBigMaster, "0", "0", "", "", "", "", "");
+}
+}  // namespace
+
+TEST_CASE("Benchmark - Redis EVAL vs EVALSHA, list invalidation script",
+          "[benchmark][redis][latency][evalsha]")
+{
+    Io io;
+
+    auto results = runTask(io, [](Io& io) -> Task<std::vector<BenchResult>> {
+        auto client = co_await RedisClient<Io>::connect(io, redisHost(), redisPort());
+        co_await client->exec("SCRIPT", "LOAD", kBigScript.body);
+
+        std::vector<BenchResult> results;
+        results.push_back(co_await benchAsync(
+            "EVAL " + std::to_string(kBigScript.body.size()) + " B", [&]() -> Task<void> {
+                co_await evalBig(*client);
+            }));
+        results.push_back(co_await benchAsync("EVALSHA", [&]() -> Task<void> {
+            co_await evalshaBig(*client);
+        }));
+        co_return results;
+    }(io));
+
+    WARN(formatTable("Redis EVAL vs EVALSHA (list invalidation script) — latency", results));
 }
 
 
@@ -496,4 +535,88 @@ TEST_CASE("Benchmark - Redis throughput SET", "[benchmark][redis][throughput][se
     WARN(formatThroughputTable(
         "Redis throughput — SET (per-thread pool=" + std::to_string(kPoolSize) + ")",
         num_threads, results));
+}
+
+
+// -----------------------------------------------------------------------------
+//  THROUGHPUT: EVAL vs EVALSHA on the list invalidation script
+// -----------------------------------------------------------------------------
+
+template<bool Sha>
+static DetachedTask redisBigScriptWorker(
+        std::shared_ptr<RedisPool<Io>> pool,
+        std::atomic<bool>& running,
+        std::atomic<int64_t>& ops,
+        std::atomic<int>& done_count)
+{
+    while (running.load(std::memory_order_relaxed)) {
+        if constexpr (Sha) {
+            auto r = co_await evalshaBig(pool->next());
+            doNotOptimize(r);
+        } else {
+            auto r = co_await evalBig(pool->next());
+            doNotOptimize(r);
+        }
+        ops.fetch_add(1, std::memory_order_relaxed);
+    }
+    done_count.fetch_add(1, std::memory_order_relaxed);
+}
+
+template<bool Sha>
+static std::vector<ThroughputResult> bigScriptThroughput(int num_threads) {
+    std::vector<ThroughputResult> results;
+    double baseline = 0;
+
+    auto thread_fn = [](int /*tid*/, int conc, std::latch& ready, std::latch& go,
+                        std::atomic<bool>& running, std::atomic<int64_t>& ops)
+    {
+        Io io;
+        auto pool = std::make_shared<RedisPool<Io>>(runTask(io,
+            [](Io& io) -> Task<RedisPool<Io>> {
+                co_return co_await RedisPool<Io>::create(
+                    io, redisHost(), redisPort(), kPoolSize);
+            }(io)));
+
+        ready.count_down();
+        go.wait();
+
+        std::atomic<int> done_count{0};
+        for (int i = 0; i < conc; ++i) {
+            redisBigScriptWorker<Sha>(pool, running, ops, done_count);
+        }
+
+        io.runUntil([&] { return !running.load(std::memory_order_relaxed); });
+        io.runUntil([&] {
+            return done_count.load(std::memory_order_relaxed) >= conc;
+        });
+    };
+
+    for (int conc : kLevels) {
+        auto r = measureMultiLoopThroughput(num_threads, conc, baseline, thread_fn);
+        if (results.empty()) baseline = r.throughput;
+        r.speedup = (baseline > 0) ? r.throughput / baseline : 1.0;
+        results.push_back(r);
+    }
+    return results;
+}
+
+TEST_CASE("Benchmark - Redis throughput EVAL vs EVALSHA",
+          "[benchmark][redis][throughput][evalsha]")
+{
+    int num_threads = benchThreads();
+    {
+        Io io;
+        runTask(io, [](Io& io) -> Task<void> {
+            auto client = co_await RedisClient<Io>::connect(io, redisHost(), redisPort());
+            co_await client->exec("SCRIPT", "LOAD", kBigScript.body);
+        }(io));
+    }
+
+    WARN(formatThroughputTable(
+        "Redis throughput — EVAL " + std::to_string(kBigScript.body.size())
+            + " B (per-thread pool=" + std::to_string(kPoolSize) + ")",
+        num_threads, bigScriptThroughput<false>(num_threads)));
+    WARN(formatThroughputTable(
+        "Redis throughput — EVALSHA (per-thread pool=" + std::to_string(kPoolSize) + ")",
+        num_threads, bigScriptThroughput<true>(num_threads)));
 }
