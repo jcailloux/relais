@@ -1963,6 +1963,100 @@ TEST_CASE("Benchmark - detached batch cleanup", "[benchmark][batch-detach]") {
 
 // #############################################################################
 //
+//  15b. Entity writes with cached lists — the L2 list invalidation script
+//
+//  Each update moves an article's sort value, so the write runs the list
+//  invalidation script (about 8.4 KB of Lua) against the master hash of the
+//  primed list groups. Redis tier (L2 only) and Both (L1+L2).
+//
+//  Run with:
+//    ./bench_relais_cache "[write-lists]"
+//
+// #############################################################################
+
+using RedisArticleListRepo = Repo<TestArticleEntity, "bench:article:l2", cfg::Redis>;
+
+template<typename R>
+static void benchWriteWithLists(const char* tier, std::vector<BenchResult>& lat,
+                                std::vector<std::string>& tput) {
+    static constexpr int POOL = 64;
+    auto author = insertTestUser(std::string("wl_") + tier, std::string("wl_") + tier + "@test.com", 0);
+    std::vector<int64_t> ids;
+    for (int i = 0; i < POOL; ++i)
+        ids.push_back(insertTestArticle("tech", author, "WL_" + std::to_string(i), i * 10));
+
+    // Prime a few list groups so the master hash has work for the script.
+    auto prime = [&] {
+        namespace ld = jcailloux::relais::list::spec;
+        using Desc = typename R::ListDescriptorType;
+        for (uint16_t limit : {5, 10, 20}) {
+            ld::ListQueryParams<Desc> p;
+            p.limit = limit;
+            p.filters.template get<"author_id">() = author;
+            p.filters.template get<"category">() = std::string("tech");
+            sync(R::query(ld::seal<Desc>(std::move(p))));
+        }
+    };
+    prime();
+
+    int counter = 0;
+    lat.push_back(bench(std::string("update, lists cached (") + tier + ")", [&]() {
+        ++counter;
+        const auto k = static_cast<size_t>(counter % POOL);
+        auto e = makeTestArticle("tech", author, "WL_" + std::to_string(k),
+                                 counter, false, ids[k]);
+        sync(R::update(ids[k], e));
+    }));
+
+    // Throughput: CORO coroutines on the loop, each updating its own articles.
+    static constexpr int CORO = 32;
+    prime();
+    std::atomic<bool> running{true};
+    std::atomic<int64_t> ops{0};
+    std::latch done{CORO};
+    auto t0 = Clock::now();
+    for (int c = 0; c < CORO; ++c) {
+        detail::testLoop().dispatch([&, c]() {
+            [](int c, int64_t author, const std::vector<int64_t>& ids,
+               std::atomic<bool>& running, std::atomic<int64_t>& ops,
+               std::latch& done) -> DetachedHandle {
+                int n = 0;
+                while (running.load(std::memory_order_relaxed)) {
+                    const auto k = static_cast<size_t>((c + n * CORO) % POOL);
+                    ++n;
+                    auto e = makeTestArticle("tech", author, "WL_" + std::to_string(k),
+                                             n * CORO + c, false, ids[k]);
+                    co_await R::update(ids[k], e);
+                    ops.fetch_add(1, std::memory_order_relaxed);
+                }
+                done.count_down();
+            }(c, author, ids, running, ops, done);
+        });
+    }
+    std::this_thread::sleep_for(std::chrono::seconds(benchDurationSeconds()));
+    running.store(false, std::memory_order_relaxed);
+    done.wait();
+    DurationResult result{Clock::now() - t0, ops.load(std::memory_order_relaxed)};
+    tput.push_back(formatDurationThroughput(
+        std::string("update throughput, lists cached (") + tier + ", "
+            + std::to_string(CORO) + " coros, single loop)",
+        1, result));
+}
+
+TEST_CASE("Benchmark - entity writes with cached lists", "[benchmark][write-lists]") {
+    TransactionGuard tx;
+    TestInternals::resetListCacheState<FullCacheArticleListRepo>();
+    std::vector<BenchResult> lat;
+    std::vector<std::string> tput;
+    benchWriteWithLists<RedisArticleListRepo>("Redis", lat, tput);
+    benchWriteWithLists<FullCacheArticleListRepo>("Both", lat, tput);
+    WARN(formatTable("Entity writes with cached lists — latency", lat));
+    for (const auto& t : tput) WARN(t);
+}
+
+
+// #############################################################################
+//
 //  16. Tier matrix — read latency / throughput per cache tier, isolated
 //
 //  One repo per tier, each measured on its own (no cross-pollution: every Repo

@@ -1,6 +1,9 @@
 #ifndef JCX_RELAIS_REDISCACHE_H
 #define JCX_RELAIS_REDISCACHE_H
 
+#include <array>
+#include <atomic>
+#include <cstdint>
 #include <string>
 #include <optional>
 #include <vector>
@@ -10,7 +13,9 @@
 
 #include "jcailloux/relais/io/Task.h"
 #include "jcailloux/relais/io/WhenAll.h"
+#include "jcailloux/relais/io/redis/RedisError.h"
 #include "jcailloux/relais/io/redis/RedisResult.h"
+#include "jcailloux/relais/io/redis/RedisScript.h"
 #include "jcailloux/relais/PgProvider.h"
 #include "jcailloux/relais/Log.h"
 #include "jcailloux/relais/detail/Chunk.h"
@@ -19,6 +24,8 @@
 #include <glaze/glaze.hpp>
 #include <jcailloux/relais/list/ListCache.h>
 #include "jcailloux/relais/entity/SerializationTraits.h"
+
+namespace relais_test { struct TestInternals; }
 
 namespace jcailloux::relais::cache {
 
@@ -548,6 +555,67 @@ namespace jcailloux::relais::cache {
             }
 
             // =================================================================
+            // Lua scripts: the only way a script reaches Redis
+            // =================================================================
+            //
+            // EVALSHA sends the 40-byte digest instead of the body (up to 8.6 KB).
+            // When the server has not cached the script (restart, failover,
+            // SCRIPT FLUSH, eviction), it replies NOSCRIPT without running
+            // anything, and the same call is resent once as EVAL, which runs the
+            // script and caches it again. Any other error propagates unchanged.
+            // The caller resumes only after the fallback, so "await X before Y"
+            // orderings hold.
+
+            /// Run `s` with its keys then its arguments, each converted to text
+            /// before this returns: the caller's arguments are not read after.
+            template<io::RedisArg... Args>
+            static io::Task<io::RedisResult> evalScript(const io::RedisScript& s, int numkeys,
+                                                        Args&&... args) {
+                std::vector<std::string> keysAndArgs;
+                keysAndArgs.reserve(sizeof...(args));
+                (keysAndArgs.push_back(io::detail::redisArgText(std::forward<Args>(args))), ...);
+                return evalScriptArgs(s, numkeys, std::move(keysAndArgs));
+            }
+
+            /// Run `s` with an argument list sized at run time (keys first).
+            /// The strings are owned by this frame: the EVAL fallback resends
+            /// them after a suspension, so they must never be views on the
+            /// caller's data.
+            static io::Task<io::RedisResult> evalScriptArgs(const io::RedisScript& s, int numkeys,
+                                                            std::vector<std::string> keysAndArgs) {
+                const std::string numkeysText = std::to_string(numkeys);
+                const std::size_t argc = keysAndArgs.size() + 3;
+                std::vector<const char*> argv(argc);
+                std::vector<size_t> argvlen(argc);
+                argv[0] = "EVALSHA";  // relais:allow-raw-eval
+                argvlen[0] = 7;
+                argv[1] = s.sha1().data();
+                argvlen[1] = s.sha1().size();
+                argv[2] = numkeysText.data();
+                argvlen[2] = numkeysText.size();
+                for (std::size_t i = 0; i < keysAndArgs.size(); ++i) {
+                    argv[i + 3] = keysAndArgs[i].data();
+                    argvlen[i + 3] = keysAndArgs[i].size();
+                }
+
+                try {
+                    co_return co_await PgProvider::redisArgv(
+                        static_cast<int>(argc), argv.data(), argvlen.data());
+                } catch (const io::RedisNoScriptError&) {
+                    // NOSCRIPT: nothing ran. co_await is not allowed in a
+                    // handler, so the fallback follows the block.
+                }
+
+                noteScriptReload(s);
+                argv[0] = "EVAL";  // relais:allow-raw-eval
+                argvlen[0] = 4;
+                argv[1] = s.body.data();
+                argvlen[1] = s.body.size();
+                co_return co_await PgProvider::redisArgv(
+                    static_cast<int>(argc), argv.data(), argvlen.data());
+            }
+
+            // =================================================================
             // Cross-instance L2 generation (topology-gated; commit 12b)
             // =================================================================
             //
@@ -635,15 +703,12 @@ namespace jcailloux::relais::cache {
             {
                 if (slots.empty() || !PgProvider::hasRedis()) co_return;
                 std::vector<std::string> args;
-                args.reserve(slots.size() + 4);
-                args.emplace_back("EVAL");
-                args.emplace_back(scripts::kBumpGenMany.body);
-                args.emplace_back("1");
+                args.reserve(slots.size() + 1);
                 args.push_back(genKey);
                 for (auto s : slots) args.push_back(std::to_string(s));
 
                 try {
-                    co_await PgProvider::redisDynamic(std::move(args));
+                    co_await evalScriptArgs(scripts::kBumpGenMany, 1, std::move(args));
                 } catch (const std::exception& e) {
                     RELAIS_LOG_WARN << "RedisCache bumpGenMany error: " << e.what();
                 }
@@ -668,8 +733,8 @@ namespace jcailloux::relais::cache {
             {
                 if (!PgProvider::hasRedis()) co_return false;
                 try {
-                    auto r = co_await PgProvider::redis(
-                        "EVAL", scripts::kSetIfGen.body, "2", genKey, key,
+                    auto r = co_await evalScript(
+                        scripts::kSetIfGen, 2, genKey, key,
                         slot, snap, payload, ttlSeconds);
                     co_return !r.isNil() && r.asInteger() == 1;
                 } catch (const std::exception& e) {
@@ -687,10 +752,7 @@ namespace jcailloux::relais::cache {
             {
                 if (entries.empty() || !PgProvider::hasRedis()) co_return 0;
                 std::vector<std::string> args;
-                args.reserve(entries.size() * 4 + 4);
-                args.emplace_back("EVAL");
-                args.emplace_back(scripts::kSetManyIfGen.body);
-                args.emplace_back(std::to_string(entries.size() + 1));
+                args.reserve(entries.size() * 4 + 2);
                 args.push_back(genKey);                          // KEYS[1]
                 for (const auto& e : entries) args.push_back(e.key);  // KEYS[2..]
                 args.push_back(std::to_string(ttlSeconds));      // ARGV[1]
@@ -701,7 +763,8 @@ namespace jcailloux::relais::cache {
                 }
 
                 try {
-                    auto r = co_await PgProvider::redisDynamic(std::move(args));
+                    auto r = co_await evalScriptArgs(scripts::kSetManyIfGen,
+                        static_cast<int>(entries.size() + 1), std::move(args));
                     co_return r.isNil() ? 0 : static_cast<size_t>(r.asInteger());
                 } catch (const std::exception& e) {
                     RELAIS_LOG_WARN << "RedisCache setManyIfGen error: " << e.what();
@@ -803,8 +866,8 @@ namespace jcailloux::relais::cache {
                 try {
                     const std::string trackingKey = groupKey + ":_keys";
 
-                    auto result = co_await PgProvider::redis(
-                        "EVAL", scripts::kInvalidateListGroup.body, "1", trackingKey);
+                    auto result = co_await evalScript(
+                        scripts::kInvalidateListGroup, 1, trackingKey);
 
                     co_return result.isNil() ? 0 : static_cast<size_t>(result.asInteger());
                 } catch (const std::exception& e) {
@@ -829,8 +892,8 @@ namespace jcailloux::relais::cache {
                 try {
                     const std::string trackingKey = groupKey + ":_keys";
 
-                    auto result = co_await PgProvider::redis(
-                        "EVAL", scripts::kInvalidateListGroupSelective.body, "1", trackingKey,
+                    auto result = co_await evalScript(
+                        scripts::kInvalidateListGroupSelective, 1, trackingKey,
                         entity_sort_val,
                         static_cast<int>(list::kListBoundsHeaderSize));
 
@@ -855,8 +918,8 @@ namespace jcailloux::relais::cache {
                 try {
                     const std::string trackingKey = groupKey + ":_keys";
 
-                    auto result = co_await PgProvider::redis(
-                        "EVAL", scripts::kInvalidateListGroupSelectiveUpdate.body, "1", trackingKey,
+                    auto result = co_await evalScript(
+                        scripts::kInvalidateListGroupSelectiveUpdate, 1, trackingKey,
                         old_sort_val, new_sort_val,
                         static_cast<int>(list::kListBoundsHeaderSize));
 
@@ -883,8 +946,8 @@ namespace jcailloux::relais::cache {
                 if (!PgProvider::hasRedis()) co_return 0;
 
                 try {
-                    auto result = co_await PgProvider::redis(
-                        "EVAL", scripts::kInvalidateListGroupsSelective.body, "1", masterKey,
+                    auto result = co_await evalScript(
+                        scripts::kInvalidateListGroupsSelective, 1, masterKey,
                         std::to_string(prefixLen),
                         static_cast<int>(list::kListBoundsHeaderSize),
                         filterSchema,
@@ -916,8 +979,8 @@ namespace jcailloux::relais::cache {
                 if (!PgProvider::hasRedis()) co_return 0;
 
                 try {
-                    auto result = co_await PgProvider::redis(
-                        "EVAL", scripts::kInvalidateListGroupsByPredicate.body, "1", masterKey,
+                    auto result = co_await evalScript(
+                        scripts::kInvalidateListGroupsByPredicate, 1, masterKey,
                         std::to_string(prefixLen),
                         static_cast<int>(list::kListBoundsHeaderSize),
                         filterSchema,
@@ -946,8 +1009,8 @@ namespace jcailloux::relais::cache {
                 if (!PgProvider::hasRedis()) co_return 0;
 
                 try {
-                    auto result = co_await PgProvider::redis(
-                        "EVAL", scripts::kInvalidateListGroupsSelectiveUpdate.body, "1", masterKey,
+                    auto result = co_await evalScript(
+                        scripts::kInvalidateListGroupsSelectiveUpdate, 1, masterKey,
                         std::to_string(prefixLen),
                         static_cast<int>(list::kListBoundsHeaderSize),
                         filterSchema,
@@ -962,6 +1025,35 @@ namespace jcailloux::relais::cache {
             }
 
         private:
+            friend struct ::relais_test::TestInternals;
+
+            // EVAL fallbacks since start. Relaxed: touched only on a fallback,
+            // read only by tests.
+            static inline std::atomic<uint64_t> script_reloads_{0};
+            // One flag per registered script: its first fallback in the process
+            // is logged as a warning (restart, failover and flush are events worth
+            // seeing), later ones at debug, so a client evicting scripts in a
+            // loop cannot flood the logs.
+            static inline std::array<std::atomic<bool>, scripts::kAllScripts.size()>
+                script_reloaded_{};
+
+            static void noteScriptReload(const io::RedisScript& s) {
+                script_reloads_.fetch_add(1, std::memory_order_relaxed);
+                bool first = true;
+                for (std::size_t i = 0; i < scripts::kAllScripts.size(); ++i) {
+                    if (scripts::kAllScripts[i] == &s) {
+                        first = !script_reloaded_[i].exchange(true, std::memory_order_relaxed);
+                        break;
+                    }
+                }
+                if (first)
+                    RELAIS_LOG_WARN << "RedisCache: script " << s.sha1()
+                                    << " not cached by Redis, reloaded with EVAL";
+                else
+                    RELAIS_LOG_DEBUG << "RedisCache: script " << s.sha1()
+                                     << " not cached by Redis, reloaded with EVAL";
+            }
+
             template<typename E>
             static std::string serializeList(const std::vector<E>& entities) {
                 std::string buffer;
