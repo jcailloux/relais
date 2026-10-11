@@ -224,6 +224,10 @@ if(RELAIS_BUILD_TESTS)
     relais_add_test(test_io_pg_types      tests/io/test_io_pg_types.cpp           LABELS "io")
     relais_add_test(test_io_redis_types   tests/io/test_io_redis_types.cpp        LABELS "io")
     relais_add_test(test_io_redis_script  tests/io/test_redis_script.cpp          LABELS "io;unit")
+    add_test(NAME no_raw_eval
+             COMMAND ${CMAKE_COMMAND} -DROOT=${PROJECT_SOURCE_DIR}
+                     -P ${PROJECT_SOURCE_DIR}/cmake/CheckNoRawEval.cmake)
+    set_tests_properties(no_raw_eval PROPERTIES LABELS "lint")
     relais_add_test(test_number_text      tests/io/test_number_text.cpp           LABELS "io")
     relais_add_test(test_io_pg_pool_compile tests/io/test_io_pg_pool_compile.cpp  LABELS "io")
     relais_add_test(test_io_resp2         tests/io/test_io_resp2.cpp              LABELS "io")

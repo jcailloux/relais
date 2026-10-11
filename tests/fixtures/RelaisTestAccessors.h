@@ -10,6 +10,8 @@
  * ListCache, ModificationTracker, and GDSFPolicy.
  */
 
+#include <atomic>
+#include <cstdint>
 #include <optional>
 #include <shared_mutex>
 #include <span>
@@ -17,9 +19,18 @@
 #include <jcailloux/relais/cache/GDSFPolicy.h>
 #include <jcailloux/relais/io/Task.h>
 
+namespace jcailloux::relais::cache { class RedisCache; }
+
 namespace relais_test {
 
 struct TestInternals {
+    /// Number of EVALSHA calls resent as EVAL after NOSCRIPT, process-wide.
+    /// A template so this header does not need RedisCache's definition.
+    template<typename Cache = jcailloux::relais::cache::RedisCache>
+    static uint64_t scriptReloads() {
+        return Cache::script_reloads_.load(std::memory_order_relaxed);
+    }
+
     /// Reset entity L1 cache: unconditionally remove all entries.
     template<typename Repo>
     static void resetEntityCacheState() {
