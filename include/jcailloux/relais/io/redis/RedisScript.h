@@ -23,7 +23,7 @@ struct RedisScript {
 /// not copied: it must have static storage (a string literal or a constexpr
 /// buffer).
 [[nodiscard]] consteval RedisScript makeRedisScript(std::string_view body) {
-    return RedisScript{body, detail::sha1Hex(body)};
+    return RedisScript{body, ::jcailloux::relais::detail::sha1Hex(body)};
 }
 
 }  // namespace jcailloux::relais::io
