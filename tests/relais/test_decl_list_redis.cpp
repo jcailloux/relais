@@ -10,6 +10,7 @@
  *   3. L2 CRUD invalidation (active invalidation via Redis Lua scripts)
  *   4. L2 cache lifecycle (Redis store/hit verification)
  *   5. L2 store-back of a list miss (one script, not awaited by the read)
+ *   6. A page in a format the current type rejects is a miss, then rewritten
  */
 
 #include <catch2/catch_test_macros.hpp>
@@ -1547,4 +1548,49 @@ TEST_CASE("[DeclList L1+L2] a page stored in L2 serves the read once L1 is clear
     execSql("DELETE FROM relais_test_articles WHERE category = 'store'");
     TestInternals::resetListCacheState<L1L2DeclArticleListRepo>();
     CHECK(sync(L1L2DeclArticleListRepo::query(bq))->size() == 2);
+}
+
+TEST_CASE("[DeclList L2] a page in the format with total_count is read as a miss",
+          "[integration][db][redis][list][compat]")
+{
+    TransactionGuard tx;
+    TestInternals::resetListCacheState<L2DeclArticleListRepo>();
+    const auto userId = insertTestUser("author", "author@compat.com", 0);
+    insertTestArticle("compat", userId, "C100", 100);
+    insertTestArticle("compat", userId, "C80", 80);
+
+    auto q = makeL2ViewCountQuery("compat", 10);
+    REQUIRE(sync(L2DeclArticleListRepo::query(q))->size() == 2);
+    const auto pageKey = buildRedisPageKey<L2DeclArticleListRepo>(q.cacheKey());
+    const auto stored = awaitL2Key(pageKey);
+    REQUIRE(stored.has_value());
+    REQUIRE(stored->size() >= list_ns::kListBoundsHeaderSize);
+
+    // An empty page as ListWrapper<TestArticleEntity>::binary() wrote it while
+    // the type still had total_count: {items: [], total_count: 0, next_cursor: ""}.
+    static constexpr unsigned char kLegacyBody[] = {
+        0x03, 0x0c, 0x14, 0x69, 0x74, 0x65, 0x6d, 0x73, 0x05, 0x00, 0x2c, 0x74,
+        0x6f, 0x74, 0x61, 0x6c, 0x5f, 0x63, 0x6f, 0x75, 0x6e, 0x74, 0x69, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2c, 0x6e, 0x65, 0x78, 0x74,
+        0x5f, 0x63, 0x75, 0x72, 0x73, 0x6f, 0x72, 0x02, 0x00,
+    };
+    const auto legacy = stored->substr(0, list_ns::kListBoundsHeaderSize)
+        + std::string(reinterpret_cast<const char*>(kLegacyBody), sizeof(kLegacyBody));
+    sync(jcailloux::relais::PgProvider::redis("SET", pageKey, legacy));
+
+    // Served from PostgreSQL, not from the empty legacy page.
+    CHECK(sync(L2DeclArticleListRepo::query(q))->size() == 2);
+
+    // The miss stores the page again, in the current format.
+    std::optional<std::string> rewritten;
+    for (int i = 0; i < 200; ++i) {
+        rewritten = awaitL2Key(pageKey);
+        if (rewritten && *rewritten != legacy) break;
+    }
+    REQUIRE(rewritten.has_value());
+    CHECK(*rewritten != legacy);
+
+    // The rewritten page is a hit: the rows are gone from PostgreSQL.
+    execSql("DELETE FROM relais_test_articles WHERE category = 'compat'");
+    CHECK(sync(L2DeclArticleListRepo::query(q))->size() == 2);
 }

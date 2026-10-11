@@ -239,7 +239,6 @@ auto view = co_await AuditLogRepo::query(q);   // CacheView<ListWrapper<Entity>>
 for (const auto& e : view->items)              // items is std::vector<Entity>, BY VALUE
     use(e.user_id);                            // struct fields accessed directly
 // view->size() (= items.size()) and view->cursor() (next-page token) also available.
-// (view->total_count is NOT populated by query() — it stays 0 on this path.)
 ```
 
 The cache keys (`groupKey`/`cacheKey`) are encoded from the sealed params

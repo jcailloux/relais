@@ -1131,7 +1131,6 @@ Generic template for paginated list results:
 template<typename Item>
 class ListWrapper {
     std::vector<Item> items;
-    int64_t total_count = 0;
     std::string next_cursor;
     size_t size() const { return items.size(); }
     // On-demand BEVE/JSON serialization (no caching), by value.

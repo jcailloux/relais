@@ -678,7 +678,6 @@ TEST_CASE("ListWrapper<TestArticle> - construction and accessors", "[wrapper][li
     SECTION("[List] empty list via default constructor") {
         ListWrapperArticle list;
         REQUIRE(list.size() == 0);
-        REQUIRE(list.count() == 0);
         REQUIRE(list.empty());
         REQUIRE(list.cursor().empty());
     }
@@ -707,9 +706,8 @@ TEST_CASE("ListWrapper<TestArticle> - construction and accessors", "[wrapper][li
     std::vector<std::shared_ptr<const TestArticle>> items = {e1, e2};
     auto list = ListWrapperArticle::fromItems(items);
 
-    SECTION("[List] fromItems size and count") {
+    SECTION("[List] fromItems size and emptiness") {
         REQUIRE(list.size() == 2);
-        REQUIRE(list.count() == 2);
         REQUIRE_FALSE(list.empty());
     }
 
@@ -740,14 +738,20 @@ TEST_CASE("ListWrapper<TestArticle> - construction and accessors", "[wrapper][li
         REQUIRE(restored->size() == 2);
     }
 
+    SECTION("[List] serialized page carries only items and next_cursor") {
+        auto paged = ListWrapperArticle::fromItems(items, "cursor_abc");
+        CHECK(paged.json().find("total_count") == std::string::npos);
+
+        auto restored = ListWrapperArticle::fromBinary(paged.binary());
+        REQUIRE(restored.has_value());
+        CHECK(restored->binary() == paged.binary());
+        CHECK(restored->cursor() == "cursor_abc");
+    }
+
     SECTION("[List] items vector is directly accessible") {
         REQUIRE(list.items.size() == 2);
         REQUIRE(list.items[0].id == 1);
         REQUIRE(list.items[1].id == 2);
-    }
-
-    SECTION("[List] total_count is directly accessible") {
-        REQUIRE(list.total_count == 2);
     }
 
     SECTION("[List] fromItems size") {
@@ -1125,7 +1129,6 @@ TEST_CASE("ListWrapper items use custom JSON field names", "[wrapper][list][cust
 
     ProductList list;
     list.items = {p1, p2};
-    list.total_count = 2;
 
     SECTION("[List->JSON] items serialized with camelCase names") {
         auto json = list.json();
