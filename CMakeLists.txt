@@ -191,7 +191,8 @@ if(RELAIS_BUILD_TESTS)
     function(relais_add_test name source)
         cmake_parse_arguments(ARG "RESOURCE_LOCK" "" "LABELS;DEFINITIONS" ${ARGN})
 
-        add_executable(${name} ${source})
+        add_executable(${name} ${source}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/LsanSuppressions.cpp)
         target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 
         if(ARG_DEFINITIONS)
