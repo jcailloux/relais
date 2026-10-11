@@ -1148,22 +1148,15 @@ protected:
                 ? list::PaginationMode::Offset
                 : list::PaginationMode::Cursor;
 
-            auto pageKey = redisPageKey(query);
-            auto groupKey = redisGroupKey(query);
-
-            // Store page binary with header prepended (reads wrapper, does not consume)
-            co_await cache::RedisCache::setListBinary(pageKey, wrapper, l2Ttl(), header);
-            // Track page in group SET
-            co_await cache::RedisCache::trackListKey(groupKey, pageKey, l2Ttl());
-            // Track group in master HASH (stores sort field index per group).
-            // L2 is best-effort: a Redis failure here must not fail a read
-            // that PostgreSQL already answered.
-            try {
-                co_await PgProvider::redis("HSET", redisMasterSetKey(), groupKey,
-                                           std::to_string(sort.field));
-            } catch (const std::exception& e) {
-                RELAIS_LOG_WARN << name() << ": list master HSET error: " << e.what();
-            }
+            // Page, its group's tracking set and the group's sort index in the
+            // master hash, in one script started without being awaited: the read
+            // returns once PostgreSQL has answered, and a Redis failure is only
+            // logged. The payload is encoded here, before wrapper moves into L1.
+            cache::RedisCache::storeListPageDetached(
+                redisPageKey(query),
+                cache::RedisCache::encodeListBinary(wrapper, header),
+                std::chrono::duration_cast<std::chrono::seconds>(l2Ttl()).count(),
+                redisGroupKey(query), redisMasterSetKey(), sort.field);
         }
 
         // 5. Store in L1 cache or epoch pool

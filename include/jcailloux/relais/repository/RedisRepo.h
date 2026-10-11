@@ -965,16 +965,17 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
             }
         }
 
-        template<typename Rep, typename Period>
-        static io::Task<bool> setListInRedis(const std::string& key,
-                                                  const std::vector<E>& entities,
-                                                  std::chrono::duration<Rep, Period> ttl,
-                                                  std::optional<list::ListBoundsHeader> header = std::nullopt)
+        /// A list page in the format getListFromRedis reads back: BEVE or JSON
+        /// per the repository's L2 format, after the bounds header when given.
+        /// nullopt when the list does not serialize.
+        static std::optional<std::string> encodeListPayload(
+            const std::vector<E>& entities,
+            const std::optional<list::ListBoundsHeader>& header = std::nullopt)
         {
             if constexpr (useL2Binary) {
-                co_return co_await cache::RedisCache::setListBeve(key, entities, ttl, header);
+                return cache::RedisCache::encodeListBeve(entities, header);
             } else {
-                co_return co_await cache::RedisCache::setList(key, entities, ttl, header);
+                return cache::RedisCache::encodeList(entities, header);
             }
         }
 
@@ -1002,7 +1003,11 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
             }
 
             auto results = co_await query();
-            co_await setListInRedis(cacheKey, results, l2Ttl());
+            // Stored without being awaited: the caller does not wait on Redis.
+            if (auto payload = encodeListPayload(results)) {
+                cache::RedisCache::setDetached(
+                    std::move(cacheKey), std::move(*payload), l2TtlSeconds());
+            }
 
             co_return results;
         }
@@ -1063,8 +1068,12 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
                 header = headerBuilder(results, limit, offset);
             }
 
-            co_await setListInRedis(cacheKey, results, l2Ttl(), header);
-            co_await cache::RedisCache::trackListKey(groupKey, cacheKey, l2Ttl());
+            // Page and tracking in one script, not awaited.
+            if (auto payload = encodeListPayload(results, header)) {
+                cache::RedisCache::storeListPageDetached(
+                    std::move(cacheKey), std::move(*payload), l2TtlSeconds(),
+                    std::move(groupKey));
+            }
 
             co_return results;
         }
@@ -1125,8 +1134,11 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
             // Cache miss: query DB and build list entity
             auto listEntity = co_await query();
 
-            // Store in L2 (binary)
-            co_await cache::RedisCache::setListBinary(cacheKey, listEntity, l2Ttl());
+            // Store in L2 (binary), not awaited
+            cache::RedisCache::setDetached(
+                std::move(cacheKey),
+                cache::RedisCache::encodeListBinary(listEntity, std::nullopt),
+                l2TtlSeconds());
 
             co_return listEntity;
         }
@@ -1177,9 +1189,12 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
                 header = headerBuilder(listEntity, limit, offset);
             }
 
-            // Store in L2 (binary, with optional header) and track the key
-            co_await cache::RedisCache::setListBinary(cacheKey, listEntity, l2Ttl(), header);
-            co_await cache::RedisCache::trackListKey(groupKey, cacheKey, l2Ttl());
+            // Store in L2 (binary, with optional header) and track the key, in
+            // one script, not awaited
+            cache::RedisCache::storeListPageDetached(
+                std::move(cacheKey),
+                cache::RedisCache::encodeListBinary(listEntity, header),
+                l2TtlSeconds(), std::move(groupKey));
 
             co_return listEntity;
         }

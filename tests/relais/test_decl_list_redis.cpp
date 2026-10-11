@@ -9,6 +9,7 @@
  *   2. Purchase list query (filters, combined)
  *   3. L2 CRUD invalidation (active invalidation via Redis Lua scripts)
  *   4. L2 cache lifecycle (Redis store/hit verification)
+ *   5. L2 store-back of a list miss (one script, not awaited by the read)
  */
 
 #include <catch2/catch_test_macros.hpp>
@@ -32,6 +33,7 @@ namespace relais_test {
 
 using L2DeclArticleListRepo = Repo<TestArticleEntity, "test:article:list:l2:decl", cfg::Redis>;
 using L2DeclPurchaseListRepo = Repo<TestPurchaseEntity, "test:purchase:list:l2:decl", cfg::Redis>;
+using L1L2DeclArticleListRepo = Repo<TestArticleEntity, "test:article:list:both:decl", cfg::Both>;
 
 // Type aliases for L2 list queries
 using L2ArticleListQuery = L2DeclArticleListRepo::ListQuery;
@@ -1410,4 +1412,139 @@ TEST_CASE("[DeclList L2] queryBinary",
         REQUIRE(json.find("BinH Article 2") != std::string::npos);
         REQUIRE(json.find("BinH Article 3") == std::string::npos);
     }
+}
+
+// #############################################################################
+//
+//  11. L2 store-back of a list miss
+//
+// #############################################################################
+//
+// A list miss stores its page into L2 with one script the read does not await:
+// each case first waits for the page (awaitL2Key). The script writes the page
+// last, so once it is visible its tracking entry and master-hash entry are too.
+
+namespace {
+
+int64_t redisInt(const char* cmd, const std::string& key) {
+    return sync(jcailloux::relais::PgProvider::redis(cmd, key)).asInteger();
+}
+
+/// The repo's list groups, from its master hash.
+template<typename RepoT>
+std::vector<std::string> listGroups() {
+    auto r = sync(jcailloux::relais::PgProvider::redis(
+        "HKEYS", std::string(RepoT::name()) + ":dlist_groups"));
+    std::vector<std::string> out;
+    for (size_t i = 0; i < r.arraySize(); ++i) out.push_back(r.at(i).asString());
+    return out;
+}
+
+bool trackedIn(const std::string& group, const std::string& pageKey) {
+    return sync(jcailloux::relais::PgProvider::redis(
+        "SISMEMBER", group + ":_keys", pageKey)).asInteger() == 1;
+}
+
+/// Poll until `key` is gone (bounded): list invalidation in L2 may not be
+/// awaited by the write either.
+bool awaitL2Gone(const std::string& key) {
+    for (int i = 0; i < 200; ++i)
+        if (redisInt("EXISTS", key) == 0) return true;
+    return false;
+}
+
+}  // namespace
+
+TEST_CASE("[DeclList L2] list miss store-back",
+          "[integration][db][redis][list][store-back]")
+{
+    TransactionGuard tx;
+    TestInternals::resetListCacheState<L2DeclArticleListRepo>();
+    const auto userId = insertTestUser("author", "author@store.com", 0);
+
+    SECTION("[store-back] page, tracking entry and master entry, with their TTLs") {
+        insertTestArticle("store", userId, "S100", 100);
+        insertTestArticle("store", userId, "S80", 80);
+
+        auto q = makeL2ViewCountQuery("store", 10);
+        auto result = sync(L2DeclArticleListRepo::query(q));
+        REQUIRE(result->size() == 2);
+
+        const auto pageKey = buildRedisPageKey<L2DeclArticleListRepo>(q.cacheKey());
+        REQUIRE(awaitL2Key(pageKey).has_value());
+
+        const auto groups = listGroups<L2DeclArticleListRepo>();
+        REQUIRE(groups.size() == 1);
+        CHECK(trackedIn(groups[0], pageKey));
+        // view_count is the descriptor's sort index 1.
+        CHECK(sync(jcailloux::relais::PgProvider::redis(
+            "HGET", std::string(L2DeclArticleListRepo::name()) + ":dlist_groups",
+            groups[0])).asString() == "1");
+
+        const auto pageTtl = redisInt("TTL", pageKey);
+        CHECK(pageTtl > 0);
+        CHECK(pageTtl <= 4 * 3600);
+        CHECK(redisInt("TTL", groups[0] + ":_keys") > 0);
+    }
+
+    SECTION("[store-back] a later page of the group does not extend the tracking TTL") {
+        for (int i = 1; i <= 4; ++i)
+            insertTestArticle("store", userId, "S" + std::to_string(i), i * 10);
+
+        auto q1 = makeL2ViewCountQuery("store", 2);
+        sync(L2DeclArticleListRepo::query(q1));
+        REQUIRE(awaitL2Key(buildRedisPageKey<L2DeclArticleListRepo>(q1.cacheKey())));
+        const auto groups = listGroups<L2DeclArticleListRepo>();
+        REQUIRE(groups.size() == 1);
+        const auto tracking = groups[0] + ":_keys";
+        const auto pttl1 = redisInt("PTTL", tracking);
+        REQUIRE(pttl1 > 0);
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+        auto q2 = makeL2ViewCountQuery("store", 3);
+        sync(L2DeclArticleListRepo::query(q2));
+        REQUIRE(awaitL2Key(buildRedisPageKey<L2DeclArticleListRepo>(q2.cacheKey())));
+        REQUIRE(listGroups<L2DeclArticleListRepo>().size() == 1);
+        CHECK(redisInt("SCARD", tracking) == 2);
+        // Renewed, it would be back at the full TTL, above pttl1.
+        CHECK(redisInt("PTTL", tracking) < pttl1);
+    }
+
+    SECTION("[store-back] an entity created into the page invalidates it in L2") {
+        insertTestArticle("store", userId, "S100", 100);
+        insertTestArticle("store", userId, "S60", 60);
+
+        auto q = makeL2ViewCountQuery("store", 10);
+        sync(L2DeclArticleListRepo::query(q));
+        const auto pageKey = buildRedisPageKey<L2DeclArticleListRepo>(q.cacheKey());
+        REQUIRE(awaitL2Key(pageKey));
+
+        sync(L2DeclArticleListRepo::insert(makeTestArticle("store", userId, "S80", 80)));
+        CHECK(awaitL2Gone(pageKey));
+        CHECK(sync(L2DeclArticleListRepo::query(q))->size() == 3);
+    }
+}
+
+TEST_CASE("[DeclList L1+L2] a page stored in L2 serves the read once L1 is cleared",
+          "[integration][db][redis][list][store-back]")
+{
+    TransactionGuard tx;
+    TestInternals::resetListCacheState<L1L2DeclArticleListRepo>();
+    const auto userId = insertTestUser("author", "author@store.com", 0);
+    insertTestArticle("store", userId, "S100", 100);
+    insertTestArticle("store", userId, "S80", 80);
+
+    using BothDesc = L1L2DeclArticleListRepo::ListDescriptorType;
+    decl::ListQueryParams<BothDesc> p;
+    p.limit = 10;
+    p.filters.get<"category">() = std::string("store");
+    const auto bq = decl::seal<BothDesc>(std::move(p));
+    REQUIRE(sync(L1L2DeclArticleListRepo::query(bq))->size() == 2);
+    REQUIRE(awaitL2Key(buildRedisPageKey<L1L2DeclArticleListRepo>(bq.cacheKey())));
+
+    // Gone from PostgreSQL and from L1: only L2 still holds the two rows.
+    execSql("DELETE FROM relais_test_articles WHERE category = 'store'");
+    TestInternals::resetListCacheState<L1L2DeclArticleListRepo>();
+    CHECK(sync(L1L2DeclArticleListRepo::query(bq))->size() == 2);
 }

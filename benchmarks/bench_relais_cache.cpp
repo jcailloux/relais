@@ -2057,6 +2057,40 @@ TEST_CASE("Benchmark - entity writes with cached lists", "[benchmark][write-list
 
 // #############################################################################
 //
+//  15c. List miss with L2 — the read pays the L2 lookup and PostgreSQL; the
+//  store-back into L2 (one script) runs after the read returns.
+//
+//  Redis is flushed before each sample, outside the timed region.
+//
+//  Run with:
+//    ./bench_relais_cache "[list-miss]"
+//
+// #############################################################################
+
+TEST_CASE("Benchmark - list miss with L2", "[benchmark][list-miss]") {
+    TransactionGuard tx;
+    auto author = insertTestUser("lm_author", "lm@test.com", 0);
+    for (int i = 0; i < 20; ++i)
+        insertTestArticle("tech", author, "LM_" + std::to_string(i), i * 10);
+
+    namespace ld = jcailloux::relais::list::spec;
+    using Desc = RedisArticleListRepo::ListDescriptorType;
+    ld::ListQueryParams<Desc> p;
+    p.limit = 20;
+    p.filters.template get<"author_id">() = author;
+    p.filters.template get<"category">() = std::string("tech");
+    const auto query = ld::seal<Desc>(std::move(p));
+
+    std::vector<BenchResult> lat;
+    lat.push_back(benchWithSetup("list miss, 20 rows (Redis tier)",
+        [] { flushRedis(); },
+        [&] { doNotOptimize(sync(RedisArticleListRepo::query(query))); }));
+    WARN(formatTable("List miss with L2", lat));
+}
+
+
+// #############################################################################
+//
 //  16. Tier matrix — read latency / throughput per cache tier, isolated
 //
 //  One repo per tier, each measured on its own (no cross-pollution: every Repo

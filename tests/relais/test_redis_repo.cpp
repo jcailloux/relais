@@ -19,6 +19,7 @@
  *  12. List custom — resolver-based list invalidation
  *  15. Selective   — Lua-based fine-grained list invalidation with SortBounds
  *  16. ListVia     — InvalidateListVia with enriched resolver
+ *  17. Store-back  — list miss stored into L2 without being awaited
  *
  * SECTION naming convention:
  *   [find]      — read by primary key with caching
@@ -38,6 +39,7 @@
  *   [list-custom]   — list + custom cross-invalidation
  *   [list-selective] — selective list invalidation with SortBounds headers
  *   [list-resolver]  — InvalidateListVia with enriched resolver
+ *   [list-store]     — L2 store-back of a list miss: presence, format, tracking
  */
 
 #include <set>
@@ -2738,5 +2740,177 @@ TEST_CASE("RedisRepo - non-regression after RowView", "[integration][db][redis][
         auto result = sync(L2TestUserRepo::patch(id, set<F::balance>(777)));
         REQUIRE(result != nullptr);
         REQUIRE(result->balance == 777);
+    }
+}
+
+// #############################################################################
+//
+//  17. Store-back of a list miss — cachedList* write L2 without being awaited
+//
+// #############################################################################
+//
+// Each case waits for the page (awaitL2Key) before inspecting Redis. Tracked
+// pages are written by one script, page last: once the page is visible, its
+// tracking entry is too.
+
+namespace relais_test {
+
+/// cachedListAsTracked: binary list entity, group tracking.
+class L2TrackedArticleListAsRepo
+    : public Repo<TestArticleEntity, "test:article:tracked:listas:l2", cfg::Redis> {
+public:
+    static io::Task<TestArticleList> getByCategory(
+        const std::string& category, int limit = 10, int offset = 0)
+    {
+        co_return co_await cachedListAsTracked<TestArticleList>(
+            [category, limit, offset]() -> io::Task<TestArticleList> {
+                auto result = co_await jcailloux::relais::PgProvider::queryArgs(
+                    "SELECT id, category, author_id, title, view_count, is_published, published_at, created_at "
+                    "FROM relais_test_articles WHERE category = $1 ORDER BY view_count DESC LIMIT $2 OFFSET $3",
+                    category, limit, offset);
+                co_return TestArticleList::fromRows(result);
+            },
+            limit, offset,
+            "category", category
+        );
+    }
+
+    static io::Task<size_t> invalidateCategoryList(const std::string& category) {
+        co_return co_await invalidateListGroup("category", category);
+    }
+};
+
+}  // namespace relais_test
+
+namespace {
+
+std::string untrackedListKey(std::string_view repoName, const std::string& category) {
+    return std::string(repoName) + ":list:category:" + category;
+}
+
+bool noKeyMatches(const std::string& pattern) {
+    auto r = sync(jcailloux::relais::PgProvider::redis("KEYS", pattern));
+    return r.arraySize() == 0;
+}
+
+}  // namespace
+
+TEST_CASE("RedisRepo - list store-back", "[integration][db][redis][list-store]") {
+    TransactionGuard tx;
+    const auto userId = insertTestUser("author", "author@store.com", 0);
+
+    SECTION("[list-store] cachedList, JSON format: stored, untracked, read back as written") {
+        insertTestArticle("st_json", userId, "J1", 10, true);
+        insertTestArticle("st_json", userId, "J2", 20, true);
+        auto first = sync(L2JsonTestArticleListRepo::getByCategory("st_json"));
+        REQUIRE(first.size() == 2);
+
+        const auto key = untrackedListKey(L2JsonTestArticleListRepo::name(), "st_json");
+        const auto raw = awaitL2Key(key);
+        REQUIRE(raw.has_value());
+        CHECK(raw->front() == '[');
+        CHECK(sync(redisTTL(key)) > 0);
+        CHECK(noKeyMatches(std::string(L2JsonTestArticleListRepo::name()) + ":*_keys"));
+
+        insertTestArticle("st_json", userId, "J3", 30, true);
+        auto again = sync(L2JsonTestArticleListRepo::getByCategory("st_json"));
+        REQUIRE(again.size() == 2);
+        CHECK(again[0].title == first[0].title);
+        CHECK(again[1].title == first[1].title);
+    }
+
+    SECTION("[list-store] cachedList, BEVE format: stored, read back as written") {
+        insertTestArticle("st_beve", userId, "B1", 10, true);
+        insertTestArticle("st_beve", userId, "B2", 20, true);
+        auto first = sync(L2TestArticleListRepo::getByCategory("st_beve"));
+        REQUIRE(first.size() == 2);
+
+        const auto raw = awaitL2Key(untrackedListKey(L2TestArticleListRepo::name(), "st_beve"));
+        REQUIRE(raw.has_value());
+        CHECK(raw->front() != '[');
+
+        insertTestArticle("st_beve", userId, "B3", 30, true);
+        auto again = sync(L2TestArticleListRepo::getByCategory("st_beve"));
+        REQUIRE(again.size() == 2);
+        CHECK(again[0].title == first[0].title);
+        CHECK(again[1].title == first[1].title);
+    }
+
+    SECTION("[list-store] cachedListAs: binary list entity, read back as written") {
+        insertTestArticle("st_as", userId, "A1", 10, true);
+        auto first = sync(L2TestArticleListAsRepo::getByCategory("st_as"));
+        REQUIRE(first.size() == 1);
+
+        const auto key = untrackedListKey(L2TestArticleListAsRepo::name(), "st_as");
+        const auto raw = awaitL2Key(key);
+        REQUIRE(raw.has_value());
+        const auto decoded = TestArticleList::fromBinary(std::span<const uint8_t>(
+            reinterpret_cast<const uint8_t*>(raw->data()), raw->size()));
+        REQUIRE(decoded.has_value());
+        CHECK(decoded->size() == 1);
+        CHECK(sync(redisTTL(key)) > 0);
+
+        insertTestArticle("st_as", userId, "A2", 20, true);
+        CHECK(sync(L2TestArticleListAsRepo::getByCategory("st_as")).size() == 1);
+    }
+
+    SECTION("[list-store] cachedListTracked: page tracked with TTLs, no master hash") {
+        for (int i = 1; i <= 3; ++i)
+            insertTestArticle("st_tr", userId, "T" + std::to_string(i), i * 10, true);
+        sync(L2TrackedArticleListRepo::getByCategory("st_tr", 2, 0));
+
+        const auto page = trackedPageKey(kTrackedRepoName, "st_tr", 2, 0);
+        const auto tracking = trackedTrackingKey(kTrackedRepoName, "st_tr");
+        REQUIRE(awaitL2Key(page).has_value());
+        CHECK(sync(redisSetContains(tracking, page)));
+        CHECK(sync(redisTTL(page)) > 0);
+        CHECK(sync(redisTTL(tracking)) > 0);
+        CHECK(noKeyMatches(std::string(kTrackedRepoName) + ":dlist_groups"));
+
+        CHECK(sync(L2TrackedArticleListRepo::invalidateCategoryList("st_tr")) == 1);
+        CHECK(sync(redisExists(page)) == 0);
+    }
+
+    SECTION("[list-store] cachedListTrackedWithHeader: page carries its bounds header") {
+        for (int i = 1; i <= 3; ++i)
+            insertTestArticle("st_hdr", userId, "H" + std::to_string(i), i * 10, true);
+        auto first = sync(L2SelectiveArticleListRepo::getByCategory("st_hdr", 5, 0));
+        REQUIRE(first.size() == 3);
+
+        const auto raw = awaitL2Key(selectivePageKey("st_hdr", 5, 0));
+        REQUIRE(raw.has_value());
+        const auto header = list::ListBoundsHeader::readFrom(
+            reinterpret_cast<const uint8_t*>(raw->data()), raw->size());
+        REQUIRE(header.has_value());
+        CHECK(header->bounds.first_value == 30);
+        CHECK(header->bounds.last_value == 10);
+        CHECK(sync(redisSetContains(selectiveTrackingKey("st_hdr"),
+                                    selectivePageKey("st_hdr", 5, 0))));
+
+        // Read back past the header.
+        insertTestArticle("st_hdr", userId, "H4", 40, true);
+        auto again = sync(L2SelectiveArticleListRepo::getByCategory("st_hdr", 5, 0));
+        REQUIRE(again.size() == 3);
+        CHECK(again[0].title == first[0].title);
+    }
+
+    SECTION("[list-store] cachedListAsTracked: binary page tracked, group invalidation reaches it") {
+        constexpr auto kRepo = "test:article:tracked:listas:l2";
+        for (int i = 1; i <= 3; ++i)
+            insertTestArticle("st_ast", userId, "AT" + std::to_string(i), i * 10, true);
+        REQUIRE(sync(L2TrackedArticleListAsRepo::getByCategory("st_ast", 2, 0)).size() == 2);
+
+        const auto page = trackedPageKey(kRepo, "st_ast", 2, 0);
+        const auto tracking = trackedTrackingKey(kRepo, "st_ast");
+        REQUIRE(awaitL2Key(page).has_value());
+        CHECK(sync(redisSetContains(tracking, page)));
+        CHECK(sync(redisTTL(tracking)) > 0);
+
+        insertTestArticle("st_ast", userId, "AT4", 40, true);
+        CHECK(sync(L2TrackedArticleListAsRepo::getByCategory("st_ast", 2, 0)).size() == 2);
+        CHECK(sync(L2TrackedArticleListAsRepo::invalidateCategoryList("st_ast")) == 1);
+        CHECK(sync(redisExists(page)) == 0);
+        CHECK(sync(L2TrackedArticleListAsRepo::getByCategory("st_ast", 2, 0))
+                  .front()->title == "AT4");
     }
 }

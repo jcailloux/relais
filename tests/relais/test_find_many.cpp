@@ -140,17 +140,6 @@ auto findManySync(std::span<const Key> ids) {
     return sync(Repo::findMany(ids));
 }
 
-// Drive the loop until a detached L2 fill becomes visible (bounded). The
-// warm-fill SET is fire-and-forget — not ordered against a later MGET across
-// pooled connections — so a single re-read races it. Polling converges once
-// Redis has processed the SET, with a bound so a genuine failure still fails.
-std::optional<std::string> awaitL2Key(const std::string& key) {
-    for (int i = 0; i < 200; ++i) {
-        auto r = sync(mgetRawKeys({key}));
-        if (r[0]) return r[0];
-    }
-    return std::nullopt;
-}
 
 }  // namespace
 

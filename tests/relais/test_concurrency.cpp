@@ -125,21 +125,6 @@ auto findManyView(const std::vector<int64_t>& ids) {
     return sync(Repo::findMany(std::span<const int64_t>(ids)));
 }
 
-/// Raw MGET against Redis — used to observe detached L2 warm-fills.
-inline io::Task<std::vector<std::optional<std::string>>>
-mgetRawKeys(std::vector<std::string> keys) {
-    co_return co_await cache::RedisCache::mgetRaw(keys);
-}
-
-/// Poll until a detached L2 fill becomes visible (bounded). Doubles as a drain:
-/// returning means the fire-and-forget SET landed, ordering it before teardown.
-inline std::optional<std::string> awaitL2Key(const std::string& key) {
-    for (int i = 0; i < 200; ++i) {
-        auto r = sync(mgetRawKeys({key}));
-        if (r[0]) return r[0];
-    }
-    return std::nullopt;
-}
 
 
 // #############################################################################
