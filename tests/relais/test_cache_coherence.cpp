@@ -38,6 +38,7 @@
 #include <fixtures/RelaisTestAccessors.h>
 #include "fixtures/generated/TestItemEntity.h"
 #include "fixtures/generated/TestAssignedKeyEntity.h"
+#include "fixtures/generated/TestArticleEntity.h"
 
 #include <algorithm>
 #include <chrono>
@@ -58,6 +59,7 @@ using Io = io::test::ControllableIoContext;
 
 using ::entity::generated::TestItemEntity;
 using ::entity::generated::TestAssignedKeyEntity;
+using ::entity::generated::TestArticleEntity;
 
 // ThreadSanitizer slows the loop ~5x, so the self-heal retry/backoff cadence
 // needs a wider convergence window than the plain build.
@@ -106,6 +108,9 @@ using CohItemTtl0 =
 // Assigned-PK, L1 only — the shape upsert applies to. The key is known before the
 // call, so the uncertain-timeout handler evicts by precaution on the update model.
 using CohAkeyL1 = Repo<TestAssignedKeyEntity, "coh:akey:l1">;
+// List repos (TestArticleEntity has a ListDescriptor → ListMixin), with an L2 tier.
+using CohArticleRedis = Repo<TestArticleEntity, "coh:article:redis", cfg::Redis>;
+using CohArticleBoth = Repo<TestArticleEntity, "coh:article:both", cfg::Both>;
 
 // =============================================================================
 // Bounded synchronous driver (mirrors test_io_liveness): a coherence suite must
@@ -628,6 +633,39 @@ TEST_CASE("coherence: a down L2 degrades reads to L3, order preserved",
     REQUIRE(mv[0]->value == 20);
     REQUIRE(mv[1]);
     REQUIRE(mv[1]->value == 10);
+}
+
+// A list miss stores the page back into L2 after PostgreSQL answered. That
+// store-back is best-effort: a Redis that stops answering at that point must not
+// turn a read PostgreSQL already served into an error.
+template<typename ListRepo>
+static void listReadSurvivesDownL2(CohEnv& env) {
+    namespace ld = jcailloux::relais::list::spec;
+    using Desc = typename ListRepo::ListDescriptorType;
+
+    // No L2 flush needed: Redis is cut before the read, so the L2 lookup misses.
+    env.probe.query("DELETE FROM relais_test_articles");
+    if constexpr (requires { ListRepo::listCache(); })
+        relais_test::TestInternals::resetListCacheState<ListRepo>();
+    env.probe.query(
+        "INSERT INTO relais_test_articles (category, author_id, title) VALUES "
+        "('coh-l2down', 1, 'a'), ('coh-l2down', 1, 'b'), ('coh-l2down', 1, 'c')");
+
+    ld::ListQueryParams<Desc> p;
+    p.limit = 10;
+    p.filters.template get<"category">() = std::string("coh-l2down");
+    auto query = ld::seal<Desc>(std::move(p));
+
+    env.holdRedis();
+    auto page = driveBounded(env.io, ListRepo::query(std::move(query)));
+    REQUIRE(page->size() == 3);
+}
+
+TEST_CASE("coherence: a list miss with a down L2 serves the PostgreSQL page",
+          "[coherence][degrade][list][redis][integration]") {
+    CohEnv env(300ms, /*with_redis=*/true, 200ms);
+    SECTION("Redis preset") { listReadSurvivesDownL2<CohArticleRedis>(env); }
+    SECTION("Both preset")  { listReadSurvivesDownL2<CohArticleBoth>(env); }
 }
 
 // =============================================================================

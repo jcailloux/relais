@@ -1155,8 +1155,15 @@ protected:
             co_await cache::RedisCache::setListBinary(pageKey, wrapper, l2Ttl(), header);
             // Track page in group SET
             co_await cache::RedisCache::trackListKey(groupKey, pageKey, l2Ttl());
-            // Track group in master HASH (stores sort field index per group)
-            co_await PgProvider::redis("HSET", redisMasterSetKey(), groupKey, std::to_string(sort.field));
+            // Track group in master HASH (stores sort field index per group).
+            // L2 is best-effort: a Redis failure here must not fail a read
+            // that PostgreSQL already answered.
+            try {
+                co_await PgProvider::redis("HSET", redisMasterSetKey(), groupKey,
+                                           std::to_string(sort.field));
+            } catch (const std::exception& e) {
+                RELAIS_LOG_WARN << name() << ": list master HSET error: " << e.what();
+            }
         }
 
         // 5. Store in L1 cache or epoch pool
