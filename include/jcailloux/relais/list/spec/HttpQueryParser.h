@@ -74,14 +74,14 @@ std::optional<T> parseInElement(const std::string& str) {
 }
 
 /// Parse a filter's scalar query value. A Via<Codec> filter takes the codec's
-/// database strings; any other goes by the value type.
+/// database strings; any other, and IS_NULL's bool, goes by the value type.
 template<typename FilterType>
-std::optional<typename FilterType::element_type> parseFilterValue(const std::string& str) {
+std::optional<typename FilterType::value_type> parseFilterValue(const std::string& str) {
     using Converter = typename FilterType::converter;
-    if constexpr (is_via_v<Converter>) {
+    if constexpr (is_via_v<Converter> && !FilterType::is_null_op) {
         return Converter::codec::fromDb(str);
     } else {
-        return parseValue<typename FilterType::element_type>(str);
+        return parseValue<typename FilterType::value_type>(str);
     }
 }
 
