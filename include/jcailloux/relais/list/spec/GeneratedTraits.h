@@ -66,7 +66,9 @@ template<typename Descriptor>
             // Get entity value (supports both data members and member functions)
             const auto entity_value = detail::extractMemberValue<FilterType::entity_ptr>(entity);
 
-            if constexpr (FilterType::op == Op::IN) {
+            if constexpr (FilterType::is_null_op) {
+                return entity_value.has_value() != *filter_value;
+            } else if constexpr (FilterType::op == Op::IN) {
                 // IN: entity scalar ∈ query set. filter_value is optional<vector>,
                 // *filter_value the set. compareWithOp is never instantiated here.
                 if constexpr (FilterType::is_optional_member) {
@@ -455,7 +457,7 @@ namespace detail {
 
 /// Intersect predicate filter I into the running [lo,hi]. Only EQ / IN /
 /// comparison on an arithmetic column narrow it; GT/LT are loosened to GE/LE
-/// (wider → never-miss); NE / NIN / absent leave it full.
+/// (wider → never-miss); NE / NIN / IS_NULL / absent leave it full.
 template<typename Descriptor, size_t I>
 void narrowSortRange(SortRange& r, const Filters<Descriptor>& pred) noexcept {
     using FT = filter_at<Descriptor, I>;
@@ -503,8 +505,9 @@ void narrowSortRangeForDim(SortRange& r, const Filters<Descriptor>& pred) noexce
 }
 
 /// Per-filter predicate↔group compatibility. False only when both sides are
-/// present and provably disjoint: EQ values differ, or IN sets share no element.
-/// Absent side = wildcard; comparison / NE / NIN = conservative (compatible).
+/// present and provably disjoint: EQ or IS_NULL values differ, or IN sets share
+/// no element. Absent side = wildcard; comparison / NE / NIN = conservative
+/// (compatible).
 template<typename Descriptor, size_t I>
 [[nodiscard]] bool predicateCompatAt(
     const Filters<Descriptor>& pred, const Filters<Descriptor>& group) noexcept {
@@ -512,7 +515,7 @@ template<typename Descriptor, size_t I>
     const auto& gv = std::get<I>(group.values);
     if (!pv.has_value() || !gv.has_value()) return true;
     constexpr Op op = filter_at<Descriptor, I>::op;
-    if constexpr (op == Op::EQ) {
+    if constexpr (op == Op::EQ || op == Op::IS_NULL) {
         return *pv == *gv;
     } else if constexpr (op == Op::IN) {
         for (const auto& e : *pv) {

@@ -517,6 +517,7 @@ Helpers over a descriptor (`ListDescriptor.h`): `filter_count<D>`, `sort_count<D
 | `LE` | less-or-equal (`<= $n`) | `optional<element>` | `Lazy` |
 | `IN` | membership, entity value ∈ set (`= ANY($n)`) | `optional<vector<element>>` | `PreComputed` |
 | `NIN` | anti-membership, entity value ∉ set (`!= ALL($n)`) | `optional<vector<element>>` | `PreComputed` |
+| `IS_NULL` | nullity: `true` → `IS NULL`, `false` → `IS NOT NULL`; binds no value | `optional<bool>` | `PreComputed` |
 
 A filter is declared as:
 
@@ -526,15 +527,18 @@ Filter<"severity", &Article::severity, "severity", Op::EQ, AsString>   // enum �
 Filter<"state", &Ticket::state, "state", Op::GE, Via<TicketMapping::StateCodec>>  // mapped enum
 Filter<"created_at", &Article::created_at, "created_at", Op::GE>       // range bound
 Filter<"category", &Article::category, "category", Op::IN>             // set membership
+Filter<"published_null", &Article::published_at, "published_at", Op::IS_NULL>  // nullity
 ```
 
 Template: `Filter<FixedString Name, auto EntityMemberPtr, FixedString ColumnName, Op = EQ, typename Converter = NoConvert, InvalidationStrategy = defaultInvalidationStrategy(Op)>`. `Name` is the HTTP query-param key; `EntityMemberPtr` may be a data member **or** a const member function. Converters: `NoConvert` (default), `AsString` (enum via ADL `toString`) and `Via<Codec>` (a mapped enum through its generated codec: `EQ`/`NE`/`IN`/`NIN` bind the database string, ordering operators compare the codec's rank with the underlying value, HTTP values parse with `Codec::fromDb`). `Codec::enum_type` must be the field's enum type (`static_assert`). The generator emits `Via<>` on every filter of a `@relais enum` field; a hand-written descriptor declares it too, so that the enum binds as its database string. See [lists.md › Enum fields](lists.md#enum-fields).
 
 > **IN/NIN guard-rails (compile-time).** A set-op filter takes `NoConvert`, or `Via<Codec>` for an enum element: every element then binds as the column stores it and encodes as the Redis-side blob reads it. `is_set_op` is the single `(op == IN || op == NIN)` switch every consumer keys off.
+>
+> **IS_NULL guard-rail (compile-time).** The member must be a `std::optional` (`static_assert`). The converter is ignored: the column is tested bare, and the HTTP value parses as a boolean.
 
 <details><summary>InvalidationStrategy — when a filter triggers list invalidation</summary>
 
-`InvalidationStrategy` (`PreComputed` / `Lazy` / `Disabled`) governs how the filter participates in cross-cache list invalidation; `defaultInvalidationStrategy(Op)` maps `EQ/NE/IN/NIN → PreComputed` (hash matched on modification) and `GT/GE/LT/LE → Lazy` (checked on cache access, via `ModificationTracker` range bumps). `Disabled` never invalidates (pagination-only fields). Per-filter exposed as `Filter::is_precomputed` / `is_lazy`. Range ops feed `predicateSortRange` for the `eraseWhere` fast path.
+`InvalidationStrategy` (`PreComputed` / `Lazy` / `Disabled`) governs how the filter participates in cross-cache list invalidation; `defaultInvalidationStrategy(Op)` maps `EQ/NE/IN/NIN/IS_NULL → PreComputed` (hash matched on modification) and `GT/GE/LT/LE → Lazy` (checked on cache access, via `ModificationTracker` range bumps). `Disabled` never invalidates (pagination-only fields). Per-filter exposed as `Filter::is_precomputed` / `is_lazy`. Range ops feed `predicateSortRange` for the `eraseWhere` fast path.
 </details>
 
 ### Sort directions
@@ -1084,7 +1088,7 @@ Any other `T` is a compile error.
 | `json_field` | Struct (or `vector<Struct>`) serialized to/from a JSON column. | [entities.md](entities.md#field-level) |
 | `enum` | Auto-resolve the DB↔enum mapping from `glz::meta<EnumType>`. | [entities.md](entities.md#field-level) |
 | `enum=db1:V1,db2:V2` | Explicit DB↔enum mapping (overrides `glz::meta`). | [entities.md](entities.md#field-level) |
-| `filterable[...]` | List filter — `filterable[:param][:op]`. Ops: `eq`/`ne`/`gt`/`ge`/`lt`/`le`/`in`/`nin` (aliases `gte`→`ge`, `lte`→`le`, `not_in`→`nin`); default `eq`. | [lists.md](lists.md) |
+| `filterable[...]` | List filter — `filterable[:param][:op]`. Ops: `eq`/`ne`/`gt`/`ge`/`lt`/`le`/`in`/`nin`/`is_null` (aliases `gte`→`ge`, `lte`→`le`, `not_in`→`nin`); default `eq`. `is_null` requires a `std::optional` field; a parameter declared twice is an error. | [lists.md](lists.md) |
 | `sortable[...]` | List sort — `sortable[:param][:asc\|\|desc]`; default direction `desc`. | [lists.md](lists.md) |
 
 > **`nullable` is not a `@relais` annotation.** Field optionality (and thus `setNull` support in `patch`) derives from the C++ type being `std::optional<T>` — `FieldInfo<F>::is_nullable` mirrors the type, not a marker. Writing `// @relais nullable` adds an inert tag the generator does not consume.

@@ -52,9 +52,11 @@ struct AuditLog {
 | `filterable:authors:in` | `authors` | IN |
 | `filterable:nin` | field name | NIN (set anti-membership) |
 | `filterable:authors:not_in` | `authors` | NIN |
+| `filterable:parent_null:is_null` | `parent_null` | IS_NULL (nullity) |
 
 Known operators: `eq`, `ne`, `gt`, `ge`/`gte`, `lt`, `le`/`lte`, `in`,
-`nin`/`not_in`.
+`nin`/`not_in`, `is_null`. A parameter name declared twice in one entity is a
+generator error.
 
 Multiple filters on one field (range queries):
 
@@ -71,7 +73,7 @@ comma-separated list (`?authors=1,2,3`); the set is canonicalized
 integer is rejected at compile time. An empty or all-invalid set leaves the
 filter inactive. The set is bounded at 256 elements.
 
-Boolean filter values — for `in` and scalar `eq` alike — accept the standard
+Boolean filter values — for `in`, scalar `eq` and `is_null` alike — accept the standard
 HTTP / HTML-form conventions, case-insensitively: `true/1/t/yes/y/on` and
 `false/0/f/no/n/off`. Any other token leaves the filter inactive rather than
 defaulting to `false`.
@@ -100,6 +102,21 @@ than `in` — the complement is far less selective, so a write is more likely to
 fall inside a cached `nin` group and purge its page. Per-operation cost is
 identical to `in` (same `cmpin`/`skipset`, same Redis round-trip).
 </details>
+
+### `is_null` operator (nullity)
+
+`filterable:<param>:is_null` filters on whether a nullable column is NULL. Its
+value is a boolean: `true` selects `"col" IS NULL`, `false` selects
+`"col" IS NOT NULL`, absent leaves the filter inactive (`?parent_null=true`).
+The field must be a `std::optional`; the generator rejects any other, as does a
+`static_assert` in a hand-written descriptor.
+
+A nullable field often carries a value filter as well, which takes the field
+name as its parameter: name the `is_null` one explicitly.
+
+```cpp
+std::optional<int64_t> parent_id;  // @relais filterable filterable:parent_null:is_null
+```
 
 ### `sortable` syntax
 
