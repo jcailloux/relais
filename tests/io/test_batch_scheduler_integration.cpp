@@ -683,6 +683,66 @@ TEST_CASE("BatchScheduler: single Redis command returns correct result",
 }
 
 // =============================================================================
+// Redis: argument ownership — an owned argv is taken over, a borrowed one is
+// copied before submitRedis returns (the caller's buffer may change after)
+// =============================================================================
+
+TEST_CASE("BatchScheduler: Redis arguments are owned before the first suspension",
+          "[io][batch][integration][redis]")
+{
+    Io io;
+    bool done = false;
+    TimeoutGuard timeout(io);
+
+    auto task = [&]() -> DetachedTask {
+        auto pool = co_await PgPool<Io>::create(io, CONNINFO, {.min_connections = 1, .max_connections = 1});
+        auto redis = co_await RedisClient<Io>::connect(io);
+        auto redis_pool = std::make_shared<RedisPool<Io>>(
+            RedisPool<Io>::fromClients({std::move(redis)}));
+        auto batcher = std::make_shared<BatchScheduler<Io>>(
+            io, pool, redis_pool, 8);
+
+        // Owned argv, binary payload with an embedded NUL.
+        const std::string payload("bin\0ary", 7);
+        {
+            std::vector<std::string> set = {"SET", "batch_test_argv_owned", payload};
+            auto pending = batcher->submitRedis(std::move(set));
+            auto result = co_await std::move(pending);
+            REQUIRE(result.asString() == "OK");
+        }
+
+        // Borrowed argv: the buffer is overwritten between the call and the
+        // co_await; the command must carry what it held at the call.
+        {
+            std::string value = "first";
+            const char* argv[] = {"SET", "batch_test_argv_borrowed", value.data()};
+            const size_t argvlen[] = {3, 24, value.size()};
+            auto pending = batcher->submitRedis(3, argv, argvlen);
+            value.assign("XXXXX");
+            auto result = co_await std::move(pending);
+            REQUIRE(result.asString() == "OK");
+        }
+
+        std::vector<std::string> getOwned = {"GET", "batch_test_argv_owned"};
+        auto owned = co_await batcher->submitRedis(std::move(getOwned));
+        REQUIRE(owned.asString() == payload);
+        std::vector<std::string> getBorrowed = {"GET", "batch_test_argv_borrowed"};
+        auto borrowed = co_await batcher->submitRedis(std::move(getBorrowed));
+        REQUIRE(borrowed.asString() == "first");
+
+        std::vector<std::string> del = {
+            "DEL", "batch_test_argv_owned", "batch_test_argv_borrowed"};
+        co_await batcher->submitRedis(std::move(del));
+        done = true;
+    };
+    task();
+
+    io.runUntil([&] { return done || timeout.timed_out; });
+    REQUIRE_FALSE(timeout.timed_out);
+    REQUIRE(done);
+}
+
+// =============================================================================
 // Redis: concurrent commands don't deadlock
 // =============================================================================
 

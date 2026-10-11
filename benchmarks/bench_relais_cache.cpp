@@ -2091,6 +2091,88 @@ TEST_CASE("Benchmark - list miss with L2", "[benchmark][list-miss]") {
 
 // #############################################################################
 //
+//  15d. Redis command argv — PgProvider::redis("SET", key, payload) through
+//  the BatchScheduler, by payload size: sequential latency, throughput with
+//  64 coroutines on one loop (pipelined), and heap allocations per command
+//  counted on the loop thread (sequential, so no batch bookkeeping).
+//
+//  Run with:
+//    ./bench_relais_cache "[redis-argv]"
+//
+// #############################################################################
+
+namespace {
+
+io::Task<void> redisSetN(const std::string& key, const std::string& payload, int n) {
+    for (int i = 0; i < n; ++i)
+        co_await jcailloux::relais::PgProvider::redis("SET", key, payload);
+}
+
+io::Task<double> redisSetAllocsPerCommand(const std::string& key,
+                                          const std::string& payload) {
+    constexpr int N = 1000;
+    co_await redisSetN(key, payload, 50);
+    const auto before = threadAllocCount();
+    co_await redisSetN(key, payload, N);
+    co_return static_cast<double>(threadAllocCount() - before) / N;
+}
+
+double redisSetThroughput(const std::string& key, const std::string& payload, int coro) {
+    std::atomic<bool> running{true};
+    std::atomic<int64_t> ops{0};
+    std::latch done{coro};
+    auto t0 = Clock::now();
+    for (int c = 0; c < coro; ++c) {
+        detail::testLoop().dispatch([&key, &payload, &running, &ops, &done]() {
+            [](const std::string& key, const std::string& payload,
+               std::atomic<bool>& running, std::atomic<int64_t>& ops,
+               std::latch& done) -> DetachedHandle {
+                while (running.load(std::memory_order_relaxed)) {
+                    co_await jcailloux::relais::PgProvider::redis("SET", key, payload);
+                    ops.fetch_add(1, std::memory_order_relaxed);
+                }
+                done.count_down();
+            }(key, payload, running, ops, done);
+        });
+    }
+    std::this_thread::sleep_for(std::chrono::seconds(benchDurationSeconds()));
+    running.store(false, std::memory_order_relaxed);
+    done.wait();
+    const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+        Clock::now() - t0).count();
+    return (us > 0) ? ops.load(std::memory_order_relaxed) * 1'000'000.0 / us : 0.0;
+}
+
+} // anonymous namespace
+
+TEST_CASE("Benchmark - Redis command argv", "[benchmark][redis-argv]") {
+    flushRedis();
+    struct Size { const char* label; std::size_t bytes; };
+    static constexpr Size sizes[] = {
+        {"100 B", 100}, {"1 KiB", 1024}, {"16 KiB", 16 * 1024}, {"64 KiB", 64 * 1024}};
+
+    std::vector<BenchResult> lat;
+    std::ostringstream extra;
+    extra << "\n  allocations per SET (loop thread) / throughput, 64 coros:";
+    for (const auto& s : sizes) {
+        const std::string key = std::string("bench:argv:") + s.label;
+        const std::string payload(s.bytes, 'x');
+        lat.push_back(bench(std::string("SET ") + s.label,
+            [&] { sync(redisSetN(key, payload, 1)); }));
+        const double allocs = sync(redisSetAllocsPerCommand(key, payload));
+        const double tp = redisSetThroughput(key, payload, 64);
+        extra << "\n    " << std::left << std::setw(8) << s.label
+              << std::right << std::fixed << std::setprecision(2) << std::setw(6)
+              << allocs << " allocs   " << fmtOps(tp);
+    }
+    flushRedis();
+    WARN(formatTable("Redis SET through PgProvider (sequential latency)", lat));
+    WARN(extra.str());
+}
+
+
+// #############################################################################
+//
 //  16. Tier matrix — read latency / throughput per cache tier, isolated
 //
 //  One repo per tier, each measured on its own (no cross-pollution: every Repo
