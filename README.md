@@ -83,7 +83,7 @@ either part of relais or a backing service you already run.
 
 **Runtime services** — the assumed stack; processes you connect to, not libraries you link:
 - PostgreSQL
-- Redis — optional, only for the L2 tier
+- Redis 7.0+ or Valkey — optional, only for the L2 tier
 
 **Internal to relais** — shipped with it, nothing to install or adopt:
 - The coroutine runtime (`io::Task`, `IoPool`) and per-loop connection pools
