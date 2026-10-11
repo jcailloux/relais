@@ -169,7 +169,7 @@ public:
         releaseLock();
 
         if (result.isError())
-            throw RedisError(result.errorMessage());
+            std::rethrow_exception(redisReplyError(result.errorMessage()));
 
         co_return result;
     }
