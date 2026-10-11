@@ -172,15 +172,23 @@ public:
     }
 
     /// Submit a Redis command (read or write — Redis pipeline handles both).
-    Task<RedisResult> submitRedis(int argc, const char** argv, const size_t* argvlen) {
-        // Build owned copies of args for the coroutine frame
+    /// `args` is the full argv, verb first; the entry takes it over as is.
+    /// Return-direct: no coroutine frame of its own.
+    Task<RedisResult> submitRedis(std::vector<std::string> args) {
         RedisEntry entry;
-        entry.args.reserve(argc);
-        for (int i = 0; i < argc; ++i) {
-            entry.args.emplace_back(argv[i], argvlen[i]);
-        }
+        entry.args = std::move(args);
+        return submitRedisEntry(std::move(entry));
+    }
 
-        co_return co_await submitRedisEntry(std::move(entry));
+    /// Same, from borrowed arguments copied before this returns: the pointers
+    /// need only be valid for the call.
+    Task<RedisResult> submitRedis(int argc, const char** argv, const size_t* argvlen) {
+        std::vector<std::string> args;
+        args.reserve(static_cast<std::size_t>(argc));
+        for (int i = 0; i < argc; ++i) {
+            args.emplace_back(argv[i], argvlen[i]);
+        }
+        return submitRedis(std::move(args));
     }
 
     /// Register a deferred cache-eviction retry whose UNLINK could not reach
@@ -310,7 +318,7 @@ private:
     };
 
     struct RedisEntry {
-        std::vector<std::string> args;   // Owned copies
+        std::vector<std::string> args;   // Owned argv, verb first
 
         std::coroutine_handle<> continuation{};
         RedisResult result;

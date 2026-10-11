@@ -137,50 +137,35 @@ public:
     static io::Task<io::RedisResult> redis(Args&&... args) {
         if (!redis_exec_) throw std::logic_error("PgProvider::redis() called before init() or Redis not configured");
 
-        // Build argv in the coroutine frame — lifetime extends until co_await completes.
-        std::vector<std::string> arg_strs;
-        arg_strs.reserve(sizeof...(args));
-        (arg_strs.push_back(io::detail::redisArgText(std::forward<Args>(args))), ...);
+        // Converted to text before the first suspension, then handed over to
+        // the scheduler: each argument is copied once.
+        std::vector<std::string> argv;
+        argv.reserve(sizeof...(args));
+        (argv.push_back(io::detail::redisArgText(std::forward<Args>(args))), ...);
 
-        std::vector<const char*> argv;
-        std::vector<size_t> argvlen;
-        argv.reserve(arg_strs.size());
-        argvlen.reserve(arg_strs.size());
-        for (const auto& s : arg_strs) {
-            argv.push_back(s.data());
-            argvlen.push_back(s.size());
-        }
-
-        co_return co_await redis_exec_(
-            static_cast<int>(argv.size()), argv.data(), argvlen.data());
+        co_return co_await redis_exec_(std::move(argv));
     }
 
     /// Execute a Redis command whose argument list is sized at runtime
     /// (e.g. MGET over N keys). `args` is the full argv — verb first — taken by
-    /// value and kept alive in the coroutine frame. Binary-safe (length-prefixed).
+    /// value and handed over to the scheduler without a copy. Binary-safe
+    /// (length-prefixed).
     static io::Task<io::RedisResult> redisDynamic(std::vector<std::string> args) {
         if (!redis_exec_) throw std::logic_error("PgProvider::redisDynamic() called before init() or Redis not configured");
-
-        std::vector<const char*> argv;
-        std::vector<size_t> argvlen;
-        argv.reserve(args.size());
-        argvlen.reserve(args.size());
-        for (const auto& s : args) {
-            argv.push_back(s.data());
-            argvlen.push_back(s.size());
-        }
-
-        co_return co_await redis_exec_(
-            static_cast<int>(argv.size()), argv.data(), argvlen.data());
+        co_return co_await redis_exec_(std::move(args));
     }
 
-    /// Internal: send a prepared argv (verb first) as is. The pointers must stay
-    /// valid until the co_await completes. Used by RedisCache::evalScriptArgs,
-    /// which owns the strings and resends the same argv on its EVAL fallback.
+    /// Internal: send a prepared argv (verb first), copied before this returns,
+    /// so the pointers need only be valid for the call. Used by
+    /// RedisCache::evalScriptArgs, which keeps its strings to resend them on
+    /// its EVAL fallback.
     static io::Task<io::RedisResult> redisArgv(int argc, const char** argv,
                                                const size_t* argvlen) {
         if (!redis_exec_) throw std::logic_error("PgProvider::redisArgv() called before init() or Redis not configured");
-        return redis_exec_(argc, argv, argvlen);
+        std::vector<std::string> owned;
+        owned.reserve(static_cast<std::size_t>(argc));
+        for (int i = 0; i < argc; ++i) owned.emplace_back(argv[i], argvlen[i]);
+        return redis_exec_(std::move(owned));
     }
 
     /// Register a deferred cache-eviction retry whose UNLINK could not reach
@@ -290,10 +275,8 @@ public:
         if (with_redis) {
             // Route Redis through the BatchScheduler for pipelining.
             // The batcher owns the redis_pool via shared_ptr.
-            redis_exec_ = [batcher](
-                int argc, const char** argv, const size_t* argvlen)
-            {
-                return batcher->submitRedis(argc, argv, argvlen);
+            redis_exec_ = [batcher](std::vector<std::string>&& args) {
+                return batcher->submitRedis(std::move(args));
             };
             // Self-heal needs the same batcher (its loop + its pool). Bound only
             // with Redis: without L2 there is no phantom to chase.
@@ -333,7 +316,7 @@ public:
     using PgWriteFn = std::function<io::Task<io::batch::PgWriteResult>(
         const char*, const io::PgParams&, io::batch::WriteMode)>;
     using RedisExecFn = std::function<io::Task<io::RedisResult>(
-        int, const char**, const size_t*)>;
+        std::vector<std::string>&&)>;
     using SelfHealEnqueueFn = std::function<void(
         std::string, std::function<io::Task<bool>()>)>;
 
