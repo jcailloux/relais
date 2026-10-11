@@ -1053,9 +1053,10 @@ Any other `T` is a compile error.
 | `io::PgUncertainError` | `PgError` | **Category** — the request was in flight when the wait failed, so the DB *may* have committed. The write path evicts the affected caches before rethrowing. |
 | `io::PgQueryTimeout` | `PgUncertainError` | A per-connection I/O wait exceeded `query_timeout`. |
 | `io::PgConnectionLost` | `PgUncertainError` | The connection dropped (RST/EOF) after the request was flushed or while its result was read. |
-| `io::RedisError` | `std::runtime_error` | Any Redis-layer error. |
+| `io::RedisError` | `std::runtime_error` | Any Redis-layer error, including an error reply from the server, whether the command was sent alone or pipelined in a batch. |
 | `io::RedisConnectionError` | `RedisError` | Connection-level Redis failure. |
 | `io::RedisQueryTimeout` | `RedisError` | A Redis I/O wait exceeded `query_timeout`. A read degrades to an L2 miss (→ L3); a write/evict is best-effort + self-heal. |
+| `io::RedisNoScriptError` | `RedisError` | Error reply `NOSCRIPT`: the server has no script under the SHA1 given to `EVALSHA`. |
 
 > Catch `PgError`/`RedisError` to handle a whole layer; catch `PgNoRows` etc. for the specific case. There is no `error_code`-style enum — branch on type. The one category that carries semantics is `PgUncertainError`: a write that throws it *may* have committed (relais has already evicted the affected caches); a write that throws a plain `PgError` provably did not. See [runtime.md › Liveness & failure semantics](runtime.md#liveness--failure-semantics).
 

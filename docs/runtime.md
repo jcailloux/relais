@@ -185,7 +185,8 @@ plays out in three cases:
 - **Reads propagate the error — they never fake an answer.** A failed entity or list
   read *throws*; it is never reported as "not found" or an empty page (a false 404).
   The one degradation is a Redis read timeout: L2 is only a cache, so the read falls
-  through to L3 (PostgreSQL) instead of throwing.
+  through to L3 (PostgreSQL) instead of throwing. Storing a result into L2 never
+  fails a read either.
 - **A deterministic write failure** — the DB rolled back (connection refused, query
   rejected) — returns `nullopt`, leaving the cache as-is. The call is safe to retry.
 - **An uncertain write** — a timeout, or a connection dropped *after* the request was
@@ -199,3 +200,14 @@ plays out in three cases:
 > and `PgConnectionLost`) is the "maybe committed" category; a plain `io::PgError`
 > means the DB is unchanged. See
 > [api-reference.md › errors](api-reference.md#pgprovider--pgresult--row--errors).
+
+### Redis error replies and scripts
+
+- **An error reply always throws.** `PgProvider::redis` and `redisDynamic` throw
+  `io::RedisError` on an error reply from the server, whether the command was sent
+  alone or pipelined with others; in a batch, only that command fails.
+- **The server's script cache needs no setup.** relais runs its Lua scripts by
+  SHA1 (`EVALSHA`). When the server no longer has one (restart, failover,
+  `SCRIPT FLUSH`), relais sends the script once with `EVAL`, which loads it again.
+  The first reload of each script in a process logs a warning, later ones a debug
+  line.
