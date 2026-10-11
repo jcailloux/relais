@@ -79,7 +79,7 @@ class EnumMapping:
 class FilterConfig:
     param: str      # HTTP query parameter name
     field: str      # Struct field name (→ &Entity::field)
-    op: str = "eq"  # Comparison operator: eq, ne, gt, ge, lt, le, in, nin
+    op: str = "eq"  # Comparison operator: eq, ne, gt, ge, lt, le, in, nin, is_null
 
 
 @dataclass
@@ -336,6 +336,15 @@ class StructParser:
             elif 'auto_enum' in m.tags:
                 annot.enums.append(EnumMapping(m.name, [], m.inner_type))
             for fc in m.filter_configs:
+                if fc.op == "is_null" and not m.is_optional:
+                    raise ValueError(
+                        f"field '{m.name}': filterable:...:is_null requires a "
+                        f"std::optional member")
+                if any(f.param == fc.param for f in annot.filters):
+                    raise ValueError(
+                        f"field '{m.name}': filter parameter '{fc.param}' is "
+                        f"declared twice; name one of them "
+                        f"(filterable:<param>:<op>)")
                 annot.filters.append(fc)
             for sc in m.sort_configs:
                 annot.sorts.append(sc)
@@ -353,13 +362,14 @@ class StructParser:
             filterable:cats:in      -> custom param + IN operator
             filterable:nin          -> NIN operator on field_name
             filterable:cats:not_in  -> custom param + NIN operator (alias)
+            filterable:parent_null:is_null -> custom param + IS_NULL (bool value)
         """
-        # "in"/"nin" must be known ops so the short forms `filterable:in` and
-        # `filterable:nin` are parsed as set operators. Without it, `:in` falls
-        # through to the custom-param branch and silently becomes an EQ filter on
-        # an HTTP param named "in". `not_in` is a readable alias for `nin`.
+        # Every op must be known so its short form (`filterable:in`) is parsed as
+        # an operator. Without it, `:in` falls through to the custom-param branch
+        # and silently becomes an EQ filter on an HTTP param named "in". `not_in`
+        # is a readable alias for `nin`.
         KNOWN_OPS = {"eq", "ne", "gt", "ge", "lt", "le", "gte", "lte",
-                     "in", "nin", "not_in"}
+                     "in", "nin", "not_in", "is_null"}
 
         def _norm(o: str) -> str:
             return (o.replace("gte", "ge").replace("lte", "le")
@@ -1346,7 +1356,8 @@ class MappingGenerator:
             # (param-sorted) order as the filters tuple, so toFilterTuple() lines
             # up element-for-element with Filters<Descriptor>::values. Members are
             # named by HTTP param (unique) for designated-init: {.author_id = 42}.
-            # IN / NOT IN take a set, mirroring Filter::filter_type.
+            # IN / NOT IN take a set and IS_NULL a bool, mirroring
+            # Filter::filter_type.
             lines.append("")
             lines.append("        struct Values {")
             for f in a.filters:
@@ -1358,6 +1369,8 @@ class MappingGenerator:
                     element = self._qualify_type(entity, element)
                 if f.op in ("in", "nin"):
                     opt_type = f"std::optional<std::vector<{element}>>"
+                elif f.op == "is_null":
+                    opt_type = "std::optional<bool>"
                 else:
                     opt_type = f"std::optional<{element}>"
                 lines.append(f"            {opt_type} {f.param}{{}};")

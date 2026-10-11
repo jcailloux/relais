@@ -374,7 +374,14 @@ local function fmatch(bin, blob)
         local gx = string.byte(bin, gp); local ex = string.byte(blob, ep)
         gp = gp + 1; ep = ep + 1
         local is_set = (fo == 64 or fo == 35)              -- IN (@) or NOT IN (#): same wire format
-        if gx == 0 then
+        if fo == 78 then
+            -- IS NULL (N): the entity slot is its presence byte alone, already
+            -- read; the group holds one bool, true = the column must be null.
+            if gx == 1 then
+                local b = string.byte(bin, gp); gp = gp + 1
+                if (ex == 0) ~= (b == 1) then return false end
+            end
+        elseif gx == 0 then
             if ex == 1 then ep = skip(blob, ep, ft) end
         elseif ex == 0 then
             -- shared cursor advance: skipset for both set ops, skip otherwise.
@@ -415,8 +422,8 @@ end
 
 -- Predicate↔group compatibility. bin = group filter bytes, blob = predicate
 -- filter bytes (same encoding). Prune (return false) only when both present and
--- provably disjoint: EQ values differ, or IN sets share no element. Absent on
--- either side is a wildcard; comparison / NE / NIN never prune.
+-- provably disjoint: EQ or IS NULL values differ, or IN sets share no element.
+-- Absent on either side is a wildcard; comparison / NE / NIN never prune.
 local function pmatch(bin, blob)
     local gp = 1; local pp = 1
     for f = 0, n_filters - 1 do
@@ -435,7 +442,7 @@ local function pmatch(bin, blob)
         elseif is_set then
             if fo == 64 and setdisjoint(bin, gp, blob, pp, ft) then return false end
             gp = skipset(bin, gp, ft); pp = skipset(blob, pp, ft)
-        elseif fo == 61 then
+        elseif fo == 61 or fo == 78 then
             if not eqval(bin, gp, blob, pp, ft) then return false end
             gp = skip(bin, gp, ft); pp = skip(blob, pp, ft)
         else

@@ -29,7 +29,8 @@ enum class Op : uint8_t {
     LT,  // Less than
     LE,  // Less than or equal
     IN,  // Membership in a set (entity value ∈ {v1, v2, ...}); SQL = ANY($n)
-    NIN  // Anti-membership (entity value ∉ {v1, v2, ...}); SQL != ALL($n)
+    NIN, // Anti-membership (entity value ∉ {v1, v2, ...}); SQL != ALL($n)
+    IS_NULL  // Nullity: true → SQL IS NULL, false → IS NOT NULL; no bound value
 };
 
 // =============================================================================
@@ -49,6 +50,7 @@ constexpr InvalidationStrategy defaultInvalidationStrategy(Op op) noexcept {
         case Op::NE:
         case Op::IN:
         case Op::NIN:
+        case Op::IS_NULL:
             return InvalidationStrategy::PreComputed;
         case Op::GT:
         case Op::GE:
@@ -311,6 +313,10 @@ struct Filter {
     /// place that must treat IN and NIN alike (filter_type, schema, blob, SQL param).
     static constexpr bool is_set_op = (Operator == Op::IN || Operator == Op::NIN);
 
+    /// Nullity operator: the active value is a bool (true = IS NULL, false =
+    /// IS NOT NULL) and the column's value is never bound nor converted.
+    static constexpr bool is_null_op = (Operator == Op::IS_NULL);
+
     /// Invalidation strategy
     static constexpr InvalidationStrategy invalidation = Invalidation;
 
@@ -329,9 +335,9 @@ struct Filter {
     /// type of a single set element; the schema element-type char is derived from it.
     using element_type = detail::unwrap_optional_t<member_type>;
 
-    /// The unwrapped type (optional<T> -> T). Kept as an alias of element_type for
-    /// backward compatibility — all existing consumers use it as the scalar type.
-    using value_type = element_type;
+    /// The scalar a query holds for this filter: bool for IS_NULL, the element
+    /// type otherwise.
+    using value_type = std::conditional_t<is_null_op, bool, element_type>;
 
     /// The filter value type (always optional for filter activation check).
     /// For set ops (IN / NOT IN), the active value is a set of elements; otherwise
@@ -339,7 +345,7 @@ struct Filter {
     using filter_type = std::conditional_t<
         is_set_op,
         std::optional<std::vector<element_type>>,
-        std::optional<element_type>>;
+        std::optional<value_type>>;
 
     /// The entity-side tag type — always a scalar optional, even for IN (an entity
     /// holds one value, matched against the cached group's set). Decouples FilterTags
@@ -361,6 +367,9 @@ struct Filter {
 
     /// Whether the entity member is optional
     static constexpr bool is_optional_member = detail::is_optional_v<member_type>;
+
+    static_assert(!is_null_op || is_optional_member,
+        "IS_NULL filter requires a std::optional member");
 
     /// Whether this filter uses pre-computed invalidation
     static constexpr bool is_precomputed = (invalidation == InvalidationStrategy::PreComputed);

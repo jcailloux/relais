@@ -126,13 +126,18 @@ private:
         // If filter not set, always matches
         if (!filter_value.has_value()) return true;
 
+        using FilterType = filter_at<Descriptor, I>;
+        constexpr Op op = FilterType::op;
+
+        // Nullity is the one verdict a null tag can satisfy.
+        if constexpr (op == Op::IS_NULL) {
+            return tag_value.has_value() != *filter_value;
+        }
+
         // If filter set but tag has no value, doesn't match
         if (!tag_value.has_value()) return false;
 
         // Compare values based on filter operator
-        using FilterType = filter_at<Descriptor, I>;
-        constexpr Op op = FilterType::op;
-
         if constexpr (op == Op::IN) {
             // Membership: entity scalar ∈ query set
             return std::ranges::find(*filter_value, *tag_value) != filter_value->end();

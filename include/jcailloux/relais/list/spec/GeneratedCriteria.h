@@ -80,7 +80,8 @@ void addArrayParamForDb(io::PgParams& params, const std::vector<T>& values) {
 /// A mapped enum under an ordering operator compares its rank, not its text.
 template<typename FilterType>
 inline constexpr bool compares_rank = is_via_v<typename FilterType::converter>
-    && FilterType::op != Op::EQ && FilterType::op != Op::NE && !FilterType::is_set_op;
+    && FilterType::op != Op::EQ && FilterType::op != Op::NE && !FilterType::is_set_op
+    && !FilterType::is_null_op;
 
 }  // namespace detail
 
@@ -119,7 +120,10 @@ template<typename Descriptor>
                                         detail::compares_rank<FilterType>>(
                     result.sql, FilterType::column());
 
-                if constexpr (FilterType::is_set_op) {
+                if constexpr (FilterType::is_null_op) {
+                    // No param: next_param stays put, later $n are unaffected.
+                    result.sql += *filter_value ? " IS NULL" : " IS NOT NULL";
+                } else if constexpr (FilterType::is_set_op) {
                     // Set op → "col" = ANY($n) (IN) | "col" != ALL($n) (NIN). One
                     // array param either way — the $n numbering invariant holds for
                     // both (0 or N params would shift every later cursor binding).

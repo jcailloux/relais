@@ -269,6 +269,7 @@ ListQuery<Descriptor> seal(ListQueryParams<Descriptor> params) {
 
 /// Encode entity filter values as a binary blob in the same format as groupKey().
 /// For each filter: [0x01][value_bytes] if entity has a value, [0x00] if optional and null.
+/// An IS_NULL slot holds the presence byte alone: nullity is all it is matched on.
 /// Lua compares this blob against the binary portion of the group key for filter matching.
 template<typename Descriptor>
     requires ValidFilterSet<Descriptor>
@@ -279,7 +280,9 @@ std::string encodeEntityFilterBlob(const typename Descriptor::Entity& entity) {
                 using FilterType = filter_at<Descriptor, Is>;
                 const auto& value = detail::extractMemberValue<FilterType::entity_ptr>(entity);
 
-                if constexpr (FilterType::is_optional_member) {
+                if constexpr (FilterType::is_null_op) {
+                    out.push_back(value.has_value() ? 1 : 0);
+                } else if constexpr (FilterType::is_optional_member) {
                     detail::appendOptional(out, value);
                 } else {
                     out.push_back(0x01);
@@ -344,7 +347,9 @@ consteval char schemaTypeChar() {
 /// An enum takes the char of its underlying type. The Lua matchers order the
 /// 2-, 4- and 8-byte integers; on the other fixed-size types an ordering
 /// operator always matches, so a page is invalidated rather than kept stale.
-/// Operator: '='=EQ, '!'=NE, '>'=GT, 'G'=GE, '<'=LT, 'L'=LE, '@'=IN, '#'=NIN.
+/// Operator: '='=EQ, '!'=NE, '>'=GT, 'G'=GE, '<'=LT, 'L'=LE, '@'=IN, '#'=NIN,
+/// 'N'=IS_NULL (typed '1': group and predicate hold a bool, the entity blob
+/// its presence byte only).
 template<typename Descriptor>
     requires ValidFilterSet<Descriptor>
 std::string filterSchema() {
@@ -367,6 +372,7 @@ std::string filterSchema() {
             else if constexpr (op == Op::LE) schema += 'L';
             else if constexpr (op == Op::IN) schema += '@';
             else if constexpr (op == Op::NIN) schema += '#';
+            else if constexpr (op == Op::IS_NULL) schema += 'N';
         }(), ...);
     }(std::make_index_sequence<filter_count<Descriptor>>{});
 
