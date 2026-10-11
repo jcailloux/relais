@@ -378,9 +378,29 @@ as gathered tasks.)
 When the config flags a shared Redis (see [§2](#configuration-system--cacheconfig-nttp)),
 the recheck authority moves into Redis: a write calls `bumpGen(id)` (`HINCRBY` on a
 sharded `{name}:l2gen` hash keyed by `Recheck::slotOf(id)`), a miss reads the gen,
-and the fill is a conditional `EVAL` that rejects a write straddling any instance's
+and the fill is a conditional script that rejects a write straddling any instance's
 invalidation. With the default (`false`), `bumpGen` is a process-local counter — no
 extra Redis ops.
+
+### Lua scripts
+
+Every script lives in `cache/RedisScripts.h` (`cache::scripts`), each preceded by
+its contract (KEYS, ARGV, return value):
+
+- **`io::RedisScript`** pairs the body with its SHA1, computed at compile time.
+  The list invalidation scripts are concatenated at compile time from shared
+  fragments (`LuaConcat`): the page header decoding and the filter matching are
+  written once.
+- **`kAllScripts`** lists them all. A test sends each one to the server with
+  `SCRIPT LOAD` and checks the digest; a new script added to the registry is
+  covered without a new test.
+- **`RedisCache::evalScript`** is the only way to run one: `EVALSHA`, and on
+  `io::RedisNoScriptError` the same call once more as `EVAL`, which reloads the
+  script. The caller resumes after the fallback, so awaited orderings hold. The
+  `no_raw_eval` CTest rejects a raw `EVAL`/`EVALSHA` in any other header.
+- **A script runs alone but is not rolled back** when a command fails halfway.
+  Order its writes so a partial run leaves nothing an invalidation cannot reach:
+  `kListStore` writes the page last, after tracking it.
 
 ## Cache Flow on Operations
 
@@ -596,6 +616,11 @@ auto entities = co_await queryFromDb(query);          // -> std::vector<Entity>
 bounds.first_value = extractSortValue<Descriptor>(entities.front(), sort.field);
 bounds.last_value  = extractSortValue<Descriptor>(entities.back(), sort.field);
 ```
+
+The page is then stored in L1, and in L2 by a detached `kListStore` (master hash,
+tracking set, page, in one script): the read does not wait for Redis. Lists have
+no L2 generation guard, unlike entities: an invalidation that runs between the
+PostgreSQL read and this store leaves a stale page in L2 until `l2_ttl`.
 
 ## InvalidationMixin — Cross-Repository Invalidation
 

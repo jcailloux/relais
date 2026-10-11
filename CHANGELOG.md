@@ -9,6 +9,8 @@
   `uint64_t`…).
 - **`findMany` on every preset.** `Uncached` and `Redis` repos gain it, same
   signature; without L1 the returned view owns its entities.
+- **`io::RedisNoScriptError`**, a `RedisError` thrown on a `NOSCRIPT` reply
+  (`EVALSHA` on a script the server does not have).
 
 ### Changed (Breaking)
 
@@ -29,8 +31,23 @@
   `get<int64_t>` on `12.5` (e.g. `avg()`) throws `PgError` instead of returning
   `12`. Read a `double` or cast in SQL.
 
+### Changed
+
+- **Lua scripts are sent by SHA1 (`EVALSHA`)**, not in full on every call (up to
+  8.6 KB per write on a repo with lists). A script the server has lost is sent
+  again automatically.
+- **A list read no longer waits for Redis to store the page.** The L2 store is
+  one atomic script, run detached: 4 sequential round trips before.
+- **Redis arguments are copied once, not twice**: large values gain throughput.
+
 ### Fixed
 
+- **A Redis error reply did not throw when the command was pipelined with
+  others**, i.e. under concurrent load: `redis`/`redisDynamic` returned it as a
+  `RedisResult`. They now throw `io::RedisError` either way, failing only that
+  command of the batch; code that tested `isError()` catches instead.
+- **A list read could fail after PostgreSQL had answered**, when Redis failed
+  while the page was stored into L2.
 - **Floating-point values sent to PostgreSQL and Redis were rounded to 6
   decimals** (`1e-7` became `0`), silently, while L1 and L2 kept the exact
   value; under a non-C `LC_NUMERIC` they were written with a decimal comma.
