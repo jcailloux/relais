@@ -440,6 +440,7 @@ private:
         try { sync(pg->query("DELETE FROM relais_test_slots")); } catch (...) {}
         try { sync(pg->query("DELETE FROM relais_test_slot_tallies")); } catch (...) {}
         try { sync(pg->query("DELETE FROM relais_test_tickets")); } catch (...) {}
+        try { sync(pg->query("DELETE FROM relais_test_filter_only")); } catch (...) {}
 
         // Reset GDSF global state for test isolation
         jcailloux::relais::cache::GDSFPolicy::instance().resetForTesting();

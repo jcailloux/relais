@@ -19,6 +19,8 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <utility>
+#include <vector>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -28,6 +30,7 @@
 #include "fixtures/generated/TestAllPkJunctionEntity.h"
 #include "fixtures/generated/TestArticleInEntity.h"
 #include "fixtures/generated/TestTicketEntity.h"
+#include "fixtures/generated/TestFilterOnlyEntity.h"
 
 #include <jcailloux/relais/list/spec/GeneratedCriteria.h>
 #include <jcailloux/relais/repository/PgRepo.h>
@@ -47,6 +50,11 @@ namespace detail = jcailloux::relais::detail;
 // embedded ListDescriptor gains the Entity alias the free helpers resolve.
 struct ArticleDesc : entity::generated::TestArticleInEntity::MappingType::ListDescriptor {
     using Entity = entity::generated::TestArticleInEntity;
+};
+
+// Filters without a list: one filter per operator.
+struct FilterOnlyDesc : entity::generated::TestFilterOnlyMapping::FilterSet {
+    using Entity = entity::generated::TestFilterOnlyEntity;
 };
 
 }  // namespace
@@ -311,4 +319,74 @@ TEST_CASE("mapped enum codec - one mapping per field", "[generator][enum]") {
         CHECK(ins.params[1] == jcailloux::relais::io::PgParam::text("closed"));
         CHECK(upd.params[1] == jcailloux::relais::io::PgParam::text("closed"));
     }
+}
+
+// #############################################################################
+//  count_where — assemblage runtime
+// #############################################################################
+
+TEST_CASE("count_where - form and $n numbering", "[generator][sql][where][count]") {
+    constexpr auto kTable = entity::generated::TestFilterOnlyMapping::table_name;
+    auto count = [&](const decl::Filters<FilterOnlyDesc>& f) {
+        auto wc = decl::buildWhereClause<FilterOnlyDesc>(f);
+        return std::pair{detail::buildCountWhereSql(kTable, wc.sql), wc.params.params.size()};
+    };
+    const std::string head = "SELECT count(*) FROM relais_test_filter_only";
+
+    SECTION("[SQL] empty predicate counts the table") {
+        decl::Filters<FilterOnlyDesc> f;
+        CHECK(count(f) == std::pair{head, size_t{0}});
+    }
+
+    SECTION("[SQL] one filter per operator") {
+        auto one = [&](auto set) {
+            decl::Filters<FilterOnlyDesc> f;
+            set(f);
+            return count(f);
+        };
+        using F = decl::Filters<FilterOnlyDesc>;
+        CHECK(one([](F& f) { f.get<"category">() = std::string("a"); })
+              == std::pair{head + " WHERE \"category\"=$1", size_t{1}});
+        CHECK(one([](F& f) { f.get<"label_ne">() = std::string("a"); })
+              == std::pair{head + " WHERE \"label\"!=$1", size_t{1}});
+        CHECK(one([](F& f) { f.get<"score_gt">() = 1; })
+              == std::pair{head + " WHERE \"score\">$1", size_t{1}});
+        CHECK(one([](F& f) { f.get<"score_ge">() = 1; })
+              == std::pair{head + " WHERE \"score\">=$1", size_t{1}});
+        CHECK(one([](F& f) { f.get<"score_lt">() = 1; })
+              == std::pair{head + " WHERE \"score\"<$1", size_t{1}});
+        CHECK(one([](F& f) { f.get<"score_le">() = 1; })
+              == std::pair{head + " WHERE \"score\"<=$1", size_t{1}});
+        CHECK(one([](F& f) { f.get<"category_in">() = std::vector<std::string>{"a", "b"}; })
+              == std::pair{head + " WHERE \"category\" = ANY($1)", size_t{1}});
+        CHECK(one([](F& f) { f.get<"label_nin">() = std::vector<std::string>{"a"}; })
+              == std::pair{head + " WHERE \"label\" != ALL($1)", size_t{1}});
+        CHECK(one([](F& f) { f.get<"label_null">() = true; })
+              == std::pair{head + " WHERE \"label\" IS NULL", size_t{0}});
+        CHECK(one([](F& f) { f.get<"label_null">() = false; })
+              == std::pair{head + " WHERE \"label\" IS NOT NULL", size_t{0}});
+    }
+
+    SECTION("[SQL] several filters: AND, continuous $n around IS_NULL") {
+        decl::Filters<FilterOnlyDesc> f;
+        f.get<"category_in">() = std::vector<std::string>{"a"};
+        f.get<"label_null">() = false;
+        f.get<"owner_id">() = int64_t{7};
+        f.get<"score_ge">() = 3;
+        CHECK(count(f) == std::pair{head + " WHERE \"category\" = ANY($1)"
+                                           " AND \"label\" IS NOT NULL"
+                                           " AND \"owner_id\"=$2 AND \"score\">=$3",
+                                    size_t{3}});
+    }
+}
+
+TEST_CASE("count_where - one interned text per predicate shape",
+          "[generator][sql][where][count]") {
+    // The batch scheduler coalesces reads by statement pointer.
+    const char* a = detail::internSql(detail::buildCountWhereSql("t", "\"x\"=$1"));
+    const char* b = detail::internSql(detail::buildCountWhereSql("t", "\"x\"=$1"));
+    const char* c = detail::internSql(detail::buildCountWhereSql("t", ""));
+    CHECK(a == b);
+    CHECK(a != c);
+    CHECK(std::string_view{a} == "SELECT count(*) FROM t WHERE \"x\"=$1");
 }

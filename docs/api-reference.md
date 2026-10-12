@@ -54,10 +54,19 @@ Single-key reads resolve to an **epoch-guarded `cache::CacheView<E>`** (defined 
 | `findBinary(const Key& id)` | `Immediate<std::vector<uint8_t>>` | `HasBinarySerialization<E>` | Empty vector if absent. L2-Binary hit returns raw bytes. |
 | `findMany(std::span<const Key> ids)` | `Immediate<cache::MultiView<E>>` | — | `view[i] ↔ ids[i]` (`nullptr` = absent). Dedups input; L1 hits are zero-copy (all-hit is frameless), the rest fold into one L2 MGET + one L3 `ANY`. Without L1, the view owns its entities. |
 
+`countWhere` counts the rows matching a [`FilterSet<E>`](#filterset--predicate-aggregate-for-the-where-variants) predicate, e.g. `repo.countWhere({.author_id = 42})`:
+
+```cpp
+template<typename Pred = FilterSet<E>>
+static Task<size_t> countWhere(Pred pred);
+```
+- **requires**: `HasFilterSet<E> && std::same_as<Pred, FilterSet<E>>`; available on `read_only` repos and on every preset.
+- **semantics**: one `SELECT count(*) … WHERE pred` on L3, never cached (empty predicate: the whole table). Identical counts batched together share one query.
+
 > `co_await Repo::find(id)` completes synchronously on an L1 hit and suspends on an L2/L3 read. See [caching.md](caching.md) for the epoch/eviction model.
 
 > **Reads throw on a DB error; a write reports a *deterministic* one as a value.**
-> `find`/`findJson`/`findBinary`/`findMany` **propagate** an L3 error (timeout,
+> `find`/`findJson`/`findBinary`/`findMany`/`countWhere` **propagate** an L3 error (timeout,
 > connection lost) — only a *successful* empty result means "not found" (empty
 > `CacheView`/`MultiView`, empty string/vector), so a read never disguises a failure
 > as a miss (no false 404). The lone exception is a Redis L2 read timeout: L2 is only
@@ -659,7 +668,7 @@ Descriptor-side limit helpers (`GeneratedTraits.h`): `normalizeLimit<D>(requeste
 
 ### FilterSet — predicate aggregate for the where-variants
 
-`FilterSet<E>` (`EntityConcepts.h`) is the user-facing predicate aggregate for `eraseWhere`/`invalidateWhere`: a generated **struct of named optionals** (one per filter), built with designated initializers.
+`FilterSet<E>` (`EntityConcepts.h`) is the user-facing predicate aggregate for `eraseWhere`/`invalidateWhere`/`countWhere`: a generated **struct of named optionals** (one per filter), built with designated initializers.
 
 ```cpp
 template<typename E>
@@ -670,7 +679,7 @@ repo.eraseWhere({.author_id = 42, .category = "tech"});
 repo.invalidateWhere({.gallery_id = gid});
 ```
 
-`HasFilterSet<E>` requires `E::MappingType::FilterSet` and `::FilterSet::Values`. The aggregate is named by HTTP param (robust to filter reordering, unlike a positional tuple) and converts to the internal `Filters<D>` tuple via `.toFilterTuple()` inside the repo. The `eraseWhere`/`invalidateWhere` methods themselves are documented in the Repository API — this is only the value type they accept.
+`HasFilterSet<E>` requires `E::MappingType::FilterSet` and `::FilterSet::Values`. The aggregate is named by HTTP param (robust to filter reordering, unlike a positional tuple) and converts to the internal `Filters<D>` tuple via `.toFilterTuple()` inside the repo. The `eraseWhere`/`invalidateWhere`/`countWhere` methods themselves are documented in the Repository API — this is only the value type they accept.
 
 > An entity may declare a `FilterSet` (satisfying `HasFilterSet` / `ValidFilterSet`) **without** a cached `ListDescriptor`. The where-variants then work with no list tier present.
 

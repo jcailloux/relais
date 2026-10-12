@@ -174,7 +174,7 @@ The concepts branch off a common root by capability — caching and mutation are
 So a repo can be cacheable without being mutable (a read-only cached view) or
 mutable without being cacheable (`Uncached` writes) — each capability is gated
 on its own. Plus orthogonal capability flags: a `ListDescriptor` unlocks list queries, a
-`FilterSet` unlocks the predicate `eraseWhere`/`invalidateWhere`, a field-update
+`FilterSet` unlocks the predicate `eraseWhere`/`invalidateWhere`/`countWhere`, a field-update
 trait unlocks `patch`, a partition hint unlocks single-partition deletes.
 
 The practical upshot:

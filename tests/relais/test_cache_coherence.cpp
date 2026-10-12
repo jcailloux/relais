@@ -41,6 +41,7 @@
 #include "fixtures/generated/TestItemEntity.h"
 #include "fixtures/generated/TestAssignedKeyEntity.h"
 #include "fixtures/generated/TestArticleEntity.h"
+#include "fixtures/generated/TestFilterOnlyEntity.h"
 
 #include <algorithm>
 #include <chrono>
@@ -114,6 +115,9 @@ using CohAkeyL1 = Repo<TestAssignedKeyEntity, "coh:akey:l1">;
 // List repos (TestArticleEntity has a ListDescriptor → ListMixin), with an L2 tier.
 using CohArticleRedis = Repo<TestArticleEntity, "coh:article:redis", cfg::Redis>;
 using CohArticleBoth = Repo<TestArticleEntity, "coh:article:both", cfg::Both>;
+// Filters without a list, for countWhere.
+using CohCount = Repo<::entity::generated::TestFilterOnlyEntity, "coh:count">;
+using CountPred = ::entity::generated::TestFilterOnlyMapping::FilterSet::Values;
 
 // =============================================================================
 // Bounded synchronous driver (mirrors test_io_liveness): a coherence suite must
@@ -388,6 +392,66 @@ TEST_CASE("coherence: a read against a killed backend throws PgError, not empty"
 
     // No false 404: the read surfaces the L3 error rather than reporting absent.
     REQUIRE_THROWS_AS(driveBounded(env.io, CohItemL1::find(id)), io::PgError);
+}
+
+// =============================================================================
+// countWhere — a read: L3 errors surface, identical counts in flight coalesce.
+// =============================================================================
+
+static void seedCounts(CohEnv& env) {
+    env.probe.query("DELETE FROM relais_test_filter_only");
+    env.probe.query("INSERT INTO relais_test_filter_only (category, owner_id) VALUES "
+                    "('coh', 1), ('coh', 1), ('coh', 2)");
+}
+
+static io::Task<std::vector<size_t>> countAll(std::vector<CountPred> preds) {
+    std::vector<io::Task<size_t>> tasks;
+    for (auto& p : preds) tasks.push_back(CohCount::countWhere(p));
+    co_return co_await io::whenAll(std::move(tasks));
+}
+
+TEST_CASE("coherence: a withheld countWhere throws PgQueryTimeout",
+          "[coherence][readpath][count][integration]") {
+    CohEnv env(300ms);
+    seedCounts(env);
+
+    env.holdPg();
+    REQUIRE_THROWS_AS(driveBounded(env.io, CohCount::countWhere({.category = "coh"})),
+                      io::PgQueryTimeout);
+}
+
+TEST_CASE("coherence: countWhere against a killed backend throws PgError, not 0",
+          "[coherence][readpath][count][integration]") {
+    CohEnv env(300ms);
+    seedCounts(env);
+
+    env.probe.terminateBackends(std::string("application_name = '") + kAppName + "'");
+    REQUIRE_THROWS_AS(driveBounded(env.io, CohCount::countWhere({.category = "coh"})),
+                      io::PgError);
+}
+
+TEST_CASE("coherence: identical countWhere in flight share one statement",
+          "[coherence][count][coalescing][integration]") {
+    CohEnv env(1s);
+    seedCounts(env);
+    // Past bootstrap, the first read goes direct and the others join a batch.
+    for (int i = 0; i < io::batch::TimingEstimator::kBootstrapThreshold + 2; ++i)
+        driveBounded(env.io, CohCount::countWhere({}));
+
+    SECTION("same predicate: the batched pair coalesces") {
+        const CountPred p{.category = "coh"};
+        auto before = env.batcher->pgReadsSent();
+        auto counts = driveBounded(env.io, countAll({p, p, p}));
+        CHECK(counts == std::vector<size_t>{3, 3, 3});
+        CHECK(env.batcher->pgReadsSent() - before == 2);  // the direct one + the batch
+    }
+    SECTION("different values: one statement each") {
+        auto before = env.batcher->pgReadsSent();
+        auto counts = driveBounded(env.io, countAll(
+            {{.owner_id = 1}, {.owner_id = 2}, {.owner_id = 3}}));
+        CHECK(counts == std::vector<size_t>{2, 1, 0});
+        CHECK(env.batcher->pgReadsSent() - before == 3);
+    }
 }
 
 // =============================================================================
