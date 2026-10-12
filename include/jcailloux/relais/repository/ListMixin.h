@@ -462,12 +462,13 @@ public:
         co_return co_await updateWithContext(id, entity, old ? &*old : nullptr);
     }
 
-    /// Erase entity and invalidate list caches.
+    /// Erase entity and invalidate list caches from the deleted row, which the
+    /// DELETE returns: no read before the write.
     static io::Task<std::optional<size_t>> erase(const Key& id)
         requires (!Base::config.read_only)
     {
-        std::optional<Entity> old = co_await findOldBestEffort(id);
-        co_return co_await eraseWithContext(id, old ? &*old : nullptr);
+        auto outcome = co_await eraseOutcome<true>(id);
+        co_return outcome.affected;
     }
 
     /// Partial update, then list invalidation (only if committed) from the row
@@ -751,26 +752,34 @@ protected:
         co_return affected;
     }
 
-    static io::Task<std::optional<size_t>> eraseWithContext(
-        const Key& id, const Entity* old_entity)
+    /// Erase, then list invalidation from the deleted row (the pages it lived
+    /// in). Uncertain: the DELETE returned nothing, so the pages are keyed on
+    /// the copy a cache tier kept before its precautionary evict
+    /// (`uncertain_before`, shared with a stacked InvalidationMixin). Without
+    /// one (row not in L1), the pages are left to l*_ttl.
+    template<bool WithBefore>
+    static io::Task<typename Base::EraseOutcome> eraseOutcome(
+        const Key& id, const Entity* hint = nullptr,
+        std::optional<Entity>* uncertain_before = nullptr)
         requires (!Base::config.read_only)
     {
-        std::optional<size_t> result;
+        static_assert(WithBefore, "this cascade reads the row before the write");
+        std::optional<Entity> own_before;
+        if (!uncertain_before) uncertain_before = &own_before;
+
+        typename Base::EraseOutcome outcome;
         std::exception_ptr timeout;
         try {
-            result = co_await Base::erase(id);
+            outcome = co_await Base::template eraseOutcome<true>(id, hint, uncertain_before);
         } catch (const io::PgUncertainError&) {
             timeout = std::current_exception();
         }
         if (timeout) {
-            // Uncertain: the row may have been deleted. Invalidate the list pages
-            // it lived in, keyed on `old` (best-effort). Without `old` (pre-read
-            // failed) the list tier stays bounded by l*_ttl.
-            if (old_entity) {
-                if constexpr (kHasL1) { listCache().onEntityDeleted(*old_entity); }
+            if (const auto& before = *uncertain_before) {
+                if constexpr (kHasL1) { listCache().onEntityDeleted(*before); }
                 if constexpr (kHasL2) {
                     try {
-                        co_await invalidateL2Deleted(*old_entity);
+                        co_await invalidateL2Deleted(*before);
                     } catch (const std::exception& e) {
                         RELAIS_LOG_ERROR << name()
                             << ": L2 list precautionary invalidate failed (erase timeout) - "
@@ -780,11 +789,11 @@ protected:
             }
             std::rethrow_exception(timeout);
         }
-        if (result.has_value() && old_entity) {
-            if constexpr (kHasL1) { listCache().onEntityDeleted(*old_entity); }
-            if constexpr (kHasL2) { co_await invalidateL2Deleted(*old_entity); }
+        if (outcome.before) {
+            if constexpr (kHasL1) { listCache().onEntityDeleted(*outcome.before); }
+            if constexpr (kHasL2) { co_await invalidateL2Deleted(*outcome.before); }
         }
-        co_return result;
+        co_return outcome;
     }
 
     /// List invalidation of a committed patch (nothing if nothing was written).

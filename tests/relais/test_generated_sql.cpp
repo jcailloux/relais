@@ -5,7 +5,8 @@
  * Ici on n'exécute aucune requête : on assert les strings constantes de
  * Mapping::SQL — leur forme, leur numérotation $n, leurs colonnes RETURNING.
  *
- * Cible : delete_by_pk_batch.
+ * Cibles : delete_by_pk_batch, et les variantes RETURNING du DELETE mono-clé
+ * (delete_by_pk_returning, delete_with_partition_returning).
  *   - clé scalaire   → WHERE pk = ANY($1) RETURNING <cols>
  *   - clé composite  → WHERE (k1,k2) IN (SELECT unnest($1::t[]), unnest($2::t[])) RETURNING <cols>
  *   - entité partitionnée → pas de partition pruning : pk = ANY($1) scanne toutes
@@ -58,6 +59,34 @@ struct FilterOnlyDesc : entity::generated::TestFilterOnlyMapping::FilterSet {
 };
 
 }  // namespace
+
+// #############################################################################
+//  delete_by_pk / delete_with_partition — variantes RETURNING (pré-image)
+// #############################################################################
+
+TEST_CASE("mono DELETE - RETURNING variants return the deleted row",
+          "[generator][sql][erase]") {
+    SECTION("[SQL] scalar key: same DELETE, then RETURNING returning_columns") {
+        CHECK(std::string(UserSQL::delete_by_pk_returning) ==
+              std::string(UserSQL::delete_by_pk) + " RETURNING "
+              + UserSQL::returning_columns);
+    }
+
+    SECTION("[SQL] composite key: same DELETE, then RETURNING returning_columns") {
+        CHECK(std::string(CompositeSQL::delete_by_pk_returning) ==
+              "DELETE FROM relais_test_composite_list "
+              "WHERE tenant_id = $1 AND item_id = $2 RETURNING tenant_id, item_id");
+    }
+
+    SECTION("[SQL] partition hint: pruned DELETE, then RETURNING returning_columns") {
+        CHECK(std::string(EventSQL::delete_with_partition_returning) ==
+              "DELETE FROM relais_test_events WHERE id = $1 AND region = $2 "
+              "RETURNING id, region, user_id, title, priority, created_at");
+        CHECK(std::string(EventSQL::delete_by_pk_returning) ==
+              std::string(EventSQL::delete_by_pk) + " RETURNING "
+              + EventSQL::returning_columns);
+    }
+}
 
 // #############################################################################
 //  delete_by_pk_batch — clé scalaire

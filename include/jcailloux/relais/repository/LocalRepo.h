@@ -294,28 +294,48 @@ public:
     static io::Task<std::optional<size_t>> erase(const Key& id)
         requires (!Cfg.read_only)
     {
+        auto outcome = co_await eraseOutcome(id);
+        co_return outcome.affected;
+    }
+
+protected:
+    /// Erase returning full outcome (WithBefore: see PgRepo::eraseOutcome).
+    /// On an uncertain outcome, the L1 entry is still the version the DELETE
+    /// targeted (L1 changes only after a commit): it is copied into
+    /// `uncertain_before`, if asked and still empty, just before the
+    /// precautionary evict. The normal path copies nothing.
+    template<bool WithBefore = false>
+    static io::Task<typename Base::EraseOutcome> eraseOutcome(
+        const Key& id, const E* hint = nullptr,
+        std::optional<E>* uncertain_before = nullptr)
+        requires (!Cfg.read_only)
+    {
         // Provide L1 hint for partition pruning (free: ~0ns RAM lookup)
-        const E* hint = nullptr;
         std::optional<E> local_hint;
         if constexpr (HasPartitionHint<E>) {
-            auto hit = tier().find(id);
-            if (hit) { local_hint.emplace(*hit.value); hint = &*local_hint; }
+            if (!hint) {
+                auto hit = tier().find(id);
+                if (hit) { local_hint.emplace(*hit.value); hint = &*local_hint; }
+            }
         }
 
         try {
-            auto outcome = co_await Base::eraseOutcome(id, hint);
+            auto outcome = co_await Base::template eraseOutcome<WithBefore>(
+                id, hint, uncertain_before);
             if (outcome.affected.has_value() && !outcome.coalesced) {
                 evict(id);
             }
-            co_return outcome.affected;
+            co_return outcome;
         } catch (const io::PgUncertainError&) {
             // Uncertain: the DELETE may have committed. Evict L1 by precaution
             // (local, cannot fail). L2 was already evicted as this unwound.
+            keepUncertainBefore(id, uncertain_before);
             evict(id);
             throw;
         }
     }
 
+public:
     /// Invalidate L1 and L2 for a key, L2 first then L1: the L1 generation bump
     /// must land after the UNLINK so a concurrent L1-miss that read the stale L2
     /// entry is rejected by the read-fill recheck. L1-first would let it survive
@@ -503,6 +523,17 @@ private:
         tier().onMutation(id);
         bumpGeneration(id);
         return {std::move(patched.before), storeAndView(id, std::move(patched.after))};
+    }
+
+    /// Copy the L1 entry into `slot` (if asked and still empty): the version
+    /// an uncertain write targeted, kept before the precautionary evict. A
+    /// failed copy leaves the pre-image unknown; the evict must still run.
+    static void keepUncertainBefore(const Key& id, std::optional<E>* slot) noexcept {
+        if (!slot || *slot) return;
+        try {
+            if (auto hit = tier().find(id)) slot->emplace(*hit.value);
+        } catch (...) {
+        }
     }
 
     /// Store entity in cache and return CacheView.

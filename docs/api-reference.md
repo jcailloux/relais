@@ -150,7 +150,7 @@ Guide: [conditional-writes.md](conditional-writes.md).
 
 | Method | Returns | Constraints | Notes |
 |---|---|---|---|
-| `erase(const Key& id)` | `Task<std::optional<size_t>>` | `!Cfg.read_only` | Rows deleted (`0` = not found), `nullopt` = DB error. Uses L1/L2 partition hint when available. |
+| `erase(const Key& id)` | `Task<std::optional<size_t>>` | `!Cfg.read_only` | Rows deleted (`0` = not found), `nullopt` = DB error. Uses L1/L2 partition hint when available. With lists or cross-invalidation the statement also returns the deleted row, so its pages and targets are invalidated without a pre-read. |
 | `eraseMany(std::span<const Key> ids)` | `Task<std::optional<size_t>>` | `!Cfg.read_only` | Count deleted; `nullopt` = DB error, `0` = no match. Dedups input; `DELETE … RETURNING` drives eviction (no extra read). Lists invalidated. |
 | `invalidate(const Key& id)` | `Task<void>` | — | Evicts L1+L2 (+ cross-inval at top). Lists left intact. |
 | `invalidateMany(std::span<const Key> ids)` | `Task<void>` | — | Best-effort. Materializes each via the read path, then evicts entity tier (rows still exist). Missing id → no-op. |
@@ -450,7 +450,7 @@ concept HasInvalidates = requires { typename T::Invalidates; };
 <details>
 <summary>Update reuses the pre-fetched old entity; batch split critical vs deferred</summary>
 
-`update`/`erase`/`patch` fetch the old entity once (`Base::find(id)`) and, when `Base` is a `ListMixin` (detected via the `HasListMixin` concept = `typename T::ListDescriptorType`), pass it down through the `*WithContext` overloads to avoid a redundant L1 lookup — then feed the same snapshot into `propagateUpdate`/`propagateDelete`.
+`update` fetches the old entity once (`Base::find(id)`) and, when `Base` is a `ListMixin` (detected via the `HasListMixin` concept = `typename T::ListDescriptorType`), passes it down through `updateWithContext` to avoid a redundant L1 lookup — then feeds the same snapshot into `propagateUpdate`. `erase` and `patch` read nothing first: the statement returns the row it replaced or deleted, and that row feeds both the list tier and `propagateDelete`/`propagateUpdate`.
 
 Batch delete is split into two protected passes:
 - `invalidateManyCritical<WithLists>` — own entity tier + L1 list tracker, awaited before the facade returns (the entity UNLINK must precede the return).

@@ -408,6 +408,21 @@ TEST_CASE("PartitionKey cross-invalidation - Event as source",
         REQUIRE(user != nullptr);
         CHECK(user->balance == 200);
     }
+
+    SECTION("[cross-inv] delete event cached in L1 (partition hint) invalidates user L1 cache") {
+        auto userId = insertTestUser("del_hint_user", "del_hint@test.com", 1000);
+        auto eventId = insertTestEvent("eu", userId, "To Delete", 1);
+
+        REQUIRE(sync(L1EventSourceRepo::find(eventId)) != nullptr);  // hint for the pruned DELETE
+        sync(L1EventTargetUserRepo::find(userId));
+        updateTestUserBalance(userId, 300);
+
+        CHECK(sync(L1EventSourceRepo::erase(eventId)) == std::optional<size_t>{1});
+
+        auto user = sync(L1EventTargetUserRepo::find(userId));
+        REQUIRE(user != nullptr);
+        CHECK(user->balance == 300);
+    }
 }
 
 // #############################################################################
