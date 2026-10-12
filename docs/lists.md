@@ -86,11 +86,12 @@ end-to-end (same param, canonicalization, element types, 256 bound, compile-time
 rejections); SQL uses `!= ALL($n)`, mirroring `in`'s `= ANY($n)`. Two semantics
 differ from `in`:
 
-- **NULL is excluded, not included.** A NULL column value matches neither `in`
-  nor `nin` — `value NOT IN (…)` is SQL three-valued NULL, so the row drops out.
-  `nin` is *not* the negation of `in` on NULL rows; it is on every non-NULL row.
-- **The empty set is the universe.** `nin {}` matches everything (`!= ALL('{}')`
-  is `TRUE`), the exact opposite of `in {}` matching nothing. As with `in`, an
+- **NULL is excluded from a non-empty set.** A NULL column value matches neither
+  `in` nor a non-empty `nin` — `NULL != ALL(…)` is SQL three-valued NULL, so the
+  row drops out. `nin` is *not* the negation of `in` on NULL rows; it is on every
+  non-NULL row.
+- **The empty set is the universe.** `nin {}` matches every row, NULL included
+  (`!= ALL('{}')` is `TRUE`), the exact opposite of `in {}` matching nothing. As with `in`, an
   empty set is unreachable over HTTP (an empty param leaves the filter inactive,
   which coincides with "match everything"); it exists only by construction.
 

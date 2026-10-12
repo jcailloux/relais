@@ -12,8 +12,9 @@
  *
  * Validates the §1 invariant on the L1 tier — "entity scalar ∉ query set" — and
  * the two NOT IN pitfalls:
- *   §1.1 NULL: a null optional member is excluded from BOTH IN and NOT IN
- *        results → NIN(null) == false (NOT the negation of IN).
+ *   NULL: a null optional member is excluded from IN and from a non-empty
+ *        NOT IN (NOT the negation of IN); NOT IN {} holds it, as SQL
+ *        `NULL <> ALL('{}')` is TRUE.
  *   §1.2 empty set: NOT IN {} = universe (everything matches), the exact
  *        opposite of IN {} = ∅.
  *
@@ -42,10 +43,10 @@
  * ~10 varied sets per element type, asserting the §1 invariant. (1) Tri-tier:
  * the NIN verdict from L1 `matchesFilters`, L2 Lua (page deleted ⇔ matched), and
  * L3 PostgreSQL `!= ALL` is identical. (2) Dualité non-null: for a present member
- * `NIN(S,v) == !IN(S,v)`. (3) Rupture sur NULL: for a null member BOTH
- * `NIN(S,NULL)` and `IN(S,NULL)` are false — the dualité does NOT hold (§1.1),
- * the single most natural implementer error (`NIN = !IN` everywhere). Requires
- * DB+Redis.
+ * `NIN(S,v) == !IN(S,v)`. (3) Rupture sur NULL: for a null member `IN(S,NULL)`
+ * is false and `NIN(S,NULL)` holds only for an empty S — the dualité does NOT
+ * hold, the single most natural implementer error (`NIN = !IN` everywhere).
+ * Requires DB+Redis.
  */
 
 #include <catch2/catch_test_macros.hpp>
@@ -213,7 +214,7 @@ TEST_CASE("[DeclListNin] NIN int32 on optional member", "[list][nin][unit]") {
     CHECK_FALSE(l1Match<DescNinOptInt32>(makeArticle(2, "x", 0, INT32_MIN), f)); // ∈ set
     CHECK(l1Match<DescNinOptInt32>(makeArticle(3, "x", 0, 5), f));               // ∉ set
 
-    SECTION("null member is excluded from NOT IN (NOT the negation of IN, §1.1)") {
+    SECTION("null member is excluded from a non-empty NOT IN (NOT the negation of IN)") {
         // The natural-but-wrong intuition is "null is not in the set, so it
         // matches NOT IN" → false. SQL three-valued logic excludes it.
         CHECK_FALSE(l1Match<DescNinOptInt32>(makeArticle(4, "x", 0, std::nullopt), f));
@@ -260,16 +261,15 @@ TEST_CASE("[DeclListNin] empty set matches everything (NOT IN {} = universe, §1
     CHECK(l1Match<DescNinString>(makeArticle(2, "", 0), f));
 }
 
-TEST_CASE("[DeclListNin] empty set still excludes a null optional member (§1.1)",
+TEST_CASE("[DeclListNin] empty set holds a null optional member",
           "[list][nin][unit]") {
-    // NOT IN {} = universe, but a NULL member is excluded from every set result,
-    // empty included — the null guard wins over the empty-set universe.
+    // SQL `NULL <> ALL('{}')` is TRUE: NOT IN {} holds every row, NULL included.
     decl::Filters<DescNinOptInt32> f;
     f.get<"view_count">() = std::vector<int32_t>{};
     REQUIRE(f.get<"view_count">().has_value());
 
     CHECK(l1Match<DescNinOptInt32>(makeArticle(1, "x", 0, 5), f));               // non-null ∉ {}
-    CHECK_FALSE(l1Match<DescNinOptInt32>(makeArticle(2, "x", 0, std::nullopt), f)); // null excluded
+    CHECK(l1Match<DescNinOptInt32>(makeArticle(2, "x", 0, std::nullopt), f));       // null ∉ {}
 }
 
 TEST_CASE("[DeclListNin] inactive NIN filter matches every entity", "[list][nin][unit]") {
@@ -303,7 +303,7 @@ TEST_CASE("[DeclListNin] EQ + NIN + range combination", "[list][nin][unit]") {
     SECTION("range AFTER the NIN set still evaluated (alignment)") {
         CHECK_FALSE(l1Match<DescCombo>(makeArticle(5, "tech", 42, 5), f));  // 5 < 10
     }
-    SECTION("range filter on null member excludes (range null → NE-only rule)") {
+    SECTION("range filter on null member excludes") {
         CHECK_FALSE(l1Match<DescCombo>(makeArticle(6, "tech", 42, std::nullopt), f));
     }
     SECTION("only NIN active — EQ and range inactive") {
@@ -722,7 +722,7 @@ TEST_CASE("[DeclListNin][L2] IN and NIN coexist — both route through skipset (
     CHECK(alive(gInNo));   // author 1 ∉ {8,9} → IN excludes (and curseur still aligned to NIN)
 }
 
-TEST_CASE("[DeclListNin][L2] optional-null entity matches no NIN group; empty set = universe",
+TEST_CASE("[DeclListNin][L2] optional-null entity matches only the empty NIN set",
           "[integration][db][redis][list][nin][l2]") {
     TransactionGuard tx;
     // DescNinOptInt32: [NIN view_count] on a std::optional<int32_t> member.
@@ -739,10 +739,10 @@ TEST_CASE("[DeclListNin][L2] optional-null entity matches no NIN group; empty se
         CHECK_FALSE(alive(gSet));    // 5 ∉ {10,20} → matches → invalidated
         CHECK_FALSE(alive(gEmpty));  // 5 ∉ {} → matches universe → invalidated
     }
-    SECTION("null member matches no NIN group, empty included (§1.1 at L2)") {
+    SECTION("null member matches the empty set only") {
         fireCreate<DescNinOptInt32>(makeArticle(2, "x", 0, std::nullopt));
-        CHECK(alive(gSet));    // null excluded from every set result
-        CHECK(alive(gEmpty));  // null excluded even from NOT IN {} (guard wins)
+        CHECK(alive(gSet));          // NULL <> ALL({10,20}) is NULL → kept
+        CHECK_FALSE(alive(gEmpty));  // NULL <> ALL('{}') is TRUE → invalidated
     }
     SECTION("value IN the set does NOT match NIN") {
         fireCreate<DescNinOptInt32>(makeArticle(3, "x", 0, 20));
@@ -810,8 +810,8 @@ TEST_CASE("[DeclListNin][L2] alignment — NIN in middle position (update, 2nd L
 // array parser, fed buildWhereClause's literal so escaping round-trips through
 // PG), L2 Lua (page deleted ⇔ matched). Plus the two dualité properties:
 //   (2) non-null member: NIN(S,v) == !IN(S,v) — the negation holds;
-//   (3) NULL member: NIN(S,NULL) == false AND IN(S,NULL) == false — the negation
-//       BREAKS (SQL 3-valued logic excludes NULL from BOTH, §1.1).
+//   (3) NULL member: IN(S,NULL) == false, NIN(S,NULL) == S.empty() — the negation
+//       BREAKS (SQL 3-valued logic; `NULL <> ALL('{}')` alone is TRUE).
 // All groups for one entity are registered into the master hash at once, then a
 // single create fires and the Lua scans them — the production multi-group scan.
 // Fixed seed (deterministic, no Math.random). IN verdict is the L1 reference.
@@ -849,11 +849,10 @@ struct DualInBool {
         decl::Sort<"id", &TestArticle::id, "id", decl::SortDirection::Desc>{}};
 };
 
-// Real PostgreSQL NIN verdict: `$1 != ALL($2)`. Only called for a present member
-// (the null break is handled in C++ via has_value()), so 3-valued NULL never
-// reaches PG here — `!= ALL('{}')` correctly yields TRUE (universe, §1.2).
+// Real PostgreSQL NIN verdict: `$1 != ALL($2)`, $1 NULL for an absent member.
 template<typename V>
-bool sqlAllVerdict(const V& val, const std::string& arrayLiteral, const char* cast) {
+bool sqlAllVerdict(const std::optional<V>& val, const std::string& arrayLiteral,
+                   const char* cast) {
     std::string sql = "SELECT CASE WHEN $1::";
     sql += cast; sql += " != ALL($2::"; sql += cast; sql += "[]) THEN 1 ELSE 0 END";
     auto r = relais_test::execQueryArgs(sql.c_str(), val, arrayLiteral);
@@ -885,7 +884,7 @@ void crossTierNinProperty(const std::vector<Entity>& entities,
             auto wc = decl::buildWhereClause<DescNin>(fn);
             const std::string arr = paramStr(wc.params.params[0]);
             const auto fld = getField(e);
-            const bool ninL3 = fld.has_value() && sqlAllVerdict(*fld, arr, cast);
+            const bool ninL3 = sqlAllVerdict(fld, arr, cast);
 
             decl::Filters<DescIn> fi;
             std::get<0>(fi.values) = sets[i];
@@ -897,8 +896,8 @@ void crossTierNinProperty(const std::vector<Entity>& entities,
             if (fld.has_value())
                 CHECK(ninL1 == !inL1);      // §7.7.2 dualité holds for a present member
             else {
-                CHECK_FALSE(ninL1);         // §7.7.3 NIN(NULL) == false
-                CHECK_FALSE(inL1);          // §7.7.3 IN(NULL) == false — negation BREAKS
+                CHECK(ninL1 == sets[i].empty());  // NIN(NULL) holds for {} only
+                CHECK_FALSE(inL1);                // IN(NULL) == false — negation BREAKS
             }
         }
     }
@@ -980,8 +979,8 @@ TEST_CASE("[DeclListNin][xtier] L1/L2/L3 agree + NULL break on int32 optional an
     std::mt19937 gen(0xC0FFEE03);
     auto entities = makeEntities(gen, kXtEntities);
     auto sets = makeSets<int32_t>(gen, kViewPool, kXtSets);
-    // view_count is std::optional<int32_t> — ~20% null entities drive §7.7.3: a null
-    // member matches NEITHER NIN nor IN, so the negation dualité does not hold.
+    // view_count is std::optional<int32_t> — ~20% null entities: a null member
+    // matches neither IN nor a non-empty NIN, so the negation dualité does not hold.
     crossTierNinProperty<DescNinOptInt32, DualInOptInt32, int32_t>(
         entities, sets, "int4",
         [](const Entity& e) { return e.view_count; });
