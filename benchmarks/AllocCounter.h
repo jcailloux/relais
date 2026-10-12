@@ -8,13 +8,16 @@
  *
  * Replaces the global allocation functions: include in exactly one translation
  * unit of a benchmark executable. Each thread counts its own allocations in a
- * plain thread_local (no shared write), so the counter adds no contention to
- * multi-threaded measurements.
+ * plain thread_local and in a slot of its own (no shared write), so the counter
+ * adds no contention to multi-threaded measurements.
  */
 
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <new>
+
+#include "IoCounter.h"
 
 namespace relais_bench {
 
@@ -25,13 +28,46 @@ inline uint64_t threadAllocCount() noexcept { return tl_alloc_count; }
 
 namespace alloc_detail {
 
-inline void* countedMalloc(std::size_t n) noexcept {
+/// One cache line per thread: the owner alone writes it, any thread sums.
+struct alignas(64) Slot { std::atomic<uint64_t> count{0}; };
+inline constexpr size_t kSlots = 1024;
+inline Slot slots[kSlots];
+inline std::atomic<size_t> next_slot{0};
+
+inline void countOne() noexcept {
     ++tl_alloc_count;
+    constinit thread_local Slot* mine = nullptr;
+    constinit thread_local bool shared = false;
+    if (!mine) [[unlikely]] {
+        const size_t i = next_slot.fetch_add(1, std::memory_order_relaxed);
+        shared = i >= kSlots - 1;
+        mine = &slots[shared ? kSlots - 1 : i];
+    }
+    // A slot of its own: a plain load and store, no locked instruction. The
+    // last slot is shared past kSlots - 1 threads: an atomic add there.
+    if (!shared) [[likely]]
+        mine->count.store(mine->count.load(std::memory_order_relaxed) + 1,
+                          std::memory_order_relaxed);
+    else
+        mine->count.fetch_add(1, std::memory_order_relaxed);
+}
+
+inline uint64_t processAllocCount() noexcept {
+    uint64_t total = 0;
+    for (auto& s : slots) total += s.count.load(std::memory_order_relaxed);
+    return total;
+}
+
+inline const bool heap_source_installed =
+    (io_count::heap_source = &processAllocCount, true);
+
+inline void* countedMalloc(std::size_t n) noexcept {
+    countOne();
     return std::malloc(n ? n : 1);
 }
 
 inline void* countedAlignedMalloc(std::size_t n, std::align_val_t al) noexcept {
-    ++tl_alloc_count;
+    countOne();
     auto align = static_cast<std::size_t>(al);
     if (align < sizeof(void*)) align = sizeof(void*);
     void* p = nullptr;
