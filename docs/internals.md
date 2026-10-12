@@ -587,8 +587,13 @@ hiding example in [§1](#repository-mixin-chain) shows, to notify the list cache
 The real `update` does not re-fetch: it reuses the already-resolved `old` via
 **`Base::updateWithContext(id, entity, old)`** — the `*WithContext` variants take
 the pre-fetched old entity as a parameter, so when both `ListMixin` and
-`InvalidationMixin` are active the old value is looked up once, not per layer. It
-then splits the notification: `onEntityUpdated` for the L1 list tier,
+`InvalidationMixin` are active the old value is looked up once, not per layer.
+`erase` reads nothing first: `Base::eraseOutcome<true>` runs `DELETE … RETURNING`
+and hands back the deleted row, which keys the list notification and, one layer up,
+`propagateDelete`. On an uncertain erase nothing comes back; `LocalRepo` copies its
+L1 entry (still the targeted version: L1 changes only after a commit) into a slot
+the upper layers pass down, just before its precautionary evict. `update` then
+splits the notification: `onEntityUpdated` for the L1 list tier,
 `invalidateL2Updated` for the L2 list tier. Either way the `ModificationTracker`
 records the change at the current generation; list pages are validated lazily on
 the next `getByKey` against that generation (validation lives in
@@ -1277,7 +1282,7 @@ entity/
 3. **Lazy validation**: modifications are checked on read (`getByKey`), not pushed on notification.
 4. **Sort bounds**: O(1) range checking avoids iterating cache entries during invalidation.
 5. **Short-circuit**: `hasModificationsSince()` (one atomic load) avoids iteration when nothing changed since the page was cached.
-6. **Old-entity reuse on update**: when both `ListMixin` and `InvalidationMixin` are active, the old entity is fetched once and threaded via `*WithContext`, avoiding a second L1 lookup.
+6. **Old-entity reuse on update**: when both `ListMixin` and `InvalidationMixin` are active, the old entity is fetched once and threaded via `updateWithContext`, avoiding a second L1 lookup. `erase` and `patch` fetch nothing: their statement returns the prior row.
 
 ## Entity Mapping Generator
 

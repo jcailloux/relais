@@ -1340,9 +1340,12 @@ protected:
         bool coalesced = false;
     };
 
+    /// Outcome of a keyed erase. `before` is the deleted row, filled only when
+    /// the tiers above asked for it (WithBefore) and a row was deleted.
     struct EraseOutcome {
         std::optional<size_t> affected;
         bool coalesced = false;
+        std::optional<E> before;
     };
 
     /// Update returning full outcome (success + coalesced flag).
@@ -1376,30 +1379,43 @@ protected:
         }
     }
 
-    /// Erase returning full outcome (affected + coalesced flag).
+    /// Erase returning full outcome (affected + coalesced flag), and the
+    /// deleted row when WithBefore: the DELETE then RETURNs it, so the list and
+    /// cross-invalidation cascades get the exact pre-image without reading the
+    /// row first. `uncertain_before` is for the cache tiers above: on an
+    /// uncertain outcome, they fill it with their copy of the row before
+    /// evicting it. L3 holds no copy and leaves it untouched.
+    template<bool WithBefore = false>
     static io::Task<EraseOutcome> eraseOutcome(
-        const Key& id, const E* hint = nullptr)
+        const Key& id, const E* hint = nullptr,
+        [[maybe_unused]] std::optional<E>* uncertain_before = nullptr)
         requires (!Cfg.read_only)
     {
+        constexpr const char* kByPk = WithBefore
+            ? Mapping::SQL::delete_by_pk_returning : Mapping::SQL::delete_by_pk;
         try {
             io::batch::PgWriteResult w;
             if constexpr (HasPartitionHint<E>) {
                 if (hint) {
+                    constexpr const char* kWithPartition = WithBefore
+                        ? Mapping::SQL::delete_with_partition_returning
+                        : Mapping::SQL::delete_with_partition;
                     auto params = Mapping::makePartitionHintParams(*hint);
-                    w = co_await PgProvider::queryWrite(
-                        Mapping::SQL::delete_with_partition, params);
+                    w = co_await PgProvider::queryWrite(kWithPartition, params);
                 } else {
                     auto params = io::PgParams::fromKey(id);
-                    w = co_await PgProvider::queryWrite(
-                        Mapping::SQL::delete_by_pk, params);
+                    w = co_await PgProvider::queryWrite(kByPk, params);
                 }
             } else {
                 auto params = io::PgParams::fromKey(id);
-                w = co_await PgProvider::queryWrite(
-                    Mapping::SQL::delete_by_pk, params);
+                w = co_await PgProvider::queryWrite(kByPk, params);
             }
-            co_return EraseOutcome{
-                static_cast<size_t>(w.result.affectedRows()), w.coalesced};
+            EraseOutcome outcome{
+                static_cast<size_t>(w.result.affectedRows()), w.coalesced, std::nullopt};
+            if constexpr (WithBefore) {
+                if (!w.result.empty()) outcome.before = E::fromRow(w.result[0]);
+            }
+            co_return outcome;
         } catch (const io::PgUncertainError&) {
             // Uncertain: the DELETE may have committed. Propagate so each layer
             // evicts its tier by precaution; the empty EraseOutcome (nullopt)

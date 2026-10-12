@@ -2057,6 +2057,84 @@ TEST_CASE("Benchmark - entity writes with cached lists", "[benchmark][write-list
 
 // #############################################################################
 //
+//  15b'. Erase of an entity with lists — the DELETE returns the deleted row,
+//  which keys the list invalidation: no read of the row before the write.
+//
+//  Latency: one row inserted per sample, outside the timed region (and read
+//  into the entity cache for the "hit" variant). Throughput: CORO coroutines,
+//  each inserting then erasing its own rows (pairs per second).
+//
+//  Run with:
+//    ./bench_relais_cache "[erase-lists]"
+//
+// #############################################################################
+
+using UncachedArticleEraseRepo = Repo<TestArticleEntity, "bench:article:erase:pg", cfg::Uncached>;
+using LocalArticleEraseRepo = Repo<TestArticleEntity, "bench:article:erase:l1">;
+
+template<typename R>
+static void benchEraseWithLists(const char* tier, bool cached_entity,
+                                std::vector<BenchResult>& lat) {
+    auto author = insertTestUser(std::string("el_") + tier + (cached_entity ? "_hit" : ""),
+                                 std::string("el_") + tier + (cached_entity ? "_hit" : "")
+                                     + "@test.com", 0);
+    int64_t id = 0;
+    lat.push_back(benchWithSetup(
+        std::string("erase, lists (") + tier + (cached_entity ? ", entity cached)" : ")"),
+        [&]() {
+            id = insertTestArticle("tech", author, "EL", 1);
+            if (cached_entity) doNotOptimize(sync(R::find(id)));
+        },
+        [&]() { doNotOptimize(sync(R::erase(id))); }));
+}
+
+template<typename R>
+static std::string benchEraseWithListsThroughput(const char* tier) {
+    static constexpr int CORO = 32;
+    auto author = insertTestUser(std::string("elt_") + tier,
+                                 std::string("elt_") + tier + "@test.com", 0);
+    std::atomic<bool> running{true};
+    std::atomic<int64_t> ops{0};
+    std::latch done{CORO};
+    auto t0 = Clock::now();
+    for (int c = 0; c < CORO; ++c) {
+        detail::testLoop().dispatch([&]() {
+            [](int64_t author, std::atomic<bool>& running, std::atomic<int64_t>& ops,
+               std::latch& done) -> DetachedHandle {
+                while (running.load(std::memory_order_relaxed)) {
+                    auto created = co_await R::insert(makeTestArticle("tech", author, "ELT", 1));
+                    if (created) co_await R::erase(created->id);
+                    ops.fetch_add(1, std::memory_order_relaxed);
+                }
+                done.count_down();
+            }(author, running, ops, done);
+        });
+    }
+    std::this_thread::sleep_for(std::chrono::seconds(benchDurationSeconds()));
+    running.store(false, std::memory_order_relaxed);
+    done.wait();
+    DurationResult result{Clock::now() - t0, ops.load(std::memory_order_relaxed)};
+    return formatDurationThroughput(
+        std::string("insert + erase throughput, lists (") + tier + ", "
+            + std::to_string(CORO) + " coros, single loop)",
+        1, result);
+}
+
+TEST_CASE("Benchmark - erase with lists", "[benchmark][erase-lists]") {
+    TransactionGuard tx;
+    std::vector<BenchResult> lat;
+    benchEraseWithLists<UncachedArticleEraseRepo>("Uncached", false, lat);
+    benchEraseWithLists<LocalArticleEraseRepo>("Local", false, lat);
+    benchEraseWithLists<LocalArticleEraseRepo>("Local", true, lat);
+    benchEraseWithLists<RedisArticleListRepo>("Redis", false, lat);
+    benchEraseWithLists<FullCacheArticleListRepo>("Both", false, lat);
+    WARN(formatTable("Erase with lists — latency", lat));
+    WARN(benchEraseWithListsThroughput<UncachedArticleEraseRepo>("Uncached"));
+    WARN(benchEraseWithListsThroughput<LocalArticleEraseRepo>("Local"));
+}
+
+// #############################################################################
+//
 //  15c. List miss with L2 — the read pays the L2 lookup and PostgreSQL; the
 //  store-back into L2 (one script) runs after the read returns.
 //

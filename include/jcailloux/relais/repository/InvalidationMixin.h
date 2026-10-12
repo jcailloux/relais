@@ -182,30 +182,27 @@ public:
         co_return affected;
     }
 
-    /// Erase entity and propagate cross-invalidation with deleted data.
-    /// When Base is ListMixin, reuses the pre-fetched entity via WithContext.
+    /// Erase entity and propagate cross-invalidation from the deleted row, which
+    /// the DELETE returns (through ListMixin when present, which invalidates the
+    /// lists from the same row). Uncertain: keyed on the copy a cache tier kept
+    /// before its precautionary evict; without one, the targets are left to
+    /// l*_ttl.
     static io::Task<std::optional<size_t>> erase(const Key& id)
         requires (!Base::config.read_only)
     {
-        std::optional<Entity> old = co_await findOldBestEffort(id);
-
-        std::optional<size_t> result;
+        std::optional<Entity> uncertain_before;
+        typename Base::EraseOutcome outcome;
         std::exception_ptr timeout;
         try {
-            if constexpr (detail::HasListMixin<Base>) {
-                result = co_await Base::eraseWithContext(id, old ? &*old : nullptr);
-            } else {
-                result = co_await Base::erase(id);
-            }
+            outcome = co_await Base::template eraseOutcome<true>(id, nullptr, &uncertain_before);
         } catch (const io::PgUncertainError&) {
             timeout = std::current_exception();
         }
         if (timeout) {
-            // Uncertain: cross-invalidate by precaution from old (if known).
-            // Best-effort; without old the cross tier is bounded by l*_ttl.
-            if (old) {
+            // Best-effort: the uncertain exception must still surface.
+            if (uncertain_before) {
                 try {
-                    co_await propagateDelete<Entity, InvList>(*old);
+                    co_await propagateDelete<Entity, InvList>(*uncertain_before);
                 } catch (const std::exception& e) {
                     RELAIS_LOG_ERROR << name()
                         << ": cross-invalidation failed (erase timeout) - " << e.what();
@@ -213,16 +210,16 @@ public:
             }
             std::rethrow_exception(timeout);
         }
-        if (result.has_value() && old) {
+        if (outcome.before) {
             // Best-effort: a committed delete never fails on cross-invalidation.
             try {
-                co_await propagateDelete<Entity, InvList>(*old);
+                co_await propagateDelete<Entity, InvList>(*outcome.before);
             } catch (const std::exception& e) {
                 RELAIS_LOG_ERROR << name()
                     << ": cross-invalidation failed (erase committed) - " << e.what();
             }
         }
-        co_return result;
+        co_return outcome.affected;
     }
 
     /// Partial update with cross-invalidation (only if committed), keyed on the
