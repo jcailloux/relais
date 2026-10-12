@@ -115,6 +115,8 @@ using CohAkeyL1 = Repo<TestAssignedKeyEntity, "coh:akey:l1">;
 // List repos (TestArticleEntity has a ListDescriptor → ListMixin), with an L2 tier.
 using CohArticleRedis = Repo<TestArticleEntity, "coh:article:redis", cfg::Redis>;
 using CohArticleBoth = Repo<TestArticleEntity, "coh:article:both", cfg::Both>;
+// A list read on no cache tier reaches PostgreSQL every time.
+using CohArticlePg = Repo<TestArticleEntity, "coh:article:pg", cfg::Uncached>;
 // Filters without a list, for countWhere.
 using CohCount = Repo<::entity::generated::TestFilterOnlyEntity, "coh:count">;
 using CountPred = ::entity::generated::TestFilterOnlyMapping::FilterSet::Values;
@@ -450,6 +452,129 @@ TEST_CASE("coherence: identical countWhere in flight share one statement",
         auto counts = driveBounded(env.io, countAll(
             {{.owner_id = 1}, {.owner_id = 2}, {.owner_id = 3}}));
         CHECK(counts == std::vector<size_t>{2, 1, 0});
+        CHECK(env.batcher->pgReadsSent() - before == 3);
+    }
+}
+
+// =============================================================================
+// List reads — one statement per query shape: limit and offset are parameters,
+// so pages of a shape share one prepared statement and identical reads in
+// flight coalesce.
+// =============================================================================
+
+namespace {
+
+using ArticleDesc = CohArticlePg::ListDescriptorType;
+namespace ld = jcailloux::relais::list::spec;
+
+auto articlePage(uint16_t limit, uint32_t offset = 0,
+                 std::optional<ld::TypedCursor<ArticleDesc>> cursor = std::nullopt) {
+    ld::ListQueryParams<ArticleDesc> p;
+    p.limit = limit;
+    p.offset = offset;
+    if (cursor) p.cursor = *cursor;
+    p.filters.template get<"category">() = std::string("coh-shape");
+    return ld::seal<ArticleDesc>(std::move(p));
+}
+
+std::vector<std::string> paramValues(const io::PgParams& params) {
+    std::vector<std::string> out;
+    for (const auto& p : params.params) out.emplace_back(p.isNull() ? "NULL" : std::string(p.data(), p.length()));
+    return out;
+}
+
+void seedArticles(CohEnv& env, int n) {
+    env.probe.query("DELETE FROM relais_test_articles");
+    for (int i = 0; i < n; ++i)
+        env.probe.query("INSERT INTO relais_test_articles (category, author_id, title) "
+                        "VALUES ('coh-shape', 1, 't" + std::to_string(i) + "')");
+}
+
+// Statements prepared on the pool's single connection (the session's own view).
+int64_t preparedOnConnection(CohEnv& env) {
+    static const char* sql = "SELECT count(*) FROM pg_prepared_statements";
+    auto r = driveBounded(env.io, PgProvider::queryParams(sql, io::PgParams{}));
+    return r[0].get<int64_t>(0);
+}
+
+io::Task<std::vector<size_t>> pageSizes(std::vector<uint32_t> offsets) {
+    std::vector<io::Task<size_t>> tasks;
+    for (auto o : offsets)
+        tasks.push_back([](uint32_t off) -> io::Task<size_t> {
+            co_return (co_await CohArticlePg::query(articlePage(5, off)))->size();
+        }(o));
+    co_return co_await io::whenAll(std::move(tasks));
+}
+
+}  // namespace
+
+TEST_CASE("list SQL: limit and offset are parameters of one text per shape",
+          "[coherence][list][sql]") {
+    using TI = relais_test::TestInternals;
+    auto [a, pa] = TI::listQuerySql<CohArticlePg>(articlePage(10));
+    auto [b, pb] = TI::listQuerySql<CohArticlePg>(articlePage(25));
+    auto [c, pc] = TI::listQuerySql<CohArticlePg>(articlePage(10, 20));
+    auto [d, pd] = TI::listQuerySql<CohArticlePg>(articlePage(25, 40));
+
+    CHECK(a == b);  // same text, same pointer
+    CHECK(c == d);
+    CHECK(a != c);  // no offset is its own shape, not OFFSET $n bound to 0
+    CHECK(std::string_view{a}.ends_with(" LIMIT $2"));
+    CHECK(std::string_view{c}.ends_with(" LIMIT $2 OFFSET $3"));
+    CHECK(paramValues(pa) == std::vector<std::string>{"coh-shape", "10"});
+    CHECK(paramValues(pb) == std::vector<std::string>{"coh-shape", "25"});
+    CHECK(paramValues(pd) == std::vector<std::string>{"coh-shape", "25", "40"});
+}
+
+TEST_CASE("list SQL: pages of one shape share one prepared statement",
+          "[coherence][list][sql][integration]") {
+    CohEnv env(1s);
+    seedArticles(env, 30);
+
+    // Cursor pages: filter $1, cursor ($2, $3), then LIMIT $4.
+    auto first = driveBounded(env.io, CohArticlePg::query(articlePage(5)));
+    REQUIRE(first->size() == 5);
+    auto cursor = ld::TypedCursor<ArticleDesc>::decode(first->cursor());
+    REQUIRE(cursor.has_value());
+    auto [sql, params] =
+        relais_test::TestInternals::listQuerySql<CohArticlePg>(articlePage(5, 0, cursor));
+    CHECK(std::string_view{sql}.find("< ($2, $3)") != std::string_view::npos);
+    CHECK(std::string_view{sql}.ends_with(" LIMIT $4"));
+    CHECK(params.params.size() == 4);
+    auto second = driveBounded(env.io, CohArticlePg::query(articlePage(5, 0, cursor)));
+    CHECK(second->size() == 5);
+    CHECK(second->items.front().id < first->items.back().id);
+
+    driveBounded(env.io, CohArticlePg::query(articlePage(5, 5)));
+    const auto prepared = preparedOnConnection(env);
+    const auto timings = env.batcher->estimator().sql_timings.size();
+    for (uint32_t offset = 10; offset < 30; offset += 5) {
+        auto page = driveBounded(env.io, CohArticlePg::query(articlePage(5, offset)));
+        CHECK(page->size() == 5);
+    }
+    driveBounded(env.io, CohArticlePg::query(articlePage(10)));
+    CHECK(preparedOnConnection(env) == prepared);
+    CHECK(env.batcher->estimator().sql_timings.size() == timings);
+}
+
+TEST_CASE("list SQL: identical list reads in flight share one statement",
+          "[coherence][list][sql][coalescing][integration]") {
+    CohEnv env(1s);
+    seedArticles(env, 30);
+    // Past bootstrap, the first read goes direct and the others join a batch.
+    for (int i = 0; i < io::batch::TimingEstimator::kBootstrapThreshold + 2; ++i)
+        driveBounded(env.io, CohArticlePg::query(articlePage(5, 5)));
+
+    SECTION("same page: the batched pair coalesces") {
+        auto before = env.batcher->pgReadsSent();
+        auto sizes = driveBounded(env.io, pageSizes({5, 5, 5}));
+        CHECK(sizes == std::vector<size_t>{5, 5, 5});
+        CHECK(env.batcher->pgReadsSent() - before == 2);  // the direct one + the batch
+    }
+    SECTION("different offsets: one statement each") {
+        auto before = env.batcher->pgReadsSent();
+        auto sizes = driveBounded(env.io, pageSizes({5, 10, 25}));
+        CHECK(sizes == std::vector<size_t>{5, 5, 5});
         CHECK(env.batcher->pgReadsSent() - before == 3);
     }
 }
