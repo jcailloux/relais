@@ -10,6 +10,8 @@
  *   BENCH_SAMPLES=N     — samples per latency benchmark (default: 500)
  *   BENCH_DURATION_S=N  — seconds per duration benchmark (default: 10)
  *   BENCH_PIN_CPU=N     — pin main thread to core N (default: no pinning)
+ *   BENCH_CSV=path      — also append one `case;variant;metric;value` line per
+ *                         result, values unrounded (default: no file)
  */
 
 #include "jcailloux/relais/io/Task.h"
@@ -31,6 +33,8 @@
 #include <vector>
 
 #include <sched.h>
+
+#include <catch2/interfaces/catch_interfaces_capture.hpp>
 
 namespace relais_bench {
 
@@ -106,6 +110,41 @@ static const bool bench_env_ready = [] {
 template<typename T>
 inline void doNotOptimize(const T& val) {
     asm volatile("" : : "r,m"(val) : "memory");
+}
+
+// =============================================================================
+// Machine-readable output
+// =============================================================================
+//
+// BENCH_CSV=path appends `case;variant;metric;value` lines: `case` is the
+// running Catch2 test case, `variant` names the row within it (table title and
+// row label), `value` is the unrounded double. The human-readable output is
+// unchanged. Metrics: ops_s, median_us, p99_us, min_us, max_us, avg_us, and
+// where a bench reports them, allocs_op and hit_pct.
+
+inline std::FILE* csvFile() {
+    static std::FILE* f = [] () -> std::FILE* {
+        auto* path = std::getenv("BENCH_CSV");
+        return (path && *path) ? std::fopen(path, "a") : nullptr;
+    }();
+    return f;
+}
+
+inline std::string csvField(std::string s) {
+    for (auto& c : s)
+        if (c == ';' || c == '\n') c = ',';
+    const auto first = s.find_first_not_of(' ');
+    if (first == std::string::npos) return {};
+    return s.substr(first, s.find_last_not_of(' ') - first + 1);
+}
+
+inline void csv(const std::string& variant, const char* metric, double value) {
+    auto* f = csvFile();
+    if (!f) return;
+    std::fprintf(f, "%s;%s;%s;%.17g\n",
+                 csvField(Catch::getResultCapture().getCurrentTestName()).c_str(),
+                 csvField(variant).c_str(), metric, value);
+    std::fflush(f);
 }
 
 // =============================================================================
@@ -245,6 +284,11 @@ inline std::string formatTable(const std::string& title,
         << "  " << bar << "\n";
 
     for (const auto& r : results) {
+        const auto variant = title + " | " + r.name;
+        csv(variant, "median_us", r.median_us);
+        csv(variant, "p99_us", r.p99_us);
+        csv(variant, "min_us", r.min_us);
+        csv(variant, "max_us", r.max_us);
         out << "   " << std::left << std::setw(static_cast<int>(max_name)) << r.name
             << std::right
             << std::setw(10) << fmtDuration(r.median_us)
@@ -292,6 +336,8 @@ inline std::string formatThroughput(
     auto total_ops = threads * ops_per_thread;
     auto ops_per_sec = (us > 0) ? total_ops * 1'000'000.0 / us : 0.0;
     auto avg_us = (total_ops > 0) ? static_cast<double>(us) / total_ops : 0.0;
+    csv(label, "ops_s", ops_per_sec);
+    csv(label, "avg_us", avg_us);
 
     auto bar = std::string(50, '-');
     std::ostringstream out;
@@ -367,6 +413,8 @@ inline std::string formatDurationThroughput(
     // Per-thread avg latency: wall_time / ops_per_thread
     auto ops_per_thread = result.total_ops / std::max(threads, 1);
     auto avg_us = (ops_per_thread > 0) ? static_cast<double>(us) / ops_per_thread : 0.0;
+    csv(label, "ops_s", ops_per_sec);
+    csv(label, "avg_us", avg_us);
 
     auto bar = std::string(50, '-');
     std::ostringstream out;
@@ -397,6 +445,10 @@ inline std::string formatMixedThroughput(
     // Per-thread avg operation time (blended reads + writes)
     auto ops_per_thread = result.total_ops / std::max(threads, 1);
     auto avg_op_us = (ops_per_thread > 0) ? static_cast<double>(us) / ops_per_thread : 0.0;
+    csv(label + " | read", "ops_s", read_ops_s);
+    csv(label + " | write", "ops_s", write_ops_s);
+    csv(label, "ops_s", total_ops_s);
+    csv(label, "avg_us", avg_op_us);
 
     // Estimate per-write cost: if read cost = avg_op from read-only benchmark,
     // then 0.75 * read_cost + 0.25 * write_cost = avg_op
@@ -547,6 +599,7 @@ inline std::string formatThroughputTable(
         std::ostringstream conc;
         conc << r.threads << " x " << r.concurrency_per_thread
              << " = " << (r.threads * r.concurrency_per_thread);
+        csv(title + " | " + conc.str(), "ops_s", r.throughput);
         out << "  " << std::left << std::setw(22) << conc.str()
             << std::setw(16) << fmtOps(r.throughput)
             << std::fixed << std::setprecision(2) << r.speedup << "x\n";

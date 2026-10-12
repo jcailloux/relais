@@ -537,6 +537,7 @@ TEST_CASE("Benchmark - timer arm+cancel (loop-local)", "[benchmark][io][timer]")
     CHECK(peak_pending == kLive);    // all live deadlines tracked, none coalesced
     CHECK(pending_drained == 0);     // cancel-all leaves no residue
 
+    csv("timer arm+cancel", "avg_us", arm_cancel_ns / 1000.0);
     std::ostringstream out;
     out << "\n  timer arm+cancel (loop-local, deadline never fires)\n"
         << "    per-op:        " << fmtDuration(arm_cancel_ns / 1000.0) << "\n"
@@ -656,6 +657,7 @@ TEST_CASE("Benchmark - PG throughput: timeout off vs on", "[benchmark][pg][throu
     std::ostringstream out;
     out << "\n  PG throughput — " << kConc << " in-flight on one loop, "
         << duration_s << "s\n";
+    for (const auto& r : rows) csv(r.label, "ops_s", r.ops_s);
     for (const auto& r : rows)
         out << "    " << std::left << std::setw(20) << r.label
             << std::right << std::setw(12) << fmtOps(r.ops_s)

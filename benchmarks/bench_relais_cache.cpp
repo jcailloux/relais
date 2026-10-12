@@ -413,6 +413,10 @@ std::string formatAllocRun(const std::string& label, int threads, const AllocRun
     const double ns = static_cast<double>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(run.duration.elapsed).count());
     const double ops = static_cast<double>(std::max<int64_t>(run.duration.total_ops, 1));
+    const auto variant = label + " | " + std::to_string(threads) + "T";
+    csv(variant, "ops_s", ops * 1e9 / ns);
+    csv(variant, "avg_us", ns * threads / ops / 1000.0);
+    csv(variant, "allocs_op", static_cast<double>(run.allocs) / ops);
     char line[128];
     std::snprintf(line, sizeof(line), "\n  %-28s %2dT %7.1f ns %13s %5.2f alloc/op",
                   label.c_str(), threads, ns * threads / ops,
@@ -1490,6 +1494,11 @@ TEST_CASE("Benchmark - production realism scaling", "[benchmark][realism]") {
         }
 #endif
 
+        std::ostringstream variant;
+        variant << "ratio " << std::fixed << std::setprecision(2) << ratio;
+        csv(variant.str(), "ops_s", ops_s);
+        csv(variant.str(), "hit_pct", hr);
+
         // Format ratio
         std::ostringstream line;
         line << "  " << std::fixed << std::setprecision(2) << ratio
@@ -2320,6 +2329,8 @@ TEST_CASE("Benchmark - Redis command argv", "[benchmark][redis-argv]") {
             [&] { sync(redisSetN(key, payload, 1)); }));
         const double allocs = sync(redisSetAllocsPerCommand(key, payload));
         const double tp = redisSetThroughput(key, payload, 64);
+        csv(std::string("SET ") + s.label + " | 64 coros", "ops_s", tp);
+        csv(std::string("SET ") + s.label + " | 64 coros", "allocs_op", allocs);
         extra << "\n    " << std::left << std::setw(8) << s.label
               << std::right << std::fixed << std::setprecision(2) << std::setw(6)
               << allocs << " allocs   " << fmtOps(tp);
@@ -2469,8 +2480,16 @@ inline std::string tierSweepTable(const std::string& title, int nkeys,
       << "   (keys=" << nkeys << ", " << benchDurationSeconds() << "s/level)\n  "
       << std::string(74, '-') << "\n";
     tierHeader(o, "concurrency");
-    for (const auto& r : rows)
-        tierRow(o, std::to_string(r.concurrency) + " coros", r);
+    for (const auto& r : rows) {
+        const auto head = std::to_string(r.concurrency) + " coros";
+        csv(title + " | " + head, "ops_s", r.tput);
+        csv(title + " | " + head, "avg_us", r.avg_us);
+        if (r.sampled) {
+            csv(title + " | " + head, "median_us", r.p50);
+            csv(title + " | " + head, "p99_us", r.p99);
+        }
+        tierRow(o, head, r);
+    }
     o << "  " << bar;
     return o.str();
 }
