@@ -436,16 +436,17 @@ TEST_CASE("coherence: identical countWhere in flight share one statement",
           "[coherence][count][coalescing][integration]") {
     CohEnv env(1s);
     seedCounts(env);
-    // Past bootstrap, the first read goes direct and the others join a batch.
+    // Past bootstrap, the first read goes direct: identical reads share its
+    // result, different ones join a batch.
     for (int i = 0; i < io::batch::TimingEstimator::kBootstrapThreshold + 2; ++i)
         driveBounded(env.io, CohCount::countWhere({}));
 
-    SECTION("same predicate: the batched pair coalesces") {
+    SECTION("same predicate: one statement for all three") {
         const CountPred p{.category = "coh"};
         auto before = env.batcher->pgReadsSent();
         auto counts = driveBounded(env.io, countAll({p, p, p}));
         CHECK(counts == std::vector<size_t>{3, 3, 3});
-        CHECK(env.batcher->pgReadsSent() - before == 2);  // the direct one + the batch
+        CHECK(env.batcher->pgReadsSent() - before == 1);
     }
     SECTION("different values: one statement each") {
         auto before = env.batcher->pgReadsSent();
@@ -561,15 +562,16 @@ TEST_CASE("list SQL: identical list reads in flight share one statement",
           "[coherence][list][sql][coalescing][integration]") {
     CohEnv env(1s);
     seedArticles(env, 30);
-    // Past bootstrap, the first read goes direct and the others join a batch.
+    // Past bootstrap, the first read goes direct: identical reads share its
+    // result, different ones join a batch.
     for (int i = 0; i < io::batch::TimingEstimator::kBootstrapThreshold + 2; ++i)
         driveBounded(env.io, CohArticlePg::query(articlePage(5, 5)));
 
-    SECTION("same page: the batched pair coalesces") {
+    SECTION("same page: one statement for all three") {
         auto before = env.batcher->pgReadsSent();
         auto sizes = driveBounded(env.io, pageSizes({5, 5, 5}));
         CHECK(sizes == std::vector<size_t>{5, 5, 5});
-        CHECK(env.batcher->pgReadsSent() - before == 2);  // the direct one + the batch
+        CHECK(env.batcher->pgReadsSent() - before == 1);
     }
     SECTION("different offsets: one statement each") {
         auto before = env.batcher->pgReadsSent();

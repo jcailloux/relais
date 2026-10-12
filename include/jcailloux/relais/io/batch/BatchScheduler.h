@@ -5,6 +5,7 @@
 #include <chrono>
 #include <coroutine>
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <functional>
 #include <memory>
@@ -41,7 +42,8 @@ namespace jcailloux::relais::io::batch {
 //   pipelining for different repos/lists, with sync between segments.
 // - Writes: pipelined with sync after each, preserving sequence order.
 // - Redis: reads + writes in the same pipeline (Redis guarantees order).
-// - Coalescing: identical queries share the same result.
+// - Coalescing: identical queries share the same result, in a batch or with
+//   the direct read in flight.
 //
 // Budget: separate ConcurrencyGates cap in-flight PG and Redis sends
 // independently, so neither tier starves the other under mixed load.
@@ -200,17 +202,22 @@ public:
 
     /// Direct query bypass — for BEGIN/COMMIT/ROLLBACK/SET.
     /// Acquires a connection and executes directly, no batching.
+    /// Counted as writes: a read submitted afterwards never shares the result of
+    /// a read sent before (see pg_writes_done_).
     Task<PgResult> directQuery(const char* sql) {
+        WriteDone done{pg_writes_done_};
         auto guard = co_await pg_pool_->acquire();
         co_return co_await guard.conn().query(sql);
     }
 
     Task<PgResult> directQueryParams(const char* sql, const PgParams& params) {
+        WriteDone done{pg_writes_done_};
         auto guard = co_await pg_pool_->acquire();
         co_return co_await guard.conn().queryParams(sql, params);
     }
 
     Task<int> directExecute(const char* sql, const PgParams& params) {
+        WriteDone done{pg_writes_done_};
         auto guard = co_await pg_pool_->acquire();
         co_return co_await guard.conn().execute(sql, params);
     }
@@ -431,12 +438,16 @@ private:
         BatchScheduler* self;
         std::unique_ptr<PgReadEntry> entry_owner;
         PgReadEntry* entry_ptr;
+        // Followers of the direct read in flight; null joins the batch.
+        std::vector<PgReadEntry*>* lead_followers;
         bool resumed = false;
 
-        PgReadAwaiter(BatchScheduler* s, PgReadEntry e)
+        PgReadAwaiter(BatchScheduler* s, PgReadEntry e,
+                      std::vector<PgReadEntry*>* lead = nullptr)
             : self(s)
             , entry_owner(std::make_unique<PgReadEntry>(std::move(e)))
-            , entry_ptr(entry_owner.get()) {}
+            , entry_ptr(entry_owner.get())
+            , lead_followers(lead) {}
 
         PgReadAwaiter(const PgReadAwaiter&) = delete;
         PgReadAwaiter(PgReadAwaiter&&) = delete;
@@ -445,7 +456,8 @@ private:
 
         void await_suspend(std::coroutine_handle<> h) {
             entry_ptr->continuation = h;
-            self->addToPgReadBatch(entry_owner.release());
+            if (lead_followers) lead_followers->push_back(entry_owner.release());
+            else self->addToPgReadBatch(entry_owner.release());
         }
 
         PgResult await_resume() {
@@ -466,9 +478,66 @@ private:
         }
     };
 
+    // The direct read in flight, offered to identical reads submitted during
+    // its round-trip. Registered only when no other direct read is: the latch
+    // can clear while one is still in flight, letting a second one go direct.
+    struct ReadLead {
+        BatchScheduler* self;
+        PgReadEntry* entry = nullptr;  // null once settled, or never registered
+
+        ReadLead(BatchScheduler* s, PgReadEntry* e) : self(s) {
+            if (s->pg_read_lead_) return;
+            s->pg_read_lead_ = e;
+            s->pg_read_lead_writes_ = s->pg_writes_done_;
+            entry = e;
+        }
+
+        ReadLead(const ReadLead&) = delete;
+        ReadLead& operator=(const ReadLead&) = delete;
+
+        // Hands the leader's result or error to its followers and resumes
+        // them. Touches nothing of the scheduler after the first resume.
+        void settle(const PgResult& result, const std::exception_ptr& error) {
+            if (!entry) return;
+            self->pg_read_lead_ = nullptr;
+            auto followers = std::move(entry->followers);
+            entry = nullptr;
+            std::vector<std::coroutine_handle<>> to_resume;
+            to_resume.reserve(followers.size());
+            for (auto* f : followers) {
+                if (f->cancelled) { delete f; continue; }
+                if (error) f->error = error;
+                else f->result = result;  // shared_ptr copy
+                to_resume.push_back(f->continuation);
+            }
+            for (auto h : to_resume) h.resume();
+        }
+
+        // The leader's frame was destroyed in flight: its result will never
+        // come, so its followers send their read in the next batch.
+        ~ReadLead() {
+            if (!entry) return;
+            self->pg_read_lead_ = nullptr;
+            for (auto* f : entry->followers) {
+                if (f->cancelled) delete f;
+                else self->addToPgReadBatch(f);
+            }
+        }
+    };
+
     Task<PgResult> submitPgRead(PgReadEntry entry) {
         if (estimator_.isPgBootstrapping() || estimator_.isPgStale()) {
-            co_return co_await sendSinglePgRead(std::move(entry));
+            co_return co_await sendSinglePgRead(entry);
+        }
+
+        // A read identical to the direct one in flight takes its result, unless
+        // a write completed since that one was sent: this caller may have
+        // awaited the write, which the statement in flight may not see.
+        if (pg_read_lead_ && pg_writes_done_ == pg_read_lead_writes_
+            && sameRead(*pg_read_lead_, entry))
+        {
+            PgReadAwaiter awaiter{this, std::move(entry), &pg_read_lead_->followers};
+            co_return co_await awaiter;
         }
 
         // Nagle: first query goes direct, subsequent accumulate during its RTT.
@@ -476,16 +545,19 @@ private:
         // latch invariant (proven at its declaration).
         if (!pg_read_inflight_) {
             pg_read_inflight_ = true;
+            ReadLead lead{this, &entry};
             PgResult result;
             try {
-                result = co_await sendSinglePgRead(std::move(entry));
+                result = co_await sendSinglePgRead(entry);
             } catch (...) {
                 pg_read_inflight_ = false;
                 firePgReadBatchNow();
+                lead.settle({}, std::current_exception());
                 throw;
             }
             pg_read_inflight_ = false;
             firePgReadBatchNow(); // flush accumulated during RTT
+            lead.settle(result, nullptr);
             co_return result;
         }
 
@@ -629,14 +701,7 @@ private:
         // same PK — saves a duplicate row fetch when N coroutines request
         // the same key concurrently.
         for (auto* existing : pg_read_batch_.entries) {
-            if (existing->batch_sql == entry->batch_sql &&
-                existing->single_sql == entry->single_sql &&
-                existing->params == entry->params &&
-                existing->batch_keys == entry->batch_keys)
-            {
-                // batch_keys is empty for single finds/list reads (compares
-                // equal → params decides); for findMany it guards against
-                // coalescing two different key sets onto one entry.
+            if (sameRead(*existing, *entry)) {
                 existing->followers.push_back(entry);
                 return;
             }
@@ -655,6 +720,20 @@ private:
             pg_read_batch_.entries.push_back(entry);
             checkPgReadBatchReady();
         }
+    }
+
+    // Same SQL (both pointers) and same parameters. batch_keys is empty for
+    // single finds and list reads (compares equal, params decides); for
+    // findMany it keeps two different key sets apart.
+    static bool sameRead(const PgReadEntry& a, const PgReadEntry& b) noexcept {
+        return a.batch_sql == b.batch_sql && a.single_sql == b.single_sql
+            && a.params == b.params && a.batch_keys == b.batch_keys;
+    }
+
+    // A statement on the read path may write (eraseWhere's DELETE, a caller's
+    // own statement through queryParams): its command tag tells.
+    static bool wroteRows(const PgResult& r) noexcept {
+        return r.raw() && std::strncmp(PQcmdStatus(r.raw()), "SELECT", 6) != 0;
     }
 
     void addToPgWriteBatch(PgWriteEntry* entry) {
@@ -829,6 +908,13 @@ private:
         InflightGuard& operator=(const InflightGuard&) = delete;
     };
 
+    // Counts a completed write when its scope ends, on every exit (result,
+    // throw, frame destruction): an uncertain write may have committed.
+    struct WriteDone {
+        uint64_t& counter;
+        ~WriteDone() { ++counter; }
+    };
+
     // =========================================================================
     // PG Read batch execution
     // =========================================================================
@@ -958,6 +1044,7 @@ private:
             for (size_t i = 0; i < segments.size(); ++i) {
                 auto& seg = segments[i];
                 auto& pr = results[i];
+                if (wroteRows(pr.result)) ++pg_writes_done_;
 
                 if (!seg.is_any) {
                     // Non-ANY segment: typically one waiter, plus its followers.
@@ -1011,6 +1098,7 @@ private:
                 e->error = eptr;
                 for (auto* f : e->followers) f->error = eptr;
             }
+            ++pg_writes_done_;  // a statement of the batch may have written
         }
 
         if (permit) permit->release();
@@ -1115,6 +1203,7 @@ private:
                 for (auto* f : e->followers) f->error = eptr;
             }
         }
+        ++pg_writes_done_;
 
         if (permit) permit->release();
 
@@ -1256,7 +1345,8 @@ private:
     // Single query execution (bootstrap / staleness / fallback)
     // =========================================================================
 
-    Task<PgResult> sendSinglePgRead(PgReadEntry entry) {
+    // `entry` lives in the caller's frame (submitPgRead) until this completes.
+    Task<PgResult> sendSinglePgRead(const PgReadEntry& entry) {
         // RAII permit: frees the in-flight slot on every exit — including a
         // throw from the estimator updates below, which are intentionally
         // outside the connection scope.
@@ -1268,7 +1358,7 @@ private:
         const char* timed_sql = entry.single_sql;
         int n_keys = 1;
 
-        {
+        try {
             // Inner scope: connection returned to the pool here, before the
             // estimator runs — preserves the pool turnover timing.
             auto guard = co_await pg_pool_->acquire();
@@ -1291,7 +1381,11 @@ private:
                 result = co_await guard.conn().queryParams(
                     entry.single_sql, entry.params);
             }
+        } catch (...) {
+            ++pg_writes_done_;  // the statement may have written
+            throw;
         }
+        if (wroteRows(result)) ++pg_writes_done_;
 
         auto elapsed_ns = static_cast<double>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1310,6 +1404,7 @@ private:
 
     Task<PgResult> sendSinglePgWrite(PgWriteEntry entry) {
         auto permit = co_await pg_gate_.acquire();
+        WriteDone done{pg_writes_done_};
 
         PgResult result;
         auto start = Clock::now();
@@ -1485,6 +1580,14 @@ private:
 
     // Write sequence counter
     uint64_t next_write_seq_ = 0;
+
+    // Writes completed on this loop (result or error), including statements of
+    // the read path that wrote. A read joins the direct read in flight
+    // (pg_read_lead_) only while this still equals pg_read_lead_writes_, its
+    // value when that read was sent: a write the caller awaited may postdate it.
+    uint64_t pg_writes_done_ = 0;
+    PgReadEntry* pg_read_lead_ = nullptr;
+    uint64_t pg_read_lead_writes_ = 0;
 
 #ifdef RELAIS_BUILDING_TESTS
     friend struct ::relais_bench::BatchBenchAccessor;

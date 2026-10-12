@@ -1914,3 +1914,234 @@ TEST_CASE("Write coalescing: mixed identical and different writes coalesce by gr
     REQUIRE_FALSE(timeout.timed_out);
     REQUIRE(done);
 }
+
+// =============================================================================
+// Read in flight: a read identical to the direct one in flight (Nagle leader)
+// takes its result instead of sending its own statement, unless a write
+// completed on the scheduler since that statement was sent.
+// =============================================================================
+
+namespace {
+
+struct ReadOutcome {
+    int value = -1;
+    bool done = false;
+    bool timed_out = false;
+    bool other_error = false;
+};
+
+DetachedTask readInt(std::shared_ptr<BatchScheduler<Io>> batcher,
+                     const char* sql, int key, ReadOutcome* out)
+{
+    try {
+        auto result = co_await batcher->submitQueryRead(sql, PgParams::make(key));
+        if (result.rows() > 0) out->value = result[0].get<int32_t>(0);
+    } catch (const PgQueryTimeout&) {
+        out->timed_out = true;
+    } catch (...) {
+        out->other_error = true;
+    }
+    out->done = true;
+}
+
+// Writes `val` for row 1, on the write path or on the read path (as
+// eraseWhere's DELETE does), then reads it back with `sql`.
+DetachedTask writeThenRead(std::shared_ptr<BatchScheduler<Io>> batcher,
+                           const char* sql, int val, bool read_path, ReadOutcome* out)
+{
+    static constexpr const char* UPDATE = "UPDATE lead_rw SET val = $2 WHERE id = $1";
+    if (read_path)
+        co_await batcher->submitQueryRead(UPDATE, PgParams::make(1, val));
+    else
+        co_await batcher->submitPgWrite(UPDATE, PgParams::make(1, val));
+    auto result = co_await batcher->submitQueryRead(sql, PgParams::make(1));
+    if (result.rows() > 0) out->value = result[0].get<int32_t>(0);
+    out->done = true;
+}
+
+bool allDone(std::initializer_list<const ReadOutcome*> outs) {
+    for (auto* o : outs) if (!o->done) return false;
+    return true;
+}
+
+} // anonymous namespace
+
+TEST_CASE("Read in flight: identical reads share the direct read's statement",
+          "[io][batch][integration][coalescing]")
+{
+    Io io;
+    bool done = false;
+    TimeoutGuard timeout(io);
+
+    auto task = [&]() -> DetachedTask {
+        auto pool = co_await PgPool<Io>::create(io, CONNINFO, {.min_connections = 1, .max_connections = 1});
+        auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, nullptr, 8);
+        co_await bootstrapPg(batcher);
+
+        static constexpr const char* SQL = "SELECT $1::int * 2";
+        ReadOutcome a, b, c, d;
+
+        auto before = batcher->pgReadsSent();
+        readInt(batcher, SQL, 21, &a);  // direct
+        readInt(batcher, SQL, 21, &b);  // shares a's statement
+        readInt(batcher, SQL, 21, &c);  // shares a's statement
+        while (!allDone({&a, &b, &c})) co_await YieldAwaiter{io};
+        CHECK(a.value == 42);
+        CHECK(b.value == 42);
+        CHECK(c.value == 42);
+        CHECK(batcher->pgReadsSent() - before == 1);
+
+        a = b = c = {};
+        before = batcher->pgReadsSent();
+        readInt(batcher, SQL, 1, &a);   // direct
+        readInt(batcher, SQL, 1, &b);   // shares a's statement
+        readInt(batcher, SQL, 2, &c);   // batch
+        readInt(batcher, SQL, 2, &d);   // coalesced in the batch
+        while (!allDone({&a, &b, &c, &d})) co_await YieldAwaiter{io};
+        CHECK(a.value == 2);
+        CHECK(b.value == 2);
+        CHECK(c.value == 4);
+        CHECK(d.value == 4);
+        CHECK(batcher->pgReadsSent() - before == 2);
+
+        done = true;
+    };
+    task();
+
+    io.runUntil([&] { return done || timeout.timed_out; });
+    REQUIRE_FALSE(timeout.timed_out);
+    REQUIRE(done);
+}
+
+TEST_CASE("Read in flight: not shared once a write completed since its send",
+          "[io][batch][integration][coalescing]")
+{
+    Io io;
+    bool done = false;
+    TimeoutGuard timeout(io);
+
+    // The direct read sleeps on one connection while the write and the
+    // second read run on the other.
+    static constexpr const char* SLOW =
+        "SELECT val FROM lead_rw, pg_sleep(0.3) WHERE id = $1";
+
+    auto task = [&]() -> DetachedTask {
+        auto pool = co_await PgPool<Io>::create(io, CONNINFO, {.min_connections = 2, .max_connections = 2});
+        auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, nullptr, 8);
+        co_await bootstrapPg(batcher);
+        co_await batcher->directQuery(
+            "CREATE TABLE IF NOT EXISTS lead_rw (id INT PRIMARY KEY, val INT)");
+        co_await batcher->directQuery("DELETE FROM lead_rw");
+        co_await batcher->directQuery("INSERT INTO lead_rw VALUES (1, 10)");
+
+        ReadOutcome lead, next;
+        auto before = batcher->pgReadsSent();
+
+        SECTION("no write in between: the second read shares the first") {
+            readInt(batcher, SLOW, 1, &lead);
+            readInt(batcher, SLOW, 1, &next);
+            while (!allDone({&lead, &next})) co_await YieldAwaiter{io};
+            CHECK(lead.value == 10);
+            CHECK(next.value == 10);
+            CHECK(batcher->pgReadsSent() - before == 1);
+        }
+        SECTION("a write awaited in between: the second read sees it") {
+            readInt(batcher, SLOW, 1, &lead);
+            writeThenRead(batcher, SLOW, 20, false, &next);
+            while (!allDone({&lead, &next})) co_await YieldAwaiter{io};
+            CHECK(lead.value == 10);
+            CHECK(next.value == 20);
+            CHECK(batcher->pgReadsSent() - before == 2);
+        }
+        SECTION("a statement of the read path that wrote: the second read sees it") {
+            readInt(batcher, SLOW, 1, &lead);
+            writeThenRead(batcher, SLOW, 30, true, &next);
+            while (!allDone({&lead, &next})) co_await YieldAwaiter{io};
+            CHECK(lead.value == 10);
+            CHECK(next.value == 30);
+            CHECK(batcher->pgReadsSent() - before == 3);  // + the UPDATE
+        }
+
+        co_await batcher->directQuery("DROP TABLE lead_rw");
+        done = true;
+    };
+    task();
+
+    io.runUntil([&] { return done || timeout.timed_out; });
+    REQUIRE_FALSE(timeout.timed_out);
+    REQUIRE(done);
+}
+
+TEST_CASE("Read in flight: the direct read's error reaches every follower",
+          "[io][batch][integration][coalescing]")
+{
+    Io io;
+    bool done = false;
+    TimeoutGuard timeout(io);
+
+    auto task = [&]() -> DetachedTask {
+        auto pool = co_await PgPool<Io>::create(io, CONNINFO,
+            {.min_connections = 1, .max_connections = 1,
+             .query_timeout = std::chrono::milliseconds(200)});
+        auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, nullptr, 8);
+        co_await bootstrapPg(batcher);
+
+        static constexpr const char* SLOW = "SELECT $1::int, pg_sleep(1)";
+        ReadOutcome a, b, c;
+        auto before = batcher->pgReadsSent();
+        readInt(batcher, SLOW, 1, &a);
+        readInt(batcher, SLOW, 1, &b);
+        readInt(batcher, SLOW, 1, &c);
+        while (!allDone({&a, &b, &c})) co_await YieldAwaiter{io};
+        CHECK(a.timed_out);
+        CHECK(b.timed_out);
+        CHECK(c.timed_out);
+        CHECK(batcher->pgReadsSent() - before == 1);
+
+        done = true;
+    };
+    task();
+
+    io.runUntil([&] { return done || timeout.timed_out; });
+    REQUIRE_FALSE(timeout.timed_out);
+    REQUIRE(done);
+}
+
+TEST_CASE("Read in flight: a cancelled follower leaves the others to finish",
+          "[io][batch][integration][coalescing]")
+{
+    Io io;
+    bool done = false;
+    TimeoutGuard timeout(io);
+
+    auto task = [&]() -> DetachedTask {
+        auto pool = co_await PgPool<Io>::create(io, CONNINFO, {.min_connections = 1, .max_connections = 1});
+        auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, nullptr, 8);
+        co_await bootstrapPg(batcher);
+
+        static constexpr const char* SQL = "SELECT $1::int, pg_sleep(0.05)";
+        ReadOutcome lead, kept;
+        auto before = batcher->pgReadsSent();
+        readInt(batcher, SQL, 7, &lead);
+
+        // A follower started by hand, then destroyed while it waits.
+        auto cancelled = std::make_unique<Task<PgResult>>(
+            batcher->submitQueryRead(SQL, PgParams::make(7)));
+        cancelled->await_suspend(std::noop_coroutine()).resume();
+
+        readInt(batcher, SQL, 7, &kept);
+        cancelled.reset();
+
+        while (!allDone({&lead, &kept})) co_await YieldAwaiter{io};
+        CHECK(lead.value == 7);
+        CHECK(kept.value == 7);
+        CHECK(batcher->pgReadsSent() - before == 1);
+
+        done = true;
+    };
+    task();
+
+    io.runUntil([&] { return done || timeout.timed_out; });
+    REQUIRE_FALSE(timeout.timed_out);
+    REQUIRE(done);
+}
