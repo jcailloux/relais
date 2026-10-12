@@ -24,6 +24,7 @@
 #include "jcailloux/relais/io/redis/RedisResult.h"
 #include "jcailloux/relais/io/SelfHealQueue.h"
 #include "jcailloux/relais/io/batch/TimingEstimator.h"
+#include "jcailloux/relais/io/batch/WriteAffinity.h"
 
 #ifdef RELAIS_BUILDING_TESTS
 namespace relais_bench { struct BatchBenchAccessor; }
@@ -162,12 +163,17 @@ public:
     /// BETWEEN batches is the caller's responsibility, carried by `co_await`
     /// (read-your-writes intra-flow). The scheduler does NOT track write
     /// dependencies across concurrent coroutines. See docs/runtime.md.
+    ///
+    /// `affinity` names the row the write targets (see WriteAffinity); the
+    /// default, kOrdered, assumes nothing about it.
     Task<WriteResult> submitPgWrite(const char* sql, PgParams params,
-                                    WriteMode mode = WriteMode::Idempotent) {
+                                    WriteMode mode = WriteMode::Idempotent,
+                                    WriteAffinity affinity = kOrdered) {
         PgWriteEntry entry;
         entry.sql = sql;
         entry.params = std::move(params);
         entry.seq = next_write_seq_++;
+        entry.affinity = affinity;
         entry.coalescable = mode == WriteMode::Idempotent;
 
         co_return co_await submitPgWriteEntry(std::move(entry));
@@ -321,12 +327,14 @@ private:
         std::coroutine_handle<> continuation{};
         PgResult result;
         int64_t processing_time_us = 0;
+        // Packed in one word: the row targeted, and the flags.
+        WriteAffinity affinity = kOrdered;
         bool coalescable = true;   // WriteMode::Idempotent
         bool coalesced = false;
+        bool cancelled = false;    // lifecycle
         std::vector<PgWriteEntry*> followers;
 
-        // Lifecycle / error
-        bool cancelled = false;
+        // Error
         std::exception_ptr error;
     };
 
