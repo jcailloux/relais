@@ -11,6 +11,11 @@
   signature; without L1 the returned view owns its entities.
 - **`io::RedisNoScriptError`**, a `RedisError` thrown on a `NOSCRIPT` reply
   (`EVALSHA` on a script the server does not have).
+- **`Op::IS_NULL` list filter** (`filterable:<param>:is_null`): `true` selects
+  rows where the column is NULL, `false` rows where it is not. The field must be
+  a `std::optional`.
+- **`countWhere(pred)`** returns the number of rows matching a `FilterSet`
+  predicate, on every preset. It is not cached: each call queries PostgreSQL.
 
 ### Changed (Breaking)
 
@@ -30,6 +35,15 @@
 - **Numeric columns are read strictly.** The whole value must parse as `T`:
   `get<int64_t>` on `12.5` (e.g. `avg()`) throws `PgError` instead of returning
   `12`. Read a `double` or cast in SQL.
+- **`ListWrapper::total_count` and `count()` are removed**, and the
+  `total_count` key leaves the JSON and BEVE output: `query()` left it at `0`,
+  `fromRows` set it to the page size. Use `size()` for the page and
+  `countWhere` for a total. A list page stored in Redis by an earlier version
+  is read as a miss and stored again.
+- **Generated entity headers must be regenerated**: the repositories use new
+  SQL constants (`update_returning_changes`, `delete_by_pk_returning`,
+  `delete_with_partition_returning`). The generator now also rejects a filter
+  parameter declared twice in one entity.
 
 ### Changed
 
@@ -39,6 +53,9 @@
 - **A list read no longer waits for Redis to store the page.** The L2 store is
   one atomic script, run detached: 4 sequential round trips before.
 - **Redis arguments are copied once, not twice**: large values gain throughput.
+- **A read identical to one already sent to PostgreSQL shares its result**
+  instead of sending a second query. It is not merged if a write has completed
+  since that read was sent.
 
 ### Fixed
 
@@ -56,6 +73,18 @@
 - **`size`, `purge` and `warmup` did not compile without L1**: absent on
   `Uncached`/`Redis`, a hard error on a list repo. They now return `0` or do
   nothing.
+- **A list page could stay stale after a write of a row with NULL in a
+  filtered column**: a `nin` filter with an empty set did not see the row, which
+  SQL includes. `ne` and range filters no longer invalidate pages for such rows,
+  which SQL excludes.
+- **List and cross-invalidation after `update` and `erase` could miss the
+  affected pages**: the row's old value came from its cached copy, stale if the
+  row had changed elsewhere, and `update` took its new value from the caller's
+  entity rather than the committed row (triggers, defaults). Both now come from
+  the write itself, which also removes the read that preceded it.
+- **List reads prepared a new statement per `limit`/`offset`** on every
+  connection, without bound, and identical list reads in flight were never
+  merged.
 
 ## [3.2.1] - 2026-09-27
 
