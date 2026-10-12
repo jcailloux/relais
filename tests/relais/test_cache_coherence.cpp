@@ -1118,3 +1118,173 @@ TEST_CASE("coherence: concurrent identical writes stay live and cache-consistent
         REQUIRE(std::to_string(v->value) == db);
     }
 }
+
+// =============================================================================
+// Erase of an entity with lists — the DELETE returns the row it deleted and the
+// list pages are keyed on it: no read before the write, and the position is the
+// one PostgreSQL removed, not a cached copy. An uncertain erase returns nothing:
+// the pages are then keyed on the copy L1 still holds.
+// =============================================================================
+
+using CohArticleL1 = Repo<TestArticleEntity, "coh:article:l1">;
+
+namespace {
+
+int64_t seedArticle(CohEnv& env, const std::string& category) {
+    auto r = env.probe.query(
+        "INSERT INTO relais_test_articles (category, author_id, title) VALUES ('"
+        + category + "', 1, 'erase') RETURNING id");
+    return std::stoll(r.get(0, 0));
+}
+
+bool articleExists(CohEnv& env, int64_t id) {
+    return !env.probe.query(
+        "SELECT 1 FROM relais_test_articles WHERE id=" + std::to_string(id)).empty();
+}
+
+template<typename ListRepo>
+void resetArticleCaches(CohEnv& env) {
+    constexpr auto level = ListRepo::config.cache_level;
+    env.probe.query("DELETE FROM relais_test_articles");
+    if constexpr (level == cfg::CacheLevel::L1 || level == cfg::CacheLevel::L1_L2) {
+        relais_test::TestInternals::resetEntityCacheState<ListRepo>();
+        relais_test::TestInternals::resetListCacheState<ListRepo>();
+    }
+    if (env.redis) driveBounded(env.io, env.redis->exec("FLUSHDB"));
+}
+
+template<typename ListRepo>
+bool pageHolds(CohEnv& env, const std::string& category, int64_t id) {
+    using Desc = typename ListRepo::ListDescriptorType;
+    ld::ListQueryParams<Desc> p;
+    p.limit = 10;
+    p.filters.template get<"category">() = category;
+    auto page = driveBounded(env.io, ListRepo::query(ld::seal<Desc>(std::move(p))));
+    for (const auto& a : page->items)
+        if (a.id == id) return true;
+    return false;
+}
+
+template<typename ListRepo>
+void eraseReadsNothingFirst(CohEnv& env, bool cached_entity) {
+    resetArticleCaches<ListRepo>(env);
+    auto id = seedArticle(env, "coh-erase");
+    auto other = seedArticle(env, "coh-erase");
+    if (cached_entity) REQUIRE(driveBounded(env.io, ListRepo::find(id)));
+    REQUIRE(pageHolds<ListRepo>(env, "coh-erase", id));
+
+    auto reads = env.batcher->pgReadsSent();
+    CHECK(driveBounded(env.io, ListRepo::erase(id)) == std::optional<size_t>{1});
+    CHECK(env.batcher->pgReadsSent() == reads);
+
+    CHECK_FALSE(pageHolds<ListRepo>(env, "coh-erase", id));
+    CHECK(pageHolds<ListRepo>(env, "coh-erase", other));
+}
+
+template<typename ListRepo>
+void eraseKeysOnDeletedRow(CohEnv& env) {
+    resetArticleCaches<ListRepo>(env);
+    auto id = seedArticle(env, "coh-pre-a");
+    REQUIRE(driveBounded(env.io, ListRepo::find(id)));  // cached copy in category a
+    // Another writer moves the row to category b; the cached copy stays in a.
+    env.probe.query("UPDATE relais_test_articles SET category='coh-pre-b' WHERE id="
+                    + std::to_string(id));
+    REQUIRE(pageHolds<ListRepo>(env, "coh-pre-b", id));
+
+    REQUIRE(driveBounded(env.io, ListRepo::erase(id)) == std::optional<size_t>{1});
+    CHECK_FALSE(pageHolds<ListRepo>(env, "coh-pre-b", id));
+}
+
+template<typename ListRepo>
+void uncertainEraseKeysOnL1Copy(CohEnv& env) {
+    resetArticleCaches<ListRepo>(env);
+    // Prepare the DELETE once, so the held erase waits only on its result.
+    driveBounded(env.io, ListRepo::erase(seedArticle(env, "coh-unc")));
+    auto id = seedArticle(env, "coh-unc");
+    REQUIRE(driveBounded(env.io, ListRepo::find(id)));
+    REQUIRE(pageHolds<ListRepo>(env, "coh-unc", id));
+
+    env.holdPg();
+    REQUIRE_THROWS_AS(driveBounded(env.io, ListRepo::erase(id)), io::PgQueryTimeout);
+    REQUIRE_FALSE(articleExists(env, id));  // the DELETE committed
+    env.releasePg();
+
+    CHECK_FALSE(pageHolds<ListRepo>(env, "coh-unc", id));
+}
+
+io::Task<std::vector<std::optional<size_t>>> eraseTwice(int64_t id) {
+    std::vector<io::Task<std::optional<size_t>>> tasks;
+    tasks.push_back(CohArticleL1::erase(id));
+    tasks.push_back(CohArticleL1::erase(id));
+    co_return co_await io::whenAll(std::move(tasks));
+}
+
+}  // namespace
+
+TEST_CASE("erase with lists: no read before the DELETE, the row's pages invalidated",
+          "[coherence][list][erase][integration]") {
+    CohEnv env(1s, /*with_redis=*/true, 200ms);
+    SECTION("Uncached")    { eraseReadsNothingFirst<CohArticlePg>(env, false); }
+    SECTION("Local, miss") { eraseReadsNothingFirst<CohArticleL1>(env, false); }
+    SECTION("Local, hit")  { eraseReadsNothingFirst<CohArticleL1>(env, true); }
+    SECTION("Redis")       { eraseReadsNothingFirst<CohArticleRedis>(env, false); }
+    SECTION("Both")        { eraseReadsNothingFirst<CohArticleBoth>(env, false); }
+}
+
+TEST_CASE("erase with lists: pages keyed on the deleted row, not a stale cached copy",
+          "[coherence][list][erase][integration]") {
+    CohEnv env(1s, /*with_redis=*/true, 200ms);
+    SECTION("Local") { eraseKeysOnDeletedRow<CohArticleL1>(env); }
+    SECTION("Both")  { eraseKeysOnDeletedRow<CohArticleBoth>(env); }
+}
+
+TEST_CASE("erase with lists: an absent row deletes and invalidates nothing",
+          "[coherence][list][erase][integration]") {
+    CohEnv env(1s);
+    resetArticleCaches<CohArticleL1>(env);
+    auto id = seedArticle(env, "coh-absent");
+    REQUIRE(pageHolds<CohArticleL1>(env, "coh-absent", id));
+    auto pending = relais_test::TestInternals::pendingModificationCount<CohArticleL1>();
+
+    CHECK(driveBounded(env.io, CohArticleL1::erase(id + 1'000'000)) == std::optional<size_t>{0});
+    CHECK(relais_test::TestInternals::pendingModificationCount<CohArticleL1>() == pending);
+    CHECK(pageHolds<CohArticleL1>(env, "coh-absent", id));
+}
+
+TEST_CASE("erase with lists: identical erases in flight invalidate the row's pages",
+          "[coherence][list][erase][concurrency][integration]") {
+    CohEnv env(1s);
+    resetArticleCaches<CohArticleL1>(env);
+    auto id = seedArticle(env, "coh-twice");
+    REQUIRE(pageHolds<CohArticleL1>(env, "coh-twice", id));
+
+    auto results = driveBounded(env.io, eraseTwice(id));
+    REQUIRE(results.size() == 2);
+    REQUIRE(results[0].has_value());
+    REQUIRE(results[1].has_value());
+    CHECK(*results[0] + *results[1] >= 1);  // coalesced: both see 1; serial: 1 then 0
+    CHECK_FALSE(articleExists(env, id));
+    CHECK_FALSE(pageHolds<CohArticleL1>(env, "coh-twice", id));
+}
+
+TEST_CASE("erase with lists: an uncertain erase keys the pages on the L1 copy",
+          "[coherence][list][erase][scenarioA][integration]") {
+    CohEnv env(300ms, /*with_redis=*/true, 200ms);
+    SECTION("Local") { uncertainEraseKeysOnL1Copy<CohArticleL1>(env); }
+    SECTION("Both")  { uncertainEraseKeysOnL1Copy<CohArticleBoth>(env); }
+}
+
+TEST_CASE("erase with lists: an uncertain erase with no cached copy only throws",
+          "[coherence][list][erase][scenarioA][integration]") {
+    // Nothing tells which pages held the row: they are left to their TTL. The
+    // caller still gets the uncertain error, and nothing else.
+    CohEnv env(300ms, /*with_redis=*/true, 200ms);
+    resetArticleCaches<CohArticleRedis>(env);
+    driveBounded(env.io, CohArticleRedis::erase(seedArticle(env, "coh-unc-nocopy")));
+    auto id = seedArticle(env, "coh-unc-nocopy");
+
+    env.holdPg();
+    CHECK_THROWS_AS(driveBounded(env.io, CohArticleRedis::erase(id)), io::PgQueryTimeout);
+    env.releasePg();
+    CHECK_FALSE(articleExists(env, id));
+}

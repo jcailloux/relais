@@ -848,6 +848,12 @@ class MappingGenerator:
         lines.append(f"        static constexpr const char* delete_by_pk =")
         lines.append(
             f'            "DELETE FROM {table_name} WHERE {pk_where}";')
+        # Same DELETE, returning the deleted row: the pre-image that list and
+        # cross-invalidation need, in the write's own round-trip.
+        lines.append(f"        static constexpr const char* delete_by_pk_returning =")
+        lines.append(
+            f'            "DELETE FROM {table_name} WHERE {pk_where} '
+            f'RETURNING {all_cols_str}";')
 
         # Batch DELETE by enumerated keys — reuses the same `batch_where` shape as
         # select_by_pk_batch (= ANY($1) for a scalar key, unnest-tuple for a
@@ -870,6 +876,11 @@ class MappingGenerator:
             lines.append(f"        static constexpr const char* delete_with_partition =")
             lines.append(
                 f'            "DELETE FROM {table_name} WHERE {hint_where_clause}";')
+            lines.append(
+                f"        static constexpr const char* delete_with_partition_returning =")
+            lines.append(
+                f'            "DELETE FROM {table_name} WHERE {hint_where_clause} '
+                f'RETURNING {all_cols_str}";')
 
         lines.append("    };")
 

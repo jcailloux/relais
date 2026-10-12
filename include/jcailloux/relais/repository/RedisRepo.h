@@ -204,9 +204,12 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
             co_return outcome.affected;
         }
 
-        /// Erase returning full outcome. Skips L2 ops when coalesced.
+        /// Erase returning full outcome (WithBefore, uncertain_before: see
+        /// PgRepo::eraseOutcome). Skips L2 ops when coalesced.
+        template<bool WithBefore = false>
         static io::Task<EraseOutcome> eraseOutcome(
-            const Key& id, const E* hint = nullptr)
+            const Key& id, const E* hint = nullptr,
+            std::optional<E>* uncertain_before = nullptr)
             requires (!Cfg.read_only)
         {
             // L2 hint fallback for partition pruning
@@ -221,7 +224,8 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
             EraseOutcome outcome;
             std::exception_ptr timeout;
             try {
-                outcome = co_await Base::eraseOutcome(id, hint);
+                outcome = co_await Base::template eraseOutcome<WithBefore>(
+                    id, hint, uncertain_before);
             } catch (const io::PgUncertainError&) {
                 timeout = std::current_exception();
             }
