@@ -214,6 +214,36 @@ if(RELAIS_BUILD_TESTS)
     endfunction()
 
     # -------------------------------------------------------------------------
+    # Rejection tests: a declaration the library must refuse
+    # -------------------------------------------------------------------------
+    #   relais_add_compile_fail_test(<name> <source> <regex>)
+    #     passes when compiling <source> prints <regex> (the static_assert text);
+    #     the target is built only by the test, never by the default build.
+    #   relais_add_generator_reject_test(<name> <sources_dir> <regex>)
+    #     passes when the entity generator prints <regex> for <sources_dir>.
+    # -------------------------------------------------------------------------
+    function(relais_add_compile_fail_test name source regex)
+        add_library(${name} OBJECT EXCLUDE_FROM_ALL ${source})
+        target_link_libraries(${name} PRIVATE jcailloux::relais)
+        add_test(NAME ${name}
+                 COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target ${name})
+        set_tests_properties(${name} PROPERTIES
+            PASS_REGULAR_EXPRESSION "${regex}"
+            LABELS "relais;compile-fail"
+            RESOURCE_LOCK "build_tree")
+    endfunction()
+
+    function(relais_add_generator_reject_test name sources_dir regex)
+        add_test(NAME ${name}
+                 COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/scripts/generate_entities.py
+                         --sources ${sources_dir}
+                         --output-dir ${CMAKE_CURRENT_BINARY_DIR}/generator_reject/${name})
+        set_tests_properties(${name} PROPERTIES
+            PASS_REGULAR_EXPRESSION "${regex}"
+            LABELS "relais;generator")
+    endfunction()
+
+    # -------------------------------------------------------------------------
     # Unit tests
     # -------------------------------------------------------------------------
     relais_add_test(relais_tests                tests/relais/test_generated_entity.cpp          DEFINITIONS RELAIS_BUILDING_TESTS)
@@ -266,6 +296,17 @@ if(RELAIS_BUILD_TESTS)
     relais_add_test(test_relais_gen_sql         tests/relais/test_generated_sql.cpp        DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;sql;generator")
     relais_add_test(test_relais_gen_list_in     tests/relais/test_gen_list_in.cpp          DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;list;in;generator")
     relais_add_test(test_relais_gen_list_nin    tests/relais/test_gen_list_nin.cpp         DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;list;nin;generator")
+    relais_add_test(test_relais_gen_list_is_null tests/relais/test_gen_list_is_null.cpp    DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;list;is_null;generator")
+    relais_add_test(test_relais_decl_list_is_null tests/relais/test_decl_list_is_null.cpp  DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;redis;list;is_null" RESOURCE_LOCK)
+    relais_add_compile_fail_test(compile_fail_is_null_non_optional
+        tests/compile_fail/is_null_non_optional.cpp
+        "IS_NULL filter requires a std::optional member")
+    relais_add_generator_reject_test(generator_rejects_is_null_non_optional
+        ${PROJECT_SOURCE_DIR}/tests/generator/is_null_non_optional
+        "is_null requires a std::optional member")
+    relais_add_generator_reject_test(generator_rejects_duplicate_filter_param
+        ${PROJECT_SOURCE_DIR}/tests/generator/is_null_duplicate_param
+        "filter parameter 'published_at' is declared twice")
     relais_add_test(test_relais_gen_list_limits tests/relais/test_gen_list_limits.cpp      DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;list;limits;generator")
     relais_add_test(test_relais_list_limits     tests/relais/test_list_limits.cpp          DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;list;limits")
     relais_add_test(test_relais_list_parse_bool tests/relais/test_list_parse_bool.cpp      DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;list;parse;bool")
