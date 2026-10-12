@@ -1,34 +1,31 @@
 /**
  * test_decl_list_in.cpp
- * Unit tests for the IN filter operator at the L1 matching layer.
+ * The IN filter operator on every tier. Invariant: L1, L2 and L3 give the same
+ * verdict — "entity scalar ∈ query set".
  *
- * Scope (commit 3): the free `matchesFilters<Descriptor>(entity, filters)` —
- * the real L1 invalidation path (ListCache.h:529/536). Tested in isolation from
- * transport (no DB, no Redis): hand-built descriptors with IN filters and a
- * directly-populated Filters set. Validates the §1 invariant on the L1 tier:
- * "entity scalar ∈ query set". The L3 SQL `= ANY` and L2 Lua `cmpin` tiers, plus
- * the binary canonicalization and HTTP parsing, are covered in later commits.
- *
- * Covers §7.6 (L1 memory matching):
+ * L1 matching (transport-free, hand-built descriptors with IN filters and a
+ * directly-populated Filters set) through the free `matchesFilters<Descriptor>(
+ * entity, filters)`, the real L1 invalidation path:
  * - IN match / mismatch per element type: string, int64, int32, bool
  * - singleton {x} ≡ EQ x
  * - empty set {} ⇒ no entity matches
  * - combinations EQ + IN + range
  * - optional member null ∉ any set
  *
- * Plus (commit 6) §7.4/§7.5 L2 selective invalidation via the Redis Lua scripts
- * (`invalidateListGroupsSelective` + `...Update`): the new `skipset`/`cmpin`/
- * `fmatch` IN path tested directly against Redis — a page stored without an SR
- * SortBounds header makes `chk` unconditionally true, so the delete decision
- * reduces to pure filter matching. Multi-filter alignment (IN in first/middle/
- * last position) is the anti-regression for `skipset` cursor desync.
+ * L3 SQL generation, binary group key and HTTP parsing (transport-free).
  *
- * Plus (commit 7) §7.7 cross-tier consistency: a deterministic property test
- * (fixed seed) forces all three tiers — L1 `matchesFilters`, L2 Lua `cmpin`,
- * L3 real PostgreSQL `= ANY` — through the same (entity, set) pairs and asserts
- * the verdicts are identical, per the §1 invariant. Covers all four element
- * encodings (string/int64/int32-optional/bool), negatives/extremes, empty sets,
- * null members, and array-literal escaping that round-trips through PG.
+ * L2 selective invalidation on create and update through the Redis Lua scripts
+ * (`invalidateListGroupsSelective` + `...Update`): the `skipset`/`cmpin`/`fmatch`
+ * IN path tested directly against Redis — a page stored without an SR SortBounds
+ * header makes `chk` unconditionally true, so the delete decision reduces to pure
+ * filter matching. Multi-filter alignment (IN in first/middle/last position)
+ * guards against `skipset` cursor desync.
+ *
+ * Cross-tier property suite: a fixed-seed test forces L1 `matchesFilters`, L2 Lua
+ * `cmpin` and L3 PostgreSQL `= ANY` through the same (entity, set) pairs and
+ * asserts identical verdicts. Covers all four element encodings
+ * (string/int64/int32-optional/bool), negatives/extremes, empty sets, null
+ * members, and array-literal escaping that round-trips through PG.
  */
 
 #include <catch2/catch_test_macros.hpp>
@@ -56,8 +53,7 @@ using relais_test::TransactionGuard;
 using Entity = entity::generated::TestArticleEntity;
 
 // =============================================================================
-// Hand-built descriptors with IN filters (independent of the generated fixture,
-// whose embedded ListDescriptor carries only EQ filters until commit 8).
+// Hand-built descriptors with IN filters, independent of the generated fixture.
 // =============================================================================
 
 namespace {
@@ -258,7 +254,7 @@ TEST_CASE("[DeclListIn] EQ + IN + range combination", "[list][in][unit]") {
 }
 
 // =============================================================================
-// L3 SQL generation — buildWhereClause IN branch (§7.3, transport-free).
+// L3 SQL generation — buildWhereClause IN branch (transport-free).
 // Validates the `= ANY($n)` clause, the single-array-param invariant, $n
 // numbering when combined with EQ/range, empty-set literal, and escaping.
 // (Live-DB round-trip + cursor/offset coverage lands with the IN fixtures.)
@@ -356,7 +352,7 @@ TEST_CASE("[DeclListIn] SQL: EQ + IN + range $n numbering", "[list][in][unit][sq
 }
 
 // =============================================================================
-// Binary group key (§7.1) — groupCacheKey IN canonicalization, transport-free.
+// Binary group key — groupCacheKey IN canonicalization, transport-free.
 // The group_key is the cache identity of a filtered list: {a,b}, {b,a}, {a,a,b}
 // MUST produce byte-identical keys or the cache fragments and the master hash
 // bloats. Canonicalization (sort+unique) lives in groupCacheKey itself so even
@@ -411,7 +407,7 @@ TEST_CASE("[DeclListIn] binary: presence byte and count layout", "[list][in][uni
 }
 
 // =============================================================================
-// HTTP parsing (§7.2) — parseListQuery / parseListQueryStrict IN branch.
+// HTTP parsing — parseListQuery / parseListQueryStrict IN branch.
 // =============================================================================
 
 namespace {
@@ -476,7 +472,7 @@ TEST_CASE("[DeclListIn] parse: strict rejects undeclared filter, accepts IN",
 }
 
 // =============================================================================
-// L2 selective invalidation (§7.4/§7.5) — the Redis Lua `skipset`/`cmpin`/
+// L2 selective invalidation — the Redis Lua `skipset`/`cmpin`/
 // `fmatch` IN path, exercised directly. A group is registered by HSET-ing its
 // canonical key (prefix + groupCacheKey) into a master hash and SADD-ing one
 // page into `<group>:_keys`. The page value is shorter than the SortBounds
@@ -707,7 +703,7 @@ TEST_CASE("[DeclListIn][L2] alignment — IN in middle position (update, revue C
 }
 
 // =============================================================================
-// Cross-tier consistency (§7.7) — the §1 invariant under load.
+// Cross-tier consistency — L1, L2 and L3 agree under load.
 //
 // For each (entity, set) pair the three tiers must agree on "entity scalar ∈
 // set": L1 `matchesFilters` (pure C++), L3 PostgreSQL `= ANY` (the real array

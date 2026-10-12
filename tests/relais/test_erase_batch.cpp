@@ -2,7 +2,7 @@
  * test_erase_batch.cpp
  * Batched / predicate erase at L3 (PgRepo::eraseManyRaw / eraseWhereRaw).
  *
- * Étape 2 du plan erase/invalidate batch :
+ * Covers:
  *   - eraseManyRaw(span<Key>)  → delete_by_pk_batch (WHERE pk=ANY RETURNING *),
  *     one statement = deletion + the deleted entities (for downstream inval).
  *   - eraseWhereRaw<Descriptor>(filters) → ctid-bounded DELETE looped at K_pg,
@@ -196,7 +196,7 @@ TEST_CASE("eraseWhereRaw: selective predicate deletes only the matched rows",
 }
 
 // ---------------------------------------------------------------------------
-// eraseWhereRaw — real loop convergence over > K_pg rows (§5 chunking)
+// eraseWhereRaw — real loop convergence over > K_pg rows (chunking)
 // ---------------------------------------------------------------------------
 
 TEST_CASE("eraseWhereRaw converges past K_pg in bounded chunks",

@@ -2,7 +2,7 @@
  * test_invalidate_many.cpp
  * Variadic batch eviction at L2 (RedisCache::invalidateMany) + its chunk splitter.
  *
- * Étape 3 du plan erase/invalidate batch :
+ * Covers:
  *   - rdetail::chunkSpan(span, K) — pure splitter: partitions a key set into
  *     subspans of ≤ K, covering the input exactly (no loss, no overlap).
  *   - RedisCache::invalidateMany(span<string>) → UNLINK k1…kN sub-chunked at
@@ -30,7 +30,7 @@ namespace rdetail = jcailloux::relais::detail;
 namespace cache = jcailloux::relais::cache;
 
 // ---------------------------------------------------------------------------
-// §1 — pure splitter: union of chunks == input, no loss, no overlap
+// Pure splitter: union of chunks == input, no loss, no overlap
 // ---------------------------------------------------------------------------
 
 namespace {
@@ -91,7 +91,7 @@ TEST_CASE("chunkSpan degenerate ceilings", "[splitter]") {
 }
 
 // ---------------------------------------------------------------------------
-// §5 — invalidateMany over a live Redis
+// invalidateMany over a live Redis
 // ---------------------------------------------------------------------------
 
 namespace {

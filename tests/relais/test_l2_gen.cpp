@@ -1,7 +1,7 @@
 /**
  * test_l2_gen.cpp
  *
- * Cross-instance L2 generation primitives (commit 12b). When one Redis is
+ * Cross-instance L2 generation primitives. When one Redis is
  * shared by several processes the read-fill recheck's authority moves to a
  * sharded generation hash {repo}:l2gen. These tests pin the contract of the
  * RedisCache primitives behind that path — deterministic, single-threaded:

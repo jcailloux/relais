@@ -587,7 +587,7 @@ namespace jcailloux::relais::cache {
             }
 
             // =================================================================
-            // Cross-instance L2 generation (topology-gated; commit 12b)
+            // Cross-instance L2 generation (topology-gated)
             // =================================================================
             //
             // The read-fill recheck's shared authority when one Redis is hit by

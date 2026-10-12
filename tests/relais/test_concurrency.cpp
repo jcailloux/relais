@@ -1114,7 +1114,7 @@ TEST_CASE("Concurrency - findMany detached L2 fill drains before teardown",
 
 // #############################################################################
 //
-//  §6 — Batch invalidation concurrency (plan erase-invalidate-batch)
+//  Batch invalidation concurrency
 //
 //  The batch paths add new shared mutable state the mono paths never touched:
 //  the per-key generation bump driven from invalidateMany/eraseMany, and the
@@ -1128,7 +1128,7 @@ TEST_CASE("Concurrency - findMany detached L2 fill drains before teardown",
 
 
 // -----------------------------------------------------------------------------
-//  §6.1+6.2 — invalidateMany (batch bumpGeneration) vs concurrent L1 fills
+//  invalidateMany (batch bumpGeneration) vs concurrent L1 fills
 //
 //  A reader re-fills L1 from L3 for the whole pool while a second thread runs
 //  invalidateMany over the same pool: each batched bump races an in-flight fill
@@ -1183,7 +1183,7 @@ TEST_CASE("Concurrency - invalidateMany vs concurrent fills",
 
 
 // -----------------------------------------------------------------------------
-//  §6.3 — eraseMany vs mono erase on overlapping keys (idempotence)
+//  eraseMany vs mono erase on overlapping keys (idempotence)
 //
 //  Half the threads batch-erase the first 60% of the pool, the other half
 //  mono-erase the last 60% — the middle 20% is double-deleted from both paths
@@ -1238,7 +1238,7 @@ TEST_CASE("Concurrency - eraseMany vs mono erase overlapping keys",
 
 
 // -----------------------------------------------------------------------------
-//  §6.3b — eraseMany vs concurrent find: the deleted-row L2→L1 phantom
+//  eraseMany vs concurrent find: the deleted-row L2→L1 phantom
 //
 //  Reader threads hammer find() on the very keys an eraser thread is deleting
 //  via eraseMany. If the batch cascade evicts L1 BEFORE clearing L2, a reader
@@ -1268,7 +1268,7 @@ static void runEraseManyVsFinds(const std::vector<int64_t>& ids) {
     }
 }
 
-// Closed by the read-fill recheck (commit 12a): a find() whose L3 fetch
+// Closed by the read-fill recheck: a find() whose L3 fetch
 // straddles the delete used to write the entity back into L1/L2 AFTER the
 // eraser cleared them (the read path cached unconditionally). The reader now
 // snapshots the recheck slot at fetch-start and skips the store when a
@@ -1382,7 +1382,7 @@ TEST_CASE("Concurrency - read-fill recheck, shared topology (Redis-side gen)",
 
 
 // -----------------------------------------------------------------------------
-//  §6.4 — concurrent eraseWhere with overlapping predicates
+//  Concurrent eraseWhere with overlapping predicates
 //
 //  {author = A} and {category = tech} both match A's tech articles. Two thread
 //  groups hammer the two predicates concurrently: each call appends a
@@ -1427,7 +1427,7 @@ TEST_CASE("Concurrency - concurrent eraseWhere overlapping predicates",
 
 
 // -----------------------------------------------------------------------------
-//  §6.5 — RangeModification production vs concurrent drainChunk / sweep
+//  RangeModification production vs concurrent drainChunk / sweep
 //
 //  eraseWhere appends a RangeModification on every call (even at zero rows, the
 //  predicate fast-path still fires). Producers race a sweeper (drainChunk clears
