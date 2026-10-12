@@ -5,11 +5,11 @@
  * Ici on n'exécute aucune requête : on assert les strings constantes de
  * Mapping::SQL — leur forme, leur numérotation $n, leurs colonnes RETURNING.
  *
- * Cible étape 1 (plan erase/invalidate batch, §1) : delete_by_pk_batch.
+ * Cible : delete_by_pk_batch.
  *   - clé scalaire   → WHERE pk = ANY($1) RETURNING <cols>
  *   - clé composite  → WHERE (k1,k2) IN (SELECT unnest($1::t[]), unnest($2::t[])) RETURNING <cols>
  *   - entité partitionnée → pas de partition pruning : pk = ANY($1) scanne toutes
- *     les partitions (choix de design acté — purge batch).
+ *     les partitions (purge batch, sans pruning).
  *
  * SECTION naming :
  *   [SQL] — assertion directe sur une constante Mapping::SQL::*
@@ -169,7 +169,7 @@ TEST_CASE("delete_by_pk_batch shares the WHERE shape of select_by_pk_batch",
 }
 
 // #############################################################################
-//  delete_where — assemblage runtime (étape 2, §1)
+//  delete_where — assemblage runtime
 // #############################################################################
 //
 // delete_where N'EST PAS un template du générateur : le prédicat est injecté en

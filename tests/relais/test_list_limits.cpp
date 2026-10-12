@@ -46,7 +46,7 @@ using LC = Desc<entity::generated::TestCompositeKeyListEntity>;
 // Descriptor without allowedLimits — exercises the kDefaultLimits fallback.
 struct NoLimits {};
 
-// --- HasLimitConfig size-agnostic contract (Étape 3) ----------------------
+// --- HasLimitConfig size-agnostic contract --------------------------------
 // A Traits surface exposing a uint16_t grid of arbitrary length must satisfy
 // HasLimitConfig — no fixed-size-4 assumption.
 
@@ -71,7 +71,7 @@ static_assert(lst::HasLimitConfig<FakeTraits<4>, int>, "size-4 grid still satisf
 static_assert(lst::HasLimitConfig<FakeTraits<5>, int>, "size-5 grid satisfies HasLimitConfig");
 static_assert(!lst::HasLimitConfig<NoGrid, int>, "no grid -> not satisfied");
 
-// --- ListMixin::ListTraits derives its grid from the descriptor (Étape 3) -
+// --- ListMixin::ListTraits derives its grid from the descriptor -----------
 // limitSteps/maxLimit must mirror the model's allowedLimits, not a fixed
 // {10,25,50,100}. Type-only instantiation — no DB connection.
 namespace rel = jcailloux::relais;
@@ -85,7 +85,7 @@ static_assert(SingleRepo::ListTraits::limitSteps == std::array<uint16_t, 1>{50},
               "single-value grid flows through to ListMixin Traits");
 static_assert(SingleRepo::ListTraits::maxLimit == 50);
 
-// --- defaultLimit<Descriptor> (Étape 4) -----------------------------------
+// --- defaultLimit<Descriptor> ---------------------------------------------
 // The default page size (no `limit` param) is allowedLimits.front() for a
 // generated descriptor, falling back to the ListQuery struct default of 20 for
 // a hand-written descriptor without a grid.
@@ -174,14 +174,14 @@ TEST_CASE("descriptors without allowedLimits use the default grid", "[list][limi
     CHECK(getAllowedLimitsString<NoLimits>() == "10, 25, 50, 100");
 }
 
-// All Étape 3 checks (HasLimitConfig size-agnosticism, ListMixin Traits grid
+// The size-agnostic checks (HasLimitConfig size-agnosticism, ListMixin Traits grid
 // derivation) are compile-time static_asserts above — reaching here means they
 // held.
 TEST_CASE("limit config is size-agnostic and descriptor-derived", "[list][limits]") {
     SUCCEED();
 }
 
-// Étape 4: a request omitting `limit` falls back to the descriptor's declared
+// A request omitting `limit` falls back to the descriptor's declared
 // default page size, not the struct default of 20.
 TEST_CASE("parse without a limit param uses the descriptor default", "[list][limits]") {
     // parseListQuery requires the augmented descriptor (Entity alias) exposed as

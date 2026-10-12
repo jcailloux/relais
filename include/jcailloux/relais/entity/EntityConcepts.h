@@ -93,7 +93,7 @@ concept HasListDescriptor = requires {
 /// E's Mapping declares a FilterSet (predicate spec — filters tuple + named
 /// Values aggregate). Drives the where-variants (eraseWhere/invalidateWhere).
 /// Decoupled from HasListDescriptor: an entity may declare filters WITHOUT a
-/// cached list and still satisfy this (étape 0b decorrelation); conversely a
+/// cached list and still satisfy this; conversely a
 /// list entity's ListDescriptor inherits its FilterSet, so list entities
 /// satisfy both.
 template<typename E>

@@ -151,8 +151,8 @@ ListQuery<Descriptor> parseListQuery(const Map& params) {
                 if constexpr (FilterType::is_set_op) {
                     // Set op (IN/NIN): comma-separated set; empty (no valid element)
                     // leaves the filter inactive → list stays unfiltered. For NIN
-                    // this coincides with the intended "NOT IN {} = universe"
-                    // (§1.2): inactive ≡ unfiltered ≡ universe. No HTTP empty-set.
+                    // this coincides with "NOT IN {} = universe": inactive ≡
+                    // unfiltered ≡ universe. No HTTP empty-set.
                     bool rejected = false;
                     auto vals = detail::parseInList<FilterType>(it->second, rejected);
                     if (!vals.empty()) {

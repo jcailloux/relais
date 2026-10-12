@@ -2,16 +2,17 @@
  * test_find_many.cpp
  * Multi-id batched read (findMany) across the mixin chain.
  *
- * Étape 1 covers the L2 MGET primitive (RedisCache::mgetRaw / mget<E>):
- *   - request-order preservation, nil holes, empty input (no I/O)
- *   - binary-safety (BEVE bytes survive the raw round-trip)
- *   - typed JSON deserialization
- * Later étapes extend this file with [pg], [l2], composite-key and partition-key
- * coverage of findManyRaw / findMany.
+ * Covers, tier by tier:
+ *   - the L2 MGET primitive (RedisCache::mgetRaw / mget<E>): request-order
+ *     preservation, nil holes, empty input (no I/O), binary-safety (BEVE bytes
+ *     survive the raw round-trip), typed JSON deserialization;
+ *   - PgRepo::findManyRaw (WHERE pk = ANY($1));
+ *   - RedisRepo::findManyRaw (MGET L2 → L3 fallback + detached fill);
+ *   - LocalRepo::findMany (guarded MultiView<E>), composite and partition keys.
  *
  * SECTION tags:
  *   [mget]            — RedisCache MGET primitive
- *   [findmany]        — public/raw findMany surface (later étapes)
+ *   [findmany]        — public/raw findMany surface
  *   [composite-key]   — multi-column matching
  *   [partition-key]   — cross-partition ANY
  */
@@ -122,7 +123,7 @@ TEST_CASE("mget<E> deserializes present JSON slots", "[findmany][mget]") {
 }
 
 // ---------------------------------------------------------------------------
-// Étape 2 — PgRepo::findManyRaw via WHERE pk = ANY($1)
+// PgRepo::findManyRaw via WHERE pk = ANY($1)
 // findManyRaw is internal (like findRaw); reached through TestInternals on
 // Uncached* repos (no L1/L2 — exercises the pure L3 ANY path).
 // ---------------------------------------------------------------------------
@@ -275,7 +276,7 @@ TEST_CASE("findManyRaw partition key: cross-partition ANY", "[findmany][partitio
 }
 
 // ---------------------------------------------------------------------------
-// Étape 3 — RedisRepo::findManyRaw : MGET L2 → fallback L3 (ANY) + fill détaché
+// RedisRepo::findManyRaw : MGET L2 → fallback L3 (ANY) + fill détaché
 // L2* repos (config Redis). Negative ids never collide with serial DB rows, so
 // an L2-only entry under a negative key proves the MGET path (no DB row to fall
 // back to). makeRedisKey is public on the repo; setInCache via TestInternals.
@@ -381,7 +382,7 @@ TEST_CASE("findManyRaw composite key over L2 (miss→L3→warm)", "[findmany][l2
 }
 
 // ---------------------------------------------------------------------------
-// Étape 4 — LocalRepo::findMany : public guarded MultiView<E>
+// LocalRepo::findMany : public guarded MultiView<E>
 // L1-bearing repos (Local / Both). Hot path = zero-copy under one batch guard;
 // miss path = MGET (L2) + ANY (L3) through the lower tiers, force-insert L1.
 // findMany is public (inherited up the chain) — called directly on the repo.
