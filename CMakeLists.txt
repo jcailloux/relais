@@ -298,6 +298,7 @@ if(RELAIS_BUILD_TESTS)
     relais_add_test(test_relais_gen_list_nin    tests/relais/test_gen_list_nin.cpp         DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;list;nin;generator")
     relais_add_test(test_relais_gen_list_is_null tests/relais/test_gen_list_is_null.cpp    DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;list;is_null;generator")
     relais_add_test(test_relais_decl_list_is_null tests/relais/test_decl_list_is_null.cpp  DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;redis;list;is_null" RESOURCE_LOCK)
+    relais_add_test(test_relais_list_null_match tests/relais/test_list_null_match.cpp DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;redis;list;null" RESOURCE_LOCK)
     relais_add_compile_fail_test(compile_fail_is_null_non_optional
         tests/compile_fail/is_null_non_optional.cpp
         "IS_NULL filter requires a std::optional member")

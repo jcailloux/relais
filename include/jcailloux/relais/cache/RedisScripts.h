@@ -384,11 +384,11 @@ local function fmatch(bin, blob)
         elseif gx == 0 then
             if ex == 1 then ep = skip(blob, ep, ft) end
         elseif ex == 0 then
-            -- shared cursor advance: skipset for both set ops, skip otherwise.
-            -- IN and NIN cannot diverge on alignment (mitigates risk #1).
-            if is_set then gp = skipset(bin, gp, ft) else gp = skip(bin, gp, ft) end
-            -- null entity matches neither EQ nor IN nor NOT IN (SQL 3-valued logic)
-            if fo == 61 or is_set then return false end
+            -- A NULL column satisfies no comparison and no membership, except
+            -- NOT IN an empty set: SQL `NULL <> ALL('{}')` is TRUE. That set is
+            -- its count alone.
+            if fo ~= 35 or u32(bin, gp) ~= 0 then return false end
+            gp = gp + 4
         elseif is_set then
             local hit = cmpin(bin, gp, blob, ep, ft)        -- entity in the group's set?
             -- IN rejects non-members; NIN rejects members (only NIN-specific line)
