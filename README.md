@@ -233,7 +233,7 @@ Each file owns one subject and reads on its own. Pick by what you're trying to d
 | **Do** a task — caching | [docs/caching.md](docs/caching.md) | `CacheConfig`, presets, `patch`, partition keys. |
 | **Do** a task — decisions under concurrency | [docs/conditional-writes.md](docs/conditional-writes.md) | `patchIf`, `claim`, `patchWhere`: guarded and relative writes (optimistic locking, job queues, reservations). |
 | **Do** a task — invalidation | [docs/invalidation.md](docs/invalidation.md) | The four `Invalidate*` mechanisms, resolvers. |
-| **Do** a task — lists | [docs/lists.md](docs/lists.md) | `filterable`/`sortable`, paginated `query()`, cursors. |
+| **Do** a task — lists | [docs/lists.md](docs/lists.md) | `filterable`/`sortable`, paginated `query()`, cursors, `countWhere`. |
 | **Do** a task — runtime | [docs/runtime.md](docs/runtime.md) | `IoPool`, N-loop scaling, the threading rule. |
 | **Look up** a signature | [docs/api-reference.md](docs/api-reference.md) | The exhaustive public surface — every method, config field, descriptor, list/query type, runtime type, annotation index. Every guide links here. |
 | **Integrate** on an existing loop | [docs/runtime.md](docs/runtime.md) → [docs/foreign-event-loops.md](docs/foreign-event-loops.md) | Co-locate relais on a framework loop (Drogon/asio/…) via an `IoContext` adapter — advanced, optional. |

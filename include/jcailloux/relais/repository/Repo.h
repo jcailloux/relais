@@ -338,7 +338,7 @@ public:
     }
 
     // =======================================================================
-    // Predicate erase / invalidate (where — declared FilterSet required)
+    // Predicate erase / invalidate / count (where — declared FilterSet required)
     // =======================================================================
     //
     // The predicate is the generated named aggregate FilterSet<E>, built with
@@ -425,6 +425,20 @@ public:
         co_await Base::template invalidateManyCritical<false>(
             std::span<const E>(*entities));
         fireInvalidateManyDeferred<false>(std::move(*entities));
+    }
+
+    /// Number of rows matching the predicate; an empty predicate counts the
+    /// table. Always read from L3, never cached: it may differ from a list page
+    /// served from cache. Throws io::PgError like find().
+    template<typename Pred = typename WherePredicate<E>::type>
+    static io::Task<size_t> countWhere(Pred pred)
+        requires HasFilterSet<E>
+              && std::same_as<Pred, typename WherePredicate<E>::type>
+    {
+        using FD = FilterDescriptorFor<E>;
+        list::spec::Filters<FD> filters;
+        filters.values = pred.toFilterTuple();
+        co_return co_await Base::template countWhereRaw<FD>(filters);
     }
 
     // =======================================================================

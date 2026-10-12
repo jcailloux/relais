@@ -223,6 +223,12 @@ public:
         return redis_pipelined_entries_;
     }
 
+    /// PG read statements sent so far, one per distinct read once coalesced
+    /// (for testing/diagnostics).
+    [[nodiscard]] uint64_t pgReadsSent() const noexcept {
+        return pg_reads_sent_;
+    }
+
     // =========================================================================
     // Ordered teardown
     // =========================================================================
@@ -932,6 +938,7 @@ private:
             }
 
             // Pipeline all segments with sync between each
+            pg_reads_sent_ += segments.size();
             for (auto& seg : segments) {
                 if (conn.ensurePreparedPipelined(seg.sql, seg.params.count()))
                     conn.pipelineSync();
@@ -1254,6 +1261,7 @@ private:
         // throw from the estimator updates below, which are intentionally
         // outside the connection scope.
         auto permit = co_await pg_gate_.acquire();
+        ++pg_reads_sent_;
 
         PgResult result;
         auto start = Clock::now();
@@ -1469,9 +1477,11 @@ private:
     // quiescentForTeardown during ordered teardown — no synchronization needed.
     size_t detached_inflight_ = 0;
 
-    // Redis entries sent inside a pipelined batch (fireRedisBatch). Loop-thread
+    // Redis entries sent inside a pipelined batch (fireRedisBatch), and PG read
+    // statements sent (one per direct read, one per batch segment). Loop-thread
     // only, like the latches above.
     uint64_t redis_pipelined_entries_ = 0;
+    uint64_t pg_reads_sent_ = 0;
 
     // Write sequence counter
     uint64_t next_write_seq_ = 0;
