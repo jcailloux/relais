@@ -802,6 +802,20 @@ class MappingGenerator:
             lines.append(
                 f'            "UPDATE {table_name} SET {update_set} '
                 f'WHERE {pk_where}";')
+            # Same UPDATE, returning the row it replaced then the committed
+            # one: the pre-image that list and cross-invalidation need, locked
+            # and exact, in the write's own round-trip. Same parameters. The
+            # SET right-hand sides are parameters only, so the target columns
+            # are not ambiguous with the CTE's.
+            pk_join = " AND ".join(f"t.{col}=o.{col}" for col in pk_cols)
+            o_cols = ", ".join(f"o.{col}" for col in all_cols)
+            t_cols = ", ".join(f"t.{col}" for col in all_cols)
+            lines.append(f"        static constexpr const char* update_returning_changes =")
+            lines.append(
+                f'            "WITH o AS (SELECT {all_cols_str} FROM {table_name} '
+                f'WHERE {pk_where} FOR UPDATE) '
+                f'UPDATE {table_name} AS t SET {update_set} FROM o '
+                f'WHERE {pk_join} RETURNING {o_cols}, {t_cols}";')
 
         # UPSERT: INSERT ... ON CONFLICT (pk) DO UPDATE SET col=EXCLUDED.col.
         # Only for caller-assigned PKs (PK not db_managed) with at least one

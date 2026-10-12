@@ -454,12 +454,13 @@ public:
         co_return co_await upsertWithContext(entity, old ? &*old : nullptr);
     }
 
-    /// Update entity and invalidate list caches.
+    /// Update entity and invalidate list caches from the row before and after,
+    /// which the UPDATE returns: no read before the write.
     static io::Task<std::optional<size_t>> update(const Key& id, const Entity& entity)
         requires MutableEntity<Entity> && HasFullUpdate<Entity> && (!Base::config.read_only)
     {
-        std::optional<Entity> old = co_await findOldBestEffort(id);
-        co_return co_await updateWithContext(id, entity, old ? &*old : nullptr);
+        auto outcome = co_await updateOutcome<true>(id, entity);
+        co_return outcome.affected;
     }
 
     /// Erase entity and invalidate list caches from the deleted row, which the
@@ -474,18 +475,30 @@ public:
     /// Partial update, then list invalidation (only if committed) from the row
     /// before and after, both returned by the write itself: the row leaves the
     /// pages of its old position and enters those of its new one. Uncertain:
-    /// neither version is known, the pages are left to l*_ttl (logged).
+    /// the new version is unknown; the old position is invalidated from the
+    /// copy a cache tier kept before its precautionary evict
+    /// (`uncertain_before`, shared with a stacked InvalidationMixin), the new
+    /// one is left to l*_ttl (logged).
     template<bool WithBefore, typename... Updates>
-    static io::Task<typename Base::PatchedRow> patchRow(const Key& id, Updates&&... updates)
+    static io::Task<typename Base::PatchedRow> patchRow(
+        const Key& id, std::optional<Entity>* uncertain_before, Updates&&... updates)
         requires HasFieldUpdate<Entity> && (!Base::config.read_only)
     {
         static_assert(WithBefore, "this cascade reads the row before the write");
+        std::optional<Entity> own_before;
+        if (!uncertain_before) uncertain_before = &own_before;
+
         typename Base::PatchedRow row;
+        std::exception_ptr timeout;
         try {
-            row = co_await Base::template patchRow<true>(id, std::forward<Updates>(updates)...);
+            row = co_await Base::template patchRow<true>(
+                id, uncertain_before, std::forward<Updates>(updates)...);
         } catch (const io::PgUncertainError&) {
-            logUncertainPatch("patch");
-            throw;
+            timeout = std::current_exception();
+        }
+        if (timeout) {
+            co_await invalidateListsUncertainPatch(*uncertain_before, "patch");
+            std::rethrow_exception(timeout);
         }
         co_await invalidateListsPatched(row);
         co_return row;
@@ -495,17 +508,25 @@ public:
     /// refused guard changed nothing: the pages stay valid.
     template<bool WithBefore, typename... Gs, typename... Updates>
     static io::Task<std::optional<typename Base::PatchedRow>> patchIfRow(
-        const Key& id, const entity::Guards<Gs...>& guard, Updates&&... updates)
+        const Key& id, std::optional<Entity>* uncertain_before,
+        const entity::Guards<Gs...>& guard, Updates&&... updates)
         requires HasFieldUpdate<Entity> && (!Base::config.read_only)
     {
         static_assert(WithBefore, "this cascade reads the row before the write");
+        std::optional<Entity> own_before;
+        if (!uncertain_before) uncertain_before = &own_before;
+
         std::optional<typename Base::PatchedRow> row;
+        std::exception_ptr timeout;
         try {
             row = co_await Base::template patchIfRow<true>(
-                id, guard, std::forward<Updates>(updates)...);
+                id, uncertain_before, guard, std::forward<Updates>(updates)...);
         } catch (const io::PgUncertainError&) {
-            logUncertainPatch("patchIf");
-            throw;
+            timeout = std::current_exception();
+        }
+        if (timeout) {
+            co_await invalidateListsUncertainPatch(*uncertain_before, "patchIf");
+            std::rethrow_exception(timeout);
         }
         if (row) co_await invalidateListsPatched(*row);
         co_return row;
@@ -702,30 +723,42 @@ protected:
         co_return std::nullopt;
     }
 
-    static io::Task<std::optional<size_t>> updateWithContext(
-        const Key& id, const Entity& entity, const Entity* old_entity)
+    /// Update, then list invalidation from the row before and after (the row
+    /// leaves the pages of its old position and enters those of its new one).
+    /// Uncertain: the UPDATE returned nothing; the old position is keyed on the
+    /// copy a cache tier kept before its precautionary evict
+    /// (`uncertain_before`, shared with a stacked InvalidationMixin), the new
+    /// one on the input entity. Without a copy (row not in L1), the old
+    /// position is left to l*_ttl.
+    template<bool WithBefore>
+    static io::Task<typename Base::UpdateOutcome> updateOutcome(
+        const Key& id, const Entity& entity,
+        std::optional<Entity>* uncertain_before = nullptr)
         requires MutableEntity<Entity> && HasFullUpdate<Entity> && (!Base::config.read_only)
     {
+        static_assert(WithBefore, "this cascade reads the row before the write");
+        std::optional<Entity> own_before;
+        if (!uncertain_before) uncertain_before = &own_before;
+
         // co_await is illegal in a catch handler: capture the uncertain timeout,
         // run the precautionary list invalidation after the try, then rethrow.
-        std::optional<size_t> affected;
+        typename Base::UpdateOutcome outcome;
         std::exception_ptr timeout;
         try {
-            affected = co_await Base::update(id, entity);
+            outcome = co_await Base::template updateOutcome<true>(id, entity, uncertain_before);
         } catch (const io::PgUncertainError&) {
             timeout = std::current_exception();
         }
         if (timeout) {
-            // Uncertain: invalidate the list pages touched by both old and new
-            // positions by precaution (new = the input `entity`, fully known).
             // L1 tracker bump cannot fail; the L2 selective EVAL is best-effort.
+            const auto& before = *uncertain_before;
             if constexpr (kHasL1) {
-                if (old_entity) listCache().onEntityUpdated(*old_entity, entity);
+                if (before) listCache().onEntityUpdated(*before, entity);
                 else listCache().onEntityCreated(entity);
             }
             if constexpr (kHasL2) {
                 try {
-                    co_await invalidateL2Updated(old_entity ? *old_entity : entity, entity);
+                    co_await invalidateL2Updated(before ? *before : entity, entity);
                 } catch (const std::exception& e) {
                     RELAIS_LOG_ERROR << name()
                         << ": L2 list precautionary invalidate failed (update timeout) - "
@@ -734,22 +767,24 @@ protected:
             }
             std::rethrow_exception(timeout);
         }
-        if (affected.value_or(0) > 0) {
+        if (outcome.affected.value_or(0) > 0) {
+            // The committed row, not the input, is the new position: the
+            // database may have changed the row as it wrote it (trigger,
+            // generated column, rounding). The input stands in only if the
+            // returned rows did not decode.
+            const Entity& after = outcome.after ? *outcome.after : entity;
             if constexpr (kHasL1) {
-                if (old_entity) {
-                    listCache().onEntityUpdated(*old_entity, entity);
-                } else {
-                    listCache().onEntityCreated(entity);
-                }
+                if (outcome.before) listCache().onEntityUpdated(*outcome.before, after);
+                else listCache().onEntityCreated(after);
             }
             // The L1 tracker bump is RAM-only; the L2 selective EVAL is best-effort
             // by construction (RedisCache swallows its own I/O failure → no-op), so
             // a Redis outage here cannot throw past this success path. No try needed.
             if constexpr (kHasL2) {
-                co_await invalidateL2Updated(old_entity ? *old_entity : entity, entity);
+                co_await invalidateL2Updated(outcome.before ? *outcome.before : after, after);
             }
         }
-        co_return affected;
+        co_return outcome;
     }
 
     /// Erase, then list invalidation from the deleted row (the pages it lived
@@ -804,9 +839,25 @@ protected:
         if constexpr (kHasL2) { co_await invalidateL2Updated(*row.before, after); }
     }
 
-    static void logUncertainPatch(const char* op) {
+    /// List invalidation of an uncertain patch: the row may have left the
+    /// pages of `before` (a cache tier's copy, if it had one) for a position
+    /// that cannot be known. Those pages are invalidated as for a deletion;
+    /// the new position is left to l*_ttl (logged). Best-effort.
+    static io::Task<void> invalidateListsUncertainPatch(
+        const std::optional<Entity>& before, const char* op) {
         RELAIS_LOG_ERROR << name() << ": " << op
-            << " timeout — row versions unknowable, list pages left to l*_ttl";
+            << " timeout — new row version unknowable, its list pages left to l*_ttl";
+        if (!before) co_return;
+        if constexpr (kHasL1) { listCache().onEntityDeleted(*before); }
+        if constexpr (kHasL2) {
+            try {
+                co_await invalidateL2Deleted(*before);
+            } catch (const std::exception& e) {
+                RELAIS_LOG_ERROR << name()
+                    << ": L2 list precautionary invalidate failed (" << op
+                    << " timeout) - " << e.what();
+            }
+        }
     }
 
     static io::Task<cache::CacheView<Entity>> upsertWithContext(

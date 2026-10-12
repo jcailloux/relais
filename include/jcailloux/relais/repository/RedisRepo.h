@@ -130,21 +130,26 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
         }
 
     protected:
-        using WriteOutcome = typename Base::WriteOutcome;
+        using UpdateOutcome = typename Base::UpdateOutcome;
         using EraseOutcome = typename Base::EraseOutcome;
 
-        /// Update returning full outcome. Skips L2 ops when coalesced.
-        static io::Task<WriteOutcome> updateOutcome(const Key& id, const E& entity)
+        /// Update returning full outcome (WithBefore, uncertain_before: see
+        /// PgRepo::updateOutcome). Skips L2 ops when coalesced.
+        template<bool WithBefore = false>
+        static io::Task<UpdateOutcome> updateOutcome(
+            const Key& id, const E& entity,
+            std::optional<E>* uncertain_before = nullptr)
             requires MutableEntity<E> && HasFullUpdate<E> && (!Cfg.read_only)
         {
             using enum config::UpdateStrategy;
 
             // co_await is illegal in a catch handler: capture the uncertain
             // outcome (timeout or lost connection), evict L2 after the try.
-            WriteOutcome outcome;
+            UpdateOutcome outcome;
             std::exception_ptr timeout;
             try {
-                outcome = co_await Base::updateOutcome(id, entity);
+                outcome = co_await Base::template updateOutcome<WithBefore>(
+                    id, entity, uncertain_before);
             } catch (const io::PgUncertainError&) {
                 timeout = std::current_exception();
             }
@@ -781,8 +786,11 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
         }
 
         /// Partial update as the tiers above see it (see PgRepo::PatchedRow).
+        /// L2 keeps no copy for `uncertain_before` (see PgRepo::eraseOutcome).
         template<bool WithBefore, typename... Updates>
-        static io::Task<typename Base::PatchedRow> patchRow(const Key& id, Updates&&... updates)
+        static io::Task<typename Base::PatchedRow> patchRow(
+            const Key& id, [[maybe_unused]] std::optional<E>* uncertain_before,
+            Updates&&... updates)
             requires HasFieldUpdate<E> && (!Cfg.read_only)
         {
             auto patched = co_await patchRaw<WithBefore>(id, std::forward<Updates>(updates)...);
@@ -794,7 +802,8 @@ class RedisRepo : public PgRepo<E, Name, Cfg, Key> {
         /// Guarded partial update as the tiers above see it. nullopt on DB error.
         template<bool WithBefore, typename... Gs, typename... Updates>
         static io::Task<std::optional<typename Base::PatchedRow>> patchIfRow(
-            const Key& id, const entity::Guards<Gs...>& guard, Updates&&... updates)
+            const Key& id, [[maybe_unused]] std::optional<E>* uncertain_before,
+            const entity::Guards<Gs...>& guard, Updates&&... updates)
             requires HasFieldUpdate<E> && (!Cfg.read_only)
         {
             auto outcome = co_await patchIfRaw<WithBefore>(

@@ -463,8 +463,8 @@ TEST_CASE("FullCache - cross-invalidation at L1+L2",
         sync(FullCacheInvUserRepo::find(user1Id));
         sync(FullCacheInvUserRepo::find(user2Id));
 
-        // Update purchase to point to user2 (FK change)
-        updateTestPurchaseUserId(created->id, user2Id);
+        // Update purchase to point to user2 (FK change, through the repo: the
+        // old user is the one the UPDATE replaces)
         auto updatedPurchase = makeTestPurchase(user2Id, "Gadget", 30, "pending", created->id);
         sync(FullCachePurchaseRepo::update(created->id, updatedPurchase));
 

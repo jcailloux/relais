@@ -454,7 +454,7 @@ public:
         requires HasFieldUpdate<E> && (!Cfg.read_only)
     {
         auto row = co_await Base::template patchRow<kTailReadsBefore>(
-            id, std::forward<Updates>(updates)...);
+            id, nullptr, std::forward<Updates>(updates)...);
         co_return std::move(row.after);
     }
 
@@ -469,7 +469,7 @@ public:
         requires HasFieldUpdate<E> && (!Cfg.read_only)
     {
         auto row = co_await Base::template patchIfRow<kTailReadsBefore>(
-            id, guard, std::forward<Updates>(updates)...);
+            id, nullptr, guard, std::forward<Updates>(updates)...);
         if (!row) co_return std::nullopt;
         co_return std::move(row->after);
     }

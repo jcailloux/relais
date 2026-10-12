@@ -395,6 +395,27 @@ TEST_CASE("PartitionKey cross-invalidation - Event as source",
         CHECK(user->balance == 750);
     }
 
+    SECTION("[cross-inv] update event keys the old user on the replaced row, not a stale L1 copy") {
+        auto userA = insertTestUser("upd_old_a", "upd_old_a@test.com", 1000);
+        auto userB = insertTestUser("upd_old_b", "upd_old_b@test.com", 1000);
+        auto userC = insertTestUser("upd_old_c", "upd_old_c@test.com", 1000);
+        auto eventId = insertTestEvent("eu", userA, "Event", 1);
+
+        REQUIRE(sync(L1EventSourceRepo::find(eventId)) != nullptr);  // cached copy: user A
+        // Another writer moves the event to user B; the cached copy stays on A.
+        execQueryArgs("UPDATE relais_test_events SET user_id = $1 WHERE id = $2",
+                      userB, eventId);
+        sync(L1EventTargetUserRepo::find(userB));
+        updateTestUserBalance(userB, 640);
+
+        CHECK(sync(L1EventSourceRepo::update(eventId,
+            makeTestEvent("eu", userC, "Moved", 1, eventId))) == std::optional<size_t>{1});
+
+        auto user = sync(L1EventTargetUserRepo::find(userB));
+        REQUIRE(user != nullptr);
+        CHECK(user->balance == 640);
+    }
+
     SECTION("[cross-inv] delete event invalidates user L1 cache") {
         auto userId = insertTestUser("del_user", "del@test.com", 1000);
         auto eventId = insertTestEvent("eu", userId, "To Delete", 1);

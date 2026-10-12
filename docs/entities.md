@@ -260,7 +260,8 @@ works without the extra `list(APPEND ...)`.
 For each entity the generator produces, inside `entity::generated`:
 
 - **`{Class}Mapping`** — `table_name`, `primary_key_column(s)`, a `Col` index
-  enum, a `SQL` struct (`select_by_pk`, `insert`, `update`, `delete_by_pk`,
+  enum, a `SQL` struct (`select_by_pk`, `insert`, `update`,
+  `update_returning_changes`, `delete_by_pk`, `delete_by_pk_returning`,
   `delete_by_pk_batch`, `select_by_pk_batch`, `returning_columns`),
   `fromRow`/`toInsertParams`/`key`, a `RowView` + `rowToJson`/`rowToBeve` for
   zero-copy serialization, `TraitsType` (the `Field` enum + `FieldInfo` for
@@ -295,9 +296,10 @@ column and receive an empty `enum class Field : uint8_t {}`:
 - a `read_only` view.
 
 An entity with no non-key, non-`db_managed` column has no `UPDATE ... SET` to
-generate. For such entities the generator omits `SQL::update`/`toUpdateParams`,
+generate. For such entities the generator omits `SQL::update`,
+`SQL::update_returning_changes` and `toUpdateParams`,
 and the repository gates the full-update path (`update`, `updateOutcome`,
-`updateWithContext`, `updateJson`, `updateBinary`) on the `HasFullUpdate`
+`updateJson`, `updateBinary`) on the `HasFullUpdate`
 concept:
 
 - `update()` (and the rest of the full-update family) is absent from the
