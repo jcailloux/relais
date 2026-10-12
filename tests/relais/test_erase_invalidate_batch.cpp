@@ -3,7 +3,7 @@
  * Common batch invalidation path (invalidateManyImpl) + its deduplicated
  * cross-invalidation core.
  *
- * Étape 4 du plan erase/invalidate batch :
+ * Covers:
  *   - detail::dedupSorted(vector<K>) — pure: set(input), never drops a distinct
  *     key, idempotent on duplicates.
  *   - Invalidate<>::targetKeysForDelete(span) — pure: N source entities → M ≤ N
@@ -15,7 +15,7 @@
  *     op: L1 evict + L2 UNLINK + list tracker + deduplicated cross-inval.
  *
  * SECTION tags:
- *   [dedup]      — pure dedup (no DB, no Redis) — the §1 units
+ *   [dedup]      — pure dedup (no DB, no Redis)
  *   [indirect]   — InvalidateVia batched cross-inval (mock target + counting resolver)
  *   [many]       — invalidateManyImpl over real repos (L1 evict / list tracker)
  */
@@ -39,7 +39,7 @@ using jcailloux::relais::Invalidate;
 using jcailloux::relais::InvalidateVia;
 
 // ---------------------------------------------------------------------------
-// §1 — pure dedup: the dangerous failure mode is dropping a distinct target,
+// Pure dedup: the dangerous failure mode is dropping a distinct target,
 // not keeping a duplicate. Assert set-equality + idempotence, no I/O.
 // ---------------------------------------------------------------------------
 
@@ -129,7 +129,7 @@ TEST_CASE("targetKeysForDelete dedups direct cross-inval keys (N → M)",
 }
 
 // ---------------------------------------------------------------------------
-// §4 — indirect cross-inval batched. N entities → M distinct targets (M < N).
+// Indirect cross-inval batched. N entities → M distinct targets (M < N).
 // Per-source loop (default) and span overload (opt-in) yield the SAME M
 // targets; the overload collapses the resolver to a single call.
 // ---------------------------------------------------------------------------
@@ -199,7 +199,7 @@ TEST_CASE("InvalidateVia batch: empty set is a no-op",
 }
 
 // ---------------------------------------------------------------------------
-// §4 — invalidateManyImpl over real repos: the cascade actually evicts.
+// invalidateManyImpl over real repos: the cascade actually evicts.
 // ---------------------------------------------------------------------------
 
 TEST_CASE("invalidateManyImpl evicts the entity set from L1 + deduped cross-inval",
@@ -257,12 +257,12 @@ TEST_CASE("invalidateManyImpl bumps the list tracker per affected entity",
 }
 
 // ===========================================================================
-// Étape 5 — public batch API: eraseMany(span<Key>) / invalidateMany(span<Key>)
+// Public batch API: eraseMany(span<Key>) / invalidateMany(span<Key>)
 // over real repos (DB + cache).
-//   §3 — erase vs invalidate distinction (the semantic split)
-//   §2 — metamorphic oracle: batch ≡ a mono sequence (trusted reference)
-//   §5 — edge sets: empty / singleton / duplicates / absent ids
-//   §4 — cross-inval propagated by the public eraseMany
+//   - erase vs invalidate distinction (the semantic split)
+//   - metamorphic oracle: batch ≡ a mono sequence (trusted reference)
+//   - edge sets: empty / singleton / duplicates / absent ids
+//   - cross-inval propagated by the public eraseMany
 // ===========================================================================
 
 namespace {
@@ -275,7 +275,7 @@ bool userExists(int64_t id) {
 
 // Oracle — eraseMany(setA) must reach the SAME observable state as a mono
 // erase loop over a symmetric setB: identical affected count, every id gone
-// from find() AND from L3. The mono path is the trusted reference (§2).
+// from find() AND from L3. The mono path is the trusted reference.
 template<typename Repo>
 void eraseManyMatchesMonoLoop() {
     int64_t a1 = insertTestUser("om_a1", "om_a1@x", 1);
@@ -341,7 +341,7 @@ void invalidateManyMatchesMonoLoop() {
 }  // namespace
 
 // ---------------------------------------------------------------------------
-// §3 — the erase/invalidate distinction (the public contract split)
+// The erase/invalidate distinction (the public contract split)
 // ---------------------------------------------------------------------------
 
 TEST_CASE("eraseMany removes from L3; invalidateMany evicts cache but keeps L3",
@@ -386,7 +386,7 @@ TEST_CASE("eraseMany removes from L3; invalidateMany evicts cache but keeps L3",
 }
 
 // ---------------------------------------------------------------------------
-// §2 — metamorphic oracle across every cache config
+// Metamorphic oracle across every cache config
 // ---------------------------------------------------------------------------
 
 TEST_CASE("eraseMany ≡ mono erase loop (Uncached/L1/L2/Both)",
@@ -408,7 +408,7 @@ TEST_CASE("invalidateMany ≡ mono invalidate loop (Uncached/L1/L2/Both)",
 }
 
 // ---------------------------------------------------------------------------
-// §5 — edge sets
+// Edge sets
 // ---------------------------------------------------------------------------
 
 TEST_CASE("eraseMany edge sets: empty / singleton / duplicates / absent ids",
@@ -482,7 +482,7 @@ TEST_CASE("invalidateMany edge sets: empty no-op, duplicates evict once",
 }
 
 // ---------------------------------------------------------------------------
-// §4 — cross-invalidation propagated by the public eraseMany
+// Cross-invalidation propagated by the public eraseMany
 // ---------------------------------------------------------------------------
 
 TEST_CASE("eraseMany propagates deduplicated cross-inval to the target repo",
@@ -514,10 +514,10 @@ TEST_CASE("eraseMany propagates deduplicated cross-inval to the target repo",
 }
 
 // ===========================================================================
-// Étape 6 — public eraseWhere / invalidateWhere (predicate, HasFilterSet)
+// Public eraseWhere / invalidateWhere (predicate, HasFilterSet)
 // ===========================================================================
 
-// §1 — concept availability (compile-time). The decorrelation: a filters-only
+// Concept availability (compile-time). The decorrelation: a filters-only
 // entity exposes a FilterSet (→ where-variants) WITHOUT a ListDescriptor (so
 // ListMixin stays out of its chain); a list entity's ListDescriptor inherits
 // its FilterSet, so it satisfies both.
@@ -563,7 +563,7 @@ int64_t articleCountByAuthor(int64_t author) {
 
 }  // namespace
 
-// §5 — selectivity: the predicate deletes exactly its matched rows from L3,
+// Selectivity: the predicate deletes exactly its matched rows from L3,
 // returns their count, leaves the rest. Designated-init names the param.
 TEST_CASE("eraseWhere deletes exactly the predicate's rows from L3",
           "[public][where][integration][db]") {
@@ -583,7 +583,7 @@ TEST_CASE("eraseWhere deletes exactly the predicate's rows from L3",
     REQUIRE(articleCountByAuthor(other) == 2);  // untouched
 }
 
-// §2 — oracle: eraseWhere(P) ≡ eraseMany(SELECT pk WHERE P). Two symmetric
+// Oracle: eraseWhere(P) ≡ eraseMany(SELECT pk WHERE P). Two symmetric
 // author sets; the predicate path and the resolved-id path must agree on count
 // and final state.
 TEST_CASE("eraseWhere ≡ eraseMany over the resolved id set",
@@ -607,7 +607,7 @@ TEST_CASE("eraseWhere ≡ eraseMany over the resolved id set",
     REQUIRE(articleCount() == 0);  // both authors' rows gone
 }
 
-// §3 — invalidateWhere evicts the cache for the matched rows but leaves L3
+// invalidateWhere evicts the cache for the matched rows but leaves L3
 // intact (the rows still exist → a later find refetches fresh). Proven by the
 // staleness trick: warm, mutate L3 directly, invalidate, observe the fresh value.
 TEST_CASE("invalidateWhere evicts cache by predicate, keeps L3",
@@ -634,7 +634,7 @@ TEST_CASE("invalidateWhere evicts cache by predicate, keeps L3",
     REQUIRE(articleCountByAuthor(author) == 2);  // still in L3
 }
 
-// §2 — oracle: invalidateWhere(P) ≡ invalidateMany(SELECT pk WHERE P). Both
+// Oracle: invalidateWhere(P) ≡ invalidateMany(SELECT pk WHERE P). Both
 // leave L3 intact and evict the matched set; symmetric authors must agree.
 TEST_CASE("invalidateWhere ≡ invalidateMany over the resolved id set",
           "[public][where][oracle][integration][db][redis]") {
@@ -659,7 +659,7 @@ TEST_CASE("invalidateWhere ≡ invalidateMany over the resolved id set",
     REQUIRE(articleCount() == 2);  // neither path deleted
 }
 
-// §5 — empty predicate is an unconditional purge of the table.
+// Empty predicate is an unconditional purge of the table.
 TEST_CASE("eraseWhere with an empty predicate purges every row",
           "[public][where][integration][db]") {
     TransactionGuard tx;

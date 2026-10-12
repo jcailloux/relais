@@ -1,52 +1,44 @@
 /**
  * test_decl_list_not_in.cpp
- * Unit tests for the NOT IN (anti-set) filter operator at the L1 matching layer.
- *
- * Scope (commit 2): the two L1 verdict paths that gained an Op::NIN branch —
- *   - free `matchesFilters<Descriptor>(entity, filters)` (GeneratedTraits.h),
- *     the real L1 invalidation path (ListCache.h:529/536);
- *   - `Filters::matchesFilters(extractTags(entity))` (GeneratedFilters.h),
- *     the FilterTags scalar-tag matching path.
- * Both are tested transport-free (no DB, no Redis): hand-built descriptors with
- * NIN filters and a directly-populated Filters set.
- *
- * Validates the §1 invariant on the L1 tier — "entity scalar ∉ query set" — and
- * the two NOT IN pitfalls:
+ * The NOT IN (anti-set) filter operator on every tier. Invariant: L1, L2 and L3
+ * give the same verdict — "entity scalar ∉ query set" — including on the two
+ * NOT IN pitfalls:
  *   NULL: a null optional member is excluded from IN and from a non-empty
  *        NOT IN (NOT the negation of IN); NOT IN {} holds it, as SQL
  *        `NULL <> ALL('{}')` is TRUE.
- *   §1.2 empty set: NOT IN {} = universe (everything matches), the exact
- *        opposite of IN {} = ∅.
+ *   Empty set: NOT IN {} = universe (everything matches), the exact opposite
+ *        of IN {} = ∅.
  *
- * Commit 3 adds the L3 SQL generation block (§7.3, transport-free): the
- * `buildWhereClause` NIN branch emits `!= ALL($n)` (mirror of IN's `= ANY($n)`)
- * with exactly one array param, preserving the $n numbering invariant — verified
- * against EQ/range combinations and IN+NIN coexistence. Live-DB round-trip and
- * cross-tier dualité land with the cross-tier suite (§7.7).
+ * L1 matching (transport-free, hand-built descriptors with NIN filters and a
+ * directly-populated Filters set): the free `matchesFilters<Descriptor>(entity,
+ * filters)` (GeneratedTraits.h), the real L1 invalidation path, and
+ * `Filters::matchesFilters(extractTags(entity))` (GeneratedFilters.h), the
+ * FilterTags scalar-tag matching path.
  *
- * Commit 4 adds HTTP parsing + canonical key + schema (§7.2, transport-free): the
- * `is_set_op` switch routes NIN through the shared `parseInList`/`groupCacheKey`
- * set path (byte-identical encoding to IN — only the verdict differs), and
- * `filterSchema` emits '#' for NIN. Both parsers (`parseListQuery` and
- * `parseListQueryStrict`) are covered.
+ * L3 SQL generation (transport-free): the `buildWhereClause` NIN branch emits
+ * `!= ALL($n)` (mirror of IN's `= ANY($n)`) with exactly one array param,
+ * preserving the $n numbering — checked against EQ/range combinations and
+ * IN+NIN coexistence.
  *
- * Commit 5 adds the L2 selective-invalidation tests (§7.4 create, §7.5 update),
- * exercising the factored Lua `fmatch` (`is_set` shared cursor advance, NIN's only
- * own line `(fo==35 and hit)`). These require DB+Redis (TransactionGuard). NIN
- * placed first/middle/last proves `skipset` keeps the following filter aligned;
- * IN+NIN coexistence proves both set ops route through `skipset` without cursor
- * collision; the update cases replay middle-alignment against the SECOND duplicated
- * Lua script. NULL and empty-set (§1.1/§1.2) verdicts are checked at the L2 tier.
+ * HTTP parsing, canonical key and schema (transport-free): the `is_set_op`
+ * switch routes NIN through the shared `parseInList`/`groupCacheKey` set path
+ * (byte-identical encoding to IN — only the verdict differs), and `filterSchema`
+ * emits '#' for NIN. Both `parseListQuery` and `parseListQueryStrict` are covered.
  *
- * Commit 6 adds the cross-tier consistency + dualité property suite (§7.7): a
- * deterministic (fixed-seed) sweep of ~25 entities (some with NULL members) ×
- * ~10 varied sets per element type, asserting the §1 invariant. (1) Tri-tier:
- * the NIN verdict from L1 `matchesFilters`, L2 Lua (page deleted ⇔ matched), and
- * L3 PostgreSQL `!= ALL` is identical. (2) Dualité non-null: for a present member
- * `NIN(S,v) == !IN(S,v)`. (3) Rupture sur NULL: for a null member `IN(S,NULL)`
- * is false and `NIN(S,NULL)` holds only for an empty S — the dualité does NOT
- * hold, the single most natural implementer error (`NIN = !IN` everywhere).
- * Requires DB+Redis.
+ * L2 selective invalidation on create and update (DB+Redis, TransactionGuard):
+ * the factored Lua `fmatch` (`is_set` shared cursor advance, NIN's only own line
+ * `(fo==35 and hit)`). NIN placed first/middle/last proves `skipset` keeps the
+ * following filter aligned; IN+NIN coexistence proves both set ops route through
+ * `skipset` without cursor collision; the update cases replay middle-alignment
+ * against the update script. NULL and empty-set verdicts are checked at L2 too.
+ *
+ * Cross-tier property suite (DB+Redis): a fixed-seed sweep of ~25 entities (some
+ * with NULL members) × ~10 varied sets per element type. (1) The NIN verdict from
+ * L1 `matchesFilters`, L2 Lua (page deleted ⇔ matched) and L3 PostgreSQL
+ * `!= ALL` is identical. (2) For a present member `NIN(S,v) == !IN(S,v)`.
+ * (3) For a null member `IN(S,NULL)` is false and `NIN(S,NULL)` holds only for an
+ * empty S — the duality does NOT hold, the most natural implementer error
+ * (`NIN = !IN` everywhere).
  */
 
 #include <catch2/catch_test_macros.hpp>
@@ -237,7 +229,7 @@ TEST_CASE("[DeclListNin] NIN bool anti-membership", "[list][nin][unit]") {
 }
 
 // =============================================================================
-// Singleton ≡ NE ; empty set = universe (§1.2) ; inactive filter
+// Singleton ≡ NE ; empty set = universe ; inactive filter
 // =============================================================================
 
 TEST_CASE("[DeclListNin] singleton set behaves like NE", "[list][nin][unit]") {
@@ -249,7 +241,7 @@ TEST_CASE("[DeclListNin] singleton set behaves like NE", "[list][nin][unit]") {
     CHECK(l1Match<DescNinString>(makeArticle(3, "news", 0), f));        // != tech
 }
 
-TEST_CASE("[DeclListNin] empty set matches everything (NOT IN {} = universe, §1.2)",
+TEST_CASE("[DeclListNin] empty set matches everything (NOT IN {} = universe)",
           "[list][nin][unit]") {
     decl::Filters<DescNinString> f;
     // Programmatic empty set: present-but-empty optional<vector>. The exact
@@ -335,10 +327,10 @@ TEST_CASE("[DeclListNin] IN and NIN coexist on distinct columns", "[list][nin][u
 }
 
 // =============================================================================
-// L3 SQL generation — buildWhereClause NIN branch (§7.3, transport-free).
+// L3 SQL generation — buildWhereClause NIN branch (transport-free).
 // Validates `!= ALL($n)` (mirror of IN's `= ANY($n)`), the single-array-param
 // invariant (NIN contributes exactly one $n like IN), $n numbering with EQ/range,
-// the empty-set literal (`!= ALL('{}')` → universe, §1.2), and IN+NIN coexistence
+// the empty-set literal (`!= ALL('{}')` → universe), and IN+NIN coexistence
 // with two array params. Live-DB round-trip lands with the cross-tier suite.
 // =============================================================================
 
@@ -382,7 +374,7 @@ TEST_CASE("[DeclListNin] SQL: singleton NIN behaves like != x", "[list][nin][uni
     CHECK(paramStr(wc.params.params[0]) == "{tech}");
 }
 
-TEST_CASE("[DeclListNin] SQL: empty set yields != ALL('{}') (universe, §1.2)",
+TEST_CASE("[DeclListNin] SQL: empty set yields != ALL('{}') (universe)",
           "[list][nin][unit][sql]") {
     decl::Filters<DescNinString> f;
     f.get<"category">() = std::vector<std::string>{};  // present-but-empty
@@ -433,7 +425,7 @@ TEST_CASE("[DeclListNin] SQL: IN and NIN coexist — two array params, $n correc
 }
 
 // =============================================================================
-// HTTP parsing + canonical key + schema (§7.2, transport-free). NIN shares the
+// HTTP parsing + canonical key + schema (transport-free). NIN shares the
 // IN set path through `is_set_op`: same `parseInList` (CSV → sort → unique →
 // cap), same `groupCacheKey` byte layout. Only the schema char ('#') is NIN's.
 // We re-test it here because `is_set_op` is a new branch point — a missed
@@ -466,7 +458,7 @@ TEST_CASE("[DeclListNin] parse: invalid int elements dropped", "[list][nin][unit
     CHECK(*q.filters().get<"author_id">() == std::vector<int64_t>{1, 3});
 }
 
-TEST_CASE("[DeclListNin] parse: empty value leaves NIN inactive (≡ NOT IN {} = universe, §1.2)",
+TEST_CASE("[DeclListNin] parse: empty value leaves NIN inactive (≡ NOT IN {} = universe)",
           "[list][nin][unit][parse]") {
     // No valid element → filter inactive. For NIN this is exactly the desired
     // semantics: inactive ≡ unfiltered ≡ NOT IN {} = universe (unlike IN, where
@@ -515,9 +507,9 @@ TEST_CASE("[DeclListNin] parse: HTTP IN and NIN produce the same canonical set",
 }
 
 // =============================================================================
-// Compact filter schema (§4.5) — NIN's operator char is '#' (ASCII 35), free of
+// Compact filter schema — NIN's operator char is '#' (ASCII 35), free of
 // every other op code (=61 !33 >62 G71 <60 L76 @64). Type char is the element
-// type, shared with IN. The schema drives the L2 Lua binary parser (commit 5).
+// type, shared with IN. The schema drives the L2 Lua binary parser.
 // =============================================================================
 
 TEST_CASE("[DeclListNin] schema: NIN operator char is '#'", "[list][nin][unit][parse]") {
@@ -535,7 +527,7 @@ TEST_CASE("[DeclListNin] schema: NIN coexists with scalar and IN ops",
 }
 
 // =============================================================================
-// L2 selective invalidation (§7.4 create, §7.5 update) — the Lua `fmatch` factored
+// L2 selective invalidation on create and update — the Lua `fmatch` factored
 // for IN(@=64)/NIN(#=35). A group's cached page is invalidated iff the created/
 // updated entity WOULD belong to that group's filter. For a NIN filter that means
 // the entity's scalar is NOT in the group's set (verdict inverted from IN).
@@ -732,7 +724,7 @@ TEST_CASE("[DeclListNin][L2] optional-null entity matches only the empty NIN set
         return registerNinGroup<DescNinOptInt32>(q);
     };
     auto gSet   = mk(std::vector<int32_t>{10, 20});
-    auto gEmpty = mk(std::vector<int32_t>{});  // NOT IN {} = universe (§1.2)
+    auto gEmpty = mk(std::vector<int32_t>{});  // NOT IN {} = universe
 
     SECTION("non-null value excluded from set matches NIN; empty set matches all") {
         fireCreate<DescNinOptInt32>(makeArticle(1, "x", 0, 5));
@@ -803,7 +795,7 @@ TEST_CASE("[DeclListNin][L2] alignment — NIN in middle position (update, 2nd L
 }
 
 // =============================================================================
-// Cross-tier consistency + dualité (§7.7) — the §1 invariant under load.
+// Cross-tier consistency + duality — L1, L2 and L3 agree under load.
 //
 // For each (entity, set) the three tiers must agree on the NIN verdict "entity
 // scalar ∉ set": L1 `matchesFilters` (pure C++), L3 PostgreSQL `!= ALL` (the real
@@ -894,7 +886,7 @@ void crossTierNinProperty(const std::vector<Entity>& entities,
             CHECK(ninL1 == ninL2);          // tri-tier: L1 == L2 Lua
             CHECK(ninL1 == ninL3);          // tri-tier: L1 == L3 SQL
             if (fld.has_value())
-                CHECK(ninL1 == !inL1);      // §7.7.2 dualité holds for a present member
+                CHECK(ninL1 == !inL1);      // duality holds for a present member
             else {
                 CHECK(ninL1 == sets[i].empty());  // NIN(NULL) holds for {} only
                 CHECK_FALSE(inL1);                // IN(NULL) == false — negation BREAKS
@@ -904,7 +896,7 @@ void crossTierNinProperty(const std::vector<Entity>& entities,
 }
 
 // Distinct sets (size 0..5) from `pool`, deduped so each group key is unique. The
-// empty set is reachable (NOT IN {} = universe, §1.2).
+// empty set is reachable (NOT IN {} = universe).
 template<typename Elem>
 std::vector<std::vector<Elem>> makeSets(std::mt19937& gen,
                                         const std::vector<Elem>& pool, size_t want) {
@@ -937,7 +929,7 @@ std::vector<Entity> makeEntities(std::mt19937& gen, size_t n) {
     out.reserve(n);
     for (size_t i = 0; i < n; ++i) {
         std::optional<int32_t> vc;
-        if (gen() % 5 != 0)  // ~20% null view_count → exercises the NULL break (§7.7.3)
+        if (gen() % 5 != 0)  // ~20% null view_count → exercises the NULL break
             vc = kViewPool[gen() % kViewPool.size()];
         out.push_back(makeArticle(
             static_cast<int64_t>(i + 1),

@@ -1,6 +1,6 @@
 /**
  * test_gen_list_in.cpp
- * Generator support for the IN filter operator (commit 8, plan §6).
+ * Generator support for the IN filter operator.
  *
  * Proves the Python entity generator emits `Op::IN` from `@relais` annotations,
  * in BOTH forms, and that the generated embedded ListDescriptor is functionally

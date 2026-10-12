@@ -614,7 +614,7 @@ private:
     }
 
     // ----------------------------------------------------------------------
-    // Fire-and-forget deferred cleanup (commit 13). The detached coroutine owns
+    // Fire-and-forget deferred cleanup. The detached coroutine owns
     // the affected set / predicate by value, so the lazy deferred tasks'
     // references stay live for the whole detached lifetime. Exceptions are
     // swallowed (best-effort; staleness is l2_ttl-bounded). Defined here (the

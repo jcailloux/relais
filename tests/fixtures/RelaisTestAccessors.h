@@ -178,7 +178,7 @@ struct TestInternals {
     }
 
     /// Detached counterpart of invalidateManyImpl — the exact production facade
-    /// shape (commit 13): await ONLY the critical pass, then fire the deferred
+    /// shape: await ONLY the critical pass, then fire the deferred
     /// pass (cross-target + L2 list EVALs) fire-and-forget. Lets a benchmark
     /// measure caller time-to-return (critical only) against the drained
     /// invalidateManyImpl (critical + deferred). Takes the same borrowed span as

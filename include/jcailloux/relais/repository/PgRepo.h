@@ -357,7 +357,7 @@ inline constexpr size_t kPgEraseChunk = 10000;
 /// Pure string assembly (no I/O) so the generated form is unit-testable. The
 /// runtime-injected `where_sql` (buildWhereClause output, `$n`-numbered) can't be
 /// a static C-string template — hence assembled here rather than by the Python
-/// generator (cf. plan step 1 deferral). Empty `where_sql` → unconditional purge.
+/// generator. Empty `where_sql` → unconditional purge.
 /// The ctid sub-select + LIMIT is what makes one statement delete at most K rows;
 /// the caller re-runs the same statement until it returns 0 (the predicate keeps
 /// matching the not-yet-deleted remainder).
@@ -807,7 +807,7 @@ protected:
     /// downstream cross-tier invalidation. Returns the entities actually deleted
     /// (absent ids contribute nothing) — size ≤ ids.size(), order is PG's.
     /// Precondition: ids deduplicated upstream. No partition pruning: pk=ANY
-    /// scans all partitions (cf. plan §3); RETURNING still carries the partition
+    /// scans all partitions; RETURNING still carries the partition
     /// column so callers can derive the L1 single-partition evict hint.
     /// nullopt signals a DB error (parité mono erase, whose EraseOutcome.affected
     /// is nullopt on PgError); an empty vector means "no matching row" — the

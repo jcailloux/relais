@@ -1,6 +1,6 @@
 /**
  * test_gen_list_nin.cpp
- * Generator support for the NIN filter operator (plan §8.7, §6).
+ * Generator support for the NIN filter operator.
  *
  * Proves the Python entity generator emits `Op::NIN` from `@relais` annotations,
  * in BOTH forms, and that the generated embedded ListDescriptor is functionally
@@ -127,7 +127,7 @@ TEST_CASE("generator emits a functional NIN descriptor (both forms)", "[list][ni
 }
 
 TEST_CASE("generator NIN empty-set is the universe", "[list][nin][gen]") {
-    // NOT IN {} = everything matches (§1.2). An empty set is the identity for
+    // NOT IN {} = everything matches. An empty set is the identity for
     // anti-membership: SQL `!= ALL('{}')` is TRUE, L1 find on empty -> end().
     decl::Filters<GenDesc> f;
     f.template get<"authors">() = std::vector<int64_t>{};  // authors NOT IN {}

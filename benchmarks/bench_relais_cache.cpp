@@ -1806,7 +1806,7 @@ TEST_CASE("Benchmark - predicate erase / invalidate (where)", "[benchmark][where
 
 // #############################################################################
 //
-//  15. Detached cleanup (commit 13) — caller throughput / time-to-return
+//  15. Detached cleanup — caller throughput / time-to-return
 //
 //  eraseMany/eraseWhere split the batch cleanup into a CRITICAL pass (awaited:
 //  L3 DELETE + L1 evict + L2 entity UNLINK + gen bump + L1 list bump) and a

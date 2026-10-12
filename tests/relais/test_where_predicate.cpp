@@ -1,17 +1,17 @@
 /**
  * test_where_predicate.cpp
- * Étape 7 — predicate list fast-path for eraseWhere: ONE RangeModification (L1)
+ * Predicate list fast-path for eraseWhere: ONE RangeModification (L1)
  * + ONE predicate EVAL (L2) for the whole deleted set, instead of N per-entity
  * blob-array invalidations.
  *
- * §1 (pure, no I/O) — the new primitives:
+ * Pure primitives (no I/O):
  *   - SortBounds::isRangeInRange — range overlap, the range generalization of the
  *     per-entity point check (lo==hi). ASC/DESC × first/incomplete/middle.
  *   - predicateGroupCompatible — never-miss filter pruning: EQ-differ / IN-disjoint
  *     prune, absent constraint is a wildcard.
  *   - predicateSortRange — aligned dimension narrows [lo,hi]; orthogonal stays full.
  *
- * §4 (L1 end-to-end) — duality vs blob-array:
+ * L1 end-to-end — duality vs blob-array:
  *   - eraseWhere drives the fast-path: one range mod, zero per-entity mods.
  *   - never-miss: the purged group's cached list reflects the deletion.
  *   - filter-aware pruning: the orthogonal group's cache survives (stays stale) —
@@ -45,7 +45,7 @@ using jcailloux::relais::list::SortBounds;
 using jcailloux::relais::list::SortDirection;
 
 // ===========================================================================
-// §1 — SortBounds::isRangeInRange (pure). A page covers [first,last] (ASC) or
+// SortBounds::isRangeInRange (pure). A page covers [first,last] (ASC) or
 // [last,first] (DESC); the open first/incomplete ends extend to ±∞. The point
 // check is the degenerate lo==hi case.
 // ===========================================================================
@@ -108,7 +108,7 @@ TEST_CASE("isRangeInRange with the full int64 range always overlaps a valid page
 }
 
 // ===========================================================================
-// §1 — predicateGroupCompatible (pure). Never-miss pruning: prune only when a
+// predicateGroupCompatible (pure). Never-miss pruning: prune only when a
 // shared filter is provably disjoint.
 // ===========================================================================
 
@@ -203,7 +203,7 @@ TEST_CASE("predicateGroupCompatible prunes IN-disjoint groups only",
 }
 
 // ===========================================================================
-// §1 — predicateSortRange (pure). Aligned dimension narrows; orthogonal stays full.
+// predicateSortRange (pure). Aligned dimension narrows; orthogonal stays full.
 // ===========================================================================
 
 TEST_CASE("predicateSortRange narrows the aligned sort dimension", "[where][unit][range]") {
@@ -228,7 +228,7 @@ TEST_CASE("predicateSortRange leaves an unconstrained dimension full", "[where][
 }
 
 // ===========================================================================
-// §4 — L1 end-to-end: the fast-path shape and the duality vs blob-array.
+// L1 end-to-end: the fast-path shape and the duality vs blob-array.
 // TestArticleListRepo is an L1 list repo; eraseWhere routes its own-list tier
 // through the predicate fast-path.
 // ===========================================================================
