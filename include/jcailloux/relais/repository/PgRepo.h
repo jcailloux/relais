@@ -868,6 +868,9 @@ protected:
         std::vector<E> out;
         try {
             auto where = list::spec::buildWhereClause<Descriptor>(filters);
+            // Not interned: this DELETE runs on the read path, which coalesces
+            // identical statements in flight by pointer. Interned, two identical
+            // erases would share one DELETE and each report its rows.
             const std::string sql = detail::buildDeleteWhereSql(
                 Mapping::table_name, Mapping::SQL::returning_columns,
                 where.sql, detail::kPgEraseChunk);
@@ -912,6 +915,8 @@ protected:
         // Read path: a successful query (even empty) returns the matched set;
         // any L3 error propagates (no swallow-to-nullopt), so invalidateWhere
         // surfaces a resolve failure instead of silently evicting nothing.
+        // The text depends only on which filters are set: interned, it is one
+        // prepared statement per shape and identical selects in flight coalesce.
         auto where = list::spec::buildWhereClause<Descriptor>(filters);
         std::string sql;
         sql.reserve(128);
@@ -924,7 +929,8 @@ protected:
             sql += where.sql;
         }
 
-        auto result = co_await PgProvider::queryParams(sql.c_str(), where.params);
+        auto result = co_await PgProvider::queryParams(
+            detail::internSql(std::move(sql)), where.params);
         std::vector<E> out;
         out.reserve(static_cast<size_t>(result.rows()));
         for (int r = 0; r < result.rows(); ++r) {
