@@ -317,6 +317,8 @@ std::string runTrials(const std::string& label, int n_trials,
 }
 
 std::string formatAccessStats(const std::string& label, const AccessStats& s) {
+    csv(label, "ops_s", s.opsPerSec());
+    csv(label, "hit_pct", s.hitRate());
     auto bar = std::string(55, '-');
     std::ostringstream out;
     out << "\n  " << bar
