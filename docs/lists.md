@@ -13,7 +13,7 @@ Paginated query results, cached in the tiers of the repo's preset with the same
 **Auto-activated** when the entity's Mapping carries an embedded `ListDescriptor`
 (detected by the `HasListDescriptor` concept). The generator emits a
 `ListDescriptor` only when the entity has **at least one `sortable` field**;
-`filterable` alone gives you `eraseWhere`/`invalidateWhere` (see
+`filterable` alone gives you `eraseWhere`/`invalidateWhere`/`countWhere` (see
 [Behavior & gotchas](#behavior--gotchas)) but no cached list.
 
 > **Prerequisite:** [concepts.md](concepts.md) and [entities.md](entities.md).
@@ -356,7 +356,7 @@ never coincides with the declaration site and is a footgun.
   yields a `FilterSet` but no `ListDescriptor`, so `HasListDescriptor` fails and
   `ListMixin` is never activated. Cursor pagination needs a deterministic order —
   so `filterable` alone won't give you a cached list (it still powers
-  `eraseWhere`/`invalidateWhere`).
+  `eraseWhere`/`invalidateWhere`/`countWhere`).
 - **Composite keys are supported.** The keyset cursor spans every primary-key
   column, so an entity with a composite key (including an all-PK junction) can
   carry a `@relais_list`.
@@ -431,6 +431,24 @@ unconditionally.
 matching rows (`SELECT … WHERE pred`, so its entity tier is O(rows)) and evicts
 only the entity caches; the rows still exist, so cached list pages stay valid
 (the oracle `invalidateWhere(P) ≡ invalidateMany(ids resolved by P)`).
+
+## Count
+
+`countWhere(pred)` returns the number of matching rows, with the same predicate as
+`eraseWhere`. An empty predicate counts the table.
+
+```cpp
+size_t n = co_await CommentRepo::countWhere({.post_id = id});
+```
+
+- **Read from PostgreSQL on every call, never cached.** It reads its own writes at
+  once, but may differ from a page `query()` serves from cache (another instance's
+  L1 page lives until `l1_ttl`). Don't compare a count with a page's size.
+- **Not a quota check.** Another request can insert between the count and your
+  `INSERT`. Enforce a quota in the database (a constraint, or
+  `INSERT … SELECT … WHERE (SELECT count(*) …) < N`).
+- **"At least N rows?"** Use `query()` with `limit(N + 1)` instead: it is served by
+  the list cache.
 
 ## List methods
 

@@ -23,6 +23,7 @@
 #include <tuple>
 
 #include "fixtures/TestRepositories.h"
+#include "fixtures/generated/TestFilterOnlyEntity.h"
 
 using namespace relais_test;
 
@@ -343,6 +344,13 @@ namespace jre = jcailloux::relais::entity;
 using BothTestArticleRepo = Repo<TestArticleEntity, "test:article:parity:both", cfg::Both>;
 using L2TestAssignedKeyRepo = Repo<TestAssignedKeyEntity, "test:akey:parity:l2", cfg::Redis>;
 
+// Filters without a list: the where-variants without ListMixin.
+using FilterOnlyEntity = entity::generated::TestFilterOnlyEntity;
+using UncachedFilterOnlyRepo = Repo<FilterOnlyEntity, "test:filter_only:parity:uncached">;
+using L1FilterOnlyRepo = Repo<FilterOnlyEntity, "test:filter_only:parity:l1", cfg::Local>;
+using L2FilterOnlyRepo = Repo<FilterOnlyEntity, "test:filter_only:parity:l2", cfg::Redis>;
+using BothFilterOnlyRepo = Repo<FilterOnlyEntity, "test:filter_only:parity:both", cfg::Both>;
+
 /// Arguments for the field-update methods: one field written, guarded and
 /// ordered on.
 template<auto F, typename V>
@@ -359,6 +367,11 @@ template<> struct ApiArgs<TestArticleEntity>
     : FieldArgs<TestArticleEntity::Field::author_id, int64_t> {};
 template<> struct ApiArgs<TestAssignedKeyEntity>
     : FieldArgs<TestAssignedKeyEntity::Field::payload, int64_t> {};
+template<> struct ApiArgs<FilterOnlyEntity>
+    : FieldArgs<FilterOnlyEntity::Field::owner_id, int64_t> {};
+
+template<typename R, typename P>
+concept CanEraseWhere = requires(P p) { R::eraseWhere(p); };
 
 /// One method's return type, tagged with the method name for diagnostics.
 template<cfg::FixedString Name, typename T>
@@ -424,7 +437,8 @@ auto apiSignatures(const K& key, const E& ent, std::span<const K> ids) {
             using P = typename E::MappingType::FilterSet::Values;
             return std::tuple<
                 Sig<"eraseWhere", decltype(R::eraseWhere(P{}))>,
-                Sig<"invalidateWhere", decltype(R::invalidateWhere(P{}))>>{};
+                Sig<"invalidateWhere", decltype(R::invalidateWhere(P{}))>,
+                Sig<"countWhere", decltype(R::countWhere(P{}))>>{};
         }
         else return std::tuple<>{};
     }();
@@ -515,6 +529,7 @@ jr::io::Task<void> exerciseApi() {
         using P = typename E::MappingType::FilterSet::Values;
         (void)co_await R::eraseWhere(P{});
         co_await R::invalidateWhere(P{});
+        (void)co_await R::countWhere(P{});
     }
     if constexpr (jr::HasListDescriptor<E>) {
         const auto q = R::queryBuilder().limit(10).build();
@@ -543,7 +558,9 @@ TEMPLATE_TEST_CASE("API parity - every documented method instantiates",
                    UncachedTestArticleRepo, L1TestArticleRepo, L2TestArticleRepo,
                    parity::BothTestArticleRepo,
                    UncachedTestAssignedKeyRepo, L1TestAssignedKeyRepo,
-                   parity::L2TestAssignedKeyRepo, FullCacheTestAssignedKeyRepo) {
+                   parity::L2TestAssignedKeyRepo, FullCacheTestAssignedKeyRepo,
+                   parity::UncachedFilterOnlyRepo, parity::L1FilterOnlyRepo,
+                   parity::L2FilterOnlyRepo, parity::BothFilterOnlyRepo) {
     auto exercise = &parity::exerciseApi<TestType>;
     STATIC_REQUIRE(std::is_same_v<decltype(exercise), jcailloux::relais::io::Task<void> (*)()>);
     (void)exercise;
@@ -562,4 +579,18 @@ TEST_CASE("API parity - identical signatures across presets", "[repository][comp
         STATIC_REQUIRE(parity::kSameApi<UncachedTestAssignedKeyRepo,
             L1TestAssignedKeyRepo, parity::L2TestAssignedKeyRepo, FullCacheTestAssignedKeyRepo>);
     }
+    SECTION("entity with filters and no list") {
+        STATIC_REQUIRE(parity::kSameApi<parity::UncachedFilterOnlyRepo,
+            parity::L1FilterOnlyRepo, parity::L2FilterOnlyRepo, parity::BothFilterOnlyRepo>);
+    }
+}
+
+TEST_CASE("countWhere - a read, available on a read-only repo",
+          "[repository][compile][where]") {
+    using R = Repo<parity::FilterOnlyEntity, "test:filter_only:read_only",
+                   test_config::ReadOnlyUncached>;
+    using P = parity::FilterOnlyEntity::MappingType::FilterSet::Values;
+    STATIC_REQUIRE(std::is_same_v<decltype(R::countWhere(P{})),
+                                  jcailloux::relais::io::Task<size_t>>);
+    STATIC_REQUIRE_FALSE(parity::CanEraseWhere<R, P>);
 }

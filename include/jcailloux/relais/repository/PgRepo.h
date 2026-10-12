@@ -7,6 +7,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -381,6 +382,32 @@ inline std::string buildDeleteWhereSql(
     sql += ") RETURNING ";
     sql += returning_columns;
     return sql;
+}
+
+/// Build the predicate count: SELECT count(*) FROM <t> [WHERE <pred>]. Empty
+/// `where_sql` counts the whole table.
+inline std::string buildCountWhereSql(std::string_view table_name,
+                                      std::string_view where_sql)
+{
+    std::string sql;
+    sql.reserve(64 + where_sql.size());
+    sql += "SELECT count(*) FROM ";
+    sql += table_name;
+    if (!where_sql.empty()) {
+        sql += " WHERE ";
+        sql += where_sql;
+    }
+    return sql;
+}
+
+/// Stable per-thread pointer for a SQL text built at runtime. The batch
+/// scheduler coalesces identical reads and keys its timing estimates by
+/// statement pointer, so a statement assembled per call must resolve to one
+/// pointer per distinct text. Only for texts drawn from a bounded set (one per
+/// predicate shape): entries are never released.
+inline const char* internSql(std::string sql) {
+    thread_local std::unordered_set<std::string> texts;
+    return texts.insert(std::move(sql)).first->c_str();
 }
 
 }  // namespace detail
@@ -905,6 +932,20 @@ protected:
                 out.push_back(std::move(*e));
         }
         co_return out;
+    }
+
+    /// Predicate count: SELECT count(*) FROM t WHERE pred. A read: any L3 error
+    /// propagates. The text depends only on which filters are set, so it is
+    /// interned and two identical counts in flight share one query.
+    template<typename Descriptor>
+        requires list::spec::ValidFilterSet<Descriptor>
+    static io::Task<size_t> countWhereRaw(const list::spec::Filters<Descriptor>& filters)
+    {
+        auto where = list::spec::buildWhereClause<Descriptor>(filters);
+        const char* sql = detail::internSql(
+            detail::buildCountWhereSql(Mapping::table_name, where.sql));
+        auto result = co_await PgProvider::queryParams(sql, where.params);
+        co_return static_cast<size_t>(result[0].template get<int64_t>(0));
     }
 
     /// Insert entity in database, returning entity by value.

@@ -276,7 +276,7 @@ For each entity the generator produces, inside `entity::generated`:
 - **Partition-key entities** — `SQL::delete_with_partition` +
   `makePartitionHintParams()`.
 - **Filterable entities (≥1 `filterable`)** — an embedded `FilterSet` (with a
-  nested `Values`) driving `eraseWhere`/`invalidateWhere`, independent of any
+  nested `Values`) driving `eraseWhere`/`invalidateWhere`/`countWhere`, independent of any
   `ListDescriptor`.
 - **List entities (≥1 `sortable`)** — an embedded `ListDescriptor` (auto-detected
   by ListMixin) and a `{Class}ListWrapper` alias. `@relais_list limits=` *alone*
