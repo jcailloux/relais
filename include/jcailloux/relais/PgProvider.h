@@ -106,8 +106,17 @@ public:
         const char* sql, const io::PgParams& params,
         const io::batch::WriteMode mode = io::batch::WriteMode::Idempotent)
     {
+        return queryWrite(sql, params, mode, io::batch::kOrdered);
+    }
+
+    /// queryWrite naming the row the write targets (internal: the repositories
+    /// know it, raw SQL does not). See io::batch::WriteAffinity.
+    static io::Task<io::batch::PgWriteResult> queryWrite(
+        const char* sql, const io::PgParams& params,
+        const io::batch::WriteMode mode, const io::batch::WriteAffinity affinity)
+    {
         if (!pg_write_) throw std::logic_error("PgProvider::queryWrite() called before init() on this thread (providers are thread_local — init() must run on each loop thread)");
-        return pg_write_(sql, params, mode);
+        return pg_write_(sql, params, mode, affinity);
     }
 
     /// Execute a parameterized SQL query with inline args.
@@ -268,8 +277,9 @@ public:
         // Return-direct: submitPgWrite already returns Task<io::batch::PgWriteResult>,
         // so no co_await/co_return wrapper — zero added coroutine frame on the write path.
         pg_write_ = [batcher](const char* sql, const io::PgParams& params,
-                              io::batch::WriteMode mode) {
-            return batcher->submitPgWrite(sql, io::PgParams{params}, mode);
+                              io::batch::WriteMode mode,
+                              io::batch::WriteAffinity affinity) {
+            return batcher->submitPgWrite(sql, io::PgParams{params}, mode, affinity);
         };
 
         if (with_redis) {
@@ -314,7 +324,8 @@ public:
     using PgEntityQueryManyFn = std::function<io::Task<io::PgResult>(
         const char*, const char*, std::vector<io::PgParams>)>;
     using PgWriteFn = std::function<io::Task<io::batch::PgWriteResult>(
-        const char*, const io::PgParams&, io::batch::WriteMode)>;
+        const char*, const io::PgParams&, io::batch::WriteMode,
+        io::batch::WriteAffinity)>;
     using RedisExecFn = std::function<io::Task<io::RedisResult>(
         std::vector<std::string>&&)>;
     using SelfHealEnqueueFn = std::function<void(

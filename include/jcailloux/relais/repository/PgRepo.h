@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "jcailloux/relais/io/Task.h"
+#include "jcailloux/relais/io/batch/WriteAffinity.h"
 #include "jcailloux/relais/io/pg/PgError.h"
 #include "jcailloux/relais/io/pg/PgParams.h"
 #include "jcailloux/relais/io/pg/PgResult.h"
@@ -828,6 +829,7 @@ protected:
             // update of the same PK in the same flow lands in seq order. The
             // returned PgWriteResult carries the RETURNING rows; coalesced is
             // irrelevant — upper layers invalidate from the returned entities.
+            // Several rows: ordered with everything around it (default).
             auto w = co_await PgProvider::queryWrite(
                 Mapping::SQL::delete_by_pk_batch, arrayParams);
 
@@ -964,7 +966,8 @@ protected:
             // the same PK. coalesced ignored — two inserts with identical params
             // yield distinct PKs, so coalescing is effectively unreachable.
             auto w = co_await PgProvider::queryWrite(
-                Mapping::SQL::insert, params);
+                Mapping::SQL::insert, params, io::batch::WriteMode::Idempotent,
+                insertAffinity());
             if (w.result.empty()) co_return std::nullopt;
             co_return E::fromRow(w.result[0]);
         } catch (const io::PgUncertainError&) {
@@ -989,7 +992,8 @@ protected:
         try {
             auto params = E::toInsertParams(entity);
             auto w = co_await PgProvider::queryWrite(
-                Mapping::SQL::upsert, params);
+                Mapping::SQL::upsert, params, io::batch::WriteMode::Idempotent,
+                insertAffinity());
             if (w.result.empty()) co_return std::nullopt;
             co_return E::fromRow(w.result[0]);
         } catch (const io::PgUncertainError&) {
@@ -1031,6 +1035,23 @@ protected:
         } else {
             params.push(id);
         }
+    }
+
+    /// The row whose key starts at parameter `first`, for the write scheduler
+    /// (see WriteAffinity).
+    static constexpr io::batch::WriteAffinity keyAt(size_t first) noexcept {
+        constexpr uint16_t kTable = io::batch::tableTag(Mapping::table_name);
+        return io::batch::rowAt(kTable, first, io::PgParams::keyParamCount<Key>());
+    }
+
+    /// The row an insert or upsert targets: its key, bound first, when the
+    /// caller supplies it; none other can be targeted when the database
+    /// assigns it. A mapping that does not say keeps the write ordered.
+    static constexpr io::batch::WriteAffinity insertAffinity() noexcept {
+        if constexpr (requires { { Mapping::insert_assigns_pk } -> std::convertible_to<bool>; })
+            return Mapping::insert_assigns_pk ? keyAt(0) : io::batch::kFree;
+        else
+            return io::batch::kOrdered;
     }
 
     /// One row of a conditional write returning `Rows`, if it decodes.
@@ -1130,13 +1151,15 @@ protected:
 
             auto params = setParams(io::PgParams::keyParamCount<Key>(),
                                     std::forward<Updates>(updates)...);
+            const auto affinity = keyAt(params.params.size());
             pushKey(params, id);
 
             // Write path (seq-ordered): keeps patch in seq with update/erase of
             // the same PK. An absolute patch is idempotent, so a coalesced
             // follower observes the same change; a relative one is Exclusive and
             // always runs on its own.
-            auto w = co_await PgProvider::queryWrite(sql.c_str(), params, mode);
+            auto w = co_await PgProvider::queryWrite(
+                sql.c_str(), params, mode, affinity);
             co_return decodePatched<WithBefore>(w.result);
         } catch (const io::PgUncertainError&) {
             // Uncertain: the UPDATE may have committed. Propagate; the cache
@@ -1173,13 +1196,14 @@ protected:
             auto params = setParams(
                 io::PgParams::keyParamCount<Key>() + detail::GuardSql<Traits, Guard>::params,
                 std::forward<Updates>(updates)...);
+            const auto affinity = keyAt(params.params.size());
             pushKey(params, id);
             detail::GuardSql<Traits, Guard>::bind(params, guard);
 
             // The guard is a decision the database takes on each execution: two
             // identical guarded writes must both be evaluated, never coalesced.
             auto w = co_await PgProvider::queryWrite(
-                sql.c_str(), params, io::batch::WriteMode::Exclusive);
+                sql.c_str(), params, io::batch::WriteMode::Exclusive, affinity);
             co_return GuardedPatchOutcome{decodePatched<WithBefore>(w.result)};
         } catch (const io::PgUncertainError&) {
             // Uncertain: the UPDATE may have committed. Propagate; the cache
@@ -1248,7 +1272,8 @@ protected:
             detail::GuardSql<Traits, Pred>::bind(params, pred);
 
             // The predicate is re-evaluated by the database on each execution:
-            // two identical writes must both run, never coalesced.
+            // two identical writes must both run, never coalesced. The rows it
+            // changes are unknown until it runs: ordered (default affinity).
             auto w = co_await PgProvider::queryWrite(
                 sql.c_str(), params, io::batch::WriteMode::Exclusive);
             co_return decodeRows<Rows>(w.result);
@@ -1299,6 +1324,8 @@ protected:
                 detail::OrderBySql<Traits, Order>::bind(params, *order);
 
             // Two identical claims must take distinct rows: never coalesced.
+            // The rows taken are unknown until it runs: ordered (default
+            // affinity).
             auto w = co_await PgProvider::queryWrite(
                 sql.c_str(), params, io::batch::WriteMode::Exclusive);
 
@@ -1380,7 +1407,8 @@ protected:
             for (auto& p : fieldParams.params)
                 params.params.push_back(std::move(p));
 
-            auto [result, coalesced] = co_await PgProvider::queryWrite(kSql, params);
+            auto [result, coalesced] = co_await PgProvider::queryWrite(
+                kSql, params, io::batch::WriteMode::Idempotent, keyAt(0));
             UpdateOutcome outcome{
                 static_cast<size_t>(result.affectedRows()), coalesced,
                 std::nullopt, std::nullopt};
@@ -1428,14 +1456,18 @@ protected:
                         ? Mapping::SQL::delete_with_partition_returning
                         : Mapping::SQL::delete_with_partition;
                     auto params = Mapping::makePartitionHintParams(*hint);
-                    w = co_await PgProvider::queryWrite(kWithPartition, params);
+                    w = co_await PgProvider::queryWrite(
+                        kWithPartition, params, io::batch::WriteMode::Idempotent,
+                        keyAt(0));
                 } else {
                     auto params = io::PgParams::fromKey(id);
-                    w = co_await PgProvider::queryWrite(kByPk, params);
+                    w = co_await PgProvider::queryWrite(
+                        kByPk, params, io::batch::WriteMode::Idempotent, keyAt(0));
                 }
             } else {
                 auto params = io::PgParams::fromKey(id);
-                w = co_await PgProvider::queryWrite(kByPk, params);
+                w = co_await PgProvider::queryWrite(
+                    kByPk, params, io::batch::WriteMode::Idempotent, keyAt(0));
             }
             EraseOutcome outcome{
                 static_cast<size_t>(w.result.affectedRows()), w.coalesced, std::nullopt};
