@@ -66,10 +66,10 @@ struct WriteRecorder {
     }
     ~WriteRecorder() { jr::PgProvider::reset(); }
 
-    /// Run `task` to completion and return the one write it submitted.
+    /// Run `task` to completion and return the one write it submitted (a
+    /// provider call may submit before the task is awaited).
     template<typename Awaitable>
     Write only(Awaitable task) {
-        writes.clear();
         bool done = false;
         [](Awaitable t, bool& d) -> jr::io::DetachedTask {
             co_await std::move(t);
@@ -77,7 +77,9 @@ struct WriteRecorder {
         }(std::move(task), done);
         REQUIRE(done);
         REQUIRE(writes.size() == 1);
-        return writes.front();
+        auto w = std::move(writes.front());
+        writes.clear();
+        return w;
     }
 };
 
