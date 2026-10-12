@@ -132,6 +132,13 @@ coroutines. Two coroutines writing the same key with no `co_await` between them
 race — their relative order is undefined, and no I/O layer can resolve that
 meaningfully (it is a business-logic race). Order dependent writes with `co_await`.
 
+Reads keep read-your-writes too. A read identical to one already sent on the loop
+(same statement, same parameters) takes that read's result instead of sending its
+own, but only if no write has completed on the loop since that read was sent. A read
+issued after an awaited write therefore always sees it. Writes made outside the loop
+(another process) are not tracked: a shared result can predate them by at most the
+round-trip of the read in flight.
+
 ### Exception: `eraseWhereRaw` is not seq-ordered
 
 `eraseWhereRaw` (the predicate `DELETE … WHERE <cond>` behind `eraseWhere`) does
