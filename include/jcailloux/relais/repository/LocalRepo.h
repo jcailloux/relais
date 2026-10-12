@@ -228,35 +228,18 @@ public:
     static io::Task<std::optional<size_t>> update(const Key& id, const E& entity)
         requires MutableEntity<E> && HasFullUpdate<E> && (!Cfg.read_only)
     {
-        using enum config::UpdateStrategy;
-
-        try {
-            auto outcome = co_await Base::updateOutcome(id, entity);
-            if (outcome.affected.value_or(0) > 0 && !outcome.coalesced) {
-                if constexpr (Cfg.update_strategy == InvalidateAndLazyReload) {
-                    evict(id);
-                } else {
-                    tier().onMutation(id);
-                    bumpGeneration(id);
-                    tier().store(id, E(entity), buildMetadata());
-                }
-            }
-            co_return outcome.affected;
-        } catch (const io::PgUncertainError&) {
-            // Uncertain: the UPDATE may have committed. Evict L1 by precaution so
-            // the next read re-fetches; the L1 evict is local and cannot fail.
-            // RedisRepo already evicted L2 before this unwound (L2-before-L1).
-            evict(id);
-            throw;
-        }
+        auto outcome = co_await updateOutcome(id, entity);
+        co_return outcome.affected;
     }
 
     /// Partial update as the tiers above see it (WithBefore: see
     /// PgRepo::patchRaw). L1 is left as is until the commit, as for update:
     /// the committed row is then stored through (see settlePatched). Uncertain:
-    /// evict L1 by precaution (L2 was already evicted as RedisRepo unwound).
+    /// keep the L1 copy in `uncertain_before` (see eraseOutcome), then evict L1
+    /// by precaution (L2 was already evicted as RedisRepo unwound).
     template<bool WithBefore, typename... Updates>
-    static io::Task<typename Base::PatchedRow> patchRow(const Key& id, Updates&&... updates)
+    static io::Task<typename Base::PatchedRow> patchRow(
+        const Key& id, std::optional<E>* uncertain_before, Updates&&... updates)
         requires HasFieldUpdate<E> && (!Cfg.read_only)
     {
         try {
@@ -265,6 +248,7 @@ public:
             if (!patched) co_return typename Base::PatchedRow{};
             co_return settlePatched(id, std::move(*patched));
         } catch (const io::PgUncertainError&) {
+            keepUncertainBefore(id, uncertain_before);
             evict(id);
             throw;
         }
@@ -275,7 +259,8 @@ public:
     /// guard wrote nothing: L1 keeps its entry.
     template<bool WithBefore, typename... Gs, typename... Updates>
     static io::Task<std::optional<typename Base::PatchedRow>> patchIfRow(
-        const Key& id, const entity::Guards<Gs...>& guard, Updates&&... updates)
+        const Key& id, std::optional<E>* uncertain_before,
+        const entity::Guards<Gs...>& guard, Updates&&... updates)
         requires HasFieldUpdate<E> && (!Cfg.read_only)
     {
         try {
@@ -285,6 +270,7 @@ public:
             if (!outcome.patched) co_return typename Base::PatchedRow{};
             co_return settlePatched(id, std::move(*outcome.patched));
         } catch (const io::PgUncertainError&) {
+            keepUncertainBefore(id, uncertain_before);
             evict(id);
             throw;
         }
@@ -329,6 +315,40 @@ protected:
         } catch (const io::PgUncertainError&) {
             // Uncertain: the DELETE may have committed. Evict L1 by precaution
             // (local, cannot fail). L2 was already evicted as this unwound.
+            keepUncertainBefore(id, uncertain_before);
+            evict(id);
+            throw;
+        }
+    }
+
+    /// Update returning full outcome (WithBefore: see PgRepo::updateOutcome).
+    /// On an uncertain outcome, the L1 entry is kept in `uncertain_before`
+    /// before the precautionary evict, as for eraseOutcome.
+    template<bool WithBefore = false>
+    static io::Task<typename Base::UpdateOutcome> updateOutcome(
+        const Key& id, const E& entity,
+        std::optional<E>* uncertain_before = nullptr)
+        requires MutableEntity<E> && HasFullUpdate<E> && (!Cfg.read_only)
+    {
+        using enum config::UpdateStrategy;
+
+        try {
+            auto outcome = co_await Base::template updateOutcome<WithBefore>(
+                id, entity, uncertain_before);
+            if (outcome.affected.value_or(0) > 0 && !outcome.coalesced) {
+                if constexpr (Cfg.update_strategy == InvalidateAndLazyReload) {
+                    evict(id);
+                } else {
+                    tier().onMutation(id);
+                    bumpGeneration(id);
+                    tier().store(id, E(entity), buildMetadata());
+                }
+            }
+            co_return outcome;
+        } catch (const io::PgUncertainError&) {
+            // Uncertain: the UPDATE may have committed. Evict L1 by precaution so
+            // the next read re-fetches; the L1 evict is local and cannot fail.
+            // RedisRepo already evicted L2 before this unwound (L2-before-L1).
             keepUncertainBefore(id, uncertain_before);
             evict(id);
             throw;

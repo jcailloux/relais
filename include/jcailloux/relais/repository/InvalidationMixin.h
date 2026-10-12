@@ -137,49 +137,46 @@ public:
         co_return result;
     }
 
-    /// Update entity and propagate cross-invalidation with old/new data.
-    /// When Base is ListMixin, reuses the pre-fetched old entity via WithContext
-    /// to avoid a redundant L1 lookup.
+    /// Update entity and propagate cross-invalidation from the row before and
+    /// after, which the UPDATE returns (through ListMixin when present, which
+    /// invalidates the lists from the same rows). Uncertain: keyed on the copy
+    /// a cache tier kept before its precautionary evict (unknown without one)
+    /// and on the input entity.
     static io::Task<std::optional<size_t>> update(const Key& id, const Entity& entity)
         requires MutableEntity<Entity> && HasFullUpdate<Entity> && (!Base::config.read_only)
     {
-        std::optional<Entity> old = co_await findOldBestEffort(id);
-
-        std::optional<size_t> affected;
+        std::optional<Entity> uncertain_before;
+        typename Base::UpdateOutcome outcome;
         std::exception_ptr timeout;
         try {
-            if constexpr (detail::HasListMixin<Base>) {
-                affected = co_await Base::updateWithContext(id, entity, old ? &*old : nullptr);
-            } else {
-                affected = co_await Base::update(id, entity);
-            }
+            outcome = co_await Base::template updateOutcome<true>(id, entity, &uncertain_before);
         } catch (const io::PgUncertainError&) {
             timeout = std::current_exception();
         }
         if (timeout) {
-            // Uncertain: cross-invalidate by precaution, keyed on old (lost ⇒
-            // null) and the input new. Best-effort. The list/entity tiers already
-            // evicted themselves as the exception unwound through the inner layers.
+            // Best-effort: the uncertain exception must still surface. The
+            // list/entity tiers already evicted themselves as it unwound.
             try {
                 co_await propagateUpdate<Entity, InvList>(
-                    old ? &*old : nullptr, entity);
+                    uncertain_before ? &*uncertain_before : nullptr, entity);
             } catch (const std::exception& e) {
                 RELAIS_LOG_ERROR << name()
                     << ": cross-invalidation failed (update timeout) - " << e.what();
             }
             std::rethrow_exception(timeout);
         }
-        if (affected.value_or(0) > 0) {
+        if (outcome.affected.value_or(0) > 0) {
             // Best-effort: a committed write never fails on cross-invalidation.
             try {
                 co_await propagateUpdate<Entity, InvList>(
-                    old ? &*old : nullptr, entity);
+                    outcome.before ? &*outcome.before : nullptr,
+                    outcome.after ? *outcome.after : entity);
             } catch (const std::exception& e) {
                 RELAIS_LOG_ERROR << name()
                     << ": cross-invalidation failed (update committed) - " << e.what();
             }
         }
-        co_return affected;
+        co_return outcome.affected;
     }
 
     /// Erase entity and propagate cross-invalidation from the deleted row, which
@@ -223,19 +220,30 @@ public:
     }
 
     /// Partial update with cross-invalidation (only if committed), keyed on the
-    /// row before and after, both returned by the write itself. Uncertain:
-    /// neither version is known, the targets are left to l*_ttl (logged).
+    /// row before and after, both returned by the write itself. Uncertain: the
+    /// new version is unknown; the targets of the old one are invalidated from
+    /// the copy a cache tier kept before its precautionary evict, the others
+    /// are left to l*_ttl (logged).
     template<bool WithBefore, typename... Updates>
-    static io::Task<typename Base::PatchedRow> patchRow(const Key& id, Updates&&... updates)
+    static io::Task<typename Base::PatchedRow> patchRow(
+        const Key& id, std::optional<Entity>* uncertain_before, Updates&&... updates)
         requires HasFieldUpdate<Entity> && (!Base::config.read_only)
     {
         static_assert(WithBefore, "this cascade reads the row before the write");
+        std::optional<Entity> own_before;
+        if (!uncertain_before) uncertain_before = &own_before;
+
         typename Base::PatchedRow row;
+        std::exception_ptr timeout;
         try {
-            row = co_await Base::template patchRow<true>(id, std::forward<Updates>(updates)...);
+            row = co_await Base::template patchRow<true>(
+                id, uncertain_before, std::forward<Updates>(updates)...);
         } catch (const io::PgUncertainError&) {
-            logUncertainPatch("patch");
-            throw;
+            timeout = std::current_exception();
+        }
+        if (timeout) {
+            co_await propagateUncertainPatch(*uncertain_before, "patch");
+            std::rethrow_exception(timeout);
         }
         co_await propagatePatched(row, "patch");
         co_return row;
@@ -245,17 +253,25 @@ public:
     /// refused guard changed nothing: no target to invalidate.
     template<bool WithBefore, typename... Gs, typename... Updates>
     static io::Task<std::optional<typename Base::PatchedRow>> patchIfRow(
-        const Key& id, const entity::Guards<Gs...>& guard, Updates&&... updates)
+        const Key& id, std::optional<Entity>* uncertain_before,
+        const entity::Guards<Gs...>& guard, Updates&&... updates)
         requires HasFieldUpdate<Entity> && (!Base::config.read_only)
     {
         static_assert(WithBefore, "this cascade reads the row before the write");
+        std::optional<Entity> own_before;
+        if (!uncertain_before) uncertain_before = &own_before;
+
         std::optional<typename Base::PatchedRow> row;
+        std::exception_ptr timeout;
         try {
             row = co_await Base::template patchIfRow<true>(
-                id, guard, std::forward<Updates>(updates)...);
+                id, uncertain_before, guard, std::forward<Updates>(updates)...);
         } catch (const io::PgUncertainError&) {
-            logUncertainPatch("patchIf");
-            throw;
+            timeout = std::current_exception();
+        }
+        if (timeout) {
+            co_await propagateUncertainPatch(*uncertain_before, "patchIf");
+            std::rethrow_exception(timeout);
         }
         if (row) co_await propagatePatched(*row, "patchIf");
         co_return row;
@@ -291,10 +307,22 @@ protected:
         }
     }
 
-    static void logUncertainPatch(const char* op) {
+    /// Cross-invalidation of an uncertain patch: the targets of `before` (a
+    /// cache tier's copy, if it had one) are invalidated as for a deletion;
+    /// those of the unknowable new version are left to l*_ttl (logged).
+    /// Best-effort: the uncertain exception must still surface.
+    static io::Task<void> propagateUncertainPatch(
+        const std::optional<Entity>& before, const char* op) {
         RELAIS_LOG_ERROR << name() << ": " << op
-            << " timeout — row versions unknowable, cross-invalidation targets "
-               "left to l*_ttl";
+            << " timeout — new row version unknowable, its cross-invalidation "
+               "targets left to l*_ttl";
+        if (!before) co_return;
+        try {
+            co_await propagateDelete<Entity, InvList>(*before);
+        } catch (const std::exception& e) {
+            RELAIS_LOG_ERROR << name() << ": cross-invalidation failed (" << op
+                << " timeout) - " << e.what();
+        }
     }
 
     /// Best-effort pre-read for cross-invalidation context. The read path no

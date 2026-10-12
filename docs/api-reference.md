@@ -85,7 +85,7 @@ Available only when `!Cfg.read_only`. Each write flows down the full chain: L3 c
 | Method | Returns | Constraints | Notes |
 |---|---|---|---|
 | `insert(const E& e)` | `Task<CacheView<E>>` | `MutableEntity<E> && !Cfg.read_only` | Empty view on error. Populates L1+L2; notifies lists. |
-| `update(const Key&, const E&)` | `Task<std::optional<size_t>>` | `MutableEntity<E> && HasFullUpdate<E> && !Cfg.read_only` | Rows affected (`0` = not found), `nullopt` = DB error. Strategy via `Cfg.update_strategy`: `InvalidateAndLazyReload` (evict) vs optimistic write-through. |
+| `update(const Key&, const E&)` | `Task<std::optional<size_t>>` | `MutableEntity<E> && HasFullUpdate<E> && !Cfg.read_only` | Rows affected (`0` = not found), `nullopt` = DB error. Strategy via `Cfg.update_strategy`: `InvalidateAndLazyReload` (evict) vs optimistic write-through. With lists or cross-invalidation the statement also returns the prior and committed rows, so both versions are invalidated without a pre-read. |
 | `updateJson(const Key&, std::string_view)` | `Task<std::optional<size_t>>` | `MutableEntity<E> && HasFullUpdate<E> && !Cfg.read_only` | Parses JSON → `update`. `nullopt` on parse failure or DB error. |
 | `updateBinary(const Key&, std::span<const uint8_t>)` | `Task<std::optional<size_t>>` | `… && HasBinarySerialization<E> && !Cfg.read_only` | Parses BEVE → `update`. `nullopt` on parse failure or DB error. |
 | `patch(const Key&, Updates&&...)` | `Task<CacheView<E>>` | `HasFieldUpdate<E> && !Cfg.read_only` | Variadic field updates ([factories](#partial-updates)), ≥1 required, in one statement. Empty view if absent or on DB error. Stores the committed row through L1 and invalidates L2 after the commit; with lists or cross-invalidation the statement also returns the prior row, so both versions are invalidated without a pre-read. |
@@ -448,9 +448,9 @@ concept HasInvalidates = requires { typename T::Invalidates; };
 `InvalidationMixin<Base, Invalidations...>` aliases the pack as `InvList = InvalidateOn<Invalidations...>` and re-exports it as `using Invalidates = InvList;` (this is what `HasInvalidates` keys on). It sits at the top of the chain (`InvalidationMixin → [ListMixin] → LocalRepo → [RedisRepo] → PgRepo`) and hides `insert`/`update`/`erase`/`patch`/`invalidate`: each calls `Base::method()` down the chain, and on success awaits the matching free helper — `propagateCreate<E, InvList>` / `propagateUpdate<E, InvList>` / `propagateDelete<E, InvList>` (free function templates in `jcailloux::relais`, not mixin members), which forward to `InvList::propagateWithData` / `propagateDeleteMany`. The layer is only assembled when the pack is non-empty.
 
 <details>
-<summary>Update reuses the pre-fetched old entity; batch split critical vs deferred</summary>
+<summary>Writes read nothing first; batch split critical vs deferred</summary>
 
-`update` fetches the old entity once (`Base::find(id)`) and, when `Base` is a `ListMixin` (detected via the `HasListMixin` concept = `typename T::ListDescriptorType`), passes it down through `updateWithContext` to avoid a redundant L1 lookup — then feeds the same snapshot into `propagateUpdate`. `erase` and `patch` read nothing first: the statement returns the row it replaced or deleted, and that row feeds both the list tier and `propagateDelete`/`propagateUpdate`.
+`update`, `erase` and `patch` read nothing first: the statement returns the row it replaced or deleted (`update` and `patch` also the committed one), and those rows feed both the list tier and `propagateUpdate`/`propagateDelete`. On an uncertain write nothing comes back: the cascades are keyed on the copy L1 held of the row, when it held one, and `update` keys the new version on its input. `upsert` keeps a best-effort pre-read: an absent row cannot be locked, so the statement cannot tell create from update.
 
 Batch delete is split into two protected passes:
 - `invalidateManyCritical<WithLists>` — own entity tier + L1 list tracker, awaited before the facade returns (the entity UNLINK must precede the return).

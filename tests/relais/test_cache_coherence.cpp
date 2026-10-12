@@ -1288,3 +1288,200 @@ TEST_CASE("erase with lists: an uncertain erase with no cached copy only throws"
     env.releasePg();
     CHECK_FALSE(articleExists(env, id));
 }
+
+// =============================================================================
+// Update of an entity with lists — the UPDATE locks the row in a CTE and
+// returns it before and after: the pages of both positions are keyed on the
+// versions PostgreSQL replaced and committed, with no read before the write. An
+// uncertain update returns nothing: the old position is then keyed on the copy
+// L1 still holds, the new one on the input. A patch already returned both
+// versions; an uncertain one now invalidates the old position from that copy.
+// =============================================================================
+
+namespace {
+
+TestArticleEntity articleIn(int64_t id, const std::string& category) {
+    TestArticleEntity e;
+    e.id = id;
+    e.category = category;
+    e.author_id = 1;
+    e.title = "update";
+    e.view_count = 0;  // NOT NULL in the table
+    return e;
+}
+
+std::string articleCategory(CohEnv& env, int64_t id) {
+    return env.probe.query(
+        "SELECT category FROM relais_test_articles WHERE id=" + std::to_string(id)).get(0, 0);
+}
+
+auto setCategory(const std::string& category) {
+    return jcailloux::relais::entity::set<TestArticleEntity::Field::category>(category);
+}
+
+template<typename ListRepo>
+void updateReadsNothingFirst(CohEnv& env, bool cached_entity) {
+    resetArticleCaches<ListRepo>(env);
+    auto id = seedArticle(env, "coh-upd-a");
+    auto other = seedArticle(env, "coh-upd-a");
+    if (cached_entity) REQUIRE(driveBounded(env.io, ListRepo::find(id)));
+    REQUIRE(pageHolds<ListRepo>(env, "coh-upd-a", id));
+    REQUIRE_FALSE(pageHolds<ListRepo>(env, "coh-upd-b", id));
+
+    auto reads = env.batcher->pgReadsSent();
+    CHECK(driveBounded(env.io, ListRepo::update(id, articleIn(id, "coh-upd-b")))
+          == std::optional<size_t>{1});
+    CHECK(env.batcher->pgReadsSent() == reads);
+
+    CHECK_FALSE(pageHolds<ListRepo>(env, "coh-upd-a", id));
+    CHECK(pageHolds<ListRepo>(env, "coh-upd-a", other));
+    CHECK(pageHolds<ListRepo>(env, "coh-upd-b", id));
+}
+
+template<typename ListRepo>
+void updateKeysOnReplacedRow(CohEnv& env) {
+    resetArticleCaches<ListRepo>(env);
+    auto id = seedArticle(env, "coh-upd-pre-a");
+    REQUIRE(driveBounded(env.io, ListRepo::find(id)));  // cached copy in category a
+    // Another writer moves the row to category b; the cached copy stays in a.
+    env.probe.query("UPDATE relais_test_articles SET category='coh-upd-pre-b' WHERE id="
+                    + std::to_string(id));
+    REQUIRE(pageHolds<ListRepo>(env, "coh-upd-pre-b", id));
+
+    REQUIRE(driveBounded(env.io, ListRepo::update(id, articleIn(id, "coh-upd-pre-c")))
+            == std::optional<size_t>{1});
+    CHECK_FALSE(pageHolds<ListRepo>(env, "coh-upd-pre-b", id));
+    CHECK(pageHolds<ListRepo>(env, "coh-upd-pre-c", id));
+}
+
+template<typename ListRepo>
+void uncertainUpdateKeysOnL1Copy(CohEnv& env) {
+    resetArticleCaches<ListRepo>(env);
+    // Prepare the UPDATE once, so the held update waits only on its result.
+    auto warm = seedArticle(env, "coh-upd-unc-warm");
+    driveBounded(env.io, ListRepo::update(warm, articleIn(warm, "coh-upd-unc-warm")));
+    auto id = seedArticle(env, "coh-upd-unc-a");
+    REQUIRE(driveBounded(env.io, ListRepo::find(id)));
+    REQUIRE(pageHolds<ListRepo>(env, "coh-upd-unc-a", id));
+    REQUIRE_FALSE(pageHolds<ListRepo>(env, "coh-upd-unc-b", id));
+
+    env.holdPg();
+    REQUIRE_THROWS_AS(driveBounded(env.io, ListRepo::update(id, articleIn(id, "coh-upd-unc-b"))),
+                      io::PgQueryTimeout);
+    REQUIRE(articleCategory(env, id) == "coh-upd-unc-b");  // the UPDATE committed
+    env.releasePg();
+
+    CHECK_FALSE(pageHolds<ListRepo>(env, "coh-upd-unc-a", id));
+    CHECK(pageHolds<ListRepo>(env, "coh-upd-unc-b", id));
+}
+
+template<typename ListRepo>
+void uncertainPatchKeysOnL1Copy(CohEnv& env) {
+    resetArticleCaches<ListRepo>(env);
+    // Prepare the patch statement once, so the held one waits only on its result.
+    driveBounded(env.io, ListRepo::patch(seedArticle(env, "coh-pat-unc-warm"),
+                                         setCategory("coh-pat-unc-warm")));
+    auto id = seedArticle(env, "coh-pat-unc-a");
+    REQUIRE(driveBounded(env.io, ListRepo::find(id)));
+    REQUIRE(pageHolds<ListRepo>(env, "coh-pat-unc-a", id));
+
+    env.holdPg();
+    REQUIRE_THROWS_AS(driveBounded(env.io, ListRepo::patch(id, setCategory("coh-pat-unc-b"))),
+                      io::PgQueryTimeout);
+    REQUIRE(articleCategory(env, id) == "coh-pat-unc-b");  // the UPDATE committed
+    env.releasePg();
+
+    CHECK_FALSE(pageHolds<ListRepo>(env, "coh-pat-unc-a", id));
+}
+
+io::Task<std::vector<std::optional<size_t>>> updateTwice(int64_t id, TestArticleEntity e) {
+    std::vector<io::Task<std::optional<size_t>>> tasks;
+    tasks.push_back(CohArticleL1::update(id, e));
+    tasks.push_back(CohArticleL1::update(id, e));
+    co_return co_await io::whenAll(std::move(tasks));
+}
+
+}  // namespace
+
+TEST_CASE("update with lists: no read before the UPDATE, both positions invalidated",
+          "[coherence][list][update][integration]") {
+    CohEnv env(1s, /*with_redis=*/true, 200ms);
+    SECTION("Uncached")    { updateReadsNothingFirst<CohArticlePg>(env, false); }
+    SECTION("Local, miss") { updateReadsNothingFirst<CohArticleL1>(env, false); }
+    SECTION("Local, hit")  { updateReadsNothingFirst<CohArticleL1>(env, true); }
+    SECTION("Redis")       { updateReadsNothingFirst<CohArticleRedis>(env, false); }
+    SECTION("Both")        { updateReadsNothingFirst<CohArticleBoth>(env, false); }
+}
+
+TEST_CASE("update with lists: old position keyed on the replaced row, not a stale cached copy",
+          "[coherence][list][update][integration]") {
+    CohEnv env(1s, /*with_redis=*/true, 200ms);
+    SECTION("Local") { updateKeysOnReplacedRow<CohArticleL1>(env); }
+    SECTION("Both")  { updateKeysOnReplacedRow<CohArticleBoth>(env); }
+}
+
+TEST_CASE("update with lists: an absent row updates and invalidates nothing",
+          "[coherence][list][update][integration]") {
+    CohEnv env(1s);
+    resetArticleCaches<CohArticleL1>(env);
+    auto id = seedArticle(env, "coh-upd-absent");
+    REQUIRE(pageHolds<CohArticleL1>(env, "coh-upd-absent", id));
+    auto pending = relais_test::TestInternals::pendingModificationCount<CohArticleL1>();
+
+    auto absent = id + 1'000'000;
+    CHECK(driveBounded(env.io, CohArticleL1::update(absent, articleIn(absent, "coh-upd-absent")))
+          == std::optional<size_t>{0});
+    CHECK(relais_test::TestInternals::pendingModificationCount<CohArticleL1>() == pending);
+    CHECK(pageHolds<CohArticleL1>(env, "coh-upd-absent", id));
+}
+
+TEST_CASE("update with lists: identical updates in flight invalidate both positions",
+          "[coherence][list][update][concurrency][integration]") {
+    CohEnv env(1s);
+    resetArticleCaches<CohArticleL1>(env);
+    auto id = seedArticle(env, "coh-upd-twice-a");
+    REQUIRE(pageHolds<CohArticleL1>(env, "coh-upd-twice-a", id));
+    REQUIRE_FALSE(pageHolds<CohArticleL1>(env, "coh-upd-twice-b", id));
+
+    auto results = driveBounded(env.io, updateTwice(id, articleIn(id, "coh-upd-twice-b")));
+    REQUIRE(results.size() == 2);
+    CHECK(results[0] == std::optional<size_t>{1});
+    CHECK(results[1] == std::optional<size_t>{1});
+    CHECK(articleCategory(env, id) == "coh-upd-twice-b");
+    CHECK_FALSE(pageHolds<CohArticleL1>(env, "coh-upd-twice-a", id));
+    CHECK(pageHolds<CohArticleL1>(env, "coh-upd-twice-b", id));
+}
+
+TEST_CASE("update with lists: an uncertain update keys the old position on the L1 copy",
+          "[coherence][list][update][scenarioA][integration]") {
+    CohEnv env(300ms, /*with_redis=*/true, 200ms);
+    SECTION("Local") { uncertainUpdateKeysOnL1Copy<CohArticleL1>(env); }
+    SECTION("Both")  { uncertainUpdateKeysOnL1Copy<CohArticleBoth>(env); }
+}
+
+TEST_CASE("update with lists: an uncertain update with no cached copy keys the new position",
+          "[coherence][list][update][scenarioA][integration]") {
+    // The old position is unknown and left to its TTL; the new one is the
+    // input. The caller still gets the uncertain error, and nothing else.
+    CohEnv env(300ms, /*with_redis=*/true, 200ms);
+    resetArticleCaches<CohArticleRedis>(env);
+    auto warm = seedArticle(env, "coh-upd-nocopy-warm");
+    driveBounded(env.io, CohArticleRedis::update(warm, articleIn(warm, "coh-upd-nocopy-warm")));
+    auto id = seedArticle(env, "coh-upd-nocopy-a");
+    REQUIRE_FALSE(pageHolds<CohArticleRedis>(env, "coh-upd-nocopy-b", id));
+
+    env.holdPg();
+    CHECK_THROWS_AS(driveBounded(env.io, CohArticleRedis::update(
+                        id, articleIn(id, "coh-upd-nocopy-b"))),
+                    io::PgQueryTimeout);
+    env.releasePg();
+    CHECK(articleCategory(env, id) == "coh-upd-nocopy-b");
+    CHECK(pageHolds<CohArticleRedis>(env, "coh-upd-nocopy-b", id));
+}
+
+TEST_CASE("patch with lists: an uncertain patch invalidates the old position from the L1 copy",
+          "[coherence][list][patch][scenarioA][integration]") {
+    CohEnv env(300ms, /*with_redis=*/true, 200ms);
+    SECTION("Local") { uncertainPatchKeysOnL1Copy<CohArticleL1>(env); }
+    SECTION("Both")  { uncertainPatchKeysOnL1Copy<CohArticleBoth>(env); }
+}
