@@ -259,7 +259,9 @@ works without the extra `list(APPEND ...)`.
 
 For each entity the generator produces, inside `entity::generated`:
 
-- **`{Class}Mapping`** — `table_name`, `primary_key_column(s)`, a `Col` index
+- **`{Class}Mapping`** — `table_name`, `primary_key_column(s)`,
+  `insert_assigns_pk` (no PK column is `db_managed`; `SQL::insert` then binds
+  the key first, in key order), a `Col` index
   enum, a `SQL` struct (`select_by_pk`, `insert`, `update`,
   `update_returning_changes`, `delete_by_pk`, `delete_by_pk_returning`,
   `delete_by_pk_batch`, `select_by_pk_batch`, `returning_columns`),

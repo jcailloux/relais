@@ -676,6 +676,7 @@ class MappingGenerator:
             lines.append(f'    static constexpr const char* primary_key_column = "{self._col(entity, a.primary_key)}";')
 
         lines.append(f"    static constexpr bool supports_upsert = {'true' if self._supports_upsert(entity) else 'false'};")
+        lines.append(f"    static constexpr bool insert_assigns_pk = {'true' if self._insert_assigns_pk(entity) else 'false'};")
 
         lines.append("")
 
@@ -765,8 +766,8 @@ class MappingGenerator:
         all_cols = [m.col_name for m in entity.members]
         all_cols_str = ", ".join(all_cols)
 
-        # INSERT: skip db_managed fields
-        insert_cols = [m.col_name for m in entity.members if m.name not in a.db_managed]
+        # INSERT: skip db_managed fields; an assigned key comes first
+        insert_cols = [m.col_name for m in self._insert_members(entity)]
         insert_cols_str = ", ".join(insert_cols)
         insert_params = ", ".join(f"${i+1}" for i in range(len(insert_cols)))
 
@@ -981,7 +982,7 @@ class MappingGenerator:
         a = entity.annotation
 
         # Determine which fields go into INSERT (skip db_managed)
-        insert_members = [m for m in entity.members if m.name not in a.db_managed]
+        insert_members = self._insert_members(entity)
 
         # Check if we have any special types that prevent simple PgParams::make
         has_special = any(
@@ -1645,6 +1646,32 @@ class MappingGenerator:
         return any(m.name not in pk_set and m.name not in a.db_managed
                    for m in entity.members)
 
+    def _insert_assigns_pk(self, entity: ParsedEntity) -> bool:
+        """True if SQL::insert carries every PK column, i.e. none is db_managed.
+
+        The key columns are then its first parameters, in key order (see
+        _insert_members): the write scheduler reads the row an insert targets
+        there, as it does for update and erase. A database-assigned key cannot
+        be targeted by any other write in flight.
+        """
+        a = entity.annotation
+        pk_set = set(a.primary_keys) if a.primary_keys else {"id"}
+        return pk_set.isdisjoint(a.db_managed)
+
+    def _insert_members(self, entity: ParsedEntity) -> list[DataMember]:
+        """Members bound by SQL::insert and toInsertParams, in parameter order:
+        db_managed ones skipped, an assigned key first in key order, the rest
+        in declaration order."""
+        a = entity.annotation
+        members = [m for m in entity.members if m.name not in a.db_managed]
+        if not self._insert_assigns_pk(entity):
+            return members
+        pk_order = a.primary_keys if a.primary_keys else ["id"]
+        by_name = {m.name: m for m in members}
+        pk_set = set(pk_order)
+        return ([by_name[pk] for pk in pk_order]
+                + [m for m in members if m.name not in pk_set])
+
     def _supports_upsert(self, entity: ParsedEntity) -> bool:
         """True if the entity can back a native INSERT ... ON CONFLICT DO UPDATE.
 
@@ -1661,8 +1688,7 @@ class MappingGenerator:
         a = entity.annotation
         if a.read_only or not self._has_update_columns(entity):
             return False
-        pk_set = set(a.primary_keys) if a.primary_keys else {"id"}
-        return pk_set.isdisjoint(a.db_managed)
+        return self._insert_assigns_pk(entity)
 
     # =========================================================================
     # Mapped enum codecs
