@@ -10,7 +10,8 @@
  * bytes (little-endian host) over a corpus that covers every value width and
  * signedness, optional members null and present, strings (empty, short, past
  * the small-string buffer), IN/NIN sets unsorted and with duplicates, bool
- * sets, raw and mapped enums, with and without sort, cursor and offset.
+ * sets, raw and mapped enums, IS_NULL, with and without sort, cursor and
+ * offset.
  *
  * Pure unit test (no DB / Redis).
  */
@@ -91,6 +92,19 @@ struct SetDesc {
         decl::Filter<"names", &Row::name, "name", decl::Op::IN>{},
         decl::Filter<"not_i64", &Row::i64, "i64", decl::Op::NIN>{},
         decl::Filter<"flags_b", &Row::flag_b, "flag_b", decl::Op::IN>{},
+        decl::Filter<"u32", &Row::u32, "u32", decl::Op::EQ>{}
+    };
+    static constexpr auto sorts = std::tuple{
+        decl::Sort<"id", &Row::id, "id", SortDirection::Desc>{}
+    };
+};
+
+// IS_NULL between two value-carrying filters.
+struct NullDesc {
+    using Entity = Row;
+    static constexpr auto filters = std::tuple{
+        decl::Filter<"i32", &Row::i32, "i32", decl::Op::EQ>{},
+        decl::Filter<"opt_null", &Row::opt, "opt", decl::Op::IS_NULL>{},
         decl::Filter<"u32", &Row::u32, "u32", decl::Op::EQ>{}
     };
     static constexpr auto sorts = std::tuple{
@@ -279,6 +293,30 @@ TEST_CASE("[ListKeyGolden] set filters: unsorted, duplicates, bool", "[list][gol
         "000001010000000000");
 }
 
+TEST_CASE("[ListKeyGolden] IS_NULL filter: inactive, true, false", "[list][golden][unit]") {
+    // The slot is one byte when inactive, presence + bool when active.
+    decl::ListQueryParams<NullDesc> p;
+    p.filters.get<"i32">() = int32_t{7};
+    p.filters.get<"u32">() = uint32_t{9};
+    p.limit = 10;
+    checkParams(p,
+        "010700000000010900000000",
+        "0107000000000109000000000a00",
+        "0107000000000109000000");
+
+    p.filters.get<"opt_null">() = true;
+    checkParams(p,
+        "01070000000101010900000000",
+        "010700000001010109000000000a00",
+        "010700000001010109000000");
+
+    p.filters.get<"opt_null">() = false;
+    checkParams(p,
+        "01070000000100010900000000",
+        "010700000001000109000000000a00",
+        "010700000001000109000000");
+}
+
 TEST_CASE("[ListKeyGolden] mapped enum filters", "[list][golden][unit]") {
     decl::ListQueryParams<TicketDesc> p;
     p.filters.get<"queue">() = int64_t{3};
@@ -364,6 +402,14 @@ TEST_CASE("[ListKeyGolden] entity blob", "[list][golden][unit]") {
     CHECK(hex(decl::encodeEntityFilterBlob<SetDesc>(r)) ==
           "011e00000061206e616d652077656c6c2070617374206669667465656e206279"
           "7465730100e68ee7fdffffff010101efbeadde");
+
+    // An IS_NULL slot holds the presence byte alone, never the value.
+    r.i32 = 7;
+    r.u32 = 9;
+    r.opt.reset();
+    CHECK(hex(decl::encodeEntityFilterBlob<NullDesc>(r)) == "0107000000000109000000");
+    r.opt = 42;
+    CHECK(hex(decl::encodeEntityFilterBlob<NullDesc>(r)) == "0107000000010109000000");
 
     ::entity::generated::TestTicketEntity t;
     t.queue_id = 3;
