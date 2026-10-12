@@ -134,15 +134,19 @@ private:
             return tag_value.has_value() != *filter_value;
         }
 
-        // If filter set but tag has no value, doesn't match
-        if (!tag_value.has_value()) return false;
+        // A null tag satisfies no comparison and no membership, except NOT IN an
+        // empty set: SQL `NULL <> ALL('{}')` is TRUE.
+        if (!tag_value.has_value()) {
+            if constexpr (op == Op::NIN) return filter_value->empty();
+            else return false;
+        }
 
         // Compare values based on filter operator
         if constexpr (op == Op::IN) {
             // Membership: entity scalar ∈ query set
             return std::ranges::find(*filter_value, *tag_value) != filter_value->end();
         } else if constexpr (op == Op::NIN) {
-            // Anti-membership: entity scalar ∉ query set (null already rejected above)
+            // Anti-membership: entity scalar ∉ query set (null handled above)
             return std::ranges::find(*filter_value, *tag_value) == filter_value->end();
         } else if constexpr (op == Op::EQ) {
             return *tag_value == *filter_value;
