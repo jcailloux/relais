@@ -125,6 +125,12 @@ struct TestInternals {
         return static_cast<bool>(Repo::listCache().get(cache_query));
     }
 
+    /// The statement and parameters a list page read sends to PostgreSQL.
+    template<typename Repo, typename Query>
+    static auto listQuerySql(const Query& query) {
+        return Repo::querySql(query);
+    }
+
     /// Direct L1 cache get — bypasses coroutine overhead.
     /// Same path as find L1 hit, but synchronous (no sync_wait thread).
     template<typename Repo, typename Key>

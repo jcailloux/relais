@@ -2,6 +2,7 @@
 #define JCX_RELAIS_LIST_MIXIN_H
 
 #include <mutex>
+#include <utility>
 
 #include "jcailloux/relais/io/Task.h"
 #include "jcailloux/relais/io/WhenAll.h"
@@ -9,6 +10,7 @@
 #include "jcailloux/relais/io/pg/PgParams.h"
 
 #include "jcailloux/relais/PgProvider.h"
+#include "jcailloux/relais/repository/PgRepo.h"
 #include "jcailloux/relais/Log.h"
 #include "jcailloux/relais/cache/RedisCache.h"
 #include "jcailloux/relais/list/ListCache.h"
@@ -1172,94 +1174,106 @@ protected:
     // Database query — direct SQL via PgClient
     // =========================================================================
 
+    /// The page's statement and its parameters. The text depends only on the
+    /// query's shape (active filters, sort, cursor, presence of an offset):
+    /// limit and offset are parameters, so a shape is one prepared statement per
+    /// connection, and the interned pointer lets identical reads in flight
+    /// coalesce.
+    static std::pair<const char*, io::PgParams> querySql(const ListQuery& query) {
+        // Build WHERE clause from filters
+        auto where = list::spec::buildWhereClause<Descriptor>(query.filters());
+
+        // Parse sort
+        auto sort = query.sort().value_or(defaultSortAsListSpec());
+        const bool is_desc = (sort.direction == list::SortDirection::Desc);
+
+        // Primary-key tiebreaker columns (one for a scalar key, N for a
+        // composite key). Appends `, "col"[ DIR]` for each, matching the
+        // key-component order encoded in the cursor.
+        constexpr size_t kKeyN = list::spec::detail::keyComponentCount<Entity>;
+        auto appendKeyColumns = [](std::string& s, const char* dir) {
+            auto one = [&](const char* col) {
+                s += ", \"";
+                s += col;
+                s += "\"";
+                if (dir) { s += " "; s += dir; }
+            };
+            if constexpr (requires { Mapping::primary_key_columns; }) {
+                for (const char* col : Mapping::primary_key_columns) one(col);
+            } else {
+                one(Mapping::primary_key_column);
+            }
+        };
+
+        // Cursor keyset condition (page 2+ with cursor). The tiebreaker is
+        // the full primary key — a PostgreSQL row-value comparison.
+        const auto& cursor_data = query.cursor().raw().data;
+        if (!cursor_data.empty()
+            && cursor_data.size() >= sizeof(int64_t) * (1 + kKeyN)) {
+            int64_t cursor_sort_value = 0;
+            std::memcpy(&cursor_sort_value, cursor_data.data(),
+                        sizeof(cursor_sort_value));
+            int64_t cursor_keys[kKeyN];
+            for (size_t i = 0; i < kKeyN; ++i) {
+                std::memcpy(&cursor_keys[i],
+                            cursor_data.data() + sizeof(int64_t) * (1 + i),
+                            sizeof(int64_t));
+            }
+
+            if (!where.sql.empty()) where.sql += " AND ";
+            where.sql += "(COALESCE(";
+            list::spec::appendSortExpression<Descriptor>(where.sql, sort.field);
+            where.sql += ", 0)";
+            appendKeyColumns(where.sql, nullptr);
+            where.sql += ") ";
+            where.sql += is_desc ? "< " : "> ";
+            where.sql += "($";
+            where.sql += std::to_string(where.next_param++);
+            for (size_t i = 0; i < kKeyN; ++i) {
+                where.sql += ", $";
+                where.sql += std::to_string(where.next_param++);
+            }
+            where.sql += ")";
+
+            where.params.params.push_back(io::PgParam::number(cursor_sort_value));
+            for (size_t i = 0; i < kKeyN; ++i) {
+                where.params.params.push_back(io::PgParam::number(cursor_keys[i]));
+            }
+        }
+
+        // Build SQL
+        std::string sql;
+        sql.reserve(256);
+        sql += "SELECT * FROM ";
+        sql += Mapping::table_name;
+        if (!where.sql.empty()) {
+            sql += " WHERE ";
+            sql += where.sql;
+        }
+        sql += " ORDER BY COALESCE(";
+        list::spec::appendSortExpression<Descriptor>(sql, sort.field);
+        sql += ", 0) ";
+        sql += is_desc ? "DESC" : "ASC";
+        appendKeyColumns(sql, is_desc ? "DESC" : "ASC");
+        sql += " LIMIT $";
+        sql += std::to_string(where.next_param++);
+        where.params.params.push_back(io::PgParam::number(query.limit()));
+
+        // Offset pagination (mutually exclusive with cursor). No offset is
+        // its own shape rather than OFFSET $n bound to 0.
+        if (query.offset() > 0 && query.cursor().empty()) {
+            sql += " OFFSET $";
+            sql += std::to_string(where.next_param++);
+            where.params.params.push_back(io::PgParam::number(query.offset()));
+        }
+
+        return {detail::internSql(std::move(sql)), std::move(where.params)};
+    }
+
     static io::Task<std::vector<Entity>> queryFromDb(const ListQuery& query) {
         try {
-            // Build WHERE clause from filters
-            auto where = list::spec::buildWhereClause<Descriptor>(query.filters());
-
-            // Parse sort
-            auto sort = query.sort().value_or(defaultSortAsListSpec());
-            const bool is_desc = (sort.direction == list::SortDirection::Desc);
-
-            // Primary-key tiebreaker columns (one for a scalar key, N for a
-            // composite key). Appends `, "col"[ DIR]` for each, matching the
-            // key-component order encoded in the cursor.
-            constexpr size_t kKeyN = list::spec::detail::keyComponentCount<Entity>;
-            auto appendKeyColumns = [](std::string& s, const char* dir) {
-                auto one = [&](const char* col) {
-                    s += ", \"";
-                    s += col;
-                    s += "\"";
-                    if (dir) { s += " "; s += dir; }
-                };
-                if constexpr (requires { Mapping::primary_key_columns; }) {
-                    for (const char* col : Mapping::primary_key_columns) one(col);
-                } else {
-                    one(Mapping::primary_key_column);
-                }
-            };
-
-            // Cursor keyset condition (page 2+ with cursor). The tiebreaker is
-            // the full primary key — a PostgreSQL row-value comparison.
-            const auto& cursor_data = query.cursor().raw().data;
-            if (!cursor_data.empty()
-                && cursor_data.size() >= sizeof(int64_t) * (1 + kKeyN)) {
-                int64_t cursor_sort_value = 0;
-                std::memcpy(&cursor_sort_value, cursor_data.data(),
-                            sizeof(cursor_sort_value));
-                int64_t cursor_keys[kKeyN];
-                for (size_t i = 0; i < kKeyN; ++i) {
-                    std::memcpy(&cursor_keys[i],
-                                cursor_data.data() + sizeof(int64_t) * (1 + i),
-                                sizeof(int64_t));
-                }
-
-                if (!where.sql.empty()) where.sql += " AND ";
-                where.sql += "(COALESCE(";
-                list::spec::appendSortExpression<Descriptor>(where.sql, sort.field);
-                where.sql += ", 0)";
-                appendKeyColumns(where.sql, nullptr);
-                where.sql += ") ";
-                where.sql += is_desc ? "< " : "> ";
-                where.sql += "($";
-                where.sql += std::to_string(where.next_param++);
-                for (size_t i = 0; i < kKeyN; ++i) {
-                    where.sql += ", $";
-                    where.sql += std::to_string(where.next_param++);
-                }
-                where.sql += ")";
-
-                where.params.params.push_back(io::PgParam::number(cursor_sort_value));
-                for (size_t i = 0; i < kKeyN; ++i) {
-                    where.params.params.push_back(io::PgParam::number(cursor_keys[i]));
-                }
-            }
-
-            // Build SQL
-            std::string sql;
-            sql.reserve(256);
-            sql += "SELECT * FROM ";
-            sql += Mapping::table_name;
-            if (!where.sql.empty()) {
-                sql += " WHERE ";
-                sql += where.sql;
-            }
-            sql += " ORDER BY COALESCE(";
-            list::spec::appendSortExpression<Descriptor>(sql, sort.field);
-            sql += ", 0) ";
-            sql += is_desc ? "DESC" : "ASC";
-            appendKeyColumns(sql, is_desc ? "DESC" : "ASC");
-            sql += " LIMIT ";
-            sql += std::to_string(query.limit());
-
-            // Offset pagination (mutually exclusive with cursor)
-            if (query.offset() > 0 && query.cursor().empty()) {
-                sql += " OFFSET ";
-                sql += std::to_string(query.offset());
-            }
-
-            // Execute
-            auto result = co_await PgProvider::queryParams(sql.c_str(), where.params);
+            auto [sql, params] = querySql(query);
+            auto result = co_await PgProvider::queryParams(sql, params);
 
             // Build entity vector from rows
             std::vector<Entity> entities;
