@@ -584,16 +584,18 @@ struct Traits {
 
 `ListMixin` intercepts `insert`/`update`/`erase`/`patch` the same way the method
 hiding example in [§1](#repository-mixin-chain) shows, to notify the list cache.
-The real `update` does not re-fetch: it reuses the already-resolved `old` via
-**`Base::updateWithContext(id, entity, old)`** — the `*WithContext` variants take
-the pre-fetched old entity as a parameter, so when both `ListMixin` and
-`InvalidationMixin` are active the old value is looked up once, not per layer.
-`erase` reads nothing first: `Base::eraseOutcome<true>` runs `DELETE … RETURNING`
-and hands back the deleted row, which keys the list notification and, one layer up,
-`propagateDelete`. On an uncertain erase nothing comes back; `LocalRepo` copies its
-L1 entry (still the targeted version: L1 changes only after a commit) into a slot
-the upper layers pass down, just before its precautionary evict. `update` then
-splits the notification: `onEntityUpdated` for the L1 list tier,
+`update`, `erase` and `patch` read nothing first. `Base::updateOutcome<true>` runs
+an `UPDATE` that locks the row in a CTE and returns it before and after;
+`Base::eraseOutcome<true>` runs `DELETE … RETURNING` and hands back the deleted row;
+`patchRow<true>` returns both versions the same way. Those rows key the list
+notification and, one layer up, `propagateUpdate`/`propagateDelete`. On an
+uncertain write nothing comes back; `LocalRepo` copies its L1 entry (still the
+targeted version: L1 changes only after a commit) into a slot the upper layers pass
+down, just before its precautionary evict. An uncertain `update` keys the old
+position on that copy and the new one on its input; an uncertain `patch` knows only
+the old position and invalidates it as for a deletion. `upsert` keeps a
+best-effort pre-read (`findOldBestEffort`): an absent row cannot be locked, so the
+statement cannot tell create from update. `update` then splits the notification: `onEntityUpdated` for the L1 list tier,
 `invalidateL2Updated` for the L2 list tier. Either way the `ModificationTracker`
 records the change at the current generation; list pages are validated lazily on
 the next `getByKey` against that generation (validation lives in
@@ -1282,7 +1284,7 @@ entity/
 3. **Lazy validation**: modifications are checked on read (`getByKey`), not pushed on notification.
 4. **Sort bounds**: O(1) range checking avoids iterating cache entries during invalidation.
 5. **Short-circuit**: `hasModificationsSince()` (one atomic load) avoids iteration when nothing changed since the page was cached.
-6. **Old-entity reuse on update**: when both `ListMixin` and `InvalidationMixin` are active, the old entity is fetched once and threaded via `updateWithContext`, avoiding a second L1 lookup. `erase` and `patch` fetch nothing: their statement returns the prior row.
+6. **No pre-read on writes**: `update`, `erase` and `patch` fetch nothing; their statement returns the prior row, which both `ListMixin` and `InvalidationMixin` use. Only `upsert` reads the row first, once for both layers.
 
 ## Entity Mapping Generator
 
@@ -1302,7 +1304,9 @@ The `scripts/generate_entities.py` script generates standalone ORM Mapping struc
 - An `enum Col : uint8_t { ... }` — `fromRow` reads columns by index (`Col::`), not by name
 - A nested `SQL` block of `static constexpr const char*` statements:
   `select_by_pk`, `select_by_pk_batch`, `insert`, `update`, `returning_columns`,
-  `delete_by_pk`, `delete_by_pk_batch` (composite keys use the matching forms)
+  `delete_by_pk`, `delete_by_pk_batch` (composite keys use the matching forms);
+  `update_returning_changes` and `delete_by_pk_returning` are the same writes
+  returning the prior row (and, for the update, the committed one)
 - `template<typename Entity> fromRow(const PgResult::Row&) -> optional<Entity>`
 - `template<typename Entity> toInsertParams(const Entity&) -> PgParams`
 - `template<typename Entity> key(const Entity&) -> auto` (a tuple for composite keys)

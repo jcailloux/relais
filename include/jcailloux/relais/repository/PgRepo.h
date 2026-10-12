@@ -569,7 +569,7 @@ public:
     static io::Task<cache::CacheView<E>> patch(const Key& id, Updates&&... updates)
         requires HasFieldUpdate<E> && (!Cfg.read_only)
     {
-        auto row = co_await patchRow<false>(id, std::forward<Updates>(updates)...);
+        auto row = co_await patchRow<false>(id, nullptr, std::forward<Updates>(updates)...);
         co_return std::move(row.after);
     }
 
@@ -582,7 +582,7 @@ public:
         const Key& id, const entity::Guards<Gs...>& guard, Updates&&... updates)
         requires HasFieldUpdate<E> && (!Cfg.read_only)
     {
-        auto row = co_await patchIfRow<false>(id, guard, std::forward<Updates>(updates)...);
+        auto row = co_await patchIfRow<false>(id, nullptr, guard, std::forward<Updates>(updates)...);
         if (!row) co_return std::nullopt;
         co_return std::move(row->after);
     }
@@ -1192,8 +1192,11 @@ protected:
     }
 
     /// Partial update as the tiers above see it (see PatchedRow).
+    /// `uncertain_before`: see eraseOutcome.
     template<bool WithBefore, typename... Updates>
-    static io::Task<PatchedRow> patchRow(const Key& id, Updates&&... updates)
+    static io::Task<PatchedRow> patchRow(
+        const Key& id, [[maybe_unused]] std::optional<E>* uncertain_before,
+        Updates&&... updates)
         requires HasFieldUpdate<E> && (!Cfg.read_only)
     {
         auto patched = co_await patchRaw<WithBefore>(id, std::forward<Updates>(updates)...);
@@ -1204,7 +1207,8 @@ protected:
     /// Guarded partial update as the tiers above see it. nullopt on DB error.
     template<bool WithBefore, typename... Gs, typename... Updates>
     static io::Task<std::optional<PatchedRow>> patchIfRow(
-        const Key& id, const entity::Guards<Gs...>& guard, Updates&&... updates)
+        const Key& id, [[maybe_unused]] std::optional<E>* uncertain_before,
+        const entity::Guards<Gs...>& guard, Updates&&... updates)
         requires HasFieldUpdate<E> && (!Cfg.read_only)
     {
         auto outcome = co_await patchIfRaw<WithBefore>(id, guard, std::forward<Updates>(updates)...);
@@ -1335,9 +1339,14 @@ protected:
     // Upper layers (RedisRepo, LocalRepo) use this to skip redundant
     // cache operations (L1 evict, L2 Redis SET/DEL).
 
-    struct WriteOutcome {
+    /// Outcome of a keyed update. `before` and `after` are the row the update
+    /// replaced and the committed one, filled only when the tiers above asked
+    /// for them (WithBefore) and a row was updated.
+    struct UpdateOutcome {
         std::optional<size_t> affected;
         bool coalesced = false;
+        std::optional<E> before;
+        std::optional<E> after;
     };
 
     /// Outcome of a keyed erase. `before` is the deleted row, filled only when
@@ -1348,10 +1357,19 @@ protected:
         std::optional<E> before;
     };
 
-    /// Update returning full outcome (success + coalesced flag).
-    static io::Task<WriteOutcome> updateOutcome(const Key& id, const E& entity)
+    /// Update returning full outcome (affected + coalesced flag), and both
+    /// row versions when WithBefore: the UPDATE then locks the row in a CTE and
+    /// RETURNs it before and after, so the list and cross-invalidation cascades
+    /// get the exact pre-image without reading the row first.
+    /// `uncertain_before`: see eraseOutcome.
+    template<bool WithBefore = false>
+    static io::Task<UpdateOutcome> updateOutcome(
+        const Key& id, const E& entity,
+        [[maybe_unused]] std::optional<E>* uncertain_before = nullptr)
         requires MutableEntity<E> && HasFullUpdate<E> && (!Cfg.read_only)
     {
+        constexpr const char* kSql = WithBefore
+            ? Mapping::SQL::update_returning_changes : Mapping::SQL::update;
         try {
             auto keyParams = io::PgParams::fromKey(id);
             io::PgParams fieldParams = E::toUpdateParams(entity);
@@ -1362,20 +1380,29 @@ protected:
             for (auto& p : fieldParams.params)
                 params.params.push_back(std::move(p));
 
-            auto [result, coalesced] = co_await PgProvider::queryWrite(
-                Mapping::SQL::update, params);
-            co_return WriteOutcome{
-                static_cast<size_t>(result.affectedRows()), coalesced};
+            auto [result, coalesced] = co_await PgProvider::queryWrite(kSql, params);
+            UpdateOutcome outcome{
+                static_cast<size_t>(result.affectedRows()), coalesced,
+                std::nullopt, std::nullopt};
+            if constexpr (WithBefore) {
+                if (!result.empty()) {
+                    if (auto change = decodeRow<Returns::Changes>(result[0])) {
+                        outcome.before = std::move(change->before);
+                        outcome.after = std::move(change->after);
+                    }
+                }
+            }
+            co_return outcome;
 
         } catch (const io::PgUncertainError&) {
             // Uncertain: the UPDATE may have committed (lost ACK). Propagate so
             // each layer evicts its tier by precaution on the way out; the empty
-            // WriteOutcome (nullopt) stays the deterministic failure (DB
+            // UpdateOutcome (nullopt) stays the deterministic failure (DB
             // unchanged) that keeps invalidations skipped.
             throw;
         } catch (const io::PgError& e) {
             RELAIS_LOG_ERROR << name() << ": update error - " << e.what();
-            co_return WriteOutcome{};
+            co_return UpdateOutcome{};
         }
     }
 

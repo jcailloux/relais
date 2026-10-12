@@ -2135,6 +2135,87 @@ TEST_CASE("Benchmark - erase with lists", "[benchmark][erase-lists]") {
 
 // #############################################################################
 //
+//  15b''. Update of an entity with lists — the UPDATE locks the row in a CTE
+//  and returns it before and after, which key the list invalidation: no read
+//  of the row before the write.
+//
+//  Latency: one row updated over and over, its view_count changing each time
+//  (read into the entity cache before each sample for the "hit" variant: the
+//  update evicts it). Throughput: CORO coroutines, each updating its own row.
+//
+//  Run with:
+//    ./bench_relais_cache "[update-lists]"
+//
+// #############################################################################
+
+using UncachedArticleUpdateRepo = Repo<TestArticleEntity, "bench:article:update:pg", cfg::Uncached>;
+using LocalArticleUpdateRepo = Repo<TestArticleEntity, "bench:article:update:l1">;
+
+template<typename R>
+static void benchUpdateWithLists(const char* tier, bool cached_entity,
+                                 std::vector<BenchResult>& lat) {
+    const std::string tag = std::string("ul_") + tier + (cached_entity ? "_hit" : "");
+    auto author = insertTestUser(tag, tag + "@test.com", 0);
+    auto id = insertTestArticle("tech", author, "UL", 1);
+    int32_t views = 1;
+    lat.push_back(benchWithSetup(
+        std::string("update, lists (") + tier + (cached_entity ? ", entity cached)" : ")"),
+        [&]() { if (cached_entity) doNotOptimize(sync(R::find(id))); },
+        [&]() {
+            doNotOptimize(sync(R::update(
+                id, makeTestArticle("tech", author, "UL", ++views, false, id))));
+        }));
+}
+
+template<typename R>
+static std::string benchUpdateWithListsThroughput(const char* tier) {
+    static constexpr int CORO = 32;
+    auto author = insertTestUser(std::string("ult_") + tier,
+                                 std::string("ult_") + tier + "@test.com", 0);
+    std::vector<int64_t> ids;
+    for (int c = 0; c < CORO; ++c) ids.push_back(insertTestArticle("tech", author, "ULT", 1));
+    std::atomic<bool> running{true};
+    std::atomic<int64_t> ops{0};
+    std::latch done{CORO};
+    auto t0 = Clock::now();
+    for (int c = 0; c < CORO; ++c) {
+        detail::testLoop().dispatch([&, id = ids[c]]() {
+            [](int64_t id, int64_t author, std::atomic<bool>& running,
+               std::atomic<int64_t>& ops, std::latch& done) -> DetachedHandle {
+                int32_t views = 1;
+                while (running.load(std::memory_order_relaxed)) {
+                    co_await R::update(id, makeTestArticle("tech", author, "ULT", ++views, false, id));
+                    ops.fetch_add(1, std::memory_order_relaxed);
+                }
+                done.count_down();
+            }(id, author, running, ops, done);
+        });
+    }
+    std::this_thread::sleep_for(std::chrono::seconds(benchDurationSeconds()));
+    running.store(false, std::memory_order_relaxed);
+    done.wait();
+    DurationResult result{Clock::now() - t0, ops.load(std::memory_order_relaxed)};
+    return formatDurationThroughput(
+        std::string("update throughput, lists (") + tier + ", "
+            + std::to_string(CORO) + " coros, single loop)",
+        1, result);
+}
+
+TEST_CASE("Benchmark - update with lists", "[benchmark][update-lists]") {
+    TransactionGuard tx;
+    std::vector<BenchResult> lat;
+    benchUpdateWithLists<UncachedArticleUpdateRepo>("Uncached", false, lat);
+    benchUpdateWithLists<LocalArticleUpdateRepo>("Local", false, lat);
+    benchUpdateWithLists<LocalArticleUpdateRepo>("Local", true, lat);
+    benchUpdateWithLists<RedisArticleListRepo>("Redis", false, lat);
+    benchUpdateWithLists<FullCacheArticleListRepo>("Both", false, lat);
+    WARN(formatTable("Update with lists — latency", lat));
+    WARN(benchUpdateWithListsThroughput<UncachedArticleUpdateRepo>("Uncached"));
+    WARN(benchUpdateWithListsThroughput<LocalArticleUpdateRepo>("Local"));
+}
+
+// #############################################################################
+//
 //  15c. List miss with L2 — the read pays the L2 lookup and PostgreSQL; the
 //  store-back into L2 (one script) runs after the read returns.
 //

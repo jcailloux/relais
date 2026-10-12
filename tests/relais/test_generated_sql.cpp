@@ -5,8 +5,9 @@
  * Ici on n'exécute aucune requête : on assert les strings constantes de
  * Mapping::SQL — leur forme, leur numérotation $n, leurs colonnes RETURNING.
  *
- * Cibles : delete_by_pk_batch, et les variantes RETURNING du DELETE mono-clé
- * (delete_by_pk_returning, delete_with_partition_returning).
+ * Cibles : delete_by_pk_batch, les variantes RETURNING du DELETE mono-clé
+ * (delete_by_pk_returning, delete_with_partition_returning) et l'UPDATE qui
+ * renvoie la ligne avant et après (update_returning_changes).
  *   - clé scalaire   → WHERE pk = ANY($1) RETURNING <cols>
  *   - clé composite  → WHERE (k1,k2) IN (SELECT unnest($1::t[]), unnest($2::t[])) RETURNING <cols>
  *   - entité partitionnée → pas de partition pruning : pk = ANY($1) scanne toutes
@@ -28,6 +29,7 @@
 #include "fixtures/generated/TestUserEntity.h"
 #include "fixtures/generated/TestEventEntity.h"
 #include "fixtures/generated/TestCompositeKeyListEntity.h"
+#include "fixtures/generated/TestMembershipEntity.h"
 #include "fixtures/generated/TestAllPkJunctionEntity.h"
 #include "fixtures/generated/TestArticleInEntity.h"
 #include "fixtures/generated/TestTicketEntity.h"
@@ -41,6 +43,7 @@ namespace {
 using UserSQL = entity::generated::TestUserMapping::SQL;
 using EventSQL = entity::generated::TestEventMapping::SQL;
 using CompositeSQL = entity::generated::TestCompositeKeyListMapping::SQL;
+using MembershipSQL = entity::generated::TestMembershipMapping::SQL;
 using JunctionSQL = entity::generated::TestAllPkJunctionMapping::SQL;
 using ArticleSQL = entity::generated::TestArticleInMapping::SQL;
 
@@ -85,6 +88,29 @@ TEST_CASE("mono DELETE - RETURNING variants return the deleted row",
         CHECK(std::string(EventSQL::delete_by_pk_returning) ==
               std::string(EventSQL::delete_by_pk) + " RETURNING "
               + EventSQL::returning_columns);
+    }
+}
+
+TEST_CASE("mono UPDATE - update_returning_changes returns the row before and after",
+          "[generator][sql][update]") {
+    SECTION("[SQL] scalar key: locking CTE, same SET and parameters, both versions") {
+        CHECK(std::string(UserSQL::update_returning_changes) ==
+              "WITH o AS (SELECT id, username, email, balance, created_at "
+              "FROM relais_test_users WHERE id = $1 FOR UPDATE) "
+              "UPDATE relais_test_users AS t SET username=$2, email=$3, balance=$4 "
+              "FROM o WHERE t.id=o.id "
+              "RETURNING o.id, o.username, o.email, o.balance, o.created_at, "
+              "t.id, t.username, t.email, t.balance, t.created_at");
+    }
+
+    SECTION("[SQL] composite key: the CTE joins on every key column") {
+        CHECK(std::string(MembershipSQL::update_returning_changes) ==
+              "WITH o AS (SELECT user_id, group_id, role, joined_at "
+              "FROM relais_test_memberships WHERE user_id = $1 AND group_id = $2 FOR UPDATE) "
+              "UPDATE relais_test_memberships AS t SET role=$3 "
+              "FROM o WHERE t.user_id=o.user_id AND t.group_id=o.group_id "
+              "RETURNING o.user_id, o.group_id, o.role, o.joined_at, "
+              "t.user_id, t.group_id, t.role, t.joined_at");
     }
 }
 
