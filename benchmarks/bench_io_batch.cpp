@@ -349,6 +349,7 @@ static std::string formatScalingTable(
     for (const auto& r : results) {
         std::string conc_str = std::to_string(r.concurrency) +
             (r.concurrency == 1 ? " coro" : " coros");
+        csv(title + " | " + conc_str, "ops_s", r.throughput);
         out << "  " << std::right << std::setw(10) << conc_str << "    "
             << std::left << std::setw(16) << fmtOps(r.throughput)
             << std::fixed << std::setprecision(1) << r.speedup << "x\n";
