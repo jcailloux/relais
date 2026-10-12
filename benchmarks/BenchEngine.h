@@ -12,10 +12,16 @@
  *   BENCH_PIN_CPU=N     — pin main thread to core N (default: no pinning)
  *   BENCH_CSV=path      — also append one `case;variant;metric;value` line per
  *                         result, values unrounded (default: no file)
+ *
+ * Next to time, each measurement reports the work it did per operation (see
+ * IoCounter.h): pg_op, pg_prepare_op, redis_op, heap_op. Unlike time, these do
+ * not depend on the load of the machine.
  */
 
 #include "jcailloux/relais/io/Task.h"
 #include "jcailloux/relais/cache/GDSFPolicy.h"
+
+#include "IoCounter.h"
 
 #include <algorithm>
 #include <atomic>
@@ -30,6 +36,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <sched.h>
@@ -147,6 +154,15 @@ inline void csv(const std::string& variant, const char* metric, double value) {
     std::fflush(f);
 }
 
+/// Work per operation of a measurement (see IoCounter.h).
+inline void csvWork(const std::string& variant, const io_count::PerOp& w) {
+    if (!w.valid) return;
+    csv(variant, "pg_op", w.pg_exec);
+    csv(variant, "pg_prepare_op", w.pg_prepare);
+    csv(variant, "redis_op", w.redis);
+    if (io_count::heap_source) csv(variant, "heap_op", w.heap);
+}
+
 // =============================================================================
 // Micro-benchmark engine
 // =============================================================================
@@ -171,6 +187,7 @@ struct BenchResult {
     double mean_us;
     double min_us;
     double max_us;
+    io_count::PerOp work{};
 };
 
 inline BenchResult computeStats(const std::string& name, std::vector<double>& times) {
@@ -188,13 +205,17 @@ inline BenchResult bench(const std::string& name, Fn&& fn) {
 
     const int samples = benchSamples();
     std::vector<double> times(samples);
+    const auto before = io_count::snapshot();
     for (int i = 0; i < samples; ++i) {
         auto t0 = Clock::now();
         fn();
         times[i] = std::chrono::duration<double, std::micro>(Clock::now() - t0).count();
     }
+    const auto after = io_count::snapshot();
 
-    return computeStats(name, times);
+    auto r = computeStats(name, times);
+    r.work = io_count::perOp(before, after, samples);
+    return r;
 }
 
 template<typename SetupFn, typename Fn>
@@ -204,14 +225,24 @@ inline BenchResult benchWithSetup(
 
     const int samples = benchSamples();
     std::vector<double> times(samples);
+    // Counted around fn only: setup's work is not the operation's.
+    io_count::Counts spent;
     for (int i = 0; i < samples; ++i) {
         setup();
+        const auto c0 = io_count::snapshot();
         auto t0 = Clock::now();
         fn();
         times[i] = std::chrono::duration<double, std::micro>(Clock::now() - t0).count();
+        const auto c1 = io_count::snapshot();
+        spent.pg_exec += c1.pg_exec - c0.pg_exec;
+        spent.pg_prepare += c1.pg_prepare - c0.pg_prepare;
+        spent.redis += c1.redis - c0.redis;
+        spent.heap += c1.heap - c0.heap;
     }
 
-    return computeStats(name, times);
+    auto r = computeStats(name, times);
+    r.work = io_count::perOp({}, spent, samples);
+    return r;
 }
 
 // Coroutine variants — used by I/O layer benchmarks (bench_io_redis, bench_io_pg)
@@ -223,13 +254,17 @@ inline io::Task<BenchResult> benchAsync(const std::string& name, Fn&& fn) {
 
     const int samples = benchSamples();
     std::vector<double> times(samples);
+    const auto before = io_count::snapshot();
     for (int i = 0; i < samples; ++i) {
         auto t0 = Clock::now();
         co_await fn();
         times[i] = std::chrono::duration<double, std::micro>(Clock::now() - t0).count();
     }
+    const auto after = io_count::snapshot();
 
-    co_return computeStats(name, times);
+    auto r = computeStats(name, times);
+    r.work = io_count::perOp(before, after, samples);
+    co_return r;
 }
 
 
@@ -289,6 +324,7 @@ inline std::string formatTable(const std::string& title,
         csv(variant, "p99_us", r.p99_us);
         csv(variant, "min_us", r.min_us);
         csv(variant, "max_us", r.max_us);
+        csvWork(variant, r.work);
         out << "   " << std::left << std::setw(static_cast<int>(max_name)) << r.name
             << std::right
             << std::setw(10) << fmtDuration(r.median_us)
@@ -301,6 +337,10 @@ inline std::string formatTable(const std::string& title,
     out << "  " << bar;
     return out.str();
 }
+
+/// Work per operation of the last measureParallel, read by formatThroughput
+/// (measureParallel returns the elapsed time only).
+inline io_count::PerOp last_parallel_work{};
 
 template<typename Fn>
 inline auto measureParallel(int num_threads, int ops_per_thread, Fn&& fn) {
@@ -323,10 +363,15 @@ inline auto measureParallel(int num_threads, int ops_per_thread, Fn&& fn) {
     }
 
     ready.wait();
+    const auto before = io_count::snapshot();
     auto t0 = Clock::now();
     go.count_down();
     for (auto& t : threads) t.join();
-    return Clock::now() - t0;
+    auto elapsed = Clock::now() - t0;
+    last_parallel_work = io_count::perOp(
+        before, io_count::snapshot(),
+        static_cast<double>(num_threads) * ops_per_thread);
+    return elapsed;
 }
 
 inline std::string formatThroughput(
@@ -338,6 +383,7 @@ inline std::string formatThroughput(
     auto avg_us = (total_ops > 0) ? static_cast<double>(us) / total_ops : 0.0;
     csv(label, "ops_s", ops_per_sec);
     csv(label, "avg_us", avg_us);
+    csvWork(label, std::exchange(last_parallel_work, {}));
 
     auto bar = std::string(50, '-');
     std::ostringstream out;
@@ -358,6 +404,7 @@ inline std::string formatThroughput(
 struct DurationResult {
     Clock::duration elapsed;
     int64_t total_ops;
+    io_count::PerOp work{};
 };
 
 inline int benchDurationSeconds() {
@@ -393,16 +440,18 @@ inline DurationResult measureDuration(int num_threads, Fn&& fn) {
     }
 
     ready.wait();
+    const auto before = io_count::snapshot();
     auto t0 = Clock::now();
     go.count_down();
     std::this_thread::sleep_for(std::chrono::seconds(benchDurationSeconds()));
     running.store(false, std::memory_order_relaxed);
     for (auto& t : threads) t.join();
     auto elapsed = Clock::now() - t0;
+    const auto after = io_count::snapshot();
 
     int64_t total = 0;
     for (auto& c : ops_counts) total += c.load(std::memory_order_relaxed);
-    return {elapsed, total};
+    return {elapsed, total, io_count::perOp(before, after, static_cast<double>(total))};
 }
 
 inline std::string formatDurationThroughput(
@@ -415,6 +464,7 @@ inline std::string formatDurationThroughput(
     auto avg_us = (ops_per_thread > 0) ? static_cast<double>(us) / ops_per_thread : 0.0;
     csv(label, "ops_s", ops_per_sec);
     csv(label, "avg_us", avg_us);
+    csvWork(label, result.work);
 
     auto bar = std::string(50, '-');
     std::ostringstream out;
@@ -449,6 +499,7 @@ inline std::string formatMixedThroughput(
     csv(label + " | write", "ops_s", write_ops_s);
     csv(label, "ops_s", total_ops_s);
     csv(label, "avg_us", avg_op_us);
+    csvWork(label, result.work);
 
     // Estimate per-write cost: if read cost = avg_op from read-only benchmark,
     // then 0.75 * read_cost + 0.25 * write_cost = avg_op
@@ -513,6 +564,7 @@ struct ThroughputResult {
     double duration_s;
     double throughput;          // ops/s, aggregated
     double speedup;             // vs first result
+    io_count::PerOp work{};
 };
 
 /// Spawns `num_threads` worker threads and orchestrates the timed run.
@@ -552,6 +604,7 @@ inline ThroughputResult measureMultiLoopThroughput(
 
     // Wait for all threads to finish setup before starting the clock.
     ready.wait();
+    const auto before = io_count::snapshot();
     auto start = Clock::now();
     go.count_down();
 
@@ -562,6 +615,7 @@ inline ThroughputResult measureMultiLoopThroughput(
     for (auto& t : threads) t.join();
     auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
         Clock::now() - start).count();
+    const auto after = io_count::snapshot();
 
     int64_t ops_total = total_ops.load(std::memory_order_relaxed);
     double throughput = (elapsed_us > 0)
@@ -572,7 +626,8 @@ inline ThroughputResult measureMultiLoopThroughput(
     return {num_threads, concurrency_per_thread,
             ops_total,
             static_cast<double>(elapsed_us) / 1'000'000.0,
-            throughput, speedup};
+            throughput, speedup,
+            io_count::perOp(before, after, static_cast<double>(ops_total))};
 }
 
 inline std::string formatThroughputTable(
@@ -600,6 +655,7 @@ inline std::string formatThroughputTable(
         conc << r.threads << " x " << r.concurrency_per_thread
              << " = " << (r.threads * r.concurrency_per_thread);
         csv(title + " | " + conc.str(), "ops_s", r.throughput);
+        csvWork(title + " | " + conc.str(), r.work);
         out << "  " << std::left << std::setw(22) << conc.str()
             << std::setw(16) << fmtOps(r.throughput)
             << std::fixed << std::setprecision(2) << r.speedup << "x\n";
