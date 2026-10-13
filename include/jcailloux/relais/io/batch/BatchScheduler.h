@@ -1,6 +1,8 @@
 #ifndef JCX_RELAIS_IO_BATCH_SCHEDULER_H
 #define JCX_RELAIS_IO_BATCH_SCHEDULER_H
 
+#include <algorithm>
+#include <array>
 #include <cassert>
 #include <chrono>
 #include <coroutine>
@@ -86,7 +88,14 @@ public:
         , self_heal_(io_, redis_pool_)
         , pg_gate_{max_concurrent}
         , redis_gate_{max_concurrent}
+        , pg_write_fanout_{writeFanout(max_concurrent)}
     {}
+
+#ifdef RELAIS_BUILDING_TESTS
+    /// Connections a write batch may span, for schedulers built afterwards;
+    /// 0 derives it from max_concurrent. 1 keeps every batch on one connection.
+    static inline size_t write_fanout_override = 0;
+#endif
 
     ~BatchScheduler() = default;
 
@@ -156,16 +165,18 @@ public:
     /// caller received the leader's result without a DB round-trip. Only
     /// WriteMode::Idempotent writes coalesce, and only onto an Idempotent leader.
     ///
-    /// Ordering: each write takes a monotonic `seq` here, at submit time, and a
-    /// batch fires its writes in `seq` order (firePgWriteBatch's sort). So two
-    /// writes submitted in a flow — e.g. INSERT then UPDATE of the same PK —
-    /// execute in submission order even when they land in the same batch. Order
-    /// BETWEEN batches is the caller's responsibility, carried by `co_await`
+    /// Ordering: each write takes a monotonic `seq` here, at submit time. A
+    /// batch may commit on several connections (groupByRow), but writes on one
+    /// row stay on one connection in `seq` order. So two writes submitted in a
+    /// flow — e.g. INSERT then UPDATE of the same PK — execute in submission
+    /// order even when they land in the same batch. Writes on different rows
+    /// have no order unless the caller carries one by `co_await`
     /// (read-your-writes intra-flow). The scheduler does NOT track write
     /// dependencies across concurrent coroutines. See docs/runtime.md.
     ///
     /// `affinity` names the row the write targets (see WriteAffinity); the
-    /// default, kOrdered, assumes nothing about it.
+    /// default, kOrdered, assumes nothing about it and keeps the whole batch
+    /// it lands in on one connection.
     Task<WriteResult> submitPgWrite(const char* sql, PgParams params,
                                     WriteMode mode = WriteMode::Idempotent,
                                     WriteAffinity affinity = kOrdered) {
@@ -884,7 +895,92 @@ private:
         auto entries = std::move(pg_write_batch_.entries);
         pg_write_batch_ = {};
 
+        // Sort by submission sequence: restores submission order regardless of
+        // how entries were accumulated/coalesced, so intra-batch write→write
+        // order == seq order == the order the caller submitted them. This is the
+        // write-ordering contract (docs/runtime.md).
+        std::sort(entries.begin(), entries.end(),
+            [](const auto* a, const auto* b) { return a->seq < b->seq; });
+
+        // Each group commits on its own connection: N writes cost about one
+        // fsync wait per group instead of one per write, as PostgreSQL commits
+        // concurrent transactions together. Groups 1.. take a copy; group 0
+        // keeps the batch's vector.
+        std::array<uint16_t, kMaxWriteFanout + 1> bounds;
+        const size_t groups = groupByRow(entries, pg_write_fanout_, bounds);
+        // A group failing synchronously (pool closed) resumes its callers
+        // before the next group is fired; one of them may drop the last owner.
+        std::shared_ptr<BatchScheduler> self;
+        if (groups > 1) self = this->shared_from_this();
+        for (size_t g = 1; g < groups; ++g)
+            firePgWriteBatch(std::vector<PgWriteEntry*>(
+                entries.begin() + bounds[g], entries.begin() + bounds[g + 1]));
+        entries.resize(bounds[1]);
         firePgWriteBatch(std::move(entries));
+    }
+
+    static constexpr size_t kMaxWriteFanout = 16;
+
+    // Split a seq-sorted write batch into at most `fanout` groups that may
+    // commit on different connections. Writes on one row share a group, in seq
+    // order; rows and kFree writes are dealt round-robin, which balances small
+    // batches better than a hash modulo. A write whose row is unknown (kOrdered,
+    // or a key position beyond its parameters) keeps the whole batch in one
+    // group. Reorders `entries` by group, stably: group g is
+    // [bounds[g], bounds[g + 1]). Returns the number of groups, 1 untouched.
+    // Not a coroutine: its tables live on the thread's stack (~14 KiB).
+    static size_t groupByRow(std::vector<PgWriteEntry*>& entries, size_t fanout,
+                             std::array<uint16_t, kMaxWriteFanout + 1>& bounds) noexcept {
+        const size_t n = entries.size();
+        bounds[0] = 0;
+        bounds[1] = static_cast<uint16_t>(n);
+        if (fanout < 2 || n < 2 || n > size_t{kMaxBatchEntries}) return 1;
+        const size_t k = std::min(n, fanout);
+
+        // Open addressing over row hashes (never 0), load factor <= 1/2.
+        size_t cap = 4;
+        while (cap < 2 * n) cap <<= 1;
+        uint64_t rows[2 * kMaxBatchEntries];
+        uint8_t row_group[2 * kMaxBatchEntries];
+        uint8_t group[kMaxBatchEntries];
+        std::fill_n(rows, cap, uint64_t{0});
+
+        size_t dealt = 0;   // rows and kFree writes dealt so far
+        size_t next = 0;    // dealt % k
+        auto deal = [&]() noexcept {
+            const auto g = static_cast<uint8_t>(next);
+            next = next + 1 == k ? 0 : next + 1;
+            ++dealt;
+            return g;
+        };
+        for (size_t i = 0; i < n; ++i) {
+            const PgWriteEntry& e = *entries[i];
+            if (e.affinity.free()) {
+                group[i] = deal();
+                continue;
+            }
+            const uint64_t h = rowHash(e.affinity, e.params);
+            if (h == 0) return 1;
+            size_t s = h & (cap - 1);
+            while (rows[s] != 0 && rows[s] != h) s = (s + 1) & (cap - 1);
+            if (rows[s] == 0) {
+                rows[s] = h;
+                row_group[s] = deal();
+            }
+            group[i] = row_group[s];
+        }
+        const size_t used = std::min(dealt, k);
+        if (used < 2) return 1;
+
+        // Stable counting sort by group.
+        std::array<uint16_t, kMaxWriteFanout + 1> at{};
+        for (size_t i = 0; i < n; ++i) ++at[group[i] + 1];
+        for (size_t g = 1; g <= used; ++g) at[g] = static_cast<uint16_t>(at[g] + at[g - 1]);
+        std::copy_n(at.begin(), used + 1, bounds.begin());
+        PgWriteEntry* sorted[kMaxBatchEntries];
+        for (size_t i = 0; i < n; ++i) sorted[at[group[i]]++] = entries[i];
+        std::copy_n(sorted, n, entries.begin());
+        return used;
     }
 
     void fireRedisBatchNow() {
@@ -1158,12 +1254,7 @@ private:
         auto self = this->shared_from_this();
         // In-flight detached accounting for ordered teardown (see firePgReadBatch).
         InflightGuard inflight{detached_inflight_};
-        // Sort by submission sequence: restores submission order regardless of
-        // how entries were accumulated/coalesced, so intra-batch write→write
-        // order == seq order == the order the caller submitted them. This is the
-        // write-ordering contract (docs/runtime.md).
-        std::sort(entries.begin(), entries.end(),
-            [](const auto* a, const auto* b) { return a->seq < b->seq; });
+        // `entries` is one group of a batch (firePgWriteBatchNow), in seq order.
 
         // Acquire inside the try (see firePgReadBatch). An escaped
         // PgPoolTimeout from pg_pool_->acquire() would be swallowed by the
@@ -1240,7 +1331,9 @@ private:
         for (auto h : to_resume) h.resume();
         for (auto* e : to_delete) delete e;
 
-        // Chain: fire next accumulated batch or clear inflight
+        // Chain: fire next accumulated batch or clear inflight. With several
+        // groups in flight, the first to finish fires it; clearing the latch
+        // while other groups run only lets one more write go direct.
         if (!pg_write_batch_.entries.empty()) {
             firePgWriteBatchNow();
         } else {
@@ -1538,11 +1631,22 @@ private:
     // Per-tier concurrency budgets. Split so a burst of in-flight Redis sends
     // can never steal PG's connection slots (and vice-versa): under mixed
     // PG+Redis load PG keeps its full budget. Both reads and writes share the
-    // PG gate — writes still pipeline on a single connection, so the gate only
-    // bounds concurrent read fires against the write fire, never reorders them.
+    // PG gate; a write batch takes at most pg_write_fanout_ of it, leaving the
+    // rest to reads.
     ConcurrencyGate pg_gate_;
     ConcurrencyGate redis_gate_;
     TimingEstimator estimator_;
+
+    // Connections a write batch may span: half the PG budget, so reads keep
+    // the other half while writes wait on their commits.
+    static size_t writeFanout(int max_concurrent) noexcept {
+#ifdef RELAIS_BUILDING_TESTS
+        if (write_fanout_override > 0) return std::min(write_fanout_override, kMaxWriteFanout);
+#endif
+        return std::clamp<size_t>(static_cast<size_t>(std::max(1, max_concurrent / 2)),
+                                  1, kMaxWriteFanout);
+    }
+    size_t pg_write_fanout_;
 
     // Current accumulating batches (one of each at a time)
     PgReadBatch pg_read_batch_;
