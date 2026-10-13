@@ -19,6 +19,7 @@
  *   ./bench_relais_cache "[list-parse-hit]"  # parse + seal + L1 hit, 1-16 threads
  *   BENCH_SAMPLES=500 ./bench_relais_cache  # 500 samples per latency benchmark
  *   BENCH_DURATION_S=5 ./bench_relais_cache # custom duration for throughput
+ *   BENCH_WRITE_FANOUT=1 ./bench_relais_cache "[update-lists]"  # one connection per write batch
  */
 
 #include <catch2/catch_test_macros.hpp>
@@ -2221,6 +2222,81 @@ TEST_CASE("Benchmark - update with lists", "[benchmark][update-lists]") {
     WARN(formatTable("Update with lists — latency", lat));
     WARN(benchUpdateWithListsThroughput<UncachedArticleUpdateRepo>("Uncached"));
     WARN(benchUpdateWithListsThroughput<LocalArticleUpdateRepo>("Local"));
+}
+
+// #############################################################################
+//
+//  15b'''. Reads under write load — CORO coroutines update their own article
+//  while CORO others read items that are never cached (Uncached): both go to
+//  PostgreSQL through one pool. Reports the latency of the reads, which share
+//  the connection budget with the write batches, and the throughput of each.
+//
+//  Run with:
+//    ./bench_relais_cache "[write-read-mix]"
+//
+// #############################################################################
+
+TEST_CASE("Benchmark - reads under write load", "[benchmark][write-read-mix]") {
+    static constexpr int CORO = 32;
+    TransactionGuard tx;
+    auto author = insertTestUser("wrm_author", "wrm@test.com", 0);
+    std::vector<int64_t> articles, items;
+    for (int c = 0; c < CORO; ++c) {
+        articles.push_back(insertTestArticle("tech", author, "WRM", 1));
+        items.push_back(insertTestItem("wrm_" + std::to_string(c), c));
+    }
+
+    std::atomic<bool> running{true};
+    std::atomic<int64_t> writes{0};
+    std::atomic<int64_t> reads{0};
+    std::vector<std::vector<double>> read_us(CORO);
+    std::latch done{2 * CORO};
+    auto t0 = Clock::now();
+    for (int c = 0; c < CORO; ++c) {
+        detail::testLoop().dispatch([&, id = articles[c]]() {
+            [](int64_t id, int64_t author, std::atomic<bool>& running,
+               std::atomic<int64_t>& writes, std::latch& done) -> DetachedHandle {
+                int32_t views = 1;
+                while (running.load(std::memory_order_relaxed)) {
+                    co_await UncachedArticleUpdateRepo::update(
+                        id, makeTestArticle("tech", author, "WRM", ++views, false, id));
+                    writes.fetch_add(1, std::memory_order_relaxed);
+                }
+                done.count_down();
+            }(id, author, running, writes, done);
+        });
+        detail::testLoop().dispatch([&, id = items[c], &out = read_us[c]]() {
+            [](int64_t id, std::atomic<bool>& running, std::atomic<int64_t>& reads,
+               std::vector<double>& out, std::latch& done) -> DetachedHandle {
+                while (running.load(std::memory_order_relaxed)) {
+                    const auto start = Clock::now();
+                    doNotOptimize(co_await UncachedTestItemRepo::find(id));
+                    out.push_back(std::chrono::duration<double, std::micro>(
+                        Clock::now() - start).count());
+                    reads.fetch_add(1, std::memory_order_relaxed);
+                }
+                done.count_down();
+            }(id, running, reads, out, done);
+        });
+    }
+    std::this_thread::sleep_for(std::chrono::seconds(benchDurationSeconds()));
+    running.store(false, std::memory_order_relaxed);
+    done.wait();
+    const auto elapsed = Clock::now() - t0;
+
+    std::vector<double> all;
+    for (auto& v : read_us) all.insert(all.end(), v.begin(), v.end());
+    REQUIRE_FALSE(all.empty());
+    std::vector<BenchResult> lat{computeStats(
+        "find, item not cached (" + std::to_string(CORO) + " readers, "
+            + std::to_string(CORO) + " writers)", all)};
+    WARN(formatTable("Reads under write load — read latency", lat));
+    WARN(formatDurationThroughput(
+        "update throughput under reads (Uncached, " + std::to_string(CORO) + " coros)",
+        1, DurationResult{elapsed, writes.load()}));
+    WARN(formatDurationThroughput(
+        "find throughput under writes (Uncached, " + std::to_string(CORO) + " coros)",
+        1, DurationResult{elapsed, reads.load()}));
 }
 
 // #############################################################################
