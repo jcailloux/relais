@@ -336,6 +336,13 @@ inline void initTest() {
         } catch (...) {}
     }
 
+#ifdef RELAIS_BUILDING_TESTS
+    // Connections a write batch may span; unset or 0 derives it from pg_max.
+    if (auto* env = std::getenv("BENCH_WRITE_FANOUT"))
+        io::batch::BatchScheduler<IoCtx>::write_fanout_override =
+            static_cast<size_t>(std::max(0, std::atoi(env)));
+#endif
+
     // Phase 2: Start background event loop thread
     detail::testLoop().start();
 

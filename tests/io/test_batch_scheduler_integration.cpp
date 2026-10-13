@@ -2145,3 +2145,357 @@ TEST_CASE("Read in flight: a cancelled follower leaves the others to finish",
     REQUIRE_FALSE(timeout.timed_out);
     REQUIRE(done);
 }
+
+// =============================================================================
+// Write batch fan-out: a batch commits on several connections, one row per
+// connection, in submission order.
+// =============================================================================
+
+namespace relais_bench {
+
+struct BatchBenchAccessor {
+    static bool writeLatch(const BatchScheduler<Io>& b) { return b.pg_write_inflight_; }
+    static size_t detachedInflight(const BatchScheduler<Io>& b) { return b.detached_inflight_; }
+    static size_t writeFanout(const BatchScheduler<Io>& b) { return b.pg_write_fanout_; }
+};
+
+}  // namespace relais_bench
+
+namespace {
+
+using relais_bench::BatchBenchAccessor;
+
+constexpr const char* kFanoutTable = "relais_test_fanout";
+
+// Each statement answers (value, backend pid).
+constexpr const char* kAppendDigit =
+    "UPDATE relais_test_fanout SET v = v * 10 + $2 WHERE id = $1 RETURNING v, pg_backend_pid()";
+constexpr const char* kSetValue =
+    "UPDATE relais_test_fanout SET v = $2 WHERE id = $1 RETURNING v, pg_backend_pid()";
+constexpr const char* kInsertRow =
+    "INSERT INTO relais_test_fanout VALUES ($1, $2) RETURNING v, pg_backend_pid()";
+constexpr const char* kKillOwnBackend =
+    "SELECT $1::int + $2::int, pg_backend_pid() FROM pg_terminate_backend(pg_backend_pid())";
+constexpr const char* kEcho = "SELECT $1::int + $2::int, pg_backend_pid()";
+
+WriteAffinity rowOf() { return rowAt(tableTag(kFanoutTable), 0, 1); }
+
+struct Outcome {
+    bool done = false;
+    bool failed = false;
+    bool coalesced = false;
+    int value = 0;
+    int pid = 0;
+};
+
+DetachedTask fanoutWrite(std::shared_ptr<BatchScheduler<Io>> b, Outcome& out,
+                         const char* sql, int id, int arg, WriteAffinity affinity,
+                         WriteMode mode = WriteMode::Exclusive)
+{
+    try {
+        auto [result, coalesced] = co_await b->submitPgWrite(
+            sql, PgParams::make(id, arg), mode, affinity);
+        out.coalesced = coalesced;
+        out.failed = !result.ok();   // a failed statement answers an error result
+        if (result.rows() > 0) {
+            out.value = result[0].get<int32_t>(0);
+            out.pid = result[0].get<int32_t>(1);
+        }
+    } catch (...) {
+        out.failed = true;
+    }
+    out.done = true;
+}
+
+// A pool of 8 warm connections, so every group finds its own; the scheduler's
+// budget of 8 gives a fan-out of 4. Rows 1..8 hold v = 0.
+Task<std::shared_ptr<BatchScheduler<Io>>> fanoutScheduler(Io& io) {
+    auto pool = co_await PgPool<Io>::create(
+        io, CONNINFO, {.min_connections = 8, .max_connections = 8});
+    auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, nullptr, 8);
+    co_await bootstrapPg(batcher);
+    co_await batcher->directQuery(
+        "CREATE TABLE IF NOT EXISTS relais_test_fanout (id INT PRIMARY KEY, v INT NOT NULL)");
+    co_await batcher->directQuery("TRUNCATE relais_test_fanout");
+    co_await batcher->directQuery(
+        "INSERT INTO relais_test_fanout SELECT g, 0 FROM generate_series(1, 8) g");
+    co_return batcher;
+}
+
+// The leader goes direct; writes launched before it returns share one batch.
+void launchLeader(std::shared_ptr<BatchScheduler<Io>> b, Outcome& lead) {
+    fanoutWrite(std::move(b), lead, kEcho, 0, 0, kFree);
+}
+
+Task<void> settle(Io& io, std::span<Outcome> outs) {
+    while (!std::ranges::all_of(outs, &Outcome::done)) co_await YieldAwaiter{io};
+}
+
+template<typename Body>
+void runFanout(Body body) {
+    Io io;
+    bool done = false;
+    TimeoutGuard timeout(io);
+    [](Io& io, bool& done, Body body) -> DetachedTask {
+        auto batcher = co_await fanoutScheduler(io);
+        co_await body(io, batcher);
+        done = true;
+    }(io, done, std::move(body));
+    io.runUntil([&] { return done || timeout.timed_out; });
+    REQUIRE_FALSE(timeout.timed_out);
+    REQUIRE(done);
+}
+
+size_t distinctPids(std::span<const Outcome> outs) {
+    std::vector<int> pids;
+    for (const auto& o : outs) pids.push_back(o.pid);
+    std::ranges::sort(pids);
+    return static_cast<size_t>(std::ranges::unique(pids).begin() - pids.begin());
+}
+
+}  // namespace
+
+TEST_CASE("Write fan-out: the derived fan-out is half the PG budget",
+          "[io][batch][fanout]")
+{
+    Io io;
+    auto b8 = std::make_shared<BatchScheduler<Io>>(io, nullptr, nullptr, 8);
+    auto b1 = std::make_shared<BatchScheduler<Io>>(io, nullptr, nullptr, 1);
+    auto b64 = std::make_shared<BatchScheduler<Io>>(io, nullptr, nullptr, 64);
+    CHECK(BatchBenchAccessor::writeFanout(*b8) == 4);
+    CHECK(BatchBenchAccessor::writeFanout(*b1) == 1);
+    CHECK(BatchBenchAccessor::writeFanout(*b64) == 16);
+}
+
+TEST_CASE("Write fan-out: writes on distinct rows commit on several connections",
+          "[io][batch][fanout][integration]")
+{
+    runFanout([](Io& io, std::shared_ptr<BatchScheduler<Io>> b) -> Task<void> {
+        Outcome lead;
+        std::array<Outcome, 8> outs;
+        launchLeader(b, lead);
+        for (int i = 0; i < 8; ++i)
+            fanoutWrite(b, outs[i], kSetValue, i + 1, 10 + i, rowOf());
+        co_await settle(io, outs);
+        for (int i = 0; i < 8; ++i) {
+            REQUIRE_FALSE(outs[i].failed);
+            CHECK(outs[i].value == 10 + i);
+        }
+        CHECK(distinctPids(outs) == 4);
+        // Rows dealt round-robin: row i and row i + 4 share a connection.
+        for (int i = 0; i < 4; ++i) CHECK(outs[i].pid == outs[i + 4].pid);
+        co_await settle(io, std::span(&lead, 1));
+    });
+}
+
+TEST_CASE("Write fan-out: writes on one row keep submission order on one connection",
+          "[io][batch][fanout][integration]")
+{
+    runFanout([](Io& io, std::shared_ptr<BatchScheduler<Io>> b) -> Task<void> {
+        Outcome lead;
+        std::array<Outcome, 10> outs;   // row 1 gets digits 1..5, interleaved
+        launchLeader(b, lead);
+        for (int d = 1; d <= 5; ++d) {
+            fanoutWrite(b, outs[2 * (d - 1)], kAppendDigit, 1, d, rowOf());
+            fanoutWrite(b, outs[2 * (d - 1) + 1], kAppendDigit, d + 1, d, rowOf());
+        }
+        co_await settle(io, outs);
+        int expected = 0;
+        for (int d = 1; d <= 5; ++d) {
+            const auto& o = outs[2 * (d - 1)];
+            REQUIRE_FALSE(o.failed);
+            expected = expected * 10 + d;
+            CHECK(o.value == expected);
+            CHECK(o.pid == outs[0].pid);
+        }
+        CHECK(distinctPids(outs) > 1);
+        co_await settle(io, std::span(&lead, 1));
+    });
+}
+
+TEST_CASE("Write fan-out: a write of unknown row keeps the batch on one connection",
+          "[io][batch][fanout][integration]")
+{
+    runFanout([](Io& io, std::shared_ptr<BatchScheduler<Io>> b) -> Task<void> {
+        Outcome lead;
+        std::array<Outcome, 6> outs;
+        launchLeader(b, lead);
+        for (int i = 0; i < 5; ++i)
+            fanoutWrite(b, outs[i], kSetValue, i + 1, 7, rowOf());
+        fanoutWrite(b, outs[5], kSetValue, 6, 7, kOrdered);
+        co_await settle(io, outs);
+        for (const auto& o : outs) REQUIRE_FALSE(o.failed);
+        CHECK(distinctPids(outs) == 1);
+        co_await settle(io, std::span(&lead, 1));
+    });
+}
+
+TEST_CASE("Write fan-out: a key beyond the parameters keeps the batch on one connection",
+          "[io][batch][fanout][integration]")
+{
+    runFanout([](Io& io, std::shared_ptr<BatchScheduler<Io>> b) -> Task<void> {
+        Outcome lead;
+        std::array<Outcome, 4> outs;
+        launchLeader(b, lead);
+        for (int i = 0; i < 3; ++i)
+            fanoutWrite(b, outs[i], kSetValue, i + 1, 7, rowOf());
+        fanoutWrite(b, outs[3], kSetValue, 4, 7, rowAt(tableTag(kFanoutTable), 2, 1));
+        co_await settle(io, outs);
+        for (const auto& o : outs) REQUIRE_FALSE(o.failed);
+        CHECK(distinctPids(outs) == 1);
+        co_await settle(io, std::span(&lead, 1));
+    });
+}
+
+TEST_CASE("Write fan-out: free writes are dealt across connections",
+          "[io][batch][fanout][integration]")
+{
+    runFanout([](Io& io, std::shared_ptr<BatchScheduler<Io>> b) -> Task<void> {
+        Outcome lead;
+        std::array<Outcome, 8> outs;
+        launchLeader(b, lead);
+        for (int i = 0; i < 8; ++i)
+            fanoutWrite(b, outs[i], kInsertRow, 100 + i, i, kFree);
+        co_await settle(io, outs);
+        for (const auto& o : outs) REQUIRE_FALSE(o.failed);
+        CHECK(distinctPids(outs) == 4);
+        co_await settle(io, std::span(&lead, 1));
+    });
+}
+
+TEST_CASE("Write fan-out: coalesced followers in several groups get their leader's result",
+          "[io][batch][fanout][integration]")
+{
+    runFanout([](Io& io, std::shared_ptr<BatchScheduler<Io>> b) -> Task<void> {
+        Outcome lead;
+        std::array<Outcome, 6> outs;   // rows 1, 2, 3, three writes each
+        launchLeader(b, lead);
+        for (int i = 0; i < 6; ++i)
+            fanoutWrite(b, outs[i], kSetValue, i % 3 + 1, 40 + i % 3, rowOf(),
+                        WriteMode::Idempotent);
+        co_await settle(io, outs);
+        for (int i = 0; i < 6; ++i) {
+            REQUIRE_FALSE(outs[i].failed);
+            CHECK(outs[i].value == 40 + i % 3);
+            CHECK(outs[i].pid == outs[i % 3].pid);
+            CHECK(outs[i].coalesced == (i >= 3));
+        }
+        CHECK(distinctPids(outs) == 3);
+        co_await settle(io, std::span(&lead, 1));
+    });
+}
+
+TEST_CASE("Write fan-out: a lost connection fails only its own group",
+          "[io][batch][fanout][integration]")
+{
+    runFanout([](Io& io, std::shared_ptr<BatchScheduler<Io>> b) -> Task<void> {
+        Outcome lead;
+        // Row 1 is dealt to the first group: its first statement kills the
+        // group's backend, and the write after it on the same row is lost too.
+        std::array<Outcome, 4> outs;
+        launchLeader(b, lead);
+        fanoutWrite(b, outs[0], kKillOwnBackend, 1, 0, rowOf());
+        fanoutWrite(b, outs[1], kSetValue, 2, 5, rowOf());
+        fanoutWrite(b, outs[2], kSetValue, 3, 5, rowOf());
+        fanoutWrite(b, outs[3], kSetValue, 1, 5, rowOf());
+        co_await settle(io, outs);
+        CHECK(outs[0].failed);
+        CHECK(outs[3].failed);
+        CHECK_FALSE(outs[1].failed);
+        CHECK_FALSE(outs[2].failed);
+        CHECK(outs[1].pid != outs[2].pid);
+        co_await settle(io, std::span(&lead, 1));
+    });
+}
+
+TEST_CASE("Write fan-out: a failed statement fails only its own write",
+          "[io][batch][fanout][integration]")
+{
+    runFanout([](Io& io, std::shared_ptr<BatchScheduler<Io>> b) -> Task<void> {
+        Outcome lead;
+        std::array<Outcome, 4> outs;
+        launchLeader(b, lead);
+        fanoutWrite(b, outs[0], kInsertRow, 1, 0, rowOf());   // row 1 exists
+        fanoutWrite(b, outs[1], kSetValue, 2, 5, rowOf());
+        fanoutWrite(b, outs[2], kSetValue, 1, 6, rowOf());   // same group, after
+        fanoutWrite(b, outs[3], kSetValue, 3, 5, rowOf());
+        co_await settle(io, outs);
+        CHECK(outs[0].failed);
+        CHECK_FALSE(outs[1].failed);
+        CHECK_FALSE(outs[2].failed);
+        CHECK(outs[2].value == 6);
+        CHECK_FALSE(outs[3].failed);
+        co_await settle(io, std::span(&lead, 1));
+    });
+}
+
+TEST_CASE("Write fan-out: a cancelled write in one group leaves the others whole",
+          "[io][batch][fanout][integration]")
+{
+    runFanout([](Io& io, std::shared_ptr<BatchScheduler<Io>> b) -> Task<void> {
+        Outcome lead;
+        std::array<Outcome, 3> outs;
+        launchLeader(b, lead);
+        fanoutWrite(b, outs[0], kSetValue, 1, 8, rowOf());
+        // Started by hand, then destroyed before the batch fires: its entry
+        // is cancelled.
+        auto dropped = std::make_unique<Task<PgWriteResult>>(
+            b->submitPgWrite(kSetValue, PgParams::make(2, 8), WriteMode::Exclusive, rowOf()));
+        dropped->await_suspend(std::noop_coroutine()).resume();
+        fanoutWrite(b, outs[1], kSetValue, 3, 8, rowOf());
+        fanoutWrite(b, outs[2], kSetValue, 4, 8, rowOf());
+        dropped.reset();
+        co_await settle(io, outs);
+        for (const auto& o : outs) {
+            REQUIRE_FALSE(o.failed);
+            CHECK(o.value == 8);
+        }
+        co_await settle(io, std::span(&lead, 1));
+    });
+}
+
+TEST_CASE("Write fan-out: the latch and teardown accounting follow every group",
+          "[io][batch][fanout][integration]")
+{
+    runFanout([](Io& io, std::shared_ptr<BatchScheduler<Io>> b) -> Task<void> {
+        Outcome lead;
+        std::array<Outcome, 8> outs;
+        launchLeader(b, lead);
+        CHECK(BatchBenchAccessor::writeLatch(*b));
+        for (int i = 0; i < 8; ++i)
+            fanoutWrite(b, outs[i], kSetValue, i + 1, 3, rowOf());
+        while (BatchBenchAccessor::detachedInflight(*b) == 0) co_await YieldAwaiter{io};
+        CHECK_FALSE(b->quiescentForTeardown());
+        co_await settle(io, outs);
+        co_await settle(io, std::span(&lead, 1));
+        while (BatchBenchAccessor::detachedInflight(*b) != 0) co_await YieldAwaiter{io};
+        CHECK(b->quiescentForTeardown());
+        CHECK_FALSE(BatchBenchAccessor::writeLatch(*b));
+
+        // Alone again: a write goes direct, not through a batch.
+        Outcome alone;
+        fanoutWrite(b, alone, kSetValue, 1, 4, rowOf());
+        CHECK(BatchBenchAccessor::writeLatch(*b));
+        co_await settle(io, std::span(&alone, 1));
+        CHECK_FALSE(alone.failed);
+        CHECK_FALSE(BatchBenchAccessor::writeLatch(*b));
+    });
+}
+
+TEST_CASE("Write fan-out: a fan-out of 1 keeps every batch on one connection",
+          "[io][batch][fanout][integration]")
+{
+    BatchScheduler<Io>::write_fanout_override = 1;
+    struct Reset { ~Reset() { BatchScheduler<Io>::write_fanout_override = 0; } } reset;
+    runFanout([](Io& io, std::shared_ptr<BatchScheduler<Io>> b) -> Task<void> {
+        Outcome lead;
+        std::array<Outcome, 8> outs;
+        launchLeader(b, lead);
+        for (int i = 0; i < 8; ++i)
+            fanoutWrite(b, outs[i], kSetValue, i + 1, 2, rowOf());
+        co_await settle(io, outs);
+        for (const auto& o : outs) REQUIRE_FALSE(o.failed);
+        CHECK(distinctPids(outs) == 1);
+        co_await settle(io, std::span(&lead, 1));
+    });
+}
