@@ -277,7 +277,7 @@ if(RELAIS_BUILD_TESTS)
     relais_add_test(test_io_redis_integration tests/io/test_io_redis_integration.cpp LABELS "io;integration" RESOURCE_LOCK)
     relais_add_test(test_io_pg_pipeline       tests/io/test_pg_pipeline.cpp          LABELS "io;integration;pipeline" RESOURCE_LOCK)
     relais_add_test(test_io_redis_pool        tests/io/test_redis_pool.cpp           LABELS "io;integration;redis-pool" RESOURCE_LOCK)
-    relais_add_test(test_batch_scheduler_integration tests/io/test_batch_scheduler_integration.cpp LABELS "io;integration;batch" RESOURCE_LOCK)
+    relais_add_test(test_batch_scheduler_integration tests/io/test_batch_scheduler_integration.cpp DEFINITIONS RELAIS_BUILDING_TESTS LABELS "io;integration;batch" RESOURCE_LOCK)
     relais_add_test(test_io_pool_integration  tests/io/test_io_pool_integration.cpp   LABELS "io;integration;iopool" RESOURCE_LOCK)
     relais_add_test(test_io_liveness          tests/io/test_io_liveness.cpp           LABELS "io;integration;liveness" RESOURCE_LOCK)
 

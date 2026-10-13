@@ -29,6 +29,7 @@
 #include <fixtures/TestRunner.h>
 
 #include <atomic>
+#include <stdexcept>
 #include <chrono>
 #include <iomanip>
 #include <sstream>
@@ -115,16 +116,21 @@ DetachedTask pgWriteWorker(
     std::atomic<int64_t>& ops,
     std::atomic<int>& done_count)
 {
+    // A worker always counts its end: a write that throws would otherwise
+    // leave the level waiting for it forever.
+    struct Done {
+        std::atomic<int>& count;
+        ~Done() { count.fetch_add(1, std::memory_order_relaxed); }
+    } done{done_count};
     int counter = 0;
     while (running.load(std::memory_order_relaxed)) {
         ++counter;
         auto params = PgParams::make(counter % 1000, counter);
         auto [result, coalesced] = co_await batcher->submitPgWrite(PG_WRITE_SQL, std::move(params));
-        (void)result;
+        if (!result.ok()) throw std::runtime_error("write failed");
         (void)coalesced;
         ops.fetch_add(1, std::memory_order_relaxed);
     }
-    done_count.fetch_add(1, std::memory_order_relaxed);
 }
 
 DetachedTask redisWorker(
@@ -185,6 +191,19 @@ static Task<void> bootstrapRedis(BatchScheduler<Io>& batcher) {
     }
 }
 
+/// Suspends the calling coroutine for a millisecond. A level waits with it
+/// rather than running the loop itself: a loop nested in a resumed coroutine
+/// runs inside the handler that resumed it, and can wait forever for input
+/// that only the outer loop delivers.
+struct Pause {
+    Io& io;
+    bool await_ready() const noexcept { return false; }
+    void await_suspend(std::coroutine_handle<> h) const {
+        io.postDelayed(std::chrono::milliseconds(1), [h] { h.resume(); });
+    }
+    void await_resume() const noexcept {}
+};
+
 /// Run a concurrency level and return throughput.
 static Task<ConcurrencyResult> runPgReadLevel(
     Io& io, std::shared_ptr<PgPool<Io>> pool,
@@ -207,16 +226,12 @@ static Task<ConcurrencyResult> runPgReadLevel(
     int duration_s = benchDurationSeconds();
     auto deadline = start + std::chrono::seconds(duration_s);
 
-    io.runUntil([&] {
-        return Clock::now() >= deadline;
-    });
+    while (Clock::now() < deadline) co_await Pause{io};
 
     running.store(false, std::memory_order_relaxed);
 
     // Wait for all workers to finish their in-flight operation
-    io.runUntil([&] {
-        return done_count.load(std::memory_order_relaxed) >= concurrency;
-    });
+    while (done_count.load(std::memory_order_relaxed) < concurrency) co_await Pause{io};
 
     auto elapsed = Clock::now() - start;
     auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count();
@@ -236,9 +251,10 @@ static Task<ConcurrencyResult> runPgWriteLevel(
 {
     auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, nullptr, 8);
 
-    // Create temp table for writes
+    // A real table: a TEMP one exists only on the connection that created
+    // it, and writes run on every connection of the pool.
     co_await batcher->directQuery(
-        "CREATE TEMP TABLE IF NOT EXISTS batch_bench_write "
+        "CREATE TABLE IF NOT EXISTS batch_bench_write "
         "(id INT PRIMARY KEY, val INT)");
 
     co_await bootstrapPg(*batcher);
@@ -256,15 +272,11 @@ static Task<ConcurrencyResult> runPgWriteLevel(
     int duration_s = benchDurationSeconds();
     auto deadline = start + std::chrono::seconds(duration_s);
 
-    io.runUntil([&] {
-        return Clock::now() >= deadline;
-    });
+    while (Clock::now() < deadline) co_await Pause{io};
 
     running.store(false, std::memory_order_relaxed);
 
-    io.runUntil([&] {
-        return done_count.load(std::memory_order_relaxed) >= concurrency;
-    });
+    while (done_count.load(std::memory_order_relaxed) < concurrency) co_await Pause{io};
 
     auto elapsed = Clock::now() - start;
     auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count();
@@ -300,15 +312,11 @@ static Task<ConcurrencyResult> runRedisLevel(
     int duration_s = benchDurationSeconds();
     auto deadline = start + std::chrono::seconds(duration_s);
 
-    io.runUntil([&] {
-        return Clock::now() >= deadline;
-    });
+    while (Clock::now() < deadline) co_await Pause{io};
 
     running.store(false, std::memory_order_relaxed);
 
-    io.runUntil([&] {
-        return done_count.load(std::memory_order_relaxed) >= concurrency;
-    });
+    while (done_count.load(std::memory_order_relaxed) < concurrency) co_await Pause{io};
 
     auto elapsed = Clock::now() - start;
     auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count();
