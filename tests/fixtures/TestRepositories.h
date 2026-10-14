@@ -169,7 +169,6 @@ inline constexpr auto BareL1 = Local
 
 /// Read-only presets
 inline constexpr auto ReadOnlyUncached = Uncached.with_read_only();
-inline constexpr auto ReadOnlyL2 = Redis.with_read_only();
 
 } // namespace test_config
 
@@ -180,23 +179,8 @@ inline constexpr auto ReadOnlyL2 = Redis.with_read_only();
 /// No caching — tests PgRepo directly
 using UncachedTestItemRepo = Repo<TestItemEntity, "test:uncached", cfg::Uncached>;
 
-/// L1 only — tests LocalRepo without Redis
+/// L1 only — tests LocalRepo
 using L1TestItemRepo = Repo<TestItemEntity, "test:l1">;
-
-/// L2 only — tests RedisRepo
-using L2TestItemRepo = Repo<TestItemEntity, "test:l2", cfg::Redis>;
-
-/// Both L1+L2 — tests full hierarchy
-using FullCacheTestItemRepo = Repo<TestItemEntity, "test:both", cfg::Both>;
-
-/// L2 only, multi-instance topology — Redis-side generation coherence (12b)
-using SharedL2TestItemRepo =
-    Repo<TestItemEntity, "test:l2:shared", cfg::Redis.with_l2_shared_across_instances()>;
-
-/// Both L1+L2, multi-instance topology — L1 process-local recheck + L2
-/// Redis-side generation (12b)
-using SharedBothTestItemRepo =
-    Repo<TestItemEntity, "test:both:shared", cfg::Both.with_l2_shared_across_instances()>;
 
 // Configuration test repositories
 using ShortTTLTestItemRepo = Repo<TestItemEntity, "test:short_ttl", test_config::ShortTTL>;
@@ -209,8 +193,6 @@ using FewChunksTestItemRepo = Repo<TestItemEntity, "test:few_chunks", test_confi
 
 using UncachedTestUserRepo = Repo<TestUserEntity, "test:user:uncached", cfg::Uncached>;
 using L1TestUserRepo = Repo<TestUserEntity, "test:user:l1">;
-using L2TestUserRepo = Repo<TestUserEntity, "test:user:l2", cfg::Redis>;
-using FullCacheTestUserRepo = Repo<TestUserEntity, "test:user:both", cfg::Both>;
 
 // =============================================================================
 // Purchase Repositories (has ListDescriptor → ListMixin auto-detected)
@@ -229,7 +211,6 @@ using L1TestPurchaseRepo = Repo<TestPurchaseEntity, "test:purchase:l1", cfg::Loc
 
 using UncachedTestArticleRepo = Repo<TestArticleEntity, "test:article:uncached", cfg::Uncached>;
 using L1TestArticleRepo = Repo<TestArticleEntity, "test:article:l1">;
-using L2TestArticleRepo = Repo<TestArticleEntity, "test:article:l2", cfg::Redis>;
 
 // =============================================================================
 // ListDescriptor Repositories — auto-detected from Entity's embedded descriptor
@@ -250,13 +231,6 @@ using TestPurchaseListRepo = Repo<TestPurchaseEntity, "test:purchase:list:l1">;
 
 /// Base-level read-only — no caching, no writes allowed
 using ReadOnlyTestItemRepo = Repo<TestItemEntity, "test:readonly:uncached", test_config::ReadOnlyUncached>;
-
-/// L2 read-only — Redis caching, no writes allowed
-using ReadOnlyL2TestItemRepo = Repo<TestItemEntity, "test:readonly:l2", test_config::ReadOnlyL2>;
-
-/// L2 read-only user — Redis caching, no writes.
-/// RedisRepo provides invalidate() for cross-invalidation target use.
-using ReadOnlyL2TestUserRepo = Repo<TestUserEntity, "test:readonly:user:l2", test_config::ReadOnlyL2>;
 
 // =============================================================================
 // Product Repositories (column= mapping: C++ field names ≠ DB column names)
@@ -311,8 +285,6 @@ inline TestEventEntity makeTestEvent(
 
 using UncachedTestEventRepo = Repo<TestEventEntity, "test:event:partial:uncached", cfg::Uncached>;
 using L1TestEventRepo = Repo<TestEventEntity, "test:event:partial:l1">;
-using L2TestEventRepo = Repo<TestEventEntity, "test:event:partial:l2", cfg::Redis>;
-using L1L2TestEventRepo = Repo<TestEventEntity, "test:event:partial:both", cfg::Both>;
 
 // =============================================================================
 // Membership Repositories (composite key: user_id + group_id)
@@ -320,8 +292,6 @@ using L1L2TestEventRepo = Repo<TestEventEntity, "test:event:partial:both", cfg::
 
 using UncachedTestMembershipRepo = Repo<TestMembershipEntity, "test:member:uncached", cfg::Uncached>;
 using L1TestMembershipRepo = Repo<TestMembershipEntity, "test:member:l1">;
-using L2TestMembershipRepo = Repo<TestMembershipEntity, "test:member:l2", cfg::Redis>;
-using FullCacheTestMembershipRepo = Repo<TestMembershipEntity, "test:member:both", cfg::Both>;
 
 inline TestMembershipEntity makeTestMembership(
     int64_t user_id,
@@ -341,7 +311,6 @@ inline TestMembershipEntity makeTestMembership(
 
 using UncachedTestAssignedKeyRepo = Repo<TestAssignedKeyEntity, "test:akey:uncached", cfg::Uncached>;
 using L1TestAssignedKeyRepo = Repo<TestAssignedKeyEntity, "test:akey:l1">;
-using FullCacheTestAssignedKeyRepo = Repo<TestAssignedKeyEntity, "test:akey:both", cfg::Both>;
 
 inline TestAssignedKeyEntity makeTestAssignedKey(
     int64_t key_id,
@@ -362,14 +331,13 @@ inline TestAssignedKeyEntity makeTestAssignedKey(
 
 using UncachedTestAllPkJunctionRepo = Repo<TestAllPkJunctionEntity, "test:junction:uncached", cfg::Uncached>;
 using L1TestAllPkJunctionRepo = Repo<TestAllPkJunctionEntity, "test:junction:l1">;
-using FullCacheTestAllPkJunctionRepo = Repo<TestAllPkJunctionEntity, "test:junction:both", cfg::Both>;
 
 // =============================================================================
 // Read-only view Repositories (@relais read_only — no writes, empty Field enum)
 // =============================================================================
 
 using UncachedTestReadOnlyViewRepo = Repo<TestReadOnlyViewEntity, "test:roview:uncached", test_config::ReadOnlyUncached>;
-using L2TestReadOnlyViewRepo = Repo<TestReadOnlyViewEntity, "test:roview:l2", test_config::ReadOnlyL2>;
+using L1TestReadOnlyViewRepo = Repo<TestReadOnlyViewEntity, "test:roview:l1", cfg::Local.with_read_only()>;
 
 // =============================================================================
 // Read-only aggregated view with array columns (int8[]/text[] -> std::vector)
@@ -426,15 +394,12 @@ using InvalidatingTestAssignedKeyRepo = Repo<TestAssignedKeyEntity, "test:akey:i
 
 using UncachedTestSlotRepo = Repo<TestSlotEntity, "test:slot:uncached", cfg::Uncached>;
 using L1TestSlotRepo = Repo<TestSlotEntity, "test:slot:l1">;
-using L2TestSlotRepo = Repo<TestSlotEntity, "test:slot:l2", cfg::Redis>;
-using FullCacheTestSlotRepo = Repo<TestSlotEntity, "test:slot:both", cfg::Both>;
 
 using UncachedTestSlotTallyRepo = Repo<TestSlotTallyEntity, "test:tally:uncached", cfg::Uncached>;
-using FullCacheTestSlotTallyRepo = Repo<TestSlotTallyEntity, "test:tally:both", cfg::Both>;
+using L1TestSlotTallyRepo = Repo<TestSlotTallyEntity, "test:tally:l1">;
 
-/// Slots paged by group (ListMixin), on L1 lists and on L1+L2 lists.
+/// Slots paged by group (ListMixin), on L1 lists.
 using L1TestSlotListRepo = Repo<TestSlotListEntity, "test:slotlist:l1">;
-using FullCacheTestSlotListRepo = Repo<TestSlotListEntity, "test:slotlist:both", cfg::Both>;
 
 /// A slot's group_id doubles as a foreign key into a dedicated item repo, so a
 /// guarded write that moves it cross-invalidates the old and new target.
@@ -455,6 +420,5 @@ using ListInvalidatingTestSlotRepo = Repo<TestSlotListEntity, "test:slotlist:lis
 // =============================================================================
 
 using L1TestTicketRepo = Repo<TestTicketEntity, "test:ticket:l1">;
-using L2TestTicketRepo = Repo<TestTicketEntity, "test:ticket:l2", cfg::Redis>;
 
 } // namespace relais_test

@@ -8,7 +8,7 @@
  * HTTP / HTML-form boolean conventions (case-insensitive), feeding both the
  * scalar EQ path (parseValue) and the IN-list path (parseInElement).
  *
- * Pure unit test (no DB / Redis): hand-built descriptors on the committed
+ * Pure unit test (no DB): hand-built descriptors on the committed
  * TestArticleEntity fixture, independent of the generator work.
  */
 

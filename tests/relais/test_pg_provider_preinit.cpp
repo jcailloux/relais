@@ -10,10 +10,7 @@ using jcailloux::relais::PgProvider;
 // thread throws std::logic_error (it does NOT assert/abort). This holds in
 // every build configuration, including Release where assert() is compiled out.
 //
-// The five non-coroutine entry points throw synchronously on call. The Redis
-// helpers (redis/redisDynamic) are coroutines with suspend_always
-// initial_suspend — their throw surfaces on co_await, not on call — so they
-// require a running loop and are covered by the integration suites.
+// The five entry points below throw synchronously on call.
 // =============================================================================
 
 TEST_CASE("PgProvider entry points throw logic_error before init", "[pg-provider][preinit]") {

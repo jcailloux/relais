@@ -2,7 +2,7 @@
  * test_composite_key.cpp
  * Integration tests for composite key repositories.
  *
- * Tests CRUD, L1/L2 caching with std::tuple<int64_t, int64_t> as Key.
+ * Tests CRUD and L1 caching with std::tuple<int64_t, int64_t> as Key.
  */
 
 #include <catch2/catch_test_macros.hpp>
@@ -190,6 +190,11 @@ TEST_CASE("CompositeKey<TestMembership> - L1 Cache",
         REQUIRE(found != nullptr);
         CHECK(found->role == "admin");
 
+        // The entity now sits in L1
+        auto cachedL1 = TestInternals::getFromCache<L1TestMembershipRepo>(key);
+        REQUIRE(cachedL1 != nullptr);
+        CHECK(cachedL1->role == "admin");
+
         // Second find should come from L1
         auto cached = sync(L1TestMembershipRepo::find(key));
         REQUIRE(cached != nullptr);
@@ -223,104 +228,21 @@ TEST_CASE("CompositeKey<TestMembership> - L1 Cache",
         auto cached = TestInternals::getFromCache<L1TestMembershipRepo>(key);
         CHECK(cached == nullptr);
     }
-}
 
-// #############################################################################
-//
-//  4. Composite Key + L2 (Redis) Cache
-//
-// #############################################################################
-
-TEST_CASE("CompositeKey<TestMembership> - L2 Cache",
-          "[integration][db][composite-key][redis]")
-{
-    TransactionGuard tx;
-
-    using Key = std::tuple<int64_t, int64_t>;
-
-    SECTION("[find] caches in Redis") {
-        insertTestMembership(120, 220, "admin");
-        Key key{120, 220};
-
-        auto found = sync(L2TestMembershipRepo::find(key));
-        REQUIRE(found != nullptr);
-        CHECK(found->role == "admin");
-
-        // Verify Redis key format
-        auto redisKey = L2TestMembershipRepo::makeRedisKey(key);
-        CHECK(redisKey == "test:member:l2:120:220");
-    }
-
-    SECTION("[insert] populates Redis cache") {
-        auto wrapper = makeTestMembership(121, 221, "member");
-        auto inserted = sync(L2TestMembershipRepo::insert(wrapper));
-        REQUIRE(inserted != nullptr);
-
-        // Should be findable from Redis
-        auto found = sync(L2TestMembershipRepo::find(Key{121, 221}));
-        REQUIRE(found != nullptr);
-        CHECK(found->role == "member");
-    }
-
-    SECTION("[erase] invalidates Redis cache") {
-        insertTestMembership(122, 222, "viewer");
-        Key key{122, 222};
-
-        // Populate Redis
-        sync(L2TestMembershipRepo::find(key));
-
-        // Erase
-        auto result = sync(L2TestMembershipRepo::erase(key));
-        REQUIRE(result.has_value());
-        CHECK(*result == 1);
-
-        // Not found after erase
-        auto found = sync(L2TestMembershipRepo::find(key));
-        CHECK(found == nullptr);
-    }
-}
-
-// #############################################################################
-//
-//  5. Composite Key + L1+L2 Cache
-//
-// #############################################################################
-
-TEST_CASE("CompositeKey<TestMembership> - L1+L2 Cache",
-          "[integration][db][composite-key][cached][redis]")
-{
-    TransactionGuard tx;
-
-    using Key = std::tuple<int64_t, int64_t>;
-
-    SECTION("[find] populates both L1 and L2") {
-        insertTestMembership(130, 230, "admin");
-        Key key{130, 230};
-
-        auto found = sync(FullCacheTestMembershipRepo::find(key));
-        REQUIRE(found != nullptr);
-        CHECK(found->role == "admin");
-
-        // Check L1
-        auto cachedL1 = TestInternals::getFromCache<FullCacheTestMembershipRepo>(key);
-        REQUIRE(cachedL1 != nullptr);
-        CHECK(cachedL1->role == "admin");
-    }
-
-    SECTION("[update] invalidates caches") {
+    SECTION("[update] invalidates L1 cache") {
         insertTestMembership(131, 231, "member");
         Key key{131, 231};
 
-        // Populate caches
-        sync(FullCacheTestMembershipRepo::find(key));
+        // Populate L1
+        sync(L1TestMembershipRepo::find(key));
 
         // Update
         auto updated = makeTestMembership(131, 231, "admin");
-        auto ok = sync(FullCacheTestMembershipRepo::update(key, updated));
+        auto ok = sync(L1TestMembershipRepo::update(key, updated));
         REQUIRE(ok == 1);
 
         // Find updated entity
-        auto found = sync(FullCacheTestMembershipRepo::find(key));
+        auto found = sync(L1TestMembershipRepo::find(key));
         REQUIRE(found != nullptr);
         CHECK(found->role == "admin");
     }

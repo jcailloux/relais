@@ -5,6 +5,7 @@
  * Covers:
  * - Query: filters, combined filters, limits, empty results
  * - Item access: front / back accessors
+ * - queryJson / queryBinary: content on a miss and on an L1 hit
  * - SortBounds-based invalidation: only pages whose sort range includes
  *   the modified entity's value are invalidated
  * - Filter matching: only pages matching the entity's filter values are affected
@@ -113,8 +114,8 @@ TEST_CASE("[decl-sortby] yields identical canonical keys as raw index", "[decl][
     pIndex.sort = SortSpec<size_t>{1, SortDirection::Desc};  // raw sort index
     auto viaIndex = decl::seal<TestDecl>(pIndex);
 
-    // group_key drives Redis invalidation — any drift would corrupt
-    // invalidation, not just sorting.
+    // The keys identify the cached page: any drift would split one query
+    // across distinct cache entries.
     REQUIRE(viaName.sort() == viaIndex.sort());
     REQUIRE(viaName.groupKey() == viaIndex.groupKey());
     REQUIRE(viaName.cacheKey() == viaIndex.cacheKey());
@@ -150,7 +151,7 @@ TEST_CASE("[decl-builder] builder equals a hand-sealed query", "[decl][builder]"
     auto sealed = decl::seal<TestDecl>(p);
 
     // operator== covers params + both keys; assert the keys explicitly too,
-    // since group_key drives Redis invalidation.
+    // since they identify the cached page.
     REQUIRE(built == sealed);
     REQUIRE(built.groupKey() == sealed.groupKey());
     REQUIRE(built.cacheKey() == sealed.cacheKey());
@@ -336,6 +337,113 @@ TEST_CASE("[DeclListRepo] L1 hit keyed through the per-thread buffer",
         auto hit = TestArticleListRepo::query(q);
         CHECK(hit.await_ready());
         CHECK(jcailloux::relais::detail::listKeyScratch().capacity() <= 4096);
+    }
+}
+
+// #############################################################################
+//
+//  queryJson / queryBinary — serialized pages
+//
+// #############################################################################
+
+TEST_CASE("[DeclListRepo] queryJson",
+          "[integration][db][list][queryJson]")
+{
+    TransactionGuard tx;
+    TestInternals::resetListCacheState<TestArticleListRepo>();
+
+    SECTION("[queryJson] a miss returns the rows as JSON") {
+        auto userId = insertTestUser("author", "author@qj.com", 0);
+        insertTestArticle("tech", userId, "QJ Article 1", 10);
+        insertTestArticle("tech", userId, "QJ Article 2", 20);
+
+        auto json = sync(TestArticleListRepo::queryJson(makeArticleQuery("tech")));
+
+        REQUIRE(!json.empty());
+        CHECK(json.find("QJ Article 1") != std::string::npos);
+        CHECK(json.find("QJ Article 2") != std::string::npos);
+    }
+
+    SECTION("[queryJson] an L1 hit serializes the cached page") {
+        auto userId = insertTestUser("author", "author@qj2.com", 0);
+        insertTestArticle("tech", userId, "Hit Article 1", 10);
+        insertTestArticle("tech", userId, "Hit Article 2", 20);
+
+        const auto q = makeArticleQuery("tech");
+        REQUIRE(sync(TestArticleListRepo::query(q))->size() == 2);
+
+        // Not notified to the list cache: only the cached page omits it.
+        insertTestArticle("tech", userId, "Hit Article 3", 30);
+
+        auto json = sync(TestArticleListRepo::queryJson(q));
+        REQUIRE(!json.empty());
+        CHECK(json.find("Hit Article 1") != std::string::npos);
+        CHECK(json.find("Hit Article 2") != std::string::npos);
+        CHECK(json.find("Hit Article 3") == std::string::npos);
+    }
+
+    SECTION("[queryJson] an empty result is an object with an empty items array") {
+        auto json = sync(TestArticleListRepo::queryJson(makeArticleQuery("nonexistent_qj")));
+
+        REQUIRE(!json.empty());
+        CHECK(json.front() == '{');
+        CHECK(json.back() == '}');
+        CHECK(json.find(R"("items":[])") != std::string::npos);
+    }
+
+    SECTION("[queryJson] matches query().json() byte for byte") {
+        auto userId = insertTestUser("author", "author@qj3.com", 0);
+        insertTestArticle("news", userId, "Byte Article", 42);
+
+        const auto q = makeArticleQuery("news");
+        auto page = sync(TestArticleListRepo::query(q));
+        REQUIRE(page != nullptr);
+        const auto entityJson = page->json();
+
+        // On a hit and on a miss alike
+        CHECK(sync(TestArticleListRepo::queryJson(q)) == entityJson);
+        TestInternals::resetListCacheState<TestArticleListRepo>();
+        CHECK(sync(TestArticleListRepo::queryJson(q)) == entityJson);
+    }
+}
+
+TEST_CASE("[DeclListRepo] queryBinary",
+          "[integration][db][list][queryBinary]")
+{
+    TransactionGuard tx;
+    TestInternals::resetListCacheState<TestArticleListRepo>();
+
+    SECTION("[queryBinary] a miss returns the rows as BEVE") {
+        auto userId = insertTestUser("author", "author@qb.com", 0);
+        insertTestArticle("tech", userId, "QB Article 1", 10);
+
+        auto beve = sync(TestArticleListRepo::queryBinary(makeArticleQuery("tech")));
+        REQUIRE(!beve.empty());
+
+        std::string json;
+        REQUIRE(!glz::beve_to_json(beve, json));
+        CHECK(json.find("QB Article 1") != std::string::npos);
+    }
+
+    SECTION("[queryBinary] an L1 hit serializes the cached page") {
+        auto userId = insertTestUser("author", "author@qb2.com", 0);
+        insertTestArticle("tech", userId, "BinH Article 1", 10);
+        insertTestArticle("tech", userId, "BinH Article 2", 20);
+
+        const auto q = makeArticleQuery("tech");
+        REQUIRE(sync(TestArticleListRepo::query(q))->size() == 2);
+
+        // Not notified to the list cache: only the cached page omits it.
+        insertTestArticle("tech", userId, "BinH Article 3", 30);
+
+        auto beve = sync(TestArticleListRepo::queryBinary(q));
+        REQUIRE(!beve.empty());
+
+        std::string json;
+        REQUIRE(!glz::beve_to_json(beve, json));
+        CHECK(json.find("BinH Article 1") != std::string::npos);
+        CHECK(json.find("BinH Article 2") != std::string::npos);
+        CHECK(json.find("BinH Article 3") == std::string::npos);
     }
 }
 

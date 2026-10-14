@@ -33,7 +33,6 @@
 #include "fixtures/TestRepositories.h"
 #include "fixtures/TestQueryHelpers.h"
 #include "fixtures/RelaisTestAccessors.h"
-#include "jcailloux/relais/cache/RedisCache.h"
 
 using namespace relais_test;
 
@@ -49,10 +48,6 @@ std::optional<AkeyRow> dbAkey(int64_t key_id) {
         "SELECT payload, note FROM relais_test_assigned_keys WHERE key_id = $1", key_id);
     if (r.empty()) return std::nullopt;
     return AkeyRow{r[0].get<int64_t>(0), r[0].get<std::string>(1)};
-}
-
-io::Task<std::optional<std::string>> redisGet(std::string key) {
-    co_return co_await jr::cache::RedisCache::getRaw(key);
 }
 
 }  // namespace
@@ -162,16 +157,6 @@ TEST_CASE("[upsert] insert branch commits and caches the row",
         REQUIRE(v);
         CHECK(v->payload == 20);
     }
-
-    SECTION("Both: the committed row lands in L2") {
-        TestInternals::resetEntityCacheState<FullCacheTestAssignedKeyRepo>();
-
-        auto v = sync(FullCacheTestAssignedKeyRepo::upsert(makeTestAssignedKey(3, 30, "c")));
-        REQUIRE(v);
-
-        auto key = FullCacheTestAssignedKeyRepo::makeRedisKey(int64_t{3});
-        REQUIRE(sync(redisGet(key)).has_value());   // store-through reached Redis
-    }
 }
 
 // #############################################################################
@@ -215,20 +200,6 @@ TEST_CASE("[upsert] update branch supersedes the cached value",
         CHECK(v->note == "new");
     }
 
-    SECTION("Both: L2 holds the new value (no stale straddle)") {
-        TestInternals::resetEntityCacheState<FullCacheTestAssignedKeyRepo>();
-
-        sync(FullCacheTestAssignedKeyRepo::upsert(makeTestAssignedKey(7, 1, "old")));
-        sync(FullCacheTestAssignedKeyRepo::find(7));  // warm L1+L2
-        sync(FullCacheTestAssignedKeyRepo::upsert(makeTestAssignedKey(7, 2, "new")));
-
-        // Drop L1 so the next read must go through L2 — proves L2 was superseded.
-        TestInternals::evict<FullCacheTestAssignedKeyRepo>(int64_t{7});
-        auto v = sync(FullCacheTestAssignedKeyRepo::find(7));
-        REQUIRE(v);
-        CHECK(v->payload == 2);
-    }
-
     SECTION("idempotent: a second identical upsert converges") {
         sync(UncachedTestAssignedKeyRepo::upsert(makeTestAssignedKey(8, 42, "x")));
         auto v = sync(UncachedTestAssignedKeyRepo::upsert(makeTestAssignedKey(8, 42, "x")));
@@ -257,23 +228,25 @@ TEST_CASE("[upsert] composite key targets the exact row",
     TransactionGuard tx;
 
     SECTION("insert then update the same (user_id, group_id)") {
-        auto a = sync(FullCacheTestMembershipRepo::upsert(makeTestMembership(1, 2, "member")));
+        TestInternals::resetEntityCacheState<L1TestMembershipRepo>();
+
+        auto a = sync(L1TestMembershipRepo::upsert(makeTestMembership(1, 2, "member")));
         REQUIRE(a);
         CHECK(a->role == "member");
 
-        auto b = sync(FullCacheTestMembershipRepo::upsert(makeTestMembership(1, 2, "admin")));
+        auto b = sync(L1TestMembershipRepo::upsert(makeTestMembership(1, 2, "admin")));
         REQUIRE(b);
         CHECK(b->user_id == 1);
         CHECK(b->group_id == 2);
         CHECK(b->role == "admin");   // updated in place
 
         // A neighbouring composite key is untouched by the conflict resolution.
-        sync(FullCacheTestMembershipRepo::upsert(makeTestMembership(1, 3, "guest")));
-        auto other = sync(FullCacheTestMembershipRepo::find(std::make_tuple(int64_t{1}, int64_t{3})));
+        sync(L1TestMembershipRepo::upsert(makeTestMembership(1, 3, "guest")));
+        auto other = sync(L1TestMembershipRepo::find(std::make_tuple(int64_t{1}, int64_t{3})));
         REQUIRE(other);
         CHECK(other->role == "guest");
 
-        auto still = sync(FullCacheTestMembershipRepo::find(std::make_tuple(int64_t{1}, int64_t{2})));
+        auto still = sync(L1TestMembershipRepo::find(std::make_tuple(int64_t{1}, int64_t{2})));
         REQUIRE(still);
         CHECK(still->role == "admin");
     }

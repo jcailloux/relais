@@ -8,13 +8,11 @@
  * Exercises all mixin combinations:
  *   - Uncached (PgRepo only)
  *   - L1 (LocalRepo)
- *   - L2 (RedisRepo)
- *   - L1+L2 (LocalRepo + RedisRepo)
  *   - With ListDescriptor (ListMixin auto-detected)
  *   - With cross-invalidation (InvalidationMixin)
  *   - Read-only variants
  *
- * No database or Redis connection needed — all tests are structural.
+ * No database connection needed — all tests are structural.
  */
 
 #include <catch2/catch_test_macros.hpp>
@@ -61,16 +59,6 @@ TEST_CASE("Repo instantiation - all cache levels", "[repository][compile]") {
                                        entity::generated::TestItemEntity>);
         STATIC_REQUIRE(std::is_same_v<L1TestItemRepo::KeyType, int64_t>);
     }
-
-    SECTION("L2 - RedisRepo") {
-        STATIC_REQUIRE(std::is_same_v<L2TestItemRepo::EntityType,
-                                       entity::generated::TestItemEntity>);
-    }
-
-    SECTION("L1+L2 - full hierarchy") {
-        STATIC_REQUIRE(std::is_same_v<FullCacheTestItemRepo::EntityType,
-                                       entity::generated::TestItemEntity>);
-    }
 }
 
 // =============================================================================
@@ -80,8 +68,6 @@ TEST_CASE("Repo instantiation - all cache levels", "[repository][compile]") {
 TEST_CASE("Repo name()", "[repository][compile]") {
     REQUIRE(std::string(UncachedTestItemRepo::name()) == "test:uncached");
     REQUIRE(std::string(L1TestItemRepo::name()) == "test:l1");
-    REQUIRE(std::string(L2TestItemRepo::name()) == "test:l2");
-    REQUIRE(std::string(FullCacheTestItemRepo::name()) == "test:both");
 }
 
 // =============================================================================
@@ -98,16 +84,6 @@ TEST_CASE("Repo config", "[repository][compile]") {
     SECTION("L1 local") {
         constexpr auto cfg = L1TestItemRepo::config;
         STATIC_REQUIRE(cfg.cache_level == jcailloux::relais::config::CacheLevel::L1);
-    }
-
-    SECTION("L2 Redis") {
-        constexpr auto cfg = L2TestItemRepo::config;
-        STATIC_REQUIRE(cfg.cache_level == jcailloux::relais::config::CacheLevel::L2);
-    }
-
-    SECTION("L1+L2 Both") {
-        constexpr auto cfg = FullCacheTestItemRepo::config;
-        STATIC_REQUIRE(cfg.cache_level == jcailloux::relais::config::CacheLevel::L1_L2);
     }
 }
 
@@ -141,8 +117,7 @@ TEST_CASE("LocalRepo features", "[repository][compile][cached]") {
 // =============================================================================
 
 TEMPLATE_TEST_CASE("L1 maintenance without L1 is neutral", "[repository][compile][maintenance]",
-                   UncachedTestItemRepo, L2TestItemRepo,
-                   UncachedTestArticleRepo, L2TestArticleRepo) {
+                   UncachedTestItemRepo, UncachedTestArticleRepo) {
     STATIC_REQUIRE(std::is_same_v<decltype(TestType::size()), size_t>);
     STATIC_REQUIRE(std::is_same_v<decltype(TestType::purge()), size_t>);
     STATIC_REQUIRE(std::is_same_v<decltype(TestType::warmup()), void>);
@@ -219,12 +194,6 @@ TEST_CASE("Read-only repositories", "[repository][compile][readonly]") {
         STATIC_REQUIRE(cfg.read_only);
         STATIC_REQUIRE(cfg.cache_level == jcailloux::relais::config::CacheLevel::None);
     }
-
-    SECTION("ReadOnly L2") {
-        constexpr auto cfg = ReadOnlyL2TestItemRepo::config;
-        STATIC_REQUIRE(cfg.read_only);
-        STATIC_REQUIRE(cfg.cache_level == jcailloux::relais::config::CacheLevel::L2);
-    }
 }
 
 // =============================================================================
@@ -253,16 +222,15 @@ TEST_CASE("All-PK junction entity", "[repository][compile][junction]") {
     }
 
     SECTION("update() is cleanly absent from the whole chain") {
-        STATIC_REQUIRE(!RepoHasUpdate<FullCacheTestAllPkJunctionRepo>);
         STATIC_REQUIRE(!RepoHasUpdate<L1TestAllPkJunctionRepo>);
         STATIC_REQUIRE(!RepoHasUpdate<UncachedTestAllPkJunctionRepo>);
         // sanity: a normal entity's repo keeps update()
-        STATIC_REQUIRE(RepoHasUpdate<FullCacheTestItemRepo>);
+        STATIC_REQUIRE(RepoHasUpdate<L1TestItemRepo>);
     }
 
-    SECTION("full mixin chain instantiates (L1+L2)") {
-        STATIC_REQUIRE(std::is_same_v<FullCacheTestAllPkJunctionRepo::EntityType, Entity>);
-        REQUIRE(FullCacheTestAllPkJunctionRepo::size() == 0);
+    SECTION("full mixin chain instantiates (L1)") {
+        STATIC_REQUIRE(std::is_same_v<L1TestAllPkJunctionRepo::EntityType, Entity>);
+        REQUIRE(L1TestAllPkJunctionRepo::size() == 0);
         REQUIRE(std::string(UncachedTestAllPkJunctionRepo::name()) == "test:junction:uncached");
     }
 }
@@ -286,7 +254,9 @@ TEST_CASE("Read-only view entity", "[repository][compile][readonly]") {
 
     SECTION("read-only repo chain instantiates") {
         STATIC_REQUIRE(UncachedTestReadOnlyViewRepo::config.read_only);
-        STATIC_REQUIRE(L2TestReadOnlyViewRepo::config.read_only);
+        STATIC_REQUIRE(L1TestReadOnlyViewRepo::config.read_only);
+        STATIC_REQUIRE(L1TestReadOnlyViewRepo::config.cache_level
+                       == jcailloux::relais::config::CacheLevel::L1);
         STATIC_REQUIRE(std::is_same_v<UncachedTestReadOnlyViewRepo::KeyType, int64_t>);
         REQUIRE(std::string(UncachedTestReadOnlyViewRepo::name()) == "test:roview:uncached");
     }
@@ -299,8 +269,6 @@ TEST_CASE("Read-only view entity", "[repository][compile][readonly]") {
 TEST_CASE("User repository variants", "[repository][compile]") {
     REQUIRE(std::string(UncachedTestUserRepo::name()) == "test:user:uncached");
     REQUIRE(std::string(L1TestUserRepo::name()) == "test:user:l1");
-    REQUIRE(std::string(L2TestUserRepo::name()) == "test:user:l2");
-    REQUIRE(std::string(FullCacheTestUserRepo::name()) == "test:user:both");
 }
 
 // =============================================================================
@@ -314,14 +282,6 @@ TEST_CASE("PartitionKey event repositories", "[repository][compile][partition_ke
 
     SECTION("L1 event") {
         STATIC_REQUIRE(std::is_same_v<L1TestEventRepo::KeyType, int64_t>);
-    }
-
-    SECTION("L2 event") {
-        STATIC_REQUIRE(std::is_same_v<L2TestEventRepo::KeyType, int64_t>);
-    }
-
-    SECTION("L1+L2 event") {
-        STATIC_REQUIRE(std::is_same_v<L1L2TestEventRepo::KeyType, int64_t>);
     }
 }
 
@@ -341,15 +301,10 @@ namespace parity {
 namespace jr = jcailloux::relais;
 namespace jre = jcailloux::relais::entity;
 
-using BothTestArticleRepo = Repo<TestArticleEntity, "test:article:parity:both", cfg::Both>;
-using L2TestAssignedKeyRepo = Repo<TestAssignedKeyEntity, "test:akey:parity:l2", cfg::Redis>;
-
 // Filters without a list: the where-variants without ListMixin.
 using FilterOnlyEntity = entity::generated::TestFilterOnlyEntity;
-using UncachedFilterOnlyRepo = Repo<FilterOnlyEntity, "test:filter_only:parity:uncached">;
+using UncachedFilterOnlyRepo = Repo<FilterOnlyEntity, "test:filter_only:parity:uncached", cfg::Uncached>;
 using L1FilterOnlyRepo = Repo<FilterOnlyEntity, "test:filter_only:parity:l1", cfg::Local>;
-using L2FilterOnlyRepo = Repo<FilterOnlyEntity, "test:filter_only:parity:l2", cfg::Redis>;
-using BothFilterOnlyRepo = Repo<FilterOnlyEntity, "test:filter_only:parity:both", cfg::Both>;
 
 /// Arguments for the field-update methods: one field written, guarded and
 /// ordered on.
@@ -554,13 +509,10 @@ constexpr bool kSameApi = (std::is_same_v<ApiSignatures<Uncached>, ApiSignatures
 
 TEMPLATE_TEST_CASE("API parity - every documented method instantiates",
                    "[repository][compile][parity]",
-                   UncachedTestItemRepo, L1TestItemRepo, L2TestItemRepo, FullCacheTestItemRepo,
-                   UncachedTestArticleRepo, L1TestArticleRepo, L2TestArticleRepo,
-                   parity::BothTestArticleRepo,
+                   UncachedTestItemRepo, L1TestItemRepo,
+                   UncachedTestArticleRepo, L1TestArticleRepo,
                    UncachedTestAssignedKeyRepo, L1TestAssignedKeyRepo,
-                   parity::L2TestAssignedKeyRepo, FullCacheTestAssignedKeyRepo,
-                   parity::UncachedFilterOnlyRepo, parity::L1FilterOnlyRepo,
-                   parity::L2FilterOnlyRepo, parity::BothFilterOnlyRepo) {
+                   parity::UncachedFilterOnlyRepo, parity::L1FilterOnlyRepo) {
     auto exercise = &parity::exerciseApi<TestType>;
     STATIC_REQUIRE(std::is_same_v<decltype(exercise), jcailloux::relais::io::Task<void> (*)()>);
     (void)exercise;
@@ -569,19 +521,19 @@ TEMPLATE_TEST_CASE("API parity - every documented method instantiates",
 TEST_CASE("API parity - identical signatures across presets", "[repository][compile][parity]") {
     SECTION("entity without list") {
         STATIC_REQUIRE(parity::kSameApi<UncachedTestItemRepo,
-            L1TestItemRepo, L2TestItemRepo, FullCacheTestItemRepo>);
+            L1TestItemRepo>);
     }
     SECTION("entity with list") {
         STATIC_REQUIRE(parity::kSameApi<UncachedTestArticleRepo,
-            L1TestArticleRepo, L2TestArticleRepo, parity::BothTestArticleRepo>);
+            L1TestArticleRepo>);
     }
     SECTION("entity with upsert") {
         STATIC_REQUIRE(parity::kSameApi<UncachedTestAssignedKeyRepo,
-            L1TestAssignedKeyRepo, parity::L2TestAssignedKeyRepo, FullCacheTestAssignedKeyRepo>);
+            L1TestAssignedKeyRepo>);
     }
     SECTION("entity with filters and no list") {
         STATIC_REQUIRE(parity::kSameApi<parity::UncachedFilterOnlyRepo,
-            parity::L1FilterOnlyRepo, parity::L2FilterOnlyRepo, parity::BothFilterOnlyRepo>);
+            parity::L1FilterOnlyRepo>);
     }
 }
 

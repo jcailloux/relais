@@ -3,37 +3,32 @@
  *
  * List invalidation for rows whose filtered column is NULL. SQL decides what a
  * page holds: a NULL column satisfies no comparison and no membership, except
- * NOT IN an empty set (`NULL <> ALL('{}')` is TRUE). Both L1 matchers and the
- * L2 Lua matcher must give PostgreSQL's verdict, or a write leaves a stale page
- * (a NULL row missing from `nin={}`) or drops pages it cannot change.
+ * NOT IN an empty set (`NULL <> ALL('{}')` is TRUE). Both L1 matchers must give
+ * PostgreSQL's verdict, or a write leaves a stale page (a NULL row missing from
+ * `nin={}`) or drops pages it cannot change.
  *
  * Fixture TestNullableList: one filter per value operator on the nullable
- * `rank`, NE and NIN on the nullable `label`, then `owner_id`, read after the
- * NOT IN slot of `label`.
+ * `rank`, NE and NIN on the nullable `label`, then `owner_id`.
  */
 
-#include <catch2/catch_template_test_macros.hpp>
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstdint>
 #include <functional>
 #include <optional>
 #include <string>
-#include <string_view>
 #include <vector>
 
 #include "fixtures/test_helper.h"
 #include "fixtures/TestRepositories.h"
 #include "fixtures/RelaisTestAccessors.h"
 #include "fixtures/generated/TestNullableListEntity.h"
-#include <jcailloux/relais/cache/RedisCache.h>
-#include <jcailloux/relais/list/spec/CanonicalEncoding.h>
+#include <jcailloux/relais/list/spec/GeneratedCriteria.h>
+#include <jcailloux/relais/list/spec/GeneratedFilters.h>
 
 namespace decl = jcailloux::relais::list::spec;
 using namespace relais_test;
 using GenEntity = entity::generated::TestNullableListEntity;
-using jcailloux::relais::PgProvider;
-namespace cache_ns = jcailloux::relais::cache;
 
 namespace {
 
@@ -60,9 +55,7 @@ int64_t insertRow(int64_t owner, std::optional<int32_t> rank,
 
 // =============================================================================
 // Verdict oracle: each filter set alone, against rows NULL or not in each
-// column. PostgreSQL evaluates the generated WHERE clause on the stored row; the
-// L2 verdict is read back from Redis (a page registered as a 1-byte value is
-// shorter than the bounds header, so it survives only if its group did not match).
+// column. PostgreSQL evaluates the generated WHERE clause on the stored row.
 // =============================================================================
 
 struct Case {
@@ -104,24 +97,6 @@ std::vector<Case> cases() {
     return out;
 }
 
-constexpr std::string_view kPrefix = "T:dlist:g:";
-const std::string kMaster = "test:null_match:l2:master";
-
-std::string registerGroup(const Filters& f) {
-    decl::ListQueryParams<GenDesc> q;
-    q.filters = f;
-    std::string groupKey = std::string(kPrefix) + decl::groupKey<GenDesc>(q.filters, q.sort);
-    std::string pageKey = groupKey + ":p";
-    sync(PgProvider::redis("SET", pageKey, "x"));
-    sync(PgProvider::redis("SADD", groupKey + ":_keys", pageKey));
-    sync(PgProvider::redis("HSET", kMaster, groupKey, "0"));
-    return pageKey;
-}
-
-bool alive(const std::string& pageKey) {
-    return sync(PgProvider::redis("EXISTS", pageKey)).asInteger() == 1;
-}
-
 bool pgVerdict(int64_t id, const Filters& f) {
     auto where = decl::buildWhereClause<GenDesc>(f);
     const auto sql = "SELECT count(*) FROM relais_test_nullable_list WHERE id = "
@@ -131,8 +106,8 @@ bool pgVerdict(int64_t id, const Filters& f) {
 
 }  // namespace
 
-TEST_CASE("[ListNullMatch] L1, L2 and PostgreSQL agree on NULL and non-NULL rows",
-          "[integration][db][redis][list][null]") {
+TEST_CASE("[ListNullMatch] L1 and PostgreSQL agree on NULL and non-NULL rows",
+          "[integration][db][list][null]") {
     TransactionGuard tx;
     const auto all = cases();
 
@@ -141,23 +116,14 @@ TEST_CASE("[ListNullMatch] L1, L2 and PostgreSQL agree on NULL and non-NULL rows
             const auto row = makeRow(1, rank, label);
             const auto id = insertRow(1, rank, label);
 
-            flushRedis();
-            std::vector<std::string> pages;
-            for (const auto& c : all) pages.push_back(registerGroup(c.filters));
-            sync(cache_ns::RedisCache::invalidateListGroupsSelective(
-                kMaster, kPrefix.size(), decl::filterSchema<GenDesc>(),
-                decl::encodeEntityFilterBlob<GenDesc>(row), "0"));
-
-            for (size_t i = 0; i < all.size(); ++i) {
-                const auto& f = all[i].filters;
+            for (const auto& c : all) {
+                const auto& f = c.filters;
                 const bool pg = pgVerdict(id, f);
                 const bool viaFree = decl::matchesFilters<GenDesc>(row, f);
                 const bool viaTags = f.matchesFilters(decl::extractTags<GenDesc>(row));
-                const bool lua = !alive(pages[i]);
-                CAPTURE(all[i].name, rank.has_value(), label.has_value());
+                CAPTURE(c.name, rank.has_value(), label.has_value());
                 CHECK(viaFree == pg);
                 CHECK(viaTags == pg);
-                CHECK(lua == pg);
             }
         }
     }
@@ -178,27 +144,17 @@ TEST_CASE("[ListNullMatch] NOT IN an empty set holds a NULL row, a non-empty one
 }
 
 // =============================================================================
-// Through the repos. Stale sentinels: a row inserted straight into PostgreSQL
+// Through the repo. Stale sentinels: a row inserted straight into PostgreSQL
 // is visible only on a page that the write under test invalidated.
 // =============================================================================
 
 namespace {
 
-template<typename R, bool HasL1>
-struct Tier {
-    using Repo = R;
-    static void resetL1() {
-        if constexpr (HasL1) TestInternals::resetListCacheState<R>();
-    }
-};
+using R = Repo<GenEntity, "test:nullable_list:l1", cfg::Local>;
 
-using L1Tier   = Tier<Repo<GenEntity, "test:nullable_list:l1", cfg::Local>, true>;
-using L2Tier   = Tier<Repo<GenEntity, "test:nullable_list:l2", cfg::Redis>, false>;
-using BothTier = Tier<Repo<GenEntity, "test:nullable_list:both", cfg::Both>, true>;
-
-template<typename R, typename Set>
+template<typename Set>
 size_t count(Set set) {
-    using Desc = typename R::ListDescriptorType;
+    using Desc = R::ListDescriptorType;
     decl::ListQueryParams<Desc> p;
     p.limit = 10;
     set(p.filters);
@@ -212,18 +168,17 @@ constexpr auto ge0 = [](auto& f) { f.template get<"rank_ge">() = 0; };
 
 }  // namespace
 
-TEMPLATE_TEST_CASE("[ListNullMatch] a NULL row invalidates the pages SQL puts it on, only those",
-                   "[integration][db][redis][list][null]", L1Tier, L2Tier, BothTier) {
-    using R = typename TestType::Repo;
+TEST_CASE("[ListNullMatch] a NULL row invalidates the pages SQL puts it on, only those",
+          "[integration][db][list][null]") {
     TransactionGuard tx;
-    TestType::resetL1();
+    TestInternals::resetListCacheState<R>();
 
     insertRow(1, 5, "a");
     insertRow(1, std::nullopt, std::nullopt);
-    REQUIRE(count<R>(ninEmpty) == 2);
-    REQUIRE(count<R>(ninB) == 1);
-    REQUIRE(count<R>(ne7) == 1);
-    REQUIRE(count<R>(ge0) == 1);
+    REQUIRE(count(ninEmpty) == 2);
+    REQUIRE(count(ninB) == 1);
+    REQUIRE(count(ne7) == 1);
+    REQUIRE(count(ge0) == 1);
 
     // Stale sentinels, one per kind of page.
     insertRow(1, std::nullopt, std::nullopt);
@@ -237,8 +192,8 @@ TEMPLATE_TEST_CASE("[ListNullMatch] a NULL row invalidates the pages SQL puts it
         REQUIRE(sync(R::update(id, makeRow(1, std::nullopt, std::nullopt))));
     }
 
-    CHECK(count<R>(ninEmpty) == 5);  // NULL label <> ALL('{}') holds
-    CHECK(count<R>(ninB) == 1);      // kept
-    CHECK(count<R>(ne7) == 1);       // kept
-    CHECK(count<R>(ge0) == 1);       // kept
+    CHECK(count(ninEmpty) == 5);  // NULL label <> ALL('{}') holds
+    CHECK(count(ninB) == 1);      // kept
+    CHECK(count(ne7) == 1);       // kept
+    CHECK(count(ge0) == 1);       // kept
 }

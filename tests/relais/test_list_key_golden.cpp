@@ -3,17 +3,15 @@
  *
  * Byte-exact format of the list cache encodings.
  *
- * The page and group keys name the L1 entries and the L2 keys; the entity
- * blob and the predicate blob are read byte by byte by the Lua matchers. A
- * change in any of them silently orphans the L2 keys already written and
- * desynchronizes the matchers, so each encoding is pinned here to its exact
- * bytes (little-endian host) over a corpus that covers every value width and
- * signedness, optional members null and present, strings (empty, short, past
- * the small-string buffer), IN/NIN sets unsorted and with duplicates, bool
- * sets, raw and mapped enums, IS_NULL, with and without sort, cursor and
- * offset.
+ * The page key names an L1 list entry and embeds the group key: two queries
+ * that mean the same must give the same bytes and two that differ must not.
+ * Both keys are pinned here to their exact bytes (little-endian host) over a
+ * corpus that covers every value width and signedness, optional members null
+ * and present, strings (empty, short, past the small-string buffer), IN/NIN
+ * sets unsorted and with duplicates, bool sets, raw and mapped enums, IS_NULL,
+ * with and without sort, cursor and offset.
  *
- * Pure unit test (no DB / Redis).
+ * Pure unit test (no DB).
  */
 
 #include <catch2/catch_test_macros.hpp>
@@ -137,17 +135,16 @@ decl::TypedCursor<D> cursorOf(std::string_view token) {
     return *c;
 }
 
-// Group key, page key and predicate blob of one params bundle, through every
-// producer: seal(), the free functions, and the appenders behind a prefix.
+// Group key and page key of one params bundle, through every producer:
+// seal(), the free functions, and the appenders behind a prefix.
 template<typename D>
 void checkParams(const decl::ListQueryParams<D>& p,
-                 std::string_view group, std::string_view page, std::string_view predicate) {
+                 std::string_view group, std::string_view page) {
     const auto q = decl::seal<D>(p);
     CHECK(hex(q.groupKey()) == group);
     CHECK(hex(q.cacheKey()) == page);
     CHECK(hex(decl::groupKey<D>(p.filters, p.sort)) == group);
     CHECK(hex(decl::cacheKey<D>(q.groupKey(), p)) == page);
-    CHECK(hex(decl::encodeFilterSet<D>(p.filters)) == predicate);
 
     const std::string prefix = "p:";
     std::string appended = prefix;
@@ -162,7 +159,7 @@ void checkParams(const decl::ListQueryParams<D>& p,
 
 // #############################################################################
 //
-//  1. Keys and predicate blob
+//  Keys
 //
 // #############################################################################
 
@@ -171,8 +168,7 @@ TEST_CASE("[ListKeyGolden] no filter, no sort", "[list][golden][unit]") {
     p.limit = 10;
     checkParams(p,
         "0000000000000000000000000000",
-        "00000000000000000000000000000a00",
-        "00000000000000000000000000");
+        "00000000000000000000000000000a00");
 }
 
 TEST_CASE("[ListKeyGolden] every scalar width, present", "[list][golden][unit]") {
@@ -199,10 +195,7 @@ TEST_CASE("[ListKeyGolden] every scalar width, present", "[list][golden][unit]")
         "73686f727401010000000000000001",
         "01fb01efbe01c01dfeff01efbeadde0100e68ee7fdffffff011032547698badc"
         "fe010000c03f0100000000000002c00101010201d4fe012a0000000105000000"
-        "73686f7274010100000000000000011900",
-        "01fb01efbe01c01dfeff01efbeadde0100e68ee7fdffffff011032547698badc"
-        "fe010000c03f0100000000000002c00101010201d4fe012a0000000105000000"
-        "73686f7274");
+        "73686f7274010100000000000000011900");
 }
 
 TEST_CASE("[ListKeyGolden] strings: empty and past the small-string buffer",
@@ -212,8 +205,7 @@ TEST_CASE("[ListKeyGolden] strings: empty and past the small-string buffer",
     empty.limit = 5;
     checkParams(empty,
         "000000000000000000000000010000000000",
-        "0000000000000000000000000100000000000500",
-        "0000000000000000000000000100000000");
+        "0000000000000000000000000100000000000500");
 
     decl::ListQueryParams<ScalarDesc> longName;
     longName.filters.get<"name">() = std::string("a name well past fifteen bytes");
@@ -224,9 +216,7 @@ TEST_CASE("[ListKeyGolden] strings: empty and past the small-string buffer",
         "000000000000000000000001ffffffff011e00000061206e616d652077656c6c"
         "2070617374206669667465656e20627974657301000000000000000000",
         "000000000000000000000001ffffffff011e00000061206e616d652077656c6c"
-        "2070617374206669667465656e206279746573010000000000000000003200",
-        "000000000000000000000001ffffffff011e00000061206e616d652077656c6c"
-        "2070617374206669667465656e206279746573");
+        "2070617374206669667465656e206279746573010000000000000000003200");
 }
 
 TEST_CASE("[ListKeyGolden] pagination: cursor, offset, cursor over offset",
@@ -241,24 +231,21 @@ TEST_CASE("[ListKeyGolden] pagination: cursor, offset, cursor over offset",
     checkParams(cursor,
         "00000000010700000000000000000000000000000001010000000000000000",
         "000000000107000000000000000000000000000000010100000000000000000a"
-        "000c000000000102030405060708090a0b",
-        "000000000107000000000000000000000000000000");
+        "000c000000000102030405060708090a0b");
 
     auto offset = base;
     offset.offset = 40;
     checkParams(offset,
         "00000000010700000000000000000000000000000001010000000000000000",
         "000000000107000000000000000000000000000000010100000000000000000a"
-        "004f28000000",
-        "000000000107000000000000000000000000000000");
+        "004f28000000");
 
     auto both = cursor;
     both.offset = 40;
     checkParams(both,
         "00000000010700000000000000000000000000000001010000000000000000",
         "000000000107000000000000000000000000000000010100000000000000000a"
-        "000c000000000102030405060708090a0b",
-        "000000000107000000000000000000000000000000");
+        "000c000000000102030405060708090a0b");
 }
 
 TEST_CASE("[ListKeyGolden] set filters: unsorted, duplicates, bool", "[list][golden][unit]") {
@@ -278,19 +265,14 @@ TEST_CASE("[ListKeyGolden] set filters: unsorted, duplicates, bool", "[list][gol
         "01040000000000000022000000612063617465676f7279206e616d6520706173"
         "74206669667465656e206279746573030000006172740600000074726176656c"
         "0103000000feffffffffffffff1e000000000000000000000000010000010200"
-        "000000010109000000010000000000000000011400",
-        "01040000000000000022000000612063617465676f7279206e616d6520706173"
-        "74206669667465656e206279746573030000006172740600000074726176656c"
-        "0103000000feffffffffffffff1e000000000000000000000000010000010200"
-        "000000010109000000");
+        "000000010109000000010000000000000000011400");
 
     decl::ListQueryParams<SetDesc> single;
     single.filters.get<"flags_b">() = std::vector<bool>{false};
     single.limit = 20;
     checkParams(single,
         "00000101000000000000",
-        "000001010000000000001400",
-        "000001010000000000");
+        "000001010000000000001400");
 }
 
 TEST_CASE("[ListKeyGolden] IS_NULL filter: inactive, true, false", "[list][golden][unit]") {
@@ -301,20 +283,17 @@ TEST_CASE("[ListKeyGolden] IS_NULL filter: inactive, true, false", "[list][golde
     p.limit = 10;
     checkParams(p,
         "010700000000010900000000",
-        "0107000000000109000000000a00",
-        "0107000000000109000000");
+        "0107000000000109000000000a00");
 
     p.filters.get<"opt_null">() = true;
     checkParams(p,
         "01070000000101010900000000",
-        "010700000001010109000000000a00",
-        "010700000001010109000000");
+        "010700000001010109000000000a00");
 
     p.filters.get<"opt_null">() = false;
     checkParams(p,
         "01070000000100010900000000",
-        "010700000001000109000000000a00",
-        "010700000001000109000000");
+        "010700000001000109000000000a00");
 }
 
 TEST_CASE("[ListKeyGolden] mapped enum filters", "[list][golden][unit]") {
@@ -330,9 +309,7 @@ TEST_CASE("[ListKeyGolden] mapped enum filters", "[list][golden][unit]") {
         "01030000000000000000000102000000050000000a0000000000011400000000"
         "0001f8ffffff01010000000000000000",
         "01030000000000000000000102000000050000000a0000000000011400000000"
-        "0001f8ffffff010100000000000000000a00",
-        "01030000000000000000000102000000050000000a0000000000011400000000"
-        "0001f8ffffff");
+        "0001f8ffffff010100000000000000000a00");
 }
 
 TEST_CASE("[ListKeyGolden] sealing canonicalizes the sets", "[list][golden][unit]") {
@@ -364,58 +341,4 @@ TEST_CASE("[ListKeyGolden] sealing canonicalizes the sets", "[list][golden][unit
     const auto big = decl::ListQueryBuilder<SetDesc>{}.filter<"names">(many).build();
     CHECK(*big.filters().get<"names">() == expected);
     CHECK(big.groupKey() == decl::ListQueryBuilder<SetDesc>{}.filter<"names">(expected).build().groupKey());
-}
-
-// #############################################################################
-//
-//  2. Entity blob
-//
-// #############################################################################
-
-TEST_CASE("[ListKeyGolden] entity blob", "[list][golden][unit]") {
-    Row r;
-    r.i8 = -5;
-    r.u16 = 0xBEEF;
-    r.i32 = -123456;
-    r.u32 = 0xDEADBEEF;
-    r.i64 = -9000000000LL;
-    r.u64 = 0xFEDCBA9876543210ULL;
-    r.f32 = 1.5f;
-    r.f64 = -2.25;
-    r.flag_b = true;
-    r.flag = Flag::Off;
-    r.level = Level::Low;
-    r.name = "a name well past fifteen bytes";
-
-    // Optional member null, then present.
-    CHECK(hex(decl::encodeEntityFilterBlob<ScalarDesc>(r)) ==
-          "01fb01efbe01c01dfeff01efbeadde0100e68ee7fdffffff011032547698badc"
-          "fe010000c03f0100000000000002c00101010201d4fe00011e00000061206e61"
-          "6d652077656c6c2070617374206669667465656e206279746573");
-    r.opt = 42;
-    CHECK(hex(decl::encodeEntityFilterBlob<ScalarDesc>(r)) ==
-          "01fb01efbe01c01dfeff01efbeadde0100e68ee7fdffffff011032547698badc"
-          "fe010000c03f0100000000000002c00101010201d4fe012a000000011e000000"
-          "61206e616d652077656c6c2070617374206669667465656e206279746573");
-
-    // Set filters encode the entity's single scalar value.
-    CHECK(hex(decl::encodeEntityFilterBlob<SetDesc>(r)) ==
-          "011e00000061206e616d652077656c6c2070617374206669667465656e206279"
-          "7465730100e68ee7fdffffff010101efbeadde");
-
-    // An IS_NULL slot holds the presence byte alone, never the value.
-    r.i32 = 7;
-    r.u32 = 9;
-    r.opt.reset();
-    CHECK(hex(decl::encodeEntityFilterBlob<NullDesc>(r)) == "0107000000000109000000");
-    r.opt = 42;
-    CHECK(hex(decl::encodeEntityFilterBlob<NullDesc>(r)) == "0107000000010109000000");
-
-    ::entity::generated::TestTicketEntity t;
-    t.queue_id = 3;
-    t.state = TicketState::Blocked;
-    t.weight = -8;
-    CHECK(hex(decl::encodeEntityFilterBlob<TicketDesc>(t)) ==
-          "0103000000000000000114000000011400000001140000000114000000011400"
-          "000001140000000114000000011400000001f8ffffff");
 }

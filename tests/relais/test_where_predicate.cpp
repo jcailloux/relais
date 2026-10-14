@@ -1,8 +1,7 @@
 /**
  * test_where_predicate.cpp
- * Predicate list fast-path for eraseWhere: ONE RangeModification (L1)
- * + ONE predicate EVAL (L2) for the whole deleted set, instead of N per-entity
- * blob-array invalidations.
+ * Predicate list fast-path for eraseWhere: ONE RangeModification (L1) for the
+ * whole deleted set, instead of N per-entity blob-array invalidations.
  *
  * Pure primitives (no I/O):
  *   - SortBounds::isRangeInRange — range overlap, the range generalization of the

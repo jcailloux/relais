@@ -100,7 +100,7 @@ using TallyF = TestSlotTallyEntity::Field;
 
 namespace {
 
-/// A repo keeping a cached copy of the row (L1, L2 or both).
+/// A repo keeping a cached copy of the row in L1.
 template<typename Repo>
 constexpr bool kCached = Repo::config.cache_level != jr::config::CacheLevel::None;
 
@@ -197,8 +197,7 @@ TEST_CASE("[relative] SET fragments and write-mode trait", "[relative][sql]")
 
 TEMPLATE_TEST_CASE("[relative] increment and decrement through patch",
                    "[relative][integration]",
-                   UncachedTestSlotRepo, L1TestSlotRepo, L2TestSlotRepo,
-                   FullCacheTestSlotRepo)
+                   UncachedTestSlotRepo, L1TestSlotRepo)
 {
     using Repo = TestType;
     TransactionGuard guard;
@@ -268,7 +267,7 @@ TEMPLATE_TEST_CASE("[relative] increment and decrement through patch",
 
 TEMPLATE_TEST_CASE("[relative] concurrent identical increments all apply",
                    "[relative][integration][concurrency]",
-                   UncachedTestSlotRepo, FullCacheTestSlotRepo)
+                   UncachedTestSlotRepo, L1TestSlotRepo)
 {
     using Repo = TestType;
     TransactionGuard guard;
@@ -303,7 +302,7 @@ TEMPLATE_TEST_CASE("[relative] concurrent identical increments all apply",
 
 TEMPLATE_TEST_CASE("[relative] nowPlus stamps the database clock",
                    "[relative][integration]",
-                   UncachedTestSlotRepo, FullCacheTestSlotRepo)
+                   UncachedTestSlotRepo, L1TestSlotRepo)
 {
     using Repo = TestType;
     TransactionGuard guard;
@@ -347,7 +346,7 @@ TEMPLATE_TEST_CASE("[relative] nowPlus stamps the database clock",
 
 TEMPLATE_TEST_CASE("[relative] increment on a composite key",
                    "[relative][integration][composite]",
-                   UncachedTestSlotTallyRepo, FullCacheTestSlotTallyRepo)
+                   UncachedTestSlotTallyRepo, L1TestSlotTallyRepo)
 {
     using Repo = TestType;
     TransactionGuard guard;
@@ -374,7 +373,7 @@ TEMPLATE_TEST_CASE("[relative] increment on a composite key",
 
 TEMPLATE_TEST_CASE("[relative] overflow is a DB error and leaves the row intact",
                    "[relative][integration][error]",
-                   UncachedTestSlotRepo, FullCacheTestSlotRepo)
+                   UncachedTestSlotRepo, L1TestSlotRepo)
 {
     using Repo = TestType;
     TransactionGuard guard;
@@ -813,8 +812,7 @@ TEST_CASE("[patchIf] SQL: SET values, then the key, then the guard", "[patchIf][
 
 TEMPLATE_TEST_CASE("[patchIf] success, refusal, absence and error",
                    "[patchIf][integration]",
-                   UncachedTestSlotRepo, L1TestSlotRepo, L2TestSlotRepo,
-                   FullCacheTestSlotRepo)
+                   UncachedTestSlotRepo, L1TestSlotRepo)
 {
     using Repo = TestType;
     TransactionGuard guard;
@@ -890,7 +888,7 @@ TEMPLATE_TEST_CASE("[patchIf] success, refusal, absence and error",
 
 TEMPLATE_TEST_CASE("[patchIf] state transitions and expiring holds",
                    "[patchIf][integration]",
-                   UncachedTestSlotRepo, FullCacheTestSlotRepo)
+                   UncachedTestSlotRepo, L1TestSlotRepo)
 {
     using Repo = TestType;
     TransactionGuard guard;
@@ -931,7 +929,7 @@ TEMPLATE_TEST_CASE("[patchIf] state transitions and expiring holds",
 
 TEMPLATE_TEST_CASE("[patchIf] identical compare-and-set writes: exactly one wins",
                    "[patchIf][integration][concurrency]",
-                   UncachedTestSlotRepo, FullCacheTestSlotRepo)
+                   UncachedTestSlotRepo, L1TestSlotRepo)
 {
     using Repo = TestType;
     TransactionGuard guard;
@@ -960,7 +958,7 @@ TEMPLATE_TEST_CASE("[patchIf] identical compare-and-set writes: exactly one wins
 }
 
 TEMPLATE_TEST_CASE("[patchIf] composite key", "[patchIf][integration]",
-                   UncachedTestSlotTallyRepo, FullCacheTestSlotTallyRepo)
+                   UncachedTestSlotTallyRepo, L1TestSlotTallyRepo)
 {
     using Repo = TestType;
     TransactionGuard guard;
@@ -1017,7 +1015,7 @@ int64_t insertGroupedSlot(int64_t group, int32_t priority = 0) {
 
 TEMPLATE_TEST_CASE("[patchIf] list pages move on commit, stay on refusal",
                    "[patchIf][integration][list]",
-                   L1TestSlotListRepo, FullCacheTestSlotListRepo, InvalidatingTestSlotListRepo)
+                   L1TestSlotListRepo, InvalidatingTestSlotListRepo)
 {
     using List = TestType;
     using ListF = TestSlotListEntity::Field;
@@ -1167,8 +1165,7 @@ void sortBy(std::vector<T>& v, Proj proj) {
 
 TEMPLATE_TEST_CASE("[patchWhere] count, committed rows, before and after",
                    "[patchWhere][integration]",
-                   UncachedTestSlotRepo, L1TestSlotRepo, L2TestSlotRepo,
-                   FullCacheTestSlotRepo)
+                   UncachedTestSlotRepo, L1TestSlotRepo)
 {
     using Repo = TestType;
     TransactionGuard guard;
@@ -1243,7 +1240,7 @@ TEMPLATE_TEST_CASE("[patchWhere] count, committed rows, before and after",
 
 TEMPLATE_TEST_CASE("[patchWhere] expired holds released by the database clock",
                    "[patchWhere][integration]",
-                   UncachedTestSlotRepo, FullCacheTestSlotRepo)
+                   UncachedTestSlotRepo, L1TestSlotRepo)
 {
     using Repo = TestType;
     TransactionGuard guard;
@@ -1262,7 +1259,7 @@ TEMPLATE_TEST_CASE("[patchWhere] expired holds released by the database clock",
 
 TEMPLATE_TEST_CASE("[patchWhere] concurrent identical writes change each row once",
                    "[patchWhere][integration][concurrency]",
-                   UncachedTestSlotRepo, FullCacheTestSlotRepo)
+                   UncachedTestSlotRepo, L1TestSlotRepo)
 {
     using Repo = TestType;
     TransactionGuard guard;
@@ -1296,7 +1293,7 @@ TEMPLATE_TEST_CASE("[patchWhere] concurrent identical writes change each row onc
 }
 
 TEMPLATE_TEST_CASE("[patchWhere] composite key", "[patchWhere][integration]",
-                   UncachedTestSlotTallyRepo, FullCacheTestSlotTallyRepo)
+                   UncachedTestSlotTallyRepo, L1TestSlotTallyRepo)
 {
     using Repo = TestType;
     TransactionGuard guard;
@@ -1325,7 +1322,7 @@ TEMPLATE_TEST_CASE("[patchWhere] composite key", "[patchWhere][integration]",
 
 TEMPLATE_TEST_CASE("[patchWhere] a row changing group moves between list pages",
                    "[patchWhere][integration][list]",
-                   L1TestSlotListRepo, FullCacheTestSlotListRepo, InvalidatingTestSlotListRepo)
+                   L1TestSlotListRepo, InvalidatingTestSlotListRepo)
 {
     using List = TestType;
     using ListF = TestSlotListEntity::Field;
@@ -1590,8 +1587,7 @@ private:
 
 TEMPLATE_TEST_CASE("[claim] Exact and UpTo",
                    "[claim][integration]",
-                   UncachedTestSlotRepo, L1TestSlotRepo, L2TestSlotRepo,
-                   FullCacheTestSlotRepo)
+                   UncachedTestSlotRepo, L1TestSlotRepo)
 {
     using Repo = TestType;
     TransactionGuard guard;
@@ -1661,7 +1657,7 @@ TEMPLATE_TEST_CASE("[claim] Exact and UpTo",
 
 TEMPLATE_TEST_CASE("[claim] orderings and the previous holder",
                    "[claim][integration][order]",
-                   UncachedTestSlotRepo, FullCacheTestSlotRepo)
+                   UncachedTestSlotRepo, L1TestSlotRepo)
 {
     using Repo = TestType;
     TransactionGuard guard;
@@ -1707,7 +1703,7 @@ TEMPLATE_TEST_CASE("[claim] orderings and the previous holder",
 
 TEMPLATE_TEST_CASE("[claim] rows locked by a concurrent transaction",
                    "[claim][integration][concurrency]",
-                   UncachedTestSlotRepo, FullCacheTestSlotRepo)
+                   UncachedTestSlotRepo, L1TestSlotRepo)
 {
     using Repo = TestType;
     TransactionGuard guard;
@@ -1766,7 +1762,7 @@ TEMPLATE_TEST_CASE("[claim] rows locked by a concurrent transaction",
 }
 
 TEMPLATE_TEST_CASE("[claim] composite key", "[claim][integration]",
-                   UncachedTestSlotTallyRepo, FullCacheTestSlotTallyRepo)
+                   UncachedTestSlotTallyRepo, L1TestSlotTallyRepo)
 {
     using Repo = TestType;
     TransactionGuard guard;
@@ -1789,7 +1785,7 @@ TEMPLATE_TEST_CASE("[claim] composite key", "[claim][integration]",
 
 TEMPLATE_TEST_CASE("[claim] a claimed row moves between list pages",
                    "[claim][integration][list]",
-                   L1TestSlotListRepo, FullCacheTestSlotListRepo, InvalidatingTestSlotListRepo)
+                   L1TestSlotListRepo, InvalidatingTestSlotListRepo)
 {
     using List = TestType;
     using ListF = TestSlotListEntity::Field;

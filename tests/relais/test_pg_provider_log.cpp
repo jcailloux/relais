@@ -113,7 +113,6 @@ TEST_CASE("Log: a pointer does not log as bool", "[log]") {
 TEST_CASE("PgProvider: not initialized", "[dbprovider]") {
     PgProvider::reset();
     REQUIRE_FALSE(PgProvider::initialized());
-    REQUIRE_FALSE(PgProvider::hasRedis());
 }
 
 TEST_CASE("PgProvider: init with PgPool", "[dbprovider][integration]") {
@@ -131,8 +130,7 @@ TEST_CASE("PgProvider: init with PgPool", "[dbprovider][integration]") {
         PgProvider::init(io, pool);
 
         REQUIRE(PgProvider::initialized());
-        REQUIRE_FALSE(PgProvider::hasRedis());
-
+    
         // Test simple query
         auto result = co_await PgProvider::query("SELECT 1 AS num");
         REQUIRE(result.ok());
@@ -151,45 +149,6 @@ TEST_CASE("PgProvider: init with PgPool", "[dbprovider][integration]") {
             "SELECT $1::text AS msg", params);
         REQUIRE(result3.ok());
         REQUIRE(result3[0].get<std::string>(0) == "hello");
-
-        PgProvider::reset();
-    }(io, conninfo));
-}
-
-TEST_CASE("PgProvider: init with Redis", "[dbprovider][integration]") {
-    using jcailloux::relais::io::test::EpollIoContext;
-    using jcailloux::relais::io::test::runTask;
-
-    EpollIoContext io;
-
-    auto conninfo = std::string("host=localhost port=5432 dbname=relais_test "
-                                "user=relais_test password=relais_test");
-
-    runTask(io, [](EpollIoContext& io, const std::string& conninfo) -> jcailloux::relais::io::Task<void> {
-        auto pool = co_await jcailloux::relais::io::PgPool<EpollIoContext>::create(
-            io, conninfo, {.min_connections = 1, .max_connections = 4});
-        auto redis = co_await jcailloux::relais::io::RedisClient<EpollIoContext>::connect(io);
-
-        PgProvider::init(io, pool, redis);
-        REQUIRE(PgProvider::initialized());
-        REQUIRE(PgProvider::hasRedis());
-
-        // Test Redis SET/GET
-        co_await PgProvider::redis("SET", "dbprovider_test_key", "hello_world");
-
-        auto reply = co_await PgProvider::redis("GET", "dbprovider_test_key");
-        REQUIRE(reply.isString());
-        REQUIRE(reply.asString() == "hello_world");
-
-        // Cleanup
-        co_await PgProvider::redis("DEL", "dbprovider_test_key");
-
-        // Test Redis with numeric args
-        co_await PgProvider::redis("SET", "dbprovider_test_num", std::to_string(42));
-        auto num_reply = co_await PgProvider::redis("GET", "dbprovider_test_num");
-        REQUIRE(num_reply.asString() == "42");
-
-        co_await PgProvider::redis("DEL", "dbprovider_test_num");
 
         PgProvider::reset();
     }(io, conninfo));

@@ -31,7 +31,7 @@ using jcailloux::relais::entity::fieldValue;
 // =========================================================================
 // Instantiate PgRepo with each entity type to verify compilation.
 // These are direct PgRepo instantiations (not Repo<>) to avoid
-// depending on the full mixin chain (RedisRepo, LocalRepo, etc.) which
+// depending on the full mixin chain (LocalRepo, ListMixin, etc.) which
 // is not yet refactored.
 // =========================================================================
 

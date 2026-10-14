@@ -2,7 +2,7 @@
  * test_conditional_writes_contention.cpp
  *
  * Conditional writes raced from several event loops at once. Each loop is an
- * IoPool worker with its own PostgreSQL and Redis connections; the repositories
+ * IoPool worker with its own PostgreSQL connections; the repositories
  * and their L1 are shared by all of them. The database decides every race, so
  * the outcome is exact whatever the interleaving:
  *
@@ -15,7 +15,7 @@
  *
  * On every loop a reader evicts and re-reads the contended rows while the race
  * runs. Once the loops are stopped, find agrees with the database through L1
- * and through L2.
+ * and, once L1 is evicted, through a fresh read.
  *
  * Catch2 assertions are not thread-safe: the loops only collect outcomes, and
  * every CHECK runs on the test thread.
@@ -107,8 +107,7 @@ constexpr jr::ClaimOptions kWaitChanges{.lock = jr::Lock::Wait, .returns = jr::R
 constexpr jr::ClaimOptions kUpTo{.mode = jr::ClaimMode::UpTo};
 
 template<typename Repo>
-constexpr bool kHasL1 = Repo::config.cache_level == jr::config::CacheLevel::L1
-                     || Repo::config.cache_level == jr::config::CacheLevel::L1_L2;
+constexpr bool kHasL1 = Repo::config.cache_level != jr::config::CacheLevel::None;
 
 template<typename T> struct TaskValue;
 template<typename T> struct TaskValue<io::Task<T>> { using type = T; };
@@ -185,14 +184,14 @@ io::Task<T> afterAll(std::latch& start, io::Task<T> task) {
 }
 
 /// Several event loops sharing the process: the repositories and their L1 are
-/// common, each loop owns its PostgreSQL and Redis connections.
+/// common, each loop owns its PostgreSQL connections.
 class Loops {
 public:
     Loops() {
         io::IoPoolConfig cfg;
         cfg.num_workers = kLoops;
         cfg.pg_conninfo = getConnInfo();
-        cfg.redis = io::RedisWorkerConfig{.conns_per_worker = 2};
+        cfg.redis = std::nullopt;
         cfg.pin_to_cores = false;
         cfg.pg_min_conns_per_worker = 2;
         cfg.pg_max_conns_per_worker = 4;
@@ -282,7 +281,7 @@ std::string describe(const TestSlotEntity& e) {
 }
 
 /// find agrees with the database for every row: through L1 when it holds the
-/// row, then through L2 once L1 is evicted.
+/// row, then through a fresh read once L1 is evicted.
 template<typename Repo>
 void checkCoherent(const Ids& ids) {
     std::string mismatches;
@@ -331,7 +330,7 @@ bool distinct(const Ids& sorted) {
 
 TEMPLATE_TEST_CASE("[contention] claim(1) on one row: exactly one winner",
                    "[claim][integration][concurrency]",
-                   UncachedTestSlotRepo, FullCacheTestSlotRepo)
+                   UncachedTestSlotRepo, L1TestSlotRepo)
 {
     using Repo = TestType;
     TransactionGuard guard;
@@ -361,7 +360,7 @@ TEMPLATE_TEST_CASE("[contention] claim(1) on one row: exactly one winner",
 
 TEMPLATE_TEST_CASE("[contention] claim(1) on ten rows: ten winners, disjoint rows",
                    "[claim][integration][concurrency]",
-                   UncachedTestSlotRepo, FullCacheTestSlotRepo)
+                   UncachedTestSlotRepo, L1TestSlotRepo)
 {
     using Repo = TestType;
     TransactionGuard guard;
@@ -394,7 +393,7 @@ TEMPLATE_TEST_CASE("[contention] claim(1) on ten rows: ten winners, disjoint row
 
 TEMPLATE_TEST_CASE("[contention] Exact claim(2) on five rows: pairs or nothing",
                    "[claim][integration][concurrency]",
-                   UncachedTestSlotRepo, FullCacheTestSlotRepo)
+                   UncachedTestSlotRepo, L1TestSlotRepo)
 {
     using Repo = TestType;
     TransactionGuard guard;
@@ -451,7 +450,7 @@ TEMPLATE_TEST_CASE("[contention] Exact claim(2) on five rows: pairs or nothing",
 
 TEMPLATE_TEST_CASE("[contention] UpTo consumers drain a task queue exactly once",
                    "[claim][integration][concurrency]",
-                   UncachedTestSlotRepo, FullCacheTestSlotRepo)
+                   UncachedTestSlotRepo, L1TestSlotRepo)
 {
     using Repo = TestType;
     TransactionGuard guard;
@@ -493,7 +492,7 @@ TEMPLATE_TEST_CASE("[contention] UpTo consumers drain a task queue exactly once"
 
 TEMPLATE_TEST_CASE("[contention] Wait preemption against SkipLocked claims",
                    "[claim][integration][concurrency]",
-                   UncachedTestSlotRepo, FullCacheTestSlotRepo)
+                   UncachedTestSlotRepo, L1TestSlotRepo)
 {
     using Repo = TestType;
     using Change = jr::Change<TestSlotEntity>;
@@ -553,7 +552,7 @@ TEMPLATE_TEST_CASE("[contention] Wait preemption against SkipLocked claims",
 
 TEMPLATE_TEST_CASE("[contention] compare-and-set by version: exactly one winner",
                    "[patchIf][integration][concurrency]",
-                   UncachedTestSlotRepo, FullCacheTestSlotRepo)
+                   UncachedTestSlotRepo, L1TestSlotRepo)
 {
     using Repo = TestType;
     TransactionGuard guard;
