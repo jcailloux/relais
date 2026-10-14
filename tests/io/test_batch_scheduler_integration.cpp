@@ -2154,7 +2154,7 @@ TEST_CASE("Read in flight: a cancelled follower leaves the others to finish",
 namespace relais_bench {
 
 struct BatchBenchAccessor {
-    static bool writeLatch(const BatchScheduler<Io>& b) { return b.pg_write_inflight_; }
+    static size_t writeUnits(const BatchScheduler<Io>& b) { return b.pg_write_units_; }
     static size_t detachedInflight(const BatchScheduler<Io>& b) { return b.detached_inflight_; }
     static size_t writeFanout(const BatchScheduler<Io>& b) { return b.pg_write_fanout_; }
 };
@@ -2454,31 +2454,83 @@ TEST_CASE("Write fan-out: a cancelled write in one group leaves the others whole
     });
 }
 
-TEST_CASE("Write fan-out: the latch and teardown accounting follow every group",
+TEST_CASE("Write fan-out: the wave and teardown accounting follow every group",
           "[io][batch][fanout][integration]")
 {
     runFanout([](Io& io, std::shared_ptr<BatchScheduler<Io>> b) -> Task<void> {
         Outcome lead;
         std::array<Outcome, 8> outs;
         launchLeader(b, lead);
-        CHECK(BatchBenchAccessor::writeLatch(*b));
+        CHECK(BatchBenchAccessor::writeUnits(*b) == 1);
         for (int i = 0; i < 8; ++i)
             fanoutWrite(b, outs[i], kSetValue, i + 1, 3, rowOf());
         while (BatchBenchAccessor::detachedInflight(*b) == 0) co_await YieldAwaiter{io};
+        CHECK(BatchBenchAccessor::writeUnits(*b) == 4);
         CHECK_FALSE(b->quiescentForTeardown());
         co_await settle(io, outs);
         co_await settle(io, std::span(&lead, 1));
         while (BatchBenchAccessor::detachedInflight(*b) != 0) co_await YieldAwaiter{io};
         CHECK(b->quiescentForTeardown());
-        CHECK_FALSE(BatchBenchAccessor::writeLatch(*b));
+        CHECK(BatchBenchAccessor::writeUnits(*b) == 0);
 
         // Alone again: a write goes direct, not through a batch.
         Outcome alone;
         fanoutWrite(b, alone, kSetValue, 1, 4, rowOf());
-        CHECK(BatchBenchAccessor::writeLatch(*b));
+        CHECK(BatchBenchAccessor::writeUnits(*b) == 1);
         co_await settle(io, std::span(&alone, 1));
         CHECK_FALSE(alone.failed);
-        CHECK_FALSE(BatchBenchAccessor::writeLatch(*b));
+        CHECK(BatchBenchAccessor::writeUnits(*b) == 0);
+    });
+}
+
+TEST_CASE("Write fan-out: writes submitted during a wave wait for it to end",
+          "[io][batch][fanout][integration]")
+{
+    runFanout([](Io& io, std::shared_ptr<BatchScheduler<Io>> b) -> Task<void> {
+        Outcome lead;
+        std::array<Outcome, 8> first;
+        std::array<Outcome, 8> second;
+        launchLeader(b, lead);
+        for (int i = 0; i < 8; ++i)
+            fanoutWrite(b, first[i], kSetValue, i + 1, 3, rowOf());
+        while (BatchBenchAccessor::detachedInflight(*b) == 0) co_await YieldAwaiter{io};
+        // The first wave is in flight: these accumulate behind it.
+        for (int i = 0; i < 8; ++i)
+            fanoutWrite(b, second[i], kAppendDigit, i + 1, 5, rowOf());
+        size_t max_units = 0;
+        while (!std::ranges::all_of(second, &Outcome::done)) {
+            max_units = std::max(max_units, BatchBenchAccessor::writeUnits(*b));
+            co_await YieldAwaiter{io};
+        }
+        CHECK(max_units <= BatchBenchAccessor::writeFanout(*b));
+        for (const auto& o : first) {
+            REQUIRE_FALSE(o.failed);
+            CHECK(o.value == 3);
+        }
+        for (const auto& o : second) {
+            REQUIRE_FALSE(o.failed);
+            CHECK(o.value == 35);
+        }
+        co_await settle(io, std::span(&lead, 1));
+    });
+}
+
+TEST_CASE("Write fan-out: a batch beyond the wave size departs over several waves",
+          "[io][batch][fanout][integration]")
+{
+    runFanout([](Io& io, std::shared_ptr<BatchScheduler<Io>> b) -> Task<void> {
+        Outcome lead;
+        std::vector<Outcome> outs(600);
+        launchLeader(b, lead);
+        for (int i = 0; i < 600; ++i)
+            fanoutWrite(b, outs[i], kEcho, i, 1, kFree);
+        co_await settle(io, outs);
+        for (int i = 0; i < 600; ++i) {
+            REQUIRE_FALSE(outs[i].failed);
+            CHECK(outs[i].value == i + 1);
+        }
+        co_await settle(io, std::span(&lead, 1));
+        CHECK(BatchBenchAccessor::writeUnits(*b) == 0);
     });
 }
 

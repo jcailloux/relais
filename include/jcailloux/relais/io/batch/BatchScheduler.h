@@ -369,9 +369,6 @@ private:
 
     struct PgWriteBatch {
         std::vector<PgWriteEntry*> entries;
-        double cost_ns = 0;
-        TimerToken timer{0};
-        bool timer_active = false;
     };
 
     struct RedisBatch {
@@ -625,19 +622,18 @@ private:
             co_return WriteResult{std::move(result), false};
         }
 
-        // Nagle: first query goes direct, subsequent accumulate during RTT
-        if (!pg_write_inflight_) {
-            pg_write_inflight_ = true;
+        // Nagle: a write with no wave in flight goes direct; the others
+        // accumulate until the wave ends.
+        if (pg_write_units_ == 0) {
+            pg_write_units_ = 1;
             PgResult result;
             try {
                 result = co_await sendSinglePgWrite(std::move(entry));
             } catch (...) {
-                pg_write_inflight_ = false;
-                firePgWriteBatchNow();
+                endPgWriteUnit();
                 throw;
             }
-            pg_write_inflight_ = false;
-            firePgWriteBatchNow(); // flush accumulated during RTT
+            endPgWriteUnit();
             co_return WriteResult{std::move(result), false};
         }
 
@@ -778,13 +774,9 @@ private:
             }
         }
 
-        if (pg_write_batch_.entries.empty()) {
-            pg_write_batch_.entries.push_back(entry);
-            schedulePgWriteDeparture();
-        } else {
-            pg_write_batch_.entries.push_back(entry);
-            checkPgWriteBatchReady();
-        }
+        // The batch departs when the wave in flight ends, never during it.
+        pg_write_batch_.entries.push_back(entry);
+        if (pg_write_units_ == 0) firePgWriteBatchNow();
     }
 
     void addToRedisBatch(RedisEntry* entry) {
@@ -811,12 +803,6 @@ private:
         }
     }
 
-    void checkPgWriteBatchReady() {
-        if (static_cast<int>(pg_write_batch_.entries.size()) >= kMaxBatchEntries) {
-            firePgWriteBatchNow();
-        }
-    }
-
     void checkRedisBatchReady() {
         if (static_cast<int>(redis_batch_.entries.size()) >= kMaxBatchEntries) {
             fireRedisBatchNow();
@@ -837,18 +823,6 @@ private:
             firePgReadBatchNow();
         });
         pg_read_batch_.timer_active = true;
-    }
-
-    void schedulePgWriteDeparture() {
-        auto delay_ns = static_cast<int64_t>(estimator_.pg_network_time_ns);
-        if (delay_ns <= 0) delay_ns = 100'000;
-        auto delay = std::chrono::nanoseconds(delay_ns);
-
-        pg_write_batch_.timer = io_.postDelayed(delay, [this] {
-            pg_write_batch_.timer_active = false;
-            firePgWriteBatchNow();
-        });
-        pg_write_batch_.timer_active = true;
     }
 
     void scheduleRedisDeparture() {
@@ -884,13 +858,15 @@ private:
         firePgReadBatch(std::move(entries));
     }
 
+    // A write unit (direct write or batch group) ended: the last one of the
+    // wave sends the writes accumulated meanwhile as the next wave.
+    void endPgWriteUnit() {
+        if (--pg_write_units_ == 0) firePgWriteBatchNow();
+    }
+
+    // Starts a wave: only with no unit in flight.
     void firePgWriteBatchNow() {
         if (pg_write_batch_.entries.empty()) return;
-
-        if (pg_write_batch_.timer_active) {
-            io_.cancelTimer(pg_write_batch_.timer);
-            pg_write_batch_.timer_active = false;
-        }
 
         auto entries = std::move(pg_write_batch_.entries);
         pg_write_batch_ = {};
@@ -901,6 +877,12 @@ private:
         // write-ordering contract (docs/runtime.md).
         std::sort(entries.begin(), entries.end(),
             [](const auto* a, const auto* b) { return a->seq < b->seq; });
+        // A wave sends at most kMaxBatchEntries writes; the later ones wait for
+        // the next wave, still after every earlier write.
+        if (entries.size() > size_t{kMaxBatchEntries}) {
+            pg_write_batch_.entries.assign(entries.begin() + kMaxBatchEntries, entries.end());
+            entries.resize(kMaxBatchEntries);
+        }
 
         // Each group commits on its own connection: N writes cost about one
         // fsync wait per group instead of one per write, as PostgreSQL commits
@@ -908,6 +890,9 @@ private:
         // keeps the batch's vector.
         std::array<uint16_t, kMaxWriteFanout + 1> bounds;
         const size_t groups = groupByRow(entries, pg_write_fanout_, bounds);
+        // Counted before any group runs: one failing synchronously must not
+        // end the wave while the others are still to be fired.
+        pg_write_units_ = groups;
         // A group failing synchronously (pool closed) resumes its callers
         // before the next group is fired; one of them may drop the last owner.
         std::shared_ptr<BatchScheduler> self;
@@ -1331,14 +1316,9 @@ private:
         for (auto h : to_resume) h.resume();
         for (auto* e : to_delete) delete e;
 
-        // Chain: fire next accumulated batch or clear inflight. With several
-        // groups in flight, the first to finish fires it; clearing the latch
-        // while other groups run only lets one more write go direct.
-        if (!pg_write_batch_.entries.empty()) {
-            firePgWriteBatchNow();
-        } else {
-            pg_write_inflight_ = false;
-        }
+        // Writes submitted by the continuations above joined the batch: the
+        // wave's last group sends it.
+        endPgWriteUnit();
     }
 
     // =========================================================================
@@ -1675,7 +1655,12 @@ private:
     // and reads are independent + idempotent, so that is correctness-neutral.
     // It can never stick true (no clear-site is skippable) nor deadlock.
     bool pg_read_inflight_ = false;
-    bool pg_write_inflight_ = false;
+    // Writes go in waves, one at a time: a direct write (one unit) or the
+    // groups of one batch (one unit each). Writes submitted during a wave
+    // accumulate and depart together when its last unit ends, so the writes
+    // in flight never hold more than pg_write_fanout_ PG slots and never touch
+    // one row from two connections. Loop-thread only, like the latches.
+    size_t pg_write_units_ = 0;
     bool redis_inflight_ = false;
 
     // In-flight detached fire coroutines (the three fire*Batch). Plain size_t: it
