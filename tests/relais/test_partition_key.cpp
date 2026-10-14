@@ -2,7 +2,7 @@
  * test_partition_key.cpp
  * Integration tests for partition key repositories.
  *
- * Tests CRUD, L1/L2 caching, and cross-invalidation
+ * Tests CRUD, L1 caching, and cross-invalidation
  * with a partitioned table where Key=int64_t and region is a partition key hint.
  */
 
@@ -293,57 +293,7 @@ TEST_CASE("PartitionKey<TestEvent> - L1 caching",
 
 // #############################################################################
 //
-//  3. PartitionKey with L2 caching (Redis)
-//
-// #############################################################################
-
-TEST_CASE("PartitionKey<TestEvent> - L2 caching",
-          "[integration][db][partition-key][redis]")
-{
-    TransactionGuard tx;
-    auto userId = insertTestUser("redis_user", "redis@test.com", 100);
-
-    SECTION("[find] caches in Redis, returns on second read") {
-        auto eventId = insertTestEvent("us", userId, "Redis Event", 3);
-
-        // First read: DB → Redis
-        auto result1 = sync(L2TestEventRepo::find(eventId));
-        REQUIRE(result1 != nullptr);
-        CHECK(result1->title == "Redis Event");
-        CHECK(result1->region == "us");
-
-        // Modify in DB directly
-        updateTestEvent(eventId, "DB Modified", 99);
-
-        // Second read: Redis (stale)
-        auto result2 = sync(L2TestEventRepo::find(eventId));
-        REQUIRE(result2 != nullptr);
-        CHECK(result2->title == "Redis Event");
-    }
-
-    SECTION("[update] invalidates Redis cache") {
-        auto eventId = insertTestEvent("eu", userId, "Redis Before", 1);
-
-        // Cache in Redis
-        sync(L2TestEventRepo::find(eventId));
-
-        // Modify in DB directly
-        updateTestEvent(eventId, "DB Changed", 7);
-
-        // Update via repo (invalidates Redis)
-        auto wrapper = makeTestEvent("eu", userId, "Redis After", 5, eventId);
-        sync(L2TestEventRepo::update(eventId, wrapper));
-
-        // Next read gets fresh data
-        auto found = sync(L2TestEventRepo::find(eventId));
-        REQUIRE(found != nullptr);
-        CHECK(found->title == "Redis After");
-    }
-}
-
-// #############################################################################
-//
-//  4. Cross-invalidation: Event (PartitionKey) as SOURCE
+//  3. Cross-invalidation: Event (PartitionKey) as SOURCE
 //
 // #############################################################################
 
@@ -448,7 +398,7 @@ TEST_CASE("PartitionKey cross-invalidation - Event as source",
 
 // #############################################################################
 //
-//  5. Cross-invalidation: Event (PartitionKey) as TARGET
+//  4. Cross-invalidation: Event (PartitionKey) as TARGET
 //
 // #############################################################################
 
@@ -487,7 +437,7 @@ TEST_CASE("PartitionKey cross-invalidation - Event as target",
 
 // #############################################################################
 //
-//  6. Serialization
+//  5. Serialization
 //
 // #############################################################################
 
@@ -537,7 +487,7 @@ TEST_CASE("PartitionKey - serialization",
 
 // #############################################################################
 //
-//  7. patch — criteria-based partial update for PartitionKey
+//  6. patch — criteria-based partial update for PartitionKey
 //
 // #############################################################################
 
@@ -663,42 +613,6 @@ TEST_CASE("PartitionKey<TestEvent> - patch (L1)",
     }
 }
 
-TEST_CASE("PartitionKey<TestEvent> - patch (L2)",
-          "[integration][db][partition-key][redis][patch]")
-{
-    TransactionGuard tx;
-    auto userId = insertTestUser("l2patch_user", "l2patch@test.com", 100);
-
-    SECTION("[patch] invalidates Redis then re-fetches") {
-        auto eventId = insertTestEvent("eu", userId, "Redis Cached", 5);
-
-        // Populate Redis
-        sync(L2TestEventRepo::find(eventId));
-
-        // Modify in DB directly (bypass cache)
-        updateTestEvent(eventId, "DB Changed", 99);
-
-        // Redis still returns stale data
-        auto stale = sync(L2TestEventRepo::find(eventId));
-        REQUIRE(stale != nullptr);
-        CHECK(stale->title == "Redis Cached");
-
-        // patch invalidates Redis, updates priority, then re-fetches from DB
-        auto result = sync(L2TestEventRepo::patch(
-            eventId, set<EF::priority>(42)));
-
-        REQUIRE(result != nullptr);
-        CHECK(result->priority == 42);
-        CHECK(result->title == "DB Changed");  // Re-fetched from DB, not stale Redis
-
-        // Independent fetch confirms correct state
-        auto found = sync(L2TestEventRepo::find(eventId));
-        REQUIRE(found != nullptr);
-        CHECK(found->priority == 42);
-        CHECK(found->title == "DB Changed");
-    }
-}
-
 TEST_CASE("PartitionKey<TestEvent> - patch cross-invalidation",
           "[integration][db][partition-key][cross-inv][patch]")
 {
@@ -733,7 +647,7 @@ TEST_CASE("PartitionKey<TestEvent> - patch cross-invalidation",
 
 // #############################################################################
 //
-//  8. erase — Opportunistic full PK via L1/L2 hint
+//  7. erase — Opportunistic full PK via L1 hint
 //
 // #############################################################################
 
@@ -779,109 +693,6 @@ TEST_CASE("PartitionKey<TestEvent> - erase with L1 hint",
 
         // Verify deletion
         auto found = sync(L1TestEventRepo::find(eventId));
-        CHECK(found == nullptr);
-    }
-}
-
-TEST_CASE("PartitionKey<TestEvent> - erase with L2 hint",
-          "[integration][db][partition-key][redis]")
-{
-    TransactionGuard tx;
-    auto userId = insertTestUser("l2erase_user", "l2erase@test.com", 100);
-
-    SECTION("[erase] succeeds when entity is in Redis (L2 hint path)") {
-        auto eventId = insertTestEvent("eu", userId, "Redis Cached", 5);
-
-        // Populate Redis cache
-        sync(L2TestEventRepo::find(eventId));
-
-        // erase (L2 hit → provides hint → full PK delete)
-        auto result = sync(L2TestEventRepo::erase(eventId));
-        REQUIRE(result.has_value());
-        CHECK(*result == 1);
-
-        // Verify deletion
-        auto found = sync(L2TestEventRepo::find(eventId));
-        CHECK(found == nullptr);
-    }
-
-    SECTION("[erase] succeeds when entity is NOT in Redis (criteria fallback)") {
-        auto eventId = insertTestEvent("us", userId, "Not Cached", 3);
-
-        // Ensure no Redis data
-        flushRedis();
-
-        // erase (no L2 hint → criteria-based)
-        auto result = sync(L2TestEventRepo::erase(eventId));
-        REQUIRE(result.has_value());
-        CHECK(*result == 1);
-    }
-}
-
-TEST_CASE("PartitionKey<TestEvent> - erase with L1+L2 hint chain",
-          "[integration][db][partition-key][cached][redis]")
-{
-    TransactionGuard tx;
-    auto userId = insertTestUser("botherase_user", "botherase@test.com", 100);
-
-    SECTION("[erase] L1 hit provides hint (skips L2 check)") {
-        auto eventId = insertTestEvent("eu", userId, "Both Cached", 5);
-
-        // Populate L1 + L2
-        sync(L1L2TestEventRepo::find(eventId));
-
-        // Verify precondition: L1 has entity with correct partition key
-        auto cached = TestInternals::getFromCache<L1L2TestEventRepo>(eventId);
-        REQUIRE(cached != nullptr);
-        CHECK(cached->region == "eu");
-
-        // erase (L1 hit → hint with region="eu" → delete_with_partition)
-        auto result = sync(L1L2TestEventRepo::erase(eventId));
-        REQUIRE(result.has_value());
-        CHECK(*result == 1);
-
-        auto found = sync(L1L2TestEventRepo::find(eventId));
-        CHECK(found == nullptr);
-    }
-
-    SECTION("[erase] L1 miss, L2 hit provides hint") {
-        auto eventId = insertTestEvent("us", userId, "L2 Only", 3);
-
-        // Populate L1 + L2
-        sync(L1L2TestEventRepo::find(eventId));
-
-        // Invalidate L1 only (L2 still has the entity)
-        L1L2TestEventRepo::evict(eventId);
-
-        // Verify precondition: L1 is empty (hint must come from L2)
-        auto cachedL1 = TestInternals::getFromCache<L1L2TestEventRepo>(eventId);
-        REQUIRE(cachedL1 == nullptr);
-
-        // erase (L1 miss → L2 hit → hint with region="us" → delete_with_partition)
-        auto result = sync(L1L2TestEventRepo::erase(eventId));
-        REQUIRE(result.has_value());
-        CHECK(*result == 1);
-
-        auto found = sync(L1L2TestEventRepo::find(eventId));
-        CHECK(found == nullptr);
-    }
-
-    SECTION("[erase] both L1 and L2 miss - criteria fallback") {
-        auto eventId = insertTestEvent("eu", userId, "No Cache", 1);
-
-        // Ensure no L1 and no L2
-        flushRedis();
-
-        // Verify precondition: L1 is empty
-        auto cachedL1 = TestInternals::getFromCache<L1L2TestEventRepo>(eventId);
-        REQUIRE(cachedL1 == nullptr);
-
-        // erase (no L1, no L2 → no hint → delete_by_pk, scans all partitions)
-        auto result = sync(L1L2TestEventRepo::erase(eventId));
-        REQUIRE(result.has_value());
-        CHECK(*result == 1);
-
-        auto found = sync(L1L2TestEventRepo::find(eventId));
         CHECK(found == nullptr);
     }
 }

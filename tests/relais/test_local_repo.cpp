@@ -13,7 +13,7 @@
  *   6. ListVia     — InvalidateListVia<> with GroupKey (3 granularities)
  *   7. Binary      — binary entity CRUD with L1 caching
  *   8. patch    — partial field updates with L1 invalidation
- *   9. JSON        — findJson with L1 caching
+ *   9. JSON/BEVE   — findJson / findBinary with L1 caching
  *  10. ReadOnly    — read-only repository at L1
  *  11. RO+Inv      — read-only as cross-invalidation target at L1
  *
@@ -1038,7 +1038,7 @@ TEST_CASE("LocalRepo<TestUser> - patch",
 
 // #############################################################################
 //
-//  9. findJson — raw JSON retrieval with L1 caching
+//  9. findJson / findBinary — serialized retrieval with L1 caching
 //
 // #############################################################################
 
@@ -1083,6 +1083,67 @@ TEST_CASE("LocalRepo - findJson",
         // sequence and its decimal occasionally contains "999" → false positive.
         REQUIRE(result2.find("\"balance\":10") != std::string::npos);
         REQUIRE(result2.find("\"balance\":999") == std::string::npos);
+    }
+}
+
+TEST_CASE("LocalRepo - findBinary",
+          "[integration][db][cached][binary]")
+{
+    TransactionGuard tx;
+
+    SECTION("[binary] returns BEVE bytes that decode to the entity") {
+        auto id = insertTestUser("binary_user", "binary@example.com", 100);
+
+        auto result = sync(L1TestUserRepo::findBinary(id));
+
+        REQUIRE(!result.empty());
+        auto entity = TestUserEntity::fromBinary(result);
+        REQUIRE(entity.has_value());
+        REQUIRE(entity->username == "binary_user");
+        REQUIRE(entity->balance == 100);
+    }
+
+    SECTION("[binary] returns empty for non-existent id") {
+        auto result = sync(L1TestUserRepo::findBinary(999999999));
+
+        REQUIRE(result.empty());
+    }
+
+    SECTION("[binary] second call is served from the L1 entity") {
+        auto id = insertTestUser("cached_binary", "cb@example.com", 200);
+
+        // First call — DB fetch, cache entity in L1
+        auto result1 = sync(L1TestUserRepo::findBinary(id));
+        REQUIRE(!result1.empty());
+
+        // Modify DB directly (bypass the repo)
+        updateTestUserBalance(id, 999);
+
+        // Second call — L1 cached entity serialized to BEVE (stale balance)
+        auto result2 = sync(L1TestUserRepo::findBinary(id));
+        REQUIRE(!result2.empty());
+        auto entity = TestUserEntity::fromBinary(result2);
+        REQUIRE(entity.has_value());
+        REQUIRE(entity->username == "cached_binary");
+        REQUIRE(entity->balance == 200);
+    }
+
+    SECTION("[binary] invalidation clears the cached entity") {
+        auto id = insertTestUser("inv_binary", "ib@example.com", 300);
+
+        // Populate L1
+        sync(L1TestUserRepo::findBinary(id));
+
+        // Invalidate, then modify DB
+        sync(L1TestUserRepo::invalidate(id));
+        updateTestUserBalance(id, 0);
+
+        // Next read fetches fresh data from DB
+        auto result = sync(L1TestUserRepo::findBinary(id));
+        REQUIRE(!result.empty());
+        auto entity = TestUserEntity::fromBinary(result);
+        REQUIRE(entity.has_value());
+        REQUIRE(entity->balance == 0);
     }
 }
 

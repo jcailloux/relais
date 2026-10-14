@@ -1,8 +1,7 @@
 /**
  * TestQueryHelpers.h
  * Shared query builder helpers for declarative list tests.
- * Used by test_cached_repository.cpp, test_decl_list_cache.cpp,
- * test_decl_list_redis.cpp, test_decl_list_full.cpp.
+ * Used by the declarative list, concurrency, upsert and warmup tests.
  */
 
 #pragma once

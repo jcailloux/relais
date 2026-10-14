@@ -90,22 +90,22 @@ TEST_CASE("AssignedKey<TestAssignedKey> - update round-trip (Uncached)",
 
 // #############################################################################
 //
-//  3. Round-trip UPDATE through the full cache (L1+L2)
+//  3. Round-trip UPDATE through the L1 cache
 //
 // #############################################################################
 
-TEST_CASE("AssignedKey<TestAssignedKey> - update round-trip (L1+L2)",
-          "[integration][db][assigned-key][cached][redis]")
+TEST_CASE("AssignedKey<TestAssignedKey> - update round-trip (L1)",
+          "[integration][db][assigned-key][cached]")
 {
     TransactionGuard tx;
 
-    SECTION("[update] invalidates caches and reloads the new value") {
-        sync(FullCacheTestAssignedKeyRepo::insert(makeTestAssignedKey(8, 10, "a")));
-        sync(FullCacheTestAssignedKeyRepo::find(8));  // populate caches
+    SECTION("[update] invalidates the cache and reloads the new value") {
+        sync(L1TestAssignedKeyRepo::insert(makeTestAssignedKey(8, 10, "a")));
+        sync(L1TestAssignedKeyRepo::find(8));  // populate cache
 
-        REQUIRE(sync(FullCacheTestAssignedKeyRepo::update(8, makeTestAssignedKey(8, 20, "b"))));
+        REQUIRE(sync(L1TestAssignedKeyRepo::update(8, makeTestAssignedKey(8, 20, "b"))));
 
-        auto found = sync(FullCacheTestAssignedKeyRepo::find(8));
+        auto found = sync(L1TestAssignedKeyRepo::find(8));
         REQUIRE(found != nullptr);
         CHECK(found->key_id == 8);
         CHECK(found->payload == 20);

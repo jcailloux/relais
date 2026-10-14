@@ -1,6 +1,6 @@
 /**
  * test_multiview.cpp
- * Pure unit tests for cache::MultiView<E> — no DB, no Redis, no event loop.
+ * Pure unit tests for cache::MultiView<E> — no DB, no event loop.
  *
  * MultiView is the guarded aggregate returned by findMany(): N positional
  * slots, each either absent (nullptr), pointing at an external L1 slot, or

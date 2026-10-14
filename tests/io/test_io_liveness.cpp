@@ -16,13 +16,8 @@
 #include <jcailloux/relais/io/pg/PgConnection.h>
 #include <jcailloux/relais/io/pg/PgPool.h>
 #include <jcailloux/relais/io/pg/PgError.h>
-#include <jcailloux/relais/io/redis/RedisClient.h>
-#include <jcailloux/relais/io/redis/RedisConnection.h>
-#include <jcailloux/relais/io/redis/RedisPool.h>
-#include <jcailloux/relais/io/redis/RedisError.h>
 #include <jcailloux/relais/io/batch/BatchScheduler.h>
 #include <jcailloux/relais/io/IoPool.h>
-#include <jcailloux/relais/io/SelfHealQueue.h>
 #include <jcailloux/relais/io/WhenAll.h>
 
 #include <fixtures/ControllableIoContext.h>
@@ -38,7 +33,6 @@
 #include <chrono>
 #include <coroutine>
 #include <exception>
-#include <future>
 #include <memory>
 #include <optional>
 #include <string>
@@ -64,8 +58,7 @@ static const char* getConnInfo() {
 // A TCP listener that accepts the kernel handshake (so connect() completes) but
 // never reads or replies. To a PG client the socket is writable for the startup
 // packet, then never readable — the exact silent hang the connect/query bound
-// must catch. To a Redis client the TCP connect simply completes and the first
-// reply never comes.
+// must catch.
 struct SilentTcpServer {
     int fd = -1;
     int port_ = 0;
@@ -96,35 +89,6 @@ struct SilentTcpServer {
     }
 };
 
-// A loopback port bound but NOT listening: a connect() to it is refused (the
-// kernel replies RST → ECONNREFUSED), so it drives the "a connect was attempted
-// and failed fast" path deterministically. Distinct from SilentTcpServer, which
-// listens and accepts the (handshake-less) TCP connect — a Redis connect against
-// a blackhole SUCCEEDS at TCP level, so only a refused port makes the connect throw.
-struct RefusedTcpPort {
-    int fd = -1;
-    int port_ = 0;
-
-    RefusedTcpPort() {
-        fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
-        REQUIRE(fd >= 0);
-        sockaddr_in addr{};
-        addr.sin_family = AF_INET;
-        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        addr.sin_port = 0;  // ephemeral
-        REQUIRE(::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
-        socklen_t len = sizeof(addr);
-        REQUIRE(::getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len) == 0);
-        port_ = ntohs(addr.sin_port);
-        // Deliberately NOT listen(): holding the fd reserves the port, and an
-        // incoming SYN with no listener → RST → ECONNREFUSED.
-    }
-    ~RefusedTcpPort() { if (fd >= 0) ::close(fd); }
-    RefusedTcpPort(const RefusedTcpPort&) = delete;
-    RefusedTcpPort& operator=(const RefusedTcpPort&) = delete;
-
-    int port() const { return port_; }
-};
 
 // Count process fds. Used as a leak tripwire: the offset (., .., the opendir fd)
 // is constant, so a before/after delta is meaningful.
@@ -435,95 +399,6 @@ TEST_CASE("liveness: a mid-query RST resolves in error without a stray timer",
 }
 
 // =============================================================================
-// Redis silent hang: query bound + lock release
-// =============================================================================
-
-TEST_CASE("liveness: a silent Redis trips RedisQueryTimeout and releases the lock",
-          "[io][liveness][integration]") {
-    SilentTcpServer silent;
-    Io io;
-    auto client = driveBounded(io,
-        RedisClient<Io>::connect(io, "127.0.0.1", silent.port(), 200ms));
-    REQUIRE(client->connected());  // TCP completed; the reply never will
-
-    // First command: send ok, reply withheld → RedisQueryTimeout.
-    REQUIRE_THROWS_AS(driveBounded(io, client->exec("PING")), RedisQueryTimeout);
-
-    // Second command on the SAME client must not deadlock on the coroutine mutex
-    // (execArgv's catch released it). If the lock had leaked, this would never
-    // start its own read and driveBounded would blow its budget.
-    REQUIRE_THROWS_AS(driveBounded(io, client->exec("PING"), 2s), RedisQueryTimeout);
-}
-
-// =============================================================================
-// RedisPool: dead-slot avoidance + reviveDeadClients
-// =============================================================================
-
-// Poison a fresh client by timing it out against the silent server; it ends
-// dead_ and quiescent (no holder, no waiter).
-static std::shared_ptr<RedisClient<Io>> poisonedClient(Io& io, int silent_port) {
-    auto c = driveBounded(io,
-        RedisClient<Io>::connect(io, "127.0.0.1", silent_port, 150ms));
-    try { driveBounded(io, c->exec("PING")); } catch (const RedisQueryTimeout&) {}
-    REQUIRE_FALSE(c->connected());
-    REQUIRE(c->isQuiescent());
-    return c;
-}
-
-TEST_CASE("liveness: next() steers off dead slots; reviveDeadClients rebuilds them",
-          "[io][liveness][integration]") {
-    SilentTcpServer silent;
-    Io io;
-
-    auto healthy = driveBounded(io, RedisClient<Io>::connect(io, "127.0.0.1", 6379));
-    REQUIRE(healthy->connected());
-    auto dead = poisonedClient(io, silent.port());
-
-    // Reconnect factory rebuilds a dead slot from the real Redis.
-    RedisPool<Io>::ReconnectFactory factory =
-        [&io](std::size_t) -> Task<std::shared_ptr<RedisClient<Io>>> {
-            co_return co_await RedisClient<Io>::connect(io, "127.0.0.1", 6379);
-        };
-    std::vector<std::shared_ptr<RedisClient<Io>>> clients{healthy, dead};
-    auto pool = RedisPool<Io>::fromClients(std::move(clients), factory);
-
-    // next() never hands out the dead slot while a live one exists.
-    for (int i = 0; i < 8; ++i)
-        REQUIRE(pool.next().connected());
-
-    // Cold-path revive rebuilds the (quiescent) dead slot; the healthy one is
-    // skipped at the connected() gate.
-    auto revived = driveBounded(io, pool.reviveDeadClients());
-    REQUIRE(revived == 1);
-    REQUIRE(pool.at(0).connected());
-    REQUIRE(pool.at(1).connected());
-}
-
-TEST_CASE("liveness: two dead quiescent slots are rebuilt in one pass without UAF",
-          "[io][liveness][integration]") {
-    SilentTcpServer silent;
-    Io io;
-
-    auto deadA = poisonedClient(io, silent.port());
-    auto deadB = poisonedClient(io, silent.port());
-
-    RedisPool<Io>::ReconnectFactory factory =
-        [&io](std::size_t) -> Task<std::shared_ptr<RedisClient<Io>>> {
-            co_return co_await RedisClient<Io>::connect(io, "127.0.0.1", 6379);
-        };
-    std::vector<std::shared_ptr<RedisClient<Io>>> clients{deadA, deadB};
-    auto pool = RedisPool<Io>::fromClients(std::move(clients), factory);
-
-    // Both dead slots are quiescent → both revived in a single pass; the swap of
-    // two slots in one cycle is the ASan-relevant path (no use-after-free on the
-    // replaced clients, which the pool solely owns).
-    auto revived = driveBounded(io, pool.reviveDeadClients());
-    REQUIRE(revived == 2);
-    REQUIRE(pool.at(0).connected());
-    REQUIRE(pool.at(1).connected());
-}
-
-// =============================================================================
 // Pipeline / batched paths
 // =============================================================================
 
@@ -736,32 +611,6 @@ TEST_CASE("liveness: ordered teardown drains an in-flight detached fire, no leak
     pump(io);  // a leaked fire frame / stray timer would surface here under ASan
 }
 
-TEST_CASE("liveness: beginShutdown stops the self-heal queue from re-arming",
-          "[io][liveness][integration][teardown]") {
-    Io io;
-    // No Redis pool needed: the drain skips revive and just runs the retry.
-    auto pool = driveBounded(io, PgPool<Io>::create(io, getConnInfo(),
-        {.min_connections = 0, .max_connections = 1}));
-    auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, nullptr, 8);
-
-    int retries = 0;
-    auto retry = [&retries]() -> Task<bool> { ++retries; co_return true; };
-
-    // Before shutdown: an enqueue arms the recurring drain, which runs the retry.
-    batcher->enqueueSelfHeal("k1", retry);
-    pump(io, 250ms);  // base drain delay is 100ms
-    REQUIRE(retries == 1);
-
-    // After beginShutdown: an enqueue must NOT arm a new drain — so teardown can
-    // settle even while keys are still pending (a draining queue against a down
-    // Redis would otherwise re-arm forever).
-    batcher->beginShutdown();
-    batcher->enqueueSelfHeal("k2", retry);
-    pump(io, 250ms);
-    REQUIRE(retries == 1);                       // no second drain ran
-    REQUIRE(batcher->quiescentForTeardown());    // not draining, no fire in flight
-}
-
 TEST_CASE("liveness: fail-fast startup reclaims an in-flight connect, no fd leak",
           "[io][liveness][integration][teardown]") {
     SilentTcpServer silent;
@@ -773,6 +622,7 @@ TEST_CASE("liveness: fail-fast startup reclaims an in-flight connect, no fd leak
     IoPoolConfig cfg;
     cfg.num_workers = 1;
     cfg.pg_conninfo = silent.conninfo();
+    cfg.redis = std::nullopt;
     cfg.pin_to_cores = false;
     cfg.acquire_timeout = 0ms;     // unbounded boot connect
     cfg.query_timeout = 0ms;
@@ -792,6 +642,7 @@ TEST_CASE("liveness: an unreachable dependency fails startup within a bound, nev
     IoPoolConfig cfg;
     cfg.num_workers = 1;
     cfg.pg_conninfo = silent.conninfo();
+    cfg.redis = std::nullopt;
     cfg.pin_to_cores = false;
     cfg.acquire_timeout = 300ms;   // bound the boot connect itself
     cfg.startup_timeout = 5s;
@@ -803,26 +654,11 @@ TEST_CASE("liveness: an unreachable dependency fails startup within a bound, nev
 }
 
 // =============================================================================
-// L1-only (redis=nullopt): no Redis pool, no boot connect, clean teardown. The
-// differential D1/D2 isolates that the `if (config.redis)` guard is what stops
-// the connect — not IoPool never connecting Redis anyway.
+// IoPool boot and teardown: clean start, no leaked fd
 // =============================================================================
 
-// Read hasRedis() ON worker `w`'s loop thread (thread_local — must be observed
-// on that thread, not the test thread).
-static bool workerHasRedis(IoPool& pool, int w) {
-    std::promise<bool> p;
-    auto fut = p.get_future();
-    pool.workerIo(w).post(
-        [&p] { p.set_value(jcailloux::relais::PgProvider::hasRedis()); });
-    REQUIRE(fut.wait_for(2s) == std::future_status::ready);
-    return fut.get();
-}
-
-TEST_CASE("liveness: L1-only IoPool attempts no Redis connect and starts clean",
+TEST_CASE("liveness: an L1-only IoPool starts clean",
           "[io][iopool][integration]") {
-    // D2: redis=nullopt → no RedisPool is built and no boot connect is attempted,
-    // so startup succeeds with no reachable Redis and hasRedis()==false.
     IoPoolConfig cfg;
     cfg.num_workers = 1;
     cfg.pg_conninfo = getConnInfo();
@@ -833,38 +669,13 @@ TEST_CASE("liveness: L1-only IoPool attempts no Redis connect and starts clean",
 
     auto pool = IoPool::create(cfg);
     REQUIRE(pool->numWorkers() == 1);
-    REQUIRE_FALSE(workerHasRedis(*pool, 0));
     pool->stop();
-}
-
-TEST_CASE("liveness: IoPool with Redis set attempts the connect (refused → fails fast)",
-          "[io][iopool][integration]") {
-    // D1, the differential to D2: with redis set, the boot DOES attempt a Redis
-    // connect. Pointed at a refused port it fails fast, failing startup. PG boots
-    // first (real conninfo, succeeds), so the throw is the Redis connect — proving
-    // a connect is attempted, which redis=nullopt skips entirely.
-    RefusedTcpPort refused;
-    IoPoolConfig cfg;
-    cfg.num_workers = 1;
-    cfg.pg_conninfo = getConnInfo();
-    cfg.redis = RedisWorkerConfig{.host = "127.0.0.1", .port = refused.port(),
-                                  .conns_per_worker = 1};
-    cfg.pin_to_cores = false;
-    cfg.pg_min_conns_per_worker = 1;
-    cfg.pg_max_conns_per_worker = 1;
-    cfg.query_timeout = 300ms;
-
-    auto t0 = std::chrono::steady_clock::now();
-    REQUIRE_THROWS(IoPool::create(cfg));
-    auto elapsed = std::chrono::steady_clock::now() - t0;
-    REQUIRE(elapsed < 2s);  // refused is immediate; never hangs on the connect
 }
 
 TEST_CASE("liveness: an L1-only IoPool tears down with no fd leak",
           "[io][iopool][integration][teardown]") {
-    // E: the redis_pool==nullptr path must dismantle cleanly — batcher trivially
-    // quiescent (no Redis batch), SelfHealQueue null-guarded, no suspended Redis
-    // frame. A before/after fd delta would surface any leaked socket or pipe.
+    // Teardown must dismantle every worker cleanly. A before/after fd delta
+    // would surface any leaked socket or pipe.
     int fds_before = countOpenFds();
     {
         IoPoolConfig cfg;
@@ -881,27 +692,4 @@ TEST_CASE("liveness: an L1-only IoPool tears down with no fd leak",
     }
     int fds_after = countOpenFds();
     REQUIRE(fds_after <= fds_before);
-}
-
-// =============================================================================
-// SelfHealQueue accounting — dedup and overflow cap. No PG/Redis: only the
-// queue's bookkeeping is exercised, with a retry that never confirms.
-// =============================================================================
-
-TEST_CASE("liveness: the self-heal queue dedups by key and caps its footprint",
-          "[io][selfheal]") {
-    Io io;
-    SelfHealQueue<Io> q(io, nullptr);  // no pool: exercise the accounting only
-    auto never = []() -> Task<bool> { co_return false; };
-
-    // The same key enqueued twice is one pending entry — a refresh, not growth.
-    q.enqueue("k", never);
-    q.enqueue("k", never);
-    REQUIRE(q.pending() == 1);
-
-    // Past the distinct-key cap the surplus is dropped: the footprint is the
-    // number of distinct stale keys, not the number of attempts (anti-OOM).
-    for (int i = 0; i < 100'001; ++i)
-        q.enqueue("key-" + std::to_string(i), never);
-    REQUIRE(q.pending() == 100'000);  // kMaxKeys, including the "k" above
 }

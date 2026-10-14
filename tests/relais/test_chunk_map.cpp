@@ -1,6 +1,6 @@
 /**
  * test_chunk_map.cpp
- * Pure unit tests for ChunkMap mutations — no DB, no Redis, no event loop.
+ * Pure unit tests for ChunkMap mutations — no DB, no event loop.
  *
  * The contract under test:
  *   - remove_if tests and removes in one step: a failing predicate leaves the

@@ -12,10 +12,10 @@
  *     batched: dedup sources, resolve (per-source loop OR opt-in span overload),
  *     dedup targets, invalidate each once. M distinct targets, M < N.
  *   - invalidateManyImpl(span<const E>) — the shared downstream of every batch
- *     op: L1 evict + L2 UNLINK + list tracker + deduplicated cross-inval.
+ *     op: L1 evict + list tracker + deduplicated cross-inval.
  *
  * SECTION tags:
- *   [dedup]      — pure dedup (no DB, no Redis)
+ *   [dedup]      — pure dedup (no I/O)
  *   [indirect]   — InvalidateVia batched cross-inval (mock target + counting resolver)
  *   [many]       — invalidateManyImpl over real repos (L1 evict / list tracker)
  */
@@ -204,7 +204,7 @@ TEST_CASE("InvalidateVia batch: empty set is a no-op",
 
 TEST_CASE("invalidateManyImpl evicts the entity set from L1 + deduped cross-inval",
           "[many]") {
-    // Pure L1 cascade (no DB/Redis): warm the entity + cross-inval target L1
+    // Pure L1 cascade (no DB): warm the entity + cross-inval target L1
     // directly, run the common path, assert both tiers are evicted.
     TestInternals::resetEntityCacheState<L1TestPurchaseRepo>();
     TestInternals::resetEntityCacheState<L1TestUserRepo>();
@@ -345,23 +345,23 @@ void invalidateManyMatchesMonoLoop() {
 // ---------------------------------------------------------------------------
 
 TEST_CASE("eraseMany removes from L3; invalidateMany evicts cache but keeps L3",
-          "[public][many][integration][db][redis]") {
+          "[public][many][integration][db]") {
     TransactionGuard tx;
     int64_t u1 = insertTestUser("d_u1", "d_u1@x", 10);
     int64_t u2 = insertTestUser("d_u2", "d_u2@x", 20);
     std::vector<int64_t> ids = {u1, u2};
 
     SECTION("invalidateMany: evicted then repopulated from L3, rows intact") {
-        sync(FullCacheTestUserRepo::find(u1));  // warm L1+L2
-        sync(FullCacheTestUserRepo::find(u2));
+        sync(L1TestUserRepo::find(u1));  // warm L1
+        sync(L1TestUserRepo::find(u2));
         updateTestUserBalance(u1, 111);         // mutate under the cache
         updateTestUserBalance(u2, 222);
 
-        sync(FullCacheTestUserRepo::invalidateMany(std::span<const int64_t>(ids)));
+        sync(L1TestUserRepo::invalidateMany(std::span<const int64_t>(ids)));
 
         // A surviving cache hit would still read 10/20 — fresh values prove eviction.
-        auto a = sync(FullCacheTestUserRepo::find(u1));
-        auto b = sync(FullCacheTestUserRepo::find(u2));
+        auto a = sync(L1TestUserRepo::find(u1));
+        auto b = sync(L1TestUserRepo::find(u2));
         REQUIRE(a);
         REQUIRE(a->balance == 111);
         REQUIRE(b);
@@ -371,15 +371,15 @@ TEST_CASE("eraseMany removes from L3; invalidateMany evicts cache but keeps L3",
     }
 
     SECTION("eraseMany: gone from every tier and from L3") {
-        sync(FullCacheTestUserRepo::find(u1));
-        sync(FullCacheTestUserRepo::find(u2));
+        sync(L1TestUserRepo::find(u1));
+        sync(L1TestUserRepo::find(u2));
 
-        auto n = sync(FullCacheTestUserRepo::eraseMany(std::span<const int64_t>(ids)));
+        auto n = sync(L1TestUserRepo::eraseMany(std::span<const int64_t>(ids)));
         REQUIRE(n.has_value());
         REQUIRE(*n == 2);
 
-        REQUIRE_FALSE(sync(FullCacheTestUserRepo::find(u1)));  // no L1 ghost
-        REQUIRE_FALSE(sync(FullCacheTestUserRepo::find(u2)));
+        REQUIRE_FALSE(sync(L1TestUserRepo::find(u1)));  // no L1 ghost
+        REQUIRE_FALSE(sync(L1TestUserRepo::find(u2)));
         REQUIRE_FALSE(userExists(u1));
         REQUIRE_FALSE(userExists(u2));
     }
@@ -389,22 +389,18 @@ TEST_CASE("eraseMany removes from L3; invalidateMany evicts cache but keeps L3",
 // Metamorphic oracle across every cache config
 // ---------------------------------------------------------------------------
 
-TEST_CASE("eraseMany ≡ mono erase loop (Uncached/L1/L2/Both)",
-          "[public][many][oracle][integration][db][redis]") {
+TEST_CASE("eraseMany ≡ mono erase loop (Uncached/L1)",
+          "[public][many][oracle][integration][db]") {
     TransactionGuard tx;
     SECTION("Uncached") { eraseManyMatchesMonoLoop<UncachedTestUserRepo>(); }
     SECTION("L1")       { eraseManyMatchesMonoLoop<L1TestUserRepo>(); }
-    SECTION("L2")       { eraseManyMatchesMonoLoop<L2TestUserRepo>(); }
-    SECTION("Both")     { eraseManyMatchesMonoLoop<FullCacheTestUserRepo>(); }
 }
 
-TEST_CASE("invalidateMany ≡ mono invalidate loop (Uncached/L1/L2/Both)",
-          "[public][many][oracle][integration][db][redis]") {
+TEST_CASE("invalidateMany ≡ mono invalidate loop (Uncached/L1)",
+          "[public][many][oracle][integration][db]") {
     TransactionGuard tx;
     SECTION("Uncached") { invalidateManyMatchesMonoLoop<UncachedTestUserRepo>(); }
     SECTION("L1")       { invalidateManyMatchesMonoLoop<L1TestUserRepo>(); }
-    SECTION("L2")       { invalidateManyMatchesMonoLoop<L2TestUserRepo>(); }
-    SECTION("Both")     { invalidateManyMatchesMonoLoop<FullCacheTestUserRepo>(); }
 }
 
 // ---------------------------------------------------------------------------
@@ -412,14 +408,14 @@ TEST_CASE("invalidateMany ≡ mono invalidate loop (Uncached/L1/L2/Both)",
 // ---------------------------------------------------------------------------
 
 TEST_CASE("eraseMany edge sets: empty / singleton / duplicates / absent ids",
-          "[public][many][integration][db][redis]") {
+          "[public][many][integration][db]") {
     TransactionGuard tx;
     int64_t u1 = insertTestUser("e_u1", "e_u1@x", 1);
     int64_t u2 = insertTestUser("e_u2", "e_u2@x", 2);
 
     SECTION("empty set is a no-op: 0 affected, nothing deleted") {
         std::vector<int64_t> none;
-        auto n = sync(FullCacheTestUserRepo::eraseMany(std::span<const int64_t>(none)));
+        auto n = sync(L1TestUserRepo::eraseMany(std::span<const int64_t>(none)));
         REQUIRE(n.has_value());
         REQUIRE(*n == 0);
         REQUIRE(userExists(u1));
@@ -428,7 +424,7 @@ TEST_CASE("eraseMany edge sets: empty / singleton / duplicates / absent ids",
 
     SECTION("singleton degenerates to the mono path") {
         std::vector<int64_t> one = {u1};
-        auto n = sync(FullCacheTestUserRepo::eraseMany(std::span<const int64_t>(one)));
+        auto n = sync(L1TestUserRepo::eraseMany(std::span<const int64_t>(one)));
         REQUIRE(n.has_value());
         REQUIRE(*n == 1);
         REQUIRE_FALSE(userExists(u1));
@@ -437,7 +433,7 @@ TEST_CASE("eraseMany edge sets: empty / singleton / duplicates / absent ids",
 
     SECTION("duplicates collapse: counted once, no double-decrement") {
         std::vector<int64_t> dups = {u1, u1, u1};
-        auto n = sync(FullCacheTestUserRepo::eraseMany(std::span<const int64_t>(dups)));
+        auto n = sync(L1TestUserRepo::eraseMany(std::span<const int64_t>(dups)));
         REQUIRE(n.has_value());
         REQUIRE(*n == 1);  // one row, not three
         REQUIRE_FALSE(userExists(u1));
@@ -445,7 +441,7 @@ TEST_CASE("eraseMany edge sets: empty / singleton / duplicates / absent ids",
 
     SECTION("absent ids excluded from the affected count") {
         std::vector<int64_t> ids = {u1, 999999, u2};  // 999999 never inserted
-        auto n = sync(FullCacheTestUserRepo::eraseMany(std::span<const int64_t>(ids)));
+        auto n = sync(L1TestUserRepo::eraseMany(std::span<const int64_t>(ids)));
         REQUIRE(n.has_value());
         REQUIRE(*n == 2);  // only u1, u2 existed
         REQUIRE_FALSE(userExists(u1));
@@ -454,27 +450,27 @@ TEST_CASE("eraseMany edge sets: empty / singleton / duplicates / absent ids",
 }
 
 TEST_CASE("invalidateMany edge sets: empty no-op, duplicates evict once",
-          "[public][many][integration][db][redis]") {
+          "[public][many][integration][db]") {
     TransactionGuard tx;
     int64_t u1 = insertTestUser("ie_u1", "ie_u1@x", 10);
 
     SECTION("empty set evicts nothing (cached copy survives stale)") {
-        sync(FullCacheTestUserRepo::find(u1));     // warm
+        sync(L1TestUserRepo::find(u1));     // warm
         updateTestUserBalance(u1, 999);            // mutate under cache
         std::vector<int64_t> none;
-        sync(FullCacheTestUserRepo::invalidateMany(std::span<const int64_t>(none)));
+        sync(L1TestUserRepo::invalidateMany(std::span<const int64_t>(none)));
         // No eviction → the next read still hits the stale cached balance.
-        auto v = sync(FullCacheTestUserRepo::find(u1));
+        auto v = sync(L1TestUserRepo::find(u1));
         REQUIRE(v);
         REQUIRE(v->balance == 10);
     }
 
     SECTION("duplicate ids evict once, then refetch fresh") {
-        sync(FullCacheTestUserRepo::find(u1));
+        sync(L1TestUserRepo::find(u1));
         updateTestUserBalance(u1, 555);
         std::vector<int64_t> dups = {u1, u1, u1};
-        sync(FullCacheTestUserRepo::invalidateMany(std::span<const int64_t>(dups)));
-        auto v = sync(FullCacheTestUserRepo::find(u1));
+        sync(L1TestUserRepo::invalidateMany(std::span<const int64_t>(dups)));
+        auto v = sync(L1TestUserRepo::find(u1));
         REQUIRE(v);
         REQUIRE(v->balance == 555);
         REQUIRE(userExists(u1));
@@ -534,9 +530,9 @@ static_assert(jcailloux::relais::HasListDescriptor<TestArticleEntity>,
 
 namespace {
 
-// Full-cache Article repo (L1+L2+L3 + own lists) for the where oracle.
+// L1 Article repo (L1+L3 + own lists) for the where oracle.
 using WhereArticleRepo = jcailloux::relais::Repo<
-    TestArticleEntity, "test:article:where:both", cfg::Both>;
+    TestArticleEntity, "test:article:where:l1", cfg::Local>;
 
 using ArticlePred = jcailloux::relais::FilterSet<TestArticleEntity>;
 
@@ -611,13 +607,13 @@ TEST_CASE("eraseWhere ≡ eraseMany over the resolved id set",
 // intact (the rows still exist → a later find refetches fresh). Proven by the
 // staleness trick: warm, mutate L3 directly, invalidate, observe the fresh value.
 TEST_CASE("invalidateWhere evicts cache by predicate, keeps L3",
-          "[public][where][integration][db][redis]") {
+          "[public][where][integration][db]") {
     TransactionGuard tx;
     auto author = insertTestUser("iw_a", "iw_a@x", 0);
     auto id1 = insertTestArticle("tech", author, "T1", 10);
     auto id2 = insertTestArticle("tech", author, "T2", 20);
 
-    sync(WhereArticleRepo::find(id1));  // warm L1+L2
+    sync(WhereArticleRepo::find(id1));  // warm L1
     sync(WhereArticleRepo::find(id2));
 
     updateTestArticle(id1, "T1", 111);  // mutate L3 behind the cache
@@ -637,7 +633,7 @@ TEST_CASE("invalidateWhere evicts cache by predicate, keeps L3",
 // Oracle: invalidateWhere(P) ≡ invalidateMany(SELECT pk WHERE P). Both
 // leave L3 intact and evict the matched set; symmetric authors must agree.
 TEST_CASE("invalidateWhere ≡ invalidateMany over the resolved id set",
-          "[public][where][oracle][integration][db][redis]") {
+          "[public][where][oracle][integration][db]") {
     TransactionGuard tx;
     auto a = insertTestUser("iwo_a", "iwo_a@x", 0);
     auto b = insertTestUser("iwo_b", "iwo_b@x", 0);

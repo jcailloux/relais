@@ -11,7 +11,7 @@
  * (is_published) and a range GE (views_min), so the static_asserts also guard
  * against the KNOWN_OPS change perturbing the other operators.
  *
- * No DB / Redis: the generated descriptor is driven straight through the free
+ * No DB: the generated descriptor is driven straight through the free
  * helpers (parseListQuery -> buildWhereClause -> matchesFilters), the same path
  * the mixin chain uses.
  */

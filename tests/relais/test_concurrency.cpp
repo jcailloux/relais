@@ -13,7 +13,7 @@
  * std::atomic<int> counters checked after join.
  *
  * Covers:
- *   1. Concurrent find (L1, L2, L1+L2)
+ *   1. Concurrent find (L1, uncached)
  *   2. Concurrent read + write on same entity
  *   3. Concurrent insert + erase
  *   4. Concurrent cross-invalidation
@@ -25,7 +25,7 @@
  *  10. Concurrent list CRUD + list cache cleanup
  *  11a. ModificationTracker drains after concurrent storm
  *  11b. Progressive tracker reduction via trySweep
- *  16. Concurrent upsert on a shared assigned-PK key (+ upsert‖update‖erase)
+ *  15. Concurrent upsert on a shared assigned-PK key (+ upsert‖update‖erase)
  */
 
 #include <catch2/catch_test_macros.hpp>
@@ -34,8 +34,6 @@
 #include "fixtures/TestRepositories.h"
 #include "fixtures/TestQueryHelpers.h"
 #include "fixtures/RelaisTestAccessors.h"
-
-#include "jcailloux/relais/cache/RedisCache.h"
 
 #include <thread>
 #include <vector>
@@ -154,31 +152,15 @@ TEST_CASE("Concurrency - concurrent find",
         REQUIRE(null_count.load() == 0);
     }
 
-    SECTION("[L2] N threads read the same entity concurrently") {
-        auto id = insertTestItem("conc_read_l2", 42);
-        sync(L2TestItemRepo::find(id));
+    SECTION("[Uncached] N threads read the same entity concurrently") {
+        auto id = insertTestItem("conc_read_uncached", 42);
+        sync(UncachedTestItemRepo::find(id));
 
         std::atomic<int> null_count{0};
 
         parallel(NUM_THREADS, [&](int) {
             for (int j = 0; j < OPS_PER_THREAD; ++j) {
-                auto item = sync(L2TestItemRepo::find(id));
-                if (!item) null_count.fetch_add(1, std::memory_order_relaxed);
-            }
-        });
-
-        REQUIRE(null_count.load() == 0);
-    }
-
-    SECTION("[L1+L2] N threads read the same entity concurrently") {
-        auto id = insertTestItem("conc_read_both", 42);
-        sync(FullCacheTestItemRepo::find(id));
-
-        std::atomic<int> null_count{0};
-
-        parallel(NUM_THREADS, [&](int) {
-            for (int j = 0; j < OPS_PER_THREAD; ++j) {
-                auto item = sync(FullCacheTestItemRepo::find(id));
+                auto item = sync(UncachedTestItemRepo::find(id));
                 if (!item) null_count.fetch_add(1, std::memory_order_relaxed);
             }
         });
@@ -240,27 +222,6 @@ TEST_CASE("Concurrency - concurrent read + write",
         auto final_item = sync(L1TestItemRepo::find(id));
         REQUIRE(final_item != nullptr);
     }
-
-    SECTION("[L1+L2] readers and writers on same entity") {
-        auto id = insertTestItem("conc_rw_both", 0);
-        sync(FullCacheTestItemRepo::find(id));
-
-        parallel(NUM_THREADS, [&](int i) {
-            for (int j = 0; j < OPS_PER_THREAD; ++j) {
-                if (i % 2 == 0) {
-                    sync(FullCacheTestItemRepo::find(id));
-                } else {
-                    auto entity = makeTestItem(
-                        "rw_both_" + std::to_string(i) + "_" + std::to_string(j),
-                        i * 1000 + j, "", true, id);
-                    sync(FullCacheTestItemRepo::update(id, entity));
-                }
-            }
-        });
-
-        auto final_item = sync(FullCacheTestItemRepo::find(id));
-        REQUIRE(final_item != nullptr);
-    }
 }
 
 
@@ -287,25 +248,6 @@ TEST_CASE("Concurrency - concurrent insert + erase",
                 if (item) {
                     created_count.fetch_add(1, std::memory_order_relaxed);
                     sync(L1TestItemRepo::erase(item->id));
-                }
-            }
-        });
-
-        REQUIRE(created_count.load() > 0);
-    }
-
-    SECTION("[L1+L2] threads insert and erase entities concurrently") {
-        std::atomic<int> created_count{0};
-
-        parallel(NUM_THREADS, [&](int i) {
-            for (int j = 0; j < OPS_PER_THREAD / 2; ++j) {
-                auto entity = makeTestItem(
-                    "cr_both_" + std::to_string(i) + "_" + std::to_string(j),
-                    i * 1000 + j);
-                auto item = sync(FullCacheTestItemRepo::insert(entity));
-                if (item) {
-                    created_count.fetch_add(1, std::memory_order_relaxed);
-                    sync(FullCacheTestItemRepo::erase(item->id));
                 }
             }
         });
@@ -447,15 +389,15 @@ TEST_CASE("Concurrency - mixed operations storm",
 {
     TransactionGuard tx;
 
-    SECTION("[L1+L2] all operations interleaved on shared entities") {
+    SECTION("[L1] all operations interleaved on shared entities") {
         std::vector<int64_t> ids;
         for (int i = 0; i < 10; ++i) {
             ids.push_back(insertTestItem("storm_" + std::to_string(i), i * 10));
         }
 
-        // Prime all caches
+        // Prime L1
         for (auto id : ids) {
-            sync(FullCacheTestItemRepo::find(id));
+            sync(L1TestItemRepo::find(id));
         }
 
         parallel(NUM_THREADS, [&](int i) {
@@ -469,11 +411,11 @@ TEST_CASE("Concurrency - mixed operations storm",
                 switch (op) {
                     case 0:  // find
                     case 1:
-                        sync(FullCacheTestItemRepo::find(id));
+                        sync(L1TestItemRepo::find(id));
                         break;
 
                     case 2:  // findJson
-                        sync(FullCacheTestItemRepo::findJson(id));
+                        sync(L1TestItemRepo::findJson(id));
                         break;
 
                     case 3:  // update
@@ -482,17 +424,17 @@ TEST_CASE("Concurrency - mixed operations storm",
                             "storm_upd_" + std::to_string(i) + "_" + std::to_string(j),
                             static_cast<int32_t>(rng() % 1000),
                             "", true, id);
-                        sync(FullCacheTestItemRepo::update(id, entity));
+                        sync(L1TestItemRepo::update(id, entity));
                         break;
                     }
 
                     case 4:  // invalidate
-                        sync(FullCacheTestItemRepo::invalidate(id));
+                        sync(L1TestItemRepo::invalidate(id));
                         break;
 
                     case 5:  // evict + read
-                        FullCacheTestItemRepo::evict(id);
-                        sync(FullCacheTestItemRepo::find(id));
+                        L1TestItemRepo::evict(id);
+                        sync(L1TestItemRepo::find(id));
                         break;
                 }
             }
@@ -500,7 +442,7 @@ TEST_CASE("Concurrency - mixed operations storm",
 
         // Verify all entities are still accessible
         for (auto id : ids) {
-            auto item = sync(FullCacheTestItemRepo::find(id));
+            auto item = sync(L1TestItemRepo::find(id));
             REQUIRE(item != nullptr);
         }
     }
@@ -931,11 +873,6 @@ TEST_CASE("Concurrency - findMany overlapping reads",
         findManyView<L1TestUserRepo>(pool);          // prime L1
         runConcurrentOverlap<L1TestUserRepo>(pool, expected);
     }
-
-    SECTION("[L1+L2] overlapping windows, zero-copy hits") {
-        findManyView<FullCacheTestUserRepo>(pool);   // prime L1 (+ detached L2)
-        runConcurrentOverlap<FullCacheTestUserRepo>(pool, expected);
-    }
 }
 
 
@@ -948,7 +885,7 @@ TEST_CASE("Concurrency - findMany overlapping reads",
 //  interleaved L3 queries — the existing read+write test documents the same
 //  transient nullptr), so the invariant is robustness, not per-op values: the
 //  pinned pointers stay dereferenceable (UAF bait for TSan/ASan) and a settled
-//  batch read after the storm is complete. Covers the read → detached-L2 window.
+//  batch read after the storm is complete.
 //
 // #############################################################################
 
@@ -996,11 +933,6 @@ TEST_CASE("Concurrency - findMany vs concurrent writes",
     SECTION("[L1] readers vs writers") {
         findManyView<L1TestUserRepo>(pool);
         runFindManyVsWrites<L1TestUserRepo>(pool);
-    }
-
-    SECTION("[L1+L2] readers vs writers") {
-        findManyView<FullCacheTestUserRepo>(pool);
-        runFindManyVsWrites<FullCacheTestUserRepo>(pool);
     }
 }
 
@@ -1062,52 +994,6 @@ TEST_CASE("Concurrency - findMany guard survives invalidation",
     SECTION("[L1] guard pins pointers across invalidation") {
         findManyView<L1TestUserRepo>(pool);
         runGuardVsInvalidation<L1TestUserRepo>(pool);
-    }
-
-    SECTION("[L1+L2] guard pins pointers across invalidation") {
-        findManyView<FullCacheTestUserRepo>(pool);
-        runGuardVsInvalidation<FullCacheTestUserRepo>(pool);
-    }
-}
-
-
-// #############################################################################
-//
-//  15. findMany (Both) — detached L2 fill drains before teardown
-//
-//  Concurrent findMany over L2-cold ids fans out one detached SET per miss.
-//  Each fire-and-forget fill must land before the TransactionGuard flushes
-//  Redis — awaitL2Key polls it to completion, ordering the DetachedTask ahead
-//  of teardown so it never touches a flushed connection.
-//
-// #############################################################################
-
-TEST_CASE("Concurrency - findMany detached L2 fill drains before teardown",
-          "[integration][db][concurrency][tsan][findmany][l2]")
-{
-    TransactionGuard tx;
-
-    constexpr int POOL = 8;
-    std::vector<int64_t> pool;
-    std::vector<std::string> keys;
-    for (int i = 0; i < POOL; ++i) {
-        auto id = insertTestUser("conc_fml2_" + std::to_string(i),
-                                 "conc_fml2_" + std::to_string(i) + "@x", i);  // DB only, L2 cold
-        pool.push_back(id);
-        keys.push_back(FullCacheTestUserRepo::makeRedisKey(id));
-    }
-
-    // Concurrent batches → L1+L2 misses → L3 fetch + one detached L2 SET each.
-    parallel(NUM_THREADS, [&](int) {
-        for (int j = 0; j < OPS_PER_THREAD / 2; ++j) {
-            auto view = findManyView<FullCacheTestUserRepo>(pool);
-            for (size_t i = 0; i < view.size(); ++i) (void)view[i];
-        }
-    });
-
-    // Drain: every detached fill must be visible before TransactionGuard flush.
-    for (const auto& k : keys) {
-        REQUIRE(awaitL2Key(k).has_value());
     }
 }
 
@@ -1174,11 +1060,6 @@ TEST_CASE("Concurrency - invalidateMany vs concurrent fills",
         findManyView<L1TestUserRepo>(pool);
         runInvalidateManyVsFills<L1TestUserRepo>(pool);
     }
-
-    SECTION("[L1+L2] batch bump vs fills") {
-        findManyView<FullCacheTestUserRepo>(pool);
-        runInvalidateManyVsFills<FullCacheTestUserRepo>(pool);
-    }
 }
 
 
@@ -1189,7 +1070,7 @@ TEST_CASE("Concurrency - invalidateMany vs concurrent fills",
 //  mono-erase the last 60% — the middle 20% is double-deleted from both paths
 //  concurrently. A double DELETE … RETURNING yields zero rows the second time;
 //  the eviction must stay idempotent (no crash, no ghost hit). After quiescence
-//  every targeted id is gone on all three tiers (no L1 phantom over a deleted row).
+//  every targeted id is gone from L1 and L3 (no L1 phantom over a deleted row).
 // -----------------------------------------------------------------------------
 
 template<typename Repo>
@@ -1227,74 +1108,55 @@ TEST_CASE("Concurrency - eraseMany vs mono erase overlapping keys",
             ids.push_back(insertTestItem("conc_em_l1_" + std::to_string(i), i));
         runEraseManyVsMono<L1TestItemRepo>(ids);
     }
-
-    SECTION("[L1+L2] batch and mono erase overlap") {
-        std::vector<int64_t> ids;
-        for (int i = 0; i < POOL; ++i)
-            ids.push_back(insertTestItem("conc_em_both_" + std::to_string(i), i));
-        runEraseManyVsMono<FullCacheTestItemRepo>(ids);
-    }
 }
 
 
 // -----------------------------------------------------------------------------
-//  eraseMany vs concurrent find: the deleted-row L2→L1 phantom
+//  Erase vs concurrent find: no deleted row resurrected in L1
 //
-//  Reader threads hammer find() on the very keys an eraser thread is deleting
-//  via eraseMany. If the batch cascade evicts L1 BEFORE clearing L2, a reader
-//  hits the window: L1-miss → L2-hit (the still-present deleted row) → re-store
-//  into the SHARED L1. Nothing re-evicts L1, so the phantom PERSISTS past
-//  quiescence — a resurrected deleted row. With L2 cleared before L1 (matching
-//  mono erase), a racing reader can only L1-hit the not-yet-evicted entry
-//  (bounded, self-heals at the evict); no L1-miss reaches the L2 phantom.
-//  Requires L1+L2 — the bug is an L2 hit repopulating L1 (no L2, no phantom).
+//  Reader threads hammer find() on the very keys an eraser thread is deleting.
+//  A find() whose L3 fetch straddles the delete would write the entity back
+//  into L1 AFTER the eraser evicted it, and nothing re-evicts it: the deleted
+//  row would survive quiescence. The read-fill recheck closes this window — the
+//  reader snapshots the recheck slot at fetch-start and skips the store when a
+//  mutation bumped it in between. The value still returns to the caller, but it
+//  never pollutes the cache, so no deleted row is resurrected.
 // -----------------------------------------------------------------------------
 template<typename Repo>
 static void runEraseManyVsFinds(const std::vector<int64_t>& ids) {
     parallel(NUM_THREADS, [&](int t) {
         for (int j = 0; j < OPS_PER_THREAD; ++j) {
             if (t % 2 == 0) {
-                for (auto id : ids) sync(Repo::find(id));  // probe the L1→L2 path
+                for (auto id : ids) sync(Repo::find(id));  // probe the read-fill path
             } else {
                 sync(Repo::eraseMany(std::span<const int64_t>(ids)));
             }
         }
     });
 
-    // No row is re-inserted → every deleted key must be gone from every tier.
+    // No row is re-inserted → every deleted key must be gone.
     // A surviving L1 phantom would resurrect a deleted row right here.
     for (auto id : ids) {
         REQUIRE(sync(Repo::find(id)) == nullptr);
     }
 }
 
-// Closed by the read-fill recheck: a find() whose L3 fetch
-// straddles the delete used to write the entity back into L1/L2 AFTER the
-// eraser cleared them (the read path cached unconditionally). The reader now
-// snapshots the recheck slot at fetch-start and skips the store when a
-// mutation bumped it in between — the value still returns to the caller, but
-// it never pollutes the cache, so no deleted row is resurrected.
-TEST_CASE("Concurrency - eraseMany vs concurrent finds (no L2->L1 phantom)",
-          "[integration][db][redis][concurrency][tsan][batch][erase]")
+TEST_CASE("Concurrency - eraseMany vs concurrent finds (no phantom)",
+          "[integration][db][concurrency][tsan][batch][erase]")
 {
     TransactionGuard tx;
-
-    // A wide pool widens the per-window opportunity: the single effective
-    // eraseMany evicts every L1 slot then suspends on the multi-key UNLINK
-    // (~1 RTT), and readers probing any of these keys during that suspension
-    // catch the phantom in the buggy (L1-before-L2) order.
     constexpr int POOL = 48;
     std::vector<int64_t> ids;
     for (int i = 0; i < POOL; ++i)
         ids.push_back(insertTestItem("conc_emf_" + std::to_string(i), i));
 
-    findManyView<FullCacheTestItemRepo>(ids);  // warm L1 + L2
-    runEraseManyVsFinds<FullCacheTestItemRepo>(ids);
+    for (auto id : ids) sync(L1TestItemRepo::find(id));  // warm L1
+    runEraseManyVsFinds<L1TestItemRepo>(ids);
 }
 
 // Mono variant: per-key erase() racing per-key find(). Exercises the mono
-// eraseOutcome → evictRedis path and the mono findRaw/findSlow read-fill
-// recheck (the batch test above drives eraseMany + findManyRaw instead).
+// erase path and the mono find read-fill recheck (the batch test above drives
+// eraseMany + findMany instead).
 template<typename Repo>
 static void runEraseVsFinds(const std::vector<int64_t>& ids) {
     parallel(NUM_THREADS, [&](int t) {
@@ -1312,7 +1174,7 @@ static void runEraseVsFinds(const std::vector<int64_t>& ids) {
 }
 
 TEST_CASE("Concurrency - mono erase vs concurrent finds (no phantom)",
-          "[integration][db][redis][concurrency][tsan][erase]")
+          "[integration][db][concurrency][tsan][erase]")
 {
     TransactionGuard tx;
     constexpr int POOL = 48;
@@ -1320,65 +1182,9 @@ TEST_CASE("Concurrency - mono erase vs concurrent finds (no phantom)",
     for (int i = 0; i < POOL; ++i)
         ids.push_back(insertTestItem("conc_mef_" + std::to_string(i), i));
 
-    findManyView<FullCacheTestItemRepo>(ids);  // warm L1 + L2
-    runEraseVsFinds<FullCacheTestItemRepo>(ids);
+    findManyView<L1TestItemRepo>(ids);  // warm L1
+    runEraseVsFinds<L1TestItemRepo>(ids);
 }
-
-// Per-tier coverage of the read-fill recheck. L1-only exercises LocalRepo's
-// snapshot/gate alone (no Redis). L2-only exercises RedisRepo's own recheck
-// AND its bumpGen — there LocalRepo is absent, so RedisRepo is the top layer
-// and must bump the shared counter itself.
-TEST_CASE("Concurrency - read-fill recheck per tier (L1-only, L2-only)",
-          "[integration][db][redis][concurrency][tsan][erase]")
-{
-    TransactionGuard tx;
-    constexpr int POOL = 48;
-    std::vector<int64_t> ids;
-    for (int i = 0; i < POOL; ++i)
-        ids.push_back(insertTestItem("conc_tier_" + std::to_string(i), i));
-
-    SECTION("L1-only") {
-        for (auto id : ids) sync(L1TestItemRepo::find(id));  // warm L1
-        runEraseManyVsFinds<L1TestItemRepo>(ids);
-    }
-    SECTION("L2-only") {
-        for (auto id : ids) sync(L2TestItemRepo::find(id));  // warm L2
-        runEraseManyVsFinds<L2TestItemRepo>(ids);
-    }
-}
-
-// Multi-instance topology (l2_shared_across_instances): the L2 read-fill recheck
-// is the Redis-side generation hash, not the process-local counter. The erase
-// HINCRBYs the slot before the entity UNLINK; a straddling fill snapshots the
-// gen (HGET) at fetch-start and lands via an atomic conditional SET (setIfGen),
-// so a value straddling the delete is rejected by the moved gen — closing the
-// same phantom across processes. Single process here exercises the real Redis
-// path (find → getGen → setIfGen, erase → bumpGen → UNLINK); the cross-instance
-// straddle itself is pinned deterministically in test_l2_gen. L2-only drives the
-// Redis-side gen alone; L1+L2 also drives LocalRepo's process-local recheck.
-TEST_CASE("Concurrency - read-fill recheck, shared topology (Redis-side gen)",
-          "[integration][db][redis][concurrency][tsan][erase]")
-{
-    TransactionGuard tx;
-    constexpr int POOL = 48;
-    std::vector<int64_t> ids;
-    for (int i = 0; i < POOL; ++i)
-        ids.push_back(insertTestItem("conc_shared_" + std::to_string(i), i));
-
-    SECTION("L2-only shared") {
-        for (auto id : ids) sync(SharedL2TestItemRepo::find(id));  // warm L2
-        runEraseManyVsFinds<SharedL2TestItemRepo>(ids);
-    }
-    SECTION("L1+L2 shared") {
-        findManyView<SharedBothTestItemRepo>(ids);  // warm L1 + L2
-        runEraseManyVsFinds<SharedBothTestItemRepo>(ids);
-    }
-    SECTION("L1+L2 shared, mono erase vs finds") {
-        findManyView<SharedBothTestItemRepo>(ids);  // warm L1 + L2
-        runEraseVsFinds<SharedBothTestItemRepo>(ids);
-    }
-}
-
 
 
 // -----------------------------------------------------------------------------
@@ -1469,12 +1275,11 @@ TEST_CASE("Concurrency - eraseWhere RangeModification vs concurrent sweep",
 
 // #############################################################################
 //
-//  16. Concurrent upsert on a shared assigned-PK key
+//  15. Concurrent upsert on a shared assigned-PK key
 //
 //  Upsert composes the update-model primitives on the shared static caches:
-//  a pre-image discriminant, then L1 onMutation+bumpGeneration+storeAndView and
-//  (Both) L2 bumpGen+setInCache of the committed RETURNING row. N threads upsert
-//  the SAME key — the first resolves to INSERT, the rest to in-place UPDATE, each
+//  a pre-image discriminant, then L1 onMutation+bumpGeneration+storeAndView of
+//  the committed RETURNING row. N threads upsert the SAME key — the first resolves to INSERT, the rest to in-place UPDATE, each
 //  racing the others' store-through and generation bump on that one slot. Worker
 //  threads assert only robustness (the `parallel` error counter); correctness is
 //  a post-quiescence deterministic settle: a final single-threaded upsert must
@@ -1549,20 +1354,14 @@ static void runUpsertUpdateEraseSameKey(int64_t key) {
 }
 
 TEST_CASE("Concurrency - concurrent upsert on shared key",
-          "[integration][db][redis][concurrency][tsan][upsert]")
+          "[integration][db][concurrency][tsan][upsert]")
 {
     TransactionGuard tx;
 
     SECTION("[L1] N threads upsert the same key") {
         runConcurrentUpsertSameKey<L1TestAssignedKeyRepo>(700001);
     }
-    SECTION("[L1+L2] N threads upsert the same key") {
-        runConcurrentUpsertSameKey<FullCacheTestAssignedKeyRepo>(700002);
-    }
     SECTION("[L1] upsert || update || erase on the same key") {
         runUpsertUpdateEraseSameKey<L1TestAssignedKeyRepo>(700003);
-    }
-    SECTION("[L1+L2] upsert || update || erase on the same key") {
-        runUpsertUpdateEraseSameKey<FullCacheTestAssignedKeyRepo>(700004);
     }
 }
