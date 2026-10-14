@@ -201,9 +201,10 @@ Speed in relais comes from four independent choices, in order of impact.
    shared data) is the largest lever — see [§2](#2--the-compile-time-mixin-tower)
    and [§3](#3--the-read--write-flow).
 2. **Automatic SQL batching & pipelining.** Concurrent coroutines on one loop have
-   their reads coalesced into a single `SELECT … WHERE id = ANY($1)` per repo and
-   their writes pipelined (libpq pipeline mode), collapsing N round-trips into one
-   per tier. This lives in the I/O layer, **below** the cache — so it speeds up a
+   their reads coalesced into a single `SELECT … WHERE id = ANY($1)` per repo,
+   collapsing N round-trips into one, and their writes pipelined (libpq pipeline
+   mode) over a few connections whose commits PostgreSQL flushes together. This
+   lives in the I/O layer, **below** the cache — so it speeds up a
    `config::Uncached`, write-heavy path just as much as a cached read one, with no
    code to write. See [§4](#4--the-shared-nothing-runtime).
 3. **The shared-nothing runtime.** N loops, one per core, each self-contained;

@@ -44,6 +44,11 @@
   SQL constants (`update_returning_changes`, `delete_by_pk_returning`,
   `delete_with_partition_returning`). The generator now also rejects a filter
   parameter declared twice in one entity.
+- **Writes in one batch keep their submission order only on the same row.**
+  Concurrent writes now commit on several connections at once: two writes on
+  different rows issued without a `co_await` between them (a parent row and its
+  child in a `whenAll`) may commit in either order. Order dependent writes with
+  `co_await`; see `docs/runtime.md › Write ordering`.
 
 ### Changed
 
@@ -56,6 +61,14 @@
 - **A read identical to one already sent to PostgreSQL shares its result**
   instead of sending a second query. It is not merged if a write has completed
   since that read was sent.
+- **Concurrent writes commit on several connections.** Writes submitted while
+  others are in flight depart together, split by row over up to half of
+  `max_concurrent` (4 connections by default), and PostgreSQL flushes their
+  commits together instead of one after another. Writes never hold more than
+  that half, so reads keep the rest during a write burst. Below
+  `max_concurrent = 6` the split gains nothing and concurrent writes are slower
+  than in 3.2.1, where they could take the whole budget: raise it for
+  write-heavy loads.
 
 ### Fixed
 
