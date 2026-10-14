@@ -872,9 +872,9 @@ private:
         pg_write_batch_ = {};
 
         // Sort by submission sequence: restores submission order regardless of
-        // how entries were accumulated/coalesced, so intra-batch write→write
-        // order == seq order == the order the caller submitted them. This is the
-        // write-ordering contract (docs/runtime.md).
+        // how entries were accumulated/coalesced, so each group below sends its
+        // writes, and those on one row, in the order the caller submitted them
+        // (write-ordering contract, docs/runtime.md).
         std::sort(entries.begin(), entries.end(),
             [](const auto* a, const auto* b) { return a->seq < b->seq; });
         // A wave sends at most kMaxBatchEntries writes; the later ones wait for

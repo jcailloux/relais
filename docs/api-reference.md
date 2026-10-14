@@ -857,7 +857,7 @@ static std::unique_ptr<IoPool> create(const IoPoolConfig& config);   // io/IoPoo
 | `redis` | `std::optional<RedisWorkerConfig>` | `RedisWorkerConfig{}` | L2 Redis endpoint + per-worker sizing (fields below); the default is an enabled localhost pool. `std::nullopt` → L1-only: no pool is built, no boot connect is attempted, `hasRedis()==false` on every worker, and the L2 tier is bypassed (not stubbed to throw). |
 | `pg_min_conns_per_worker` | `size_t` | `2` | PG pool floor per worker. |
 | `pg_max_conns_per_worker` | `size_t` | `8` | PG pool ceiling per worker. Total PG conns = `num_workers × this` — keep under the DB's `max_connections`. |
-| `max_concurrent_per_worker` | `int` | `8` | Shared I/O budget per worker (PG + Redis combined). |
+| `max_concurrent_per_worker` | `int` | `8` | Sends in flight per worker, counted separately for PG and for Redis. Concurrent writes take at most half of the PG budget (up to 16 connections), leaving the rest to reads; PostgreSQL commits them together from 3 connections on, so a write-heavy worker gains from `6` or more. |
 | `pin_to_cores` | `bool` | `true` | Pin each worker thread to a CPU core. |
 | `first_core` | `int` | `1` | First core index for pinning (worker `i` → `first_core + i`); `1` avoids core 0 (OS/IRQ). |
 | `acquire_timeout` | `std::chrono::milliseconds` | `5000` | Bounds each connection acquire, including the startup warm-up connect — an unreachable DB fails `create()` instead of hanging. |
@@ -983,7 +983,7 @@ static void runAll(Io& io, Drive drive);   // testing/IoContextConformance.h
 | `query(const char* sql)` | `Task<PgResult>` | Parameterless query. `sql` must outlive the `co_await`. |
 | `queryParams(const char* sql, const io::PgParams& params)` | `Task<PgResult>` | Parameterized; `sql` + `params` must outlive the `co_await`. Build `params` with `io::PgParams::make(args...)`, which takes the same arguments as `queryArgs`. |
 | `template<io::PgArg... Args> queryArgs(const char* sql, Args&&...)` | `Task<PgResult>` | Binds each argument as listed under **Arguments** below into a `PgParams` kept in the coroutine frame; forwards to `queryParams`. |
-| `queryWrite(const char* sql, const PgParams&, batch::WriteMode mode = Idempotent)` | `Task<batch::PgWriteResult>` | Sole write entry point (seq-ordered write batch). Result carries RETURNING rows + `affectedRows()`; `coalesced=true` ⇒ an identical `Idempotent` write was already batched, no DB round-trip. `WriteMode::Exclusive` (relative SET, guarded write, claim, `now()`-dependent value) is never coalesced: it runs once per caller, still batched. |
+| `queryWrite(const char* sql, const PgParams&, batch::WriteMode mode = Idempotent)` | `Task<batch::PgWriteResult>` | Sole write entry point (write batch, ordering in [runtime.md › Write ordering](runtime.md#write-ordering)). Result carries RETURNING rows + `affectedRows()`; `coalesced=true` ⇒ an identical `Idempotent` write was already batched, no DB round-trip. `WriteMode::Exclusive` (relative SET, guarded write, claim, `now()`-dependent value) is never coalesced: it runs once per caller, still batched. |
 | `template<io::RedisArg... Args> redis(Args&&...)` | `Task<RedisResult>` | Variadic Redis command (verb first); each argument is sent as listed under **Arguments** below, binary-safe. |
 | `redisDynamic(std::vector<std::string> args)` | `Task<RedisResult>` | Runtime-sized argv (verb first), e.g. MGET over N keys. |
 | `hasRedis()` / `initialized()` | `bool` (noexcept) | Whether Redis is configured / providers bound on this thread. |
@@ -1016,7 +1016,7 @@ static void init(
     std::type_identity_t<std::shared_ptr<io::RedisClient<Io>>> redisClient = nullptr,
     int max_concurrent = 8);
 ```
-- The Redis argument is **non-deduced** (`std::type_identity_t<...>`) so passing an explicit `nullptr` doesn't break `Io` deduction; `Io` comes from `io`/`pool` only. Default `nullptr` ⇒ no Redis. Default `max_concurrent = 8`.
+- The Redis argument is **non-deduced** (`std::type_identity_t<...>`) so passing an explicit `nullptr` doesn't break `Io` deduction; `Io` comes from `io`/`pool` only. Default `nullptr` ⇒ no Redis. `max_concurrent` (default `8`) is the loop's send budget, as `IoPoolConfig::max_concurrent_per_worker`.
 - Providers are `thread_local`: `init` on thread A binds nothing for thread B. Debug builds assert `io.isInLoopThread()` for adapters that expose it. `bindBatcher<Io>(batcher, with_redis)` is the lower-level entry `IoPool` uses (one batcher per worker).
 
 **`PgResult`** (`io/pg/PgResult.h`) — RAII wrapper over `PGresult`:
