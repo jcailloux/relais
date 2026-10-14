@@ -1,13 +1,18 @@
 /**
  * test_decl_list_full.cpp
  *
- * Tests for declarative list caching at L1+L2 (Both).
- * Verifies list cache interaction between RAM and Redis layers.
+ * Tests for declarative list invalidation (L1): how writes reach cached pages.
+ * Complements test_decl_list_cache.cpp, which covers queries and the
+ * ModificationTracker lifecycle.
  *
  * Covers:
- *   1. Article list query at L1+L2
- *   2. Cascade invalidation (list + entity in both layers)
- *   3. Entity and list on same repo (cross-interaction)
+ *   1. Write paths (insert / update / erase) invalidate the list
+ *   2. Entity and list on the same repo (cross-interaction)
+ *   3. Filter-based selective invalidation (EQ on string and int64, combined,
+ *      partial and absent filters, update moving an entity between groups)
+ *   4. Sort-range invalidation on cursor pages
+ *   5. Insertion invalidation edge cases (no cached page, empty page, exact
+ *      boundary, offset vs cursor incomplete page, null sort value)
  */
 
 #include <catch2/catch_test_macros.hpp>
@@ -19,599 +24,474 @@
 #include "fixtures/RelaisTestAccessors.h"
 using namespace relais_test;
 
-// #############################################################################
-//
-//  Local L1+L2 list repos
-//
-// #############################################################################
-
-namespace relais_test {
-
-using FullCacheArticleListRepo = Repo<TestArticleEntity, "test:article:list:both", cfg::Both>;
-using FullCachePurchaseListRepo = Repo<TestPurchaseEntity, "test:purchase:list:both", cfg::Both>;
-
-using FullArticleListQuery = FullCacheArticleListRepo::ListQuery;
-using FullPurchaseListQuery = FullCachePurchaseListRepo::ListQuery;
-
-} // namespace relais_test
-
-// =============================================================================
-// L1+L2 query helpers
-// =============================================================================
+namespace {
 
 namespace decl = jcailloux::relais::list::spec;
+namespace list_ns = jcailloux::relais::list;
 
-static FullArticleListQuery makeFullArticleQuery(
-    std::optional<std::string> category = std::nullopt,
-    std::optional<int64_t> author_id = std::nullopt,
-    uint16_t limit = 10
-) {
-    using Desc = FullCacheArticleListRepo::ListDescriptorType;
-    decl::ListQueryParams<Desc> q;
+using ListRepo = TestArticleListRepo;
+using ArticleDecl = ListRepo::ListDescriptorType;
+
+/// Articles of a category sorted by view_count DESC, offset pagination.
+ListRepo::ListQuery viewCountQuery(std::string_view category, uint16_t limit,
+                                   uint32_t offset = 0) {
+    decl::ListQueryParams<ArticleDecl> q;
     q.limit = limit;
-    if (author_id) q.filters.template get<"author_id">() = *author_id;
-    if (category) q.filters.template get<"category">() = std::move(*category);
-    return decl::seal<Desc>(std::move(q));
+    q.offset = offset;
+    q.filters.get<"category">() = std::string(category);
+    q.sort = list_ns::SortSpec<size_t>{1, list_ns::SortDirection::Desc};
+    return decl::seal<ArticleDecl>(std::move(q));
 }
 
-static FullPurchaseListQuery makeFullPurchaseQuery(
-    std::optional<int64_t> user_id = std::nullopt,
-    std::optional<std::string> status = std::nullopt,
-    uint16_t limit = 10
-) {
-    using Desc = FullCachePurchaseListRepo::ListDescriptorType;
-    decl::ListQueryParams<Desc> q;
-    q.limit = limit;
-    if (status) q.filters.template get<"status">() = std::move(*status);
-    if (user_id) q.filters.template get<"user_id">() = *user_id;
-    return decl::seal<Desc>(std::move(q));
+/// The page following `page` of `category` (same sort and limit), by cursor.
+template<typename Page>
+ListRepo::ListQuery viewCountQueryAfter(std::string_view category, uint16_t limit,
+                                        const Page& page) {
+    auto params = viewCountQuery(category, limit).params();
+    params.cursor = ListRepo::Cursor::decode(std::string(page->cursor())).value();
+    return decl::seal<ArticleDecl>(std::move(params));
 }
+
+size_t countOf(std::optional<std::string> category = std::nullopt,
+               std::optional<int64_t> author_id = std::nullopt) {
+    return sync(ListRepo::query(makeArticleQuery(std::move(category), author_id)))->size();
+}
+
+} // anonymous namespace
 
 
 // #############################################################################
 //
-//  1. Article list query at L1+L2
+//  1. Write paths invalidate the list
 //
 // #############################################################################
 
-TEST_CASE("[DeclList L1+L2] Article list query",
-          "[integration][db][list][full-cache][query]")
+TEST_CASE("[DeclList] Write paths invalidate the list",
+          "[integration][db][list][invalidation]")
 {
     TransactionGuard tx;
-    TestInternals::resetListCacheState<FullCacheArticleListRepo>();
+    TestInternals::resetListCacheState<ListRepo>();
 
-    SECTION("[query] list cached in L1 after first query") {
-        auto userId = insertTestUser("author", "author@both.com", 0);
-        insertTestArticle("tech", userId, "Tech 1", 10);
-        insertTestArticle("tech", userId, "Tech 2", 20);
-
-        auto result = sync(FullCacheArticleListRepo::query(
-            makeFullArticleQuery("tech")));
-        REQUIRE(result->size() == 2);
-
-        // Verify L1 caching: insert directly, cache should return stale
-        insertTestArticle("tech", userId, "Tech 3", 30);
-
-        auto cached = sync(FullCacheArticleListRepo::query(
-            makeFullArticleQuery("tech")));
-        REQUIRE(cached->size() == 2);  // Stale from L1
-    }
-
-    SECTION("[query] L1 hit prevents L2 query") {
-        auto userId = insertTestUser("author", "author@both.com", 0);
+    SECTION("[invalidation] insert invalidates the list") {
+        auto userId = insertTestUser("author", "author@write.com", 0);
         insertTestArticle("tech", userId, "Tech 1", 10);
 
-        // First query populates both L1 and L2
-        sync(FullCacheArticleListRepo::query(makeFullArticleQuery("tech")));
+        REQUIRE(countOf("tech") == 1);
 
-        // Insert directly in DB
-        insertTestArticle("tech", userId, "Tech 2", 20);
+        sync(ListRepo::insert(makeTestArticle("tech", userId, "Tech 2", 20)));
 
-        // L1 hit returns stale (2nd article not visible)
-        auto cached = sync(FullCacheArticleListRepo::query(
-            makeFullArticleQuery("tech")));
-        REQUIRE(cached->size() == 1);
+        CHECK(countOf("tech") == 2);
     }
 
-    SECTION("[query] combined filters work at L1+L2") {
-        auto user1 = insertTestUser("alice", "alice@both.com", 0);
-        auto user2 = insertTestUser("bob", "bob@both.com", 0);
-        insertTestArticle("tech", user1, "Alice Tech", 10);
-        insertTestArticle("news", user1, "Alice News", 20);
-        insertTestArticle("tech", user2, "Bob Tech", 30);
-        insertTestArticle("news", user2, "Bob News", 40);
-
-        auto result = sync(FullCacheArticleListRepo::query(
-            makeFullArticleQuery("tech", user2)));
-        REQUIRE(result->size() == 1);
-    }
-}
-
-
-// #############################################################################
-//
-//  2. Cascade invalidation
-//
-// #############################################################################
-
-TEST_CASE("[DeclList L1+L2] Cascade invalidation",
-          "[integration][db][list][full-cache][invalidation]")
-{
-    TransactionGuard tx;
-    TestInternals::resetListCacheState<FullCacheArticleListRepo>();
-
-    SECTION("[invalidation] insert invalidates list in both L1 and L2") {
-        auto userId = insertTestUser("author", "author@both.com", 0);
-        insertTestArticle("tech", userId, "Tech 1", 10);
-
-        // Populate cache
-        auto r1 = sync(FullCacheArticleListRepo::query(
-            makeFullArticleQuery("tech")));
-        REQUIRE(r1->size() == 1);
-
-        // insert via repo → should invalidate list
-        auto newArticle = makeTestArticle("tech", userId, "Tech 2", 20);
-        sync(FullCacheArticleListRepo::insert(newArticle));
-
-        // Next query should reflect the new article
-        auto r2 = sync(FullCacheArticleListRepo::query(
-            makeFullArticleQuery("tech")));
-        REQUIRE(r2->size() == 2);
-    }
-
-    SECTION("[invalidation] update invalidates both layers") {
-        auto userId = insertTestUser("author", "author@both.com", 0);
+    SECTION("[invalidation] update invalidates the list") {
+        auto userId = insertTestUser("author", "author@write.com", 0);
         auto articleId = insertTestArticle("tech", userId, "Before", 10);
 
-        // Populate list cache
-        sync(FullCacheArticleListRepo::query(makeFullArticleQuery("tech")));
+        sync(ListRepo::query(makeArticleQuery("tech")));
 
-        // Update via repo
         auto updated = makeTestArticle("tech", userId, "After", 20, false, articleId);
-        sync(FullCacheArticleListRepo::update(articleId, updated));
+        sync(ListRepo::update(articleId, updated));
 
-        // List should be refreshed
-        auto result = sync(FullCacheArticleListRepo::query(
-            makeFullArticleQuery("tech")));
+        auto result = sync(ListRepo::query(makeArticleQuery("tech")));
         REQUIRE(result->size() == 1);
-        REQUIRE(result->items.front().title == "After");
-    }
-
-    SECTION("[invalidation] delete invalidates both layers") {
-        auto userId = insertTestUser("author", "author@both.com", 0);
-        auto articleId = insertTestArticle("tech", userId, "To Delete", 10);
-        insertTestArticle("tech", userId, "To Keep", 20);
-
-        // Populate list cache
-        auto r1 = sync(FullCacheArticleListRepo::query(
-            makeFullArticleQuery("tech")));
-        REQUIRE(r1->size() == 2);
-
-        // Delete via repo
-        sync(FullCacheArticleListRepo::erase(articleId));
-
-        // List should show only the remaining article
-        auto r2 = sync(FullCacheArticleListRepo::query(
-            makeFullArticleQuery("tech")));
-        REQUIRE(r2->size() == 1);
-    }
-}
-
-
-// #############################################################################
-//
-//  3. Entity and list on same repo
-//
-// #############################################################################
-
-TEST_CASE("[DeclList L1+L2] Entity and list on same repo",
-          "[integration][db][list][full-cache][cross-inv]")
-{
-    TransactionGuard tx;
-    TestInternals::resetListCacheState<FullCacheArticleListRepo>();
-
-    SECTION("[cross-inv] entity update invalidates list but entity cache reflects update") {
-        auto userId = insertTestUser("author", "author@both.com", 0);
-        auto articleId = insertTestArticle("tech", userId, "Original", 10);
-
-        // Cache both entity and list
-        sync(FullCacheArticleListRepo::find(articleId));
-        sync(FullCacheArticleListRepo::query(makeFullArticleQuery("tech")));
-
-        // Update entity via repo
-        auto updated = makeTestArticle("tech", userId, "Updated", 20, false, articleId);
-        sync(FullCacheArticleListRepo::update(articleId, updated));
-
-        // Entity cache should reflect the update
-        auto entity = sync(FullCacheArticleListRepo::find(articleId));
-        REQUIRE(entity != nullptr);
-        REQUIRE(entity->title == "Updated");
-
-        // List should also reflect the update (invalidated and re-fetched)
-        auto list = sync(FullCacheArticleListRepo::query(
-            makeFullArticleQuery("tech")));
-        REQUIRE(list->size() == 1);
-        REQUIRE(list->items.front().title == "Updated");
-    }
-
-    SECTION("[cross-inv] list query repopulates after entity-triggered invalidation") {
-        auto userId = insertTestUser("author", "author@both.com", 0);
-        insertTestArticle("tech", userId, "Article 1", 10);
-
-        // Populate list cache
-        auto r1 = sync(FullCacheArticleListRepo::query(
-            makeFullArticleQuery("tech")));
-        REQUIRE(r1->size() == 1);
-
-        // insert a new entity via repo → invalidates list
-        auto newArticle = makeTestArticle("tech", userId, "Article 2", 20);
-        auto created = sync(FullCacheArticleListRepo::insert(newArticle));
-        REQUIRE(created != nullptr);
-
-        // List re-fetches from DB, includes new article
-        auto r2 = sync(FullCacheArticleListRepo::query(
-            makeFullArticleQuery("tech")));
-        REQUIRE(r2->size() == 2);
-
-        // Further DB-direct insert not visible (list is now cached)
-        insertTestArticle("tech", userId, "Article 3", 30);
-        auto r3 = sync(FullCacheArticleListRepo::query(
-            makeFullArticleQuery("tech")));
-        REQUIRE(r3->size() == 2);  // Stale from cache
-    }
-}
-
-
-// #############################################################################
-//
-//  4. L1+L2 notify* path (synchronous invalidation)
-//
-// #############################################################################
-
-TEST_CASE("[DeclList L1+L2] notify* path (L1 sync + L2 invalidation)",
-          "[integration][db][list][full-cache][notify]")
-{
-    TransactionGuard tx;
-    TestInternals::resetListCacheState<FullCacheArticleListRepo>();
-
-    SECTION("[notify] notifyCreated invalidates both L1 and L2") {
-        auto userId = insertTestUser("author", "author@notify.com", 0);
-        insertTestArticle("tech", userId, "Tech 1", 10);
-
-        // Populate L1+L2
-        auto r1 = sync(FullCacheArticleListRepo::query(makeFullArticleQuery("tech")));
-        REQUIRE(r1->size() == 1);
-
-        // Insert sentinel in DB
-        insertTestArticle("tech", userId, "Sentinel", 20);
-
-        // Verify cache returns stale
-        REQUIRE(sync(FullCacheArticleListRepo::query(
-            makeFullArticleQuery("tech")))->size() == 1);
-
-        // notifyCreatedSync → invalidates both L1 and L2
-        auto entity = makeTestArticle("tech", userId, "Notified", 30);
-        TestInternals::notifyCreatedSync<FullCacheArticleListRepo>(entity);
-
-        // Both layers invalidated → DB hit → sentinel visible
-        auto r2 = sync(FullCacheArticleListRepo::query(makeFullArticleQuery("tech")));
-        CHECK(r2->size() == 2);
-    }
-
-    SECTION("[notify] notifyUpdated invalidates both layers") {
-        auto userId = insertTestUser("author", "author@notify.com", 0);
-        auto articleId = insertTestArticle("tech", userId, "Before", 10);
-
-        // Populate L1+L2
-        sync(FullCacheArticleListRepo::query(makeFullArticleQuery("tech")));
-
-        // Update DB directly
-        updateTestArticle(articleId, "After", 20);
-
-        // notifyUpdatedSync
-        auto oldEntity = makeTestArticle("tech", userId, "Before", 10, false, articleId);
-        auto newEntity = makeTestArticle("tech", userId, "After", 20, false, articleId);
-        TestInternals::notifyUpdatedSync<FullCacheArticleListRepo>(oldEntity, newEntity);
-
-        // Both layers invalidated → DB hit
-        auto result = sync(FullCacheArticleListRepo::query(makeFullArticleQuery("tech")));
-        CHECK(result->size() == 1);
         CHECK(result->items.front().title == "After");
     }
 
-    SECTION("[notify] notifyDeleted invalidates both layers") {
-        auto userId = insertTestUser("author", "author@notify.com", 0);
+    SECTION("[invalidation] erase invalidates the list") {
+        auto userId = insertTestUser("author", "author@write.com", 0);
         auto articleId = insertTestArticle("tech", userId, "To Delete", 10);
         insertTestArticle("tech", userId, "To Keep", 20);
 
-        // Populate L1+L2
-        REQUIRE(sync(FullCacheArticleListRepo::query(
-            makeFullArticleQuery("tech")))->size() == 2);
+        REQUIRE(countOf("tech") == 2);
 
-        // Delete from DB
-        deleteTestArticle(articleId);
+        sync(ListRepo::erase(articleId));
 
-        // notifyDeletedSync
-        auto entity = makeTestArticle("tech", userId, "To Delete", 10, false, articleId);
-        TestInternals::notifyDeletedSync<FullCacheArticleListRepo>(entity);
-
-        // Both layers invalidated
-        CHECK(sync(FullCacheArticleListRepo::query(
-            makeFullArticleQuery("tech")))->size() == 1);
+        CHECK(countOf("tech") == 1);
     }
 }
 
 
 // #############################################################################
 //
-//  5. L1+L2 Filter-based selective invalidation
+//  2. Entity and list on the same repo
 //
 // #############################################################################
 
-TEST_CASE("[DeclList L1+L2] Filter-based selective invalidation",
-          "[integration][db][list][full-cache][filter-match]")
+TEST_CASE("[DeclList] Entity and list on the same repo",
+          "[integration][db][list][cross-inv]")
 {
     TransactionGuard tx;
-    TestInternals::resetListCacheState<FullCacheArticleListRepo>();
+    TestInternals::resetListCacheState<ListRepo>();
 
-    SECTION("[filter-match] insert tech: tech supprimé, news conservé") {
+    SECTION("[cross-inv] entity update invalidates the list and refreshes the entity") {
+        auto userId = insertTestUser("author", "author@same.com", 0);
+        auto articleId = insertTestArticle("tech", userId, "Original", 10);
+
+        // Cache both entity and list
+        sync(ListRepo::find(articleId));
+        sync(ListRepo::query(makeArticleQuery("tech")));
+
+        auto updated = makeTestArticle("tech", userId, "Updated", 20, false, articleId);
+        sync(ListRepo::update(articleId, updated));
+
+        auto entity = sync(ListRepo::find(articleId));
+        REQUIRE(entity != nullptr);
+        CHECK(entity->title == "Updated");
+
+        auto list = sync(ListRepo::query(makeArticleQuery("tech")));
+        REQUIRE(list->size() == 1);
+        CHECK(list->items.front().title == "Updated");
+    }
+
+    SECTION("[cross-inv] the list is cached again after a write invalidated it") {
+        auto userId = insertTestUser("author", "author@same.com", 0);
+        insertTestArticle("tech", userId, "Article 1", 10);
+
+        REQUIRE(countOf("tech") == 1);
+
+        auto created = sync(ListRepo::insert(makeTestArticle("tech", userId, "Article 2", 20)));
+        REQUIRE(created != nullptr);
+
+        // Re-fetched from the database, then cached
+        REQUIRE(countOf("tech") == 2);
+
+        // A direct insert is not seen: the page is cached again
+        insertTestArticle("tech", userId, "Article 3", 30);
+        CHECK(countOf("tech") == 2);
+    }
+}
+
+
+// #############################################################################
+//
+//  3. Filter-based selective invalidation
+//
+// #############################################################################
+//
+// Each section caches pages, inserts sentinel rows directly in the database
+// (invisible to a cached page), then notifies a modification: an invalidated
+// page is re-fetched and shows its sentinel, a preserved page does not.
+
+TEST_CASE("[DeclList] Filter-based selective invalidation",
+          "[integration][db][list][filter-match]")
+{
+    TransactionGuard tx;
+    TestInternals::resetListCacheState<ListRepo>();
+
+    SECTION("[filter-match] string EQ: insert tech invalidates tech, keeps news and sports") {
         auto userId = insertTestUser("author", "author@fm.com", 0);
         insertTestArticle("tech", userId, "Tech 1", 10);
         insertTestArticle("news", userId, "News 1", 20);
+        insertTestArticle("sports", userId, "Sports 1", 30);
 
-        // Populate both groups in L1+L2
-        sync(FullCacheArticleListRepo::query(makeFullArticleQuery("tech")));
-        sync(FullCacheArticleListRepo::query(makeFullArticleQuery("news")));
+        countOf("tech");
+        countOf("news");
+        countOf("sports");
 
-        // Insert sentinels
-        insertTestArticle("tech", userId, "Tech Sentinel", 30);
-        insertTestArticle("news", userId, "News Sentinel", 40);
+        insertTestArticle("tech", userId, "Tech Sentinel", 40);
+        insertTestArticle("news", userId, "News Sentinel", 50);
+        insertTestArticle("sports", userId, "Sports Sentinel", 60);
 
-        // notifyCreatedSync with tech entity → selective invalidation
-        auto entity = makeTestArticle("tech", userId, "Tech Notify", 50);
-        TestInternals::notifyCreatedSync<FullCacheArticleListRepo>(entity);
+        ListRepo::notifyCreated(makeTestArticle("tech", userId, "Tech Notify", 70));
 
-        // tech SUPPRIMÉ: DB hit → original + sentinel
-        CHECK(sync(FullCacheArticleListRepo::query(
-            makeFullArticleQuery("tech")))->size() == 2);
-        // news CONSERVÉ: L1 cache hit → sentinel invisible
-        CHECK(sync(FullCacheArticleListRepo::query(
-            makeFullArticleQuery("news")))->size() == 1);
+        CHECK(countOf("tech") == 2);    // invalidated
+        CHECK(countOf("news") == 1);    // preserved
+        CHECK(countOf("sports") == 1);  // preserved
     }
 
-    SECTION("[filter-match] update tech→news: tech+news supprimés, sports conservé") {
+    SECTION("[filter-match] int64 EQ: only the matching author's page is invalidated") {
+        auto user42 = insertTestUser("user42", "user42@fm.com", 0);
+        auto user99 = insertTestUser("user99", "user99@fm.com", 0);
+        insertTestArticle("tech", user42, "By 42", 10);
+        insertTestArticle("tech", user99, "By 99", 20);
+
+        countOf(std::nullopt, user42);
+        countOf(std::nullopt, user99);
+
+        insertTestArticle("tech", user42, "Sentinel 42", 30);
+        insertTestArticle("tech", user99, "Sentinel 99", 40);
+
+        ListRepo::notifyCreated(makeTestArticle("tech", user42, "Notify", 50));
+
+        CHECK(countOf(std::nullopt, user42) == 2);  // invalidated
+        CHECK(countOf(std::nullopt, user99) == 1);  // preserved
+    }
+
+    SECTION("[filter-match] combined filters: a mismatch on one of them preserves the page") {
+        auto user42 = insertTestUser("user42", "user42@fm.com", 0);
+        auto user99 = insertTestUser("user99", "user99@fm.com", 0);
+        insertTestArticle("tech", user42, "Tech by 42", 10);
+
+        countOf("tech", user42);
+        insertTestArticle("tech", user42, "Sentinel", 20);
+
+        // Category matches, author does not
+        ListRepo::notifyCreated(makeTestArticle("tech", user99, "Tech by 99", 30));
+
+        CHECK(countOf("tech", user42) == 1);  // preserved
+    }
+
+    SECTION("[filter-match] an inactive filter does not constrain the match") {
+        auto user42 = insertTestUser("user42", "user42@fm.com", 0);
+        auto user99 = insertTestUser("user99", "user99@fm.com", 0);
+        insertTestArticle("tech", user42, "Tech 1", 10);
+
+        // Group (category=tech, author=any)
+        countOf("tech");
+        insertTestArticle("tech", user99, "Sentinel", 20);
+
+        ListRepo::notifyCreated(makeTestArticle("tech", user99, "Tech by 99", 30));
+
+        CHECK(countOf("tech") == 2);  // invalidated
+    }
+
+    SECTION("[filter-match] the unfiltered page matches any entity") {
+        auto userId = insertTestUser("author", "author@fm.com", 0);
+        insertTestArticle("tech", userId, "Tech 1", 10);
+
+        countOf();
+        countOf("tech");
+        insertTestArticle("tech", userId, "Sentinel", 20);
+
+        ListRepo::notifyCreated(makeTestArticle("tech", userId, "Tech Notify", 30));
+
+        CHECK(countOf() == 2);        // invalidated
+        CHECK(countOf("tech") == 2);  // invalidated
+    }
+
+    SECTION("[filter-match] update tech→news invalidates both groups, keeps sports") {
         auto userId = insertTestUser("author", "author@fm.com", 0);
         auto articleId = insertTestArticle("tech", userId, "Migrating", 10);
         insertTestArticle("news", userId, "News 1", 20);
         insertTestArticle("sports", userId, "Sports 1", 30);
 
-        // Populate 3 groups
-        sync(FullCacheArticleListRepo::query(makeFullArticleQuery("tech")));
-        sync(FullCacheArticleListRepo::query(makeFullArticleQuery("news")));
-        sync(FullCacheArticleListRepo::query(makeFullArticleQuery("sports")));
+        countOf("tech");
+        countOf("news");
+        countOf("sports");
 
-        // Insert sentinels
         insertTestArticle("tech", userId, "Tech Sentinel", 40);
         insertTestArticle("news", userId, "News Sentinel", 50);
         insertTestArticle("sports", userId, "Sports Sentinel", 60);
 
-        // Update DB
         updateTestArticleCategory(articleId, "news");
 
-        // notifyUpdatedSync: old=tech, new=news
         auto oldEntity = makeTestArticle("tech", userId, "Migrating", 10, false, articleId);
         auto newEntity = makeTestArticle("news", userId, "Migrating", 10, false, articleId);
-        TestInternals::notifyUpdatedSync<FullCacheArticleListRepo>(oldEntity, newEntity);
+        ListRepo::notifyUpdated(oldEntity, newEntity);
 
-        // tech SUPPRIMÉ (old group): sentinel only
-        CHECK(sync(FullCacheArticleListRepo::query(
-            makeFullArticleQuery("tech")))->size() == 1);
-        // news SUPPRIMÉ (new group): existing + migrated + sentinel
-        CHECK(sync(FullCacheArticleListRepo::query(
-            makeFullArticleQuery("news")))->size() == 3);
-        // sports CONSERVÉ
-        CHECK(sync(FullCacheArticleListRepo::query(
-            makeFullArticleQuery("sports")))->size() == 1);
+        CHECK(countOf("tech") == 1);    // old group: sentinel only
+        CHECK(countOf("news") == 3);    // new group: existing + migrated + sentinel
+        CHECK(countOf("sports") == 1);  // preserved
+    }
+
+    SECTION("[filter-match] delete invalidates only the matching group") {
+        auto userId = insertTestUser("author", "author@fm.com", 0);
+        auto articleId = insertTestArticle("tech", userId, "To Delete", 10);
+        insertTestArticle("news", userId, "News 1", 20);
+
+        countOf("tech");
+        countOf("news");
+
+        insertTestArticle("tech", userId, "Tech Sentinel", 30);
+        insertTestArticle("news", userId, "News Sentinel", 40);
+        deleteTestArticle(articleId);
+
+        ListRepo::notifyDeleted(makeTestArticle("tech", userId, "To Delete", 10, false, articleId));
+
+        CHECK(countOf("tech") == 1);  // invalidated: sentinel only
+        CHECK(countOf("news") == 1);  // preserved
     }
 }
 
 
 // #############################################################################
 //
-//  6. L2 hit repopulates L1
+//  4. Sort-range invalidation on cursor pages
 //
 // #############################################################################
 
-TEST_CASE("[DeclList L1+L2] L2 hit repopulates L1",
-          "[integration][db][list][full-cache][l2-to-l1]")
+TEST_CASE("[DeclList] Sort-range invalidation on cursor pages",
+          "[integration][db][list][sortbounds]")
 {
     TransactionGuard tx;
-    TestInternals::resetListCacheState<FullCacheArticleListRepo>();
+    TestInternals::resetListCacheState<ListRepo>();
 
-    SECTION("[l2-to-l1] L1 miss falls through to L2 hit and repopulates L1") {
-        auto userId = insertTestUser("author", "author@l2tol1.com", 0);
-        insertTestArticle("tech", userId, "Tech 1", 10);
-        insertTestArticle("tech", userId, "Tech 2", 20);
+    auto userId = insertTestUser("author", "author@sort.com", 0);
+    // [100, 80, 60, 40] sorted by view_count DESC, limit=2
+    insertTestArticle("tech", userId, "A100", 100);
+    auto a80 = insertTestArticle("tech", userId, "A80", 80);
+    insertTestArticle("tech", userId, "A60", 60);
+    insertTestArticle("tech", userId, "A40", 40);
 
-        // 1st query → populates both L1 and L2
-        auto r1 = sync(FullCacheArticleListRepo::query(
-            makeFullArticleQuery("tech")));
-        REQUIRE(r1->size() == 2);
+    // Page 1 [100, 80]: first, complete
+    auto p1 = sync(ListRepo::query(viewCountQuery("tech", 2)));
+    REQUIRE(p1->size() == 2);
+    REQUIRE(p1->items[0].view_count.value() == 100);
+    REQUIRE(p1->items[1].view_count.value() == 80);
 
-        // Clear L1 only (ChunkMap + ModificationTracker + get_counter). L2 intact.
-        TestInternals::resetListCacheState<FullCacheArticleListRepo>();
+    // Page 2 [60, 40] via cursor: not first, complete
+    auto q2 = viewCountQueryAfter("tech", 2, p1);
+    auto p2 = sync(ListRepo::query(q2));
+    REQUIRE(p2->size() == 2);
+    REQUIRE(p2->items[0].view_count.value() == 60);
+    REQUIRE(p2->items[1].view_count.value() == 40);
 
-        // Insert sentinel directly in DB (bypasses repo, no invalidation)
-        insertTestArticle("tech", userId, "Sentinel", 30);
+    SECTION("[sortbounds] a value inside a middle page's range invalidates it") {
+        insertTestArticle("tech", userId, "Sentinel55", 55);
 
-        // 2nd query → L1 miss → L2 hit → returns 2 (sentinel invisible, stale from L2)
-        auto r2 = sync(FullCacheArticleListRepo::query(
-            makeFullArticleQuery("tech")));
-        CHECK(r2->size() == 2);
+        // 55 <= 60 and 55 >= 40 → page 2 invalidated
+        ListRepo::notifyCreated(makeTestArticle("tech", userId, "Notify55", 55));
 
-        // 3rd query → L1 hit → still returns 2 (proves L1 was repopulated from L2)
-        auto r3 = sync(FullCacheArticleListRepo::query(
-            makeFullArticleQuery("tech")));
-        CHECK(r3->size() == 2);
+        auto fresh = sync(ListRepo::query(q2));
+        bool sentinel_visible = false;
+        for (const auto& item : fresh->items) {
+            if (item.view_count.value_or(0) == 55) { sentinel_visible = true; break; }
+        }
+        CHECK(sentinel_visible);
+    }
+
+    SECTION("[sortbounds] an update whose old and new values are both outside preserves it") {
+        insertTestArticle("tech", userId, "Sentinel105", 105);
+        updateTestArticle(a80, "A80-updated", 110);
+
+        // old=80, new=110: neither is within [60, 40] → page 2 preserved
+        auto oldEntity = makeTestArticle("tech", userId, "A80", 80, false, a80);
+        auto newEntity = makeTestArticle("tech", userId, "A80-updated", 110, false, a80);
+        ListRepo::notifyUpdated(oldEntity, newEntity);
+
+        auto cached = sync(ListRepo::query(q2));
+        REQUIRE(cached->size() == 2);
+        CHECK(cached->items[0].view_count.value() == 60);
+        CHECK(cached->items[1].view_count.value() == 40);
+    }
+
+    SECTION("[sortbounds] a value at a first page's last bound invalidates it, not the next page") {
+        insertTestArticle("tech", userId, "Boundary80", 80);
+
+        // Page 1 (first, DESC): 80 >= 80 → invalidated
+        // Page 2 ([60, 40]): 80 <= 60? no → preserved
+        ListRepo::notifyCreated(makeTestArticle("tech", userId, "Boundary80", 80));
+
+        auto cached = sync(ListRepo::query(q2));
+        REQUIRE(cached->size() == 2);
+        CHECK(cached->items[0].view_count.value() == 60);
+        CHECK(cached->items[1].view_count.value() == 40);
     }
 }
 
 
 // #############################################################################
 //
-//  7. Insertion invalidation edge cases (L1+L2)
+//  5. Insertion invalidation edge cases
 //
 // #############################################################################
 
-namespace {
-namespace list_ns = jcailloux::relais::list;
-
-using FullArticleDecl = FullCacheArticleListRepo::ListDescriptorType;
-using FullArticleDescQuery = decl::ListQuery<FullArticleDecl>;
-
-/// Build a sorted query for L1+L2 articles (view_count DESC).
-static FullArticleDescQuery makeFullViewCountQuery(
-    std::string_view category, uint16_t limit)
-{
-    decl::ListQueryParams<FullArticleDecl> q;
-    q.limit = limit;
-    q.filters.get<"category">() = std::string(category);
-    q.sort = list_ns::SortSpec<size_t>{1, list_ns::SortDirection::Desc};
-    return decl::seal<FullArticleDecl>(std::move(q));
-}
-} // anonymous namespace
-
-TEST_CASE("[DeclList L1+L2] Insertion invalidation edge cases",
-          "[integration][db][list][full-cache][edge-invalidation]")
+TEST_CASE("[DeclList] Insertion invalidation edge cases",
+          "[integration][db][list][edge-invalidation]")
 {
     TransactionGuard tx;
-    TestInternals::resetListCacheState<FullCacheArticleListRepo>();
+    TestInternals::resetListCacheState<ListRepo>();
 
-    SECTION("[edge] insert when no list queries are cached (L1+L2)") {
+    SECTION("[edge] insert when no list query is cached") {
         auto userId = insertTestUser("author", "author@edge.com", 0);
         insertTestArticle("tech", userId, "Tech 1", 10);
 
-        // No query executed — no cache populated
-        auto newArticle = makeTestArticle("tech", userId, "Tech 2", 20);
-        auto created = sync(FullCacheArticleListRepo::insert(newArticle));
+        auto created = sync(ListRepo::insert(makeTestArticle("tech", userId, "Tech 2", 20)));
         CHECK(created != nullptr);
 
-        auto result = sync(FullCacheArticleListRepo::query(
-            makeFullArticleQuery("tech")));
-        CHECK(result->size() == 2);
+        CHECK(countOf("tech") == 2);
     }
 
-    SECTION("[edge] rapid sequential inserts invalidate both L1 and L2") {
+    SECTION("[edge] rapid sequential inserts each invalidate the list") {
         auto userId = insertTestUser("author", "author@edge.com", 0);
         insertTestArticle("tech", userId, "Tech 1", 10);
 
-        // Populate L1+L2
-        auto r1 = sync(FullCacheArticleListRepo::query(
-            makeFullArticleQuery("tech")));
-        REQUIRE(r1->size() == 1);
+        REQUIRE(countOf("tech") == 1);
 
-        // 3 rapid sequential inserts via repo
-        sync(FullCacheArticleListRepo::insert(
-            makeTestArticle("tech", userId, "Tech 2", 20)));
-        sync(FullCacheArticleListRepo::insert(
-            makeTestArticle("tech", userId, "Tech 3", 30)));
-        sync(FullCacheArticleListRepo::insert(
-            makeTestArticle("tech", userId, "Tech 4", 40)));
+        sync(ListRepo::insert(makeTestArticle("tech", userId, "Tech 2", 20)));
+        sync(ListRepo::insert(makeTestArticle("tech", userId, "Tech 3", 30)));
+        sync(ListRepo::insert(makeTestArticle("tech", userId, "Tech 4", 40)));
 
-        // Each insert invalidated both L1 and L2 → query hits DB
-        auto result = sync(FullCacheArticleListRepo::query(
-            makeFullArticleQuery("tech")));
-        CHECK(result->size() == 4);
+        CHECK(countOf("tech") == 4);
     }
 
-    SECTION("[edge] insert into empty cached list (L1+L2)") {
+    SECTION("[edge] insert into an empty cached list") {
         auto userId = insertTestUser("author", "author@edge.com", 0);
 
-        // Query empty category
-        auto r1 = sync(FullCacheArticleListRepo::query(
-            makeFullArticleQuery("empty_cat")));
-        REQUIRE(r1->size() == 0);
+        REQUIRE(countOf("empty_cat") == 0);
 
-        // Insert sentinel directly
         insertTestArticle("empty_cat", userId, "First", 10);
+        CHECK(countOf("empty_cat") == 0);  // stale
 
-        // Cache returns stale empty result
-        CHECK(sync(FullCacheArticleListRepo::query(
-            makeFullArticleQuery("empty_cat")))->size() == 0);
+        // An empty page has no sort bounds: any matching entity affects it
+        ListRepo::notifyCreated(makeTestArticle("empty_cat", userId, "Notify", 20));
 
-        // notifyCreated → empty page (is_valid=false) → always invalidated
-        auto entity = makeTestArticle("empty_cat", userId, "Notify", 20);
-        TestInternals::notifyCreatedSync<FullCacheArticleListRepo>(entity);
-
-        // Both L1 and L2 invalidated → DB hit → sentinel visible
-        CHECK(sync(FullCacheArticleListRepo::query(
-            makeFullArticleQuery("empty_cat")))->size() == 1);
+        CHECK(countOf("empty_cat") == 1);
     }
 
-    SECTION("[edge] L1 and L2 independence verifiable via insert") {
-        auto userId = insertTestUser("author", "author@edge.com", 0);
-        insertTestArticle("tech", userId, "Tech 1", 10);
-
-        // Populate L1+L2
-        auto r1 = sync(FullCacheArticleListRepo::query(
-            makeFullArticleQuery("tech")));
-        REQUIRE(r1->size() == 1);
-
-        // Insert sentinel directly in DB (no repo, no invalidation)
-        insertTestArticle("tech", userId, "Sentinel", 20);
-
-        // L1 hit → stale
-        CHECK(sync(FullCacheArticleListRepo::query(
-            makeFullArticleQuery("tech")))->size() == 1);
-
-        // Clear L1 only, L2 intact
-        TestInternals::resetListCacheState<FullCacheArticleListRepo>();
-
-        // L1 miss → L2 hit → still stale (proves L2 was NOT invalidated)
-        CHECK(sync(FullCacheArticleListRepo::query(
-            makeFullArticleQuery("tech")))->size() == 1);
-
-        // Insert via repo → triggers invalidation of both L1 and L2
-        sync(FullCacheArticleListRepo::insert(
-            makeTestArticle("tech", userId, "Tech 3", 30)));
-
-        // DB hit → sees all 3 (original + sentinel + repo-inserted)
-        auto result = sync(FullCacheArticleListRepo::query(
-            makeFullArticleQuery("tech")));
-        CHECK(result->size() == 3);
-    }
-
-    SECTION("[edge] L1 incomplete page preserved when sort value out of range") {
+    SECTION("[edge] cursor incomplete page preserved when the sort value is out of range") {
         auto userId = insertTestUser("author", "author@edge.com", 0);
         insertTestArticle("tech", userId, "A100", 100);
         insertTestArticle("tech", userId, "A80", 80);
         insertTestArticle("tech", userId, "A60", 60);
 
         // Page 1 [100, 80]: first, complete (limit=2)
-        auto q1 = makeFullViewCountQuery("tech", 2);
-        auto p1 = sync(FullCacheArticleListRepo::query(q1));
+        auto p1 = sync(ListRepo::query(viewCountQuery("tech", 2)));
         REQUIRE(p1->size() == 2);
 
-        // Page 2 [60] via cursor: NOT first, incomplete (1 < limit 2)
-        auto q2params = makeFullViewCountQuery("tech", 2).params();
-        q2params.cursor = FullCacheArticleListRepo::Cursor::decode(std::string(p1->cursor())).value();
-        auto q2 = decl::seal<FullArticleDecl>(std::move(q2params));
-        auto p2 = sync(FullCacheArticleListRepo::query(q2));
+        // Page 2 [60] via cursor: not first, incomplete (1 < limit 2)
+        auto q2 = viewCountQueryAfter("tech", 2, p1);
+        auto p2 = sync(ListRepo::query(q2));
         REQUIRE(p2->size() == 1);
         REQUIRE(p2->items[0].view_count.value() == 60);
 
-        // Insert sentinel in DB (not through repo)
         insertTestArticle("tech", userId, "Sentinel999", 999);
 
-        // notifyCreated with sort value 999 (far above all ranges, DESC)
-        // L1 page 2 (cursor, incomplete, [60]): isValueInRange(999, false, true, true)
-        //   → 999 <= 60? NO → L1 page 2 PRESERVED (lazy invalidation does range check)
-        auto entity = makeTestArticle("tech", userId, "E999", 999);
-        TestInternals::notifyCreatedSync<FullCacheArticleListRepo>(entity);
+        // Incomplete cursor page (DESC) covers (-inf, 60]: 999 is out of range
+        ListRepo::notifyCreated(makeTestArticle("tech", userId, "E999", 999));
 
-        // Page 2 PRESERVED at L1: cache hit → stale (sentinel not visible)
-        auto p2_cached = sync(FullCacheArticleListRepo::query(q2));
+        auto p2_cached = sync(ListRepo::query(q2));
         CHECK(p2_cached->size() == 1);
         CHECK(p2_cached->items[0].view_count.value() == 60);
+    }
+
+    SECTION("[edge] offset incomplete page invalidated by a value below every bound") {
+        auto userId = insertTestUser("author", "author@edge.com", 0);
+        insertTestArticle("tech", userId, "A100", 100);
+        insertTestArticle("tech", userId, "A80", 80);
+        insertTestArticle("tech", userId, "A60", 60);
+
+        // Page 1 (offset=0, complete): [100, 80]
+        auto q_off1 = viewCountQuery("tech", 2, 0);
+        REQUIRE(sync(ListRepo::query(q_off1))->size() == 2);
+
+        // Page 2 (offset=2, incomplete): [60]
+        auto q_off2 = viewCountQuery("tech", 2, 2);
+        REQUIRE(sync(ListRepo::query(q_off2))->size() == 1);
+
+        insertTestArticle("tech", userId, "Sentinel1", 1);
+
+        // Page 1 (DESC, complete) covers [80, +inf): 1 is out of range → preserved
+        // Page 2 is incomplete: it holds the tail of the result → invalidated
+        ListRepo::notifyCreated(makeTestArticle("tech", userId, "E1", 1));
+
+        CHECK(sync(ListRepo::query(q_off1))->size() == 2);
+        CHECK(sync(ListRepo::query(q_off2))->size() == 2);  // [60, 1]
+    }
+
+    SECTION("[edge] insert with a null sort value") {
+        auto userId = insertTestUser("author", "author@edge.com", 0);
+        insertTestArticle("tech", userId, "A100", 100);
+        insertTestArticle("tech", userId, "A50", 50);
+
+        // First and incomplete page (2 items, limit=10): affected by any match
+        auto q = viewCountQuery("tech", 10);
+        REQUIRE(sync(ListRepo::query(q))->size() == 2);
+
+        insertTestArticle("tech", userId, "Sentinel", 30);
+
+        ListRepo::notifyCreated(makeTestArticle("tech", userId, "NullSort", std::nullopt));
+
+        CHECK(sync(ListRepo::query(q))->size() == 3);
     }
 }

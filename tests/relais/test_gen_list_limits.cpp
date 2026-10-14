@@ -9,7 +9,7 @@
  * precondition normalizeLimit's round-up relies on.
  *
  * Pure compile-time: the generated descriptors are inspected directly, no
- * DB / Redis.
+ * DB.
  */
 
 #include <array>

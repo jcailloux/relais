@@ -32,8 +32,6 @@ namespace {
 
 using CountUncached = Repo<FilterOnly, "test:count:uncached">;
 using CountL1 = Repo<FilterOnly, "test:count:l1", cfg::Local>;
-using CountL2 = Repo<FilterOnly, "test:count:l2", cfg::Redis>;
-using CountBoth = Repo<FilterOnly, "test:count:both", cfg::Both>;
 using ArticleInRepo = Repo<entity::generated::TestArticleInEntity, "test:count:article_in">;
 
 void seed(const std::string& category, int64_t owner, int32_t score,
@@ -141,8 +139,8 @@ TEST_CASE("[CountWhere] an empty IN set counts what query() lists",
 }
 
 TEMPLATE_TEST_CASE("[CountWhere] reads its own writes on every preset",
-                   "[integration][db][redis][where][count]",
-                   CountUncached, CountL1, CountL2, CountBoth) {
+                   "[integration][db][where][count]",
+                   CountUncached, CountL1) {
     using R = TestType;
     TransactionGuard tx;
     const Pred unlabelled{.label_null = true, .owner_id = 9};

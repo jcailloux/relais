@@ -19,18 +19,9 @@
 #include <jcailloux/relais/cache/GDSFPolicy.h>
 #include <jcailloux/relais/io/Task.h>
 
-namespace jcailloux::relais::cache { class RedisCache; }
-
 namespace relais_test {
 
 struct TestInternals {
-    /// Number of EVALSHA calls resent as EVAL after NOSCRIPT, process-wide.
-    /// A template so this header does not need RedisCache's definition.
-    template<typename Cache = jcailloux::relais::cache::RedisCache>
-    static uint64_t scriptReloads() {
-        return Cache::script_reloads_.load(std::memory_order_relaxed);
-    }
-
     /// Reset entity L1 cache: unconditionally remove all entries.
     template<typename Repo>
     static void resetEntityCacheState() {
@@ -202,17 +193,6 @@ struct TestInternals {
         } catch (...) {}
     }
 
-    /// Populate L2 directly in the repo's configured format (BEVE/JSON) under
-    /// its real Redis key — lets a test stage an L2-only entry (no DB row) to
-    /// prove the MGET path. setInCache is protected; RedisRepo befriends us.
-    template<typename Repo, typename Key, typename Ent>
-    static jcailloux::relais::io::Task<bool> setInCache(const Key& id, const Ent& entity) {
-        // Own the key in this frame: setInCache binds key by const-ref and is
-        // lazy, so a makeRedisKey() temporary would dangle before sync() drives it.
-        std::string key = Repo::makeRedisKey(id);
-        co_return co_await Repo::setInCache(key, entity);
-    }
-
     /// Direct L1 cache put — bypasses coroutine overhead.
     template<typename Repo, typename Key>
     static void putInCache(const Key& key, const typename Repo::EntityType& entity) {
@@ -380,54 +360,6 @@ struct TestInternals {
     static constexpr size_t bucketSlotSize() {
         using TierType = std::remove_reference_t<decltype(*Repo::tier_ptr_)>;
         return TierType::kBucketSlotSize;
-    }
-
-    // =========================================================================
-    // Synchronous notify helpers — L1 sync + L2 awaited (not fire-and-forget)
-    // =========================================================================
-
-    /// Synchronous notifyCreated: L1 inline + L2 co_await (not DetachedTask).
-    /// Returns number of L2 pages deleted. Requires sync() from test_helper.h.
-    template<typename Repo>
-    static size_t notifyCreatedSync(const typename Repo::EntityType& entity) {
-        constexpr auto level = Repo::config.cache_level;
-        constexpr bool hasL1 = level == jcailloux::relais::config::CacheLevel::L1
-                            || level == jcailloux::relais::config::CacheLevel::L1_L2;
-        constexpr bool hasL2 = level == jcailloux::relais::config::CacheLevel::L2
-                            || level == jcailloux::relais::config::CacheLevel::L1_L2;
-
-        if constexpr (hasL1) { Repo::listCache().onEntityCreated(entity); }
-        if constexpr (hasL2) { return sync(Repo::invalidateL2Created(entity)); }
-        return 0;
-    }
-
-    /// Synchronous notifyUpdated: L1 inline + L2 co_await.
-    template<typename Repo>
-    static size_t notifyUpdatedSync(const typename Repo::EntityType& old_e,
-                                    const typename Repo::EntityType& new_e) {
-        constexpr auto level = Repo::config.cache_level;
-        constexpr bool hasL1 = level == jcailloux::relais::config::CacheLevel::L1
-                            || level == jcailloux::relais::config::CacheLevel::L1_L2;
-        constexpr bool hasL2 = level == jcailloux::relais::config::CacheLevel::L2
-                            || level == jcailloux::relais::config::CacheLevel::L1_L2;
-
-        if constexpr (hasL1) { Repo::listCache().onEntityUpdated(old_e, new_e); }
-        if constexpr (hasL2) { return sync(Repo::invalidateL2Updated(old_e, new_e)); }
-        return 0;
-    }
-
-    /// Synchronous notifyDeleted: L1 inline + L2 co_await.
-    template<typename Repo>
-    static size_t notifyDeletedSync(const typename Repo::EntityType& entity) {
-        constexpr auto level = Repo::config.cache_level;
-        constexpr bool hasL1 = level == jcailloux::relais::config::CacheLevel::L1
-                            || level == jcailloux::relais::config::CacheLevel::L1_L2;
-        constexpr bool hasL2 = level == jcailloux::relais::config::CacheLevel::L2
-                            || level == jcailloux::relais::config::CacheLevel::L1_L2;
-
-        if constexpr (hasL1) { Repo::listCache().onEntityDeleted(entity); }
-        if constexpr (hasL2) { return sync(Repo::invalidateL2Deleted(entity)); }
-        return 0;
     }
 
 private:

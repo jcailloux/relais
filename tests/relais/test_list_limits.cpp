@@ -75,8 +75,8 @@ static_assert(!lst::HasLimitConfig<NoGrid, int>, "no grid -> not satisfied");
 // limitSteps/maxLimit must mirror the model's allowedLimits, not a fixed
 // {10,25,50,100}. Type-only instantiation — no DB connection.
 namespace rel = jcailloux::relais;
-using FiveRepo   = rel::Repo<entity::generated::TestLimitsEntity, "test:limits:traits", rel::config::Both>;
-using SingleRepo = rel::Repo<entity::generated::TestCompositeKeyListEntity, "test:single:traits", rel::config::Both>;
+using FiveRepo   = rel::Repo<entity::generated::TestLimitsEntity, "test:limits:traits", rel::config::Local>;
+using SingleRepo = rel::Repo<entity::generated::TestCompositeKeyListEntity, "test:single:traits", rel::config::Local>;
 
 static_assert(FiveRepo::ListTraits::limitSteps == std::array<uint16_t, 5>{5, 10, 20, 50, 100},
               "ListMixin Traits sources the 5-value grid from the descriptor");

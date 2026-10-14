@@ -1,6 +1,6 @@
 /**
  * test_recheck_guard.cpp
- * Pure unit tests for RecheckGuard — no DB, no Redis, no event loop.
+ * Pure unit tests for RecheckGuard — no DB, no event loop.
  *
  * RecheckGuard is the sharded generation counter behind the read-fill recheck.
  * A filling reader snapshots its key's slot at fetch-start, then asks changed()

@@ -9,7 +9,7 @@
  *     returns every deleted entity across chunks.
  *
  * Raw methods are protected (like findManyRaw) — reached via TestInternals on
- * Uncached* repos so we exercise the pure L3 path (no L1/L2 interference).
+ * Uncached* repos so we exercise the pure L3 path (no L1 interference).
  *
  * SECTION tags:
  *   [erasemany]      — eraseManyRaw by enumerated keys

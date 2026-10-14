@@ -13,9 +13,7 @@
 #include <jcailloux/relais/io/pg/PgPool.h>
 #include <jcailloux/relais/io/pg/PgResult.h>
 #include <jcailloux/relais/io/pg/PgParams.h>
-#include <jcailloux/relais/io/redis/RedisClient.h>
 #include <jcailloux/relais/PgProvider.h>
-#include <jcailloux/relais/cache/RedisScripts.h>
 
 #include <fixtures/EpollIoContext.h>
 #include <fixtures/TestRunner.h>
@@ -173,16 +171,10 @@ namespace detail {
         return pg;
     }
 
-    inline std::shared_ptr<io::RedisClient<IoCtx>>& testRedis() {
-        static std::shared_ptr<io::RedisClient<IoCtx>> redis;
-        return redis;
-    }
-
     inline void cleanup() {
         if (isInitialized().exchange(false)) {
             testLoop().stop();
             jcailloux::relais::PgProvider::reset();
-            testRedis().reset();
             testPg().reset();
         }
     }
@@ -288,7 +280,7 @@ inline const char* getConnInfo() {
 
 /**
  * Initialize I/O for integration tests.
- * Phase 1: synchronous init (PgPool, Redis, PgProvider) via runTask().
+ * Phase 1: synchronous init (PgPool, PgProvider) via runTask().
  * Phase 2: start background event loop thread for concurrent sync() calls.
  */
 inline void initTest() {
@@ -314,28 +306,6 @@ inline void initTest() {
 
     detail::testPg() = std::make_shared<io::PgClient<IoCtx>>(pool);
 
-    std::shared_ptr<io::RedisClient<IoCtx>> redis;
-    try {
-        // Try Unix socket first (lower latency)
-        redis = io::test::runTask(io,
-            io::RedisClient<IoCtx>::connectUnix(io, "/run/redis/redis.sock"));
-    } catch (...) {
-        // Fall back to TCP
-        redis = io::test::runTask(io,
-            io::RedisClient<IoCtx>::connect(io, "127.0.0.1", 6379));
-    }
-    detail::testRedis() = redis;
-
-    // Load every script once. A detached L2 fill whose script is not cached falls
-    // back to EVAL one round trip later, after the test's next command on this
-    // connection: preloading keeps fills ordered before the reads that follow.
-    // The fallback itself is covered by test_redis_scripts.
-    for (const auto* script : jcailloux::relais::cache::scripts::kAllScripts) {
-        try {
-            io::test::runTask(io, redis->exec("SCRIPT", "LOAD", script->body));
-        } catch (...) {}
-    }
-
 #ifdef RELAIS_BUILDING_TESTS
     // Connections a write batch may span; unset or 0 derives it from pg_max.
     if (auto* env = std::getenv("BENCH_WRITE_FANOUT"))
@@ -351,44 +321,11 @@ inline void initTest() {
     // also builds the BatchScheduler against `io` — must happen there.
     std::promise<void> bound;
     auto bound_fut = bound.get_future();
-    detail::testLoop().dispatch([&io, pool, redis, pg_max, &bound]() mutable {
-        jcailloux::relais::PgProvider::init(io, pool, redis, pg_max);
+    detail::testLoop().dispatch([&io, pool, pg_max, &bound]() mutable {
+        jcailloux::relais::PgProvider::init(io, pool, nullptr, pg_max);
         bound.set_value();
     });
     bound_fut.get();
-}
-
-/**
- * Flush all keys from Redis (for test isolation).
- */
-inline void flushRedis() {
-    auto& redis = detail::testRedis();
-    if (!redis) return;
-
-    try {
-        sync(redis->exec("FLUSHDB"));
-    } catch (...) {
-        // Ignore flush errors
-    }
-}
-
-/**
- * Poll until a key written by a detached L2 fill is visible (bounded). The
- * fire-and-forget write is not ordered against a later read on another pooled
- * connection, so a single read races it. Returning also means the write landed,
- * so it cannot leak past the test's Redis flush.
- */
-inline io::Task<std::optional<std::string>> getRawKey(std::string key) {
-    auto r = co_await jcailloux::relais::PgProvider::redis("GET", key);
-    if (r.isNil()) co_return std::nullopt;
-    co_return r.asString();
-}
-
-inline std::optional<std::string> awaitL2Key(const std::string& key) {
-    for (int i = 0; i < 200; ++i) {
-        if (auto v = sync(getRawKey(key))) return v;
-    }
-    return std::nullopt;
 }
 
 /**
@@ -428,7 +365,6 @@ private:
         if (!detail::isInitialized().load()) {
             return;
         }
-        flushRedis();
 
         // Delete all test data (order matters due to FK constraints)
         auto& pg = detail::testPg();

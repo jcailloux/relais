@@ -8,7 +8,7 @@
  * - L1 operations (ns-scale): duration-based (tight loop, 1 or N threads).
  *   Per-sample timing would add ~30ns of Clock::now() overhead, dwarfing the
  *   5-10ns actual cost. Duration-based amortizes one timer over millions of ops.
- * - L2/DB/write operations (μs/ms-scale): sample-based (per-op timing).
+ * - DB/write operations (μs/ms-scale): sample-based (per-op timing).
  *   Clock overhead is negligible vs the measured I/O latency.
  *
  * Run with:
@@ -223,55 +223,6 @@ TEST_CASE("Benchmark - L1 cache hit", "[benchmark][l1]")
 
 // #############################################################################
 //
-//  2. L2 cache hit latency (sample-based — clock overhead negligible vs μs I/O)
-//
-// #############################################################################
-
-TEST_CASE("Benchmark - L2 cache hit", "[benchmark][l2]")
-{
-    TransactionGuard tx;
-    auto id = insertTestItem("bench_l2", 42);
-    sync(L2TestItemRepo::find(id));
-
-    std::vector<BenchResult> results;
-
-    results.push_back(bench("find", [&]() {
-        doNotOptimize(sync(L2TestItemRepo::find(id)));
-    }));
-
-    results.push_back(bench("findJson", [&]() {
-        doNotOptimize(sync(L2TestItemRepo::findJson(id)));
-    }));
-
-    WARN(formatTable("L2 cache hit (Redis)", results));
-}
-
-
-// #############################################################################
-//
-//  3. L1+L2 cache hit latency (L2 fallback)
-//
-// #############################################################################
-
-TEST_CASE("Benchmark - L1+L2 cache hit", "[benchmark][full-cache]")
-{
-    TransactionGuard tx;
-    auto id = insertTestItem("bench_both", 42);
-    sync(FullCacheTestItemRepo::find(id));
-
-    std::vector<BenchResult> results;
-
-    results.push_back(benchWithSetup("find (L2 fallback)",
-        [&]() { FullCacheTestItemRepo::evict(id); },
-        [&]() { doNotOptimize(sync(FullCacheTestItemRepo::find(id))); }
-    ));
-
-    WARN(formatTable("L1+L2 cache hit", results));
-}
-
-
-// #############################################################################
-//
 //  4. Cache miss latency (DB fetch)
 //
 // #############################################################################
@@ -286,11 +237,6 @@ TEST_CASE("Benchmark - cache miss (DB fetch)", "[benchmark][db]")
     results.push_back(benchWithSetup("find (L1 miss -> DB)",
         [&]() { L1TestItemRepo::evict(id); },
         [&]() { doNotOptimize(sync(L1TestItemRepo::find(id))); }
-    ));
-
-    results.push_back(benchWithSetup("find (L1+L2 miss -> DB)",
-        [&]() { sync(FullCacheTestItemRepo::invalidate(id)); },
-        [&]() { doNotOptimize(sync(FullCacheTestItemRepo::find(id))); }
     ));
 
     WARN(formatTable("Cache miss (DB fetch)", results));
@@ -311,10 +257,6 @@ TEST_CASE("Benchmark - write operations", "[benchmark][write]")
     sync(L1TestItemRepo::find(upd_id));
     int c1 = 0;
 
-    auto upd_both_id = insertTestItem("bench_upd_both", 42);
-    sync(FullCacheTestItemRepo::find(upd_both_id));
-    int c2 = 0;
-
     std::vector<BenchResult> results;
 
     results.push_back(bench("insert + erase (L1)", [&]() {
@@ -329,14 +271,6 @@ TEST_CASE("Benchmark - write operations", "[benchmark][write]")
             "bench_u_" + std::to_string(c1), c1,
             "bench_u_description", true, upd_id);
         sync(L1TestItemRepo::update(upd_id, entity));
-    }));
-
-    results.push_back(bench("update (L1+L2)", [&]() {
-        ++c2;
-        auto entity = makeTestItem(
-            "bench_ub_" + std::to_string(c2), c2,
-            "bench_ub_description", true, upd_both_id);
-        sync(FullCacheTestItemRepo::update(upd_both_id, entity));
     }));
 
     WARN(formatTable("Write operations", results));
@@ -784,12 +718,11 @@ TEST_CASE("Benchmark - L1 throughput mixed", "[benchmark][throughput][mixed]") {
 
 // #############################################################################
 //
-//  8. Production simulation (coroutine, L1+L2+DB, pinned event loop)
+//  8. Production simulation (coroutine, L1+DB, pinned event loop)
 //
-//  Realistic model: concurrent coroutines on a single event loop.
-//  Two variants compared side-by-side:
-//    - L1+DB (no Redis): misses go directly to PostgreSQL
-//    - L1+L2+DB (with Redis): misses try Redis first, then PostgreSQL
+//  Realistic model: concurrent coroutines on a single event loop; L1 misses go
+//  directly to PostgreSQL. A warm-read baseline, a production mix and a
+//  high-miss mix.
 //
 //  Run with:
 //    BENCH_PG_POOL_MAX=16 ./bench_relais_cache "[production]"
@@ -824,8 +757,7 @@ public:
     [[nodiscard]] size_t size() const noexcept { return cdf_.size(); }
 };
 
-// Coroutine worker for production benchmark.
-// Templated on Repo to compare L1-only vs L1+L2 with identical logic.
+// Coroutine worker for production benchmark, templated on Repo.
 template<typename Repo>
 struct ProdStats {
     int64_t reads = 0;
@@ -847,7 +779,7 @@ DetachedHandle prodWorker(
             auto result = co_await Repo::find(kid);
             doNotOptimize(result);
             ++stats.reads;
-        } else if (roll == 1) {  // 1% L1 evictions (next read → L2 or DB)
+        } else if (roll == 1) {  // 1% L1 evictions (next read → DB)
             Repo::evict(kid);
             ++stats.l1_evicts;
         } else {  // 1% full invalidations (next read → DB)
@@ -933,8 +865,8 @@ std::string runProductionBench(
 
     std::ostringstream extra;
     extra << "\n  L1 hit rate:     " << std::fixed << std::setprecision(1) << l1_pct << "%"
-          << "\n  L1 misses:       " << l1_misses << " (\u2192 L2 or DB)"
-          << "\n  L1 evictions:    " << total.l1_evicts << " (next read \u2192 L2 or DB)"
+          << "\n  L1 misses:       " << l1_misses << " (\u2192 DB)"
+          << "\n  L1 evictions:    " << total.l1_evicts << " (next read \u2192 DB)"
           << "\n  invalidations:   " << total.invalidates << " (next read \u2192 DB)"
           << "\n  coroutines:      " << coro_count
           << "\n  IO pinned:       core " << io_core
@@ -972,7 +904,7 @@ TEST_CASE("Benchmark - production simulation", "[benchmark][production]") {
         f.wait();
     }
 
-    // ---------- L1+DB variant (no Redis) ----------
+    // ---------- L1+DB variant ----------
 
     SECTION("L1+DB baseline — warm reads (single thread)") {
         std::vector<int64_t> ids;
@@ -1090,44 +1022,6 @@ TEST_CASE("Benchmark - production simulation", "[benchmark][production]") {
               << "\n  IO pinned:       core " << io_core
               << formatSweepMetrics();
         WARN(msg + extra.str());
-    }
-
-    // ---------- L1+L2+DB variant (with Redis) ----------
-
-    SECTION("L1+L2+DB baseline — warm reads (single thread)") {
-        std::vector<int64_t> ids;
-        ids.reserve(NUM_KEYS);
-        for (int i = 0; i < NUM_KEYS; ++i) {
-            auto kid = insertTestItem("bench_prod_" + std::to_string(i), i);
-            sync(FullCacheTestItemRepo::find(kid));
-            ids.push_back(kid);
-        }
-
-        auto result = measureDuration(1, [&](int, std::atomic<bool>& running) -> int64_t {
-            int64_t ops = 0;
-            while (running.load(std::memory_order_relaxed)) {
-                auto task = FullCacheTestItemRepo::find(ids[ops % NUM_KEYS]);
-                doNotOptimize(task.await_resume());
-                ++ops;
-            }
-            return ops;
-        });
-        WARN(formatDurationThroughput("L1+L2+DB find, warm L1 (1 thread)", 1, result));
-    }
-
-    SECTION("L1+L2+DB production mix (98R/1E/1I)") {
-        std::vector<int64_t> ids;
-        ids.reserve(NUM_KEYS);
-        for (int i = 0; i < NUM_KEYS; ++i) {
-            auto kid = insertTestItem("bench_prod_" + std::to_string(i), i);
-            sync(FullCacheTestItemRepo::find(kid));
-            ids.push_back(kid);
-        }
-
-        auto msg = runProductionBench<FullCacheTestItemRepo>(
-            "L1+L2+DB (98R/1E/1I, with Redis)",
-            ids, NUM_KEYS, CORO_COUNT, io_core);
-        WARN(msg);
     }
 }
 
@@ -1520,20 +1414,20 @@ TEST_CASE("Benchmark - production realism scaling", "[benchmark][realism]") {
 //
 //  findMany(N) collapses N point lookups into one guarded MultiView:
 //    - all-L1-hit  → zero-copy, synchronous (await_ready), no coroutine frame
-//    - all-miss    → ONE batched round-trip per tier (L2 MGET, L3 ANY)
+//    - all-miss    → ONE batched round-trip (WHERE pk = ANY)
 //                    vs N sequential round-trips for N × find
 //    - mixed       → only the misses pay I/O, batched
 //
 //  The round-trip win is read directly off latency: N × find scales linearly
-//  with N (sequential RTTs), findMany stays ~flat (one batch). FullCache repo
-//  (L1+L2) exercises the multi-tier batch; L1-only isolates the hot path.
+//  with N (sequential RTTs), findMany stays ~flat (one batch). The L1 repo
+//  covers the hit, miss and mixed paths; the Uncached repo prices the bare
+//  database batch.
 //
 // #############################################################################
 
 namespace {
 
-// Drain detached L2 warm-fills so the next sample's setup starts from a known
-// state. invalidate() clears L1+L2 synchronously for the requested ids.
+// Evict the requested ids so the next sample starts cold.
 template<typename Repo>
 void invalidateAll(const std::vector<int64_t>& ids) {
     for (auto id : ids) sync(Repo::invalidate(id));
@@ -1608,25 +1502,37 @@ TEST_CASE("Benchmark - findMany batched read", "[benchmark][findmany]") {
     }
 
     // --- B. all-miss cold path (μs/ms-scale → sample-based latency) ----------
-    // FullCache (L1+L2): findMany issues one MGET + one ANY; N × find issues N
-    // sequential round-trips. invalidate() between samples re-arms the miss.
+    // findMany issues one ANY; N × find issues N sequential round-trips.
+    // invalidate() between samples re-arms the L1 miss; the Uncached repo has
+    // nothing to evict, every read goes to the database.
     {
         std::vector<BenchResult> miss;
         for (int n : Ns) {
             miss.push_back(benchWithSetup(
                 "findMany(" + std::to_string(n) + ")",
-                [&]() { invalidateAll<FullCacheTestUserRepo>(ids); },
-                [&]() { doNotOptimize(findManyN<FullCacheTestUserRepo>(ids, n)); }));
+                [&]() { invalidateAll<L1TestUserRepo>(ids); },
+                [&]() { doNotOptimize(findManyN<L1TestUserRepo>(ids, n)); }));
             miss.push_back(benchWithSetup(
                 std::to_string(n) + " x find",
-                [&]() { invalidateAll<FullCacheTestUserRepo>(ids); },
-                [&]() { nFinds<FullCacheTestUserRepo>(ids, n); }));
+                [&]() { invalidateAll<L1TestUserRepo>(ids); },
+                [&]() { nFinds<L1TestUserRepo>(ids, n); }));
         }
-        WARN(formatTable("findMany all-miss (L1+L2 cold, 1 batch vs N RTT)", miss));
+        WARN(formatTable("findMany all-miss (L1 cold, 1 batch vs N RTT)", miss));
+
+        std::vector<BenchResult> db;
+        for (int n : Ns) {
+            db.push_back(bench(
+                "findMany(" + std::to_string(n) + ")",
+                [&]() { doNotOptimize(findManyN<UncachedTestUserRepo>(ids, n)); }));
+            db.push_back(bench(
+                std::to_string(n) + " x find",
+                [&]() { nFinds<UncachedTestUserRepo>(ids, n); }));
+        }
+        WARN(formatTable("findMany all-miss (Uncached, 1 batch vs N RTT)", db));
     }
 
     // --- C. mixed path (half in L1, half cold) -------------------------------
-    // Only the misses pay I/O — batched into a single round-trip per tier.
+    // Only the misses pay I/O — batched into a single round-trip.
     {
         std::vector<BenchResult> mixed;
         for (int n : Ns) {
@@ -1634,21 +1540,21 @@ TEST_CASE("Benchmark - findMany batched read", "[benchmark][findmany]") {
             mixed.push_back(benchWithSetup(
                 "findMany(" + std::to_string(n) + ")",
                 [&]() {
-                    invalidateAll<FullCacheTestUserRepo>(ids);
+                    invalidateAll<L1TestUserRepo>(ids);
                     for (int k = 0; k < half; ++k)
-                        sync(FullCacheTestUserRepo::find(ids[k]));   // warm half
+                        sync(L1TestUserRepo::find(ids[k]));   // warm half
                 },
-                [&]() { doNotOptimize(findManyN<FullCacheTestUserRepo>(ids, n)); }));
+                [&]() { doNotOptimize(findManyN<L1TestUserRepo>(ids, n)); }));
             mixed.push_back(benchWithSetup(
                 std::to_string(n) + " x find",
                 [&]() {
-                    invalidateAll<FullCacheTestUserRepo>(ids);
+                    invalidateAll<L1TestUserRepo>(ids);
                     for (int k = 0; k < half; ++k)
-                        sync(FullCacheTestUserRepo::find(ids[k]));
+                        sync(L1TestUserRepo::find(ids[k]));
                 },
-                [&]() { nFinds<FullCacheTestUserRepo>(ids, n); }));
+                [&]() { nFinds<L1TestUserRepo>(ids, n); }));
         }
-        WARN(formatTable("findMany mixed (50% L1 hit, misses batched)", mixed));
+        WARN(formatTable("findMany mixed (L1, 50% hit, misses batched)", mixed));
     }
 }
 
@@ -1658,14 +1564,15 @@ TEST_CASE("Benchmark - findMany batched read", "[benchmark][findmany]") {
 //  13. eraseMany / invalidateMany — batched write vs N × mono
 //
 //  Both collapse N enumerated keys into one cascade:
-//    - eraseMany(N)      → ONE  DELETE WHERE pk = ANY($1) RETURNING  (L3, one
-//                          round-trip) + ONE batched UNLINK (L2), vs N sequential
-//                          DELETE + N UNLINK for N × erase.
-//    - invalidateMany(N) → ONE  variadic UNLINK sub-chunked at K_redis (L2), vs N
-//                          UNLINK for N × invalidate. Rows persist (evict only).
+//    - eraseMany(N)      → ONE  DELETE WHERE pk = ANY($1) RETURNING  (one
+//                          round-trip) + the L1 evictions, vs N sequential
+//                          DELETE for N × erase.
+//    - invalidateMany(N) → one L1 eviction pass, vs N × invalidate. Rows persist
+//                          (evict only).
 //
-//  FullCache (L1+L2) exercises the multi-tier batch; the win is read directly off
-//  latency — N × mono scales linearly with N (sequential RTTs), batch stays flat.
+//  The L1 repo runs both; the Uncached repo prices the bare database batch for
+//  eraseMany. The win is read directly off latency — N × mono scales linearly
+//  with N (sequential RTTs), batch stays flat.
 //
 // #############################################################################
 
@@ -1676,19 +1583,19 @@ TEST_CASE("Benchmark - batch erase / invalidate", "[benchmark][batch]") {
     static constexpr int POOL = 128;
     const std::vector<int> Ns = {8, 32, 128};
 
-    // --- A. eraseMany(N) vs N × erase — FullCache cold (L1+L2 primed, deleted) --
+    // --- A. eraseMany(N) vs N × erase — L1 primed, rows deleted ---------------
     // Rows are consumed each sample → re-insert + re-prime in setup (unmeasured).
     {
         std::vector<int64_t> live;
         live.reserve(POOL);
 
-        auto reinsert = [&](int n) {
+        auto reinsert = [&](int n, bool prime) {
             live.clear();
             for (int i = 0; i < n; ++i) {
                 auto id = insertTestUser(
                     "em_bench_" + std::to_string(i),
                     "emb" + std::to_string(i) + "@test.com", i);
-                sync(FullCacheTestUserRepo::find(id));   // prime L1+L2
+                if (prime) sync(L1TestUserRepo::find(id));   // prime L1
                 live.push_back(id);
             }
         };
@@ -1697,23 +1604,39 @@ TEST_CASE("Benchmark - batch erase / invalidate", "[benchmark][batch]") {
         for (int n : Ns) {
             erase.push_back(benchWithSetup(
                 "eraseMany(" + std::to_string(n) + ")",
-                [&, n]() { reinsert(n); },
-                [&]() { doNotOptimize(sync(FullCacheTestUserRepo::eraseMany(
+                [&, n]() { reinsert(n, true); },
+                [&]() { doNotOptimize(sync(L1TestUserRepo::eraseMany(
                             std::span<const int64_t>(live)))); }));
             erase.push_back(benchWithSetup(
                 std::to_string(n) + " x erase",
-                [&, n]() { reinsert(n); },
+                [&, n]() { reinsert(n, true); },
                 [&]() {
                     for (auto id : live)
-                        doNotOptimize(sync(FullCacheTestUserRepo::erase(id)));
+                        doNotOptimize(sync(L1TestUserRepo::erase(id)));
                 }));
         }
-        WARN(formatTable("eraseMany vs N x erase (L1+L2, 1 DELETE ANY vs N RTT)", erase));
+        WARN(formatTable("eraseMany vs N x erase (L1, 1 DELETE ANY vs N RTT)", erase));
+
+        std::vector<BenchResult> db;
+        for (int n : Ns) {
+            db.push_back(benchWithSetup(
+                "eraseMany(" + std::to_string(n) + ")",
+                [&, n]() { reinsert(n, false); },
+                [&]() { doNotOptimize(sync(UncachedTestUserRepo::eraseMany(
+                            std::span<const int64_t>(live)))); }));
+            db.push_back(benchWithSetup(
+                std::to_string(n) + " x erase",
+                [&, n]() { reinsert(n, false); },
+                [&]() {
+                    for (auto id : live)
+                        doNotOptimize(sync(UncachedTestUserRepo::erase(id)));
+                }));
+        }
+        WARN(formatTable("eraseMany vs N x erase (Uncached, 1 DELETE ANY vs N RTT)", db));
     }
 
-    // --- B. invalidateMany(N) vs N × invalidate — FullCache warm (rows persist) -
-    // invalidateMany batches the L2 UNLINK; rows are NOT deleted → fixed pool,
-    // re-prime L1+L2 in setup.
+    // --- B. invalidateMany(N) vs N × invalidate — L1 warm (rows persist) ------
+    // Rows are NOT deleted → fixed pool, re-prime L1 in setup.
     {
         std::vector<int64_t> ids;
         ids.reserve(POOL);
@@ -1723,7 +1646,7 @@ TEST_CASE("Benchmark - batch erase / invalidate", "[benchmark][batch]") {
                 "imb" + std::to_string(i) + "@test.com", i));
 
         auto prime = [&](int n) {
-            for (int k = 0; k < n; ++k) sync(FullCacheTestUserRepo::find(ids[k]));
+            for (int k = 0; k < n; ++k) sync(L1TestUserRepo::find(ids[k]));
         };
 
         std::vector<BenchResult> inval;
@@ -1731,17 +1654,17 @@ TEST_CASE("Benchmark - batch erase / invalidate", "[benchmark][batch]") {
             inval.push_back(benchWithSetup(
                 "invalidateMany(" + std::to_string(n) + ")",
                 [&, n]() { prime(n); },
-                [&, n]() { sync(FullCacheTestUserRepo::invalidateMany(
+                [&, n]() { sync(L1TestUserRepo::invalidateMany(
                             std::span<const int64_t>(ids.data(), n))); }));
             inval.push_back(benchWithSetup(
                 std::to_string(n) + " x invalidate",
                 [&, n]() { prime(n); },
                 [&, n]() {
                     for (int k = 0; k < n; ++k)
-                        sync(FullCacheTestUserRepo::invalidate(ids[k]));
+                        sync(L1TestUserRepo::invalidate(ids[k]));
                 }));
         }
-        WARN(formatTable("invalidateMany vs N x invalidate (L1+L2, batched UNLINK)", inval));
+        WARN(formatTable("invalidateMany vs N x invalidate (L1)", inval));
     }
 }
 
@@ -1756,8 +1679,8 @@ TEST_CASE("Benchmark - batch erase / invalidate", "[benchmark][batch]") {
 //      invalidateMany runs over explicit ids. The delta vs invalidateMany(ids)
 //      is exactly the resolve round-trip — priced against not knowing the ids.
 //    - eraseWhere(P)      → ONE DELETE WHERE P RETURNING (resolve + delete fused)
-//      + ONE RangeModification (L1 own-list) + ONE predicate EVAL (L2 own-list),
-//      O(1)/O(groups), regardless of matched-set size.
+//      + ONE RangeModification (L1 own-list), O(1)/O(groups), regardless of
+//      matched-set size.
 //
 // #############################################################################
 
@@ -1819,25 +1742,21 @@ TEST_CASE("Benchmark - predicate erase / invalidate (where)", "[benchmark][where
 //  15. Detached cleanup — caller throughput / time-to-return
 //
 //  eraseMany/eraseWhere split the batch cleanup into a CRITICAL pass (awaited:
-//  L3 DELETE + L1 evict + L2 entity UNLINK + gen bump + L1 list bump) and a
-//  DEFERRED pass (fired fire-and-forget: cross-target + the L2 list EVALs). The
-//  caller returns after the critical pass; the deferred Redis work drains in the
-//  background, l2_ttl-bounded (cache-staleness tolerance).
+//  L3 DELETE + L1 evict + L1 list bump) and a DEFERRED pass (fired
+//  fire-and-forget: cross-target invalidations). The caller returns after the
+//  critical pass; the deferred work drains in the background.
 //
-//  This isolates what detachment buys, on the WithLists=true cascade — the only
-//  path with a non-trivial deferred half (invalidateMany uses WithLists=false,
-//  so its deferred pass is empty). Rows persist (invalidate semantics), so the
-//  affected set is reusable across samples without re-insert:
+//  This measures the WithLists=true cascade on an L1 repo with lists. Rows
+//  persist (invalidate semantics), so the affected set is reusable across
+//  samples without re-insert:
 //    A. latency    — drain (critical+deferred awaited) vs detached (critical
-//                    only) → the per-call latency the L2 list EVAL no longer
-//                    adds to the caller's path.
+//                    only, deferred fired with its own copy of the set).
 //    B. throughput — K concurrent coroutines issuing the cascade in a loop on
-//                    one event loop. Detached lets call N+1 start while N's EVALs
-//                    are in flight → concurrent EVALs coalesce into fewer Redis
-//                    round-trips. Reported as caller-observed op rate (critical
-//                    completions); deferred EVALs trail in the background.
+//                    one event loop. Reported as caller-observed op rate
+//                    (critical completions).
 //
-//  Local L1+L2+lists repo so the deferred pass hits Redis (the detachable work).
+//  This repo declares no cross-target invalidation, so its deferred pass is
+//  empty: the two arms differ only by the cost of firing it.
 //
 //  Run with:
 //    ./bench_relais_cache "[batch-detach]"
@@ -1845,12 +1764,11 @@ TEST_CASE("Benchmark - predicate erase / invalidate (where)", "[benchmark][where
 //
 // #############################################################################
 
-/// L1+L2 + auto-detected ListMixin (TestArticleEntity carries a ListDescriptor).
-using FullCacheArticleListRepo =
-    Repo<TestArticleEntity, "bench:article:both", cfg::Both>;
+/// L1 + auto-detected ListMixin (TestArticleEntity carries a ListDescriptor).
+using LocalArticleListRepo = Repo<TestArticleEntity, "bench:article:l1">;
 
 TEST_CASE("Benchmark - detached batch cleanup", "[benchmark][batch-detach]") {
-    using Repo = FullCacheArticleListRepo;
+    using Repo = LocalArticleListRepo;
 
     TransactionGuard tx;
     TestInternals::resetListCacheState<Repo>();
@@ -1869,7 +1787,7 @@ TEST_CASE("Benchmark - detached batch cleanup", "[benchmark][batch-detach]") {
     for (int i = 0; i < POOL; ++i) {
         auto id = insertTestArticle("tech", author, "DT_" + std::to_string(i), i * 10);
         ids.push_back(id);
-        auto v = sync(Repo::find(id));            // materialize entity + warm L1+L2
+        auto v = sync(Repo::find(id));            // materialize entity + warm L1
         REQUIRE(v != nullptr);
         entities.push_back(*v);
     }
@@ -1894,8 +1812,7 @@ TEST_CASE("Benchmark - detached batch cleanup", "[benchmark][batch-detach]") {
 
     // --- A. latency: drain vs detached -------------------------------------
     // Both arms borrow the same span over entities[0..n) (symmetric caller cost).
-    // drain awaits the L2 list EVAL; detached fires it and returns. Delta ≈ the
-    // EVAL round-trip removed from the caller path.
+    // drain awaits the deferred pass; detached fires it and returns.
     {
         std::vector<BenchResult> lat;
         for (int n : Ns) {
@@ -1909,18 +1826,16 @@ TEST_CASE("Benchmark - detached batch cleanup", "[benchmark][batch-detach]") {
                 [&, n]() { reprime(n); },
                 [&, setN]() { sync(TestInternals::invalidateManyDetached<Repo>(setN)); }));
         }
-        WARN(formatTable("detached cleanup — time-to-return vs full drain", lat));
+        WARN(formatTable("detached cleanup (L1) — time-to-return vs full drain", lat));
     }
 
     // --- B. cascade throughput sentinel ------------------------------------
     // A single regression number: caller op rate (critical completion) of the
-    // detached cascade under saturated concurrency on one event loop. At this
-    // batch size the critical pass is CPU-bound on the loop thread (N L1 evicts +
-    // N list-tracker bumps + the deferred copy per op), so concurrency does NOT
-    // scale it — that is expected. The I/O-bound pipelining curve (distinct keys,
-    // super-linear Redis batching) is bench_io_batch's "[batch][scaling]"; this
-    // tracks the FULL facade-cascade cost (L1 + list bookkeeping + fire) that
-    // bench_io_batch's raw-Redis path does not see.
+    // detached cascade under saturated concurrency on one event loop. The
+    // critical pass is CPU-bound on the loop thread (N L1 evicts + N list-tracker
+    // bumps + the deferred copy per op), so concurrency does NOT scale it — that
+    // is expected. This tracks the full facade-cascade cost (L1 + list
+    // bookkeeping + fire).
     {
         static constexpr int CORO = 32;
         static constexpr int N = 32;
@@ -1947,13 +1862,13 @@ TEST_CASE("Benchmark - detached batch cleanup", "[benchmark][batch-detach]") {
         running.store(false, std::memory_order_relaxed);
         done.wait();
         auto el = Clock::now() - t0;
-        // Settle fired deferreds before TransactionGuard flush.
+        // Settle fired deferreds before the TransactionGuard rollback.
         for (int s = 0; s < 4; ++s) sync(Repo::query(makeQuery(1)));
 
         int64_t cascade_ops = ops.load(std::memory_order_relaxed);
         DurationResult result{el, cascade_ops};
         auto base = formatDurationThroughput(
-            "detached cascade throughput (" + std::to_string(CORO)
+            "detached cascade throughput (L1, " + std::to_string(CORO)
                 + " coros, " + std::to_string(N) + " entities/op, single loop)",
             1, result);
         // The op unit is a 32-entity batch; report the per-entity rate too, and
@@ -1973,18 +1888,16 @@ TEST_CASE("Benchmark - detached batch cleanup", "[benchmark][batch-detach]") {
 
 // #############################################################################
 //
-//  15b. Entity writes with cached lists — the L2 list invalidation script
+//  15b. Entity writes with cached lists
 //
-//  Each update moves an article's sort value, so the write runs the list
-//  invalidation script (about 8.4 KB of Lua) against the master hash of the
-//  primed list groups. Redis tier (L2 only) and Both (L1+L2).
+//  Each update moves an article's sort value, so the write invalidates the
+//  primed list groups of the L1 list cache. Latency and throughput (CORO
+//  coroutines on one loop).
 //
 //  Run with:
 //    ./bench_relais_cache "[write-lists]"
 //
 // #############################################################################
-
-using RedisArticleListRepo = Repo<TestArticleEntity, "bench:article:l2", cfg::Redis>;
 
 template<typename R>
 static void benchWriteWithLists(const char* tier, std::vector<BenchResult>& lat,
@@ -1995,7 +1908,7 @@ static void benchWriteWithLists(const char* tier, std::vector<BenchResult>& lat,
     for (int i = 0; i < POOL; ++i)
         ids.push_back(insertTestArticle("tech", author, "WL_" + std::to_string(i), i * 10));
 
-    // Prime a few list groups so the master hash has work for the script.
+    // Prime a few list groups so the update has pages to invalidate.
     auto prime = [&] {
         namespace ld = jcailloux::relais::list::spec;
         using Desc = typename R::ListDescriptorType;
@@ -2055,11 +1968,10 @@ static void benchWriteWithLists(const char* tier, std::vector<BenchResult>& lat,
 
 TEST_CASE("Benchmark - entity writes with cached lists", "[benchmark][write-lists]") {
     TransactionGuard tx;
-    TestInternals::resetListCacheState<FullCacheArticleListRepo>();
+    TestInternals::resetListCacheState<LocalArticleListRepo>();
     std::vector<BenchResult> lat;
     std::vector<std::string> tput;
-    benchWriteWithLists<RedisArticleListRepo>("Redis", lat, tput);
-    benchWriteWithLists<FullCacheArticleListRepo>("Both", lat, tput);
+    benchWriteWithLists<LocalArticleListRepo>("Local", lat, tput);
     WARN(formatTable("Entity writes with cached lists — latency", lat));
     for (const auto& t : tput) WARN(t);
 }
@@ -2136,8 +2048,6 @@ TEST_CASE("Benchmark - erase with lists", "[benchmark][erase-lists]") {
     benchEraseWithLists<UncachedArticleEraseRepo>("Uncached", false, lat);
     benchEraseWithLists<LocalArticleEraseRepo>("Local", false, lat);
     benchEraseWithLists<LocalArticleEraseRepo>("Local", true, lat);
-    benchEraseWithLists<RedisArticleListRepo>("Redis", false, lat);
-    benchEraseWithLists<FullCacheArticleListRepo>("Both", false, lat);
     WARN(formatTable("Erase with lists — latency", lat));
     WARN(benchEraseWithListsThroughput<UncachedArticleEraseRepo>("Uncached"));
     WARN(benchEraseWithListsThroughput<LocalArticleEraseRepo>("Local"));
@@ -2217,8 +2127,6 @@ TEST_CASE("Benchmark - update with lists", "[benchmark][update-lists]") {
     benchUpdateWithLists<UncachedArticleUpdateRepo>("Uncached", false, lat);
     benchUpdateWithLists<LocalArticleUpdateRepo>("Local", false, lat);
     benchUpdateWithLists<LocalArticleUpdateRepo>("Local", true, lat);
-    benchUpdateWithLists<RedisArticleListRepo>("Redis", false, lat);
-    benchUpdateWithLists<FullCacheArticleListRepo>("Both", false, lat);
     WARN(formatTable("Update with lists — latency", lat));
     WARN(benchUpdateWithListsThroughput<UncachedArticleUpdateRepo>("Uncached"));
     WARN(benchUpdateWithListsThroughput<LocalArticleUpdateRepo>("Local"));
@@ -2301,119 +2209,42 @@ TEST_CASE("Benchmark - reads under write load", "[benchmark][write-read-mix]") {
 
 // #############################################################################
 //
-//  15c. List miss with L2 — the read pays the L2 lookup and PostgreSQL; the
-//  store-back into L2 (one script) runs after the read returns.
-//
-//  Redis is flushed before each sample, outside the timed region.
+//  15c. List miss — a cold list query reads PostgreSQL. On the L1 repo the
+//  page is then stored in the list cache (the L1 list cache is cleared before
+//  each sample, outside the timed region); the Uncached repo never caches it.
 //
 //  Run with:
 //    ./bench_relais_cache "[list-miss]"
 //
 // #############################################################################
 
-TEST_CASE("Benchmark - list miss with L2", "[benchmark][list-miss]") {
+TEST_CASE("Benchmark - list miss", "[benchmark][list-miss]") {
     TransactionGuard tx;
+    TestInternals::resetListCacheState<LocalArticleListRepo>();
     auto author = insertTestUser("lm_author", "lm@test.com", 0);
     for (int i = 0; i < 20; ++i)
         insertTestArticle("tech", author, "LM_" + std::to_string(i), i * 10);
 
-    namespace ld = jcailloux::relais::list::spec;
-    using Desc = RedisArticleListRepo::ListDescriptorType;
-    ld::ListQueryParams<Desc> p;
-    p.limit = 20;
-    p.filters.template get<"author_id">() = author;
-    p.filters.template get<"category">() = std::string("tech");
-    const auto query = ld::seal<Desc>(std::move(p));
+    // Each repo's Descriptor is parameterized by its Name: seal per repo.
+    auto makeQuery = [&]<typename R>() {
+        namespace ld = jcailloux::relais::list::spec;
+        using Desc = typename R::ListDescriptorType;
+        ld::ListQueryParams<Desc> p;
+        p.limit = 20;
+        p.filters.template get<"author_id">() = author;
+        p.filters.template get<"category">() = std::string("tech");
+        return ld::seal<Desc>(std::move(p));
+    };
+    const auto local = makeQuery.template operator()<LocalArticleListRepo>();
+    const auto uncached = makeQuery.template operator()<UncachedTestArticleRepo>();
 
     std::vector<BenchResult> lat;
-    lat.push_back(benchWithSetup("list miss, 20 rows (Redis tier)",
-        [] { flushRedis(); },
-        [&] { doNotOptimize(sync(RedisArticleListRepo::query(query))); }));
-    WARN(formatTable("List miss with L2", lat));
-}
-
-
-// #############################################################################
-//
-//  15d. Redis command argv — PgProvider::redis("SET", key, payload) through
-//  the BatchScheduler, by payload size: sequential latency, throughput with
-//  64 coroutines on one loop (pipelined), and heap allocations per command
-//  counted on the loop thread (sequential, so no batch bookkeeping).
-//
-//  Run with:
-//    ./bench_relais_cache "[redis-argv]"
-//
-// #############################################################################
-
-namespace {
-
-io::Task<void> redisSetN(const std::string& key, const std::string& payload, int n) {
-    for (int i = 0; i < n; ++i)
-        co_await jcailloux::relais::PgProvider::redis("SET", key, payload);
-}
-
-io::Task<double> redisSetAllocsPerCommand(const std::string& key,
-                                          const std::string& payload) {
-    constexpr int N = 1000;
-    co_await redisSetN(key, payload, 50);
-    const auto before = threadAllocCount();
-    co_await redisSetN(key, payload, N);
-    co_return static_cast<double>(threadAllocCount() - before) / N;
-}
-
-double redisSetThroughput(const std::string& key, const std::string& payload, int coro) {
-    std::atomic<bool> running{true};
-    std::atomic<int64_t> ops{0};
-    std::latch done{coro};
-    auto t0 = Clock::now();
-    for (int c = 0; c < coro; ++c) {
-        detail::testLoop().dispatch([&key, &payload, &running, &ops, &done]() {
-            [](const std::string& key, const std::string& payload,
-               std::atomic<bool>& running, std::atomic<int64_t>& ops,
-               std::latch& done) -> DetachedHandle {
-                while (running.load(std::memory_order_relaxed)) {
-                    co_await jcailloux::relais::PgProvider::redis("SET", key, payload);
-                    ops.fetch_add(1, std::memory_order_relaxed);
-                }
-                done.count_down();
-            }(key, payload, running, ops, done);
-        });
-    }
-    std::this_thread::sleep_for(std::chrono::seconds(benchDurationSeconds()));
-    running.store(false, std::memory_order_relaxed);
-    done.wait();
-    const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
-        Clock::now() - t0).count();
-    return (us > 0) ? ops.load(std::memory_order_relaxed) * 1'000'000.0 / us : 0.0;
-}
-
-} // anonymous namespace
-
-TEST_CASE("Benchmark - Redis command argv", "[benchmark][redis-argv]") {
-    flushRedis();
-    struct Size { const char* label; std::size_t bytes; };
-    static constexpr Size sizes[] = {
-        {"100 B", 100}, {"1 KiB", 1024}, {"16 KiB", 16 * 1024}, {"64 KiB", 64 * 1024}};
-
-    std::vector<BenchResult> lat;
-    std::ostringstream extra;
-    extra << "\n  allocations per SET (loop thread) / throughput, 64 coros:";
-    for (const auto& s : sizes) {
-        const std::string key = std::string("bench:argv:") + s.label;
-        const std::string payload(s.bytes, 'x');
-        lat.push_back(bench(std::string("SET ") + s.label,
-            [&] { sync(redisSetN(key, payload, 1)); }));
-        const double allocs = sync(redisSetAllocsPerCommand(key, payload));
-        const double tp = redisSetThroughput(key, payload, 64);
-        csv(std::string("SET ") + s.label + " | 64 coros", "ops_s", tp);
-        csv(std::string("SET ") + s.label + " | 64 coros", "allocs_op", allocs);
-        extra << "\n    " << std::left << std::setw(8) << s.label
-              << std::right << std::fixed << std::setprecision(2) << std::setw(6)
-              << allocs << " allocs   " << fmtOps(tp);
-    }
-    flushRedis();
-    WARN(formatTable("Redis SET through PgProvider (sequential latency)", lat));
-    WARN(extra.str());
+    lat.push_back(benchWithSetup("list miss, 20 rows (Local)",
+        [] { TestInternals::resetListCacheState<LocalArticleListRepo>(); },
+        [&] { doNotOptimize(sync(LocalArticleListRepo::query(local))); }));
+    lat.push_back(bench("list miss, 20 rows (Uncached)",
+        [&] { doNotOptimize(sync(UncachedTestArticleRepo::query(uncached))); }));
+    WARN(formatTable("List miss", lat));
 }
 
 
@@ -2422,17 +2253,16 @@ TEST_CASE("Benchmark - Redis command argv", "[benchmark][redis-argv]") {
 //  16. Tier matrix — read latency / throughput per cache tier, isolated
 //
 //  One repo per tier, each measured on its own (no cross-pollution: every Repo
-//  type owns a distinct L1 cache + Redis prefix, so warming one never warms
-//  another). Reads target DISTINCT keys (stride) so L2/DB reads actually pipeline
-//  through the BatchScheduler instead of coalescing onto one key.
+//  type owns a distinct L1 cache, so warming one never warms another). Reads
+//  target DISTINCT keys (stride) so DB reads actually pipeline through the
+//  BatchScheduler instead of coalescing onto one key.
 //
 //    DB only (Uncached) — every find hits PostgreSQL.
-//    L2 only (Redis)    — cfg::Redis has no L1, so every find is an L2 hit.
 //    L1 only (Local)    — warm, every find is a synchronous RAM hit.
 //
 //  Per tier, a concurrency sweep on ONE event loop. The "1 coro" row is the
 //  sequential rate (latency = 1/throughput); higher rows expose the pipelining
-//  win for the I/O tiers. L1 hits resolve synchronously (no suspend), so its
+//  win for the DB tier. L1 hits resolve synchronously (no suspend), so its
 //  curve is flat — concurrency does not apply to a RAM read.
 //
 //  Run with:
@@ -2459,7 +2289,7 @@ struct TierStat {
 };
 
 // Concurrent reads on the shared test loop: `coro` DetachedHandle workers, each
-// reading DISTINCT keys (stride) so the I/O tiers pipeline through the batcher
+// reading DISTINCT keys (stride) so the DB tier pipelines through the batcher
 // instead of coalescing onto one key. Sample=true times every op (negligible
 // Clock overhead vs µs I/O); Sample=false keeps the ns-scale L1 path timer-free
 // so its throughput stays real (two Clock::now() would dwarf a ~30ns RAM hit).
@@ -2600,16 +2430,11 @@ TEST_CASE("Benchmark - tier matrix", "[benchmark][tier-matrix]") {
     for (int i = 0; i < N; ++i)
         ids.push_back(insertTestItem("tier_" + std::to_string(i), i));
 
-    std::vector<TierStat> db, l2, l1;
+    std::vector<TierStat> db, l1;
 
     // DB only — no cache to warm; every find is a PostgreSQL round-trip.
     for (int k : levels) db.push_back(tierReadStat<UncachedTestItemRepo, true>(ids, k));
     WARN(tierSweepTable("DB only (Uncached) — find -> PostgreSQL", N, db));
-
-    // L2 only — cfg::Redis, no L1; warm L2 so every find is a Redis hit.
-    for (auto id : ids) sync(L2TestItemRepo::find(id));
-    for (int k : levels) l2.push_back(tierReadStat<L2TestItemRepo, true>(ids, k));
-    WARN(tierSweepTable("L2 only (Redis hit) — find -> Redis GET", N, l2));
 
     // L1 only — warm RAM; finds resolve synchronously (latency not sampled).
     for (auto id : ids) sync(L1TestItemRepo::find(id));
@@ -2619,7 +2444,6 @@ TEST_CASE("Benchmark - tier matrix", "[benchmark][tier-matrix]") {
     // Side-by-side at the top concurrency level — the easy-compare view.
     WARN(tierCompareTable(N, levels.back(), {
         {"L1 (RAM)",    l1.back()},
-        {"L2 (Redis)",  l2.back()},
         {"DB (Pg)",     db.back()},
     }));
 }

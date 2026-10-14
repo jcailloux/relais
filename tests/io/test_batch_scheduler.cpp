@@ -15,9 +15,7 @@ TEST_CASE("TimingEstimator: bootstrap state", "[io][batch]") {
     TimingEstimator est;
 
     REQUIRE(est.isPgBootstrapping());
-    REQUIRE(est.isRedisBootstrapping());
     REQUIRE(est.isPgStale());
-    REQUIRE(est.isRedisStale());
 }
 
 TEST_CASE("TimingEstimator: PG network time updates", "[io][batch]") {
@@ -34,15 +32,6 @@ TEST_CASE("TimingEstimator: PG network time updates", "[io][batch]") {
     est.updatePgNetworkTime(200'000.0, 0.0);
     REQUIRE(est.pg_network_time_ns > prev);
     REQUIRE(est.pg_bootstrap_count == 2);
-}
-
-TEST_CASE("TimingEstimator: Redis network time updates", "[io][batch]") {
-    TimingEstimator est;
-
-    est.updateRedisNetworkTime(50'000.0);
-    REQUIRE(est.redis_network_time_ns > 0.0);
-    REQUIRE(est.redis_bootstrap_count == 1);
-    REQUIRE_FALSE(est.isRedisStale());
 }
 
 TEST_CASE("TimingEstimator: SQL timing per key", "[io][batch]") {
