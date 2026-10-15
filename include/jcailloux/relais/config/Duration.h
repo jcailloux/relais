@@ -11,7 +11,7 @@ namespace jcailloux::relais::config {
 /// so it cannot appear in a template parameter aggregate.
 ///
 /// Usage:
-///   constexpr CacheConfig cfg{ .l1_ttl = 30min, .l2_ttl = 4h };
+///   constexpr CacheConfig cfg{ .l1_ttl = 30min };
 ///   auto ns = std::chrono::nanoseconds(cfg.l1_ttl);  // explicit conversion
 struct Duration {
     int64_t ns = 0;

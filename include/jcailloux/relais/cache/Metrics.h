@@ -86,22 +86,12 @@ struct L1Counters {
     StripedCounter misses;
 };
 
-/// L2 cache hit/miss counter pair.
-struct L2Counters {
-    StripedCounter hits;
-    StripedCounter misses;
-};
-
 /// Immutable snapshot of all cache metrics for a Repo instantiation.
 struct MetricsSnapshot {
     uint64_t l1_hits = 0;
     uint64_t l1_misses = 0;
-    uint64_t l2_hits = 0;
-    uint64_t l2_misses = 0;
     uint64_t list_l1_hits = 0;
     uint64_t list_l1_misses = 0;
-    uint64_t list_l2_hits = 0;
-    uint64_t list_l2_misses = 0;
     uint64_t sweep_count = 0;
     uint64_t sweep_total_ns = 0;
     uint64_t sweep_last_ns = 0;
@@ -112,19 +102,9 @@ struct MetricsSnapshot {
         return total ? static_cast<double>(l1_hits) / static_cast<double>(total) : 0.0;
     }
 
-    [[nodiscard]] double l2HitRatio() const noexcept {
-        auto total = l2_hits + l2_misses;
-        return total ? static_cast<double>(l2_hits) / static_cast<double>(total) : 0.0;
-    }
-
     [[nodiscard]] double listL1HitRatio() const noexcept {
         auto total = list_l1_hits + list_l1_misses;
         return total ? static_cast<double>(list_l1_hits) / static_cast<double>(total) : 0.0;
-    }
-
-    [[nodiscard]] double listL2HitRatio() const noexcept {
-        auto total = list_l2_hits + list_l2_misses;
-        return total ? static_cast<double>(list_l2_hits) / static_cast<double>(total) : 0.0;
     }
 
     /// Average sweep duration in microseconds (0 if no sweeps).

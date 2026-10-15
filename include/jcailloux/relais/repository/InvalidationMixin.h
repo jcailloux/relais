@@ -3,7 +3,6 @@
 
 #include <span>
 #include "jcailloux/relais/io/Task.h"
-#include "jcailloux/relais/io/WhenAll.h"
 #include "jcailloux/relais/io/pg/PgError.h"
 #include "jcailloux/relais/repository/InvalidateOn.h"
 #include "jcailloux/relais/Log.h"
@@ -25,7 +24,7 @@ concept HasListMixin = requires { typename T::ListDescriptorType; };
  * Sits at the top of the mixin chain and intercepts insert/update/erase
  * to propagate invalidations to dependent caches.
  *
- * Chain: InvalidationMixin -> [ListMixin] -> LocalRepo -> [RedisRepo] -> PgRepo
+ * Chain: InvalidationMixin -> [ListMixin] -> [LocalRepo] -> PgRepo
  *
  * Method hiding: InvalidationMixin::update() hides Base::update().
  * The explicit Base::update() call delegates down the chain correctly.
@@ -277,7 +276,7 @@ public:
         co_return row;
     }
 
-    /// Invalidate all caches (L1 + L2) and propagate cross-invalidation.
+    /// Invalidate the entity cache and propagate cross-invalidation.
     static io::Task<void> invalidate(const Key& id) {
         std::optional<Entity> old = co_await findOldBestEffort(id);
         if (old) {
@@ -340,9 +339,8 @@ protected:
     }
 
     /// Batch invalidation, critical pass — no cross-target here (it is deferred):
-    /// delegate the entity tier + L1 list tracker straight down the chain. Awaited
-    /// by the facade (latency-critical: the entity UNLINK must precede the return,
-    /// see PgRepo for the split rationale).
+    /// delegate the entity tier + L1 list tracker straight down the chain.
+    /// Awaited by the facade (see PgRepo for the split rationale).
     template<bool WithLists = true>
     static io::Task<void> invalidateManyCritical(std::span<const Entity> entities) {
         co_await Base::template invalidateManyCritical<WithLists>(entities);
@@ -351,14 +349,11 @@ protected:
     /// Batch invalidation, deferred pass — deduplicated cross-target invalidation
     /// (union of distinct target keys invalidated once, materialized by value
     /// before any invalidation — the InvalidationData raw pointers never outlive
-    /// this frame) co-pipelined with the own L2 list EVALs (disjoint caches, no
-    /// inter-dependency) so their commands share one flush. Fired fire-and-forget
-    /// by the facade (invalidate-stale tolerated).
-    template<bool WithLists = true>
+    /// this frame). The same for erase and invalidate: the targets depend on the
+    /// row, not on whether it left the table. Fired fire-and-forget by the facade
+    /// (invalidate-stale tolerated).
     static io::Task<void> invalidateManyDeferred(std::span<const Entity> entities) {
-        co_await io::whenAll(
-            propagateDeleteMany<Entity, InvList>(entities),
-            Base::template invalidateManyDeferred<WithLists>(entities));
+        co_await propagateDeleteMany<Entity, InvList>(entities);
     }
 
     /// Rows changed in place: no cross-target in the critical pass, as above.
@@ -367,11 +362,9 @@ protected:
     }
 
     /// Deduplicated cross-target invalidation of every row before and after the
-    /// write, co-pipelined with the own L2 list EVALs.
+    /// write.
     static io::Task<void> invalidateManyUpdatedDeferred(std::span<const Change<Entity>> changes) {
-        co_await io::whenAll(
-            propagateUpdateMany<Entity, InvList>(changes),
-            Base::invalidateManyUpdatedDeferred(changes));
+        co_await propagateUpdateMany<Entity, InvList>(changes);
     }
 
     friend struct ::relais_test::TestInternals;

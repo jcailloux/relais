@@ -27,9 +27,7 @@ namespace jcailloux::relais {
 //
 // Chain (bottom to top):
 //   PgRepo
-//     ↑ (if L2 or L1_L2)
-//   RedisRepo
-//     ↑ (if L1 or L1_L2)
+//     ↑ (if L1)
 //   LocalRepo
 //     ↑ (if E has ListDescriptor)
 //   ListMixin
@@ -45,13 +43,9 @@ namespace detail {
 template<typename E, config::FixedString Name, config::CacheConfig Cfg, typename Key>
 struct CacheLayerSelector {
     using type = std::conditional_t<
-        Cfg.cache_level == config::CacheLevel::L1 || Cfg.cache_level == config::CacheLevel::L1_L2,
+        Cfg.cache_level == config::CacheLevel::L1,
         LocalRepo<E, Name, Cfg, Key>,
-        std::conditional_t<
-            Cfg.cache_level == config::CacheLevel::L2,
-            RedisRepo<E, Name, Cfg, Key>,
-            PgRepo<E, Name, Cfg, Key>
-        >
+        PgRepo<E, Name, Cfg, Key>
     >;
 };
 
@@ -82,7 +76,7 @@ struct MixinStack {
 //
 // Usage:
 //   using MyRepo = Repo<MyEntity, "MyEntity">;                      // L1 (default)
-//   using MyRepo = Repo<MyEntity, "MyEntity", config::Both>;        // L1+L2
+//   using MyRepo = Repo<MyEntity, "MyEntity", config::Uncached>;    // DB only
 //   using MyRepo = Repo<MyEntity, "MyEntity", config::Local,
 //       Invalidate<OtherRepo, &MyStruct::other_id>>;                // with cross-inv
 //
@@ -132,16 +126,9 @@ class Repo
         "Cached entities must satisfy CacheableEntity (provide JSON or binary serialization)");
 
     static_assert(
-        Cfg.cache_level != config::CacheLevel::L1 &&
-        Cfg.cache_level != config::CacheLevel::L1_L2 ||
+        Cfg.cache_level != config::CacheLevel::L1 ||
         (Cfg.l1_chunk_count_log2 >= 1),
         "L1 cache requires l1_chunk_count_log2 >= 1");
-
-    static_assert(
-        Cfg.cache_level != config::CacheLevel::L2 &&
-        Cfg.cache_level != config::CacheLevel::L1_L2 ||
-        Cfg.l2_ttl.ns > 0,
-        "L2 cache requires l2_ttl > 0");
 
 public:
     using typename Base::EntityType;
@@ -163,19 +150,10 @@ public:
         cache::MetricsSnapshot snap{};
 
         // L1 entity counters
-        if constexpr (Cfg.cache_level == config::CacheLevel::L1
-                    || Cfg.cache_level == config::CacheLevel::L1_L2) {
+        if constexpr (Cfg.cache_level == config::CacheLevel::L1) {
             using CachedLayer = LocalRepo<E, Name, Cfg, Key>;
             snap.l1_hits   = CachedLayer::l1_counters_.hits.load();
             snap.l1_misses = CachedLayer::l1_counters_.misses.load();
-        }
-
-        // L2 entity counters
-        if constexpr (Cfg.cache_level == config::CacheLevel::L2
-                    || Cfg.cache_level == config::CacheLevel::L1_L2) {
-            using RedisLayer = RedisRepo<E, Name, Cfg, Key>;
-            snap.l2_hits   = RedisLayer::l2_counters_.hits.load();
-            snap.l2_misses = RedisLayer::l2_counters_.misses.load();
         }
 
         // List counters
@@ -184,8 +162,6 @@ public:
             using ListLayer = ListMixin<CacheLayer>;
             snap.list_l1_hits   = ListLayer::list_l1_counters_.hits.load();
             snap.list_l1_misses = ListLayer::list_l1_counters_.misses.load();
-            snap.list_l2_hits   = ListLayer::list_l2_counters_.hits.load();
-            snap.list_l2_misses = ListLayer::list_l2_counters_.misses.load();
         }
 
         // Sweep counters (global, shared across all repos)
@@ -199,18 +175,10 @@ public:
     }
 
     static void resetMetrics() {
-        if constexpr (Cfg.cache_level == config::CacheLevel::L1
-                    || Cfg.cache_level == config::CacheLevel::L1_L2) {
+        if constexpr (Cfg.cache_level == config::CacheLevel::L1) {
             using CachedLayer = LocalRepo<E, Name, Cfg, Key>;
             CachedLayer::l1_counters_.hits.reset();
             CachedLayer::l1_counters_.misses.reset();
-        }
-
-        if constexpr (Cfg.cache_level == config::CacheLevel::L2
-                    || Cfg.cache_level == config::CacheLevel::L1_L2) {
-            using RedisLayer = RedisRepo<E, Name, Cfg, Key>;
-            RedisLayer::l2_counters_.hits.reset();
-            RedisLayer::l2_counters_.misses.reset();
         }
 
         if constexpr (HasListDescriptor<E>) {
@@ -218,8 +186,6 @@ public:
             using ListLayer = ListMixin<CacheLayer>;
             ListLayer::list_l1_counters_.hits.reset();
             ListLayer::list_l1_counters_.misses.reset();
-            ListLayer::list_l2_counters_.hits.reset();
-            ListLayer::list_l2_counters_.misses.reset();
         }
 
         // Sweep counters (global)
@@ -269,7 +235,7 @@ public:
     // the shared invalidateManyImpl cascade resolved at the top of the chain.
 
     /// Delete the enumerated rows from L3, then evict the deleted set across the
-    /// cache hierarchy (L1 + L2 + own lists + deduplicated cross-inval). Returns
+    /// cache hierarchy (L1 + own lists + deduplicated cross-inval). Returns
     /// the number of rows actually deleted (duplicates and absent ids contribute
     /// nothing) — parité mono erase: nullopt signals a DB error, 0 a non-matching
     /// (but valid) set. eraseManyRaw's RETURNING is the source of the affected
@@ -290,7 +256,7 @@ public:
         }
         if (timeout) {
             // Uncertain: the batch DELETE may have committed (lost ACK). Evict the
-            // known input key set from the entity tier (L1+L2) by precaution — a
+            // known input key set from the entity tier (L1) by precaution — a
             // possibly-deleted row must not stay cached. Per-key invalidate also
             // runs cross-invalidation when the entity is still cached (the common
             // case right after an erase). Fanned out with whenAll so the worst
@@ -298,7 +264,7 @@ public:
             // through to a bounded L3 find — costs ONE query_timeout in parallel,
             // not N sequentially (`keys` outlives the gather). Lists are NOT
             // recoverable here: without the row bodies (no RETURNING) their
-            // filter/sort values are unknown, so that tier stays bounded by l*_ttl.
+            // filter/sort values are unknown, so that tier stays bounded by l1_ttl.
             std::vector<io::Task<void>> evictions;
             evictions.reserve(keys.size());
             for (const auto& k : keys) evictions.push_back(Base::invalidate(k));
@@ -306,14 +272,13 @@ public:
             std::rethrow_exception(timeout);
         }
         if (!deleted) co_return std::nullopt;  // DB error
-        // Await the latency-critical cleanup (L1 evict + L2 entity UNLINK + gen
-        // bump + L1 list bump), then fire the order-free remainder (cross-target
-        // + L2 list EVALs) detached — the caller returns after DELETE + 1 entity
-        // RTT, not after the full cascade.
+        // Await the local cleanup (L1 evict + gen bump + L1 list bump), then
+        // fire the cross-target invalidation detached — the caller returns after
+        // the DELETE, not after the resolvers of the cascade.
         co_await Base::template invalidateManyCritical<true>(
             std::span<const E>(*deleted));
         auto n = deleted->size();
-        fireInvalidateManyDeferred<true>(std::move(*deleted));
+        if constexpr (kHasDeferred) fireInvalidateManyDeferred(std::move(*deleted));
         co_return n;
     }
 
@@ -334,7 +299,7 @@ public:
         }
         co_await Base::template invalidateManyCritical<false>(
             std::span<const E>(entities));
-        fireInvalidateManyDeferred<false>(std::move(entities));
+        if constexpr (kHasDeferred) fireInvalidateManyDeferred(std::move(entities));
     }
 
     // =======================================================================
@@ -373,10 +338,10 @@ public:
             // Uncertain: a chunk DELETE may have committed. The matched primary
             // keys are unknowable after a lost ACK (a post-hoc SELECT no longer
             // finds a committed delete), so the entity tier is left bounded by
-            // l1/l2_ttl (logged). The LIST tier is still recoverable — the
+            // l1_ttl (logged). The LIST tier is still recoverable — the
             // predicate drives it directly, no resolved id set needed.
             RELAIS_LOG_ERROR << name()
-                << ": eraseWhere timeout — entity tier left to l*_ttl "
+                << ": eraseWhere timeout — entity tier left to l1_ttl "
                    "(matched keys unknowable), invalidating lists by predicate";
             try {
                 co_await Base::template invalidateWhereListsCritical<FD>(filters);
@@ -388,22 +353,18 @@ public:
             std::rethrow_exception(timeout);
         }
         if (!deleted) co_return std::nullopt;  // DB error
-        // Two disjoint tiers, gathered so their L2 commands share one flush:
-        //  - entity tier (L1 evict + L2 UNLINK + cross-inval) per deleted row,
-        //    WithLists=false so the OWN-list tier is left to the predicate path;
-        //  - own-list tier: ONE RangeModification (L1) + ONE predicate EVAL (L2)
-        //    for the whole deleted set — O(1)/O(groups), filter-aware, never-miss.
+        // Two disjoint tiers:
+        //  - entity tier (L1 evict) per deleted row, WithLists=false so the
+        //    OWN-list tier is left to the predicate path;
+        //  - own-list tier: ONE RangeModification (L1) for the whole deleted
+        //    set — O(1), filter-aware, never-miss.
         // The rows left the table, so their lists change (eraseMany analogue), but
-        // the predicate drives that, not the resolved id set. Await the critical
-        // tiers (entity L1/L2 evict + ONE L1 RangeModification), then fire the
-        // deferred remainder (cross-target + the single predicate L2 list EVAL)
-        // detached. `*deleted`/`filters` outlive the await; each critical child
-        // evicts L1 before any submit (anti-stale).
-        co_await io::whenAll(
-            Base::template invalidateManyCritical<false>(std::span<const E>(*deleted)),
-            Base::template invalidateWhereListsCritical<FD>(filters));
+        // the predicate drives that, not the resolved id set. Both are awaited,
+        // then the cross-target invalidation is fired detached.
+        co_await Base::template invalidateManyCritical<false>(std::span<const E>(*deleted));
+        co_await Base::template invalidateWhereListsCritical<FD>(filters);
         auto n = deleted->size();
-        fireEraseWhereDeferred<FD>(std::move(*deleted), filters);
+        if constexpr (kHasDeferred) fireInvalidateManyDeferred(std::move(*deleted));
         co_return n;
     }
 
@@ -424,7 +385,7 @@ public:
         if (!entities) co_return;  // DB error → nothing evicted
         co_await Base::template invalidateManyCritical<false>(
             std::span<const E>(*entities));
-        fireInvalidateManyDeferred<false>(std::move(*entities));
+        if constexpr (kHasDeferred) fireInvalidateManyDeferred(std::move(*entities));
     }
 
     /// Number of rows matching the predicate; an empty predicate counts the
@@ -483,8 +444,8 @@ public:
     /// waited on, then re-checked). Returns, per `O.returns`, the number of rows
     /// changed, each committed row, or each row before and after the write;
     /// nullopt on a DB error. The changed rows are known only after the write:
-    /// the entity tier and the L1 list pages are evicted before returning, the
-    /// L2 list pages and cross-targets right after, detached.
+    /// the entity tier and the list pages are evicted before returning, the
+    /// cross-targets right after, detached.
     template<WhereOptions O = {}, typename... Gs, typename... Updates>
     static io::Task<ResultFor<E, O.returns>> patchWhere(
         const entity::Guards<Gs...>& pred, Updates&&... updates)
@@ -500,7 +461,7 @@ public:
             // predicate may still match them: nothing to invalidate by.
             RELAIS_LOG_ERROR << name()
                 << ": patchWhere timeout — changed rows unknowable, entity and "
-                   "list tiers left to l*_ttl";
+                   "list tiers left to l1_ttl";
             throw;
         }
         if (!rows) co_return std::nullopt;  // DB error
@@ -548,6 +509,11 @@ private:
     static constexpr bool kTailReadsBefore =
         HasListDescriptor<E> || (sizeof...(Invalidations) > 0);
 
+    /// Whether a batch write has a detached tail: the cross-target
+    /// invalidation, whose resolvers may query the database. Every own tier
+    /// is evicted before the write returns.
+    static constexpr bool kHasDeferred = sizeof...(Invalidations) > 0;
+
     /// Rows a predicate write returns for a caller asking `r`: at least what
     /// its cache tail reads (each version for the cascades above, the
     /// committed rows' keys for the entity tiers, nothing without a cache).
@@ -571,7 +537,7 @@ private:
         } catch (const io::PgUncertainError&) {
             RELAIS_LOG_ERROR << name()
                 << ": claim timeout — rows taken unknowable, entity and "
-                   "list tiers left to l*_ttl";
+                   "list tiers left to l1_ttl";
             throw;
         }
         if (!rows) co_return std::nullopt;  // DB error
@@ -580,9 +546,9 @@ private:
 
     /// Cache tail of a predicate write, from the rows it returned (`Rows`,
     /// see tailRows), then the caller's `R` out of them: the entity tier and
-    /// the L1 list pages are evicted before returning, the L2 list pages and
-    /// cross-targets right after, detached. The rows are copied for the
-    /// detached tail only when it reads them and the caller keeps them too.
+    /// the list pages are evicted before returning, the cross-targets right
+    /// after, detached. The rows are copied for the detached tail only when
+    /// there is one and the caller keeps them too.
     template<Returns R, Returns Rows>
     static io::Task<ResultFor<E, R>> settleRows(RowsFor<E, Rows> rows) {
         if constexpr (Rows == Returns::Count) {
@@ -600,7 +566,7 @@ private:
             if constexpr (R == Returns::Count) {
                 result = rows.size();
             } else if constexpr (R == Rows) {
-                if constexpr (kTailReadsBefore) result = rows;
+                if constexpr (kHasDeferred) result = rows;
                 else result = std::move(rows);
             } else {  // After out of Changes: the tail reads both versions
                 std::vector<E> after;
@@ -608,25 +574,22 @@ private:
                 for (const auto& c : rows) after.push_back(c.after);
                 result = std::move(after);
             }
-            if constexpr (kTailReadsBefore) fireInvalidateManyUpdatedDeferred(std::move(rows));
+            if constexpr (kHasDeferred) fireInvalidateManyUpdatedDeferred(std::move(rows));
             co_return result;
         }
     }
 
     // ----------------------------------------------------------------------
-    // Fire-and-forget deferred cleanup. The detached coroutine owns
-    // the affected set / predicate by value, so the lazy deferred tasks'
-    // references stay live for the whole detached lifetime. Exceptions are
-    // swallowed (best-effort; staleness is l2_ttl-bounded). Defined here (the
-    // most-derived class) so `Base::invalidateManyDeferred` resolves to the chain
-    // top — InvalidationMixin (cross-target) when present, else the own tiers.
+    // Fire-and-forget cross-target invalidation (InvalidationMixin, present
+    // only with kHasDeferred). The detached coroutine owns the affected set by
+    // value, so the lazy deferred tasks' references stay live for the whole
+    // detached lifetime. Exceptions are swallowed (best-effort; staleness is
+    // bounded by the targets' l1_ttl).
     // ----------------------------------------------------------------------
 
-    template<bool WithLists>
     static io::DetachedTask fireInvalidateManyDeferred(std::vector<E> entities) {
         try {
-            co_await Base::template invalidateManyDeferred<WithLists>(
-                std::span<const E>(entities));
+            co_await Base::invalidateManyDeferred(std::span<const E>(entities));
         } catch (...) {}
     }
 
@@ -634,17 +597,6 @@ private:
         try {
             co_await Base::invalidateManyUpdatedDeferred(
                 std::span<const Change<E>>(changes));
-        } catch (...) {}
-    }
-
-    template<typename Desc>
-    static io::DetachedTask fireEraseWhereDeferred(
-        std::vector<E> deleted, list::spec::Filters<Desc> predicate) {
-        try {
-            co_await io::whenAll(
-                Base::template invalidateManyDeferred<false>(
-                    std::span<const E>(deleted)),
-                Base::template invalidateWhereListsDeferred<Desc>(predicate));
         } catch (...) {}
     }
 };

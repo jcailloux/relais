@@ -5,14 +5,12 @@
 #include <utility>
 
 #include "jcailloux/relais/io/Task.h"
-#include "jcailloux/relais/io/WhenAll.h"
 #include "jcailloux/relais/io/pg/PgError.h"
 #include "jcailloux/relais/io/pg/PgParams.h"
 
 #include "jcailloux/relais/PgProvider.h"
 #include "jcailloux/relais/repository/PgRepo.h"
 #include "jcailloux/relais/Log.h"
-#include "jcailloux/relais/cache/RedisCache.h"
 #include "jcailloux/relais/list/ListCache.h"
 #include "jcailloux/relais/list/ListQuery.h"
 #include "jcailloux/relais/list/spec/ListDescriptor.h"
@@ -37,7 +35,7 @@ namespace detail {
 /// Per-thread buffer the L1 lookup of a list query encodes its page key into,
 /// shared by every repository. It is valid only from the encoding to the
 /// lookup, with no suspension in between: a key that must outlive the lookup
-/// (L2 access, store) is encoded into its own string.
+/// (the store after a miss) is encoded into its own string.
 inline std::string& listKeyScratch() noexcept {
     thread_local std::string key;
     key.clear();
@@ -59,15 +57,14 @@ inline void trimListKeyScratch(std::string& key) noexcept {
  * Activated when Entity has a ListDescriptor (detected via HasListDescriptor concept).
  * Sits in the mixin chain between the cache layer and InvalidationMixin.
  *
- * Chain: [InvalidationMixin] -> ListMixin -> LocalRepo -> [RedisRepo] -> PgRepo
+ * Chain: [InvalidationMixin] -> ListMixin -> [LocalRepo] -> PgRepo
  *
  * Provides:
- * - query()           : paginated list queries with L1/L2 caching
+ * - query()           : paginated list queries with L1 caching
  * - CRUD interception : automatically invalidates list caches on insert/update/erase
  * - warmup()          : primes both entity and list L1 caches
  *
  * L1 uses ListCache (ChunkMap-based) with ModificationTracker for lazy invalidation.
- * L2 uses Redis with binary (BEVE) storage and active invalidation via Lua scripts.
  */
 template<typename Base>
 class ListMixin : public Base {
@@ -88,12 +85,7 @@ class ListMixin : public Base {
     // =========================================================================
 
     static constexpr bool kHasL1 =
-        Base::config.cache_level == config::CacheLevel::L1
-     || Base::config.cache_level == config::CacheLevel::L1_L2;
-
-    static constexpr bool kHasL2 =
-        Base::config.cache_level == config::CacheLevel::L2
-     || Base::config.cache_level == config::CacheLevel::L1_L2;
+        Base::config.cache_level == config::CacheLevel::L1;
 
     // =========================================================================
     // Type aliases from list infrastructure
@@ -224,9 +216,6 @@ class ListMixin : public Base {
         return instance;
     }
 
-    // L2 TTL helper
-    static constexpr auto l2Ttl() { return std::chrono::nanoseconds(Base::config.l2_ttl); }
-
     // Epoch pool for list wrappers (non-L1 paths only)
     static epoch::memory_pool<ListWrapperType>& listPool() {
         // Force epoch_s + ThreadIdPool construction before the pool, so they
@@ -242,26 +231,6 @@ class ListMixin : public Base {
         auto* ptr = listPool().New(std::move(w));
         listPool().Retire(ptr);
         return cache::CacheView<ListWrapperType>(ptr, std::move(guard));
-    }
-
-    // Redis key helpers for declarative list caching: the canonical key is
-    // encoded straight behind its prefix.
-    static std::string redisPageKey(const list::spec::ListQuery<Descriptor>& q) {
-        std::string key(Base::name());
-        key += ":dlist:p:";
-        list::spec::appendPageKey<Descriptor>(key, q);
-        return key;
-    }
-
-    static std::string redisGroupKey(const list::spec::ListQuery<Descriptor>& q) {
-        std::string key(Base::name());
-        key += ":dlist:g:";
-        list::spec::appendGroupKey<Descriptor>(key, q);
-        return key;
-    }
-
-    static std::string redisMasterSetKey() {
-        return std::string(Base::name()) + ":dlist_groups";
     }
 
     // =========================================================================
@@ -304,7 +273,6 @@ class ListMixin : public Base {
 public:
 #if RELAIS_ENABLE_METRICS
     static inline cache::L1Counters list_l1_counters_{};
-    static inline cache::L2Counters list_l2_counters_{};
 #endif
 
     using typename Base::EntityType;
@@ -350,7 +318,7 @@ public:
     // Query interface
     // =========================================================================
 
-    /// Execute a paginated list query with L1/L2 caching.
+    /// Execute a paginated list query with L1 caching.
     /// L1 hit: zero overhead (Immediate holds ListResult directly, no Task).
     static io::Immediate<ListResult> query(const ListQuery& q) {
         if constexpr (kHasL1) {
@@ -365,8 +333,7 @@ public:
 
     /// Execute a paginated list query and return raw JSON string.
     /// L1 hit: serialize on demand from cached entities (Immediate, no Task).
-    /// L2 hit (BEVE): transcodes via glz::beve_to_json (skips ListBoundsHeader).
-    /// L2/DB miss: delegates to entity path (cachedListQuery).
+    /// Miss: delegates to the entity path (cachedListQuery).
     static io::Immediate<std::string> queryJson(const ListQuery& q) {
         // L1 check: serialize from cached entities
         if constexpr (kHasL1) {
@@ -381,8 +348,7 @@ public:
 
     /// Execute a paginated list query and return raw binary (BEVE).
     /// L1 hit: serialize on demand from cached entities (Immediate, no Task).
-    /// L2 hit: returns raw binary (skips ListBoundsHeader).
-    /// L2/DB miss: delegates to entity path (cachedListQuery).
+    /// Miss: delegates to the entity path (cachedListQuery).
     static io::Immediate<std::vector<uint8_t>> queryBinary(const ListQuery& q)
         requires HasBinarySerialization<Entity>
     {
@@ -419,26 +385,15 @@ public:
         try {
             auto result = co_await Base::insert(entity);
             if (result) {
-                // L2 EVAL is best-effort (RedisCache swallows its own I/O errors).
                 if constexpr (kHasL1) { listCache().onEntityCreated(*result); }
-                if constexpr (kHasL2) { co_await invalidateL2Created(*result); }
             }
             co_return result;
         } catch (const io::PgUncertainError&) {
-            timeout = std::current_exception();  // co_await is illegal in a catch
+            timeout = std::current_exception();
         }
-        // Uncertain: invalidate the own-list tier from the input entity (L1 bump
-        // cannot fail, L2 EVAL best-effort), then rethrow.
+        // Uncertain: invalidate the own-list tier from the input entity (the L1
+        // bump cannot fail), then rethrow.
         if constexpr (kHasL1) { listCache().onEntityCreated(entity); }
-        if constexpr (kHasL2) {
-            try {
-                co_await invalidateL2Created(entity);
-            } catch (const std::exception& e) {
-                RELAIS_LOG_ERROR << name()
-                    << ": L2 list precautionary invalidate failed (insert timeout) - "
-                    << e.what();
-            }
-        }
         std::rethrow_exception(timeout);
     }
 
@@ -478,7 +433,7 @@ public:
     /// the new version is unknown; the old position is invalidated from the
     /// copy a cache tier kept before its precautionary evict
     /// (`uncertain_before`, shared with a stacked InvalidationMixin), the new
-    /// one is left to l*_ttl (logged).
+    /// one is left to l1_ttl (logged).
     template<bool WithBefore, typename... Updates>
     static io::Task<typename Base::PatchedRow> patchRow(
         const Key& id, std::optional<Entity>* uncertain_before, Updates&&... updates)
@@ -573,36 +528,29 @@ public:
         co_await Base::invalidate(id);
     }
 
-    /// Invalidate all L2 declarative list cache groups for this repository.
+    /// Full-pattern target of InvalidateListVia (the resolver returned
+    /// nullopt). No tier holds list groups to drop: returns 0.
     static io::Task<size_t> invalidateAllListGroups() {
-        if constexpr (kHasL2) {
-            co_return co_await invalidateRedisListGroups();
-        } else {
-            co_return 0;
-        }
+        co_return 0;
     }
 
     // =========================================================================
     // Cross-invalidation entry points
     // =========================================================================
     //
-    // Synchronous API: L1 invalidation inline + L2 fire-and-forget (DetachedTask).
-    // Called by InvalidateList<> cross-invalidation and external sync callers.
-    // CRUD methods use co_await for L2 instead (no fire-and-forget).
+    // Synchronous API: L1 invalidation inline. Called by InvalidateList<>
+    // cross-invalidation and external sync callers.
 
     static void notifyCreated(const Entity& entity) {
         if constexpr (kHasL1) { listCache().onEntityCreated(entity); }
-        if constexpr (kHasL2) { fireL2Created(Entity(entity)); }
     }
 
     static void notifyUpdated(const Entity& old_entity, const Entity& new_entity) {
         if constexpr (kHasL1) { listCache().onEntityUpdated(old_entity, new_entity); }
-        if constexpr (kHasL2) { fireL2Updated(Entity(old_entity), Entity(new_entity)); }
     }
 
     static void notifyDeleted(const Entity& entity) {
         if constexpr (kHasL1) { listCache().onEntityDeleted(entity); }
-        if constexpr (kHasL2) { fireL2Deleted(Entity(entity)); }
     }
 
 #ifdef RELAIS_BUILDING_TESTS
@@ -615,47 +563,23 @@ protected:
     // =========================================================================
 
     /// Batch invalidation common path — list tier. When WithLists (eraseMany),
-    /// invalidates the list pages touched by every affected entity (L1 tracker +
-    /// L2 blob-array selective) — the entity left the table, like mono erase.
-    /// When !WithLists (invalidateMany), the entity still exists so its lists are
-    /// left intact, matching mono invalidate (ListMixin::invalidate is a no-op on
-    /// lists). Per-entity loop for correctness; the single-bump L1 + single-EVAL
-    /// L2 collapse is a downstream optimization.
+    /// invalidates the list pages touched by every affected entity (L1 tracker)
+    /// — the entity left the table, like mono erase. When !WithLists
+    /// (invalidateMany), the entity still exists so its lists are left intact,
+    /// matching mono invalidate (ListMixin::invalidate is a no-op on lists).
     template<bool WithLists = true>
     static io::Task<void> invalidateManyCritical(std::span<const Entity> entities) {
-        // L1 list tracker is RAM-only (generation bump) and latency-critical: the
-        // synchronous bump is what guards a concurrent L1 list read-fill against
-        // re-caching a page the deleted rows belonged to (the tracker is consulted
-        // on every list GET). Keep it awaited; the L2 list EVALs are deferred.
+        // The synchronous tracker bump is what guards a concurrent L1 list
+        // read-fill against re-caching a page the deleted rows belonged to (the
+        // tracker is consulted on every list GET).
         if constexpr (WithLists && kHasL1) {
             for (const auto& e : entities) listCache().onEntityDeleted(e);
         }
         co_await Base::template invalidateManyCritical<WithLists>(entities);
     }
 
-    template<bool WithLists = true>
-    static io::Task<void> invalidateManyDeferred(std::span<const Entity> entities) {
-        // L2 selective EVALs are independent per entity — gather them so the
-        // N commands co-pipeline in one flush instead of N sequential RTTs.
-        // Each task reads its entity synchronously before its first suspend
-        // (invalidateL2Created extracts blob/sortVals up front); `entities`
-        // outlives the whenAll await, so the lazy tasks' references stay live.
-        // Detachable: the synchronous L1 tracker bump (critical pass) already
-        // guards L1 list reads; L2 list pages carry no read-fill recheck guard,
-        // so a straddling L2 list read-fill is l2_ttl-bounded either way.
-        if constexpr (WithLists && kHasL2) {
-            std::vector<io::Task<size_t>> tasks;
-            tasks.reserve(entities.size());
-            for (const auto& e : entities) tasks.push_back(invalidateL2Deleted(e));
-            co_await io::whenAll(std::move(tasks));
-        }
-        co_await Base::template invalidateManyDeferred<WithLists>(entities);
-    }
-
     /// Rows changed in place (patchWhere): each row leaves the pages of its
-    /// version before the write and joins those of the committed one. The L1
-    /// tracker bump is awaited (it guards L1 list read-fills), the L2 EVALs are
-    /// deferred, as for the deletion cascade.
+    /// version before the write and joins those of the committed one.
     static io::Task<void> invalidateManyUpdatedCritical(std::span<const Change<Entity>> changes) {
         if constexpr (kHasL1) {
             for (const auto& c : changes) listCache().onEntityUpdated(c.before, c.after);
@@ -663,21 +587,10 @@ protected:
         co_await Base::invalidateManyUpdatedCritical(changes);
     }
 
-    static io::Task<void> invalidateManyUpdatedDeferred(std::span<const Change<Entity>> changes) {
-        if constexpr (kHasL2) {
-            std::vector<io::Task<size_t>> tasks;
-            tasks.reserve(changes.size());
-            for (const auto& c : changes) tasks.push_back(invalidateL2Updated(c.before, c.after));
-            co_await io::whenAll(std::move(tasks));
-        }
-        co_await Base::invalidateManyUpdatedDeferred(changes);
-    }
-
     /// Predicate list invalidation (eraseWhere fast-path). Replaces the per-entity
-    /// blob-array list work with ONE RangeModification (L1) + ONE predicate EVAL
-    /// (L2) for the whole deleted set — O(1)/O(groups) instead of O(N). The caller
-    /// (Repo::eraseWhere) runs the entity tier separately via invalidateManyImpl
-    /// with WithLists=false. The predicate arrives as Filters<Desc> where Desc is
+    /// list work with ONE RangeModification (L1) for the whole deleted set — O(1)
+    /// instead of O(N). The caller (Repo::eraseWhere) runs the entity tier
+    /// separately with WithLists=false. The predicate arrives as Filters<Desc> where Desc is
     /// the entity's standalone FilterSet; its value tuple is identical to this
     /// repo's ListDescriptor filter tuple (both inherit the same FilterSet), so it
     /// copies straight across.
@@ -685,26 +598,13 @@ protected:
     static io::Task<void> invalidateWhereListsCritical(
         const list::spec::Filters<Desc>& predicate) {
         // ONE RangeModification on the L1 tracker (RAM, synchronous) — the
-        // latency-critical guard for L1 list reads, like the per-entity bump.
+        // guard for L1 list reads, like the per-entity bump.
         if constexpr (kHasL1) {
             DescriptorFilters local;
             local.values = predicate.values;
             listCache().onEntityRangeDeleted(local);
         }
         co_await Base::template invalidateWhereListsCritical<Desc>(predicate);
-    }
-
-    template<typename Desc>
-    static io::Task<void> invalidateWhereListsDeferred(
-        const list::spec::Filters<Desc>& predicate) {
-        // The single predicate EVAL (L2) — detachable like the per-entity list
-        // EVALs; the L1 range bump (critical pass) already guards L1 list reads.
-        if constexpr (kHasL2) {
-            DescriptorFilters local;
-            local.values = predicate.values;
-            co_await invalidateWhereListsL2(std::move(local));
-        }
-        co_await Base::template invalidateWhereListsDeferred<Desc>(predicate);
     }
 
     /// Best-effort pre-read of the current entity, used by the top mixin to feed
@@ -729,7 +629,7 @@ protected:
     /// copy a cache tier kept before its precautionary evict
     /// (`uncertain_before`, shared with a stacked InvalidationMixin), the new
     /// one on the input entity. Without a copy (row not in L1), the old
-    /// position is left to l*_ttl.
+    /// position is left to l1_ttl.
     template<bool WithBefore>
     static io::Task<typename Base::UpdateOutcome> updateOutcome(
         const Key& id, const Entity& entity,
@@ -750,20 +650,11 @@ protected:
             timeout = std::current_exception();
         }
         if (timeout) {
-            // L1 tracker bump cannot fail; the L2 selective EVAL is best-effort.
+            // The L1 tracker bump cannot fail.
             const auto& before = *uncertain_before;
             if constexpr (kHasL1) {
                 if (before) listCache().onEntityUpdated(*before, entity);
                 else listCache().onEntityCreated(entity);
-            }
-            if constexpr (kHasL2) {
-                try {
-                    co_await invalidateL2Updated(before ? *before : entity, entity);
-                } catch (const std::exception& e) {
-                    RELAIS_LOG_ERROR << name()
-                        << ": L2 list precautionary invalidate failed (update timeout) - "
-                        << e.what();
-                }
             }
             std::rethrow_exception(timeout);
         }
@@ -777,12 +668,6 @@ protected:
                 if (outcome.before) listCache().onEntityUpdated(*outcome.before, after);
                 else listCache().onEntityCreated(after);
             }
-            // The L1 tracker bump is RAM-only; the L2 selective EVAL is best-effort
-            // by construction (RedisCache swallows its own I/O failure → no-op), so
-            // a Redis outage here cannot throw past this success path. No try needed.
-            if constexpr (kHasL2) {
-                co_await invalidateL2Updated(outcome.before ? *outcome.before : after, after);
-            }
         }
         co_return outcome;
     }
@@ -791,7 +676,7 @@ protected:
     /// in). Uncertain: the DELETE returned nothing, so the pages are keyed on
     /// the copy a cache tier kept before its precautionary evict
     /// (`uncertain_before`, shared with a stacked InvalidationMixin). Without
-    /// one (row not in L1), the pages are left to l*_ttl.
+    /// one (row not in L1), the pages are left to l1_ttl.
     template<bool WithBefore>
     static io::Task<typename Base::EraseOutcome> eraseOutcome(
         const Key& id, const Entity* hint = nullptr,
@@ -812,21 +697,11 @@ protected:
         if (timeout) {
             if (const auto& before = *uncertain_before) {
                 if constexpr (kHasL1) { listCache().onEntityDeleted(*before); }
-                if constexpr (kHasL2) {
-                    try {
-                        co_await invalidateL2Deleted(*before);
-                    } catch (const std::exception& e) {
-                        RELAIS_LOG_ERROR << name()
-                            << ": L2 list precautionary invalidate failed (erase timeout) - "
-                            << e.what();
-                    }
-                }
             }
             std::rethrow_exception(timeout);
         }
         if (outcome.before) {
             if constexpr (kHasL1) { listCache().onEntityDeleted(*outcome.before); }
-            if constexpr (kHasL2) { co_await invalidateL2Deleted(*outcome.before); }
         }
         co_return outcome;
     }
@@ -836,28 +711,19 @@ protected:
         if (!row.after) co_return;
         const Entity& after = *row.after;
         if constexpr (kHasL1) { listCache().onEntityUpdated(*row.before, after); }
-        if constexpr (kHasL2) { co_await invalidateL2Updated(*row.before, after); }
+        co_return;
     }
 
     /// List invalidation of an uncertain patch: the row may have left the
     /// pages of `before` (a cache tier's copy, if it had one) for a position
     /// that cannot be known. Those pages are invalidated as for a deletion;
-    /// the new position is left to l*_ttl (logged). Best-effort.
+    /// the new position is left to l1_ttl (logged).
     static io::Task<void> invalidateListsUncertainPatch(
         const std::optional<Entity>& before, const char* op) {
         RELAIS_LOG_ERROR << name() << ": " << op
-            << " timeout — new row version unknowable, its list pages left to l*_ttl";
+            << " timeout — new row version unknowable, its list pages left to l1_ttl";
         if (!before) co_return;
         if constexpr (kHasL1) { listCache().onEntityDeleted(*before); }
-        if constexpr (kHasL2) {
-            try {
-                co_await invalidateL2Deleted(*before);
-            } catch (const std::exception& e) {
-                RELAIS_LOG_ERROR << name()
-                    << ": L2 list precautionary invalidate failed (" << op
-                    << " timeout) - " << e.what();
-            }
-        }
     }
 
     static io::Task<cache::CacheView<Entity>> upsertWithContext(
@@ -877,22 +743,12 @@ protected:
             // Uncertain: the ON CONFLICT statement may have committed as either
             // branch. Keyed on the pre-image — a known old migrates to the input
             // entity (its fields fully known), an unknown old appends. The L1
-            // tracker bump cannot fail; the L2 selective EVAL is best-effort. An
-            // update from an unknown old leaves that old position bounded by l*_ttl
-            // — the same residual update already tolerates.
+            // tracker bump cannot fail. An update from an unknown old leaves that
+            // old position bounded by l1_ttl — the same residual update already
+            // tolerates.
             if constexpr (kHasL1) {
                 if (old_entity) listCache().onEntityUpdated(*old_entity, entity);
                 else listCache().onEntityCreated(entity);
-            }
-            if constexpr (kHasL2) {
-                try {
-                    co_await invalidateL2Updated(
-                        old_entity ? *old_entity : entity, entity);
-                } catch (const std::exception& e) {
-                    RELAIS_LOG_ERROR << name()
-                        << ": L2 list precautionary invalidate failed (upsert timeout) - "
-                        << e.what();
-                }
             }
             std::rethrow_exception(timeout);
         }
@@ -904,203 +760,26 @@ protected:
                 if (old_entity) listCache().onEntityUpdated(*old_entity, *result);
                 else listCache().onEntityCreated(*result);
             }
-            // L1 bump is RAM-only; the L2 selective EVAL is best-effort by
-            // construction (RedisCache swallows its own I/O failure → no-op), so a
-            // Redis outage here cannot throw past this success path. No try needed.
-            if constexpr (kHasL2) {
-                if (old_entity) co_await invalidateL2Updated(*old_entity, *result);
-                else co_await invalidateL2Created(*result);
-            }
         }
         co_return result;
     }
 
     // =========================================================================
-    // Redis L2 selective invalidation (all-in-one Lua, 1 RTT)
+    // Slow paths for queryJson / queryBinary (L1 miss → DB)
     // =========================================================================
 
-    /// Build comma-separated sort values for all sort fields.
-    static std::string buildSortValues(const Entity& entity) {
-        std::string result;
-        [&]<size_t... Is>(std::index_sequence<Is...>) {
-            size_t count = 0;
-            ((result += (count++ > 0 ? "," : ""),
-              result += std::to_string(Traits::extractSortValue(entity, Is))), ...);
-        }(std::make_index_sequence<list::spec::sort_count<Descriptor>>{});
-        return result;
-    }
-
-    /// Build the per-sort-dimension predicate value ranges as two parallel CSVs
-    /// (lo, hi), indexed by sort field — the Lua picks lo_vals[si]/hi_vals[si] for
-    /// each group's sort dimension. Unconstrained dimensions get the full int64
-    /// domain (every page in range).
-    static std::pair<std::string, std::string> buildPredicateRangeCsv(
-        const DescriptorFilters& predicate) {
-        std::string lo, hi;
-        [&]<size_t... Is>(std::index_sequence<Is...>) {
-            size_t count = 0;
-            (([&] {
-                auto r = list::spec::predicateSortRange<Descriptor>(predicate, Is);
-                if (count++ > 0) { lo += ","; hi += ","; }
-                lo += std::to_string(r.lo);
-                hi += std::to_string(r.hi);
-            }()), ...);
-        }(std::make_index_sequence<list::spec::sort_count<Descriptor>>{});
-        return {std::move(lo), std::move(hi)};
-    }
-
-    /// Predicate-driven L2 list invalidation (single EVAL, O(groups)).
-    static io::Task<size_t> invalidateWhereListsL2(DescriptorFilters predicate) {
-        auto masterKey = redisMasterSetKey();
-        auto prefixLen = std::string(Base::name()).size() + 9;  // ":dlist:g:"
-        auto schema = list::spec::filterSchema<Descriptor>();
-        auto [loCsv, hiCsv] = buildPredicateRangeCsv(predicate);
-        auto pblob = list::spec::encodeFilterSet<Descriptor>(std::move(predicate));
-
-        co_return co_await cache::RedisCache::invalidateListGroupsByPredicate(
-            masterKey, prefixLen, schema, pblob, loCsv, hiCsv);
-    }
-
-    /// Selective L2 invalidation for entity creation (or deletion).
-    static io::Task<size_t> invalidateL2Created(const Entity& entity) {
-        auto masterKey = redisMasterSetKey();
-        auto prefixLen = std::string(Base::name()).size() + 9; // ":dlist:g:"
-        auto schema = list::spec::filterSchema<Descriptor>();
-        auto blob = list::spec::encodeEntityFilterBlob<Descriptor>(entity);
-        auto sortVals = buildSortValues(entity);
-
-        co_return co_await cache::RedisCache::invalidateListGroupsSelective(
-            masterKey, prefixLen, schema, blob, sortVals);
-    }
-
-    /// Selective L2 invalidation for entity update (old + new entities).
-    static io::Task<size_t> invalidateL2Updated(const Entity& old_e, const Entity& new_e) {
-        auto masterKey = redisMasterSetKey();
-        auto prefixLen = std::string(Base::name()).size() + 9;
-        auto schema = list::spec::filterSchema<Descriptor>();
-        auto newBlob = list::spec::encodeEntityFilterBlob<Descriptor>(new_e);
-        auto newSortVals = buildSortValues(new_e);
-        auto oldBlob = list::spec::encodeEntityFilterBlob<Descriptor>(old_e);
-        auto oldSortVals = buildSortValues(old_e);
-
-        co_return co_await cache::RedisCache::invalidateListGroupsSelectiveUpdate(
-            masterKey, prefixLen, schema, newBlob, newSortVals, oldBlob, oldSortVals);
-    }
-
-    /// Selective L2 invalidation for entity deletion (same logic as creation).
-    static io::Task<size_t> invalidateL2Deleted(const Entity& entity) {
-        return invalidateL2Created(entity);
-    }
-
-    /// Fire-and-forget L2 invalidation for entity creation.
-    static io::DetachedTask fireL2Created(Entity entity) {
-        try { co_await invalidateL2Created(entity); } catch (...) {}
-    }
-
-    /// Fire-and-forget L2 invalidation for entity update.
-    static io::DetachedTask fireL2Updated(Entity old_e, Entity new_e) {
-        try { co_await invalidateL2Updated(old_e, new_e); } catch (...) {}
-    }
-
-    /// Fire-and-forget L2 invalidation for entity deletion.
-    static io::DetachedTask fireL2Deleted(Entity entity) {
-        try { co_await invalidateL2Deleted(entity); } catch (...) {}
-    }
-
-    /// Coarse L2 invalidation — fallback that invalidates all groups.
-    static io::Task<size_t> invalidateRedisListGroups() {
-        if constexpr (!kHasL2) {
-            co_return 0;
-        } else {
-            try {
-                if (!PgProvider::hasRedis()) co_return 0;
-
-                auto masterKey = redisMasterSetKey();
-
-                auto result = co_await PgProvider::redis("HKEYS", masterKey);
-                if (result.isNil() || !result.isArray()) co_return 0;
-
-                auto groups = result.asStringArray();
-                size_t count = 0;
-
-                for (const auto& group : groups) {
-                    count += co_await cache::RedisCache::invalidateListGroup(group);
-                }
-
-                co_await PgProvider::redis("UNLINK", masterKey);
-
-                co_return count;
-            } catch (const std::exception& e) {
-                RELAIS_LOG_ERROR << Base::name()
-                    << ": invalidateRedisListGroups error - " << e.what();
-                co_return 0;
-            }
-        }
-    }
-
-    // =========================================================================
-    // Slow paths for queryJson / queryBinary (L1 miss → L2/DB)
-    // =========================================================================
-
-    /// Slow path for queryJson(): L1 miss → L2 transcode or DB fetch.
+    /// Slow path for queryJson(): L1 miss → DB fetch.
     static io::Task<std::string> queryJsonSlow(const ListQuery& q) {
-        // L2 check: BEVE → JSON transcode (skip ListBoundsHeader)
-        if constexpr (kHasL2) {
-            auto pageKey = redisPageKey(q);
-
-            std::optional<std::vector<uint8_t>> beve;
-            if constexpr (Base::config.l2_refresh_on_get) {
-                beve = co_await cache::RedisCache::getRawBinaryEx(pageKey, l2Ttl());
-            } else {
-                beve = co_await cache::RedisCache::getRawBinary(pageKey);
-            }
-
-            if (beve) {
-                // Skip ListBoundsHeader if present (magic 0x53 0x52)
-                size_t off = (beve->size() > list::kListBoundsHeaderSize
-                    && (*beve)[0] == list::kListBoundsHeaderMagic[0]
-                    && (*beve)[1] == list::kListBoundsHeaderMagic[1])
-                    ? list::kListBoundsHeaderSize : 0;
-                std::string json;
-                if (!glz::beve_to_json(
-                        std::span(beve->data() + off, beve->size() - off), json)) {
-                    co_return json;
-                }
-            }
-        }
-
         // Miss: entity path (needed for cursor/bounds/L1 population)
         auto wrapper = co_await cachedListQuery(q);
         if (!wrapper) co_return std::string{};
         co_return wrapper->json();
     }
 
-    /// Slow path for queryBinary(): L1 miss → L2 or DB fetch.
+    /// Slow path for queryBinary(): L1 miss → DB fetch.
     static io::Task<std::vector<uint8_t>> queryBinarySlow(const ListQuery& q)
         requires HasBinarySerialization<Entity>
     {
-        // L2 check: raw binary from Redis (skip ListBoundsHeader)
-        if constexpr (kHasL2) {
-            auto pageKey = redisPageKey(q);
-
-            std::optional<std::vector<uint8_t>> beve;
-            if constexpr (Base::config.l2_refresh_on_get) {
-                beve = co_await cache::RedisCache::getRawBinaryEx(pageKey, l2Ttl());
-            } else {
-                beve = co_await cache::RedisCache::getRawBinary(pageKey);
-            }
-
-            if (beve) {
-                // Skip ListBoundsHeader if present (magic 0x53 0x52)
-                size_t off = (beve->size() > list::kListBoundsHeaderSize
-                    && (*beve)[0] == list::kListBoundsHeaderMagic[0]
-                    && (*beve)[1] == list::kListBoundsHeaderMagic[1])
-                    ? list::kListBoundsHeaderSize : 0;
-                co_return std::vector<uint8_t>(
-                    beve->begin() + static_cast<ptrdiff_t>(off), beve->end());
-            }
-        }
-
         // Miss: entity path (needed for cursor/bounds/L1 population)
         auto wrapper = co_await cachedListQuery(q);
         if (!wrapper) co_return std::vector<uint8_t>{};
@@ -1131,45 +810,7 @@ protected:
         [[maybe_unused]] uint32_t fetch_gen = 0;
         if constexpr (kHasL1) fetch_gen = listCache().generation();
 
-        // 2. L2 check — binary (BEVE) with auto header skip
-        if constexpr (kHasL2) {
-            auto pageKey = redisPageKey(query);
-
-            std::optional<ListWrapperType> cached;
-            if constexpr (Base::config.l2_refresh_on_get) {
-                cached = co_await cache::RedisCache::getListBinaryEx<ListWrapperType>(
-                    pageKey, l2Ttl());
-            } else {
-                cached = co_await cache::RedisCache::getListBinary<ListWrapperType>(pageKey);
-            }
-
-            if (cached) {
-                RELAIS_METRICS_INC(list_l2_counters_.hits);
-                if constexpr (kHasL1) {
-                    // Move into L1 cache, return epoch-guarded view
-                    auto elapsed_us = static_cast<float>(
-                        std::chrono::duration_cast<std::chrono::microseconds>(
-                            Clock::now() - start).count());
-
-                    auto sort = query.sort().value_or(defaultSortAsListSpec());
-                    list::SortBounds bounds;
-                    if (!cached->items.empty()) {
-                        bounds.first_value = list::spec::extractSortValue<Descriptor>(
-                            cached->items.front(), sort.field);
-                        bounds.last_value = list::spec::extractSortValue<Descriptor>(
-                            cached->items.back(), sort.field);
-                        bounds.is_valid = true;
-                    }
-                    co_return listCache().put(toCacheQuery(query, std::move(page_key)),
-                                              std::move(*cached), fetch_gen, bounds, elapsed_us);
-                } else {
-                    co_return makeListView(std::move(*cached));
-                }
-            }
-            RELAIS_METRICS_INC(list_l2_counters_.misses);
-        }
-
-        // 3. Cache miss — query database
+        // 2. Cache miss — query database
         auto entities = co_await queryFromDb(query);
         auto sort = query.sort().value_or(defaultSortAsListSpec());
 
@@ -1198,30 +839,7 @@ protected:
             bounds.is_valid = true;
         }
 
-        // 4. Store in L2 with ListBoundsHeader (BEFORE moving into L1)
-        if constexpr (kHasL2) {
-            list::ListBoundsHeader header;
-            header.bounds = bounds;
-            header.sort_direction = (sort.direction == list::SortDirection::Desc)
-                ? list::SortDirection::Desc : list::SortDirection::Asc;
-            header.is_first_page = query.cursor().empty() && query.offset() == 0;
-            header.is_incomplete = wrapper.items.size() < static_cast<size_t>(query.limit());
-            header.pagination_mode = query.cursor().empty()
-                ? list::PaginationMode::Offset
-                : list::PaginationMode::Cursor;
-
-            // Page, its group's tracking set and the group's sort index in the
-            // master hash, in one script started without being awaited: the read
-            // returns once PostgreSQL has answered, and a Redis failure is only
-            // logged. The payload is encoded here, before wrapper moves into L1.
-            cache::RedisCache::storeListPageDetached(
-                redisPageKey(query),
-                cache::RedisCache::encodeListBinary(wrapper, header),
-                std::chrono::duration_cast<std::chrono::seconds>(l2Ttl()).count(),
-                redisGroupKey(query), redisMasterSetKey(), sort.field);
-        }
-
-        // 5. Store in L1 cache or epoch pool
+        // 3. Store in L1 cache or epoch pool
         if constexpr (kHasL1) {
             co_return listCache().put(toCacheQuery(query, std::move(page_key)),
                                       std::move(wrapper), fetch_gen, bounds, elapsed_us);

@@ -155,27 +155,27 @@ struct TestInternals {
     }
 
     /// Reach the batch invalidation cascade — the shared downstream of
-    /// invalidateMany/eraseMany: L1 evict + L2 UNLINK + list invalidation +
-    /// deduplicated cross-inval. Drives BOTH passes (critical then deferred)
-    /// awaited, so the test observes the full effect deterministically — the
-    /// production facade awaits only the critical pass and fires the deferred one
-    /// fire-and-forget. Takes the already-resolved affected set; the coroutine
-    /// copies the span into its frame, so `entities` must outlive the sync().
+    /// invalidateMany/eraseMany: L1 evict + list invalidation + deduplicated
+    /// cross-inval. Drives BOTH passes (critical then deferred) awaited, so the
+    /// test observes the full effect deterministically — the production facade
+    /// awaits only the critical pass and fires the deferred one fire-and-forget.
+    /// Takes the already-resolved affected set; the coroutine copies the span
+    /// into its frame, so `entities` must outlive the sync().
     template<typename Repo, typename Ent>
     static jcailloux::relais::io::Task<void> invalidateManyImpl(
         std::span<const Ent> entities) {
         co_await Repo::template invalidateManyCritical<true>(entities);
-        co_await Repo::template invalidateManyDeferred<true>(entities);
+        co_await Repo::invalidateManyDeferred(entities);
     }
 
     /// Detached counterpart of invalidateManyImpl — the exact production facade
-    /// shape: await ONLY the critical pass, then fire the deferred
-    /// pass (cross-target + L2 list EVALs) fire-and-forget. Lets a benchmark
-    /// measure caller time-to-return (critical only) against the drained
-    /// invalidateManyImpl (critical + deferred). Takes the same borrowed span as
-    /// invalidateManyImpl (symmetric caller-side cost); the fired deferred owns
-    /// its own copy so the set stays valid across every Redis suspend — mirroring
-    /// the facade, which moves an already-owned vector into the DetachedTask.
+    /// shape: await ONLY the critical pass, then fire the deferred pass
+    /// (cross-target) fire-and-forget. Lets a benchmark measure caller
+    /// time-to-return (critical only) against the drained invalidateManyImpl
+    /// (critical + deferred). Takes the same borrowed span as invalidateManyImpl
+    /// (symmetric caller-side cost); the fired deferred owns its own copy so the
+    /// set stays valid across every suspend — mirroring the facade, which moves
+    /// an already-owned vector into the DetachedTask.
     template<typename Repo, typename Ent>
     static jcailloux::relais::io::Task<void> invalidateManyDetached(
         std::span<const Ent> entities) {
@@ -188,7 +188,7 @@ struct TestInternals {
     static jcailloux::relais::io::DetachedTask fireInvalidateManyDeferred(
         std::vector<Ent> entities) {
         try {
-            co_await Repo::template invalidateManyDeferred<true>(
+            co_await Repo::invalidateManyDeferred(
                 std::span<const Ent>(entities));
         } catch (...) {}
     }
