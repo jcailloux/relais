@@ -35,7 +35,7 @@ constexpr IoEvent& operator|=(IoEvent& a, IoEvent b) noexcept {
 
 // IoContext — the event-loop extension point relais binds I/O onto.
 //
-// EpollIoContext is the bundled model, but PgPool/RedisPool and the awaiter
+// EpollIoContext is the bundled model, but PgPool and the awaiter
 // machinery are generic over this concept: any epoll-family loop (e.g. a
 // trantor::EventLoop shim to run relais inline on Drogon's threads) can satisfy
 // it. The concept fixes only the signatures below; the *semantic* contract an

@@ -245,7 +245,7 @@ inline BenchResult benchWithSetup(
     return r;
 }
 
-// Coroutine variants — used by I/O layer benchmarks (bench_io_redis, bench_io_pg)
+// Coroutine variants — used by I/O layer benchmarks (bench_io_pg)
 // where the overhead (~40ns) is negligible vs μs-scale I/O round-trips.
 
 template<typename Fn>

@@ -11,7 +11,7 @@ namespace jcailloux::relais::io::batch {
 // for batch scheduling decisions.
 //
 // Maintains:
-// - pg_network_time_ns / redis_network_time_ns: EMA of network round-trip
+// - pg_network_time_ns: EMA of network round-trip
 // - Per-SQL timing: request_time_ns per query type (identified by SQL pointer)
 // - Bootstrap counter: first 10 queries are sent immediately
 // - Staleness detection: > 5 min without single-query measurement → recalibrate
@@ -21,17 +21,14 @@ struct TimingEstimator {
 
     // Network round-trip time (EMA alpha = 0.01)
     double pg_network_time_ns = 0;
-    double redis_network_time_ns = 0;
 
     // Bootstrap: first N queries are sent immediately to calibrate
     static constexpr int kBootstrapThreshold = 5;
     int pg_bootstrap_count = 0;
-    int redis_bootstrap_count = 0;
 
     // Staleness: if last single-entity batch was > 5 min ago, send immediately
     static constexpr auto kStalenessThreshold = std::chrono::minutes(5);
     Clock::time_point pg_last_single_batch{};
-    Clock::time_point redis_last_single_batch{};
 
     // Per-SQL query timing (keyed by SQL pointer — unique per statement per repo)
     struct SqlTiming {
@@ -44,18 +41,9 @@ struct TimingEstimator {
         return pg_bootstrap_count < kBootstrapThreshold;
     }
 
-    [[nodiscard]] bool isRedisBootstrapping() const noexcept {
-        return redis_bootstrap_count < kBootstrapThreshold;
-    }
-
     [[nodiscard]] bool isPgStale() const noexcept {
         if (pg_last_single_batch == Clock::time_point{}) return true;
         return (Clock::now() - pg_last_single_batch) > kStalenessThreshold;
-    }
-
-    [[nodiscard]] bool isRedisStale() const noexcept {
-        if (redis_last_single_batch == Clock::time_point{}) return true;
-        return (Clock::now() - redis_last_single_batch) > kStalenessThreshold;
     }
 
     /// Get estimated per-query cost for a SQL statement (ns).
@@ -93,18 +81,6 @@ struct TimingEstimator {
 
         ++pg_bootstrap_count;
         pg_last_single_batch = Clock::now();
-    }
-
-    /// Update Redis network time from a single-command batch.
-    void updateRedisNetworkTime(double measured_ns) {
-        if (redis_bootstrap_count == 0) {
-            redis_network_time_ns = measured_ns;
-        } else {
-            redis_network_time_ns += 0.01 * (measured_ns - redis_network_time_ns);
-        }
-
-        ++redis_bootstrap_count;
-        redis_last_single_batch = Clock::now();
     }
 
     /// Update per-SQL request time from a batch result.

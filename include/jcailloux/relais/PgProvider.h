@@ -14,8 +14,6 @@
 #include "jcailloux/relais/io/pg/PgPool.h"
 #include "jcailloux/relais/io/pg/PgResult.h"
 #include "jcailloux/relais/io/pg/PgParams.h"
-#include "jcailloux/relais/io/redis/RedisClient.h"
-#include "jcailloux/relais/io/redis/RedisResult.h"
 #include "jcailloux/relais/io/batch/BatchScheduler.h"
 
 namespace jcailloux::relais::io { class IoPool; }
@@ -23,24 +21,22 @@ namespace jcailloux::relais::io { class IoPool; }
 namespace jcailloux::relais {
 
 // =============================================================================
-// PgProvider — Type-erased service locator for PostgreSQL and Redis
+// PgProvider — Type-erased service locator for PostgreSQL
 //
-// Wraps io::PgClient<Io> and io::RedisClient<Io> behind std::function
-// to decouple relais from the concrete IoContext type. The application
+// Wraps the per-loop io::batch::BatchScheduler<Io> behind std::function to
+// decouple relais from the concrete IoContext type. The application
 // initializes once at startup with the appropriate IoContext.
 //
 // The overhead of std::function indirection (one pointer-chase per call) is
-// negligible compared to the network I/O latency of database/Redis operations.
+// negligible compared to the network I/O latency of database operations.
 //
 // Initialization (in application startup):
 //   auto pool = co_await PgPool<MyIo>::create(io, conninfo,
 //                  {.min_connections = 4, .max_connections = 16});
-//   auto redis = co_await RedisClient<MyIo>::connect(io, "127.0.0.1", 6379);
-//   PgProvider::init(io, pool, redis);   // on the loop thread it serves
+//   PgProvider::init(io, pool);   // on the loop thread it serves
 //
 // Usage in repositories:
 //   auto result = co_await PgProvider::queryParams(sql, params);
-//   auto reply = co_await PgProvider::redis("GET", key);
 //
 // Lifetime: params and sql must remain valid until the co_await completes.
 // This is naturally satisfied when params is a local variable in the calling
@@ -127,72 +123,6 @@ public:
         co_return co_await queryParams(sql, params);
     }
 
-    // =========================================================================
-    // Redis operations
-    // =========================================================================
-
-    /// Execute a Redis command with variadic arguments (see io::RedisArg).
-    /// Numbers are sent as their exact decimal text. Binary data can be passed
-    /// as std::string_view (including embedded NUL bytes — all args are
-    /// binary-safe since RESP2 uses length-prefixed strings).
-    ///
-    /// Usage:
-    ///   co_await PgProvider::redis("SET", "key", "value");
-    ///   co_await PgProvider::redis("SETEX", key, ttl, value);
-    ///   co_await PgProvider::redis("EVALSHA", script_sha1, "1", tracking_key);
-    ///   co_await PgProvider::redis("SETEX", key, ttl_str,
-    ///       std::string_view(reinterpret_cast<const char*>(bin.data()), bin.size()));
-    template<io::RedisArg... Args>
-    static io::Task<io::RedisResult> redis(Args&&... args) {
-        if (!redis_exec_) throw std::logic_error("PgProvider::redis() called before init() or Redis not configured");
-
-        // Converted to text before the first suspension, then handed over to
-        // the scheduler: each argument is copied once.
-        std::vector<std::string> argv;
-        argv.reserve(sizeof...(args));
-        (argv.push_back(io::detail::redisArgText(std::forward<Args>(args))), ...);
-
-        co_return co_await redis_exec_(std::move(argv));
-    }
-
-    /// Execute a Redis command whose argument list is sized at runtime
-    /// (e.g. MGET over N keys). `args` is the full argv — verb first — taken by
-    /// value and handed over to the scheduler without a copy. Binary-safe
-    /// (length-prefixed).
-    static io::Task<io::RedisResult> redisDynamic(std::vector<std::string> args) {
-        if (!redis_exec_) throw std::logic_error("PgProvider::redisDynamic() called before init() or Redis not configured");
-        co_return co_await redis_exec_(std::move(args));
-    }
-
-    /// Internal: send a prepared argv (verb first), copied before this returns,
-    /// so the pointers need only be valid for the call. Used by
-    /// RedisCache::evalScriptArgs, which keeps its strings to resend them on
-    /// its EVAL fallback.
-    static io::Task<io::RedisResult> redisArgv(int argc, const char** argv,
-                                               const size_t* argvlen) {
-        if (!redis_exec_) throw std::logic_error("PgProvider::redisArgv() called before init() or Redis not configured");
-        std::vector<std::string> owned;
-        owned.reserve(static_cast<std::size_t>(argc));
-        for (int i = 0; i < argc; ++i) owned.emplace_back(argv[i], argvlen[i]);
-        return redis_exec_(std::move(owned));
-    }
-
-    /// Register a deferred cache-eviction retry whose UNLINK could not reach
-    /// Redis (self-heal of the L2/L1 staleness bound). No-op when Redis is not
-    /// configured — there is then no L2 phantom to chase. Routed to this thread's
-    /// BatchScheduler, which owns the per-loop self-heal queue and the pool it
-    /// rebuilds. Off the hot path: called only on a failed eviction.
-    static void enqueueSelfHeal(
-        std::string key, std::function<io::Task<bool>()> retry)
-    {
-        if (self_heal_enqueue_) self_heal_enqueue_(std::move(key), std::move(retry));
-    }
-
-    /// Check if Redis is configured.
-    [[nodiscard]] static bool hasRedis() noexcept {
-        return redis_exec_ != nullptr;
-    }
-
     /// Check if PgProvider has been initialized.
     [[nodiscard]] static bool initialized() noexcept {
         return pg_query_ != nullptr;
@@ -202,9 +132,8 @@ public:
     // Initialization (call once PER LOOP THREAD at startup)
     // =========================================================================
 
-    /// Bind this thread's providers to a freshly built BatchScheduler (PG +
-    /// Redis pipelining). The IoContext type is erased — callers don't need to
-    /// know it.
+    /// Bind this thread's providers to a freshly built BatchScheduler. The
+    /// IoContext type is erased — callers don't need to know it.
     ///
     /// Thread affinity: the providers are thread_local. Call init() ON the loop
     /// thread whose pool you pass — mono-loop: once on that loop; N-loop: once
@@ -214,9 +143,6 @@ public:
     static void init(
         Io& io,
         std::shared_ptr<io::PgPool<Io>> pool,
-        // type_identity_t → non-deduced: Io comes from io/pool only, so passing
-        // an explicit `nullptr` here doesn't break deduction.
-        std::type_identity_t<std::shared_ptr<io::RedisClient<Io>>> redisClient = nullptr,
         int max_concurrent = 8)
     {
         // Debug guard: providers are thread_local, so init() MUST run on the loop
@@ -230,17 +156,8 @@ public:
                 "thread_local — call it once per loop thread for N-loop)");
         }
 
-        // Wrap single RedisClient into a RedisPool for the BatchScheduler
-        std::shared_ptr<io::RedisPool<Io>> redis_pool;
-        if (redisClient) {
-            redis_pool = std::make_shared<io::RedisPool<Io>>(
-                io::RedisPool<Io>::fromClients({std::move(redisClient)}));
-        }
-
-        auto batcher = std::make_shared<io::batch::BatchScheduler<Io>>(
-            io, std::move(pool), redis_pool, max_concurrent);
-
-        bindBatcher<Io>(std::move(batcher), redis_pool != nullptr);
+        bindBatcher<Io>(std::make_shared<io::batch::BatchScheduler<Io>>(
+            io, std::move(pool), max_concurrent));
     }
 
     /// Bind the calling thread's providers to an already-built BatchScheduler.
@@ -249,9 +166,7 @@ public:
     /// objects co-own `batcher` via shared_ptr — it lives until reset() or the
     /// thread exits.
     template<typename Io>
-    static void bindBatcher(
-        std::shared_ptr<io::batch::BatchScheduler<Io>> batcher, bool with_redis)
-    {
+    static void bindBatcher(std::shared_ptr<io::batch::BatchScheduler<Io>> batcher) {
         pg_query_ = [batcher](const char* sql) {
             return batcher->directQuery(sql);
         };
@@ -281,24 +196,6 @@ public:
                               io::batch::WriteAffinity affinity) {
             return batcher->submitPgWrite(sql, io::PgParams{params}, mode, affinity);
         };
-
-        if (with_redis) {
-            // Route Redis through the BatchScheduler for pipelining.
-            // The batcher owns the redis_pool via shared_ptr.
-            redis_exec_ = [batcher](std::vector<std::string>&& args) {
-                return batcher->submitRedis(std::move(args));
-            };
-            // Self-heal needs the same batcher (its loop + its pool). Bound only
-            // with Redis: without L2 there is no phantom to chase.
-            self_heal_enqueue_ = [batcher](
-                std::string key, std::function<io::Task<bool>()> retry)
-            {
-                batcher->enqueueSelfHeal(std::move(key), std::move(retry));
-            };
-        } else {
-            redis_exec_ = nullptr;
-            self_heal_enqueue_ = nullptr;
-        }
     }
 
     /// Reset all providers (for testing).
@@ -308,8 +205,6 @@ public:
         pg_entity_query_ = nullptr;
         pg_entity_query_many_ = nullptr;
         pg_write_ = nullptr;
-        redis_exec_ = nullptr;
-        self_heal_enqueue_ = nullptr;
     }
 
     // =========================================================================
@@ -326,10 +221,6 @@ public:
     using PgWriteFn = std::function<io::Task<io::batch::PgWriteResult>(
         const char*, const io::PgParams&, io::batch::WriteMode,
         io::batch::WriteAffinity)>;
-    using RedisExecFn = std::function<io::Task<io::RedisResult>(
-        std::vector<std::string>&&)>;
-    using SelfHealEnqueueFn = std::function<void(
-        std::string, std::function<io::Task<bool>()>)>;
 
     // thread_local: each event-loop thread binds its OWN pool/batcher by calling
     // init() on that thread (shared-nothing). A Task co_awaited on loop K then
@@ -340,8 +231,6 @@ public:
     static inline thread_local PgEntityQueryFn pg_entity_query_;
     static inline thread_local PgEntityQueryManyFn pg_entity_query_many_;
     static inline thread_local PgWriteFn pg_write_;
-    static inline thread_local RedisExecFn redis_exec_;
-    static inline thread_local SelfHealEnqueueFn self_heal_enqueue_;
 
     // IoPool needs to set these directly
     friend class io::IoPool;

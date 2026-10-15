@@ -61,7 +61,6 @@ TEST_CASE("IoPool: each worker binds its own provider and routes PG locally",
     IoPoolConfig cfg;
     cfg.num_workers = 2;
     cfg.pg_conninfo = connInfo();
-    cfg.redis = std::nullopt;
     cfg.pin_to_cores = false;  // don't fight the test runner for cores
     cfg.pg_min_conns_per_worker = 1;
     cfg.pg_max_conns_per_worker = 2;

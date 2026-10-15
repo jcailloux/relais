@@ -9,7 +9,6 @@
  *   ./bench_io_batch                       # all benchmarks
  *   ./bench_io_batch "[batch][pg-read]"    # PG read only
  *   ./bench_io_batch "[batch][pg-write]"   # PG write only
- *   ./bench_io_batch "[batch][redis]"      # Redis only
  *   ./bench_io_batch "[batch][scaling]"    # summary scaling table
  *   BENCH_DURATION_S=10 ./bench_io_batch   # custom duration
  */
@@ -20,8 +19,6 @@
 
 #include <jcailloux/relais/io/pg/PgPool.h>
 #include <jcailloux/relais/io/pg/PgParams.h>
-#include <jcailloux/relais/io/redis/RedisClient.h>
-#include <jcailloux/relais/io/redis/RedisPool.h>
 #include <jcailloux/relais/io/batch/BatchScheduler.h>
 #include <jcailloux/relais/io/Task.h>
 
@@ -52,17 +49,13 @@ namespace relais_bench {
 struct BatchBenchAccessor {
     struct Stats {
         double pg_rtt_us;
-        double redis_rtt_us;
         bool pg_bootstrapping;
-        bool redis_bootstrapping;
     };
 
     static Stats snapshot(const BatchScheduler<Io>& b) {
         return {
             b.estimator_.pg_network_time_ns / 1000.0,
-            b.estimator_.redis_network_time_ns / 1000.0,
             b.estimator_.isPgBootstrapping(),
-            b.estimator_.isRedisBootstrapping(),
         };
     }
 };
@@ -75,16 +68,6 @@ struct BatchBenchAccessor {
 
 static constexpr const char* CONNINFO =
     "host=localhost port=5432 dbname=relais_test user=relais_test password=relais_test";
-
-static const char* redisHost() {
-    const char* h = std::getenv("REDIS_HOST");
-    return h ? h : "127.0.0.1";
-}
-
-static int redisPort() {
-    const char* p = std::getenv("REDIS_PORT");
-    return p ? std::atoi(p) : 6379;
-}
 
 // =============================================================================
 // Worker coroutines (free functions — safe for fire-and-forget)
@@ -133,31 +116,6 @@ DetachedTask pgWriteWorker(
     }
 }
 
-DetachedTask redisWorker(
-    std::shared_ptr<BatchScheduler<Io>> batcher,
-    std::atomic<bool>& running,
-    std::atomic<int64_t>& ops,
-    std::atomic<int>& done_count)
-{
-    int counter = 0;
-    while (running.load(std::memory_order_relaxed)) {
-        ++counter;
-        std::string key = "bench:batch:" + std::to_string(counter % 1000);
-        std::string val = std::to_string(counter);
-        std::vector<std::string> args = {"SET", key, val};
-        std::vector<const char*> argv;
-        std::vector<size_t> argvlen;
-        for (const auto& a : args) {
-            argv.push_back(a.data());
-            argvlen.push_back(a.size());
-        }
-        co_await batcher->submitRedis(
-            static_cast<int>(argv.size()), argv.data(), argvlen.data());
-        ops.fetch_add(1, std::memory_order_relaxed);
-    }
-    done_count.fetch_add(1, std::memory_order_relaxed);
-}
-
 // =============================================================================
 // Helpers
 // =============================================================================
@@ -173,21 +131,6 @@ static Task<void> bootstrapPg(BatchScheduler<Io>& batcher) {
     for (int i = 0; i < TimingEstimator::kBootstrapThreshold + 2; ++i) {
         auto params = PgParams::make(i);
         co_await batcher.submitQueryRead(PG_READ_SQL, std::move(params));
-    }
-}
-
-static Task<void> bootstrapRedis(BatchScheduler<Io>& batcher) {
-    for (int i = 0; i < TimingEstimator::kBootstrapThreshold + 2; ++i) {
-        std::string key = "bench:boot:" + std::to_string(i);
-        std::vector<std::string> args = {"SET", key, "x"};
-        std::vector<const char*> argv;
-        std::vector<size_t> argvlen;
-        for (const auto& a : args) {
-            argv.push_back(a.data());
-            argvlen.push_back(a.size());
-        }
-        co_await batcher.submitRedis(
-            static_cast<int>(argv.size()), argv.data(), argvlen.data());
     }
 }
 
@@ -209,7 +152,7 @@ static Task<ConcurrencyResult> runPgReadLevel(
     Io& io, std::shared_ptr<PgPool<Io>> pool,
     int concurrency, double baseline_throughput)
 {
-    auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, nullptr, 8);
+    auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, 8);
     co_await bootstrapPg(*batcher);
 
     std::atomic<bool> running{true};
@@ -249,7 +192,7 @@ static Task<ConcurrencyResult> runPgWriteLevel(
     Io& io, std::shared_ptr<PgPool<Io>> pool,
     int concurrency, double baseline_throughput)
 {
-    auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, nullptr, 8);
+    auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, 8);
 
     // A real table: a TEMP one exists only on the connection that created
     // it, and writes run on every connection of the pool.
@@ -267,46 +210,6 @@ static Task<ConcurrencyResult> runPgWriteLevel(
 
     for (int i = 0; i < concurrency; ++i) {
         pgWriteWorker(batcher, running, ops, done_count);
-    }
-
-    int duration_s = benchDurationSeconds();
-    auto deadline = start + std::chrono::seconds(duration_s);
-
-    while (Clock::now() < deadline) co_await Pause{io};
-
-    running.store(false, std::memory_order_relaxed);
-
-    while (done_count.load(std::memory_order_relaxed) < concurrency) co_await Pause{io};
-
-    auto elapsed = Clock::now() - start;
-    auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count();
-    double throughput = (elapsed_us > 0)
-        ? ops.load(std::memory_order_relaxed) * 1'000'000.0 / elapsed_us
-        : 0.0;
-    double speedup = (baseline_throughput > 0)
-        ? throughput / baseline_throughput
-        : 1.0;
-
-    co_return ConcurrencyResult{concurrency, throughput, speedup};
-}
-
-static Task<ConcurrencyResult> runRedisLevel(
-    Io& io, std::shared_ptr<PgPool<Io>> pg_pool,
-    std::shared_ptr<RedisPool<Io>> redis_pool,
-    int concurrency, double baseline_throughput)
-{
-    auto batcher = std::make_shared<BatchScheduler<Io>>(
-        io, pg_pool, redis_pool, 8);
-    co_await bootstrapRedis(*batcher);
-
-    std::atomic<bool> running{true};
-    std::atomic<int64_t> ops{0};
-    std::atomic<int> done_count{0};
-
-    auto start = Clock::now();
-
-    for (int i = 0; i < concurrency; ++i) {
-        redisWorker(batcher, running, ops, done_count);
     }
 
     int duration_s = benchDurationSeconds();
@@ -400,7 +303,7 @@ TEST_CASE("Benchmark - PG Read Batching", "[benchmark][batch][pg-read]")
         Io io2;
         rtt_us = runTask(io2, [](Io& io2) -> Task<double> {
             auto pool = co_await PgPool<Io>::create(io2, CONNINFO, {.min_connections = 1, .max_connections = 4});
-            auto batcher = std::make_shared<BatchScheduler<Io>>(io2, pool, nullptr, 8);
+            auto batcher = std::make_shared<BatchScheduler<Io>>(io2, pool, 8);
             co_await bootstrapPg(*batcher);
             auto stats = BatchBenchAccessor::snapshot(*batcher);
             co_return stats.pg_rtt_us;
@@ -443,7 +346,7 @@ TEST_CASE("Benchmark - PG Write Batching", "[benchmark][batch][pg-write]")
         Io io2;
         rtt_us = runTask(io2, [](Io& io2) -> Task<double> {
             auto pool = co_await PgPool<Io>::create(io2, CONNINFO, {.min_connections = 1, .max_connections = 4});
-            auto batcher = std::make_shared<BatchScheduler<Io>>(io2, pool, nullptr, 8);
+            auto batcher = std::make_shared<BatchScheduler<Io>>(io2, pool, 8);
             co_await bootstrapPg(*batcher);
             auto stats = BatchBenchAccessor::snapshot(*batcher);
             co_return stats.pg_rtt_us;
@@ -456,66 +359,7 @@ TEST_CASE("Benchmark - PG Write Batching", "[benchmark][batch][pg-write]")
 
 // #############################################################################
 //
-//  3. Redis Batching — scaling with concurrency
-//
-// #############################################################################
-
-TEST_CASE("Benchmark - Redis Batching", "[benchmark][batch][redis]")
-{
-    Io io;
-    static constexpr int levels[] = {1, 4, 16, 64, 128};
-
-    auto results = runTask(io, [](Io& io) -> Task<std::vector<ConcurrencyResult>> {
-        auto pg_pool = co_await PgPool<Io>::create(io, CONNINFO, {.min_connections = 1, .max_connections = 4});
-        auto redis_pool = std::make_shared<RedisPool<Io>>(
-            co_await RedisPool<Io>::create(io, redisHost(), redisPort(), 4));
-
-        std::vector<ConcurrencyResult> results;
-        double baseline = 0;
-
-        for (int n : levels) {
-            auto r = co_await runRedisLevel(io, pg_pool, redis_pool, n, baseline);
-            if (n == 1) baseline = r.throughput;
-            r.speedup = (baseline > 0) ? r.throughput / baseline : 1.0;
-            results.push_back(r);
-        }
-
-        // Cleanup bench keys
-        auto& client = redis_pool->next();
-        for (int i = 0; i < 1000; ++i) {
-            std::string key = "bench:batch:" + std::to_string(i);
-            co_await client.exec("DEL", key);
-        }
-        for (int i = 0; i < TimingEstimator::kBootstrapThreshold + 2; ++i) {
-            std::string key = "bench:boot:" + std::to_string(i);
-            co_await client.exec("DEL", key);
-        }
-
-        co_return results;
-    }(io));
-
-    double rtt_us = 0;
-    {
-        Io io2;
-        rtt_us = runTask(io2, [](Io& io2) -> Task<double> {
-            auto pg_pool = co_await PgPool<Io>::create(io2, CONNINFO, {.min_connections = 1, .max_connections = 4});
-            auto redis_pool = std::make_shared<RedisPool<Io>>(
-                co_await RedisPool<Io>::create(io2, redisHost(), redisPort(), 1));
-            auto batcher = std::make_shared<BatchScheduler<Io>>(
-                io2, pg_pool, redis_pool, 8);
-            co_await bootstrapRedis(*batcher);
-            auto stats = BatchBenchAccessor::snapshot(*batcher);
-            co_return stats.redis_rtt_us;
-        }(io2));
-    }
-
-    WARN(formatScalingTable("Redis Batching", rtt_us, results));
-}
-
-
-// #############################################################################
-//
-//  4. Combined Scaling Summary
+//  3. Combined Scaling Summary
 //
 // #############################################################################
 
@@ -526,17 +370,13 @@ TEST_CASE("Benchmark - Batch Scaling Summary", "[benchmark][batch][scaling]")
     struct AllResults {
         std::vector<ConcurrencyResult> pg_read;
         std::vector<ConcurrencyResult> pg_write;
-        std::vector<ConcurrencyResult> redis;
         double pg_rtt_us = 0;
-        double redis_rtt_us = 0;
     };
 
     auto all = runTask(io, [](Io& io) -> Task<AllResults> {
         AllResults out;
 
         auto pg_pool = co_await PgPool<Io>::create(io, CONNINFO, {.min_connections = 2, .max_connections = 8});
-        auto redis_pool = std::make_shared<RedisPool<Io>>(
-            co_await RedisPool<Io>::create(io, redisHost(), redisPort(), 4));
 
         // PG Read: 1, 16, 64
         {
@@ -560,35 +400,11 @@ TEST_CASE("Benchmark - Batch Scaling Summary", "[benchmark][batch][scaling]")
             }
         }
 
-        // Redis: 1, 16, 64
-        {
-            double baseline = 0;
-            for (int n : {1, 16, 64}) {
-                auto r = co_await runRedisLevel(io, pg_pool, redis_pool, n, baseline);
-                if (n == 1) baseline = r.throughput;
-                r.speedup = (baseline > 0) ? r.throughput / baseline : 1.0;
-                out.redis.push_back(r);
-            }
-        }
-
         // Get RTT estimates
         {
-            auto batcher = std::make_shared<BatchScheduler<Io>>(
-                io, pg_pool, redis_pool, 8);
+            auto batcher = std::make_shared<BatchScheduler<Io>>(io, pg_pool, 8);
             co_await bootstrapPg(*batcher);
-            co_await bootstrapRedis(*batcher);
-            auto stats = BatchBenchAccessor::snapshot(*batcher);
-            out.pg_rtt_us = stats.pg_rtt_us;
-            out.redis_rtt_us = stats.redis_rtt_us;
-        }
-
-        // Cleanup
-        auto& client = redis_pool->next();
-        for (int i = 0; i < 1000; ++i) {
-            co_await client.exec("DEL", "bench:batch:" + std::to_string(i));
-        }
-        for (int i = 0; i < TimingEstimator::kBootstrapThreshold + 2; ++i) {
-            co_await client.exec("DEL", "bench:boot:" + std::to_string(i));
+            out.pg_rtt_us = BatchBenchAccessor::snapshot(*batcher).pg_rtt_us;
         }
 
         co_return out;
@@ -597,8 +413,7 @@ TEST_CASE("Benchmark - Batch Scaling Summary", "[benchmark][batch][scaling]")
     std::ostringstream out;
     out << "\n"
         << formatScalingTable("PG Read Batching", all.pg_rtt_us, all.pg_read) << "\n\n"
-        << formatScalingTable("PG Write Batching", all.pg_rtt_us, all.pg_write) << "\n\n"
-        << formatScalingTable("Redis Batching", all.redis_rtt_us, all.redis);
+        << formatScalingTable("PG Write Batching", all.pg_rtt_us, all.pg_write);
 
     WARN(out.str());
 }
