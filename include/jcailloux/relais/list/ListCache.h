@@ -393,8 +393,7 @@ public:
     /// `fetch_gen` is generation(), read before the page was fetched: every
     /// modification notified since must be able to invalidate it. A page read
     /// from the database reflects every modification notified before (they
-    /// are notified after their commit); a page read from L2 is only as fresh
-    /// as L2, whose pages are invalidated separately. Returns epoch-guarded ResultView pointing to the stored
+    /// are notified after their commit). Returns epoch-guarded ResultView pointing to the stored
     /// entry (still readable if the entry is evicted again right away).
     ///
     /// Stamping the page at put time instead would let a modification notified

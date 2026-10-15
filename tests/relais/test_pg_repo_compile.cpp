@@ -476,27 +476,6 @@ TEST_CASE("Mapping metadata", "[base_repo]") {
 }
 
 // =========================================================================
-// List key building tests
-// =========================================================================
-
-TEST_CASE("List cache key building", "[base_repo]") {
-    SECTION("makeGroupKey with string parts") {
-        auto key = ItemRepo::makeGroupKey("category", "tech");
-        REQUIRE(key == "test:item:list:category:tech");
-    }
-
-    SECTION("makeGroupKey with integer parts") {
-        auto key = ItemRepo::makeGroupKey(int64_t(42));
-        REQUIRE(key == "test:item:list:42");
-    }
-
-    SECTION("makeGroupKey with mixed parts") {
-        auto key = UserRepo::makeGroupKey("guild", int64_t(123));
-        REQUIRE(key == "test:user:list:guild:123");
-    }
-}
-
-// =========================================================================
 // column= mapping tests (C++ field names ≠ DB column names)
 // =========================================================================
 
