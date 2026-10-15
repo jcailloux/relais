@@ -1,9 +1,13 @@
 #ifndef JCX_RELAIS_IO_PG_ERROR_H
 #define JCX_RELAIS_IO_PG_ERROR_H
 
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+#include <utility>
+
+#include "jcailloux/relais/io/pg/SettleTicket.h"
 
 namespace jcailloux::relais::io {
 
@@ -37,9 +41,25 @@ public:
 // Uncertain outcome: the request was in flight when the wait failed, so the
 // server may have committed it. The write path catches this before catch(PgError&)
 // and evicts by precaution; a plain PgError means the DB is unchanged (nullopt).
+//
+// A failure on the write path carries the settle ticket of the connection that
+// sent the write; it is null for a read, with UncertainSettle::Off, or when the
+// backend is unknown. The ticket is attached to the thrown object before any
+// exception_ptr is taken, so every holder of that exception_ptr sees it.
 class PgUncertainError : public PgError {
 public:
     using PgError::PgError;
+
+    void attachSettleTicket(std::shared_ptr<SettleTicket> ticket) const noexcept {
+        ticket_ = std::move(ticket);
+    }
+    [[nodiscard]] const std::shared_ptr<SettleTicket>& settleTicket() const noexcept {
+        return ticket_;
+    }
+
+private:
+    // mutable: handlers catch by const reference.
+    mutable std::shared_ptr<SettleTicket> ticket_;
 };
 
 // Client-side query timeout: an I/O wait exceeded PgPoolConfig::query_timeout.
