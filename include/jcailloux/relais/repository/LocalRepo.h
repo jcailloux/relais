@@ -13,6 +13,7 @@
 #include "jcailloux/relais/io/Task.h"
 #include "jcailloux/relais/repository/PgRepo.h"
 #include "jcailloux/relais/repository/KeyDedup.h"
+#include "jcailloux/relais/repository/Precaution.h"
 #include "jcailloux/relais/repository/RecheckGuard.h"
 #include "jcailloux/relais/Log.h"
 #include "jcailloux/relais/cache/CacheTier.h"
@@ -202,8 +203,8 @@ public:
                 co_return storeAndView(result->key(), std::move(*result));
             }
             co_return {};
-        } catch (const io::PgUncertainError&) {
-            evict(entity.key());
+        } catch (const io::PgUncertainError& e) {
+            detail::precautionSync(e.settleTicket(), [key = entity.key()] { evict(key); });
             throw;
         }
     }
@@ -232,9 +233,9 @@ public:
                 id, std::forward<Updates>(updates)...);
             if (!patched) co_return typename Base::PatchedRow{};
             co_return settlePatched(id, std::move(*patched));
-        } catch (const io::PgUncertainError&) {
+        } catch (const io::PgUncertainError& e) {
             keepUncertainBefore(id, uncertain_before);
-            evict(id);
+            detail::precautionSync(e.settleTicket(), [id] { evict(id); });
             throw;
         }
     }
@@ -254,9 +255,9 @@ public:
             if (outcome.error) co_return std::nullopt;
             if (!outcome.patched) co_return typename Base::PatchedRow{};
             co_return settlePatched(id, std::move(*outcome.patched));
-        } catch (const io::PgUncertainError&) {
+        } catch (const io::PgUncertainError& e) {
             keepUncertainBefore(id, uncertain_before);
-            evict(id);
+            detail::precautionSync(e.settleTicket(), [id] { evict(id); });
             throw;
         }
     }
@@ -297,11 +298,11 @@ protected:
                 evict(id);
             }
             co_return outcome;
-        } catch (const io::PgUncertainError&) {
+        } catch (const io::PgUncertainError& e) {
             // Uncertain: the DELETE may have committed. Evict L1 by precaution
             // (local, cannot fail).
             keepUncertainBefore(id, uncertain_before);
-            evict(id);
+            detail::precautionSync(e.settleTicket(), [id] { evict(id); });
             throw;
         }
     }
@@ -330,11 +331,11 @@ protected:
                 }
             }
             co_return outcome;
-        } catch (const io::PgUncertainError&) {
+        } catch (const io::PgUncertainError& e) {
             // Uncertain: the UPDATE may have committed. Evict L1 by precaution so
             // the next read re-fetches; the L1 evict is local and cannot fail.
             keepUncertainBefore(id, uncertain_before);
-            evict(id);
+            detail::precautionSync(e.settleTicket(), [id] { evict(id); });
             throw;
         }
     }
