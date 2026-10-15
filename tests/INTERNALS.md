@@ -8,7 +8,6 @@ Technical details about the relais test infrastructure.
 ┌─────────────────────────────────────────────────────────────────────┐
 │                         Test Files (.cpp)                           │
 │  test_pg_repo.cpp              PgRepo (no cache) + patch │
-│  test_redis_repo.cpp           RedisRepo (L2 cache)           │
 │  test_decl_list_cache.cpp      ListMixin (L1 lists)                  │
 │  test_local_repo.cpp           LocalRepo (L1 cache)          │
 │  test_partition_key.cpp         PartitionKey (composite PK, partitions) │
@@ -18,8 +17,8 @@ Technical details about the relais test infrastructure.
                               ▼
 ┌─────────────────────────────────────────────────────────────────────┐
 │                       TestRepositories.h                            │
-│  Configs: Uncached, L1Only, L2Only, Both, ShortTTL, WriteThrough…  │
-│  Entity repos: L2TestItemRepo, L1TestUserRepo, L2TestPurchaseRepo… │
+│  Configs: Uncached, Local, ShortTTL, WriteThrough, FewChunks…       │
+│  Entity repos: UncachedTestItemRepo, L1TestItemRepo, L1TestUserRepo…│
 │  List repos: TestArticleListRepo, TestPurchaseListRepo  │
 │  (inherit from relais::Repo<...> + ListCacheRepo)    │
 └─────────────────────────────────────────────────────────────────────┘
@@ -37,8 +36,8 @@ Technical details about the relais test infrastructure.
                               ▼
 ┌─────────────────────────────────────────────────────────────────────┐
 │                        test_helper.h                                │
-│  - initTest(): PgProvider + PostgreSQL + Redis initialization       │
-│  - TransactionGuard: RAII test isolation (BEGIN/ROLLBACK + flush)   │
+│  - initTest(): PgProvider + PostgreSQL initialization               │
+│  - TransactionGuard: RAII test isolation (deletes test data)        │
 │  - sync(): Coroutine synchronous execution                          │
 │  - insertTestItem/User/Purchase/Article: Direct DB helpers          │
 │  - getCacheSize<Repo>(), forceFullCleanup<Repo>()                  │
@@ -54,27 +53,15 @@ Technical details about the relais test infrastructure.
 Initializes the I/O layer for testing:
 1. Creates `IoContext` and starts the event loop in a background thread
 2. Creates `PgPool` with hardcoded config (localhost:5432, relais_test)
-3. Creates `RedisClient` (127.0.0.1:6379)
-4. Calls `PgProvider::init(pool, redis)` to register providers
+3. Calls `PgProvider::init(io, pool, max_concurrent)` to register providers
 
 **Important**: Called once per test run (guarded by atomic flag).
 
 #### `TransactionGuard`
 
-RAII class for test isolation:
-```cpp
-TransactionGuard() {
-    flushRedis();           // Clear Redis
-    execSql("BEGIN");       // Start transaction
-}
-
-~TransactionGuard() {
-    execSql("ROLLBACK");    // Undo all changes
-    flushRedis();           // Clear Redis again
-}
-```
-
-All database modifications within a test are automatically rolled back.
+RAII class for test isolation: its constructor and its destructor both delete
+the rows of every test table and reset the GDSF state. No test leaves data behind,
+even on failure.
 
 #### `sync<T>()`
 
@@ -124,20 +111,15 @@ sync(Repo::update(id, makeEntity(updated)));
 
 ### TestRepositories.h
 
-Four repository classes with different cache configurations:
+Repositories come in two cache configurations, plus `Local` variants tuned for
+specific tests (`ShortTTL`, `WriteThrough`, `FewChunks`…):
 
 ```cpp
 // No caching - tests PgRepo
-class UncachedTestItemRepo : public Repo<..., config::Uncached> {};
+using UncachedTestItemRepo = Repo<TestItemEntity, "test:uncached", cfg::Uncached>;
 
-// L1 only - tests LocalRepo without Redis
-class L1TestItemRepo : public Repo<..., config::L1Only> {};
-
-// L2 only - tests RedisRepo
-class L2TestItemRepo : public Repo<..., config::L2Only> {};
-
-// Full hierarchy - tests LocalRepo with Redis
-class FullCacheTestItemRepo : public Repo<..., config::Both> {};
+// L1 - tests LocalRepo
+using L1TestItemRepo = Repo<TestItemEntity, "test:l1">;
 ```
 
 All entity types are `Entity<Struct, Mapping>` aliases defined in `TestEntities.h`. List types use `ListWrapper<EntityType>`.
@@ -234,30 +216,6 @@ L1Repo::clearCache();
 ./test_relais_base "[PgRepo] CRUD Operations" -s
 ```
 
-## Redis Repo Tests (`test_redis_repo.cpp`)
-
-Comprehensive integration tests for the L2 (Redis) cache layer, organized in 17 logical sections:
-
-| Section | Tag                                    | Content |
-|---------|----------------------------------------|---------|
-| 1 | `[item]`                               | `find` — cache hit, miss, multi-entity |
-| 2 | `[item]`                               | `insert` — insert + populate Redis |
-| 3 | `[item]`                               | `update` — invalidate Redis (lazy reload) |
-| 4 | `[item]`                               | `erase` — invalidate Redis |
-| 5 | `[binary]`                             | Binary (BEVE) serialization in Redis |
-| 6 | `[patch]`                           | Partial field updates with Redis invalidation |
-| 7 | `[json]`                               | `findJson` raw JSON retrieval |
-| 8 | `[invalidate]`                         | Explicit `evictRedis` + isolation |
-| 9 | `[readonly]`                           | Read-only repository caching |
-| 10 | `[cross-inv]`                          | `Invalidate<>` entity→entity (insert, update, delete, FK change) |
-| 11 | `[custom-inv]`                         | `InvalidateVia<>` with custom resolver |
-| 12 | `[readonly-inv]`                       | Cross-invalidation targeting read-only caches |
-| 13 | `[list]` + `[fb-list]`                 | List caching — JSON and BEVE binary |
-| 14 | `[list-inv]` + `[list-custom]`         | `InvalidateList<>` and list custom resolver |
-| 15 | `[list-tracked]`                       | Tracked pagination + group invalidation + tracking data |
-| 16 | `[list-selective]` + `[list-resolver]` | SortBounds Lua selective invalidation + `InvalidateListVia` with GroupKey |
-| 17 | `[list-granularity]`                   | Three granularities: per-page, per-group, full pattern |
-
 ## ListDescriptor Tests (`test_decl_list_cache.cpp`)
 
 Integration tests for the declarative L1 list cache system:
@@ -332,7 +290,7 @@ using Invalidates = InvalidateOn<
 
 ### GroupKey
 
-Each list repository defines its own `GroupKey` struct containing the typed filter values that identify a cache group. This is **not** a Redis key string — it represents the logical group identity.
+Each list repository defines its own `GroupKey` struct containing the typed filter values that identify a cache group. It represents the logical group identity, not a cache key.
 
 ```cpp
 struct GroupKey {
@@ -342,16 +300,13 @@ struct GroupKey {
 
 ### `invalidateByTarget(GroupKey, optional<int64_t>)`
 
-Defined in the concrete list repository. Translates the typed `GroupKey` + optional sort value into actual cache operations:
-
-- **`sort_value` present** → calls `invalidateListGroupSelective()` (per-page, Lua-based)
-- **`sort_value` absent** → calls `invalidateListGroup()` (per-group, deletes all pages)
+Defined in the concrete list repository. Translates the typed `GroupKey` + optional sort value into actual cache operations.
 
 ### `invalidateAllListGroups()`
 
-Defined in the CRTP hierarchy:
+Defined in the mixin chain:
 - **PgRepo**: no-op (no cache to invalidate)
-- **RedisRepo**: `SCAN` with pattern `name() + ":list:*"` and `DEL` each match
+- **ListMixin**: records one full-range modification on the L1 tracker; every cached page is dropped lazily on its next read or sweep
 
 Called when the resolver returns `std::nullopt` (full pattern invalidation).
 
@@ -375,8 +330,6 @@ Tests for repositories with partitioned PostgreSQL tables where the composite PK
 |-----------|--------|-------------|
 | `UncachedTestEventRepo` | `Uncached` | None |
 | `L1TestEventRepo` | `Local` | L1 |
-| `L2TestEventRepo` | `Redis` | L2 |
-| `L1L2TestEventRepo` | `Both` | L1+L2 |
 
 ### `patch` — Criteria-Based
 
@@ -394,16 +347,12 @@ For partition pruning, `DELETE WHERE id=$1 AND region=$2` scans 1 partition vs `
 ```
 LocalRepo::erase(id)
   → hint = getFromCache(id)        // Free L1 check
-  → RedisRepo::eraseImpl(id, hint)
-    → if (!hint && HasPartitionKey) {
-        hint = getFromRedis(id)    // ~0.1ms L2 check
-      }
-    → PgRepo::eraseImpl(id, hint)
-      → if (hint) deleteByPrimaryKey(fullPK)  // Pruned: 1 partition
-      → else      deleteByKey(id)              // Scan: N partitions
+  → PgRepo::eraseImpl(id, hint)
+    → if (hint) deleteByPrimaryKey(fullPK)  // Pruned: 1 partition
+    → else      deleteByKey(id)              // Scan: N partitions
 ```
 
-**Performance rule**: Never add a DB round-trip just for partition pruning. Only use full PK when the entity is already available from cache (free or near-free).
+**Performance rule**: Never add a DB round-trip just for partition pruning. Only use full PK when the entity is already in L1.
 
 ### Test Coverage
 
@@ -411,14 +360,10 @@ LocalRepo::erase(id)
 |---------|-------------------------------------------------------------------------|
 | 1 | CRUD: find, insert, update, erase (Uncached)                           |
 | 2 | L1 caching: cache hit, staleness, invalidation                          |
-| 3 | L2 caching: Redis hit, staleness, invalidation                          |
-| 4 | Cross-invalidation: Event as source (→ User L1)                         |
-| 5 | Cross-invalidation: Event as target (Purchase → Event via resolver)     |
-| 6 | Serialization: JSON + BEVE round-trip                                   |
-| 7a | patch Uncached: single/multi field, partition preservation, re-fetch |
-| 7b | patch L1: cache invalidation + re-fetch                              |
-| 7c | patch L2: Redis invalidation + re-fetch                              |
-| 7d | patch cross-invalidation: Event patch → User L1                   |
-| 8a | erase L1 hint: cache hit vs miss paths                                 |
-| 8b | erase L2 hint: Redis hit vs miss paths                                 |
-| 8c | erase L1+L2 chain: L1 hit, L1 miss/L2 hit, both miss                   |
+| 3 | Cross-invalidation: Event as source (→ User L1)                         |
+| 4 | Cross-invalidation: Event as target (Purchase → Event via resolver)     |
+| 5 | Serialization: JSON + BEVE round-trip                                   |
+| 6a | patch Uncached: single/multi field, partition preservation, re-fetch |
+| 6b | patch L1: cache invalidation + re-fetch                              |
+| 6c | patch cross-invalidation: Event patch → User L1                   |
+| 7 | erase L1 hint: cache hit vs miss paths                                 |
