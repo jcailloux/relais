@@ -134,10 +134,9 @@ struct Invalidate {
 
     /// Batch delete cross-invalidation over the M *distinct* target keys. When
     /// the target exposes the batch facade (`invalidateMany(span)`, every Repo
-    /// does), the M evictions collapse to a single multi-key UNLINK at the L2
-    /// tier (⌈M/1000⌉ commands) instead of M single-key UNLINKs — the same final
-    /// state (oracle: invalidateMany ≡ mono invalidate loop), fewer round-trips.
-    /// A target without the facade falls back to the per-key loop.
+    /// does), the M evictions go through one batch call — the same final state
+    /// (oracle: invalidateMany ≡ mono invalidate loop). A target without the
+    /// facade falls back to the per-key loop.
     template<typename E>
     static io::Task<void> invalidateManyForDelete(std::span<const E> entities) {
         co_await invalidateKeys(targetKeysForDelete<E>(entities));
@@ -268,8 +267,8 @@ struct InvalidateList {
     }
 
 private:
-    /// The mono invalidations run concurrently: their L2 commands share one
-    /// flush instead of one round trip each.
+    /// The mono invalidations run concurrently: a list cache whose hooks
+    /// are asynchronous overlaps their I/O.
     template<typename E>
     static io::Task<void> invalidateAll(std::vector<InvalidationData<E>> data) {
         std::vector<io::Task<void>> tasks;

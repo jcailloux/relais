@@ -7,7 +7,7 @@
  *   1. TestItem    — CRUD, edge cases, multiple entities, serialization
  *   2. TestUser    — CRUD with different entity structure
  *   3. TestPurchase— FK-constrained entity, cross-entity queries
- *   7. Lists       — uncached list queries (cachedList, cachedListAs pass-through)
+ *   7. Lists       — list entity decoded from rows
  *
  * SECTION naming convention:
  *   [find]     — read by primary key
@@ -863,263 +863,38 @@ TEST_CASE("PgRepo - read-only configuration", "[integration][db][base][readonly]
 
 // #############################################################################
 //
-//  7. List queries — uncached pass-through (cachedList, cachedListAs, etc.)
+//  7. List entity — rows decoded into a typed list (TestArticleList::fromRows)
 //
 // #############################################################################
 
 namespace {
 
-// Local repos for uncached list testing
-namespace uncached_list {
+io::Task<TestArticleList> articlesByCategory(const std::string& category, int limit = 10) {
+    auto result = co_await jcailloux::relais::PgProvider::queryArgs(
+        "SELECT id, category, author_id, title, view_count, is_published, published_at, created_at "
+        "FROM relais_test_articles WHERE category = $1 ORDER BY created_at DESC LIMIT $2",
+        category, limit);
+    co_return TestArticleList::fromRows(result);
+}
 
-/**
- * Uncached article list repo — uses cachedList pass-through.
- */
-class UncachedArticleListRepo : public Repo<TestArticleEntity, "test:article:list:uncached", cfg::Uncached> {
-public:
-    static io::Task<std::vector<TestArticleEntity>> getByCategory(
-        const std::string& category, int limit = 10)
-    {
-        co_return co_await cachedList(
-            [category, limit]() -> io::Task<std::vector<TestArticleEntity>> {
-                auto result = co_await jcailloux::relais::PgProvider::queryArgs(
-                    "SELECT id, category, author_id, title, view_count, is_published, published_at, created_at "
-                    "FROM relais_test_articles WHERE category = $1 ORDER BY created_at DESC LIMIT $2",
-                    category, limit);
-                std::vector<TestArticleEntity> entities;
-                for (size_t i = 0; i < result.rows(); ++i) {
-                    if (auto e = entity::generated::TestArticleMapping::fromRow<TestArticleEntity>(result[i]))
-                        entities.push_back(std::move(*e));
-                }
-                co_return entities;
-            },
-            "category", category
-        );
-    }
-
-    static io::Task<std::vector<TestArticleEntity>> getByCategoryTracked(
-        const std::string& category, int limit = 5, int offset = 0)
-    {
-        co_return co_await cachedListTracked(
-            [category, limit, offset]() -> io::Task<std::vector<TestArticleEntity>> {
-                auto result = co_await jcailloux::relais::PgProvider::queryArgs(
-                    "SELECT id, category, author_id, title, view_count, is_published, published_at, created_at "
-                    "FROM relais_test_articles WHERE category = $1 ORDER BY view_count DESC LIMIT $2 OFFSET $3",
-                    category, limit, offset);
-                std::vector<TestArticleEntity> entities;
-                for (size_t i = 0; i < result.rows(); ++i) {
-                    if (auto e = entity::generated::TestArticleMapping::fromRow<TestArticleEntity>(result[i]))
-                        entities.push_back(std::move(*e));
-                }
-                co_return entities;
-            },
-            limit, offset,
-            "category", category
-        );
-    }
-
-    // Expose invalidation methods for testing (no-ops at Base level)
-    static io::Task<size_t> invalidateCategoryGroup(const std::string& category) {
-        co_return co_await invalidateListGroup("category", category);
-    }
-
-    static io::Task<size_t> invalidateCategorySelective(
-        const std::string& category, int64_t sort_val)
-    {
-        co_return co_await invalidateListGroupSelective(sort_val, "category", category);
-    }
-
-    static io::Task<size_t> invalidateCategorySelectiveUpdate(
-        const std::string& category, int64_t old_val, int64_t new_val)
-    {
-        co_return co_await invalidateListGroupSelectiveUpdate(old_val, new_val, "category", category);
-    }
-};
-
-/**
- * Uncached article list repo — uses cachedListAs pass-through (typed list entity).
- */
-class UncachedArticleListAsRepo : public Repo<TestArticleEntity, "test:article:as:list:uncached", cfg::Uncached> {
-public:
-    static io::Task<TestArticleList> getByCategory(
-        const std::string& category, int limit = 10)
-    {
-        co_return co_await cachedListAs<TestArticleList>(
-            [category, limit]() -> io::Task<TestArticleList> {
-                auto result = co_await jcailloux::relais::PgProvider::queryArgs(
-                    "SELECT id, category, author_id, title, view_count, is_published, published_at, created_at "
-                    "FROM relais_test_articles WHERE category = $1 ORDER BY created_at DESC LIMIT $2",
-                    category, limit);
-                co_return TestArticleList::fromRows(result);
-            },
-            "category", category
-        );
-    }
-};
-
-} // namespace uncached_list
 } // anonymous namespace
 
-TEST_CASE("PgRepo - uncached list queries (JSON)", "[integration][db][base][list]") {
+TEST_CASE("PgRepo - list entity from rows", "[integration][db][base][list-as]") {
     TransactionGuard tx;
-    using Repo = uncached_list::UncachedArticleListRepo;
-
-    SECTION("[list] query returns articles from database") {
-        auto userId = insertTestUser("author", "author@test.com", 0);
-        insertTestArticle("tech", userId, "Tech 1", 10, true);
-        insertTestArticle("tech", userId, "Tech 2", 20, true);
-        insertTestArticle("news", userId, "News 1", 30, true);
-
-        auto result = sync(Repo::getByCategory("tech"));
-
-        REQUIRE(result.size() == 2);
-        REQUIRE(result[0].title == "Tech 2");
-        REQUIRE(result[1].title == "Tech 1");
-    }
-
-    SECTION("[list] no caching — new data visible immediately") {
-        auto userId = insertTestUser("author", "author@test.com", 0);
-        insertTestArticle("fresh_cat", userId, "Article 1", 10, true);
-
-        auto result1 = sync(Repo::getByCategory("fresh_cat"));
-        REQUIRE(result1.size() == 1);
-
-        // Insert another article directly in DB
-        insertTestArticle("fresh_cat", userId, "Article 2", 20, true);
-
-        // Second query — no cache, should see the new article immediately
-        auto result2 = sync(Repo::getByCategory("fresh_cat"));
-        REQUIRE(result2.size() == 2);
-    }
-
-    SECTION("[list] different categories return independent results") {
-        auto userId = insertTestUser("author", "author@test.com", 0);
-        insertTestArticle("tech", userId, "Tech 1", 10, true);
-        insertTestArticle("news", userId, "News 1", 20, true);
-
-        auto tech = sync(Repo::getByCategory("tech"));
-        auto news = sync(Repo::getByCategory("news"));
-
-        REQUIRE(tech.size() == 1);
-        REQUIRE(news.size() == 1);
-        REQUIRE(tech[0].category == "tech");
-        REQUIRE(news[0].category == "news");
-    }
-
-    SECTION("[list] empty category returns empty list") {
-        auto result = sync(Repo::getByCategory("nonexistent"));
-        REQUIRE(result.empty());
-    }
-
-    SECTION("[list] limit is respected") {
-        auto userId = insertTestUser("author", "author@test.com", 0);
-        for (int i = 0; i < 5; ++i) {
-            insertTestArticle("many", userId, "Art " + std::to_string(i), i * 10, true);
-        }
-
-        auto result = sync(Repo::getByCategory("many", 3));
-        REQUIRE(result.size() == 3);
-    }
-}
-
-TEST_CASE("PgRepo - uncached tracked list queries", "[integration][db][base][list-tracked]") {
-    TransactionGuard tx;
-    using Repo = uncached_list::UncachedArticleListRepo;
-
-    SECTION("[list-tracked] paginated query returns correct page") {
-        auto userId = insertTestUser("author", "author@test.com", 0);
-        for (int i = 1; i <= 10; ++i) {
-            insertTestArticle("paged", userId, "Art " + std::to_string(i), i * 10, true);
-        }
-
-        // Page 0: top 5 by view_count DESC → view_count 100,90,80,70,60
-        auto page0 = sync(Repo::getByCategoryTracked("paged", 5, 0));
-        REQUIRE(page0.size() == 5);
-        REQUIRE(page0[0].view_count == 100);
-        REQUIRE(page0[4].view_count == 60);
-
-        // Page 1: next 5 → view_count 50,40,30,20,10
-        auto page1 = sync(Repo::getByCategoryTracked("paged", 5, 5));
-        REQUIRE(page1.size() == 5);
-        REQUIRE(page1[0].view_count == 50);
-        REQUIRE(page1[4].view_count == 10);
-    }
-
-    SECTION("[list-tracked] no caching — new data visible on re-query") {
-        auto userId = insertTestUser("author", "author@test.com", 0);
-        insertTestArticle("tracked_cat", userId, "Art 1", 50, true);
-        insertTestArticle("tracked_cat", userId, "Art 2", 40, true);
-
-        auto result1 = sync(Repo::getByCategoryTracked("tracked_cat", 5, 0));
-        REQUIRE(result1.size() == 2);
-
-        // Insert higher view_count article
-        insertTestArticle("tracked_cat", userId, "Art 3", 60, true);
-
-        auto result2 = sync(Repo::getByCategoryTracked("tracked_cat", 5, 0));
-        REQUIRE(result2.size() == 3);
-        REQUIRE(result2[0].view_count == 60);
-    }
-}
-
-TEST_CASE("PgRepo - uncached list invalidation (no-ops)", "[integration][db][base][list-inv]") {
-    TransactionGuard tx;
-    using Repo = uncached_list::UncachedArticleListRepo;
-
-    SECTION("[list-inv] invalidateListGroup returns 0 (no-op)") {
-        auto count = sync(Repo::invalidateCategoryGroup("tech"));
-        REQUIRE(count == 0);
-    }
-
-    SECTION("[list-inv] invalidateListGroupSelective returns 0 (no-op)") {
-        auto count = sync(Repo::invalidateCategorySelective("tech", 42));
-        REQUIRE(count == 0);
-    }
-
-    SECTION("[list-inv] invalidateListGroupSelectiveUpdate returns 0 (no-op)") {
-        auto count = sync(Repo::invalidateCategorySelectiveUpdate("tech", 42, 99));
-        REQUIRE(count == 0);
-    }
-
-    SECTION("[list-inv] invalidateListGroupByKey returns 0 (no-op)") {
-        auto groupKey = Repo::makeGroupKey("category", "tech");
-        auto count = sync(Repo::invalidateListGroupByKey(groupKey, 42));
-        REQUIRE(count == 0);
-    }
-}
-
-TEST_CASE("PgRepo - uncached list queries (listAs)", "[integration][db][base][list-as]") {
-    TransactionGuard tx;
-    using Repo = uncached_list::UncachedArticleListAsRepo;
 
     SECTION("[list-as] query returns list entity") {
         auto userId = insertTestUser("author", "author@test.com", 0);
         insertTestArticle("as_cat", userId, "Article 1", 10, true);
         insertTestArticle("as_cat", userId, "Article 2", 20, true);
 
-        auto result = sync(Repo::getByCategory("as_cat"));
+        auto result = sync(articlesByCategory("as_cat"));
 
         REQUIRE(result.size() == 2);
         REQUIRE_FALSE(result.empty());
     }
 
-    SECTION("[list-as] no caching — new data visible immediately") {
-        auto userId = insertTestUser("author", "author@test.com", 0);
-        insertTestArticle("as_fresh", userId, "Cached", 10, true);
-
-        auto result1 = sync(Repo::getByCategory("as_fresh"));
-        REQUIRE(result1.size() == 1);
-
-        // Insert another article
-        insertTestArticle("as_fresh", userId, "New", 20, true);
-
-        // No cache — should see 2 articles immediately
-        auto result2 = sync(Repo::getByCategory("as_fresh"));
-        REQUIRE(result2.size() == 2);
-    }
-
     SECTION("[list-as] empty category returns empty list") {
-        auto result = sync(Repo::getByCategory("nonexistent"));
+        auto result = sync(articlesByCategory("nonexistent"));
         REQUIRE(result.empty());
     }
 }

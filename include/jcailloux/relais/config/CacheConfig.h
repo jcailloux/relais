@@ -12,17 +12,7 @@ namespace jcailloux::relais::config {
     // =========================================================================
     enum class CacheLevel {
         None,   // DB only (PgRepo)
-        L1,     // RAM -> DB (LocalRepo without Redis)
-        L2,     // Redis -> DB (RedisRepo)
-        L1_L2   // RAM -> Redis -> DB (LocalRepo with Redis)
-    };
-
-    // =========================================================================
-    // L2 serialization format - how entities are stored in Redis
-    // =========================================================================
-    enum class L2Format {
-        Binary,  // BEVE binary (default) - compact and fast
-        Json     // JSON - human-readable, interoperable with non-C++ consumers
+        L1      // RAM -> DB (LocalRepo)
     };
 
     // =========================================================================
@@ -41,7 +31,7 @@ namespace jcailloux::relais::config {
     //
     // Usage:
     //   using MyRepo = Repo<MyEntity, "MyEntity">;                 // Repo default: Local (L1)
-    //   using MyRepo = Repo<MyEntity, "MyEntity", config::Both>;   // preset
+    //   using MyRepo = Repo<MyEntity, "MyEntity", config::Uncached>; // preset
     //   using MyRepo = Repo<MyEntity, "MyEntity",
     //       config::Local.with_l1_ttl(30min).with_read_only()>;    // customized
     //
@@ -61,24 +51,6 @@ namespace jcailloux::relais::config {
         // count. 2^12 = 4096 slots = 32 KB/repo. Raise it for write-heavy repos.
         uint8_t recheck_slots_log2 = 12;
 
-        // L2 (Redis cache)
-        Duration l2_ttl = std::chrono::hours(4);
-        bool l2_refresh_on_get = false;
-        L2Format l2_format = L2Format::Binary;
-
-        // Cross-instance L2 coherence — set TRUE when this Redis is shared by
-        // more than one process. A deployment FACT (is L2 shared?), not a
-        // behavior knob.
-        //  - false (default, single-instance): the read-fill recheck is the
-        //    cheap process-local counter (no extra Redis ops); L2 coherence is
-        //    guaranteed within the process, bounded by l2_ttl across instances.
-        //  - true (multi-instance): the recheck authority moves to Redis (a
-        //    sharded generation hash, HINCRBY on invalidation, conditional
-        //    setIfGen at fill) so a fill straddling ANY instance's invalidation
-        //    is rejected. Adds an HGET at miss + an EVAL at fill (cold path
-        //    only; the L2 hit stays a plain GET).
-        bool l2_shared_across_instances = false;
-
         // Fluent chainable modifiers (compile-time only)
         consteval CacheConfig with_cache_level(CacheLevel v) const { auto c = *this; c.cache_level = v; return c; }
         consteval CacheConfig with_read_only(bool v = true) const { auto c = *this; c.read_only = v; return c; }
@@ -86,10 +58,6 @@ namespace jcailloux::relais::config {
         consteval CacheConfig with_l1_ttl(Duration v) const { auto c = *this; c.l1_ttl = v; return c; }
         consteval CacheConfig with_l1_chunk_count_log2(uint8_t v) const { auto c = *this; c.l1_chunk_count_log2 = v; return c; }
         consteval CacheConfig with_recheck_slots_log2(uint8_t v) const { auto c = *this; c.recheck_slots_log2 = v; return c; }
-        consteval CacheConfig with_l2_ttl(Duration v) const { auto c = *this; c.l2_ttl = v; return c; }
-        consteval CacheConfig with_l2_refresh_on_get(bool v) const { auto c = *this; c.l2_refresh_on_get = v; return c; }
-        consteval CacheConfig with_l2_format(L2Format v) const { auto c = *this; c.l2_format = v; return c; }
-        consteval CacheConfig with_l2_shared_across_instances(bool v = true) const { auto c = *this; c.l2_shared_across_instances = v; return c; }
 
         constexpr auto operator<=>(const CacheConfig&) const = default;
     };
@@ -102,27 +70,9 @@ namespace jcailloux::relais::config {
     /// E.g., logs history, write-only tables.
     inline constexpr CacheConfig Uncached{};
 
-    /// RAM cache only (L1) - fast local cache, no Redis.
-    /// Perfect for data always accessed via the same API instance.
+    /// RAM cache (L1) in front of the database.
     /// E.g., guild/user-related data.
     inline constexpr CacheConfig Local{ .cache_level = CacheLevel::L1 };
-
-    /// Redis cache only (L2) - shared cache across instances, no local RAM cache.
-    /// Perfect for data that can be accessed via any API instance.
-    /// E.g., admin metrics, global counters.
-    inline constexpr CacheConfig Redis{
-        .cache_level = CacheLevel::L2,
-        .l2_ttl = std::chrono::hours(4),
-    };
-
-    /// Full caching (L1 + L2) - RAM cache backed by Redis.
-    /// Typical use-case: short L1 TTL + long L2 TTL.
-    /// E.g., slash commands data, feature flags, DB statistics.
-    inline constexpr CacheConfig Both{
-        .cache_level = CacheLevel::L1_L2,
-        .l1_ttl = std::chrono::minutes(1),
-        .l2_ttl = std::chrono::hours(1),
-    };
 
 }  // namespace jcailloux::relais::config
 

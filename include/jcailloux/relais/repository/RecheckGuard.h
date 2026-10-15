@@ -11,8 +11,8 @@
 
 namespace jcailloux::relais {
 
-/// Read-fill recheck guard — a sharded generation counter shared by the L1
-/// (LocalRepo) and L2 (RedisRepo) layers of a single repository.
+/// Read-fill recheck guard — a sharded generation counter for the L1 tier
+/// (LocalRepo) of a single repository.
 ///
 /// The bug it closes: `find` on a miss fetches from a lower tier and stores
 /// the result unconditionally. A reader whose fetch straddles a concurrent
@@ -40,11 +40,8 @@ namespace jcailloux::relais {
 /// (µs–ms), not the entry lifetime. A false "unchanged" would need 2⁶⁴ bumps
 /// during one fetch → impossible. `uint64_t` for comfort; no backstop needed.
 ///
-/// Shared across the mixin chain: LocalRepo and RedisRepo for the same repo
-/// instantiate RecheckGuard<Name, Key, SlotsLog2> identically → one static
-/// array per repo, visible to both tiers. (In an L2-only config LocalRepo is
-/// absent, so RedisRepo both bumps and rechecks; in L1+L2 both layers bump the
-/// same array — a redundant bump is harmless, the counter is monotonic.)
+/// One static array per RecheckGuard<Name, Key, SlotsLog2> instantiation,
+/// i.e. per repository.
 template<config::FixedString Name, typename Key, std::size_t SlotsLog2>
 struct RecheckGuard {
     static constexpr std::size_t kSlots = std::size_t{1} << SlotsLog2;

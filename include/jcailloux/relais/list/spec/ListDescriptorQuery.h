@@ -76,7 +76,7 @@ public:
     [[nodiscard]] uint32_t offset() const noexcept { return params_.offset; }
     [[nodiscard]] const ListQueryParams<Descriptor>& params() const noexcept { return params_; }
 
-    /// Canonical key for filters+sort (Redis group tracking), computed on each call.
+    /// Canonical key for filters+sort (the page key's prefix), computed on each call.
     [[nodiscard]] std::string groupKey() const {
         std::string key;
         appendGroupKey<Descriptor>(key, *this);

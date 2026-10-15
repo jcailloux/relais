@@ -11,7 +11,7 @@
 #include <vector>
 
 #include "jcailloux/relais/io/Task.h"
-#include "jcailloux/relais/repository/RedisRepo.h"
+#include "jcailloux/relais/repository/PgRepo.h"
 #include "jcailloux/relais/repository/KeyDedup.h"
 #include "jcailloux/relais/repository/RecheckGuard.h"
 #include "jcailloux/relais/Log.h"
@@ -38,44 +38,30 @@ namespace jcailloux::relais {
  * LocalRepo adds only domain-specific concerns:
  * - Generation counter for stale write prevention
  * - CacheView wrapping for find() results
- * - Mixin chain delegation (Base = RedisRepo or PgRepo)
- *
- * Supports two modes based on Cfg.cache_level:
- * - CacheLevel::L1:    RAM -> Database (Redis bypassed)
- * - CacheLevel::L1_L2: RAM -> Redis -> Database (full hierarchy)
+ * - Mixin chain delegation (Base = PgRepo)
  *
  * Note: L1 config constraints are verified in Repo.h to avoid
  * eager evaluation issues with std::conditional_t.
  */
 template<typename E, config::FixedString Name, config::CacheConfig Cfg, typename Key>
 requires CacheableEntity<E>
-class LocalRepo : public std::conditional_t<
-    Cfg.cache_level == config::CacheLevel::L1,
-    PgRepo<E, Name, Cfg, Key>,
-    RedisRepo<E, Name, Cfg, Key>
-> {
-    static constexpr bool HasRedis = (Cfg.cache_level == config::CacheLevel::L1_L2);
+class LocalRepo : public PgRepo<E, Name, Cfg, Key> {
     // Materialize the L1 TTL ns into a scalar constant: GCC miscompiles
     // std::chrono::nanoseconds(Cfg.l1_ttl) — a duration built straight from a
     // class-type NTTP subobject — under -fsanitize=thread (it folds to 0 at the
     // construction site, though a plain field read is fine). Building durations
-    // from kL1TtlNs sidesteps it. Mirrors RedisRepo::kL2TtlNs.
+    // from kL1TtlNs sidesteps it.
     static constexpr int64_t kL1TtlNs = Cfg.l1_ttl.ns;
     static constexpr bool HasTTL = (kL1TtlNs > 0);
     static constexpr bool HasGDSF = cache::GDSFPolicy::enabled;
     static constexpr bool HasCleanup = HasGDSF || HasTTL;
 
-    using Base = std::conditional_t<
-        HasRedis,
-        RedisRepo<E, Name, Cfg, Key>,
-        PgRepo<E, Name, Cfg, Key>
-    >;
+    using Base = PgRepo<E, Name, Cfg, Key>;
 
     using Metadata = cache::CacheMetadata<HasGDSF, HasTTL>;
     using Tier = cache::CacheTier<Key, E, Metadata>;
 
-    /// Read-fill recheck guard — shared with RedisRepo for the same repo
-    /// (same Name/Key/SlotsLog2 → one static slot array seen by both tiers).
+    /// Read-fill recheck guard (one static slot array per Name/Key/SlotsLog2).
     using Recheck = RecheckGuard<Name, Key, Cfg.recheck_slots_log2>;
 
     /// TTL in seconds (compile-time, for metadata construction).
@@ -100,7 +86,7 @@ public:
     // Queries
     // =========================================================================
 
-    /// Find by ID with L1 -> (L2) -> DB fallback.
+    /// Find by ID with L1 -> DB fallback.
     /// L1 hit: zero overhead (Immediate holds CacheView directly, no Task).
     static io::Immediate<cache::CacheView<E>> find(const Key& id) {
         auto hit = tier().find(id);
@@ -114,15 +100,14 @@ public:
     }
 
     /// Batched multi-id read. Probes L1 for every (deduplicated) id under a
-    /// single batch EpochGuard, then issues one MGET (L2) + one ANY (L3) over
-    /// the L1 misses via the lower tiers. Returns a guarded MultiView<E>:
+    /// single batch EpochGuard, then issues one ANY (L3) over the L1 misses.
+    /// Returns a guarded MultiView<E>:
     /// view[i] maps to ids[i] (nullptr = absent in every tier), L1 hits are
     /// zero-copy slot pointers kept alive by the batch guard.
     ///
     /// Duplicate ids collapse to one key downstream; their positions share one
     /// entry. Empty ids → empty view (no guard, no I/O, no frame). All-L1-hit →
-    /// synchronous Immediate (no coroutine frame). The detached L2 warm-fill of
-    /// the L3 misses is handled one layer down (RedisRepo::findManyRaw).
+    /// synchronous Immediate (no coroutine frame).
     static io::Immediate<cache::MultiView<E>> findMany(std::span<const Key> ids) {
         const size_t n = ids.size();
         if (n == 0) return cache::MultiView<E>{};
@@ -205,7 +190,7 @@ public:
     /// superseded cleanly: onMutation drives the read-fill recheck and
     /// bumpGeneration rejects a straddling stale fetch — this is upsert-L1 =
     /// update-L1, not insert. On an uncertain outcome, evict L1 by precaution
-    /// (local, cannot fail); L2 was already evicted as RedisRepo unwound.
+    /// (local, cannot fail).
     static io::Task<cache::CacheView<E>> upsert(const E& entity)
         requires UpsertableEntity<E, Key> && HasUpsertSql<E> && (!Cfg.read_only)
     {
@@ -236,7 +221,7 @@ public:
     /// PgRepo::patchRaw). L1 is left as is until the commit, as for update:
     /// the committed row is then stored through (see settlePatched). Uncertain:
     /// keep the L1 copy in `uncertain_before` (see eraseOutcome), then evict L1
-    /// by precaution (L2 was already evicted as RedisRepo unwound).
+    /// by precaution.
     template<bool WithBefore, typename... Updates>
     static io::Task<typename Base::PatchedRow> patchRow(
         const Key& id, std::optional<E>* uncertain_before, Updates&&... updates)
@@ -314,7 +299,7 @@ protected:
             co_return outcome;
         } catch (const io::PgUncertainError&) {
             // Uncertain: the DELETE may have committed. Evict L1 by precaution
-            // (local, cannot fail). L2 was already evicted as this unwound.
+            // (local, cannot fail).
             keepUncertainBefore(id, uncertain_before);
             evict(id);
             throw;
@@ -348,7 +333,6 @@ protected:
         } catch (const io::PgUncertainError&) {
             // Uncertain: the UPDATE may have committed. Evict L1 by precaution so
             // the next read re-fetches; the L1 evict is local and cannot fail.
-            // RedisRepo already evicted L2 before this unwound (L2-before-L1).
             keepUncertainBefore(id, uncertain_before);
             evict(id);
             throw;
@@ -356,44 +340,25 @@ protected:
     }
 
 public:
-    /// Invalidate L1 and L2 for a key, L2 first then L1: the L1 generation bump
-    /// must land after the UNLINK so a concurrent L1-miss that read the stale L2
-    /// entry is rejected by the read-fill recheck. L1-first would let it survive
-    /// in the shared L1 until TTL even when the UNLINK succeeds (cf. invalidateManyCritical).
+    /// Invalidate L1 for a key (generation bump, then evict).
     static io::Task<void> invalidate(const Key& id) {
-        if constexpr (HasRedis) {
-            co_await Base::evictL2OrSelfHeal(id);
-        }
         evict(id);
+        co_return;
     }
 
-    /// Batch invalidation common path — L1 entity tier. Delegate to L2/L3 first,
-    /// then point-evict L1 (one per key, never purgeAll). L2-before-L1 matters: the
-    /// L1 evict's generation bump must land after the UNLINK so the read-fill
-    /// recheck rejects a racing L1-miss that read the stale L2 entry. L1-first would
-    /// let it survive in the shared L1 until TTL — the ordering is the invariant.
+    /// Batch invalidation common path — L1 entity tier: point-evict L1 (one per
+    /// key, never purgeAll). The L1 entity tier has no deferred work.
     template<bool WithLists = true>
     static io::Task<void> invalidateManyCritical(std::span<const E> entities) {
-        co_await Base::template invalidateManyCritical<WithLists>(entities);
         for (const auto& e : entities) evict(e.key());
+        co_return;
     }
 
-    /// Rows changed in place: L2 first, then the L1 point-evicts (same ordering
-    /// invariant). No store-through: the eviction suffices.
+    /// Rows changed in place: the L1 point-evicts. No store-through: the
+    /// eviction suffices.
     static io::Task<void> invalidateManyUpdatedCritical(std::span<const Change<E>> changes) {
-        co_await Base::invalidateManyUpdatedCritical(changes);
         for (const auto& c : changes) evict(c.after.key());
-    }
-
-    static io::Task<void> invalidateManyUpdatedDeferred(std::span<const Change<E>> changes) {
-        co_await Base::invalidateManyUpdatedDeferred(changes);
-    }
-
-    /// L1 entity tier has no deferred work — the point-evict is critical RAM.
-    /// Pass the deferred cascade down to the own-list / cross-target tiers.
-    template<bool WithLists = true>
-    static io::Task<void> invalidateManyDeferred(std::span<const E> entities) {
-        co_await Base::template invalidateManyDeferred<WithLists>(entities);
+        co_return;
     }
 
     /// Invalidate L1 cache only. Non-coroutine since there is no async work.
@@ -514,13 +479,6 @@ private:
                     },
                     .name = static_cast<const char*>(Name)
                 });
-                if constexpr (HasRedis) {
-                    // Let the L2 layer's deferred self-heal reach the shared L1:
-                    // RedisRepo cannot name this derived tier, so register its
-                    // point-evict as the hook the retry calls after a confirmed
-                    // UNLINK (kills a stale entry a concurrent read re-stored).
-                    Base::l1SelfHealHook_ = &LocalRepo::evict;
-                }
                 // Release: publish only after the Tier is fully enrolled.
                 tier_ptr_.store(&instance, std::memory_order_release);
             }
@@ -567,7 +525,7 @@ private:
     // Slow paths (delegated to CacheTier::findOrFetch with inflight dedup)
     // =========================================================================
 
-    /// Slow path for find(): L1 miss -> dedup -> (L2) -> DB -> cache.
+    /// Slow path for find(): L1 miss -> dedup -> DB -> cache.
     /// Snapshot the recheck slot at fetch-start; the admit gate skips the L1
     /// store if a mutation landed during the fetch (read-fill recheck).
     static io::Task<cache::CacheView<E>> findSlow(const Key& id) {
@@ -587,7 +545,7 @@ private:
         co_return {};
     }
 
-    /// Slow path for findJson(): L1 miss -> dedup -> (L2) -> DB -> cache -> JSON.
+    /// Slow path for findJson(): L1 miss -> dedup -> DB -> cache -> JSON.
     static io::Task<std::string> findJsonSlow(const Key& id) {
         uint64_t snap = Recheck::snapshot(id);
         auto hit = co_await tier().findOrFetch(
@@ -602,7 +560,7 @@ private:
         co_return std::string{};
     }
 
-    /// Slow path for findBinary(): L1 miss -> dedup -> (L2) -> DB -> cache -> binary.
+    /// Slow path for findBinary(): L1 miss -> dedup -> DB -> cache -> binary.
     static io::Task<std::vector<uint8_t>> findBinarySlow(const Key& id)
         requires HasBinarySerialization<E>
     {
@@ -619,8 +577,8 @@ private:
         co_return std::vector<uint8_t>{};
     }
 
-    /// Miss path for findMany: fetch the L1 misses through the lower tiers (one
-    /// MGET + one ANY), force-insert each into L1 — same as the single-find
+    /// Miss path for findMany: fetch the L1 misses from L3 (one ANY),
+    /// force-insert each into L1 — same as the single-find
     /// fetch path in the non-GDSF build — and point the view at the fresh slots.
     /// The batch guard is held across the await so both the pre-await L1 hits
     /// and the freshly stored misses stay valid. Absent ids keep their nullptr.
@@ -681,7 +639,7 @@ private:
     // Read-fill recheck — stale write prevention (lock-free, cross-thread)
     // =========================================================================
     //
-    // Delegates to RecheckGuard (shared with RedisRepo). bumpGeneration is the
+    // Delegates to RecheckGuard. bumpGeneration is the
     // write-side hook; the read side snapshots at fetch-start and gates the
     // store. See RecheckGuard.h for the full rationale.
 

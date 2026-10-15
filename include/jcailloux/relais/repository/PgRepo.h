@@ -596,18 +596,6 @@ public:
         co_return;
     }
 
-    template<typename... GroupArgs>
-    static std::string makeGroupKey(GroupArgs&&... groupParts) {
-        return makeListGroupKey(std::forward<GroupArgs>(groupParts)...);
-    }
-
-    static io::Task<size_t> invalidateListGroupByKey(
-        [[maybe_unused]] const std::string& groupKey,
-        [[maybe_unused]] int64_t entity_sort_val)
-    {
-        co_return 0;
-    }
-
     static io::Task<size_t> invalidateAllListGroups()
     {
         co_return 0;
@@ -620,19 +608,15 @@ protected:
     // =====================================================================
     //
     // The batch invalidation cascade (invalidateMany/eraseMany/...) is split into
-    // two passes that each flow through the mixin chain (fire-and-forget cleanup):
-    //   - invalidateManyCritical — the latency-critical, awaited work: L1 evict +
-    //     L2 entity UNLINK + gen bump + L1 list-tracker bump. Kept synchronous so
-    //     erase*/invalidate* return only once the entity tier is coherent (the
-    //     read-fill recheck cannot reject a strictly-after stale entry, so the
-    //     entity UNLINK must precede the caller's return).
-    //   - invalidateManyDeferred — the detachable, order-free work: deduplicated
-    //     cross-target invalidation + selective L2 list EVALs. Fired fire-and-forget
-    //     by the facade (invalidate-stale tolerated; L1 list reads stay guarded by
-    //     the synchronous tracker bump, L2 list/cross-target staleness is l2_ttl-
-    //     bounded). Repo::invalidateManyImpl awaits both — the reference path the
-    //     cascade unit tests reach via TestInternals.
-    // L3 (this layer) owns no entity cache, so both passes are no-op terminators.
+    // two passes that each flow through the mixin chain:
+    //   - invalidateManyCritical — the own tiers, awaited: L1 evict + gen bump +
+    //     L1 list-tracker bump. RAM only; erase*/invalidate* return once the
+    //     entity tier is coherent.
+    //   - invalidateManyDeferred — the deduplicated cross-target invalidation
+    //     (InvalidationMixin), whose resolvers may query the database. Fired
+    //     fire-and-forget by the facade (invalidate-stale tolerated, bounded by
+    //     the targets' l1_ttl).
+    // L3 (this layer) owns no cache, so both passes are no-op terminators.
     //
     // WithLists gates the OWN-list tier (ListMixin): eraseMany passes true (the
     // entity left the table → its list pages change, like mono erase), while
@@ -645,7 +629,6 @@ protected:
         co_return;
     }
 
-    template<bool WithLists = true>
     static io::Task<void> invalidateManyDeferred(
         [[maybe_unused]] std::span<const E> entities) {
         co_return;
@@ -665,17 +648,11 @@ protected:
         co_return;
     }
 
-    /// Terminal no-ops for the predicate list fast-path (eraseWhere). L3 has no
+    /// Terminal no-op for the predicate list fast-path (eraseWhere). L3 has no
     /// list cache; the real work lives in ListMixin when present. Always-present
     /// bottom of the chain so the call resolves even without a ListDescriptor.
     template<typename Desc>
     static io::Task<void> invalidateWhereListsCritical(
-        [[maybe_unused]] const list::spec::Filters<Desc>& predicate) {
-        co_return;
-    }
-
-    template<typename Desc>
-    static io::Task<void> invalidateWhereListsDeferred(
         [[maybe_unused]] const list::spec::Filters<Desc>& predicate) {
         co_return;
     }
@@ -1363,8 +1340,8 @@ protected:
     //
     // When the BatchScheduler coalesces identical writes (same SQL + same
     // params), followers receive the leader's result with coalesced=true.
-    // Upper layers (RedisRepo, LocalRepo) use this to skip redundant
-    // cache operations (L1 evict, L2 Redis SET/DEL).
+    // Upper layers (LocalRepo) use this to skip redundant cache operations
+    // (L1 evict).
 
     /// Outcome of a keyed update. `before` and `after` are the row the update
     /// replaced and the committed one, filled only when the tiers above asked
@@ -1483,124 +1460,6 @@ protected:
         } catch (const io::PgError& e) {
             RELAIS_LOG_ERROR << name() << ": erase error - " << e.what();
             co_return EraseOutcome{};
-        }
-    }
-
-    // =====================================================================
-    // List query pass-through methods (no caching at L3 level)
-    // =====================================================================
-
-    template<typename... Args>
-    static std::string makeListCacheKey(Args&&... args) {
-        std::string key = std::string(name()) + ":list";
-        ((key += ":" + toString(std::forward<Args>(args))), ...);
-        return key;
-    }
-
-    template<typename... GroupArgs>
-    static std::string makeListGroupKey(GroupArgs&&... groupParts) {
-        std::string key = std::string(name()) + ":list";
-        ((key += ":" + toString(std::forward<GroupArgs>(groupParts))), ...);
-        return key;
-    }
-
-    template<typename QueryFn, typename... KeyArgs>
-    static io::Task<std::vector<E>> cachedList(
-        QueryFn&& query,
-        [[maybe_unused]] KeyArgs&&... keyParts)
-    {
-        co_return co_await query();
-    }
-
-    template<typename QueryFn, typename... GroupArgs>
-    static io::Task<std::vector<E>> cachedListTracked(
-        QueryFn&& query,
-        [[maybe_unused]] int limit,
-        [[maybe_unused]] int offset,
-        [[maybe_unused]] GroupArgs&&... groupParts)
-    {
-        co_return co_await query();
-    }
-
-    template<typename QueryFn, typename HeaderBuilder, typename... GroupArgs>
-    static io::Task<std::vector<E>> cachedListTrackedWithHeader(
-        QueryFn&& query,
-        [[maybe_unused]] int limit,
-        [[maybe_unused]] int offset,
-        [[maybe_unused]] HeaderBuilder&& headerBuilder,
-        [[maybe_unused]] GroupArgs&&... groupParts)
-    {
-        co_return co_await query();
-    }
-
-    template<typename... GroupArgs>
-    static io::Task<size_t> invalidateListGroup(
-        [[maybe_unused]] GroupArgs&&... groupParts)
-    {
-        co_return 0;
-    }
-
-    template<typename... GroupArgs>
-    static io::Task<size_t> invalidateListGroupSelective(
-        [[maybe_unused]] int64_t entity_sort_val,
-        [[maybe_unused]] GroupArgs&&... groupParts)
-    {
-        co_return 0;
-    }
-
-    template<typename... GroupArgs>
-    static io::Task<size_t> invalidateListGroupSelectiveUpdate(
-        [[maybe_unused]] int64_t old_sort_val,
-        [[maybe_unused]] int64_t new_sort_val,
-        [[maybe_unused]] GroupArgs&&... groupParts)
-    {
-        co_return 0;
-    }
-
-    template<typename ListEntity, typename QueryFn, typename... KeyArgs>
-    static io::Task<ListEntity> cachedListAs(
-        QueryFn&& query,
-        [[maybe_unused]] KeyArgs&&... keyParts)
-    {
-        co_return co_await query();
-    }
-
-    template<typename ListEntity, typename QueryFn, typename... GroupArgs>
-    static io::Task<ListEntity> cachedListAsTracked(
-        QueryFn&& query,
-        [[maybe_unused]] int limit,
-        [[maybe_unused]] int offset,
-        [[maybe_unused]] GroupArgs&&... groupParts)
-    {
-        co_return co_await query();
-    }
-
-    template<typename ListEntity, typename QueryFn, typename HeaderBuilder, typename... GroupArgs>
-    static io::Task<ListEntity> cachedListAsTrackedWithHeader(
-        QueryFn&& query,
-        [[maybe_unused]] int limit,
-        [[maybe_unused]] int offset,
-        [[maybe_unused]] HeaderBuilder&& headerBuilder,
-        [[maybe_unused]] GroupArgs&&... groupParts)
-    {
-        co_return co_await query();
-    }
-
-    template<typename T>
-    static std::string toString(const T& value) {
-        if constexpr (is_tuple_v<T>) {
-            std::string result;
-            std::apply([&](const auto&... parts) {
-                bool first = true;
-                ((result += (first ? "" : ":"),
-                  result += toString(parts),
-                  first = false), ...);
-            }, value);
-            return result;
-        } else if constexpr (std::is_integral_v<T>) {
-            return std::to_string(value);
-        } else {
-            return std::string(value);
         }
     }
 

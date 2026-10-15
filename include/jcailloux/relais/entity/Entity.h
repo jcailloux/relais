@@ -114,7 +114,7 @@ public:
     // =========================================================================
     //
     // On-demand serialization (allocates each call). For cached serialization,
-    // use Repo::findJson() / Repo::findBinary() which leverage L1/L2 cache.
+    // use Repo::findJson() / Repo::findBinary() which leverage the L1 cache.
 
     [[nodiscard]] std::vector<uint8_t> binary() const {
         std::vector<uint8_t> buf;
