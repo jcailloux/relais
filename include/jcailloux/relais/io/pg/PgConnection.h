@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -126,8 +127,9 @@ public:
     // (tests/benches) compiling unchanged.
     //
     // `settle` decides what a write failing uncertainly on this connection must
-    // wait for (settleTicket()). Terminate and Await name the backend, read here
-    // within acquire_timeout; Delay and Off add no round-trip.
+    // wait for (settleTicket()). Terminate and Await name the backend, and Delay
+    // without a delay reads the server's statement_timeout, both here within
+    // acquire_timeout; a given delay and Off add no round-trip.
     static Task<PgConnection> connect(Io& io, const char* conninfo,
                                       std::chrono::nanoseconds acquire_timeout = {},
                                       std::chrono::nanoseconds query_timeout = {},
@@ -147,6 +149,8 @@ public:
         pgconn.settle_ = settle;
         if (settle.mode == UncertainSettle::Terminate || settle.mode == UncertainSettle::Await)
             co_await pgconn.readBackendId(acquire_timeout);
+        else if (settle.mode == UncertainSettle::Delay && settle.delay.count() <= 0)
+            co_await pgconn.readStatementTimeout(acquire_timeout);
         co_return std::move(pgconn);
     }
 
@@ -154,9 +158,17 @@ public:
     /// settle mode does not need it or the read failed.
     [[nodiscard]] const BackendId& backendId() const noexcept { return backend_; }
 
+    /// The wait that settles an uncertain write in mode Delay: the configured
+    /// delay, else the server's statement_timeout plus kSettleMargin; 0 when
+    /// nothing bounds a write.
+    [[nodiscard]] std::chrono::milliseconds settleDelay() const noexcept {
+        return settle_.mode == UncertainSettle::Delay ? settle_.delay
+                                                       : std::chrono::milliseconds{0};
+    }
+
     /// What a write that failed uncertainly on this connection must wait for
     /// before its outcome is final. Null when there is nothing to settle: mode
-    /// Off, Delay without a delay, or a backend that could not be named.
+    /// Off, Delay with nothing to bound a write, or a backend that could not be named.
     [[nodiscard]] std::shared_ptr<SettleTicket> settleTicket() const {
         switch (settle_.mode) {
             case UncertainSettle::Terminate:
@@ -357,22 +369,44 @@ private:
         static constexpr const char* kSql =
             "SELECT pid, backend_start::text FROM pg_stat_activity "
             "WHERE pid = pg_backend_pid()";
+        std::optional<PgResult> r = co_await settleQuery(kSql, acquire_timeout,
+            "cannot name the backend of a connection, its uncertain writes will not be settled");
+        if (r && r->rows() == 1) {
+            backend_.pid = (*r)[0].get<int32_t>(0);
+            backend_.backend_start = (*r)[0].get<std::string>(1);
+        }
+    }
+
+    // Delay without a configured delay: the server's statement_timeout bounds
+    // a write. Read in milliseconds; 0 (no bound) leaves nothing to settle.
+    Task<void> readStatementTimeout(std::chrono::nanoseconds acquire_timeout) {
+        static constexpr const char* kSql =
+            "SELECT setting::bigint FROM pg_settings WHERE name = 'statement_timeout'";
+        std::optional<PgResult> r = co_await settleQuery(kSql, acquire_timeout,
+            "cannot read statement_timeout, uncertain writes will not be settled");
+        if (r && r->rows() == 1) {
+            const auto ms = (*r)[0].get<int64_t>(0);
+            if (ms > 0) settle_.delay = std::chrono::milliseconds{ms} + kSettleMargin;
+        }
+    }
+
+    // Runs a settle setup query, nullopt when the server refuses it.
+    Task<std::optional<PgResult>> settleQuery(const char* sql,
+                                              std::chrono::nanoseconds acquire_timeout,
+                                              const char* refused) {
         const auto query_timeout = std::exchange(query_timeout_, acquire_timeout);
+        std::optional<PgResult> r;
         try {
-            PgResult r = co_await query(kSql);
-            if (r.rows() == 1) {
-                backend_.pid = r[0].get<int32_t>(0);
-                backend_.backend_start = r[0].get<std::string>(1);
-            }
+            r = co_await query(sql);
         } catch (const PgQueryTimeout&) {
-            throw PgPoolTimeout("backend identity exceeded acquire_timeout");
+            throw PgPoolTimeout("settle setup exceeded acquire_timeout");
         } catch (const PgConnectionLost& e) {
             throw PgConnectionError(e.what());
         } catch (const PgError& e) {
-            RELAIS_LOG_WARN << "relais: cannot name the backend of a connection, "
-                               "its uncertain writes will not be settled: " << e.what();
+            RELAIS_LOG_WARN << "relais: " << refused << ": " << e.what();
         }
         query_timeout_ = query_timeout;
+        co_return r;
     }
 
     void resetPipelineBookkeeping() noexcept {

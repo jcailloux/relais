@@ -61,6 +61,10 @@ struct IoPoolConfig {
     std::chrono::milliseconds query_timeout{30000};
     std::chrono::milliseconds startup_timeout{30000};
 
+    // How an uncertain write is settled; see PgPoolConfig.
+    UncertainSettle uncertain_settle = UncertainSettle::Terminate;
+    std::chrono::milliseconds settle_delay{0};
+
     // Core pinning
     bool pin_to_cores = true;
     int first_core = 1;  // Avoid core 0 (OS/IRQ)
@@ -198,7 +202,9 @@ public:
                             {.min_connections = config.pg_min_conns_per_worker,
                              .max_connections = config.pg_max_conns_per_worker,
                              .acquire_timeout = config.acquire_timeout,
-                             .query_timeout = config.query_timeout});
+                             .query_timeout = config.query_timeout,
+                             .uncertain_settle = config.uncertain_settle,
+                             .settle_delay = config.settle_delay});
 
                         // Batch scheduler — owned per worker (shared so the
                         // thread_local providers can co-own it).
