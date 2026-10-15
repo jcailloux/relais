@@ -35,7 +35,7 @@ concept HasSorts = requires {
 
 /// A filter set: an entity + a tuple of filters, no sort/pagination required.
 /// This is the predicate-only substrate the filter core operates on (Filters,
-/// FilterTags, buildWhereClause, groupKey, encodeEntityFilterBlob, extractTags).
+/// FilterTags, buildWhereClause, groupKey, extractTags).
 /// A ListDescriptor is one consumer; eraseWhere/invalidateWhere is another. An
 /// entity may declare filters WITHOUT a cached list and still satisfy this.
 template<typename Descriptor>
