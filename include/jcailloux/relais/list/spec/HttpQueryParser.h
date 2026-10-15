@@ -131,7 +131,7 @@ std::vector<typename FilterType::element_type> parseInList(const std::string& st
 // =============================================================================
 // HTTP Query Parser - Auto-parse filters from HTTP request
 //
-// Canonical encoders (groupKey/cacheKey/encodeEntityFilterBlob/filterSchema)
+// Canonical encoders (groupKey/cacheKey)
 // live in CanonicalEncoding.h — this header is the HTTP adapter only.
 // =============================================================================
 
