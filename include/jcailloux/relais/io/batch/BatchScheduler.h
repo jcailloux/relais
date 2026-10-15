@@ -22,6 +22,7 @@
 #include "jcailloux/relais/io/pg/PgPool.h"
 #include "jcailloux/relais/io/pg/PgResult.h"
 #include "jcailloux/relais/io/pg/PgParams.h"
+#include "jcailloux/relais/io/pg/SettleQueue.h"
 #include "jcailloux/relais/io/batch/TimingEstimator.h"
 #include "jcailloux/relais/io/batch/WriteAffinity.h"
 
@@ -81,6 +82,7 @@ public:
         , pg_pool_(std::move(pg_pool))
         , pg_gate_{max_concurrent}
         , pg_write_fanout_{writeFanout(max_concurrent)}
+        , settle_queue_{io_, pg_pool_}
     {}
 
 #ifdef RELAIS_BUILDING_TESTS
@@ -232,6 +234,14 @@ public:
 
     /// Diagnostic: in-flight detached fire coroutines (loop-thread only).
     [[nodiscard]] size_t inflightDetached() const noexcept { return detached_inflight_; }
+
+    /// The queue settling this loop's uncertain writes (for testing/diagnostics).
+    /// Its pending tickets do not hold teardown back: destroying the scheduler
+    /// abandons them, and the process exits with the caches they protect.
+    [[nodiscard]] const SettleQueue<Io>& settleQueue() const noexcept { return settle_queue_; }
+#ifdef RELAIS_BUILDING_TESTS
+    [[nodiscard]] SettleQueue<Io>& settleQueue() noexcept { return settle_queue_; }
+#endif
 
 private:
     // =========================================================================
@@ -1112,7 +1122,7 @@ private:
             // covers both the acquire timeout (no conn yet) and a pipeline error.
             // The ticket goes on before the exception_ptr is taken: every waiter
             // and follower then shares it.
-            if (guard) attachSettleTicket(guard->conn());
+            if (guard) settleUncertain(guard->conn());
             auto eptr = std::current_exception();
             if (guard) { try { guard->conn().exitPipelineMode(); } catch (...) {} }
             for (auto* e : entries) {
@@ -1227,7 +1237,7 @@ private:
             try {
                 result = co_await guard.conn().queryParams(entry.sql, entry.params);
             } catch (...) {
-                attachSettleTicket(guard.conn());
+                settleUncertain(guard.conn());
                 throw;
             }
         }
@@ -1249,13 +1259,15 @@ private:
     // =========================================================================
 
     /// Called from a handler on the write path: an uncertain failure gets the
-    /// settle ticket of the connection that sent the write. Reads never call it:
-    /// they change nothing, there is nothing to settle.
-    static void attachSettleTicket(const typename PgPool<Io>::ConnectionType& conn) {
+    /// settle ticket of the connection that sent the write, and the ticket is
+    /// queued. Reads never call it: they change nothing, there is nothing to settle.
+    void settleUncertain(const typename PgPool<Io>::ConnectionType& conn) {
         try {
             throw;
         } catch (const PgUncertainError& e) {
-            e.attachSettleTicket(conn.settleTicket());
+            auto ticket = conn.settleTicket();
+            e.attachSettleTicket(ticket);
+            settle_queue_.enqueue(std::move(ticket));
         } catch (...) {}
     }
 
@@ -1388,6 +1400,9 @@ private:
     uint64_t pg_writes_done_ = 0;
     PgReadEntry* pg_read_lead_ = nullptr;
     uint64_t pg_read_lead_writes_ = 0;
+
+    // Declared last: destroyed first, while the pool it reads is still held.
+    SettleQueue<Io> settle_queue_;
 
 #ifdef RELAIS_BUILDING_TESTS
     friend struct ::relais_bench::BatchBenchAccessor;

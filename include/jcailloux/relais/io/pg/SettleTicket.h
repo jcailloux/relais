@@ -3,7 +3,11 @@
 
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <string>
+#include <vector>
+
+#include "jcailloux/relais/io/Task.h"
 
 namespace jcailloux::relais::io {
 
@@ -20,8 +24,12 @@ enum class UncertainSettle : uint8_t {
 // Settling as configured on a connection; the pool fills it from PgPoolConfig.
 struct SettleConfig {
     UncertainSettle mode = UncertainSettle::Off;
-    std::chrono::milliseconds delay{0};  // Delay only; 0 = no bound, nothing to settle
+    std::chrono::milliseconds delay{0};  // Delay only; 0 = the server's statement_timeout
 };
+
+// Added to the server's statement_timeout when it bounds a write: the statement
+// may start a little after it was sent, and its commit follows its end.
+inline constexpr std::chrono::milliseconds kSettleMargin{1000};
 
 // A server backend, named by pid AND start time: a pid alone may be reused by a
 // later backend once the first one exits.
@@ -42,6 +50,9 @@ struct SettleTicket {
     BackendId backend;                  // Terminate / Await
     std::chrono::milliseconds delay{0}; // Delay
     State state = State::Pending;
+    // Run once settled, in registration order: the precautionary evictions,
+    // again. A failing replay does not stop the next ones.
+    std::vector<std::function<Task<void>()>> replays;
 };
 
 } // namespace jcailloux::relais::io
