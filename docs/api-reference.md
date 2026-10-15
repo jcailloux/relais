@@ -11,7 +11,7 @@ New to relais? Read [concepts.md](concepts.md) first for the mental model, then 
 ## Contents
 
 1. [Repository API](#repository-api) — every method on the final `Repo` (reads, writes, conditional writes, deletes/invalidation, list, maintenance, metrics) and its type aliases.
-2. [CacheConfig](#cacheconfig) — tier selection, TTLs, sizing, L2 format, update strategy: all fields, presets, `consteval with_*()` modifiers, and `RELAIS_L1_MAX_MEMORY`.
+2. [CacheConfig](#cacheconfig) — cache level, TTL, sizing, update strategy: all fields, presets, `consteval with_*()` modifiers, and `RELAIS_L1_MAX_MEMORY`.
 3. [Invalidation descriptors](#invalidation-descriptors) — the four `Invalidate*` templates, resolver contracts, `InvalidationData`, `ListInvalidationTarget`, and wiring.
 4. [List and query API](#list-and-query-api) — `ListDescriptor`, filter operators, sort directions, the fluent builder, `ListQuery`/`ListQueryParams`/`TypedCursor`, HTTP parsers, and `FilterSet`.
 5. [Entity and concepts](#entity-and-concepts) — the `Entity<Struct, Mapping>` surface, partial-update factories, guards and ordering, and the full concept hierarchy (what each requires, what each enables).
@@ -22,12 +22,12 @@ New to relais? Read [concepts.md](concepts.md) first for the mental model, then 
 
 ## Repository API
 
-The `Repo<E, Name, Cfg, Invalidations...>` class is the single user-facing type. It assembles a compile-time mixin tower (`PgRepo` → `RedisRepo` → `LocalRepo` → `ListMixin` → `InvalidationMixin`) selected by `Cfg.cache_level` and entity traits; every method below is reached through name-hiding on this final class.
+The `Repo<E, Name, Cfg, Invalidations...>` class is the single user-facing type. It assembles a compile-time mixin tower (`PgRepo` → `LocalRepo` → `ListMixin` → `InvalidationMixin`) selected by `Cfg.cache_level` and entity traits; every method below is reached through name-hiding on this final class.
 
 Three contracts hold across the whole surface:
 
 - every method is **`static`**;
-- **the API does not depend on the preset**: every method below has the same signature, return type included, on `Uncached`, `Local`, `Redis` and `Both`, so changing `Cfg.cache_level` never breaks the caller's compilation. Only the entity (`HasListDescriptor`, `HasFieldUpdate`, …) and `Cfg.read_only` gate a method;
+- **the API does not depend on the preset**: every method below has the same signature, return type included, on `Uncached` and `Local`, so changing `Cfg.cache_level` never breaks the caller's compilation. Only the entity (`HasListDescriptor`, `HasFieldUpdate`, …) and `Cfg.read_only` gate a method;
 - reads return **`io::Immediate<...>`** (resolved without a coroutine frame when L1 holds the value), writes return **`io::Task<...>`**; `co_await` consumes both.
 
 ### Type aliases
@@ -49,10 +49,10 @@ Single-key reads resolve to an **epoch-guarded `cache::CacheView<E>`** (defined 
 
 | Method | Returns | Constraints | Notes |
 |---|---|---|---|
-| `find(const Key& id)` | `Immediate<CacheView<E>>` | — | L1 hit resolves synchronously (no coroutine frame); miss falls through L2→L3. |
-| `findJson(const Key& id)` | `Immediate<std::string>` | — | Empty string if absent. L2-BEVE hit transcodes via `glz::beve_to_json` (no entity build); L2-JSON hit returns raw. |
-| `findBinary(const Key& id)` | `Immediate<std::vector<uint8_t>>` | `HasBinarySerialization<E>` | Empty vector if absent. L2-Binary hit returns raw bytes. |
-| `findMany(std::span<const Key> ids)` | `Immediate<cache::MultiView<E>>` | — | `view[i] ↔ ids[i]` (`nullptr` = absent). Dedups input; L1 hits are zero-copy (all-hit is frameless), the rest fold into one L2 MGET + one L3 `ANY`. Without L1, the view owns its entities. |
+| `find(const Key& id)` | `Immediate<CacheView<E>>` | — | L1 hit resolves synchronously (no coroutine frame); miss reads the database and fills L1. |
+| `findJson(const Key& id)` | `Immediate<std::string>` | — | Empty string if absent. Serializes the entity on each call; the bytes are not cached. |
+| `findBinary(const Key& id)` | `Immediate<std::vector<uint8_t>>` | `HasBinarySerialization<E>` | Empty vector if absent. Serializes the entity on each call, like `findJson`. |
+| `findMany(std::span<const Key> ids)` | `Immediate<cache::MultiView<E>>` | — | `view[i] ↔ ids[i]` (`nullptr` = absent). Dedups input; L1 hits are zero-copy (all-hit is frameless), the rest fold into one `WHERE pk = ANY($1)`. Without L1, the view owns its entities. |
 
 `countWhere` counts the rows matching a [`FilterSet<E>`](#filterset--predicate-aggregate-for-the-where-variants) predicate, e.g. `repo.countWhere({.author_id = 42})`:
 
@@ -61,16 +61,15 @@ template<typename Pred = FilterSet<E>>
 static Task<size_t> countWhere(Pred pred);
 ```
 - **requires**: `HasFilterSet<E> && std::same_as<Pred, FilterSet<E>>`; available on `read_only` repos and on every preset.
-- **semantics**: one `SELECT count(*) … WHERE pred` on L3, never cached (empty predicate: the whole table). Identical counts batched together share one query.
+- **semantics**: one `SELECT count(*) … WHERE pred`, never cached (empty predicate: the whole table). Identical counts batched together share one query.
 
-> `co_await Repo::find(id)` completes synchronously on an L1 hit and suspends on an L2/L3 read. See [caching.md](caching.md) for the epoch/eviction model.
+> `co_await Repo::find(id)` completes synchronously on an L1 hit and suspends on a database read. See [caching.md](caching.md) for the epoch/eviction model.
 
 > **Reads throw on a DB error; a write reports a *deterministic* one as a value.**
-> `find`/`findJson`/`findBinary`/`findMany`/`countWhere` **propagate** an L3 error (timeout,
+> `find`/`findJson`/`findBinary`/`findMany`/`countWhere` **propagate** a database error (timeout,
 > connection lost) — only a *successful* empty result means "not found" (empty
 > `CacheView`/`MultiView`, empty string/vector), so a read never disguises a failure
-> as a miss (no false 404). The lone exception is a Redis L2 read timeout: L2 is only
-> a cache, so it degrades to a miss and falls through to L3. On the write side,
+> as a miss (no false 404). On the write side,
 > `nullopt` (and `insert`'s empty view) means a **deterministic** failure — the DB
 > provably rolled back, safe to retry; an **uncertain** write (a timeout, or a
 > connection dropped mid-request) instead **throws `io::PgUncertainError`** after
@@ -80,15 +79,15 @@ static Task<size_t> countWhere(Pred pred);
 
 ### Writes
 
-Available only when `!Cfg.read_only`. Each write flows down the full chain: L3 commit → L2 SET/evict → L1 store/evict → list invalidation → cross-invalidation. Write coalescing (identical SQL+params) propagates a `coalesced` flag so upper layers skip redundant cache ops; relative and conditional writes are never coalesced.
+Available only when `!Cfg.read_only`. Each write flows down the full chain: database commit → L1 store/evict → list invalidation → cross-invalidation. Write coalescing (identical SQL+params) propagates a `coalesced` flag so upper layers skip redundant cache ops; relative and conditional writes are never coalesced.
 
 | Method | Returns | Constraints | Notes |
 |---|---|---|---|
-| `insert(const E& e)` | `Task<CacheView<E>>` | `MutableEntity<E> && !Cfg.read_only` | Empty view on error. Populates L1+L2; notifies lists. |
+| `insert(const E& e)` | `Task<CacheView<E>>` | `MutableEntity<E> && !Cfg.read_only` | Empty view on error. Populates L1; notifies lists. |
 | `update(const Key&, const E&)` | `Task<std::optional<size_t>>` | `MutableEntity<E> && HasFullUpdate<E> && !Cfg.read_only` | Rows affected (`0` = not found), `nullopt` = DB error. Strategy via `Cfg.update_strategy`: `InvalidateAndLazyReload` (evict) vs optimistic write-through. With lists or cross-invalidation the statement also returns the prior and committed rows, so both versions are invalidated without a pre-read. |
 | `updateJson(const Key&, std::string_view)` | `Task<std::optional<size_t>>` | `MutableEntity<E> && HasFullUpdate<E> && !Cfg.read_only` | Parses JSON → `update`. `nullopt` on parse failure or DB error. |
 | `updateBinary(const Key&, std::span<const uint8_t>)` | `Task<std::optional<size_t>>` | `… && HasBinarySerialization<E> && !Cfg.read_only` | Parses BEVE → `update`. `nullopt` on parse failure or DB error. |
-| `patch(const Key&, Updates&&...)` | `Task<CacheView<E>>` | `HasFieldUpdate<E> && !Cfg.read_only` | Variadic field updates ([factories](#partial-updates)), ≥1 required, in one statement. Empty view if absent or on DB error. Stores the committed row through L1 and invalidates L2 after the commit; with lists or cross-invalidation the statement also returns the prior row, so both versions are invalidated without a pre-read. |
+| `patch(const Key&, Updates&&...)` | `Task<CacheView<E>>` | `HasFieldUpdate<E> && !Cfg.read_only` | Variadic field updates ([factories](#partial-updates)), ≥1 required, in one statement. Empty view if absent or on DB error. Stores the committed row through L1; with lists or cross-invalidation the statement also returns the prior row, so both versions are invalidated without a pre-read. |
 | `upsert(const E& e)` | `Task<CacheView<E>>` | `UpsertableEntity<E,Key> && HasUpsertSql<E> && !Cfg.read_only` | Insert-or-update on the PK (`ON CONFLICT DO UPDATE … RETURNING`). **Assigned-PK entities only** (absent for serial PK). Store-through of the committed row; coherence & list/cross-invalidation identical to `update`. |
 
 > `HasFullUpdate<E>` = generator emitted `toUpdateParams` (false for all-PK junction tables, so `update`/`updateJson`/`updateBinary` are cleanly *absent* there — `patch` still works via `HasFieldUpdate`).
@@ -140,19 +139,19 @@ static Task<ResultFor<E, O.returns>> claim(const Guards<Gs...>& pred, const Orde
 - **ordering**: `claim` without `order` takes rows in primary-key order; `order` is always closed by the primary key, and results come back in the order.
 - **`n == 0`**: `claim` returns empty without a query.
 - **rows**: `patchWhere`/`claim` return entities by value, not views.
-- **cache**: `patchIf` settles like `patch`; a refusal or DB error leaves the cache untouched. `patchWhere`/`claim` evict the entity tiers and L1 list pages before returning, L2 list pages and cross-targets detached. Uncertain: `patchIf` evicts its row; the rows of `patchWhere`/`claim` are unknowable and left to `l*_ttl` (logged).
+- **cache**: `patchIf` settles like `patch`; a refusal or DB error leaves the cache untouched. `patchWhere`/`claim` evict the entities and list pages before returning, cross-targets detached. Uncertain: `patchIf` evicts its row; the rows of `patchWhere`/`claim` are unknowable and left to `l1_ttl` (logged).
 
 Guide: [conditional-writes.md](conditional-writes.md).
 
 ### Deletes & invalidation
 
-`erase`/`eraseMany`/`eraseWhere` remove rows from L3 **and** evict the cache hierarchy. `invalidate`/`invalidateMany`/`invalidateWhere` evict the cache **without** touching L3 (a later read repopulates). Deletes require `!Cfg.read_only`; invalidations do not. The batch/predicate paths split into an awaited *critical* tier (L1 evict + L2 UNLINK + gen bump + L1 list bump) and a fire-and-forget *deferred* tier (cross-target + L2 list EVALs).
+`erase`/`eraseMany`/`eraseWhere` remove rows from the database **and** evict L1. `invalidate`/`invalidateMany`/`invalidateWhere` evict L1 **without** touching the database (a later read repopulates). Deletes require `!Cfg.read_only`; invalidations do not. The batch/predicate paths await the L1 entity and list eviction, and fire the cross-invalidation detached.
 
 | Method | Returns | Constraints | Notes |
 |---|---|---|---|
-| `erase(const Key& id)` | `Task<std::optional<size_t>>` | `!Cfg.read_only` | Rows deleted (`0` = not found), `nullopt` = DB error. Uses L1/L2 partition hint when available. With lists or cross-invalidation the statement also returns the deleted row, so its pages and targets are invalidated without a pre-read. |
+| `erase(const Key& id)` | `Task<std::optional<size_t>>` | `!Cfg.read_only` | Rows deleted (`0` = not found), `nullopt` = DB error. Uses the L1 partition hint when available. With lists or cross-invalidation the statement also returns the deleted row, so its pages and targets are invalidated without a pre-read. |
 | `eraseMany(std::span<const Key> ids)` | `Task<std::optional<size_t>>` | `!Cfg.read_only` | Count deleted; `nullopt` = DB error, `0` = no match. Dedups input; `DELETE … RETURNING` drives eviction (no extra read). Lists invalidated. |
-| `invalidate(const Key& id)` | `Task<void>` | — | Evicts L1+L2 (+ cross-inval at top). Lists left intact. |
+| `invalidate(const Key& id)` | `Task<void>` | — | Evicts L1 (+ cross-inval at top). Lists left intact. |
 | `invalidateMany(std::span<const Key> ids)` | `Task<void>` | — | Best-effort. Materializes each via the read path, then evicts entity tier (rows still exist). Missing id → no-op. |
 
 `eraseWhere`/`invalidateWhere` take the generated named `FilterSet<E>` aggregate via designated initializers, e.g. `repo.eraseWhere({.author_id = 42})`.
@@ -166,11 +165,10 @@ static Task<void> invalidateWhere(Pred pred);
 ```
 - **returns**: `eraseWhere` → count deleted across all `K_pg`-bounded `DELETE` chunks, `nullopt` on DB error; `invalidateWhere` → `void` (best-effort).
 - **requires**: `HasFilterSet<E> && std::same_as<Pred, FilterSet<E>>`; `eraseWhere` additionally `!Cfg.read_only`.
-- **semantics**: `eraseWhere` deletes matching rows then evicts entity tier + one filter-aware predicate list invalidation (`O(groups)`). `invalidateWhere` resolves the set via `SELECT … WHERE pred` and evicts the entity tier only (oracle `invalidateWhere(P) ≡ invalidateMany(ids)`).
-- **availability**: any `Cfg`; the list-invalidation portion is active only when the entity has a `ListDescriptor` and the preset includes that tier.
+- **semantics**: `eraseWhere` deletes matching rows then evicts the entities + one filter-aware predicate list invalidation (O(1)). `invalidateWhere` resolves the set via `SELECT … WHERE pred` and evicts the entities only (oracle `invalidateWhere(P) ≡ invalidateMany(ids)`).
+- **availability**: any `Cfg`; the list-invalidation portion is active only when the entity has a `ListDescriptor` and the preset is `Local`.
 
 > **Never `purgeAll` on invalidation.** Batch and predicate paths point-evict the exact affected keys; unrelated hot entries are untouched.
-> **Eviction ordering is L2-before-L1** (mirrors mono `erase`): clearing L2 first prevents a racing L1-miss from re-storing a not-yet-UNLINKed L2 phantom into the shared L1.
 
 ### List
 
@@ -178,17 +176,17 @@ Present only when the entity declares a `ListDescriptor` (the `ListMixin` layer)
 
 | Method | Returns | Notes |
 |---|---|---|
-| `query(const ListQuery& q)` | `Immediate<ListResult>` (`ListResult = CacheView<ListWrapper<E>>`) | Paginated, L1/L2-cached; L1 hit zero-overhead. Also `queryJson` → `Immediate<std::string>` and `queryBinary` → `Immediate<std::vector<uint8_t>>` (the latter `requires HasBinarySerialization<E>`), serving serialized pages. |
+| `query(const ListQuery& q)` | `Immediate<ListResult>` (`ListResult = CacheView<ListWrapper<E>>`) | Paginated, L1-cached; L1 hit zero-overhead. Also `queryJson` → `Immediate<std::string>` and `queryBinary` → `Immediate<std::vector<uint8_t>>` (the latter `requires HasBinarySerialization<E>`), serving serialized pages. |
 | `queryBuilder()` | `QueryBuilder` (noexcept) | Fluent, name-checked builder: `.filter<"...">().sortDesc<"...">().limit(n).after(cursor).build()` seals a `ListQuery`. |
 | `listSize()` | `size_t` (noexcept) | L1 list-cache entry count (`0` when no L1). |
 
-> CRUD methods (`insert`/`update`/`erase`/`patch`) and the conditional writes (`patchIf`/`patchWhere`/`claim`) are intercepted here to invalidate list caches automatically (L1 `ModificationTracker` bump — the list cache's monotonic generation counter — + selective L2 Lua EVAL).
+> CRUD methods (`insert`/`update`/`erase`/`patch`) and the conditional writes (`patchIf`/`patchWhere`/`claim`) are intercepted here to invalidate list caches automatically (`ModificationTracker` bump — the list cache's monotonic generation counter).
 
 ### Maintenance & metrics
 
 | Method | Returns | Notes |
 |---|---|---|
-| `name()` | `const char*` (constexpr) | The compile-time repo name / Redis key prefix. |
+| `name()` | `const char*` (constexpr) | The compile-time repo name. |
 | `config` | `static constexpr CacheConfig` | The `Cfg` NTTP (data member, not a call). |
 | `size()` | `size_t` | L1 entity-cache entry count; `0` without L1. |
 | `purge()` | `size_t` | Clear the L1 entity (and list) caches; returns entries removed, `0` without L1. |
@@ -196,15 +194,15 @@ Present only when the entity declares a `ListDescriptor` (the `ListMixin` layer)
 
 ```cpp
 #if RELAIS_ENABLE_METRICS
-static cache::MetricsSnapshot metrics();   // aggregated L1/L2/list/sweep counters
+static cache::MetricsSnapshot metrics();   // aggregated L1/list/sweep counters
 static void                  resetMetrics();
 #endif
 ```
-- **availability**: `metrics`/`resetMetrics` exist **only** when compiled with `RELAIS_ENABLE_METRICS`. The snapshot fields populate per active tier (L1, L2, list L1/L2) plus the global sweep counters; absent tiers stay zero.
+- **availability**: `metrics`/`resetMetrics` exist **only** when compiled with `RELAIS_ENABLE_METRICS`. The snapshot fields populate per active cache (L1 entities, L1 lists) plus the global sweep counters; without L1 they stay zero.
 
 <details><summary>Public-but-internal members (not part of the supported surface)</summary>
 
-The mixin layers also expose a few `public` methods that exist for cross-invalidation wiring or debugging, not for application use: `invalidateAllListGroups()` / `invalidateListGroupByKey(key, sort_value)` (coarse/targeted list-group eviction primitives that a target repo's `invalidateByTarget` builds on), `makeGroupKey(...)` / `makeRedisKey(key)` (key derivation), `evictRedis(key)` (L2-only evict), `sweep(chunk_id)` (one L1 chunk, called by `GDSFPolicy`), and `avgConstructionTime()` (L1 timing, testing/debug). They are reachable on `Repo` by name-hiding but are not contract surface — prefer the documented methods above.
+The mixin layers also expose a few `public` methods that exist for cross-invalidation wiring or debugging, not for application use: `invalidateAllListGroups()` (every list page, the full-pattern target of `InvalidateListVia`), `notifyCreated`/`notifyUpdated`/`notifyDeleted` (list-cache notifications behind `InvalidateList`), `sweep(chunk_id)` (one L1 chunk, called by `GDSFPolicy`), and `avgConstructionTime()` (L1 timing, testing/debug). They are reachable on `Repo` by name-hiding but are not contract surface — prefer the documented methods above.
 </details>
 
 → Guides: [caching.md](caching.md), [lists.md](lists.md), [invalidation.md](invalidation.md)
@@ -213,7 +211,7 @@ The mixin layers also expose a few `public` methods that exist for cross-invalid
 
 ## CacheConfig
 
-`CacheConfig` is the structural NTTP aggregate that configures a repository at compile time: which cache tiers are active, their TTLs and sizing, the L2 wire format, and the update/coherence policy. It is passed as the third template parameter of `Repo<E, Name, Cfg, Invalidations...>`. Because it is a structural type, every field and preset is usable directly as a template argument, and all customization happens through `consteval` fluent modifiers that return a new value.
+`CacheConfig` is the structural NTTP aggregate that configures a repository at compile time: whether L1 is active, its TTL and sizing, and the update/coherence policy. It is passed as the third template parameter of `Repo<E, Name, Cfg, Invalidations...>`. Because it is a structural type, every field and preset is usable directly as a template argument, and all customization happens through `consteval` fluent modifiers that return a new value.
 
 ```cpp
 template<typename E, config::FixedString Name,
@@ -228,21 +226,12 @@ Neither `std::chrono::duration` (private members) nor a raw string literal is a 
 
 ### Enums
 
-**`CacheLevel`** — selects which tiers the mixin chain assembles.
+**`CacheLevel`** — selects whether the mixin chain assembles L1.
 
 | Value | Meaning |
 |---|---|
 | `None` | DB only (`PgRepo`), no caching |
-| `L1` | RAM → DB (`LocalRepo` without Redis) |
-| `L2` | Redis → DB (`RedisRepo`) |
-| `L1_L2` | RAM → Redis → DB (`LocalRepo` over `RedisRepo`) |
-
-**`L2Format`** — how entities are serialized in Redis.
-
-| Value | Meaning |
-|---|---|
-| `Binary` | BEVE binary (default) — compact and fast |
-| `Json` | JSON — human-readable, interoperable with non-C++ consumers |
+| `L1` | RAM → DB (`LocalRepo` over `PgRepo`) |
 
 **`UpdateStrategy`** — how a write reconciles the cache.
 
@@ -255,16 +244,12 @@ Neither `std::chrono::duration` (private members) nor a raw string literal is a 
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `cache_level` | `CacheLevel` | `None` | Active tiers (see above). |
+| `cache_level` | `CacheLevel` | `None` | L1 or none (see above). |
 | `read_only` | `bool` | `false` | Disables mutating repository methods at compile time. |
 | `update_strategy` | `UpdateStrategy` | `InvalidateAndLazyReload` | Cache reconciliation on write (see above). |
 | `l1_ttl` | `Duration` | `1h` | L1 entry time-to-live. `Duration{0}` = no TTL (entries never expire by time; eviction is GDSF/budget-driven only). |
 | `l1_chunk_count_log2` | `uint8_t` | `3` | L1 `ChunkMap` shard count as a power of two (`2^3 = 8` chunks). |
 | `recheck_slots_log2` | `uint8_t` | `12` | Read-fill recheck guard: sharded generation-counter table size, power of two (`2^12 = 4096` slots ≈ 32 KB/repo). See below. |
-| `l2_ttl` | `Duration` | `4h` | L2 (Redis) entry time-to-live. |
-| `l2_refresh_on_get` | `bool` | `false` | When `true`, an L2 hit resets the Redis TTL (sliding expiration). |
-| `l2_format` | `L2Format` | `Binary` | Redis serialization format. |
-| `l2_shared_across_instances` | `bool` | `false` | Cross-instance L2 coherence. A deployment *fact*, not a behavior knob. See below. |
 
 <details>
 <summary><code>recheck_slots_log2</code> — the read-fill recheck guard</summary>
@@ -272,16 +257,9 @@ Neither `std::chrono::duration` (private members) nor a raw string literal is a 
 The read-fill recheck closes the race where a read misses, fetches from the DB, and is about to store a value that an interleaving write has already invalidated. A sharded generation counter is snapshotted at miss and re-compared at fill; if the generation moved, the fill is rejected (pessimistic miss, **never stale**). The table is sized in slots rather than per-key, so memory is bounded by accepting hash collisions (a collision only costs an extra pessimistic miss). It scales with **write concurrency** (`write_rate × fetch_duration`), **not** with the number of keys — raise `recheck_slots_log2` for write-heavy repositories; the default `12` (4096 slots, ~32 KB/repo) suits typical workloads.
 </details>
 
-<details>
-<summary><code>l2_shared_across_instances</code> — single- vs multi-instance L2</summary>
-
-- **`false` (default, single-instance):** the recheck authority is the cheap process-local counter — no extra Redis ops. L2 coherence is guaranteed within the process and bounded by `l2_ttl` across instances.
-- **`true` (multi-instance):** the recheck authority moves into Redis (a sharded generation hash; `HINCRBY` on invalidation, conditional `setIfGen` at fill via `EVAL`), so a fill that straddles *any* instance's invalidation is rejected. Cost is one `HGET` at miss plus one `EVAL` at fill — **cold path only**; an ordinary L2 hit stays a plain `GET`.
-</details>
-
 ### Fluent modifiers
 
-All modifiers are `consteval`, non-mutating (each returns a new `CacheConfig`), and chainable. `with_read_only` and `with_l2_shared_across_instances` default their argument to `true`.
+All modifiers are `consteval`, non-mutating (each returns a new `CacheConfig`), and chainable. `with_read_only` defaults its argument to `true`.
 
 ```cpp
 consteval CacheConfig with_cache_level(CacheLevel v) const;
@@ -290,10 +268,6 @@ consteval CacheConfig with_update_strategy(UpdateStrategy v) const;
 consteval CacheConfig with_l1_ttl(Duration v) const;
 consteval CacheConfig with_l1_chunk_count_log2(uint8_t v) const;
 consteval CacheConfig with_recheck_slots_log2(uint8_t v) const;
-consteval CacheConfig with_l2_ttl(Duration v) const;
-consteval CacheConfig with_l2_refresh_on_get(bool v) const;
-consteval CacheConfig with_l2_format(L2Format v) const;
-consteval CacheConfig with_l2_shared_across_instances(bool v = true) const;
 ```
 
 ```cpp
@@ -306,14 +280,12 @@ using MyRepo = Repo<MyEntity, "MyEntity",
 
 Each preset is an `inline constexpr CacheConfig`. Fields not listed take the struct defaults.
 
-| Preset | `cache_level` | `l1_ttl` | `l2_ttl` | All other fields |
-|---|---|---|---|---|
-| `Uncached` | `None` | `1h` (unused) | `4h` (unused) | defaults |
-| `Local` | `L1` | `1h` | `4h` (unused) | defaults |
-| `Redis` | `L2` | `1h` (unused) | `4h` | defaults |
-| `Both` | `L1_L2` | `1min` | `1h` | defaults |
+| Preset | `cache_level` | `l1_ttl` | All other fields |
+|---|---|---|---|
+| `Uncached` | `None` | `1h` (unused) | defaults |
+| `Local` | `L1` | `1h` | defaults |
 
-`Uncached` is the default-constructed value (DB only). `Local` is RAM-only, ideal for data always reached through the same process. `Redis` is shared-across-instances cache with no local RAM tier. `Both` pairs a short L1 TTL with a longer L2 TTL — the typical full-stack configuration.
+`Uncached` is the default-constructed value (DB only). `Local` is RAM in front of the database; L1 is per process, so with several instances writing the same rows `l1_ttl` bounds how long one serves a value another has changed — see [caching.md › Several instances](caching.md#several-instances).
 
 ### Environment: `RELAIS_L1_MAX_MEMORY`
 
@@ -371,7 +343,7 @@ The descriptor detects the span overload with `if constexpr (requires { Resolver
 
 ### 4. `InvalidateListVia<ListRepo, KeyExtractor, Resolver>`
 
-Indirect entity→list with **selective** page invalidation. The resolver returns typed `ListInvalidationTarget<GroupKey>` values (`GroupKey = ListRepo::GroupKey`, the canonical filter-key encoding — see [List and query API](#list-and-query-api)); each invalidates one list group via `ListRepo::invalidateByTarget(target.filters, target.sort_value)` — a contract the target `ListRepo` **must define itself** (`GroupKey` + `invalidateByTarget`). The shipped mixins provide only the lower-level primitives it builds on: `ListMixin` ships `invalidateAllListGroups`, and the L2 tier (`RedisRepo`/`PgRepo`) ships `invalidateListGroupByKey` (see [invalidation.md](invalidation.md#selective-list-invalidation-via-invalidatelistvia)).
+Indirect entity→list with **selective** page invalidation. The resolver returns typed `ListInvalidationTarget<GroupKey>` values (`GroupKey = ListRepo::GroupKey`, the canonical filter-key encoding — see [List and query API](#list-and-query-api)); each invalidates one list group via `ListRepo::invalidateByTarget(target.filters, target.sort_value)` — a contract the target `ListRepo` **must define itself** (`GroupKey` + `invalidateByTarget`). `invalidateByTarget` decides which pages a target drops; the shipped `ListMixin` provides `invalidateAllListGroups` (every page of the repo, O(1)), which a resolver returning `std::nullopt` triggers (see [invalidation.md](invalidation.md#selective-list-invalidation-via-invalidatelistvia)).
 
 Resolver contract — three granularities, two overloads:
 
@@ -445,7 +417,7 @@ concept HasInvalidates = requires { typename T::Invalidates; };
 
 ### Wiring — the `Invalidations...` pack
 
-`InvalidationMixin<Base, Invalidations...>` aliases the pack as `InvList = InvalidateOn<Invalidations...>` and re-exports it as `using Invalidates = InvList;` (this is what `HasInvalidates` keys on). It sits at the top of the chain (`InvalidationMixin → [ListMixin] → LocalRepo → [RedisRepo] → PgRepo`) and hides `insert`/`update`/`erase`/`patch`/`invalidate`: each calls `Base::method()` down the chain, and on success awaits the matching free helper — `propagateCreate<E, InvList>` / `propagateUpdate<E, InvList>` / `propagateDelete<E, InvList>` (free function templates in `jcailloux::relais`, not mixin members), which forward to `InvList::propagateWithData` / `propagateDeleteMany`. The layer is only assembled when the pack is non-empty.
+`InvalidationMixin<Base, Invalidations...>` aliases the pack as `InvList = InvalidateOn<Invalidations...>` and re-exports it as `using Invalidates = InvList;` (this is what `HasInvalidates` keys on). It sits at the top of the chain (`InvalidationMixin → [ListMixin] → [LocalRepo] → PgRepo`) and hides `insert`/`update`/`erase`/`patch`/`invalidate`: each calls `Base::method()` down the chain, and on success awaits the matching free helper — `propagateCreate<E, InvList>` / `propagateUpdate<E, InvList>` / `propagateDelete<E, InvList>` (free function templates in `jcailloux::relais`, not mixin members), which forward to `InvList::propagateWithData` / `propagateDeleteMany`. The layer is only assembled when the pack is non-empty.
 
 <details>
 <summary>Writes read nothing first; batch split critical vs deferred</summary>
@@ -453,10 +425,10 @@ concept HasInvalidates = requires { typename T::Invalidates; };
 `update`, `erase` and `patch` read nothing first: the statement returns the row it replaced or deleted (`update` and `patch` also the committed one), and those rows feed both the list tier and `propagateUpdate`/`propagateDelete`. On an uncertain write nothing comes back: the cascades are keyed on the copy L1 held of the row, when it held one, and `update` keys the new version on its input. `upsert` keeps a best-effort pre-read: an absent row cannot be locked, so the statement cannot tell create from update.
 
 Batch delete is split into two protected passes:
-- `invalidateManyCritical<WithLists>` — own entity tier + L1 list tracker, awaited before the facade returns (the entity UNLINK must precede the return).
-- `invalidateManyDeferred<WithLists>` — deduplicated cross-target invalidation `whenAll`-pipelined with the own L2 list EVALs (disjoint caches share one flush), fired fire-and-forget (cross-target invalidate-stale is tolerated).
+- `invalidateManyCritical<WithLists>` — own L1 entities + list tracker, awaited before the facade returns.
+- `invalidateManyDeferred` — deduplicated cross-target invalidation, fired fire-and-forget (cross-target invalidate-stale is tolerated). Without an `Invalidations...` pack nothing is fired.
 
-Per descriptor, batch delete folds N source events into M ≤ N distinct target keys: `Invalidate` collapses to a single `invalidateMany(span)` (one multi-key UNLINK, ⌈M/1000⌉ commands) when the target exposes that facade, else a per-key loop. `dedupSorted` is the unit-testable, I/O-free core; `dedupStable` handles composite/partition keys that model only equality.
+Per descriptor, batch delete folds N source events into M ≤ N distinct target keys: `Invalidate` collapses to a single `invalidateMany(span)` when the target exposes that facade, else a per-key loop. `dedupSorted` is the unit-testable, I/O-free core; `dedupStable` handles composite/partition keys that model only equality.
 </details>
 
 → Guide: [invalidation.md](invalidation.md)
@@ -465,7 +437,7 @@ Per descriptor, batch delete folds N source events into M ≤ N distinct target 
 
 ## List and query API
 
-The list subsystem turns a declarative `ListDescriptor` (filters + sorts + page-size grid, emitted by the generator from `@relais` annotations) into a paginated, L1/L2-cached query API on the `ListMixin` layer. A query is built by name — `Repo::queryBuilder().filter<"...">(v).sortDesc<"...">().limit(n).after(cursor).build()` — and **sealed** into an immutable `ListQuery` whose canonical params determine its cache keys. HTTP query strings parse into the same type via `parseListQuery` (tolerant) or `parseListQueryStrict` (validating). Everything below lives in `jcailloux::relais::list` / `jcailloux::relais::list::spec` and is re-exported by a list-enabled `Repo`.
+The list subsystem turns a declarative `ListDescriptor` (filters + sorts + page-size grid, emitted by the generator from `@relais` annotations) into a paginated, L1-cached query API on the `ListMixin` layer. A query is built by name — `Repo::queryBuilder().filter<"...">(v).sortDesc<"...">().limit(n).after(cursor).build()` — and **sealed** into an immutable `ListQuery` whose canonical params determine its cache keys. HTTP query strings parse into the same type via `parseListQuery` (tolerant) or `parseListQueryStrict` (validating). Everything below lives in `jcailloux::relais::list` / `jcailloux::relais::list::spec` and is re-exported by a list-enabled `Repo`.
 
 ### ListDescriptor — what the entity declares
 
@@ -508,7 +480,7 @@ struct ListDescriptor : FilterSet {                          // auto-detected by
 };
 ```
 
-> **Group key vs cache key.** There is no separately *declared* group key. The **group key** is the canonical encoding of `filters + sort` (same group regardless of pagination — used for Redis group tracking and selective invalidation); the **cache key** is `group_key + limit + cursor + offset` (identifies one page). Both are encoded from the sealed params (`CanonicalEncoding.h`), never hashed.
+> **Group key vs cache key.** There is no separately *declared* group key. The **group key** is the canonical encoding of `filters + sort` (same group regardless of pagination); the **cache key** is `group_key + limit + cursor + offset` (identifies one page). Both are encoded from the sealed params (`CanonicalEncoding.h`), never hashed.
 
 Helpers over a descriptor (`ListDescriptor.h`): `filter_count<D>`, `sort_count<D>`, `filter_at<D, I>`, `sort_at<D, I>`.
 
@@ -541,7 +513,7 @@ Filter<"published_null", &Article::published_at, "published_at", Op::IS_NULL>  /
 
 Template: `Filter<FixedString Name, auto EntityMemberPtr, FixedString ColumnName, Op = EQ, typename Converter = NoConvert, InvalidationStrategy = defaultInvalidationStrategy(Op)>`. `Name` is the HTTP query-param key; `EntityMemberPtr` may be a data member **or** a const member function. Converters: `NoConvert` (default), `AsString` (enum via ADL `toString`) and `Via<Codec>` (a mapped enum through its generated codec: `EQ`/`NE`/`IN`/`NIN` bind the database string, ordering operators compare the codec's rank with the underlying value, HTTP values parse with `Codec::fromDb`). `Codec::enum_type` must be the field's enum type (`static_assert`). The generator emits `Via<>` on every filter of a `@relais enum` field; a hand-written descriptor declares it too, so that the enum binds as its database string. See [lists.md › Enum fields](lists.md#enum-fields).
 
-> **IN/NIN guard-rails (compile-time).** A set-op filter takes `NoConvert`, or `Via<Codec>` for an enum element: every element then binds as the column stores it and encodes as the Redis-side blob reads it. `is_set_op` is the single `(op == IN || op == NIN)` switch every consumer keys off.
+> **IN/NIN guard-rails (compile-time).** A set-op filter takes `NoConvert`, or `Via<Codec>` for an enum element: every element then binds as the column stores it and compares in memory as it does in SQL. `is_set_op` is the single `(op == IN || op == NIN)` switch every consumer keys off.
 >
 > **IS_NULL guard-rail (compile-time).** The member must be a `std::optional` (`static_assert`). The converter is ignored: the column is tested bare, and the HTTP value parses as a boolean.
 
@@ -625,7 +597,7 @@ ListQuery<Descriptor> seal(ListQueryParams<Descriptor> params);   // CanonicalEn
 
 The wire token is plain base64 over the cursor bytes: `int64(sort_value)` followed by the `N` int64 primary-key components (one for a scalar key, N for a composite key) — the full keyset tiebreaker for the `ORDER BY` row-value comparison.
 
-> **Primary keys must be integral.** Keyset pagination seeks from a fixed-width, totally-ordered tiebreaker, so every key component is encoded as `int64_t` here (and compared Redis-side during selective page invalidation) — inherent to cursor pagination, not a relais-specific limit. A non-integral primary key is therefore a **compile error** (`"list keyset pagination requires an integer primary key"`): an entity with a string PK (`uuid`, `slug`) cannot carry a `@relais_list` — use a `bigserial` surrogate key. This mirrors the integral-or-enum constraint on sort fields (see [Sort directions](#sort-directions)).
+> **Primary keys must be integral.** Keyset pagination seeks from a fixed-width, totally-ordered tiebreaker, so every key component is encoded as `int64_t` here — inherent to cursor pagination, not a relais-specific limit. A non-integral primary key is therefore a **compile error** (`"list keyset pagination requires an integer primary key"`): an entity with a string PK (`uuid`, `slug`) cannot carry a `@relais_list` — use a `bigserial` surrogate key. This mirrors the integral-or-enum constraint on sort fields (see [Sort directions](#sort-directions)).
 
 <details><summary>Pagination cycle — mint and hand-back</summary>
 
@@ -733,7 +705,7 @@ The public surface (namespace `jcailloux::relais`):
 | `Format` | `using Format = StructFormat` | Tag type satisfying `HasFormat`. |
 | `read_only` | `static constexpr bool read_only` | Mirror of `Mapping::read_only`. |
 
-> No serialization caching: every `json()` / `binary()` call allocates and reserializes. For cache-backed serialization use `Repo::findJson()` / `Repo::findBinary()`, which serve precomputed bytes from L1/L2.
+> No serialization caching: every `json()` / `binary()` call allocates and reserializes. `Repo::findJson()` / `Repo::findBinary()` serve the same bytes from the cached entity: L1 holds the entity, not its serialization.
 
 > Copies and moves are `Struct`-only (no per-entity serialization state), so they are trivial.
 
@@ -810,8 +782,8 @@ The building blocks live in `EntityConcepts.h` / `SerializationTraits.h`; the up
 | `Serializable<E>` | `HasJsonSerialization<E> \|\| HasBinarySerialization<E>` | Building block of `CacheableEntity`. |
 | `Writable<E>` | `E::toInsertParams(e) → io::PgParams` | Building block of `MutableEntity`. |
 | `Keyed<E, Key>` | `e.key() → convertible_to<Key>` | Building block of `CreatableEntity`. |
-| `ReadableEntity<E>` | `Readable<E>` | **PgRepo** (L3, DB-only read). |
-| `CacheableEntity<E>` | `ReadableEntity<E> && Serializable<E>` | **RedisRepo / LocalRepo** (read + cache store). |
+| `ReadableEntity<E>` | `Readable<E>` | **PgRepo** (DB-only read). |
+| `CacheableEntity<E>` | `ReadableEntity<E> && Serializable<E>` | **LocalRepo** (read + cache store). |
 | `MutableEntity<E>` | `ReadableEntity<E> && Writable<E>` | `insert()` / `update()` (read + DB write). |
 | `CreatableEntity<E, Key>` | `MutableEntity<E> && Keyed<E, Key>` | `insert()` with cache population (write + key). |
 | `HasFullUpdate<E>` | `E::toUpdateParams(e)` well-formed | Gates every full-row `update()` path; absent for all-PK junctions where no column is updatable. |
@@ -822,7 +794,7 @@ The building blocks live in `EntityConcepts.h` / `SerializationTraits.h`; the up
 | `HasFilterSet<E>` | `E::MappingType::FilterSet` and `::FilterSet::Values` exist | Gates the where-variants `eraseWhere()` / `invalidateWhere()`; exposes the `FilterSet<E>` named-optionals aggregate. Decoupled from `HasListDescriptor`. |
 | `HasPartitionHint<E>` | `MappingType::SQL::delete_with_partition → const char*` and `MappingType::makePartitionHintParams(e) → io::PgParams` | Enables single-partition pruned DELETE when the entity is cached; falls back to PK-only scan otherwise. |
 
-> `HasPartitionKey` is not a concept in the code; partition support is detected through `HasPartitionHint`. The cache key alone identifies the row — the partition column is an *opportunistic hint* used only for single-partition pruning when available from L1/L2.
+> `HasPartitionKey` is not a concept in the code; partition support is detected through `HasPartitionHint`. The cache key alone identifies the row — the partition column is an *opportunistic hint* used only for single-partition pruning when L1 holds the row.
 
 > `HasFilterSet` is intentionally decorrelated from `HasListDescriptor`: an entity may declare filters with no cached list (and still satisfy `HasFilterSet`); conversely a list entity's `ListDescriptor` carries its `FilterSet`, so list entities satisfy both. The `FilterSet<E>` value type and its usage are detailed under [List and query API → FilterSet](#list-and-query-api).
 
@@ -832,11 +804,11 @@ The building blocks live in `EntityConcepts.h` / `SerializationTraits.h`; the up
 
 ## Runtime and I/O
 
-Repository calls don't reach PostgreSQL/Redis directly — they route through `PgProvider` (a `thread_local` service locator) to a per-loop `BatchScheduler` and connection pools running on an `IoContext` event loop. This section is the exhaustive reference for that runtime: the awaitable `Task`/`Immediate`/`DetachedTask` family, the `IoContext` extension point and its conformance harness, the `IoPool` reference runtime, the `spawnOn` cross-thread bridge, and `PgProvider` with its result/error types. Everything lives in `namespace jcailloux::relais::io` unless noted; `Outcome`/`spawnOn`/`PgProvider` are in root `jcailloux::relais`.
+Repository calls don't reach PostgreSQL directly — they route through `PgProvider` (a `thread_local` service locator) to a per-loop `BatchScheduler` and connection pools running on an `IoContext` event loop. This section is the exhaustive reference for that runtime: the awaitable `Task`/`Immediate`/`DetachedTask` family, the `IoContext` extension point and its conformance harness, the `IoPool` reference runtime, the `spawnOn` cross-thread bridge, and `PgProvider` with its result/error types. Everything lives in `namespace jcailloux::relais::io` unless noted; `Outcome`/`spawnOn`/`PgProvider` are in root `jcailloux::relais`.
 
 ### IoPool & IoPoolConfig
 
-`io::IoPool` is the reference shared-nothing runtime: N `EpollIoContext` loops, each pinned to a core, each owning its own `PgPool`/`RedisPool`/`BatchScheduler` and binding its own `thread_local` providers automatically (no manual `init()`).
+`io::IoPool` is the reference shared-nothing runtime: N `EpollIoContext` loops, each pinned to a core, each owning its own `PgPool`/`BatchScheduler` and binding its own `thread_local` providers automatically (no manual `init()`).
 
 ```cpp
 static std::unique_ptr<IoPool> create(const IoPoolConfig& config);   // io/IoPool.h
@@ -846,7 +818,7 @@ static std::unique_ptr<IoPool> create(const IoPoolConfig& config);   // io/IoPoo
 - **other members**: `void stop()` (idempotent; also runs in `~IoPool`), `int numWorkers() const noexcept`, `Io& workerIo(int idx) noexcept` (the worker's `EpollIoContext`, for posting work / testing). `using Io = EpollIoContext`.
 - **semantics**: each worker binds `PgProvider`'s `thread_local` providers to its own `BatchScheduler` on its own thread during `create()` — a coroutine running on a worker routes to that worker's resources with no cross-thread hop.
 
-> The bundled `PgPool<Io>::create` / `RedisPool<Io>::create` are *coroutines* (lazy `Task`s doing connection I/O on the loop thread) — `IoPool::create` drives them internally. You only touch them directly in a bring-your-own-loop bootstrap (see `spawnOn`).
+> The bundled `PgPool<Io>::create` is a *coroutine* (a lazy `Task` doing connection I/O on the loop thread) — `IoPool::create` drives it internally. You only touch it directly in a bring-your-own-loop bootstrap (see `spawnOn`).
 
 `IoPoolConfig` — all fields, defaults from the header:
 
@@ -854,24 +826,14 @@ static std::unique_ptr<IoPool> create(const IoPoolConfig& config);   // io/IoPoo
 |---|---|---|---|
 | `num_workers` | `int` | `1` | Number of event loops / worker threads (one per core). |
 | `pg_conninfo` | `std::string` | `""` | libpq conninfo; empty → libpq `PG*` env vars. |
-| `redis` | `std::optional<RedisWorkerConfig>` | `RedisWorkerConfig{}` | L2 Redis endpoint + per-worker sizing (fields below); the default is an enabled localhost pool. `std::nullopt` → L1-only: no pool is built, no boot connect is attempted, `hasRedis()==false` on every worker, and the L2 tier is bypassed (not stubbed to throw). |
 | `pg_min_conns_per_worker` | `size_t` | `2` | PG pool floor per worker. |
 | `pg_max_conns_per_worker` | `size_t` | `8` | PG pool ceiling per worker. Total PG conns = `num_workers × this` — keep under the DB's `max_connections`. |
-| `max_concurrent_per_worker` | `int` | `8` | Sends in flight per worker, counted separately for PG and for Redis. Concurrent writes take at most half of the PG budget (up to 16 connections), leaving the rest to reads; PostgreSQL commits them together from 3 connections on, so a write-heavy worker gains from `6` or more. |
+| `max_concurrent_per_worker` | `int` | `8` | Sends in flight per worker. Concurrent writes take at most half of the PG budget (up to 16 connections), leaving the rest to reads; PostgreSQL commits them together from 3 connections on, so a write-heavy worker gains from `6` or more. |
 | `pin_to_cores` | `bool` | `true` | Pin each worker thread to a CPU core. |
 | `first_core` | `int` | `1` | First core index for pinning (worker `i` → `first_core + i`); `1` avoids core 0 (OS/IRQ). |
 | `acquire_timeout` | `std::chrono::milliseconds` | `5000` | Bounds each connection acquire, including the startup warm-up connect — an unreachable DB fails `create()` instead of hanging. |
-| `query_timeout` | `std::chrono::milliseconds` | `30000` | Bounds each per-connection I/O wait (PG *and* Redis). A liveness backstop, not an SLA; `0` disables it (discouraged). See [runtime.md › Liveness & failure semantics](runtime.md#liveness--failure-semantics). |
+| `query_timeout` | `std::chrono::milliseconds` | `30000` | Bounds each per-connection I/O wait. A liveness backstop, not an SLA; `0` disables it (discouraged). See [runtime.md › Liveness & failure semantics](runtime.md#liveness--failure-semantics). |
 | `startup_timeout` | `std::chrono::milliseconds` | `30000` | Bounds `create()`'s wait for all workers to report ready — a worker that hangs at boot (e.g. an unreachable dependency) makes `create()` throw `io::IoPoolStartupError` rather than block forever. |
-
-`RedisWorkerConfig` — the L2 endpoint and per-worker Redis sizing carried in `IoPoolConfig::redis`. Set `redis = std::nullopt` for an L1-only pool that reaches no Redis at all.
-
-| Field | Type | Default | Meaning |
-|---|---|---|---|
-| `unix_path` | `std::string` | `""` | Redis Unix socket path. Empty → use TCP (`host`/`port`). |
-| `host` | `std::string` | `"127.0.0.1"` | Redis TCP host (used when `unix_path` is empty). |
-| `port` | `int` | `6379` | Redis TCP port. |
-| `conns_per_worker` | `size_t` | `4` | Redis connections opened per worker (each worker owns its own pool). |
 
 ### Task / Immediate / DetachedTask
 
@@ -916,7 +878,7 @@ A suspended driver coroutine is created holding `task` + `on_done`; `io.post()` 
 
 ### The `IoContext` concept
 
-The event-loop extension point (`io/IoContext.h`). `PgPool<Io>`, `RedisPool<Io>`, `BatchScheduler<Io>`, the awaiter machinery, and `spawnOn` are all generic over it: any epoll-family loop (e.g. a trantor shim for Drogon) that satisfies it can host relais inline. The concept fixes **only the signatures below**; the semantic contract (callbacks on the loop thread, FIFO posts, cross-thread wakeups, reentrant `removeWatch`) is encoded in the conformance harness, not the concept.
+The event-loop extension point (`io/IoContext.h`). `PgPool<Io>`, `BatchScheduler<Io>`, the awaiter machinery, and `spawnOn` are all generic over it: any epoll-family loop (e.g. a trantor shim for Drogon) that satisfies it can host relais inline. The concept fixes **only the signatures below**; the semantic contract (callbacks on the loop thread, FIFO posts, cross-thread wakeups, reentrant `removeWatch`) is encoded in the conformance harness, not the concept.
 
 Required member types (2): `T::WatchHandle`, `T::TimerToken`.
 
@@ -976,7 +938,7 @@ static void runAll(Io& io, Drive drive);   // testing/IoContextConformance.h
 
 ### PgProvider & PgResult / Row & errors
 
-`PgProvider` (`PgProvider.h`, root ns) is the type-erased service locator: it wraps `io::PgClient<Io>`/`io::RedisClient<Io>` behind `thread_local std::function`s so repositories don't name the concrete `IoContext`. **All query entry points are static methods of `PgProvider`** (not of `PgResult`/`Row`).
+`PgProvider` (`PgProvider.h`, root ns) is the type-erased service locator: it wraps `io::PgClient<Io>` behind `thread_local std::function`s so repositories don't name the concrete `IoContext`. **All query entry points are static methods of `PgProvider`** (not of `PgResult`/`Row`).
 
 | Method | Returns | Notes |
 |---|---|---|
@@ -984,24 +946,22 @@ static void runAll(Io& io, Drive drive);   // testing/IoContextConformance.h
 | `queryParams(const char* sql, const io::PgParams& params)` | `Task<PgResult>` | Parameterized; `sql` + `params` must outlive the `co_await`. Build `params` with `io::PgParams::make(args...)`, which takes the same arguments as `queryArgs`. |
 | `template<io::PgArg... Args> queryArgs(const char* sql, Args&&...)` | `Task<PgResult>` | Binds each argument as listed under **Arguments** below into a `PgParams` kept in the coroutine frame; forwards to `queryParams`. |
 | `queryWrite(const char* sql, const PgParams&, batch::WriteMode mode = Idempotent)` | `Task<batch::PgWriteResult>` | Sole write entry point (write batch, ordering in [runtime.md › Write ordering](runtime.md#write-ordering)). Result carries RETURNING rows + `affectedRows()`; `coalesced=true` ⇒ an identical `Idempotent` write was already batched, no DB round-trip. `WriteMode::Exclusive` (relative SET, guarded write, claim, `now()`-dependent value) is never coalesced: it runs once per caller, still batched. |
-| `template<io::RedisArg... Args> redis(Args&&...)` | `Task<RedisResult>` | Variadic Redis command (verb first); each argument is sent as listed under **Arguments** below, binary-safe. |
-| `redisDynamic(std::vector<std::string> args)` | `Task<RedisResult>` | Runtime-sized argv (verb first), e.g. MGET over N keys. |
-| `hasRedis()` / `initialized()` | `bool` (noexcept) | Whether Redis is configured / providers bound on this thread. |
+| `initialized()` | `bool` (noexcept) | Whether providers are bound on this thread. |
 | `reset()` | `void` (noexcept) | Clear this thread's providers (testing). |
 
 `entityQueryParams` / `entityQueryParamsMany` also exist (entity-read paths routed through `submitEntityRead*` for `pk = ANY` batching/fusion) — repositories use these, not application code.
 
-**Arguments** — `queryArgs`, `PgParams::make` and `redis` accept a closed set of types, enforced by the `io::PgArg` and `io::RedisArg` concepts. Nothing converts implicitly: what is sent is exactly what is written.
+**Arguments** — `queryArgs` and `PgParams::make` accept a closed set of types, enforced by the `io::PgArg` concept. Nothing converts implicitly: what is sent is exactly what is written.
 
-| Argument | PostgreSQL (`PgArg`) | Redis (`RedisArg`) |
-|---|---|---|
-| Number: any arithmetic type except `bool` and the character types (`int8_t`/`uint8_t` are numbers) | Exact decimal text | Exact decimal text |
-| `bool` | `t` / `f` | Refused (Redis has no boolean) |
-| `std::string`, `std::string_view`, `const char*` | Text | Bytes |
-| `std::nullptr_t` | `NULL` | Refused |
-| `std::optional<T>`, `T` a number, `bool` or text | `NULL` or `T` | Refused |
-| `std::vector<T>`, `T` a number, `bool`, text, or an `optional` of one | Array literal (`{1,2,3}`; text quoted when needed, `NULL` for an empty `optional`) | Refused (use `redisDynamic`) |
-| Enum, or any other type (including classes convertible to the above) | Compile error | Compile error |
+| Argument | Sent as |
+|---|---|
+| Number: any arithmetic type except `bool` and the character types (`int8_t`/`uint8_t` are numbers) | Exact decimal text |
+| `bool` | `t` / `f` |
+| `std::string`, `std::string_view`, `const char*` | Text |
+| `std::nullptr_t` | `NULL` |
+| `std::optional<T>`, `T` a number, `bool` or text | `NULL` or `T` |
+| `std::vector<T>`, `T` a number, `bool`, text, or an `optional` of one | Array literal (`{1,2,3}`; text quoted when needed, `NULL` for an empty `optional`) |
+| Enum, or any other type (including classes convertible to the above) | Compile error |
 
 - **Floating point** is sent as the shortest text that reads back to the same value (`0.1` → `0.1`, `1e-7` → `1e-07`), independent of the C locale. NaN is sent as `NaN`, ±∞ as `Infinity`/`-Infinity`. Being text, the same value binds to a `real`, `double precision` or `numeric` column alike.
 - **An enum must say what it stands for**: its integer (`std::to_underlying(e)`) or its database text (a `std::string`). Binding it implicitly as an integer would hide a mismatch with a text or PostgreSQL `ENUM` column.
@@ -1013,11 +973,10 @@ template<typename Io>
 static void init(
     Io& io,
     std::shared_ptr<io::PgPool<Io>> pool,
-    std::type_identity_t<std::shared_ptr<io::RedisClient<Io>>> redisClient = nullptr,
     int max_concurrent = 8);
 ```
-- The Redis argument is **non-deduced** (`std::type_identity_t<...>`) so passing an explicit `nullptr` doesn't break `Io` deduction; `Io` comes from `io`/`pool` only. Default `nullptr` ⇒ no Redis. `max_concurrent` (default `8`) is the loop's send budget, as `IoPoolConfig::max_concurrent_per_worker`.
-- Providers are `thread_local`: `init` on thread A binds nothing for thread B. Debug builds assert `io.isInLoopThread()` for adapters that expose it. `bindBatcher<Io>(batcher, with_redis)` is the lower-level entry `IoPool` uses (one batcher per worker).
+- `max_concurrent` (default `8`) is the loop's send budget, as `IoPoolConfig::max_concurrent_per_worker`.
+- Providers are `thread_local`: `init` on thread A binds nothing for thread B. Debug builds assert `io.isInLoopThread()` for adapters that expose it. `bindBatcher<Io>(batcher)` is the lower-level entry `IoPool` uses (one batcher per worker).
 
 **`PgResult`** (`io/pg/PgResult.h`) — RAII wrapper over `PGresult`:
 
@@ -1066,12 +1025,8 @@ Any other `T` is a compile error.
 | `io::PgUncertainError` | `PgError` | **Category** — the request was in flight when the wait failed, so the DB *may* have committed. The write path evicts the affected caches before rethrowing. |
 | `io::PgQueryTimeout` | `PgUncertainError` | A per-connection I/O wait exceeded `query_timeout`. |
 | `io::PgConnectionLost` | `PgUncertainError` | The connection dropped (RST/EOF) after the request was flushed or while its result was read. |
-| `io::RedisError` | `std::runtime_error` | Any Redis-layer error, including an error reply from the server, whether the command was sent alone or pipelined in a batch. |
-| `io::RedisConnectionError` | `RedisError` | Connection-level Redis failure. |
-| `io::RedisQueryTimeout` | `RedisError` | A Redis I/O wait exceeded `query_timeout`. A read degrades to an L2 miss (→ L3); a write/evict is best-effort + self-heal. |
-| `io::RedisNoScriptError` | `RedisError` | Error reply `NOSCRIPT`: the server has no script under the SHA1 given to `EVALSHA`. |
 
-> Catch `PgError`/`RedisError` to handle a whole layer; catch `PgNoRows` etc. for the specific case. There is no `error_code`-style enum — branch on type. The one category that carries semantics is `PgUncertainError`: a write that throws it *may* have committed (relais has already evicted the affected caches); a write that throws a plain `PgError` provably did not. See [runtime.md › Liveness & failure semantics](runtime.md#liveness--failure-semantics).
+> Catch `PgError` to handle the whole layer; catch `PgNoRows` etc. for the specific case. There is no `error_code`-style enum — branch on type. The one category that carries semantics is `PgUncertainError`: a write that throws it *may* have committed (relais has already evicted the affected caches); a write that throws a plain `PgError` provably did not. See [runtime.md › Liveness & failure semantics](runtime.md#liveness--failure-semantics).
 
 → Guides: [runtime.md](runtime.md), [foreign-event-loops.md](foreign-event-loops.md)
 

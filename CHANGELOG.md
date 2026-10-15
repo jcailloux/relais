@@ -4,13 +4,10 @@
 
 ### Added
 
-- **Every number type is accepted** as a query or Redis argument, unsigned
-  integers included, and read by `get<T>`/`getOpt<T>` (`float`, `int16_t`,
-  `uint64_t`…).
-- **`findMany` on every preset.** `Uncached` and `Redis` repos gain it, same
-  signature; without L1 the returned view owns its entities.
-- **`io::RedisNoScriptError`**, a `RedisError` thrown on a `NOSCRIPT` reply
-  (`EVALSHA` on a script the server does not have).
+- **Every number type is accepted** as a query argument, unsigned integers
+  included, and read by `get<T>`/`getOpt<T>` (`float`, `int16_t`, `uint64_t`…).
+- **`findMany` on every preset.** `Uncached` repos gain it, same signature;
+  without L1 the returned view owns its entities.
 - **`Op::IS_NULL` list filter** (`filterable:<param>:is_null`): `true` selects
   rows where the column is NULL, `false` rows where it is not. The field must be
   a `std::optional`.
@@ -20,26 +17,23 @@
 ### Changed (Breaking)
 
 - **The repository API no longer depends on the preset.** Every method has the
-  same signature, return type included, on `Uncached`, `Local`, `Redis` and
-  `Both`: changing `cache_level` never breaks compilation. `find`, `findJson`
-  and `findBinary` now return `io::Immediate<…>` on `Uncached` and `Redis` too;
-  code that names `io::Task<…>` for them switches to `io::Immediate<…>` or
-  `auto`.
+  same signature, return type included, on `Uncached` and `Local`: changing
+  `cache_level` never breaks compilation. `find`, `findJson` and `findBinary`
+  now return `io::Immediate<…>` on `Uncached` too; code that names
+  `io::Task<…>` for them switches to `io::Immediate<…>` or `auto`.
 - **`sweep(chunk_id)` is no longer public API.** The library sweeps L1 itself;
   `purge()` clears the caches.
 - **Query arguments form a closed set**, checked by `io::PgArg` (`queryArgs`,
-  `PgParams::make`) and `io::RedisArg` (`redis`); see `docs/api-reference.md ›
-  Arguments`. An enum, alone or in an `optional`/`vector`, no longer compiles:
-  pass `std::to_underlying(e)` or its database text. `redis` no longer accepts
-  `bool`.
+  `PgParams::make`); see `docs/api-reference.md › Arguments`. An enum, alone or
+  in an `optional`/`vector`, no longer compiles: pass `std::to_underlying(e)` or
+  its database text.
 - **Numeric columns are read strictly.** The whole value must parse as `T`:
   `get<int64_t>` on `12.5` (e.g. `avg()`) throws `PgError` instead of returning
   `12`. Read a `double` or cast in SQL.
 - **`ListWrapper::total_count` and `count()` are removed**, and the
   `total_count` key leaves the JSON and BEVE output: `query()` left it at `0`,
   `fromRows` set it to the page size. Use `size()` for the page and
-  `countWhere` for a total. A list page stored in Redis by an earlier version
-  is read as a miss and stored again.
+  `countWhere` for a total.
 - **Generated entity headers must be regenerated**: the repositories use new
   SQL constants (`update_returning_changes`, `delete_by_pk_returning`,
   `delete_with_partition_returning`). The generator now also rejects a filter
@@ -52,12 +46,6 @@
 
 ### Changed
 
-- **Lua scripts are sent by SHA1 (`EVALSHA`)**, not in full on every call (up to
-  8.6 KB per write on a repo with lists). A script the server has lost is sent
-  again automatically.
-- **A list read no longer waits for Redis to store the page.** The L2 store is
-  one atomic script, run detached: 4 sequential round trips before.
-- **Redis arguments are copied once, not twice**: large values gain throughput.
 - **A read identical to one already sent to PostgreSQL shares its result**
   instead of sending a second query. It is not merged if a write has completed
   since that read was sent.
@@ -70,22 +58,32 @@
   than in 3.2.1, where they could take the whole budget: raise it for
   write-heavy loads.
 
+### Removed
+
+- **Redis and the L2 cache tier.** relais caches in process (L1) in front of
+  PostgreSQL. Gone: the `Redis` and `Both` presets, `CacheLevel::L2` and
+  `L1_L2`, `L2Format`, the `l2_*` fields and their `with_l2_*` modifiers, the
+  L2 counters of `MetricsSnapshot`, `IoPoolConfig::redis` and
+  `RedisWorkerConfig`, `PgProvider::redis`, `redisDynamic` and `hasRedis`,
+  `invalidateListGroupByKey`, and the `io::Redis*` client and error types.
+  Migrate `config::Both` and `config::Redis` to `config::Local`,
+  `PgProvider::init(io, pool, nullptr, n)` to `init(io, pool, n)`, and
+  `bindBatcher(batcher, with_redis)` to `bindBatcher(batcher)`. Instances that
+  share rows see each other's writes after at most `l1_ttl`; see
+  `docs/caching.md › Several instances`.
+
 ### Fixed
 
-- **A Redis error reply did not throw when the command was pipelined with
-  others**, i.e. under concurrent load: `redis`/`redisDynamic` returned it as a
-  `RedisResult`. They now throw `io::RedisError` either way, failing only that
-  command of the batch; code that tested `isError()` catches instead.
-- **A list read could fail after PostgreSQL had answered**, when Redis failed
-  while the page was stored into L2.
-- **Floating-point values sent to PostgreSQL and Redis were rounded to 6
-  decimals** (`1e-7` became `0`), silently, while L1 and L2 kept the exact
-  value; under a non-C `LC_NUMERIC` they were written with a decimal comma.
-  Entity writes, filters, `queryArgs` and `redis` now send the shortest text
-  that reads back the same value. Values already stored are not repaired.
+- **`InvalidateListVia` left L1 list pages stale when its resolver returned
+  `std::nullopt`** (every group affected): only Redis pages were dropped. Every
+  L1 page of the target list repo is now invalidated.
+- **Floating-point values sent to PostgreSQL were rounded to 6 decimals**
+  (`1e-7` became `0`), silently, while L1 kept the exact value; under a non-C
+  `LC_NUMERIC` they were written with a decimal comma. Entity writes, filters
+  and `queryArgs` now send the shortest text that reads back the same value.
+  Values already stored are not repaired.
 - **`size`, `purge` and `warmup` did not compile without L1**: absent on
-  `Uncached`/`Redis`, a hard error on a list repo. They now return `0` or do
-  nothing.
+  `Uncached`, a hard error on a list repo. They now return `0` or do nothing.
 - **A list page could stay stale after a write of a row with NULL in a
   filtered column**: a `nin` filter with an empty set did not see the row, which
   SQL includes. `ne` and range filters no longer invalidate pages for such rows,
