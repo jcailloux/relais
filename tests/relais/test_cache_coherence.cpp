@@ -27,6 +27,7 @@
 #include <jcailloux/relais/io/pg/PgPool.h>
 #include <jcailloux/relais/io/pg/PgError.h>
 #include <jcailloux/relais/io/pg/SettleQueue.h>
+#include <jcailloux/relais/repository/Precaution.h>
 #include <jcailloux/relais/Log.h>
 #include <jcailloux/relais/io/batch/BatchScheduler.h>
 #include <jcailloux/relais/io/batch/TimingEstimator.h>
@@ -39,6 +40,8 @@
 #include "fixtures/generated/TestAssignedKeyEntity.h"
 #include "fixtures/generated/TestArticleEntity.h"
 #include "fixtures/generated/TestFilterOnlyEntity.h"
+#include "fixtures/generated/TestUserEntity.h"
+#include "fixtures/generated/TestPurchaseEntity.h"
 
 #include <array>
 #include <chrono>
@@ -1681,7 +1684,311 @@ TEST_CASE("settle queue: destroyed with pending tickets, it abandons them",
         resetItems(env);
         auto id = env.seedItem("settle", 1);
         auto lock = lockItem(id);
-        (void)blockedUpdate(env, id, 2);
+        auto t = blockedUpdate(env, id, 2);
+        CHECK(t->replays.size() == 1);  // dropped with the queue, never run
     }
     CHECK(LogCapture::count(log::Level::Warn, "abandoned unsettled") == 1);
+}
+
+// =============================================================================
+// Replayed evictions — each cache tier evicts at once after an uncertain write,
+// and registers that eviction on the write's ticket, which runs it again once
+// the write can no longer commit. The write here blocks on a lock held by a
+// probe; under Await, releasing the lock lets it commit AFTER its first
+// eviction, and a read in between refills the cache with the old row: only the
+// replay removes it.
+// =============================================================================
+
+using CohUserL1 = Repo<::entity::generated::TestUserEntity, "coh:user:l1">;
+inline constexpr auto cohPurchaseUser = [](const auto& p) -> int64_t { return p.user_id; };
+using CohPurchaseL1 = Repo<::entity::generated::TestPurchaseEntity, "coh:purchase:l1",
+                           cfg::Local, Invalidate<CohUserL1, cohPurchaseUser>>;
+
+namespace {
+
+// Fails `op` uncertainly against a held lock, runs `refill` (reads that cache
+// the old row once the first eviction is done), releases the lock, then lets
+// the queue settle. Under Await the write commits as the lock goes.
+template<typename Op, typename Refill>
+std::shared_ptr<io::SettleTicket> settleAfterRefill(CohEnv& env, std::optional<RowLock>& lock,
+                                                   Op op, Refill refill) {
+    queueOf(env).pause();
+    auto t = uncertainTicket(env, std::move(op));
+    REQUIRE(t);
+    REQUIRE_FALSE(t->replays.empty());
+    refill();
+    lock.reset();
+    queueOf(env).resume();
+    REQUIRE(pumpUntil(env, [&] { return settledAll(env); }, 7s));
+    return t;
+}
+
+int32_t cachedValue(CohEnv& env, int64_t id) {
+    auto v = driveBounded(env.io, CohItemL1::find(id));
+    REQUIRE(v);
+    return v->value;
+}
+
+bool inL1Item(int64_t id) {
+    return static_cast<bool>(relais_test::TestInternals::getFromCache<CohItemL1>(id));
+}
+
+auto setValue(int32_t v) {
+    return jcailloux::relais::entity::set<TestItemEntity::Field::value>(v);
+}
+
+int64_t seedUser(CohEnv& env, const std::string& name) {
+    return std::stoll(env.probe.query(
+        "INSERT INTO relais_test_users (username, email) VALUES ('" + name + "', '"
+        + name + "@coh') RETURNING id").get(0, 0));
+}
+
+int64_t seedPurchase(CohEnv& env, int64_t user) {
+    return std::stoll(env.probe.query(
+        "INSERT INTO relais_test_purchases (user_id, product_name, amount, status) VALUES ("
+        + std::to_string(user) + ", 'coh', 1, 'pending') RETURNING id").get(0, 0));
+}
+
+}  // namespace
+
+TEST_CASE("precaution: an eviction runs at once and again only on a pending ticket",
+          "[coherence][settle]") {
+    int runs = 0;
+    auto evict = [&runs] { ++runs; };
+
+    SECTION("pending: registered") {
+        auto t = ticketFor(io::UncertainSettle::Delay, {}, 1s);
+        detail::precautionSync(t, evict);
+        CHECK(runs == 1);
+        REQUIRE(t->replays.size() == 1);
+    }
+    SECTION("settled: run once, not registered") {
+        auto t = ticketFor(io::UncertainSettle::Delay, {}, 1s);
+        t->state = io::SettleTicket::State::Settled;
+        detail::precautionSync(t, evict);
+        CHECK(runs == 1);
+        CHECK(t->replays.empty());
+    }
+    SECTION("no ticket (settling Off): run once") {
+        detail::precautionSync(nullptr, evict);
+        CHECK(runs == 1);
+    }
+}
+
+TEST_CASE("replay: a write committed after its eviction is evicted again once settled",
+          "[coherence][settle][replay][integration]") {
+    CohEnv env(300ms, io::UncertainSettle::Await);
+    resetItems(env);
+    auto id = env.seedItem("replay", 1);
+    std::optional<RowLock> lock;
+    lock.emplace("relais_test_items", "id=" + std::to_string(id));
+
+    settleAfterRefill(env, lock, CohItemL1::update(id, item(id, "replay", 2)), [&] {
+        CHECK(cachedValue(env, id) == 1);  // the old row, cached after the first eviction
+    });
+    REQUIRE(probeValue(env, id) == "2");   // committed late
+    CHECK(cachedValue(env, id) == 2);
+}
+
+TEST_CASE("replay: Terminate settles before the commit, the cache matches PostgreSQL",
+          "[coherence][settle][replay][integration]") {
+    CohEnv env(300ms);
+    resetItems(env);
+    auto id = env.seedItem("replay", 1);
+    std::optional<RowLock> lock;
+    lock.emplace("relais_test_items", "id=" + std::to_string(id));
+    auto t = blockedUpdate(env, id, 2);
+    CHECK(cachedValue(env, id) == 1);
+    queueOf(env).resume();
+    REQUIRE(pumpUntil(env, [&] { return settledAll(env); }, 7s));
+    CHECK_FALSE(inL1Item(id));  // replayed
+    lock.reset();
+    CHECK(probeValue(env, id) == "1");
+    CHECK(cachedValue(env, id) == 1);
+}
+
+TEST_CASE("replay: patch, erase and upsert are evicted again once settled",
+          "[coherence][settle][replay][integration]") {
+    CohEnv env(300ms, io::UncertainSettle::Await);
+
+    SECTION("patch") {
+        resetItems(env);
+        auto id = env.seedItem("replay", 1);
+        std::optional<RowLock> lock;
+        lock.emplace("relais_test_items", "id=" + std::to_string(id));
+        settleAfterRefill(env, lock, CohItemL1::patch(id, setValue(2)), [&] {
+            CHECK(cachedValue(env, id) == 1);
+        });
+        REQUIRE(probeValue(env, id) == "2");
+        CHECK(cachedValue(env, id) == 2);
+    }
+    SECTION("erase") {
+        resetItems(env);
+        auto id = env.seedItem("replay", 1);
+        std::optional<RowLock> lock;
+        lock.emplace("relais_test_items", "id=" + std::to_string(id));
+        settleAfterRefill(env, lock, CohItemL1::erase(id), [&] {
+            CHECK(cachedValue(env, id) == 1);
+        });
+        REQUIRE(probeValue(env, id) == "<absent>");
+        CHECK_FALSE(driveBounded(env.io, CohItemL1::find(id)));
+    }
+    SECTION("upsert, update branch") {
+        resetAkey(env);
+        seedAkey(env, 7, 1);
+        std::optional<RowLock> lock;
+        lock.emplace("relais_test_assigned_keys", "key_id=7");
+        settleAfterRefill(env, lock, CohAkeyL1::upsert(akey(7, 2)), [&] {
+            auto v = driveBounded(env.io, CohAkeyL1::find(7));
+            REQUIRE(v);
+            CHECK(v->payload == 1);
+        });
+        REQUIRE(probeAkey(env, 7) == "2");
+        auto v = driveBounded(env.io, CohAkeyL1::find(7));
+        REQUIRE(v);
+        CHECK(v->payload == 2);
+    }
+}
+
+TEST_CASE("replay: an insert committed late enters its list page once settled",
+          "[coherence][settle][replay][list][integration]") {
+    CohEnv env(300ms, io::UncertainSettle::Await);
+    resetArticleCaches<CohArticleL1>(env);
+    // Prepare the INSERT once, so the held one waits only on its result.
+    driveBounded(env.io, CohArticleL1::insert(articleIn(0, "coh-rep-warm")));
+    std::optional<RowLock> lock;
+    lock.emplace("relais_test_articles", "false");  // opens the transaction
+    lock->locker.query("LOCK TABLE relais_test_articles IN SHARE MODE");
+
+    auto pageSize = [&] {
+        using Desc = CohArticleL1::ListDescriptorType;
+        ld::ListQueryParams<Desc> p;
+        p.limit = 10;
+        p.filters.template get<"category">() = std::string("coh-rep-ins");
+        return driveBounded(env.io, CohArticleL1::query(ld::seal<Desc>(std::move(p))))
+            ->items.size();
+    };
+    settleAfterRefill(env, lock, CohArticleL1::insert(articleIn(0, "coh-rep-ins")), [&] {
+        CHECK(pageSize() == 0);
+    });
+    REQUIRE(env.probe.query("SELECT count(*) FROM relais_test_articles WHERE category='coh-rep-ins'")
+                .get(0, 0) == "1");
+    CHECK(pageSize() == 1);
+}
+
+TEST_CASE("replay: the pages of both positions follow a move committed late",
+          "[coherence][settle][replay][list][integration]") {
+    CohEnv env(300ms, io::UncertainSettle::Await);
+    resetArticleCaches<CohArticleL1>(env);
+    auto warm = seedArticle(env, "coh-rep-warm");
+    driveBounded(env.io, CohArticleL1::update(warm, articleIn(warm, "coh-rep-warm")));
+    auto id = seedArticle(env, "coh-rep-a");
+    REQUIRE(driveBounded(env.io, CohArticleL1::find(id)));  // the L1 copy keys the old position
+    std::optional<RowLock> lock;
+    lock.emplace("relais_test_articles", "id=" + std::to_string(id));
+
+    settleAfterRefill(env, lock, CohArticleL1::update(id, articleIn(id, "coh-rep-b")), [&] {
+        CHECK(pageHolds<CohArticleL1>(env, "coh-rep-a", id));
+        CHECK_FALSE(pageHolds<CohArticleL1>(env, "coh-rep-b", id));
+    });
+    REQUIRE(articleCategory(env, id) == "coh-rep-b");
+    CHECK_FALSE(pageHolds<CohArticleL1>(env, "coh-rep-a", id));
+    CHECK(pageHolds<CohArticleL1>(env, "coh-rep-b", id));
+}
+
+TEST_CASE("replay: both cross-invalidation targets are evicted again once settled",
+          "[coherence][settle][replay][integration]") {
+    CohEnv env(300ms, io::UncertainSettle::Await);
+    env.probe.query("DELETE FROM relais_test_purchases");
+    relais_test::TestInternals::resetEntityCacheState<CohUserL1>();
+    relais_test::TestInternals::resetEntityCacheState<CohPurchaseL1>();
+    relais_test::TestInternals::resetListCacheState<CohPurchaseL1>();
+    auto u1 = seedUser(env, "coh-rep-u1");
+    auto u2 = seedUser(env, "coh-rep-u2");
+    auto pid = seedPurchase(env, u1);
+    auto before = driveBounded(env.io, CohPurchaseL1::find(pid));  // the L1 copy keys u1
+    REQUIRE(before);
+    auto moved = ::entity::generated::TestPurchaseEntity(*before);
+    moved.user_id = u2;
+    driveBounded(env.io, CohPurchaseL1::update(pid, *before));  // prepares the UPDATE
+    REQUIRE(driveBounded(env.io, CohPurchaseL1::find(pid)));
+    std::optional<RowLock> lock;
+    lock.emplace("relais_test_purchases", "id=" + std::to_string(pid));
+
+    auto inL1User = [](int64_t u) {
+        return static_cast<bool>(relais_test::TestInternals::getFromCache<CohUserL1>(u));
+    };
+    settleAfterRefill(env, lock, CohPurchaseL1::update(pid, moved), [&] {
+        REQUIRE(driveBounded(env.io, CohUserL1::find(u1)));
+        REQUIRE(driveBounded(env.io, CohUserL1::find(u2)));
+        REQUIRE(inL1User(u1));
+        REQUIRE(inL1User(u2));
+    });
+    CHECK_FALSE(inL1User(u1));
+    CHECK_FALSE(inL1User(u2));
+    env.probe.query("DELETE FROM relais_test_users WHERE id IN (" + std::to_string(u1) + ", "
+                    + std::to_string(u2) + ")");
+}
+
+TEST_CASE("replay: writes of one pipeline share one ticket and replay every eviction",
+          "[coherence][settle][replay][integration]") {
+    CohEnv env(300ms);
+    resetItems(env);
+    auto first = env.seedItem("replay-first", 0);
+    auto locked = env.seedItem("replay-locked", 0);
+
+    // Past the estimator's bootstrap, writes submitted while one is in flight
+    // are batched instead of sent one by one.
+    for (int i = 0; i < 6; ++i)
+        driveBounded(env.io, CohItemL1::update(first, item(first, "replay-first", i)));
+
+    queueOf(env).pause();
+    std::optional<RowLock> lock;
+    lock.emplace("relais_test_items", "id=" + std::to_string(locked));
+    std::array<std::shared_ptr<io::SettleTicket>, 3> tickets;
+    auto write = [&](int slot, int64_t id, int32_t value) -> io::Task<void> {
+        try {
+            (void)co_await CohItemL1::update(id, item(id, "replay", value));
+        } catch (const io::PgUncertainError& e) {
+            if (slot >= 0) tickets[slot] = e.settleTicket();
+        }
+    };
+    auto wave = [&]() -> io::Task<void> {
+        std::vector<io::Task<void>> tasks;
+        tasks.push_back(write(-1, first, 100));  // sent alone, completes
+        tasks.push_back(write(0, locked, 1));    // the same row: one sub-batch
+        tasks.push_back(write(1, locked, 2));
+        tasks.push_back(write(2, locked, 3));
+        co_await io::whenAll(std::move(tasks));
+    };
+    driveBounded(env.io, wave());
+    REQUIRE(tickets[0]);
+    REQUIRE(tickets[1] == tickets[0]);
+    REQUIRE(tickets[2] == tickets[0]);
+    CHECK(tickets[0]->replays.size() == 3);
+
+    CHECK(cachedValue(env, locked) == 0);
+    queueOf(env).resume();
+    REQUIRE(pumpUntil(env, [&] { return settledAll(env); }, 7s));
+    CHECK(queueOf(env).statements() == 1);
+    CHECK_FALSE(inL1Item(locked));
+    lock.reset();
+    CHECK(probeValue(env, locked) == "0");
+}
+
+TEST_CASE("replay: the second eviction is as narrow as the first",
+          "[coherence][settle][replay][integration]") {
+    CohEnv env(300ms, io::UncertainSettle::Await);
+    resetItems(env);
+    auto id = env.seedItem("replay", 1);
+    auto other = env.seedItem("replay-other", 5);
+    CHECK(cachedValue(env, other) == 5);
+    std::optional<RowLock> lock;
+    lock.emplace("relais_test_items", "id=" + std::to_string(id));
+
+    settleAfterRefill(env, lock, CohItemL1::update(id, item(id, "replay", 2)), [&] {
+        CHECK(cachedValue(env, id) == 1);
+    });
+    CHECK_FALSE(inL1Item(id));
+    CHECK(inL1Item(other));
 }

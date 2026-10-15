@@ -5,6 +5,7 @@
 #include "jcailloux/relais/io/Task.h"
 #include "jcailloux/relais/io/pg/PgError.h"
 #include "jcailloux/relais/repository/InvalidateOn.h"
+#include "jcailloux/relais/repository/Precaution.h"
 #include "jcailloux/relais/Log.h"
 
 namespace relais_test { struct TestInternals; }
@@ -55,21 +56,26 @@ public:
         // run the precautionary cross-invalidation after the try, then rethrow.
         cache::CacheView<Entity> result;
         std::exception_ptr timeout;
+        std::shared_ptr<io::SettleTicket> ticket;
         try {
             result = co_await Base::insert(entity);
-        } catch (const io::PgUncertainError&) {
+        } catch (const io::PgUncertainError& e) {
+            ticket = e.settleTicket();
             timeout = std::current_exception();
         }
         if (timeout) {
             // Uncertain: the row may have been inserted (RETURNING id lost).
             // Cross-invalidate from the INPUT entity — the dependent keys live in
             // the entity's own fields, not the generated id. Best-effort.
-            try {
-                co_await propagateCreate<Entity, InvList>(entity);
-            } catch (const std::exception& e) {
-                RELAIS_LOG_ERROR << name()
-                    << ": cross-invalidation failed (insert timeout) - " << e.what();
-            }
+            co_await detail::precaution(std::move(ticket),
+                [entity]() -> io::Task<void> {
+                    try {
+                        co_await propagateCreate<Entity, InvList>(entity);
+                    } catch (const std::exception& e) {
+                        RELAIS_LOG_ERROR << name()
+                            << ": cross-invalidation failed (insert timeout) - " << e.what();
+                    }
+                });
             std::rethrow_exception(timeout);
         }
         if (result) {
@@ -100,13 +106,15 @@ public:
 
         cache::CacheView<Entity> result;
         std::exception_ptr timeout;
+        std::shared_ptr<io::SettleTicket> ticket;
         try {
             if constexpr (detail::HasListMixin<Base>) {
                 result = co_await Base::upsertWithContext(entity, old ? &*old : nullptr);
             } else {
                 result = co_await Base::upsert(entity);
             }
-        } catch (const io::PgUncertainError&) {
+        } catch (const io::PgUncertainError& e) {
+            ticket = e.settleTicket();
             timeout = std::current_exception();
         }
         if (timeout) {
@@ -114,13 +122,16 @@ public:
             // old→input on the update branch, the input on the create branch. The
             // list/entity tiers already evicted themselves as the exception unwound
             // through the inner layers. Best-effort.
-            try {
-                if (old) co_await propagateUpdate<Entity, InvList>(&*old, entity);
-                else co_await propagateCreate<Entity, InvList>(entity);
-            } catch (const std::exception& e) {
-                RELAIS_LOG_ERROR << name()
-                    << ": cross-invalidation failed (upsert timeout) - " << e.what();
-            }
+            co_await detail::precaution(std::move(ticket),
+                [old, entity]() -> io::Task<void> {
+                    try {
+                        if (old) co_await propagateUpdate<Entity, InvList>(&*old, entity);
+                        else co_await propagateCreate<Entity, InvList>(entity);
+                    } catch (const std::exception& e) {
+                        RELAIS_LOG_ERROR << name()
+                            << ": cross-invalidation failed (upsert timeout) - " << e.what();
+                    }
+                });
             std::rethrow_exception(timeout);
         }
         if (result) {
@@ -147,21 +158,26 @@ public:
         std::optional<Entity> uncertain_before;
         typename Base::UpdateOutcome outcome;
         std::exception_ptr timeout;
+        std::shared_ptr<io::SettleTicket> ticket;
         try {
             outcome = co_await Base::template updateOutcome<true>(id, entity, &uncertain_before);
-        } catch (const io::PgUncertainError&) {
+        } catch (const io::PgUncertainError& e) {
+            ticket = e.settleTicket();
             timeout = std::current_exception();
         }
         if (timeout) {
             // Best-effort: the uncertain exception must still surface. The
             // list/entity tiers already evicted themselves as it unwound.
-            try {
-                co_await propagateUpdate<Entity, InvList>(
-                    uncertain_before ? &*uncertain_before : nullptr, entity);
-            } catch (const std::exception& e) {
-                RELAIS_LOG_ERROR << name()
-                    << ": cross-invalidation failed (update timeout) - " << e.what();
-            }
+            co_await detail::precaution(std::move(ticket),
+                [before = std::move(uncertain_before), entity]() -> io::Task<void> {
+                    try {
+                        co_await propagateUpdate<Entity, InvList>(
+                            before ? &*before : nullptr, entity);
+                    } catch (const std::exception& e) {
+                        RELAIS_LOG_ERROR << name()
+                            << ": cross-invalidation failed (update timeout) - " << e.what();
+                    }
+                });
             std::rethrow_exception(timeout);
         }
         if (outcome.affected.value_or(0) > 0) {
@@ -189,20 +205,25 @@ public:
         std::optional<Entity> uncertain_before;
         typename Base::EraseOutcome outcome;
         std::exception_ptr timeout;
+        std::shared_ptr<io::SettleTicket> ticket;
         try {
             outcome = co_await Base::template eraseOutcome<true>(id, nullptr, &uncertain_before);
-        } catch (const io::PgUncertainError&) {
+        } catch (const io::PgUncertainError& e) {
+            ticket = e.settleTicket();
             timeout = std::current_exception();
         }
         if (timeout) {
             // Best-effort: the uncertain exception must still surface.
             if (uncertain_before) {
-                try {
-                    co_await propagateDelete<Entity, InvList>(*uncertain_before);
-                } catch (const std::exception& e) {
-                    RELAIS_LOG_ERROR << name()
-                        << ": cross-invalidation failed (erase timeout) - " << e.what();
-                }
+                co_await detail::precaution(std::move(ticket),
+                    [before = std::move(*uncertain_before)]() -> io::Task<void> {
+                        try {
+                            co_await propagateDelete<Entity, InvList>(before);
+                        } catch (const std::exception& e) {
+                            RELAIS_LOG_ERROR << name()
+                                << ": cross-invalidation failed (erase timeout) - " << e.what();
+                        }
+                    });
             }
             std::rethrow_exception(timeout);
         }
@@ -234,14 +255,16 @@ public:
 
         typename Base::PatchedRow row;
         std::exception_ptr timeout;
+        std::shared_ptr<io::SettleTicket> ticket;
         try {
             row = co_await Base::template patchRow<true>(
                 id, uncertain_before, std::forward<Updates>(updates)...);
-        } catch (const io::PgUncertainError&) {
+        } catch (const io::PgUncertainError& e) {
+            ticket = e.settleTicket();
             timeout = std::current_exception();
         }
         if (timeout) {
-            co_await propagateUncertainPatch(*uncertain_before, "patch");
+            co_await propagateUncertainPatch(std::move(ticket), *uncertain_before, "patch");
             std::rethrow_exception(timeout);
         }
         co_await propagatePatched(row, "patch");
@@ -262,14 +285,16 @@ public:
 
         std::optional<typename Base::PatchedRow> row;
         std::exception_ptr timeout;
+        std::shared_ptr<io::SettleTicket> ticket;
         try {
             row = co_await Base::template patchIfRow<true>(
                 id, uncertain_before, guard, std::forward<Updates>(updates)...);
-        } catch (const io::PgUncertainError&) {
+        } catch (const io::PgUncertainError& e) {
+            ticket = e.settleTicket();
             timeout = std::current_exception();
         }
         if (timeout) {
-            co_await propagateUncertainPatch(*uncertain_before, "patchIf");
+            co_await propagateUncertainPatch(std::move(ticket), *uncertain_before, "patchIf");
             std::rethrow_exception(timeout);
         }
         if (row) co_await propagatePatched(*row, "patchIf");
@@ -311,17 +336,21 @@ protected:
     /// those of the unknowable new version are left to l*_ttl (logged).
     /// Best-effort: the uncertain exception must still surface.
     static io::Task<void> propagateUncertainPatch(
+        std::shared_ptr<io::SettleTicket> ticket,
         const std::optional<Entity>& before, const char* op) {
         RELAIS_LOG_ERROR << name() << ": " << op
             << " timeout — new row version unknowable, its cross-invalidation "
                "targets left to l*_ttl";
         if (!before) co_return;
-        try {
-            co_await propagateDelete<Entity, InvList>(*before);
-        } catch (const std::exception& e) {
-            RELAIS_LOG_ERROR << name() << ": cross-invalidation failed (" << op
-                << " timeout) - " << e.what();
-        }
+        co_await detail::precaution(std::move(ticket),
+            [b = *before, op]() -> io::Task<void> {
+                try {
+                    co_await propagateDelete<Entity, InvList>(b);
+                } catch (const std::exception& e) {
+                    RELAIS_LOG_ERROR << name() << ": cross-invalidation failed (" << op
+                        << " timeout) - " << e.what();
+                }
+            });
     }
 
     /// Best-effort pre-read for cross-invalidation context. The read path no

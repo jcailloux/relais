@@ -13,6 +13,7 @@
 #include "jcailloux/relais/repository/LocalRepo.h"
 #include "jcailloux/relais/repository/InvalidationMixin.h"
 #include "jcailloux/relais/repository/ListMixin.h"
+#include "jcailloux/relais/repository/Precaution.h"
 #include "jcailloux/relais/config/FixedString.h"
 #include "jcailloux/relais/entity/EntityConcepts.h"
 #include "jcailloux/relais/list/spec/GeneratedFilters.h"
@@ -249,9 +250,11 @@ public:
         // evict the input key set after the try, then rethrow.
         std::optional<std::vector<E>> deleted;
         std::exception_ptr timeout;
+        std::shared_ptr<io::SettleTicket> ticket;
         try {
             deleted = co_await Base::eraseManyRaw(std::span<const Key>(keys));
-        } catch (const io::PgUncertainError&) {
+        } catch (const io::PgUncertainError& e) {
+            ticket = e.settleTicket();
             timeout = std::current_exception();
         }
         if (timeout) {
@@ -265,10 +268,13 @@ public:
             // not N sequentially (`keys` outlives the gather). Lists are NOT
             // recoverable here: without the row bodies (no RETURNING) their
             // filter/sort values are unknown, so that tier stays bounded by l1_ttl.
-            std::vector<io::Task<void>> evictions;
-            evictions.reserve(keys.size());
-            for (const auto& k : keys) evictions.push_back(Base::invalidate(k));
-            co_await io::whenAll(std::move(evictions));
+            co_await detail::precaution(std::move(ticket),
+                [keys = std::move(keys)]() -> io::Task<void> {
+                    std::vector<io::Task<void>> evictions;
+                    evictions.reserve(keys.size());
+                    for (const auto& k : keys) evictions.push_back(Base::invalidate(k));
+                    co_await io::whenAll(std::move(evictions));
+                });
             std::rethrow_exception(timeout);
         }
         if (!deleted) co_return std::nullopt;  // DB error
@@ -329,9 +335,11 @@ public:
         filters.values = pred.toFilterTuple();
         std::optional<std::vector<E>> deleted;
         std::exception_ptr timeout;
+        std::shared_ptr<io::SettleTicket> ticket;
         try {
             deleted = co_await Base::template eraseWhereRaw<FD>(filters);
-        } catch (const io::PgUncertainError&) {
+        } catch (const io::PgUncertainError& e) {
+            ticket = e.settleTicket();
             timeout = std::current_exception();
         }
         if (timeout) {
@@ -343,13 +351,16 @@ public:
             RELAIS_LOG_ERROR << name()
                 << ": eraseWhere timeout — entity tier left to l1_ttl "
                    "(matched keys unknowable), invalidating lists by predicate";
-            try {
-                co_await Base::template invalidateWhereListsCritical<FD>(filters);
-            } catch (const std::exception& e) {
-                RELAIS_LOG_ERROR << name()
-                    << ": predicate list invalidate failed (eraseWhere timeout) - "
-                    << e.what();
-            }
+            co_await detail::precaution(std::move(ticket),
+                [filters]() -> io::Task<void> {
+                    try {
+                        co_await Base::template invalidateWhereListsCritical<FD>(filters);
+                    } catch (const std::exception& e) {
+                        RELAIS_LOG_ERROR << name()
+                            << ": predicate list invalidate failed (eraseWhere timeout) - "
+                            << e.what();
+                    }
+                });
             std::rethrow_exception(timeout);
         }
         if (!deleted) co_return std::nullopt;  // DB error
@@ -457,8 +468,9 @@ public:
             rows = co_await Base::template patchWhereRaw<kRows>(
                 pred, std::forward<Updates>(updates)...);
         } catch (const io::PgUncertainError&) {
-            // The changed rows are unknowable after a lost ACK, and the
-            // predicate may still match them: nothing to invalidate by.
+            // precaution-exempt: the changed rows are unknowable after a lost
+            // ACK, and the predicate may still match them: nothing to
+            // invalidate by.
             RELAIS_LOG_ERROR << name()
                 << ": patchWhere timeout — changed rows unknowable, entity and "
                    "list tiers left to l1_ttl";
@@ -535,6 +547,7 @@ private:
             rows = co_await Base::template claimRaw<O, kRows, Order>(
                 pred, order, n, std::forward<Updates>(updates)...);
         } catch (const io::PgUncertainError&) {
+            // precaution-exempt: the rows taken are unknowable after a lost ACK.
             RELAIS_LOG_ERROR << name()
                 << ": claim timeout — rows taken unknowable, entity and "
                    "list tiers left to l1_ttl";
