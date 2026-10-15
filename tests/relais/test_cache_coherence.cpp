@@ -26,6 +26,8 @@
 #include <jcailloux/relais/PgProvider.h>
 #include <jcailloux/relais/io/pg/PgPool.h>
 #include <jcailloux/relais/io/pg/PgError.h>
+#include <jcailloux/relais/io/pg/SettleQueue.h>
+#include <jcailloux/relais/Log.h>
 #include <jcailloux/relais/io/batch/BatchScheduler.h>
 #include <jcailloux/relais/io/batch/TimingEstimator.h>
 #include <jcailloux/relais/io/WhenAll.h>
@@ -173,14 +175,17 @@ struct CohEnv {
     int pg_fd = -1;
     std::chrono::milliseconds q_timeout_;
 
+    // `conninfo_extra` is appended to the pool's conninfo (the settle
+    // connection uses it too).
     explicit CohEnv(std::chrono::milliseconds query_timeout,
                     io::UncertainSettle settle = io::UncertainSettle::Terminate,
-                    std::chrono::milliseconds settle_delay = 0ms)
+                    std::chrono::milliseconds settle_delay = 0ms,
+                    const std::string& conninfo_extra = "")
         : probe(probeConnInfo()), q_timeout_(query_timeout)
     {
         // min=max=1: a single connection serves every op, so holdReads(pg_fd)
         // deterministically withholds the result of whatever the repo runs.
-        pool = driveBounded(io, io::PgPool<Io>::create(io, poolConnInfo(),
+        pool = driveBounded(io, io::PgPool<Io>::create(io, poolConnInfo() + conninfo_extra,
             {.min_connections = 1, .max_connections = 1,
              .acquire_timeout = 2s, .query_timeout = query_timeout,
              .uncertain_settle = settle, .settle_delay = settle_delay}));
@@ -1113,7 +1118,8 @@ TEST_CASE("patch with lists: an uncertain patch invalidates the old position fro
 // Settle ticket — a write that failed uncertainly names what must end before
 // its outcome is final: the backend that ran it (Terminate, Await) or a delay
 // (Delay). The backend here is blocked on a row lock held by a second probe, so
-// it is still alive, exactly as after a real timeout.
+// it is still alive, exactly as after a real timeout. These cases pause the
+// settle queue: they check what the ticket names, before anything settles it.
 // =============================================================================
 
 namespace {
@@ -1159,6 +1165,7 @@ bool backendAlive(CohEnv& env, const io::BackendId& b) {
 TEST_CASE("settle ticket: an uncertain write names the backend that ran it",
           "[coherence][settle][integration]") {
     CohEnv env(300ms);
+    env.batcher->settleQueue().pause();
     resetItems(env);
     auto id = env.seedItem("settle-name", 1);
 
@@ -1178,6 +1185,7 @@ TEST_CASE("settle ticket: an uncertain write names the backend that ran it",
 TEST_CASE("settle ticket: a connection lost after sending carries a ticket",
           "[coherence][settle][integration]") {
     CohEnv env(1s);
+    env.batcher->settleQueue().pause();
     resetItems(env);
     auto id = env.seedItem("settle-lost", 1);
     auto lock = lockItem(id);
@@ -1231,6 +1239,7 @@ TEST_CASE("settle ticket: an uncertain read carries none",
 TEST_CASE("settle ticket: every caller of a failed batch shares one ticket",
           "[coherence][settle][integration]") {
     CohEnv env(300ms);
+    env.batcher->settleQueue().pause();
     resetItems(env);
     auto first = env.seedItem("settle-batch-first", 0);
     auto locked = env.seedItem("settle-batch-locked", 0);
@@ -1277,6 +1286,7 @@ TEST_CASE("settle ticket: the mode decides what the ticket names",
           "[coherence][settle][integration]") {
     SECTION("Await names the backend") {
         CohEnv env(300ms, io::UncertainSettle::Await);
+        env.batcher->settleQueue().pause();
         resetItems(env);
         auto id = env.seedItem("settle-await", 1);
         auto lock = lockItem(id);
@@ -1296,7 +1306,7 @@ TEST_CASE("settle ticket: the mode decides what the ticket names",
         CHECK(t->delay == 2s);
         CHECK_FALSE(t->backend.known());
     }
-    SECTION("Delay without a delay has nothing to settle") {
+    SECTION("Delay with no delay and no statement_timeout has nothing to settle") {
         CohEnv env(300ms, io::UncertainSettle::Delay);
         resetItems(env);
         auto id = env.seedItem("settle-delay0", 1);
@@ -1310,4 +1320,368 @@ TEST_CASE("settle ticket: the mode decides what the ticket names",
         auto lock = lockItem(id);
         CHECK_FALSE(uncertainTicket(env, CohItemL1::update(id, item(id, "settle-off", 2))));
     }
+}
+
+// =============================================================================
+// Settle queue — works each ticket until the write can no longer commit, then
+// marks it settled and runs its replays. Settling uses a connection of its own:
+// these cases run with the pool reduced to one connection.
+// =============================================================================
+
+namespace {
+
+using Queue = io::SettleQueue<Io>;
+
+template<typename Pred>
+bool pumpUntil(CohEnv& env, Pred pred, std::chrono::milliseconds budget) {
+    auto deadline = std::chrono::steady_clock::now() + budget;
+    while (!pred() && std::chrono::steady_clock::now() < deadline) env.io.runOnce(10);
+    return pred();
+}
+
+Queue& queueOf(CohEnv& env) { return env.batcher->settleQueue(); }
+
+bool settledAll(CohEnv& env) { return queueOf(env).pending() == 0; }
+
+// The settle connection carries the pool's application_name: count only the
+// backend named by the ticket.
+io::BackendId backendOf(io::test::PgProbe& probe) {
+    auto r = probe.query(
+        "SELECT pid, backend_start::text FROM pg_stat_activity WHERE pid = pg_backend_pid()");
+    return {static_cast<int32_t>(std::stol(r.get(0, 0))), r.get(0, 1)};
+}
+
+std::shared_ptr<io::SettleTicket> ticketFor(io::UncertainSettle mode, io::BackendId b,
+                                            std::chrono::milliseconds delay = 0ms) {
+    return std::make_shared<io::SettleTicket>(
+        io::SettleTicket{.mode = mode, .backend = std::move(b), .delay = delay});
+}
+
+// Captures the log lines of one level while alive.
+struct LogCapture {
+    static inline std::vector<std::pair<log::Level, std::string>> lines;
+    log::Callback previous = log::getCallback();
+    LogCapture() {
+        lines.clear();
+        log::setCallback([](log::Level level, const char* msg, size_t len) {
+            lines.emplace_back(level, std::string(msg, len));
+        });
+    }
+    ~LogCapture() { log::setCallback(previous); }
+    static size_t count(log::Level level, std::string_view needle) {
+        size_t n = 0;
+        for (const auto& [l, m] : lines)
+            if (l == level && m.find(needle) != std::string::npos) ++n;
+        return n;
+    }
+};
+
+// Resets the injected faults whatever the outcome of the case.
+struct FaultReset {
+    ~FaultReset() { Queue::fault = {}; }
+};
+
+// Holds the row, makes the update of it fail uncertainly, and returns its ticket;
+// the queue is paused so that the case decides when settling starts.
+std::shared_ptr<io::SettleTicket> blockedUpdate(CohEnv& env, int64_t id, int32_t value) {
+    queueOf(env).pause();
+    auto t = uncertainTicket(env, CohItemL1::update(id, item(id, "settle", value)));
+    REQUIRE(t);
+    REQUIRE(queueOf(env).pending() == 1);
+    return t;
+}
+
+}  // namespace
+
+TEST_CASE("settle queue: Terminate ends the backend, the write never commits",
+          "[coherence][settle][integration]") {
+    CohEnv env(300ms);
+    resetItems(env);
+    auto id = env.seedItem("settle", 1);
+    std::optional<RowLock> lock;
+    lock.emplace("relais_test_items", "id=" + std::to_string(id));
+    auto t = blockedUpdate(env, id, 2);
+    REQUIRE(backendAlive(env, t->backend));
+
+    queueOf(env).resume();
+    REQUIRE(pumpUntil(env, [&] { return settledAll(env); }, 7s));
+    CHECK(t->state == io::SettleTicket::State::Settled);
+    CHECK(queueOf(env).settled() == 1);
+    CHECK(queueOf(env).statements() == 1);
+    CHECK_FALSE(backendAlive(env, t->backend));
+
+    lock.reset();
+    CHECK(probeValue(env, id) == "1");
+}
+
+TEST_CASE("settle queue: a ticket runs its replays once, in order, past a failing one",
+          "[coherence][settle][integration]") {
+    CohEnv env(300ms);
+    std::vector<int> ran;
+    auto t = ticketFor(io::UncertainSettle::Delay, {}, 50ms);
+    t->replays.push_back([&ran]() -> io::Task<void> { ran.push_back(1); co_return; });
+    t->replays.push_back([&ran]() -> io::Task<void> {
+        ran.push_back(2);
+        throw std::runtime_error("replay failure");
+        co_return;
+    });
+    t->replays.push_back([&ran]() -> io::Task<void> { ran.push_back(3); co_return; });
+
+    LogCapture logs;
+    queueOf(env).enqueue(t);
+    queueOf(env).enqueue(t);  // already queued: ignored
+    REQUIRE(pumpUntil(env, [&] { return settledAll(env); }, 2s));
+    pumpUntil(env, [] { return false; }, 100ms);
+
+    CHECK(ran == std::vector<int>{1, 2, 3});
+    CHECK(t->state == io::SettleTicket::State::Settled);
+    CHECK(t->replays.empty());
+    CHECK(queueOf(env).settled() == 1);
+    CHECK(queueOf(env).statements() == 0);
+    CHECK(LogCapture::count(log::Level::Warn, "replay failure") == 1);
+
+    queueOf(env).enqueue(t);  // settled: ignored
+    CHECK(queueOf(env).pending() == 0);
+}
+
+TEST_CASE("settle queue: tickets of one backend are settled by one statement",
+          "[coherence][settle][integration]") {
+    CohEnv env(300ms);
+    resetItems(env);
+    auto id = env.seedItem("settle", 1);
+    auto lock = lockItem(id);
+    auto t = blockedUpdate(env, id, 2);
+    auto twin = ticketFor(io::UncertainSettle::Terminate, t->backend);
+    queueOf(env).enqueue(twin);
+    CHECK(queueOf(env).pending() == 2);
+
+    queueOf(env).resume();
+    REQUIRE(pumpUntil(env, [&] { return settledAll(env); }, 7s));
+    CHECK(t->state == io::SettleTicket::State::Settled);
+    CHECK(twin->state == io::SettleTicket::State::Settled);
+    CHECK(queueOf(env).settled() == 2);
+    CHECK(queueOf(env).statements() == 1);
+}
+
+TEST_CASE("settle queue: start time guards against a reused pid",
+          "[coherence][settle][integration]") {
+    CohEnv env(300ms);
+    io::test::PgProbe other{probeConnInfo()};
+    auto b = backendOf(other);
+    b.backend_start = "2000-01-01 00:00:00+00";
+    auto t = ticketFor(io::UncertainSettle::Terminate, b);
+
+    queueOf(env).enqueue(t);
+    REQUIRE(pumpUntil(env, [&] { return settledAll(env); }, 3s));
+    CHECK(t->state == io::SettleTicket::State::Settled);
+    // The backend with that pid but another start time is left alone.
+    CHECK(other.query("SELECT 1").get(0, 0) == "1");
+}
+
+TEST_CASE("settle queue: a backend already gone is settled",
+          "[coherence][settle][integration]") {
+    CohEnv env(300ms);
+    std::shared_ptr<io::SettleTicket> t;
+    io::BackendId b;
+    {
+        io::test::PgProbe gone{probeConnInfo()};
+        b = backendOf(gone);
+    }
+    // The probe's backend exits right after the probe disconnects.
+    REQUIRE(pumpUntil(env, [&] {
+        return env.probe.query("SELECT count(*) FROM pg_stat_activity WHERE pid = "
+                               + std::to_string(b.pid)).get(0, 0) == "0";
+    }, 2s));
+    t = ticketFor(io::UncertainSettle::Terminate, b);
+    queueOf(env).enqueue(t);
+    REQUIRE(pumpUntil(env, [&] { return settledAll(env); }, 3s));
+    CHECK(t->state == io::SettleTicket::State::Settled);
+    CHECK(queueOf(env).statements() == 1);
+}
+
+TEST_CASE("settle queue: Await waits for the backend to end on its own",
+          "[coherence][settle][integration]") {
+    CohEnv env(300ms, io::UncertainSettle::Await);
+    resetItems(env);
+    auto id = env.seedItem("settle", 1);
+    std::optional<RowLock> lock;
+    lock.emplace("relais_test_items", "id=" + std::to_string(id));
+    auto t = blockedUpdate(env, id, 2);
+
+    queueOf(env).resume();
+    pumpUntil(env, [] { return false; }, 400ms);
+    CHECK(queueOf(env).pending() == 1);
+    CHECK(backendAlive(env, t->backend));
+
+    // Unblocked, the write commits, then its backend finds the client gone.
+    lock.reset();
+    REQUIRE(pumpUntil(env, [&] { return settledAll(env); }, 5s));
+    CHECK(t->state == io::SettleTicket::State::Settled);
+    CHECK_FALSE(backendAlive(env, t->backend));
+    CHECK(probeValue(env, id) == "2");
+}
+
+TEST_CASE("settle queue: Delay settles after the delay, without a statement",
+          "[coherence][settle][integration]") {
+    CohEnv env(300ms, io::UncertainSettle::Delay, 400ms);
+    resetItems(env);
+    auto id = env.seedItem("settle", 1);
+    auto lock = lockItem(id);
+    // The delay runs from the failure, which comes query_timeout after the send.
+    const auto sent = std::chrono::steady_clock::now();
+    auto t = uncertainTicket(env, CohItemL1::update(id, item(id, "settle", 2)));
+    REQUIRE(t);
+    pumpUntil(env, [] { return false; }, 200ms);
+    CHECK(queueOf(env).pending() == 1);
+
+    REQUIRE(pumpUntil(env, [&] { return settledAll(env); }, 2s));
+    CHECK(std::chrono::steady_clock::now() - sent >= 300ms + 400ms);
+    CHECK(t->state == io::SettleTicket::State::Settled);
+    CHECK(queueOf(env).statements() == 0);
+}
+
+TEST_CASE("settle queue: PostgreSQL unreachable, settling is retried with a growing wait",
+          "[coherence][settle][integration]") {
+    FaultReset reset;
+    CohEnv env(300ms);
+    resetItems(env);
+    auto id = env.seedItem("settle", 1);
+    auto lock = lockItem(id);
+    auto t = blockedUpdate(env, id, 2);
+
+    Queue::fault = {.kind = Queue::Fault::Kind::Unreachable, .count = 3};
+    const auto start = std::chrono::steady_clock::now();
+    queueOf(env).resume();
+    REQUIRE(pumpUntil(env, [&] { return settledAll(env); }, 7s));
+    // Waits of 50, 100 and 200 ms between the four attempts.
+    CHECK(std::chrono::steady_clock::now() - start >= 350ms);
+    CHECK(Queue::fault.count == 0);
+    CHECK(queueOf(env).statements() == 1);
+    CHECK_FALSE(backendAlive(env, t->backend));
+}
+
+TEST_CASE("settle queue: a refused termination falls back to statement_timeout",
+          "[coherence][settle][integration]") {
+    FaultReset reset;
+    SECTION("statement_timeout bounds the write: settled after it") {
+        LogCapture logs;
+        CohEnv env(300ms, io::UncertainSettle::Terminate, 0ms,
+                   " options='-c statement_timeout=700'");
+        resetItems(env);
+        auto id = env.seedItem("settle", 1);
+        auto lock = lockItem(id);
+        auto t = blockedUpdate(env, id, 2);
+
+        Queue::fault = {.kind = Queue::Fault::Kind::Refused, .count = 1};
+        const auto start = std::chrono::steady_clock::now();
+        queueOf(env).resume();
+        pumpUntil(env, [] { return false; }, 1s);
+        CHECK(queueOf(env).pending() == 1);
+        REQUIRE(pumpUntil(env, [&] { return settledAll(env); }, 3s));
+        CHECK(std::chrono::steady_clock::now() - start >= 1700ms);
+        CHECK(t->state == io::SettleTicket::State::Settled);
+        CHECK(queueOf(env).abandoned() == 0);
+        CHECK(LogCapture::count(log::Level::Error, "statement_timeout instead") == 1);
+    }
+    SECTION("nothing bounds the write: abandoned") {
+        LogCapture logs;
+        CohEnv env(300ms);
+        resetItems(env);
+        auto id = env.seedItem("settle", 1);
+        auto lock = lockItem(id);
+        auto t = blockedUpdate(env, id, 2);
+        t->replays.push_back([]() -> io::Task<void> { co_return; });
+
+        Queue::fault = {.kind = Queue::Fault::Kind::Refused, .count = 1};
+        queueOf(env).resume();
+        REQUIRE(pumpUntil(env, [&] { return settledAll(env); }, 3s));
+        CHECK(t->state == io::SettleTicket::State::Pending);
+        CHECK(t->replays.empty());
+        CHECK(queueOf(env).abandoned() == 1);
+        CHECK(queueOf(env).settled() == 0);
+        CHECK(LogCapture::count(log::Level::Error, "stays unsettled") == 1);
+    }
+}
+
+TEST_CASE("settle queue: settles while the pool's only connection is blocked",
+          "[coherence][settle][integration]") {
+    CohEnv env(3s);
+    resetItems(env);
+    auto id = env.seedItem("settle", 1);
+    std::optional<RowLock> lock;
+    lock.emplace("relais_test_items", "id=" + std::to_string(id));
+    queueOf(env).pause();
+
+    auto starter = [](io::Task<void> t) -> Starter { co_await std::move(t); };
+    auto update = [&](int32_t value, bool& done, std::shared_ptr<io::SettleTicket>* out)
+            -> io::Task<void> {
+        try {
+            (void)co_await CohItemL1::update(id, item(id, "settle", value));
+        } catch (const io::PgUncertainError& e) {
+            if (out) *out = e.settleTicket();
+        } catch (...) {}
+        done = true;
+    };
+
+    // A: sent, blocked on the lock, then its connection is lost.
+    bool a_done = false;
+    std::shared_ptr<io::SettleTicket> t;
+    auto a = starter(update(2, a_done, &t));
+    pumpUntil(env, [] { return false; }, 150ms);
+    REQUIRE(::shutdown(env.pg_fd, SHUT_RD) == 0);
+    REQUIRE(pumpUntil(env, [&] { return a_done; }, 2s));
+    REQUIRE(t);
+
+    // B: takes the pool's only connection and blocks on the same lock.
+    bool b_done = false;
+    auto b = starter(update(3, b_done, nullptr));
+    pumpUntil(env, [] { return false; }, 150ms);
+    REQUIRE_FALSE(b_done);
+    REQUIRE(env.pool->totalConnections() == 1);
+    REQUIRE(env.pool->idleCount() == 0);
+
+    queueOf(env).resume();
+    REQUIRE(pumpUntil(env, [&] { return settledAll(env); }, 2s));
+    CHECK_FALSE(b_done);
+    CHECK_FALSE(backendAlive(env, t->backend));
+
+    lock.reset();
+    REQUIRE(pumpUntil(env, [&] { return b_done; }, 3s));
+    CHECK(probeValue(env, id) == "3");
+    if (a.handle) a.handle.destroy();
+    if (b.handle) b.handle.destroy();
+}
+
+TEST_CASE("settle queue: Delay without a delay takes statement_timeout",
+          "[coherence][settle][integration]") {
+    SECTION("statement_timeout set: the ticket waits it plus a margin") {
+        LogCapture logs;
+        CohEnv env(300ms, io::UncertainSettle::Delay, 0ms,
+                   " options='-c statement_timeout=700'");
+        CHECK(LogCapture::count(log::Level::Warn, "uncertain_settle is Delay") == 0);
+        resetItems(env);
+        auto id = env.seedItem("settle", 1);
+        auto lock = lockItem(id);
+        auto t = uncertainTicket(env, CohItemL1::update(id, item(id, "settle", 2)));
+        REQUIRE(t);
+        CHECK(t->delay == 700ms + io::kSettleMargin);
+    }
+    SECTION("no statement_timeout: warned at startup") {
+        LogCapture logs;
+        CohEnv env(300ms, io::UncertainSettle::Delay);
+        CHECK(LogCapture::count(log::Level::Warn, "uncertain_settle is Delay") == 1);
+    }
+}
+
+TEST_CASE("settle queue: destroyed with pending tickets, it abandons them",
+          "[coherence][settle][integration]") {
+    LogCapture logs;
+    {
+        CohEnv env(300ms);
+        resetItems(env);
+        auto id = env.seedItem("settle", 1);
+        auto lock = lockItem(id);
+        (void)blockedUpdate(env, id, 2);
+    }
+    CHECK(LogCapture::count(log::Level::Warn, "abandoned unsettled") == 1);
 }

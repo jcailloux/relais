@@ -38,7 +38,9 @@ namespace jcailloux::relais::io {
 //       lost connection after sending) is settled: Terminate stops its backend,
 //       Await waits for it to end, Delay waits settle_delay (behind a transaction
 //       pooler, where the backend is not stable; settle_delay must exceed the
-//       server's statement_timeout), Off settles nothing.
+//       server's statement_timeout, and 0 takes that timeout plus a margin), Off
+//       settles nothing. Settling runs over a connection of its own, outside the
+//       pool, with the same conninfo.
 struct PgPoolConfig {
     size_t min_connections = 2;
     size_t max_connections = 16;
@@ -125,6 +127,13 @@ public:
             ++pool->total_;
         }
 
+        if (cfg.uncertain_settle == UncertainSettle::Delay && !pool->idle_.empty()
+            && pool->idle_.front().settleDelay().count() == 0) {
+            RELAIS_LOG_WARN << "relais: uncertain_settle is Delay, but neither settle_delay "
+                               "nor the server's statement_timeout bounds a write: "
+                               "uncertain writes will not be settled";
+        }
+
         co_return pool;
     }
 
@@ -172,6 +181,9 @@ public:
     [[nodiscard]] size_t totalConnections() const noexcept { return total_; }
     [[nodiscard]] size_t idleCount() const noexcept { return idle_.size(); }
     [[nodiscard]] size_t waiterCount() const noexcept { return waiters_.size(); }
+
+    [[nodiscard]] const std::string& conninfo() const noexcept { return conninfo_; }
+    [[nodiscard]] const PgPoolConfig& config() const noexcept { return cfg_; }
 
 private:
     // Forward-declared: onWaiterTimeout() names Waiter as a parameter type, and a
