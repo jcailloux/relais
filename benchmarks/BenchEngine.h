@@ -14,7 +14,7 @@
  *                         result, values unrounded (default: no file)
  *
  * Next to time, each measurement reports the work it did per operation (see
- * IoCounter.h): pg_op, pg_prepare_op, redis_op, heap_op. Unlike time, these do
+ * IoCounter.h): pg_op, pg_prepare_op, heap_op. Unlike time, these do
  * not depend on the load of the machine.
  */
 
@@ -159,7 +159,6 @@ inline void csvWork(const std::string& variant, const io_count::PerOp& w) {
     if (!w.valid) return;
     csv(variant, "pg_op", w.pg_exec);
     csv(variant, "pg_prepare_op", w.pg_prepare);
-    csv(variant, "redis_op", w.redis);
     if (io_count::heap_source) csv(variant, "heap_op", w.heap);
 }
 
@@ -236,7 +235,6 @@ inline BenchResult benchWithSetup(
         const auto c1 = io_count::snapshot();
         spent.pg_exec += c1.pg_exec - c0.pg_exec;
         spent.pg_prepare += c1.pg_prepare - c0.pg_prepare;
-        spent.redis += c1.redis - c0.redis;
         spent.heap += c1.heap - c0.heap;
     }
 
@@ -542,7 +540,7 @@ inline std::string formatMixedThroughput(
 // threads beyond the stop flag and the aggregated op counter. This is the
 // model the relais runtime is meant to scale with — one event loop per core.
 //
-// Defaults to `hardware_concurrency()/2` threads so PG/Redis on the same
+// Defaults to `hardware_concurrency()/2` threads so PostgreSQL on the same
 // host can use the remaining cores. Override with `BENCH_THREADS=N`.
 // =============================================================================
 

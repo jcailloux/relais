@@ -1,11 +1,10 @@
 # Relais Tests
 
-Integration tests for the relais library using a real PostgreSQL database and Redis.
+Integration tests for the relais library using a real PostgreSQL database.
 
 ## Prerequisites
 
 - PostgreSQL server running locally
-- Redis server running locally
 - `relais_test` user configured in `pg_hba.conf` with `scram-sha-256` authentication
 
 ## Quick Start
@@ -74,16 +73,12 @@ tests/
 │   ├── 000004_create_test_orders.sql
 │   └── 000005_create_test_events.sql  # Partitioned table (eu/us/ap)
 ├── config/
-│   ├── test_l1_config.cpp          # Exhaustive L1 config parameter tests (TTL, refresh, cleanup)
-│   └── test_l2_config.cpp          # Exhaustive L2 config parameter tests (TTL, refresh, strategy)
+│   └── test_l1_config.cpp          # Exhaustive L1 config parameter tests (TTL, refresh, cleanup)
 ├── test_generated_entity.cpp       # Unit tests for struct + Entity + ListWrapper
 ├── test_pg_repo.cpp                # Tests for PgRepo (no cache) + patch
-├── test_redis_repo.cpp             # Tests for RedisRepo (L2 cache)
 ├── test_local_repo.cpp             # Tests for LocalRepo (L1 cache)
-├── test_full_cache.cpp             # Tests for L1+L2 (Both) cache hierarchy interaction
 ├── test_decl_list_cache.cpp        # Tests for ListMixin (L1 list cache)
-├── test_decl_list_redis.cpp        # Tests for declarative list caching at L2 (Redis)
-├── test_decl_list_full.cpp         # Tests for declarative list caching at L1+L2 (Both)
+├── test_decl_list_full.cpp         # Tests for declarative list caching at L1 (selective invalidation, edge inserts)
 ├── test_partition_key.cpp          # Tests for partition key repos (composite PK, partitioned tables)
 ├── test_warmup.cpp                 # Tests for warmup() priming cache infrastructure
 ├── test_concurrency.cpp            # Concurrency stress tests across all cache levels
@@ -120,24 +115,18 @@ ctest -L integration --output-on-failure
 
 ## Test Configurations
 
-Four repository configurations are tested:
+Two repository configurations are tested:
 
 | Config      | Cache Level | Description                    |
 |-------------|-------------|--------------------------------|
 | `Uncached`  | None        | Direct DB access only          |
-| `L1Only`    | L1          | RAM cache, no Redis            |
-| `L2Only`    | L2          | Redis cache, no RAM            |
-| `Both`      | L1_L2       | RAM cache backed by Redis      |
+| `Local`     | L1          | RAM cache in front of the DB   |
 
 ## Test Isolation
 
-Each test section uses `TransactionGuard` which:
-1. Flushes Redis at start
-2. Begins a PostgreSQL transaction
-3. Rolls back the transaction at end (even on failure)
-4. Flushes Redis again
-
-This ensures complete isolation between tests without leaving data behind.
+Each test section uses `TransactionGuard`, which deletes the test data and resets
+the GDSF state when it is built and again when it is destroyed (even on failure).
+No test leaves data behind.
 
 ## patch Tests
 
@@ -157,28 +146,6 @@ See `test_partition_key.cpp` sections 7a-7d for coverage at all cache levels + c
 
 ## Test Tags
 
-### `test_relais_redis` (RedisRepo — L2 cache)
-
-| Tag                  | Description |
-|----------------------|-------------|
-| `[item]`             | Entity CRUD with Redis caching |
-| `[binary]`           | Binary (BEVE) serialization in Redis |
-| `[patch]`         | Partial field updates with Redis invalidation |
-| `[json]`             | `findJson` raw JSON retrieval |
-| `[invalidate]`       | Explicit `evictRedis` operations |
-| `[readonly]`         | Read-only repository caching |
-| `[cross-inv]`        | `Invalidate<>` entity→entity cross-invalidation |
-| `[custom-inv]`       | `InvalidateVia<>` with custom resolver |
-| `[readonly-inv]`     | Cross-invalidation targeting read-only caches |
-| `[list]`             | List caching (JSON) |
-| `[fb-list]`          | List caching (binary) |
-| `[list-inv]`         | `InvalidateList<>` entity→list cross-invalidation |
-| `[list-custom]`      | List cross-invalidation with custom resolver |
-| `[list-tracked]`     | Tracked pagination with group invalidation |
-| `[list-selective]`   | SortBounds selective page invalidation (Lua) |
-| `[list-resolver]`    | `InvalidateListVia<>` with typed `GroupKey` resolver |
-| `[list-granularity]` | Three granularities: per-page, per-group, full pattern |
-
 ### `test_relais_decl_list_cache` (ListMixin — L1 list cache)
 
 | Tag | Description |
@@ -194,21 +161,12 @@ See `test_partition_key.cpp` sections 7a-7d for coverage at all cache levels + c
 |-----|-------------|
 | `[partition-key]` | All partition key tests |
 | `[cached]` | L1 cache behavior with partition key |
-| `[redis]` | L2 cache behavior with partition key |
 | `[cross-inv]` | Cross-invalidation (Event as source/target) |
 | `[patch]` | Criteria-based partial updates at all cache levels |
 
-### `test_relais_full_cache` (L1+L2 cache hierarchy)
+### `test_relais_decl_list_full` (Declarative list caching — L1)
 
-Tests verifying interaction between RAM and Redis layers when both are active.
-
-### `test_relais_decl_list_redis` (Declarative list caching — L2)
-
-Tests for declarative list caching at the Redis layer with filters, combined queries, and SortBounds invalidation.
-
-### `test_relais_decl_list_full` (Declarative list caching — L1+L2)
-
-Tests for declarative list caching with both cache layers active, including cascade invalidation and cross-interaction.
+Tests for declarative list caching at L1: selective invalidation by filter and by sort range on cursor pages, and insertion edge cases.
 
 ### `test_relais_warmup` (Warmup)
 
@@ -218,7 +176,7 @@ Tests for `warmup()` priming cache infrastructure including L1 entity cache and 
 
 | Tag | Description |
 |-----|-------------|
-| `[read]` | Concurrent `find` (L1, L2, L1+L2) |
+| `[read]` | Concurrent `find` |
 | `[read-write]` | Concurrent read + write on same entity |
 | `[insert-erase]` | Concurrent insert + erase |
 | `[cross-inv]` | Concurrent cross-invalidation |
@@ -231,9 +189,9 @@ Tests for `warmup()` priming cache infrastructure including L1 entity cache and 
 | `[tracker-drain]` | `purge()` drains tracker to zero after concurrent storm |
 | `[tracker-progressive]` | Progressive tracker reduction via `trySweep()` |
 
-### `config/test_l1_config` and `config/test_l2_config` (Configuration)
+### `config/test_l1_config` (Configuration)
 
-Exhaustive tests for individual cache configuration parameters. L1 tests cover TTL, refresh, cleanup frequency, and write restriction. L2 tests cover TTL, refresh, and update strategy variants.
+Exhaustive tests for individual L1 cache configuration parameters: TTL, refresh, cleanup frequency, and write restriction.
 
 ### `test_relais_benchmark` (Performance benchmarks)
 
