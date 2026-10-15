@@ -10,7 +10,6 @@
 #include <exception>
 #include <memory>
 #include <mutex>
-#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -23,7 +22,6 @@
 #include "jcailloux/relais/io/EpollIoContext.h"
 #include "jcailloux/relais/io/Task.h"
 #include "jcailloux/relais/io/pg/PgPool.h"
-#include "jcailloux/relais/io/redis/RedisPool.h"
 #include "jcailloux/relais/io/batch/BatchScheduler.h"
 #include "jcailloux/relais/PgProvider.h"
 
@@ -37,48 +35,26 @@ struct IoPoolStartupError : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
-// RedisWorkerConfig — L2 Redis endpoint and per-worker pool sizing for IoPool.
-// Held in an optional on IoPoolConfig: its ABSENCE (std::nullopt) is the
-// canonical "no Redis" (L1-only) signal — no pool is built and no boot connect
-// is attempted.
-struct RedisWorkerConfig {
-    // Endpoint: prefer Unix socket, fall back to TCP.
-    std::string unix_path;            // Empty = use TCP (host/port below)
-    std::string host = "127.0.0.1";
-    int         port = 6379;
-
-    // Connections opened per worker (each worker owns its own pool).
-    size_t conns_per_worker = 4;
-};
-
 // IoPoolConfig — configuration for the multi-core I/O pool.
 
 struct IoPoolConfig {
     int num_workers = 1;
     std::string pg_conninfo;
 
-    // L2 Redis endpoint + per-worker sizing. std::nullopt → L1-only: no
-    // RedisPool is built, no Redis connect is attempted at boot, and
-    // PgProvider::hasRedis() reports false on every worker (the L2 tier is
-    // cleanly bypassed, not stubbed to throw). A config::Local deployment then
-    // needs no reachable Redis. Defaults to an enabled localhost pool,
-    // preserving the prior behaviour.
-    std::optional<RedisWorkerConfig> redis = RedisWorkerConfig{};
-
     // PG pool sizing per worker
     size_t pg_min_conns_per_worker = 2;
     size_t pg_max_conns_per_worker = 8;
 
-    // Shared I/O budget per worker (PG + Redis combined)
+    // PG sends in flight per worker (reads and writes together)
     int max_concurrent_per_worker = 8;
 
     // Liveness timeouts threaded into the per-worker pools.
     //   - acquire_timeout bounds each PG acquire, including the warm-up connect
     //     at boot, so an unreachable PostgreSQL fails startup instead of hanging.
-    //   - query_timeout bounds each per-connection I/O wait (PG and Redis; also the
-    //     Redis boot connect). A generous liveness backstop, not an SLA: it bounds a
-    //     silently blackholed socket, which statement_timeout (PG) and Redis (no
-    //     server bound) miss. 0 disables it (discouraged); set tighter for an SLA.
+    //   - query_timeout bounds each per-connection I/O wait. A generous liveness
+    //     backstop, not an SLA: it bounds a silently blackholed socket, which
+    //     statement_timeout misses. 0 disables it (discouraged); set tighter for
+    //     an SLA.
     //   - startup_timeout bounds the wait for all workers to report ready, so a
     //     worker stuck in a connect that never returns cannot freeze create().
     std::chrono::milliseconds acquire_timeout{5000};
@@ -97,8 +73,8 @@ struct IoPoolConfig {
 // gives the handle to its owner. That ownership is what lets fail-fast teardown
 // reclaim a boot that is still suspended on a connect which never completed
 // (a dependency blackholed at boot, past startup_timeout): destroying the frame
-// runs its in-frame connection destructors — PgConnection/RedisConnection both
-// cancel the watch-bound timer, removeWatch, and close/PQfinish the fd — so
+// runs its in-frame connection destructors — PgConnection cancels the
+// watch-bound timer, removes the watch, and PQfinishes the fd — so
 // neither the coroutine frame nor its socket fd leaks. With a self-destroying
 // DetachedTask the suspended frame and its fd would be abandoned, leaking one fd
 // per failed startup; a service that retries create() in a loop would exhaust
@@ -144,7 +120,6 @@ struct BootTask {
 // Each worker owns:
 // - An EpollIoContext (event loop)
 // - A PgPool (PostgreSQL connection pool)
-// - A RedisPool (Redis connection pool; absent for an L1-only pool)
 // - A BatchScheduler (adaptive batching)
 // - A std::jthread (the actual OS thread)
 //
@@ -225,35 +200,13 @@ public:
                              .acquire_timeout = config.acquire_timeout,
                              .query_timeout = config.query_timeout});
 
-                        // Redis pool — query_timeout bounds the connect
-                        // handshake. Absent (std::nullopt) → L1-only: no pool,
-                        // no boot connect; w.redis_pool stays null and the
-                        // batcher binds without Redis (hasRedis()==false).
-                        if (config.redis) {
-                            const auto& r = *config.redis;
-                            if (!r.unix_path.empty()) {
-                                w.redis_pool = std::make_shared<RedisPool<Io>>(
-                                    co_await RedisPool<Io>::createUnix(
-                                        *w.io, r.unix_path.c_str(),
-                                        r.conns_per_worker,
-                                        {.query_timeout = config.query_timeout}));
-                            } else {
-                                w.redis_pool = std::make_shared<RedisPool<Io>>(
-                                    co_await RedisPool<Io>::create(
-                                        *w.io, r.host.c_str(), r.port,
-                                        r.conns_per_worker,
-                                        {.query_timeout = config.query_timeout}));
-                            }
-                        }
-
                         // Batch scheduler — owned per worker (shared so the
                         // thread_local providers can co-own it).
                         w.batcher = std::make_shared<batch::BatchScheduler<Io>>(
-                            *w.io, w.pg_pool, w.redis_pool,
-                            config.max_concurrent_per_worker);
+                            *w.io, w.pg_pool, config.max_concurrent_per_worker);
 
                         // Bind THIS worker thread's providers to its own batcher.
-                        PgProvider::bindBatcher<Io>(w.batcher, w.redis_pool != nullptr);
+                        PgProvider::bindBatcher<Io>(w.batcher);
                     } catch (...) {
                         // Capture the failure: a bare DetachedTask would swallow
                         // it silently. The main thread rethrows it after the
@@ -284,19 +237,17 @@ public:
                 // Phase 1: serve until stop is requested.
                 w.io->runUntil([&stop] { return stop.stop_requested(); });
 
-                // Phase 2: ordered teardown. A detached fire or self-heal drain
-                // still suspended on a blackholed dependency would otherwise leak
-                // its frame — and, for a fire, the pool via its in-frame
-                // ConnectionGuard. Stop the self-heal queue re-arming, then pump
-                // the loop until every detached coroutine has completed (each is
-                // bounded by the per-operation query/acquire timeouts: a hung fire
-                // times out, unwinds in error, and self-destroys) or the grace
-                // window elapses (the fallback when a timeout is 0 or the serial
-                // drain outruns the window — the residual frame is then abandoned,
+                // Phase 2: ordered teardown. A detached fire still suspended on a
+                // blackholed server would otherwise leak its frame and, via its
+                // in-frame ConnectionGuard, the pool. Pump the loop until every
+                // detached fire has completed (each is bounded by the
+                // per-operation query/acquire timeouts: a hung fire times out,
+                // unwinds in error, and self-destroys) or the grace window
+                // elapses (the fallback when a timeout is 0 or the serial drain
+                // outruns the window — the residual frame is then abandoned,
                 // bounded best-effort; see teardown_grace). The join in stop()
                 // blocks on this, so teardown waits for the drain rather than
                 // tearing the loop out from under it.
-                if (w.batcher) w.batcher->beginShutdown();
                 auto drain_deadline = Io::Clock::now() + teardown_grace;
                 w.io->runUntil([&w, drain_deadline] {
                     return (!w.batcher || w.batcher->quiescentForTeardown())
@@ -306,8 +257,9 @@ public:
         }
 
         // Wait for every worker to report, bounded by startup_timeout so a
-        // worker stuck in a connect that never returns (e.g. a blackholed Redis
-        // at boot when query_timeout is unset) cannot freeze startup forever.
+        // worker stuck in a connect that never returns (e.g. a blackholed
+        // PostgreSQL at boot when acquire_timeout is unset) cannot freeze
+        // startup forever.
         bool all_done;
         {
             std::unique_lock lock(ready_mutex);
@@ -368,7 +320,6 @@ private:
         // alive, so its connection dtors' removeWatch lands on a live IoContext.
         BootTask init_task;
         std::shared_ptr<PgPool<Io>> pg_pool;
-        std::shared_ptr<RedisPool<Io>> redis_pool;
         std::shared_ptr<batch::BatchScheduler<Io>> batcher;
         std::jthread thread;
         std::exception_ptr init_error;  // set if this worker's init threw

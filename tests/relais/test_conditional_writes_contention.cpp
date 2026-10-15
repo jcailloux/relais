@@ -191,7 +191,6 @@ public:
         io::IoPoolConfig cfg;
         cfg.num_workers = kLoops;
         cfg.pg_conninfo = getConnInfo();
-        cfg.redis = std::nullopt;
         cfg.pin_to_cores = false;
         cfg.pg_min_conns_per_worker = 2;
         cfg.pg_max_conns_per_worker = 4;

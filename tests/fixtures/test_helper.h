@@ -322,7 +322,7 @@ inline void initTest() {
     std::promise<void> bound;
     auto bound_fut = bound.get_future();
     detail::testLoop().dispatch([&io, pool, pg_max, &bound]() mutable {
-        jcailloux::relais::PgProvider::init(io, pool, nullptr, pg_max);
+        jcailloux::relais::PgProvider::init(io, pool, pg_max);
         bound.set_value();
     });
     bound_fut.get();

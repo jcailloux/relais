@@ -183,19 +183,17 @@ struct CohEnv {
         // Build the batcher directly (not PgProvider::init) so the cases can read
         // its counters and shut it down. Bound on the test thread, which
         // driveBounded already stamped as the loop thread.
-        batcher = std::make_shared<io::batch::BatchScheduler<Io>>(
-            io, pool, nullptr, 8);
-        PgProvider::bindBatcher<Io>(batcher, false);
+        batcher = std::make_shared<io::batch::BatchScheduler<Io>>(io, pool, 8);
+        PgProvider::bindBatcher<Io>(batcher);
     }
 
     ~CohEnv() {
         // The manual driver has no IoPool to drain detached coroutines still
         // suspended on a held connection when a test ends. Mirror IoPool's ordered
-        // teardown: release the hold, begin the shutdown, and pump past the
-        // per-op bound so every suspended frame fires its timer and unwinds —
-        // otherwise its frame leaks (ASan/LSan).
+        // teardown: release the hold and pump past the per-op bound so every
+        // suspended frame fires its timer and unwinds — otherwise its frame leaks
+        // (ASan/LSan).
         releasePg();
-        if (batcher) batcher->beginShutdown();
         auto deadline = std::chrono::steady_clock::now() + q_timeout_ + 400ms;
         while (std::chrono::steady_clock::now() < deadline)
             io.runOnce(20);

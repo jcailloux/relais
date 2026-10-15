@@ -206,7 +206,7 @@ TEST_CASE("BatchScheduler: single query returns correct result",
 
     auto task = [&]() -> DetachedTask {
         auto pool = co_await PgPool<Io>::create(io, CONNINFO, {.min_connections = 1, .max_connections = 1});
-        auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, nullptr, 8);
+        auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, 8);
 
         auto result = co_await batcher->submitQueryRead(
             "SELECT 42 AS val", PgParams{});
@@ -233,7 +233,7 @@ TEST_CASE("BatchScheduler: parameterized query returns correct result",
 
     auto task = [&]() -> DetachedTask {
         auto pool = co_await PgPool<Io>::create(io, CONNINFO, {.min_connections = 1, .max_connections = 1});
-        auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, nullptr, 8);
+        auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, 8);
 
         auto params = PgParams::make(7, 35);
         auto result = co_await batcher->submitQueryRead(
@@ -265,7 +265,7 @@ TEST_CASE("BatchScheduler: submitPgWrite returns result with RETURNING",
 
     auto task = [&]() -> DetachedTask {
         auto pool = co_await PgPool<Io>::create(io, CONNINFO, {.min_connections = 1, .max_connections = 1});
-        auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, nullptr, 8);
+        auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, 8);
 
         co_await batcher->directQuery(
             "CREATE TEMP TABLE IF NOT EXISTS batch_test_write (id INT, val TEXT)");
@@ -299,7 +299,7 @@ TEST_CASE("BatchScheduler: submitPgWrite returns affected rows",
 
     auto task = [&]() -> DetachedTask {
         auto pool = co_await PgPool<Io>::create(io, CONNINFO, {.min_connections = 1, .max_connections = 1});
-        auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, nullptr, 8);
+        auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, 8);
 
         co_await batcher->directQuery(
             "CREATE TEMP TABLE IF NOT EXISTS batch_test_exec (id INT)");
@@ -346,7 +346,7 @@ TEST_CASE("Write ordering: INSERT-then-UPDATE same PK lands in seq order",
 
     auto task = [&]() -> DetachedTask {
         auto pool = co_await PgPool<Io>::create(io, CONNINFO, {.min_connections = 1, .max_connections = 1});
-        auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, nullptr, 8);
+        auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, 8);
 
         co_await batcher->directQuery(
             "CREATE TEMP TABLE IF NOT EXISTS ord_test (id INT PRIMARY KEY, val INT)");
@@ -393,7 +393,7 @@ TEST_CASE("BatchScheduler: concurrent queries with tight budget don't deadlock",
     auto task = [&]() -> DetachedTask {
         auto pool = co_await PgPool<Io>::create(io, CONNINFO, {.min_connections = 1, .max_connections = 1});
         auto batcher = std::make_shared<BatchScheduler<Io>>(
-            io, pool, nullptr, /*max_concurrent=*/1);
+            io, pool, /*max_concurrent=*/1);
 
         for (int i = 0; i < N; ++i) {
             concurrentRead(batcher, completed, i + 1);
@@ -424,7 +424,7 @@ TEST_CASE("BatchScheduler: mixed reads and writes don't deadlock",
     auto task = [&]() -> DetachedTask {
         auto pool = co_await PgPool<Io>::create(io, CONNINFO, {.min_connections = 1, .max_connections = 1});
         auto batcher = std::make_shared<BatchScheduler<Io>>(
-            io, pool, nullptr, /*max_concurrent=*/2);
+            io, pool, /*max_concurrent=*/2);
 
         co_await batcher->directQuery(
             "CREATE TEMP TABLE IF NOT EXISTS batch_test_mixed (id INT, val INT)");
@@ -457,7 +457,7 @@ TEST_CASE("BatchScheduler: timing estimator updates after bootstrap",
 
     auto task = [&]() -> DetachedTask {
         auto pool = co_await PgPool<Io>::create(io, CONNINFO, {.min_connections = 1, .max_connections = 1});
-        auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, nullptr, 8);
+        auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, 8);
 
         // Initial state
         REQUIRE(batcher->estimator().isPgBootstrapping());
@@ -510,7 +510,7 @@ TEST_CASE("BatchScheduler: directQuery bypass works",
 
     auto task = [&]() -> DetachedTask {
         auto pool = co_await PgPool<Io>::create(io, CONNINFO, {.min_connections = 1, .max_connections = 1});
-        auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, nullptr, 8);
+        auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, 8);
 
         // directQuery: no params
         auto r1 = co_await batcher->directQuery("SELECT 1 AS val");
@@ -561,7 +561,7 @@ TEST_CASE("BatchScheduler: concurrent queries after bootstrap complete correctly
     auto task = [&]() -> DetachedTask {
         auto pool = co_await PgPool<Io>::create(io, CONNINFO, {.min_connections = 1, .max_connections = 1});
         auto batcher = std::make_shared<BatchScheduler<Io>>(
-            io, pool, nullptr, /*max_concurrent=*/4);
+            io, pool, /*max_concurrent=*/4);
 
         static constexpr const char* SQL = "SELECT $1::int AS val";
 
@@ -633,7 +633,7 @@ TEST_CASE("Entity read fusion: concurrent find + findMany share one ANY",
         // fusion path (dedup + fan-out) runs entirely on one pipelined
         // connection regardless, so a 1-connection pool exercises it fully.
         auto pool = co_await PgPool<Io>::create(io, CONNINFO, {.min_connections = 1, .max_connections = 1});
-        auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, nullptr, 8);
+        auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, 8);
 
         // Bootstrap so Nagle batching is active (else every read goes direct).
         co_await bootstrapPg(batcher);
@@ -766,7 +766,7 @@ TEST_CASE("Pipelined read batch: several statements prepared mid-batch",
         // Single connection: the batch runs on the connection the leader
         // used, whose prepared-statement set is known.
         auto pool = co_await PgPool<Io>::create(io, CONNINFO, {.min_connections = 1, .max_connections = 1});
-        auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, nullptr, 8);
+        auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, 8);
         co_await bootstrapPg(batcher);
 
         std::atomic<int> completed{0};
@@ -802,7 +802,7 @@ TEST_CASE("Pipelined read batch: prepared statement ahead of an unprepared one",
 
     auto task = [&]() -> DetachedTask {
         auto pool = co_await PgPool<Io>::create(io, CONNINFO, {.min_connections = 1, .max_connections = 1});
-        auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, nullptr, 8);
+        auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, 8);
         co_await bootstrapPg(batcher);
 
         static constexpr const char* KNOWN = "SELECT 9201::int AS tag, $1::int AS v";
@@ -839,7 +839,7 @@ TEST_CASE("Pipelined write batch: several statements prepared mid-batch",
 
     auto task = [&]() -> DetachedTask {
         auto pool = co_await PgPool<Io>::create(io, CONNINFO, {.min_connections = 1, .max_connections = 1});
-        auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, nullptr, 8);
+        auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, 8);
         co_await bootstrapPg(batcher);
 
         std::atomic<int> completed{0};
@@ -874,7 +874,7 @@ TEST_CASE("Write coalescing: identical writes in batch are coalesced",
 
     auto task = [&]() -> DetachedTask {
         auto pool = co_await PgPool<Io>::create(io, CONNINFO, {.min_connections = 1, .max_connections = 1});
-        auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, nullptr, 8);
+        auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, 8);
 
         // Bootstrap to activate Nagle batching
         co_await bootstrapPg(batcher);
@@ -924,7 +924,7 @@ TEST_CASE("Write coalescing: different params are NOT coalesced",
 
     auto task = [&]() -> DetachedTask {
         auto pool = co_await PgPool<Io>::create(io, CONNINFO, {.min_connections = 1, .max_connections = 1});
-        auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, nullptr, 8);
+        auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, 8);
 
         co_await bootstrapPg(batcher);
 
@@ -969,7 +969,7 @@ TEST_CASE("Write coalescing: coalesced followers get correct result",
 
     auto task = [&]() -> DetachedTask {
         auto pool = co_await PgPool<Io>::create(io, CONNINFO, {.min_connections = 1, .max_connections = 1});
-        auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, nullptr, 8);
+        auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, 8);
 
         co_await bootstrapPg(batcher);
 
@@ -1037,7 +1037,7 @@ TEST_CASE("Write coalescing: N absolute SETs are idempotent in final state",
 
     auto task = [&]() -> DetachedTask {
         auto pool = co_await PgPool<Io>::create(io, CONNINFO, {.min_connections = 1, .max_connections = 1});
-        auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, nullptr, 8);
+        auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, 8);
 
         co_await bootstrapPg(batcher);
 
@@ -1093,7 +1093,7 @@ TEST_CASE("Write coalescing: identical Exclusive writes all execute",
 
     auto task = [&]() -> DetachedTask {
         auto pool = co_await PgPool<Io>::create(io, CONNINFO, {.min_connections = 1, .max_connections = 1});
-        auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, nullptr, 8);
+        auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, 8);
 
         co_await bootstrapPg(batcher);
 
@@ -1150,7 +1150,7 @@ TEST_CASE("Write coalescing: Exclusive neither joins nor leads Idempotent",
 
     auto task = [&]() -> DetachedTask {
         auto pool = co_await PgPool<Io>::create(io, CONNINFO, {.min_connections = 1, .max_connections = 1});
-        auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, nullptr, 8);
+        auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, 8);
 
         co_await bootstrapPg(batcher);
 
@@ -1212,7 +1212,7 @@ TEST_CASE("Write coalescing: submitPgWrite coalescing returns correct affected r
 
     auto task = [&]() -> DetachedTask {
         auto pool = co_await PgPool<Io>::create(io, CONNINFO, {.min_connections = 1, .max_connections = 1});
-        auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, nullptr, 8);
+        auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, 8);
 
         co_await bootstrapPg(batcher);
 
@@ -1258,7 +1258,7 @@ TEST_CASE("Write coalescing: mixed identical and different writes coalesce by gr
 
     auto task = [&]() -> DetachedTask {
         auto pool = co_await PgPool<Io>::create(io, CONNINFO, {.min_connections = 1, .max_connections = 1});
-        auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, nullptr, 8);
+        auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, 8);
 
         co_await bootstrapPg(batcher);
 
@@ -1362,7 +1362,7 @@ TEST_CASE("Read in flight: identical reads share the direct read's statement",
 
     auto task = [&]() -> DetachedTask {
         auto pool = co_await PgPool<Io>::create(io, CONNINFO, {.min_connections = 1, .max_connections = 1});
-        auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, nullptr, 8);
+        auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, 8);
         co_await bootstrapPg(batcher);
 
         static constexpr const char* SQL = "SELECT $1::int * 2";
@@ -1414,7 +1414,7 @@ TEST_CASE("Read in flight: not shared once a write completed since its send",
 
     auto task = [&]() -> DetachedTask {
         auto pool = co_await PgPool<Io>::create(io, CONNINFO, {.min_connections = 2, .max_connections = 2});
-        auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, nullptr, 8);
+        auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, 8);
         co_await bootstrapPg(batcher);
         co_await batcher->directQuery(
             "CREATE TABLE IF NOT EXISTS lead_rw (id INT PRIMARY KEY, val INT)");
@@ -1470,7 +1470,7 @@ TEST_CASE("Read in flight: the direct read's error reaches every follower",
         auto pool = co_await PgPool<Io>::create(io, CONNINFO,
             {.min_connections = 1, .max_connections = 1,
              .query_timeout = std::chrono::milliseconds(200)});
-        auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, nullptr, 8);
+        auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, 8);
         co_await bootstrapPg(batcher);
 
         static constexpr const char* SLOW = "SELECT $1::int, pg_sleep(1)";
@@ -1503,7 +1503,7 @@ TEST_CASE("Read in flight: a cancelled follower leaves the others to finish",
 
     auto task = [&]() -> DetachedTask {
         auto pool = co_await PgPool<Io>::create(io, CONNINFO, {.min_connections = 1, .max_connections = 1});
-        auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, nullptr, 8);
+        auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, 8);
         co_await bootstrapPg(batcher);
 
         static constexpr const char* SQL = "SELECT $1::int, pg_sleep(0.05)";
@@ -1599,7 +1599,7 @@ DetachedTask fanoutWrite(std::shared_ptr<BatchScheduler<Io>> b, Outcome& out,
 Task<std::shared_ptr<BatchScheduler<Io>>> fanoutScheduler(Io& io) {
     auto pool = co_await PgPool<Io>::create(
         io, CONNINFO, {.min_connections = 8, .max_connections = 8});
-    auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, nullptr, 8);
+    auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, 8);
     co_await bootstrapPg(batcher);
     co_await batcher->directQuery(
         "CREATE TABLE IF NOT EXISTS relais_test_fanout (id INT PRIMARY KEY, v INT NOT NULL)");
@@ -1646,9 +1646,9 @@ TEST_CASE("Write fan-out: the derived fan-out is half the PG budget",
           "[io][batch][fanout]")
 {
     Io io;
-    auto b8 = std::make_shared<BatchScheduler<Io>>(io, nullptr, nullptr, 8);
-    auto b1 = std::make_shared<BatchScheduler<Io>>(io, nullptr, nullptr, 1);
-    auto b64 = std::make_shared<BatchScheduler<Io>>(io, nullptr, nullptr, 64);
+    auto b8 = std::make_shared<BatchScheduler<Io>>(io, nullptr, 8);
+    auto b1 = std::make_shared<BatchScheduler<Io>>(io, nullptr, 1);
+    auto b64 = std::make_shared<BatchScheduler<Io>>(io, nullptr, 64);
     CHECK(BatchBenchAccessor::writeFanout(*b8) == 4);
     CHECK(BatchBenchAccessor::writeFanout(*b1) == 1);
     CHECK(BatchBenchAccessor::writeFanout(*b64) == 16);

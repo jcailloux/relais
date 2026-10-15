@@ -426,7 +426,7 @@ TEST_CASE("liveness: a batched fire that cannot acquire a connection fails its w
     // Pool that can never connect (silent server), short acquire bound.
     auto pool = driveBounded(io, PgPool<Io>::create(io, silent.conninfo(),
         {.min_connections = 0, .max_connections = 2, .acquire_timeout = 300ms}));
-    auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, nullptr, 8);
+    auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, 8);
 
     // The submit batches and fires; the detached fire's acquire blackholes and
     // times out, and the fire's catch must propagate PgPoolTimeout to the waiter
@@ -450,7 +450,7 @@ TEST_CASE("liveness: a withheld pipeline read times out via the pipeline awaiter
     { auto g = driveBounded(io, pool->acquire()); fd = g.conn().socket(); }
     io.holdReads(fd);
 
-    auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, nullptr, 8);
+    auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, 8);
 
     // Two distinct (non-coalescing) reads → one pipeline, two segments. The
     // withheld response trips query_timeout inside readPipelineResults, so the
@@ -476,7 +476,7 @@ TEST_CASE("liveness: destroying the scheduler inside a detached fire does not UA
 
     std::weak_ptr<BatchScheduler<Io>> weak;
     {
-        auto b = std::make_shared<BatchScheduler<Io>>(io, pool, nullptr, 8);
+        auto b = std::make_shared<BatchScheduler<Io>>(io, pool, 8);
         weak = b;
 
         bool done = false;
@@ -546,7 +546,7 @@ TEST_CASE("liveness: ordered teardown drains an in-flight detached fire, no leak
         {.min_connections = 1, .max_connections = 2, .acquire_timeout = 2s,
          .query_timeout = 400ms}));
 
-    auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, nullptr, 8);
+    auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, 8);
 
     // Warm the estimator past bootstrap so submitPgRead takes the batching path
     // (a bootstrapping batcher sends every read direct, never firing a detached
@@ -592,10 +592,9 @@ TEST_CASE("liveness: ordered teardown drains an in-flight detached fire, no leak
     REQUIRE(batcher->inflightDetached() >= 1);
     REQUIRE_FALSE(batcher->quiescentForTeardown());
 
-    // Ordered teardown: stop self-heal re-arming, then pump until the in-flight
-    // fire has drained (its read times out, it unwinds in error, the DetachedTask
-    // self-destructs). Bounded — the loop never hangs on it.
-    batcher->beginShutdown();
+    // Ordered teardown: pump until the in-flight fire has drained (its read
+    // times out, it unwinds in error, the DetachedTask self-destructs). Bounded —
+    // the loop never hangs on it.
     auto deadline = std::chrono::steady_clock::now() + 3s;
     while (!batcher->quiescentForTeardown() &&
            std::chrono::steady_clock::now() < deadline)
@@ -622,7 +621,6 @@ TEST_CASE("liveness: fail-fast startup reclaims an in-flight connect, no fd leak
     IoPoolConfig cfg;
     cfg.num_workers = 1;
     cfg.pg_conninfo = silent.conninfo();
-    cfg.redis = std::nullopt;
     cfg.pin_to_cores = false;
     cfg.acquire_timeout = 0ms;     // unbounded boot connect
     cfg.query_timeout = 0ms;
@@ -642,7 +640,6 @@ TEST_CASE("liveness: an unreachable dependency fails startup within a bound, nev
     IoPoolConfig cfg;
     cfg.num_workers = 1;
     cfg.pg_conninfo = silent.conninfo();
-    cfg.redis = std::nullopt;
     cfg.pin_to_cores = false;
     cfg.acquire_timeout = 300ms;   // bound the boot connect itself
     cfg.startup_timeout = 5s;
@@ -662,7 +659,6 @@ TEST_CASE("liveness: an L1-only IoPool starts clean",
     IoPoolConfig cfg;
     cfg.num_workers = 1;
     cfg.pg_conninfo = getConnInfo();
-    cfg.redis = std::nullopt;
     cfg.pin_to_cores = false;
     cfg.pg_min_conns_per_worker = 1;
     cfg.pg_max_conns_per_worker = 1;
@@ -681,7 +677,6 @@ TEST_CASE("liveness: an L1-only IoPool tears down with no fd leak",
         IoPoolConfig cfg;
         cfg.num_workers = 2;
         cfg.pg_conninfo = getConnInfo();
-        cfg.redis = std::nullopt;
         cfg.pin_to_cores = false;
         cfg.pg_min_conns_per_worker = 1;
         cfg.pg_max_conns_per_worker = 1;

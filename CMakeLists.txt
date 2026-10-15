@@ -431,13 +431,6 @@ if(RELAIS_BUILD_BENCHMARKS)
     target_compile_definitions(bench_relais_cache PRIVATE RELAIS_BUILDING_TESTS RELAIS_ENABLE_METRICS=1)
     target_link_libraries(bench_relais_cache PRIVATE jcailloux::relais Catch2::Catch2WithMain)
 
-    add_executable(bench_io_redis benchmarks/bench_io_redis.cpp)
-    target_include_directories(bench_io_redis PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-    target_compile_definitions(bench_io_redis PRIVATE RELAIS_ENABLE_METRICS=1)
-    target_link_libraries(bench_io_redis PRIVATE jcailloux::relais Catch2::Catch2WithMain)
-
     add_executable(bench_io_pg benchmarks/bench_io_pg.cpp)
     target_include_directories(bench_io_pg PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks
