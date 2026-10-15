@@ -34,11 +34,18 @@ namespace jcailloux::relais::io {
 //     - query_timeout bounds each per-connection I/O wait. A generous liveness
 //       backstop (not an SLA): it bounds a blackholed socket that statement_timeout
 //       misses. 0 delegates entirely to the server (discouraged); set tighter for an SLA.
+//     - uncertain_settle decides how a write that failed uncertainly (timeout or
+//       lost connection after sending) is settled: Terminate stops its backend,
+//       Await waits for it to end, Delay waits settle_delay (behind a transaction
+//       pooler, where the backend is not stable; settle_delay must exceed the
+//       server's statement_timeout), Off settles nothing.
 struct PgPoolConfig {
     size_t min_connections = 2;
     size_t max_connections = 16;
     std::chrono::milliseconds acquire_timeout{5000};
     std::chrono::milliseconds query_timeout{30000};
+    UncertainSettle uncertain_settle = UncertainSettle::Terminate;
+    std::chrono::milliseconds settle_delay{0};
 };
 
 // PgPool — bounded connection pool with coroutine wait queue
@@ -113,7 +120,7 @@ public:
             // query I/O waits.
             auto conn = co_await ConnectionType::connect(
                 pool->io_, pool->conninfo_.c_str(),
-                cfg.acquire_timeout, cfg.query_timeout);
+                cfg.acquire_timeout, cfg.query_timeout, pool->settleConfig());
             pool->idle_.push_back(std::move(conn));
             ++pool->total_;
         }
@@ -148,7 +155,8 @@ public:
             // (DNS, SYN blackhole) throws PgPoolTimeout, the SlotGuard unwinds
             // ++total_, and acquire() propagates instead of freezing.
             auto conn = co_await ConnectionType::connect(
-                io_, conninfo_.c_str(), cfg_.acquire_timeout, cfg_.query_timeout);
+                io_, conninfo_.c_str(), cfg_.acquire_timeout, cfg_.query_timeout,
+                settleConfig());
             slot.committed = true;
             co_return ConnectionGuard(this->shared_from_this(), std::move(conn));
         }
@@ -176,6 +184,10 @@ private:
         , conninfo_(std::move(conninfo))
         , cfg_(cfg)
     {}
+
+    [[nodiscard]] SettleConfig settleConfig() const noexcept {
+        return {cfg_.uncertain_settle, cfg_.settle_delay};
+    }
 
     void release(ConnectionType conn) {
         if (!waiters_.empty()) {
