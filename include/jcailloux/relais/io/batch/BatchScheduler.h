@@ -1110,6 +1110,9 @@ private:
         } catch (...) {
             // Propagate exception to all waiters instead of silent PgResult{} —
             // covers both the acquire timeout (no conn yet) and a pipeline error.
+            // The ticket goes on before the exception_ptr is taken: every waiter
+            // and follower then shares it.
+            if (guard) attachSettleTicket(guard->conn());
             auto eptr = std::current_exception();
             if (guard) { try { guard->conn().exitPipelineMode(); } catch (...) {} }
             for (auto* e : entries) {
@@ -1221,7 +1224,12 @@ private:
 
         {
             auto guard = co_await pg_pool_->acquire();
-            result = co_await guard.conn().queryParams(entry.sql, entry.params);
+            try {
+                result = co_await guard.conn().queryParams(entry.sql, entry.params);
+            } catch (...) {
+                attachSettleTicket(guard.conn());
+                throw;
+            }
         }
 
         auto elapsed_ns = static_cast<double>(
@@ -1239,6 +1247,17 @@ private:
     // =========================================================================
     // Helpers
     // =========================================================================
+
+    /// Called from a handler on the write path: an uncertain failure gets the
+    /// settle ticket of the connection that sent the write. Reads never call it:
+    /// they change nothing, there is nothing to settle.
+    static void attachSettleTicket(const typename PgPool<Io>::ConnectionType& conn) {
+        try {
+            throw;
+        } catch (const PgUncertainError& e) {
+            e.attachSettleTicket(conn.settleTicket());
+        } catch (...) {}
+    }
 
     /// Distribute an ANY-batch PgResult to individual waiters by matching PK
     /// column values. A single-key waiter (find) gets a zero-copy single-row

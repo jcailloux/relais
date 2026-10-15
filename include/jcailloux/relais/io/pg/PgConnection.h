@@ -15,11 +15,13 @@
 
 #include <libpq-fe.h>
 
+#include "jcailloux/relais/Log.h"
 #include "jcailloux/relais/io/Task.h"
 #include "jcailloux/relais/io/IoContext.h"
 #include "jcailloux/relais/io/pg/PgError.h"
 #include "jcailloux/relais/io/pg/PgParams.h"
 #include "jcailloux/relais/io/pg/PgResult.h"
+#include "jcailloux/relais/io/pg/SettleTicket.h"
 
 namespace jcailloux::relais::io {
 
@@ -65,6 +67,8 @@ public:
         , timer_(std::exchange(o.timer_, {}))
         , timer_armed_(std::exchange(o.timer_armed_, false))
         , query_timeout_(o.query_timeout_)
+        , settle_(o.settle_)
+        , backend_(std::move(o.backend_))
     {
         // Never move mid-wait: the watch callback (and timer) capture a raw `this`
         // that move does not patch → UAF. watch_active_ catches the query_timeout=0
@@ -92,6 +96,8 @@ public:
             timer_ = std::exchange(o.timer_, {});
             timer_armed_ = std::exchange(o.timer_armed_, false);
             query_timeout_ = o.query_timeout_;
+            settle_ = o.settle_;
+            backend_ = std::move(o.backend_);
         }
         return *this;
     }
@@ -118,9 +124,14 @@ public:
     // connection as the default bound for subsequent I/O waits. Both default to
     // 0 = unbounded (server/conninfo-delegated), which keeps direct callers
     // (tests/benches) compiling unchanged.
+    //
+    // `settle` decides what a write failing uncertainly on this connection must
+    // wait for (settleTicket()). Terminate and Await name the backend, read here
+    // within acquire_timeout; Delay and Off add no round-trip.
     static Task<PgConnection> connect(Io& io, const char* conninfo,
                                       std::chrono::nanoseconds acquire_timeout = {},
-                                      std::chrono::nanoseconds query_timeout = {}) {
+                                      std::chrono::nanoseconds query_timeout = {},
+                                      SettleConfig settle = {}) {
         PGconn* conn = PQconnectStart(conninfo);
         if (!conn)
             throw PgConnectionError("PQconnectStart returned null");
@@ -133,7 +144,34 @@ public:
 
         PgConnection pgconn(io, conn, query_timeout);
         co_await pgconn.awaitConnect(acquire_timeout);
+        pgconn.settle_ = settle;
+        if (settle.mode == UncertainSettle::Terminate || settle.mode == UncertainSettle::Await)
+            co_await pgconn.readBackendId(acquire_timeout);
         co_return std::move(pgconn);
+    }
+
+    /// The backend serving this connection, read at connect; unknown when the
+    /// settle mode does not need it or the read failed.
+    [[nodiscard]] const BackendId& backendId() const noexcept { return backend_; }
+
+    /// What a write that failed uncertainly on this connection must wait for
+    /// before its outcome is final. Null when there is nothing to settle: mode
+    /// Off, Delay without a delay, or a backend that could not be named.
+    [[nodiscard]] std::shared_ptr<SettleTicket> settleTicket() const {
+        switch (settle_.mode) {
+            case UncertainSettle::Terminate:
+            case UncertainSettle::Await:
+                if (!backend_.known()) return nullptr;
+                return std::make_shared<SettleTicket>(
+                    SettleTicket{.mode = settle_.mode, .backend = backend_});
+            case UncertainSettle::Delay:
+                if (settle_.delay.count() <= 0) return nullptr;
+                return std::make_shared<SettleTicket>(
+                    SettleTicket{.mode = settle_.mode, .delay = settle_.delay});
+            case UncertainSettle::Off:
+                break;
+        }
+        return nullptr;
     }
 
     // Async query with parameters
@@ -311,6 +349,32 @@ public:
     }
 
 private:
+    // Part of acquiring the connection, so bounded by acquire_timeout and failing
+    // as an acquire does: the request changes nothing, its failure is never
+    // uncertain. A server-side refusal leaves the backend unknown and the
+    // connection usable.
+    Task<void> readBackendId(std::chrono::nanoseconds acquire_timeout) {
+        static constexpr const char* kSql =
+            "SELECT pid, backend_start::text FROM pg_stat_activity "
+            "WHERE pid = pg_backend_pid()";
+        const auto query_timeout = std::exchange(query_timeout_, acquire_timeout);
+        try {
+            PgResult r = co_await query(kSql);
+            if (r.rows() == 1) {
+                backend_.pid = r[0].get<int32_t>(0);
+                backend_.backend_start = r[0].get<std::string>(1);
+            }
+        } catch (const PgQueryTimeout&) {
+            throw PgPoolTimeout("backend identity exceeded acquire_timeout");
+        } catch (const PgConnectionLost& e) {
+            throw PgConnectionError(e.what());
+        } catch (const PgError& e) {
+            RELAIS_LOG_WARN << "relais: cannot name the backend of a connection, "
+                               "its uncertain writes will not be settled: " << e.what();
+        }
+        query_timeout_ = query_timeout;
+    }
+
     void resetPipelineBookkeeping() noexcept {
         pipeline_prepare_queued_ = false;
         pipeline_prepares_.clear();  // keeps capacity: no allocation per batch
@@ -679,6 +743,9 @@ private:
     typename Io::TimerToken timer_{};
     bool timer_armed_ = false;
     std::chrono::nanoseconds query_timeout_{};  // default bound for query I/O waits
+
+    SettleConfig settle_{};
+    BackendId backend_{};
 };
 
 } // namespace jcailloux::relais::io
