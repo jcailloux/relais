@@ -9,7 +9,7 @@ Five ideas carry the whole library:
 
 1. [Entity / mapping decoupling](#1--entity--mapping-decoupling) — a pure struct, a generated mapping, one wrapper at the API edge.
 2. [The compile-time mixin tower](#2--the-compile-time-mixin-tower) — the repository is assembled from your config; what you don't enable isn't there.
-3. [The read / write flow](#3--the-read--write-flow) — L1 → L2 → L3 on reads; invalidate-then-write on writes.
+3. [The read / write flow](#3--the-read--write-flow) — L1, then PostgreSQL, on reads; commit-then-invalidate on writes.
 4. [The shared-nothing runtime](#4--the-shared-nothing-runtime) — one event loop per thread, no cross-thread hops.
 5. [Type-safety by concepts](#5--type-safety-by-concepts) — capability is a compile-time property; misuse doesn't compile.
 
@@ -45,11 +45,9 @@ traits:
                           │
         ListMixin      ← only if the entity has a ListDescriptor
                           │
-        LocalRepo      ← L1 (RAM)   — only if Cfg selects L1 or L1_L2
+        LocalRepo      ← L1 (RAM) — only if Cfg selects L1
                           │
-        RedisRepo      ← L2 (Redis) — only if Cfg selects L2 or L1_L2
-                          │
-         PgRepo        ← L3 (PostgreSQL) — always present
+         PgRepo        ← PostgreSQL — always present
 ```
 
 Each layer defines the same method names as the one below it and calls down with
@@ -59,15 +57,15 @@ calls; the optimizer sees straight through it.
 
 The consequence is the single most important property of the library:
 
-> **What you don't configure doesn't exist in the binary.** A `config::Local`
-> repo has no `RedisRepo` layer — there is no dead Redis branch to skip at
+> **What you don't configure doesn't exist in the binary.** A `config::Uncached`
+> repo has no `LocalRepo` layer — there is no dead cache branch to skip at
 > runtime, because the code was never generated. Add `Invalidate...` descriptors
 > and the `InvalidationMixin` appears; declare a `ListDescriptor` and list
 > caching appears. You pay, in code size and in cycles, for exactly the tiers and
 > features you turned on.
 
-The presets name the common towers: `Uncached` (PgRepo only), `Local` (+ L1),
-`Redis` (+ L2), `Both` (L1 + L2). The tower changes, the API does not: every
+The presets name the two towers: `Uncached` (PgRepo only) and `Local` (+ L1).
+The tower changes, the API does not: every
 preset exposes the same methods with the same signatures, so switching preset
 never breaks compilation.
 
@@ -79,34 +77,34 @@ never breaks compilation.
 
 ## 3 — The read / write flow
 
-**Reads climb the tower.** A `find` checks the fastest tier first and falls
-through on a miss, back-filling each tier it passed on the way up:
+**Reads climb the tower.** A `find` checks L1 first and falls through to the
+database on a miss, back-filling L1 on the way up:
 
 ```
 L1 hit  → return                              (in-process RAM, no I/O)
-L1 miss → L2 hit  → store into L1 → return    (Redis round-trip)
-       └→ L2 miss → DB query → store L2 → store L1 → return
+L1 miss → DB query → store into L1 → return
 ```
 
-A hit on L1 is a synchronous, frameless lookup; only a real L2/L3 miss does
-asynchronous I/O. The back-fill is awaited before the read returns, with a recheck
-that drops the store if a concurrent write invalidated the key mid-fetch (so a
-back-fill is never stale). Batched warm-fills, on the multi-key path, are instead
-detached fire-and-forget.
+A hit on L1 is a synchronous, frameless lookup; only a miss does asynchronous
+I/O. The back-fill happens before the read returns, with a recheck that drops the
+store if a concurrent write invalidated the key mid-fetch (so a back-fill is never
+stale).
 
 **Writes go the other way: invalidate, then commit.** A mutation commits to
-PostgreSQL, then *evicts* the affected entries from L2 and L1 (and bumps the list
+PostgreSQL, then *evicts* the affected entries from L1 (and bumps the list
 caches) rather than overwriting them. The next read re-fetches and re-fills. This
 "invalidate-then-reload" is the safe default (`UpdateStrategy::InvalidateAndLazyReload`)
 — it can never leave a stale value cached, because it leaves *nothing* cached.
 (An optimistic `PopulateImmediately` write-through exists for read-after-write-heavy
 paths; see [api-reference.md › CacheConfig](api-reference.md#cacheconfig).)
 
-**Staleness is bounded by timing, never by scope.** Cross-target and
-cross-instance invalidation propagate detached (fire-and-forget), so a dependent
+**Staleness is bounded by timing, never by scope.** The cross-target invalidation of
+batch and predicate writes propagates detached (fire-and-forget), so a dependent
 cache can lag the source by a few milliseconds — but relais never over-invalidates:
 eviction is always *point-targeted* at the exact affected keys (never `purgeAll`),
-so a write to one entity never flushes unrelated hot entries.
+so a write to one entity never flushes unrelated hot entries. L1 is per process:
+another instance sees a write once its own entry expires (`l1_ttl`) — see
+[caching.md › Several instances](caching.md#several-instances).
 
 > The eviction model, partition hints, and `patch` semantics →
 > [caching.md](caching.md). Cross-entity and cross-list invalidation →
@@ -117,14 +115,14 @@ so a write to one entity never flushes unrelated hot entries.
 ## 4 — The shared-nothing runtime
 
 Because a real miss does asynchronous I/O, repository calls don't touch
-PostgreSQL or Redis on the calling thread — they run **on an event loop** and
+PostgreSQL on the calling thread — they run **on an event loop** and
 route through `thread_local` providers (each owning that loop's connection pools).
 The runtime model is shared-nothing:
 
 - **One event loop per worker thread**, typically pinned to a core. N workers = N
   independent loops.
-- **Each loop owns its own resources** — its PostgreSQL pool, its Redis pool, its
-  batch scheduler, bound to that thread's `thread_local` providers.
+- **Each loop owns its own resources** — its PostgreSQL pool, its batch
+  scheduler, bound to that thread's `thread_local` providers.
 - **A request stays on its loop, end to end.** No locks on the hot path, no
   cross-thread handoff between the coroutine and its I/O. Throughput scales
   ~linearly with cores at unchanged per-request latency.
@@ -133,8 +131,7 @@ The runtime model is shared-nothing:
    core 1            core 2            core 3
   ┌───────┐         ┌───────┐         ┌───────┐
   │ loop  │         │ loop  │         │ loop  │     each: own PG pool,
-  │  +PG  │         │  +PG  │         │  +PG  │      Redis pool, scheduler
-  │ +Redis│         │ +Redis│         │ +Redis│      — nothing shared
+  │  +PG  │         │  +PG  │         │  +PG  │      scheduler
   └───────┘         └───────┘         └───────┘
 ```
 
@@ -196,9 +193,9 @@ The practical upshot:
 Speed in relais comes from four independent choices, in order of impact.
 
 1. **The right cache preset.** An L1 hit is an in-process sharded-map (`ChunkMap`) lookup
-   (~50 ns, no syscall, no I/O, no thread hop); only real L2/L3 misses do async I/O. Choosing the
-   tier per entity (`Local`/`Both` for hot reads, `Redis` for cross-instance
-   shared data) is the largest lever — see [§2](#2--the-compile-time-mixin-tower)
+   (~50 ns, no syscall, no I/O, no thread hop); only real misses do async I/O. Choosing the
+   preset per entity (`Local` for hot reads, `Uncached` for write-only tables or
+   rows several instances write) is the largest lever — see [§2](#2--the-compile-time-mixin-tower)
    and [§3](#3--the-read--write-flow).
 2. **Automatic SQL batching & pipelining.** Concurrent coroutines on one loop have
    their reads coalesced into a single `SELECT … WHERE id = ANY($1)` per repo,

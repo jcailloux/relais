@@ -76,13 +76,11 @@ For indirect list invalidation where a source change should selectively drop
 cached list *pages*, use `InvalidateListVia` with a typed resolver. The target
 list repo defines a `GroupKey` (typed filter values) and **must provide** an
 `invalidateByTarget(GroupKey, std::optional<int64_t> sort_value)` method that the resolver
-drives; the resolver returns `ListInvalidationTarget<GroupKey>`. This API is
-**cache-level agnostic** — identical for L1 (RAM) and L2 (Redis).
+drives; the resolver returns `ListInvalidationTarget<GroupKey>`.
 
-> `invalidateByTarget` is the target repo's responsibility. The shipped mixins
-> provide only the lower-level primitives it builds on — `invalidateAllListGroups`
-> (`ListMixin`) and `invalidateListGroupByKey` (the L2 tier, `RedisRepo`/`PgRepo`) —
-> not `invalidateByTarget` itself.
+> `invalidateByTarget` is the target repo's responsibility: it decides which pages
+> a target drops. The shipped `ListMixin` provides `invalidateAllListGroups`, which
+> drops every cached page of the repo in O(1) — not `invalidateByTarget` itself.
 
 ```cpp
 using Target = ListInvalidationTarget<ArticleListRepo::GroupKey>;
@@ -108,27 +106,22 @@ using PurchaseRepo = Repo<PurchaseEntity, "Purchase", config::Local,
 >;
 ```
 
-### Three granularities
+### What the resolver returns
 
-| Granularity | Resolver returns | Effect |
-|---|---|---|
-| **Per-page** | `sort_value` present | Only pages whose sort range includes the value |
-| **Per-group** | `sort_value` absent (`nullopt`) | All pages in the targeted group |
-| **Full pattern** | resolver returns `std::nullopt` | All groups in the repository |
-
-Each cached Redis page carries a 19-byte binary header (magic + sort bounds +
-flags). For per-page granularity, a Lua script reads those headers atomically
-(`GETRANGE`) and deletes only the affected pages — one Redis round-trip.
+| Resolver returns | Call on the list repo |
+|---|---|
+| Targets | `invalidateByTarget(target.filters, target.sort_value)` per target — `sort_value` set for one sort position, `nullopt` for the whole group |
+| `std::nullopt` (with an `optional` return type) | `invalidateAllListGroups()` — every page of the repo |
 
 ## Batch and predicate erase / invalidate
 
 Beyond the per-id `erase`/`invalidate`, four methods act on a set of rows in a
 single cascade. `eraseMany`/`invalidateMany` take an enumerated key set;
 `eraseWhere`/`invalidateWhere` take a predicate that resolves its own set
-server-side. `erase*` removes the rows from L3; `invalidate*` only evicts caches
-(rows persist, a later read repopulates).
+server-side. `erase*` removes the rows from the database; `invalidate*` only
+evicts L1 (rows persist, a later read repopulates).
 
-| Method | Input | L3 | Lists | Return |
+| Method | Input | Database | Lists | Return |
 |---|---|---|---|---|
 | `eraseMany(span<const Key>)` | enumerated keys | `DELETE … WHERE pk = ANY` | dropped (rows gone) | `optional<size_t>` rows deleted |
 | `invalidateMany(span<const Key>)` | enumerated keys | untouched | kept (rows persist) | `void` |
@@ -139,7 +132,7 @@ server-side. `erase*` removes the rows from L3; `invalidate*` only evicts caches
 non-matching set. The real gates: `eraseMany` and the `erase*` family require a
 writable (`!read_only`) config; `invalidateMany` is unconditional;
 `eraseWhere`/`invalidateWhere` require `HasFilterSet<E>`. All four are facades on
-`Repo` regardless of preset — the cascade short-circuits in tiers a preset omits.
+`Repo` regardless of preset — without L1 there is nothing to evict.
 
 > Exact signatures (and the `eraseWhere`/`invalidateWhere` template form) are in
 > [api-reference.md › Deletes & invalidation](api-reference.md#repository-api).
@@ -150,21 +143,19 @@ writable (`!read_only`) config; `invalidateMany` is unconditional;
 std::vector<int64_t> ids = {1, 2, 3, 2};   // duplicates collapse by equality
 auto n = co_await UserRepo::eraseMany(ids); // *n == 3 (deduped, absent ids skip)
 
-co_await UserRepo::invalidateMany(ids);     // evict only, rows stay in L3
+co_await UserRepo::invalidateMany(ids);     // evict only, rows stay in the database
 ```
 
 The input is `span<const Key>` — the zero-copy, caller-owned convention shared
 with `findMany`. Both dedup the input by equality first (composite/partition
-keys model `==` but not `<`). Across the hierarchy the cascade collapses to one
-round-trip per tier: `eraseMany` issues one `DELETE WHERE pk = ANY($1) RETURNING`
-(the `RETURNING` set is the affected-entity source — no extra read) and one
-batched `UNLINK`; `invalidateMany` issues one batched `UNLINK`, sub-chunked at
-1000 keys per command. Cross-invalidation declared via `Invalidations...` is **deduplicated**
-across the whole set before propagating. Unlike the mono ops, the batch path
-**awaits only the latency-critical pass** (entity L1 evict + L2 entity `UNLINK` +
-L1 list-tracker bump) and **fires the deferred pass detached** (cross-target
-cross-invalidation + L2 list `EVAL`s): the caller returns before that remainder
-completes, with `l2_ttl`-bounded staleness on the deferred targets.
+keys model `==` but not `<`). `eraseMany` issues one
+`DELETE WHERE pk = ANY($1) RETURNING` (the `RETURNING` set is the affected-entity
+source — no extra read); `invalidateMany` reads each key through `find` (L1, else
+the database) to get the rows it propagates. Cross-invalidation
+declared via `Invalidations...` is **deduplicated** across the whole set before
+propagating. Unlike the mono ops, the batch path **awaits only the critical pass**
+(entity L1 evict + L1 list-tracker bump) and **fires the cross-invalidation
+detached**: the caller returns before the targets are invalidated.
 
 ### Predicate — `eraseWhere` / `invalidateWhere`
 
@@ -181,10 +172,10 @@ co_await ArticleRepo::invalidateWhere({.author_id = 42});  // evict only
 `eraseWhere` fuses resolve and delete in a chunked, ctid-bounded
 `DELETE … RETURNING` loop (`K_pg` rows per chunk, looping until a chunk deletes
 nothing); `invalidateWhere` resolves via one `SELECT WHERE pred`, then evicts. The entity
-tier evicts per resolved row (L1 + L2 + deduped cross-inval). The **own-list**
-tier is driven by the predicate, not the resolved id set: `eraseWhere` emits
-exactly **one `RangeModification` (L1) + one predicate-driven `EVAL` (L2)** for
-the whole deleted set — O(1)/O(groups), filter-aware, never-miss — see
+tier evicts per resolved row (L1 + deduped cross-inval). The **own-list**
+tier is driven by the predicate, not the resolved id set: `eraseWhere` records
+exactly **one `RangeModification`** for the whole deleted set — O(1),
+filter-aware, never-miss — see
 [the predicate list fast-path](lists.md#predicate-erase-and-invalidate). The
 oracle holds: `invalidateWhere(P)` ≡ `invalidateMany(ids resolved by P)`.
 
@@ -196,10 +187,9 @@ detached deferred pass.
 
 **Modification ops** (`insert`, `update`, `patch`, `patchIf`, `erase`):
 
-1. Fetch the old value first (`update`, `erase`); `patch` and `patchIf` get it from
-   the write statement itself.
-2. Run the DB operation.
-3. Propagate to dependent caches with old/new entity data (a refused `patchIf`
+1. Run the DB operation. `update`, `erase`, `patch` and `patchIf` get the old
+   row from the same statement — no prior read.
+2. Propagate to dependent caches with old/new entity data (a refused `patchIf`
    propagates nothing).
 
 `patchWhere` and `claim` follow the batch path: their rows, old and new, come back
@@ -209,5 +199,5 @@ from the statement and propagate like `eraseMany`'s.
 
 1. Fetch the entity for propagation.
 2. Propagate to dependent caches.
-3. Invalidate all tiers (L1 + L2).
+3. Evict L1.
 </content>

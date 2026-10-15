@@ -5,21 +5,20 @@
 > guide is the how-to for the cache tiers; every method signature lives in
 > [api-reference.md › Repository API](api-reference.md#repository-api).
 
-relais composes up to three cache tiers at compile time:
+relais puts an optional in-process cache in front of PostgreSQL, chosen at
+compile time:
 
 ```
-L1 hit → return
-L1 miss → L2 hit → fill L1 → return
-L2 miss → DB → fill L2 → fill L1 → return
+L1 hit  → return
+L1 miss → DB → fill L1 → return
 ```
 
 - **L1 (RAM)** — entities held **by value** in a process-global, sharded
   in-memory cache (`CacheTier` over `ChunkMap`) shared across all loop threads; reads
   borrow an epoch-guarded `CacheView<E>`, never a `shared_ptr`.
-- **L2 (Redis)** — BEVE binary, shared across instances.
-- **L3 (PostgreSQL)** — source of truth, rows hydrated via `fromRow()`.
+- **PostgreSQL** — source of truth, rows hydrated via `fromRow()`.
 
-Which tiers exist is chosen by the `CacheConfig` NTTP — there is zero runtime
+Whether L1 exists is chosen by the `CacheConfig` NTTP — there is zero runtime
 branching on configuration.
 
 ## CacheConfig — compile-time configuration
@@ -29,12 +28,11 @@ Parameter. Every field has a default; override only what differs, via
 `consteval` fluent chaining — each `with_*()` returns a new config at compile
 time (see [Composing](#composing) below).
 
-The full field list (tiers, TTLs, sizing, `update_strategy`, plus the
-cross-instance and read-fill-guard knobs) with defaults, every preset, and all
-`with_*()` signatures is the canonical reference in
+The full field list (cache level, TTL, sizing, `update_strategy`, the
+read-fill guard) with defaults, both presets, and all `with_*()` signatures is the
+canonical reference in
 [api-reference.md › CacheConfig](api-reference.md#cacheconfig). This guide covers
-the fields it leans on: `cache_level`, `l1_ttl`, `l2_ttl`, `l2_format`,
-`read_only`.
+the fields it leans on: `cache_level`, `l1_ttl`, `read_only`.
 
 > `Duration` wraps `std::chrono::duration` (whose private members bar it from
 > NTTP aggregates); `FixedString` lets string literals be template parameters —
@@ -46,13 +44,14 @@ the fields it leans on: `cache_level`, `l1_ttl`, `l2_ttl`, `l2_format`,
 L1 grows without limit unless something reclaims entries. What's available
 depends on **how relais was compiled**.
 
-**1. TTL (`l1_ttl`) — always active.** A *staleness ceiling* against the source
-of truth, not a memory cap. The default `1h` is a safety net: invalidation covers
-writes through this repo, but **not** out-of-band mutations (another instance, a
-migration, manual SQL). Expiry is **lazy** — an expired entry is dropped when it
-is next looked up (`find()` evicts on read); there is no background sweep in the
-default build, so a key written once and never read again lingers until touched.
-`with_l1_ttl(0s)` disables time expiry entirely.
+**1. TTL (`l1_ttl`) — always active.** A *staleness ceiling* against the source of
+truth, not a memory cap. The default `1h` is a safety net: invalidation covers
+writes through this process, but **not** out-of-band mutations (another instance, a
+migration, manual SQL) — see [Several instances](#several-instances). Expiry is
+**lazy** — an expired entry is dropped when it is next looked up (`find()` evicts on
+read); there is no background sweep in the default build, so a key written once and
+never read again lingers until touched. `with_l1_ttl(0s)` disables time expiry
+entirely.
 
 **2. Memory budget + GDSF (`RELAIS_L1_MAX_MEMORY`) — compile-time opt-in.**
 Size-aware GDSF eviction (score = frequency × cost ÷ entry size, evicts when over budget) and
@@ -84,16 +83,10 @@ To cap L1 by *memory* (a hard ceiling with proactive eviction), build with
 | Preset | Cache level | Use case |
 |---|---|---|
 | `config::Uncached` | None | Write-only tables, audit sinks |
-| `config::Local` | L1 only | Per-instance data (default) |
-| `config::Redis` | L2 only | Shared / cross-instance data |
-| `config::Both` | L1 + L2 | High-read, feature flags |
-
-> `config::Both` ships its own TTLs — `l1_ttl = 1min`, `l2_ttl = 1h` (short L1 over
-> long L2). The `1h` L1 figure cited above is the struct default, which `Local` and
-> uncustomized configs use; `Both` overrides it.
+| `config::Local` | L1 | Read-heavy data (default) |
 
 Switching preset never breaks compilation: every `Repo` method has the same
-signature, return type included, on all four presets. Without L1, the L1
+signature, return type included, on both presets. Without L1, the L1
 maintenance calls (`size`/`purge`/`warmup`) return `0` or do nothing.
 
 ### Composing
@@ -106,6 +99,21 @@ inline constexpr auto ReadOnly5m = config::Local.with_l1_ttl(5min).with_read_onl
 // Use inline as a template argument
 using MyRepo = Repo<MyEntity, "My", config::Local.with_l1_ttl(30min)>;
 ```
+
+## Several instances
+
+L1 lives in one process. A write invalidates the L1 of the process that made it,
+never another's: an instance that cached a row keeps serving it until its
+`l1_ttl` expires, whatever another instance wrote meanwhile. How to deploy
+depends on who writes which rows:
+
+| Deployment | L1 coherence |
+|---|---|
+| One instance | Exact: every write goes through this L1. |
+| Several, each key written and read by one instance | Exact: route keys so ownership is disjoint. |
+| Several sharing keys | Stale for up to `l1_ttl` on the instances that did not write. Choose `l1_ttl` as the tolerated staleness, or use `Uncached` for data that must never lag. |
+
+`l1_ttl = 0` (no expiry) is only safe when no other process writes the table.
 
 ## Read-only repositories
 
@@ -158,13 +166,11 @@ Requirements:
 - Hand-written entities without `TraitsType` don't support `patch` — gated by
   the `HasFieldUpdate` concept.
 
-Cache handling: after the commit, the returned row is stored through L1, so the
-view `patch` returns is already warm, and L2 is invalidated (it re-fills on the
-next read). With lists or cross-invalidation, the statement also returns the row
-as it was before, so pages and targets are updated from both versions without a
-prior read.
-On an uncertain outcome (`io::PgUncertainError`), the entry is evicted from L2 and
-L1 before the exception propagates.
+Cache handling: after the commit, the returned row is stored through L1, so the view
+`patch` returns is already warm. With lists or cross-invalidation, the statement
+also returns the row as it was before, so pages and targets are updated from both
+versions without a prior read. On an uncertain outcome (`io::PgUncertainError`), the
+entry is evicted from L1 before the exception propagates.
 
 ## Insert-or-update with `upsert`
 
@@ -174,7 +180,7 @@ RETURNING <all cols>`. It returns the `CacheView<E>` of the row as it stands onc
 the conflict resolves — the database decides insert vs. update, not a prior read.
 
 ```cpp
-using AccountRepo = Repo<AccountEntity, "Account", config::Both>;
+using AccountRepo = Repo<AccountEntity, "Account", config::Local>;
 
 auto view = co_await AccountRepo::upsert(makeAccount(id, balance));
 // PK absent → INSERT; PK present → UPDATE of every non-PK column
@@ -202,13 +208,12 @@ The PK is the only conflict target in this version; a UNIQUE-constraint target a
 
 ### Coherence and invalidation — identical to `update`
 
-`upsert` **stores the committed `RETURNING` row through** every active tier,
+`upsert` **stores the committed `RETURNING` row through** L1,
 unconditionally: it holds the authoritative row, so caching it is correct on both
 branches. It is the one write that ignores `UpdateStrategy` — there is no
 invalidate-then-reload variant, because the value to cache is already in hand. A
-pre-existing L1/L2 entry is superseded with the same generation bump `update` uses,
-so a concurrent read-fill cannot reinstate the stale value (cross-instance via the
-Redis-side generation under `l2_shared_across_instances`).
+pre-existing L1 entry is superseded with the same generation bump `update` uses,
+so a concurrent read-fill cannot reinstate the stale value.
 
 List and cross-invalidation match `update` exactly. Membership is reconciled from a
 **pre-image** (the row's prior state, read just before the statement): an insert
@@ -222,16 +227,17 @@ store-through, no read.
 
 An **uncertain** write (timeout, mid-request connection loss) may have committed
 over a key that already held a value, so on `io::PgUncertainError` `upsert` **evicts
-the affected L1/L2 entries and invalidates the possibly-affected pages by
-precaution**, then rethrows — no stale value survives. (`insert` evicts nothing on
-an uncertain write; there was no prior value to go stale.) A *deterministic* failure
-returns an empty view with nothing cached.
+the affected L1 entry and invalidates the possibly-affected pages by precaution**,
+then rethrows (see the limit in [runtime.md › Failures and the
+cache](runtime.md#failures-and-the-cache)). (`insert` evicts nothing on an uncertain
+write; there was no prior value to go stale.) A *deterministic* failure returns an
+empty view with nothing cached.
 
 The insert-vs-update decision is read a moment before the statement runs, so a row
 inserted concurrently in that window resolves as an update in SQL but propagates as
 a create. **The write stays atomic**; only the list cleanup of the vanished old
 state is skipped — exactly what `update` already tolerates when its pre-image is
-absent, bounded by `l1_ttl`/`l2_ttl`, timing not scope.
+absent, bounded by `l1_ttl`, timing not scope.
 
 ## Partition-key repositories
 
@@ -247,7 +253,7 @@ struct Event {
     std::string title;
 };
 
-using EventRepo = Repo<EventEntity, "Event", config::Both>;
+using EventRepo = Repo<EventEntity, "Event">;
 // Key = int64_t (id); HasPartitionKey auto-detected from the Mapping
 ```
 
@@ -261,14 +267,12 @@ round-trip just to prune:
 ```
 LocalRepo::erase(id)
   └─ hint = L1 lookup (~0 ns, free)
-RedisRepo::eraseImpl(id, hint)
-  └─ if no hint: try L2 (~0.1 ms)
 PgRepo::eraseImpl(id, hint)
   ├─ hint present: DELETE ... WHERE id=$1 AND region=$2   → 1 partition
   └─ no hint:      DELETE ... WHERE id=$1                 → N partitions
 ```
 
-**Rule:** use the full key only when the entity is free (L1) or near-free (L2).
+**Rule:** use the full key only when the entity is already in L1.
 
 ### Partition-key `patch`
 
@@ -301,23 +305,19 @@ view[3];              // nullptr — absent in every tier
 
 Contract:
 
-- **Order preserved, holes are absent.** `view[i]` maps positionally to `ids[i]`;
-  a `nullptr` slot means the id was found in no tier. Duplicate ids collapse to a
-  single downstream entry and share one pointer.
-- **One round-trip per tier.** The ids L1 does not hold (all of them without L1)
-  are batched into a single `MGET` (L2) and a single `WHERE pk = ANY($1)` (L3) —
-  never N sequential lookups. The saving scales with the miss count, not the
-  request size.
+- **Order preserved, holes are absent.** `view[i]` maps positionally to `ids[i]`; a
+  `nullptr` slot means the id was found neither in L1 nor in the database. Duplicate
+  ids collapse to a single downstream entry and share one pointer.
+- **One round-trip.** The ids L1 does not hold (all of them without L1) are batched
+  into a single `WHERE pk = ANY($1)` — never N sequential lookups. The saving scales
+  with the miss count, not the request size.
 - **L1 hits are zero-copy.** Hits return the live L1 slot pointer; nothing is
   copied or rehydrated.
 - **Lifetime is the view's.** L1 hit pointers are pinned by one batch
-  `EpochGuard` held inside the `MultiView`; entities read from L2/L3 that L1 does
-  not keep (all of them without L1) are moved into the view. Either way, every
+  `EpochGuard` held inside the `MultiView`; entities read from the database that
+  L1 does not keep (all of them without L1) are moved into the view. Either way, every
   pointer stays dereferenceable for as long as the view is alive — and must not
   outlive it.
-- **Detached L2 warming.** On `Redis` and `Both`, L3 hits that missed L2 are
-  written back to Redis fire-and-forget; the view returns without waiting for
-  the fill.
 - **Fast paths.** Empty `ids` → empty view, no guard, no I/O, no coroutine
   frame. All ids hitting L1 → synchronous resolution with no coroutine frame
   (still allocates the dedup and view buffers — the batch wins on misses, not on

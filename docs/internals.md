@@ -14,19 +14,18 @@ This document describes the internal architecture of relais for contributors and
 1. [Repository Mixin Chain](#repository-mixin-chain) — method-hiding tower, `CacheLayerSelector`/`MixinStack`, conditional layer selection
 2. [Configuration System — CacheConfig NTTP](#configuration-system--cacheconfig-nttp) — compile-time config plumbing
 3. [L1 Cache: CacheTier](#l1-cache-cachetier) — RAM tier over ChunkMap: by-value storage, singleton, TTL, cleanup
-4. [L2 Cache: Redis Integration](#l2-cache-redis-integration) — key format, TTL refresh
-5. [Cache Flow on Operations](#cache-flow-on-operations) — read/delete/write paths across tiers
-6. [ListMixin — Automatic List Caching](#listmixin--automatic-list-caching) — detection, descriptor augmentation, interception
-7. [InvalidationMixin — Cross-Repository Invalidation](#invalidationmixin--cross-repository-invalidation) — the four mechanisms, propagation
-8. [List Cache Architecture](#list-cache-architecture) — `ListCache`, sort bounds, Lua selective invalidation
-9. [Modification Tracking](#modification-tracking) — `ModificationTracker`: generation + chunk-bitmap drain, validation
-10. [Entity Concept Hierarchy](#entity-concept-hierarchy) — concepts and serialization capabilities
-11. [Partial Field Updates (`patch`)](#partial-field-updates-patch) — `FieldUpdate`, cross-tier patch flow
-12. [Partition Key Repositories](#partition-key-repositories) — composite-key auto-detection
-13. [Namespace Organization](#namespace-organization) — directory and namespace map
-14. [Thread Safety](#thread-safety) — per-component guarantees
-15. [Performance Considerations](#performance-considerations) — warmup, contention, lazy validation
-16. [Entity Mapping Generator](#entity-mapping-generator) — `generate_entities.py` internals
+4. [Cache Flow on Operations](#cache-flow-on-operations) — read/delete/write paths
+5. [ListMixin — Automatic List Caching](#listmixin--automatic-list-caching) — detection, descriptor augmentation, interception
+6. [InvalidationMixin — Cross-Repository Invalidation](#invalidationmixin--cross-repository-invalidation) — the four mechanisms, propagation
+7. [List Cache Architecture](#list-cache-architecture) — `ListCache`, sort bounds
+8. [Modification Tracking](#modification-tracking) — `ModificationTracker`: generation + chunk-bitmap drain, validation
+9. [Entity Concept Hierarchy](#entity-concept-hierarchy) — concepts and serialization capabilities
+10. [Partial Field Updates (`patch`)](#partial-field-updates-patch) — `FieldUpdate`, patch flow
+11. [Partition Key Repositories](#partition-key-repositories) — composite-key auto-detection
+12. [Namespace Organization](#namespace-organization) — directory and namespace map
+13. [Thread Safety](#thread-safety) — per-component guarantees
+14. [Performance Considerations](#performance-considerations) — warmup, contention, lazy validation
+15. [Entity Mapping Generator](#entity-mapping-generator) — `generate_entities.py` internals
 
 ## Repository Mixin Chain
 
@@ -35,11 +34,7 @@ The library uses a **mixin architecture with method hiding** for compile-time co
 ```
 PgRepo<E, Name, Cfg, Key>
        |
-       |  (adds Redis caching — if L2 or L1_L2)
-       v
-RedisRepo<E, Name, Cfg, Key>
-       |
-       |  (adds RAM caching — if L1 or L1_L2)
+       |  (adds RAM caching — if L1)
        v
 LocalRepo<E, Name, Cfg, Key>
        |
@@ -57,7 +52,7 @@ Repo<E, Name, Cfg, Invalidations...>  (final class)
 
 ### Template Parameters
 
-The three **cache layers** (`PgRepo`, `RedisRepo`, `LocalRepo`) share four
+The two **cache layers** (`PgRepo`, `LocalRepo`) share four
 template parameters:
 
 ```cpp
@@ -65,7 +60,7 @@ template<typename E, config::FixedString Name, config::CacheConfig Cfg, typename
 ```
 
 - **E**: the `Entity<Struct, Mapping>` type
-- **Name**: `FixedString` NTTP — compile-time string literal for the repository name and Redis key prefix
+- **Name**: `FixedString` NTTP — compile-time string literal for the repository name
 - **Cfg**: `CacheConfig` NTTP — structural aggregate (all fields are public structural types)
 - **Key**: auto-deduced from `decltype(std::declval<const E>().key())`
 
@@ -109,13 +104,9 @@ namespace detail {
 template<typename E, config::FixedString Name, config::CacheConfig Cfg, typename Key>
 struct CacheLayerSelector {
     using type = std::conditional_t<
-        Cfg.cache_level == config::CacheLevel::L1 || Cfg.cache_level == config::CacheLevel::L1_L2,
+        Cfg.cache_level == config::CacheLevel::L1,
         LocalRepo<E, Name, Cfg, Key>,
-        std::conditional_t<
-            Cfg.cache_level == config::CacheLevel::L2,
-            RedisRepo<E, Name, Cfg, Key>,
-            PgRepo<E, Name, Cfg, Key>
-        >
+        PgRepo<E, Name, Cfg, Key>
     >;
 };
 
@@ -144,10 +135,10 @@ struct MixinStack {
 The `Repo<>` class inherits from `MixinStack::type` and adds:
 - Compile-time `static_assert` validation: `ReadableEntity<E>` always;
   `CacheableEntity<E>` when `cache_level != None`; `l1_chunk_count_log2 >= 1` for
-  L1 configs; `l2_ttl > 0` for L2 configs.
+  L1 configs.
 - Convenience methods (`updateJson`, `updateBinary`) and the predicate
   where-variants (`eraseWhere`/`invalidateWhere`, gated by `HasFilterSet<E>` — see
-  [§10](#entity-concept-hierarchy)/[§16](#entity-mapping-generator)).
+  [§9](#entity-concept-hierarchy)/[§15](#entity-mapping-generator)).
 - Re-export of base type aliases: `EntityType`, `KeyType`, `WrapperType` (= `E`,
   defined in `PgRepo`), `FindResultType` (note: not `MappingType` — that lives on
   `Entity`; the `ListWrapper<E>` type is a separate `ListWrapperType` on `ListMixin`,
@@ -158,22 +149,7 @@ The `Repo<>` class inherits from `MixinStack::type` and adds:
 | `Cfg.cache_level` | Selected Base |
 |--------------------|---------------|
 | `CacheLevel::None` | `PgRepo` |
-| `CacheLevel::L2` | `RedisRepo` |
 | `CacheLevel::L1` | `LocalRepo` (inherits `PgRepo`) |
-| `CacheLevel::L1_L2` | `LocalRepo` (inherits `RedisRepo`) |
-
-### Conditional Inheritance in LocalRepo
-
-`LocalRepo` uses `std::conditional_t` to choose its base class at compile time:
-
-```cpp
-template<typename E, config::FixedString Name, config::CacheConfig Cfg, typename Key>
-class LocalRepo : public std::conditional_t<
-    Cfg.cache_level == config::CacheLevel::L1,
-    PgRepo<E, Name, Cfg, Key>,      // L1-only: skip Redis
-    RedisRepo<E, Name, Cfg, Key>       // L1_L2: include Redis layer
-> { ... };
-```
 
 ## Configuration System — CacheConfig NTTP
 
@@ -181,8 +157,7 @@ All configuration lives in a single structural aggregate, `CacheConfig`, passed 
 
 ```cpp
 // config/CacheConfig.h
-enum class CacheLevel { None, L1, L2, L1_L2 };
-enum class L2Format   { Binary, Json };      // BEVE (default) or JSON in Redis
+enum class CacheLevel { None, L1 };
 enum class UpdateStrategy { InvalidateAndLazyReload, PopulateImmediately };
 
 struct CacheConfig {
@@ -198,22 +173,11 @@ struct CacheConfig {
     // Scales with WRITE concurrency, not key count. 2^12 = 4096 slots = 32 KB/repo.
     uint8_t  recheck_slots_log2 = 12;
 
-    // L2 (Redis cache)
-    Duration l2_ttl = 4h;
-    bool     l2_refresh_on_get = false;
-    L2Format l2_format = L2Format::Binary;
-
-    // Cross-instance L2 coherence — a deployment FACT (is this Redis shared by
-    // more than one process?), not a behavior knob. See "L2 cross-instance gen".
-    bool     l2_shared_across_instances = false;
-
     // Fluent chaining (consteval — compile-time only), one with_* per field:
     consteval CacheConfig with_l1_ttl(Duration v) const { auto c = *this; c.l1_ttl = v; return c; }
     consteval CacheConfig with_read_only(bool v = true) const { auto c = *this; c.read_only = v; return c; }
-    consteval CacheConfig with_l2_format(L2Format v) const { auto c = *this; c.l2_format = v; return c; }
     // ... with_cache_level / with_update_strategy / with_l1_chunk_count_log2 /
-    //     with_recheck_slots_log2 / with_l2_ttl / with_l2_refresh_on_get /
-    //     with_l2_shared_across_instances
+    //     with_recheck_slots_log2
 
     constexpr auto operator<=>(const CacheConfig&) const = default;
 };
@@ -225,19 +189,13 @@ struct CacheConfig {
 
 **`FixedString`:** lets string literals be template arguments. `FixedString<N>` stores `char[N]` and is implicitly convertible to `const char*`.
 
-**Two subsystems worth naming** (both gated entirely by config, zero cost when off):
-
-- **`recheck_slots_log2`** sizes the read-fill recheck guard — a sharded generation counter that rejects a cache fill if a mutation landed during the fetch (pessimistic miss, never stale).
-- **`l2_shared_across_instances`** switches L2 coherence authority: `false` (default) uses the cheap process-local recheck; `true` moves the generation authority into Redis (a sharded gen hash, `HINCRBY` on invalidation, conditional set at fill) so a fill straddling *any* instance's invalidation is rejected — adds one `HGET` at miss + one `EVAL` at fill (cold path only; an L2 hit stays a plain `GET`).
+**`recheck_slots_log2`** sizes the read-fill recheck guard — a sharded generation counter that rejects a cache fill if a mutation landed during the fetch (pessimistic miss, never stale). It is process-local: it does not see another instance's writes.
 
 **Presets:**
 
 ```cpp
 inline constexpr CacheConfig Uncached{};                                   // CacheLevel::None
 inline constexpr CacheConfig Local{ .cache_level = CacheLevel::L1 };
-inline constexpr CacheConfig Redis{ .cache_level = CacheLevel::L2, .l2_ttl = 4h };
-inline constexpr CacheConfig Both{  .cache_level = CacheLevel::L1_L2,
-                                    .l1_ttl = 1min, .l2_ttl = 1h };
 ```
 
 **Composable:** `config::Local.with_l1_ttl(30min).with_read_only()`
@@ -307,7 +265,7 @@ registry).
 ### Read and TTL validation
 
 `find()` probes the tier; a hit becomes a `CacheView<E>` with no copy, a miss
-falls to `findSlow()` (L2 → DB via `CacheTier::findOrFetch`, with inflight dedup
+falls to `findSlow()` (DB via `CacheTier::findOrFetch`, with inflight dedup
 and the read-fill recheck guard):
 
 ```cpp
@@ -336,72 +294,6 @@ tier walks one chunk at a time, evicting expired entries (and, when GDSF is on,
 low-score entries against a byte target) so a sweep never holds a chunk locked
 longer than that chunk.
 
-## L2 Cache: Redis Integration
-
-All Redis operations go through **`PgProvider::redis(cmd, args...)`** — a variadic,
-type-erased command interface (with `redisDynamic` for runtime-sized arg lists).
-`cache::RedisCache` builds on it and never names `io::RedisClient` directly.
-
-### Key Format
-
-`makeRedisKey` (`RedisRepo.h`) prefixes the repo `name()` and dispatches on the
-key type:
-
-```cpp
-static std::string makeRedisKey(const Key& id) {
-    if constexpr (is_tuple_v<Key>) {          // composite/partition key
-        std::string key(name());
-        std::apply([&](const auto&... p) { ((key += ":" + keyPartToString(p)), ...); }, id);
-        return key;
-    } else if constexpr (std::is_integral_v<Key>)
-        return std::string(name()) + ":" + std::to_string(id);   // e.g. "User:123"
-    else
-        return std::string(name()) + ":" + std::string(id);      // string key
-}
-```
-
-### TTL Refresh with GETEX
-
-When `Cfg.l2_refresh_on_get = true`, the read path uses `getRawEx`, which issues a
-Redis 6.2+ `GETEX` to fetch and slide the TTL in one round-trip:
-
-```cpp
-// RedisCache::getRawEx
-co_await PgProvider::redis("GETEX", key, "EX", ttl_seconds);
-```
-
-(The multi-key read has no native counterpart — `mgetRawEx` fans out N `GETEX`
-as gathered tasks.)
-
-### Cross-instance generation (when `l2_shared_across_instances`)
-
-When the config flags a shared Redis (see [§2](#configuration-system--cacheconfig-nttp)),
-the recheck authority moves into Redis: a write calls `bumpGen(id)` (`HINCRBY` on a
-sharded `{name}:l2gen` hash keyed by `Recheck::slotOf(id)`), a miss reads the gen,
-and the fill is a conditional script that rejects a write straddling any instance's
-invalidation. With the default (`false`), `bumpGen` is a process-local counter — no
-extra Redis ops.
-
-### Lua scripts
-
-Every script lives in `cache/RedisScripts.h` (`cache::scripts`), each preceded by
-its contract (KEYS, ARGV, return value):
-
-- **`io::RedisScript`** pairs the body with its SHA1, computed at compile time.
-  The list invalidation scripts are concatenated at compile time from shared
-  fragments (`LuaConcat`): the page header decoding and the filter matching are
-  written once.
-- **`kAllScripts`** lists them all. A test sends each one to the server with
-  `SCRIPT LOAD` and checks the digest; a new script added to the registry is
-  covered without a new test.
-- **`RedisCache::evalScript`** is the only way to run one: `EVALSHA`, and on
-  `io::RedisNoScriptError` the same call once more as `EVAL`, which reloads the
-  script. The caller resumes after the fallback, so awaited orderings hold. The
-  `no_raw_eval` CTest rejects a raw `EVAL`/`EVALSHA` in any other header.
-- **A script runs alone but is not rolled back** when a command fails halfway.
-  Order its writes so a partial run leaves nothing an invalidation cannot reach:
-  `kListStore` writes the page last, after tracking it.
-
 ## Cache Flow on Operations
 
 ### Read: `find(id)`
@@ -410,10 +302,7 @@ its contract (KEYS, ARGV, return value):
 L1 Cache Hit? --yes--> Return CacheView (epoch-guarded borrow, no copy)
       |no
       v
-L2 Cache Hit? --yes--> Deserialize --> Store in L1 --> Return CacheView
-      |no
-      v
-Database Query --> Store in L2 --> Store in L1 --> Return CacheView
+Database Query --> Store in L1 (read-fill recheck) --> Return CacheView
 ```
 
 ### Delete: `erase(id)`
@@ -423,16 +312,12 @@ in cache) down the chain so a partition-pruned `DELETE` is possible without an
 extra read. The hint is taken **only for partition entities** (`HasPartitionHint<E>`)
 and is an **owned copy** (`std::optional<E> local_hint` filled from the L1 hit),
 not a borrow into the live slot. The real method is `eraseOutcome(id, hint)` at
-each layer (L2-before-L1 eviction order, matching `eraseMany`):
+each layer:
 
 ```
-LocalRepo::erase(id)
+LocalRepo::eraseOutcome(id, hint)
     |-- if constexpr (HasPartitionHint<E>):   // skipped entirely otherwise
     |     local_hint.emplace(*tier().find(id)) // copy out of L1 (~0ns), hint = &local_hint
-    v
-RedisRepo::eraseOutcome(id, hint)
-    |-- outcome = co_await Base::eraseOutcome(id, hint)
-    |-- bumpGen(id); evictRedis(id)          // L2 evicted here
     v
 PgRepo::eraseOutcome(id, hint)
     |-- if constexpr (HasPartitionHint<E>) && hint:
@@ -441,22 +326,16 @@ PgRepo::eraseOutcome(id, hint)
     |   else:
     |     SQL::delete_by_pk                   // PK only -> scans N partitions
     |
-    (back in LocalRepo::erase: evict L1 last)
+    (back in LocalRepo: evict L1 after the commit;
+     on PgUncertainError: evict L1 by precaution, then rethrow)
 ```
 
-So the order is **DB delete → L2 UNLINK → L1 evict** (L2 still before L1, matching
-`eraseMany`): the DB delete runs in `PgRepo` (innermost), then `RedisRepo` UNLINKs
-L2, then control returns to `LocalRepo` which evicts L1 last. The reason for
-L1-last is the **phantom-resurrection invariant**, not hint lifetime (the hint is
-an owned copy that outlives the slot regardless). Were L1 evicted *before* L2, a
-racing L1-miss could read the not-yet-UNLINKed L2 row (a deleted phantom) and
-re-store it into the shared L1 — a persistent phantom nothing re-evicts. Clearing
-L2 first removes that source: a racing reader can at worst L1-hit the
-not-yet-evicted entry (bounded-stale, self-heals at the L1 evict below). (`bumpGen` here is the recheck bump — process-local by default,
-`HINCRBY` only when `l2_shared_across_instances`; see [§2](#configuration-system--cacheconfig-nttp).)
+So the order is **DB delete → L1 evict**. A reader racing the delete can at worst
+L1-hit the not-yet-evicted entry; the read-fill recheck rejects a fill fetched
+before the eviction.
 
 **Performance rule**: never add a DB round-trip just for partition pruning. Use the
-partition hint only when the entity is free (L1) or near-free (L2 ~0.1ms).
+partition hint only when the entity is already in L1.
 
 ### Write: `update(id, entity)`
 
@@ -464,21 +343,22 @@ Both strategies (controlled by `Cfg.update_strategy`) share the same shape; only
 the cache step differs:
 
 ```
-Fetch old entity (for cross-invalidation)
+UPDATE … RETURNING   (prior + committed rows, when lists or cross-inval need them)
       |
       v
-Database Update --> {Invalidate | Write} L2 --> {Invalidate | Write} L1
-      |              (RedisRepo, inner)          (LocalRepo, outer — runs last)
-      v                  ^ InvalidateAndLazyReload (safe, default)
-                         ^ PopulateImmediately      (optimistic write-through)
-Propagate cross-invalidations with old/new data
+{Invalidate | Write} L1     (LocalRepo)
+      ^ InvalidateAndLazyReload (safe, default)
+      ^ PopulateImmediately      (optimistic write-through)
+      |
+      v
+Lists + cross-invalidation from the prior/committed rows
 ```
 
 ### Write: `upsert(entity)`
 
 `INSERT … ON CONFLICT (pk) DO UPDATE SET …=EXCLUDED.… RETURNING *` in one
 statement. Unlike `update`, the committed `RETURNING` row is **stored through**
-every tier unconditionally (it is authoritative), so there is no `UpdateStrategy`
+L1 unconditionally (it is authoritative), so there is no `UpdateStrategy`
 branch:
 
 ```
@@ -487,12 +367,11 @@ Fetch old entity (pre-image; only if lists/cross-inval in the chain)
       v
 INSERT … ON CONFLICT DO UPDATE … RETURNING
       |
-      +-- success ------> store-through L2 (bumpGen + SET)
-      |                    store-through L1 (onMutation + bumpGeneration + storeAndView)
+      +-- success ------> store-through L1 (onMutation + bumpGeneration + storeAndView)
       |                    lists: old ? onEntityUpdated(old,new) : onEntityCreated(new)
       |                    cross: old ? propagateUpdate(old,new)  : propagateCreate(new)
       |
-      +-- uncertain ----> evict L2, evict L1, invalidate lists from old∪input,
+      +-- uncertain ----> evict L1, invalidate lists from old∪input,
       |   (PgUncertainError) propagate from old/input, then rethrow   (the update model)
       |
       +-- deterministic error --> empty view, nothing cached
@@ -595,9 +474,8 @@ down, just before its precautionary evict. An uncertain `update` keys the old
 position on that copy and the new one on its input; an uncertain `patch` knows only
 the old position and invalidates it as for a deletion. `upsert` keeps a
 best-effort pre-read (`findOldBestEffort`): an absent row cannot be locked, so the
-statement cannot tell create from update. `update` then splits the notification: `onEntityUpdated` for the L1 list tier,
-`invalidateL2Updated` for the L2 list tier. Either way the `ModificationTracker`
-records the change at the current generation; list pages are validated lazily on
+statement cannot tell create from update. `onEntityUpdated` then has the
+`ModificationTracker` record the change at the current generation; list pages are validated lazily on
 the next `getByKey` against that generation (validation lives in
 `ListCache::getByKey`, not a cache callback).
 
@@ -624,10 +502,7 @@ bounds.first_value = extractSortValue<Descriptor>(entities.front(), sort.field);
 bounds.last_value  = extractSortValue<Descriptor>(entities.back(), sort.field);
 ```
 
-The page is then stored in L1, and in L2 by a detached `kListStore` (master hash,
-tracking set, page, in one script): the read does not wait for Redis. Lists have
-no L2 generation guard, unlike entities: an invalidation that runs between the
-PostgreSQL read and this store leaves a stale page in L2 until `l2_ttl`.
+The page is then stored in L1.
 
 ## InvalidationMixin — Cross-Repository Invalidation
 
@@ -645,21 +520,24 @@ class InvalidationMixin : public Base {
 
 ### Interception Pattern
 
-Each CRUD method fetches the old entity (for propagation data), delegates to `Base`, then propagates:
+Each CRUD method delegates to `Base` through its `*Outcome<true>` variant, which
+returns the rows the statement replaced or deleted, then propagates from them
+(simplified — the uncertain path propagates from the L1 copy and rethrows):
 
 ```cpp
-static io::Task<bool> update(const Key& id, const Entity& entity) {
-    std::optional<Entity> old;
-    if (auto v = co_await Base::find(id); v) old.emplace(*v);  // cache-aware
-    bool ok = co_await Base::update(id, entity);
-    if (ok) co_await propagateUpdate<Entity, InvList>(old ? &*old : nullptr, entity);
-    co_return ok;
+static io::Task<std::optional<size_t>> update(const Key& id, const Entity& entity) {
+    std::optional<Entity> uncertain_before;
+    auto outcome = co_await Base::template updateOutcome<true>(id, entity, &uncertain_before);
+    if (outcome.after)
+        co_await propagateUpdate<Entity, InvList>(
+            outcome.before ? &*outcome.before : nullptr, *outcome.after);
+    co_return outcome.affected;
 }
 ```
 
 `propagateUpdate` lives in root `jcailloux::relais` and takes the old entity as a
-`const Entity*` (null when the row was absent). `Base::find()` resolves through the
-full cache chain (L1 -> L2 -> DB), so the old-entity lookup is typically a cache hit.
+`const Entity*` (null when the row was absent). `upsert` and `invalidate` keep a
+best-effort read (`findOldBestEffort`) through the cache chain.
 
 ### Four Invalidation Mechanisms
 
@@ -703,16 +581,14 @@ C modified -> InvalidateVia resolves c_id -> [a_id]
 
 ### Selective List Invalidation: `InvalidateListVia`
 
-For fine-grained Lua-based list page invalidation:
-
 ```
 Source entity modified
   -> extractKey(entity) -> source_key
-  -> co_await Resolver(source_key) -> [{group_key, sort_val}, ...]
-  -> co_await ListRepo::invalidateListGroupByKey(group_key, sort_val)
+  -> co_await Resolver(source_key) -> optional<[{filters, sort_value}, ...]>
+  -> per target: co_await ListRepo::invalidateByTarget(filters, sort_value)  // user-defined
+  -> nullopt:    co_await ListRepo::invalidateAllListGroups()   // one empty-predicate
+                                                                // RangeModification, O(1)
 ```
-
-Each `invalidateListGroupByKey` executes a Lua script that reads the 19-byte binary header of each cached page (via `GETRANGE 0 18`) to check if the sort value falls within the page's bounds.
 
 ## List Cache Architecture
 
@@ -720,7 +596,7 @@ Each `invalidateListGroupByKey` executes a Lua script that reads the 19-byte bin
 
 ```
 list/                            # namespace jcailloux::relais::list
-├── ListCache.h              # Core cache, SortBounds, PaginationMode, ListBoundsHeader
+├── ListCache.h              # Core cache, SortBounds
 ├── ListCacheTraits.h        # Traits concepts for filter/sort
 ├── ListQuery.h              # Query and result types
 ├── ListWrapper.h            # ListWrapper<Item> result wrapper
@@ -792,7 +668,7 @@ ResultView getByKey(const std::string& key) {
 ```
 
 Validation short-circuits cheaply when nothing changed since the page was cached —
-see [§9](#modification-tracking). There is no per-get counter or `GetAction`
+see [§8](#modification-tracking). There is no per-get counter or `GetAction`
 callback; cleanup is the per-chunk `GDSFPolicy` sweep (via `ListCache::sweep` →
 `drainChunk`) draining chunk bitmaps.
 
@@ -821,78 +697,6 @@ Range checking rules by page type:
 | Middle page | `first <= value <= last` | `last <= value <= first` |
 | Last page (incomplete) | `value >= first` | `value <= first` |
 
-### ListBoundsHeader — Redis L2 Binary Header
-
-For Redis L2 list caching, each cached page value is prefixed with a 19-byte binary header. This enables atomic Lua-based selective invalidation: the Lua script reads headers via `GETRANGE` without deserializing the full payload.
-
-**Format (19 bytes):**
-
-| Offset | Size | Field |
-|--------|------|-------|
-| 0 | 2 | Magic bytes: `0x53 0x52` ("SR" = Relais) |
-| 2 | 8 | `first_value` (int64_t, little-endian) |
-| 10 | 8 | `last_value` (int64_t, little-endian) |
-| 18 | 1 | Flags byte (see below) |
-
-**Flags byte:**
-
-| Bit | Meaning |
-|-----|---------|
-| 0 | `sort_direction` (0=ASC, 1=DESC) |
-| 1 | `is_first_page` |
-| 2 | `is_incomplete` (fewer items than limit) |
-| 3 | `pagination_mode` (0=Offset, 1=Cursor) |
-| 4-7 | Reserved |
-
-**Backward compatibility:** If the first 2 bytes != `0x53 0x52`, the value is treated as old format (no header) and always invalidated conservatively.
-
-### Lua-Based Selective Invalidation
-
-Two Lua scripts execute atomically within Redis (~100-200us for 10 pages):
-
-**Insert/Delete script** (`invalidateListGroupSelective`):
-```
-SMEMBERS {groupKey}:_keys  -> [page_key_1, page_key_2, ...]
-For each page_key:
-  GETRANGE page_key 0 18   -> 19-byte header
-  Decode header, check if entity_sort_val is in range
-  If affected: DEL page_key, SREM from tracking set
-Return count of deleted pages
-```
-
-**Update script** (`invalidateListGroupSelectiveUpdate`):
-```
-Same as above, but checks interval overlap:
-  [page_min, page_max] intersect [min(old,new), max(old,new)]
-  For offset mode: cascade from affected segment
-  For cursor mode: localized check
-```
-
-**Invalidation modes by pagination:**
-
-| Mode | Insert/Delete                    | Update |
-|------|------------------------------------|--------|
-| Offset | Affected segment + all after (cascade) | Interval overlap `[min(old,new), max(old,new)]` |
-| Cursor | Only affected segment(s) (localized) | Only affected segment(s) |
-
-### List Method Hierarchy
-
-List query methods exist at all repository levels for config-level switching:
-
-| Method | PgRepo | RedisRepo |
-|--------|---------------|-----------------|
-| `cachedList(query, keyParts...)` | Pass-through (executes query) | Redis-cached |
-| `cachedListTracked(query, limit, offset, groupParts...)` | Pass-through | Redis-cached + tracked |
-| `cachedListTrackedWithHeader(query, limit, offset, headerBuilder, groupParts...)` | Pass-through | Redis-cached + tracked + header |
-| `cachedListAs<ListEntity>(query, keyParts...)` | Pass-through | Redis-cached (binary) |
-| `invalidateListGroup(groupParts...)` | No-op (returns 0) | Full group invalidation |
-| `invalidateListGroupSelective(sortVal, groupParts...)` | No-op (returns 0) | Lua selective invalidation |
-| `invalidateListGroupSelectiveUpdate(oldVal, newVal, groupParts...)` | No-op (returns 0) | Lua selective invalidation |
-| `makeGroupKey(groupParts...)` | Key generation | Key generation |
-| `invalidateListGroupByKey(groupKey, sortVal)` | No-op (returns 0) | Lua selective invalidation |
-
-This ensures switching `Cfg.cache_level` from `L2` to `None` doesn't break compilation.
-
 ### Sort Value Encoding Limitation
 
 Sort values are encoded as `int64_t` via `toInt64ForCursor()`. It has exactly
@@ -907,8 +711,7 @@ bounds range checks. Sort fields must be an integral or enum type (store
 timestamps as an integral epoch column, not a string).
 
 The same `int64_t` cursor encoding constrains the **primary key**: every key
-component is written into the cursor and reparsed Redis-side during selective
-page invalidation. `extractKeyComponents()` therefore `static_assert`s that each
+component is written into the cursor. `extractKeyComponents()` therefore `static_assert`s that each
 component is integral (`"list keyset pagination requires an integer primary
 key"`), so a string PK is a compile error rather than a `0` fallback — an entity
 with a non-integral PK cannot carry a cached list at all.
@@ -1039,7 +842,7 @@ Composed concepts used in repository `requires` clauses:
 | Concept | Definition | Used by |
 |---------|------------|---------|
 | `ReadableEntity<E>` | `Readable` (provides `fromRow`) | `PgRepo` |
-| `CacheableEntity<E>` | `Readable + Serializable` | `RedisRepo`, `LocalRepo` |
+| `CacheableEntity<E>` | `Readable + Serializable` | `LocalRepo` |
 | `MutableEntity<E>` | `Readable + Writable` (provides `toInsertParams`) | `insert()`, `update()` |
 | `CreatableEntity<E, K>` | `Mutable + Keyed` | `insert()` with cache population |
 
@@ -1049,11 +852,11 @@ Detection concepts in the same header gate the optional features:
 partition pruning).
 
 `HasFilterSet<E>` gates the where-variants. Mind three same-named things: the
-generated **struct** `Mapping::FilterSet` (the predicate spec, [§16](#entity-mapping-generator))
+generated **struct** `Mapping::FilterSet` (the predicate spec, [§15](#entity-mapping-generator))
 exposes a member type **`::Values`** (the designated-init aggregate); the user-facing
 **alias `FilterSet<E>`** = `E::MappingType::FilterSet::Values`. The `ModificationTracker`'s
 `RangePayload` is instantiated to this `FilterSet` (a predicate stands in for an
-`eraseWhere` delete set — [§9](#modification-tracking)).
+`eraseWhere` delete set — [§8](#modification-tracking)).
 
 ### Serialization Capabilities (`entity/SerializationTraits.h`)
 
@@ -1074,8 +877,8 @@ concept HasBinarySerialization = requires(const E& e, std::span<const uint8_t> d
 };
 ```
 
-The L2 path picks its format from `Cfg.l2_format` (`Binary` default, or `Json`),
-both backed by Glaze — see [§4](#l2-cache-redis-integration).
+Both are backed by Glaze; `Repo::findJson()`/`findBinary()` and the list
+`queryJson`/`queryBinary` use them on the cached value.
 
 ### Entity<Struct, Mapping>
 
@@ -1105,8 +908,8 @@ class Entity : public Struct {
 - **No serialization caches.** The class comment is explicit: *"No serialization
   caches — copies/moves are trivial (Struct-only)."* There is no `std::call_once`,
   no cached `shared_ptr`, no `releaseCaches()`. `binary()`/`json()` re-serialize on
-  every call. For *cached* serialization, use `Repo::findJson()` / `findBinary()`,
-  which serve the bytes off L1/L2.
+  every call. `Repo::findJson()` / `findBinary()` serialize the entity held in L1 on
+  each hit; the bytes are not cached.
 - `Entity` does **not** conditionally expose `makePartitionHintParams` or `ListDescriptor`
   — those live on the `Mapping`; the repository detects them there via concepts.
 
@@ -1186,20 +989,16 @@ template<auto F> auto setNull();          // Returns FieldSetNull<F>
 }
 ```
 
-### patch Flow Across Tiers
+### patch Flow
 
-The public `patch` delegates down via **`patchRaw`** (the cache layers hide the raw
-form, not `patch` itself):
+The public `patch` goes down through **`patchRow`** (`LocalRepo`) to **`patchRaw`**
+(`PgRepo`):
 
 ```
-LocalRepo::patch(id, set<F>(v)...)
-    |-- onMutation(id); bumpGeneration(id); tier().evict(id)  // evict L1 before the UPDATE
-    |-- entity = co_await Base::patchRaw(id, updates...)
-    |-- storeAndView(id, *entity)            // re-store the fresh RETURNING row in L1
-    v
-RedisRepo::patchRaw(id, updates...)
-    |-- bumpGen(id); evictRedis(id)          // evict L2 before the UPDATE
-    |-- co_return co_await Base::patchRaw(id, updates...)
+LocalRepo::patchRow(id, set<F>(v)...)
+    |-- patched = co_await Base::patchRaw(id, updates...)  // L1 untouched until the commit
+    |-- settlePatched(id, *patched)          // store the committed RETURNING row in L1
+    |-- on PgUncertainError: evict L1, rethrow
     v
 PgRepo::patchRaw(id, updates...)
     |-- sql = buildUpdateReturning(table, pk, {set-cols...}, SQL::returning_columns)
@@ -1211,7 +1010,7 @@ PgRepo::patchRaw(id, updates...)
 The `RETURNING` list is `SQL::returning_columns` (the generated column set), not
 `RETURNING *`, and the statement goes through the **write batch** (`queryWrite`).
 When `ListMixin`/`InvalidationMixin` are active they intercept `patch` (via
-`patchWithContext`) to additionally notify the list cache and/or propagate
+`patchRow`) to additionally notify the list cache and/or propagate
 cross-invalidation.
 
 ## Partition Key Repositories
@@ -1232,13 +1031,13 @@ when `@relais partition_key` is used.
 | `find` | `SELECT ... WHERE id = $1` | Same (id is unique across partitions) |
 | `update` | `UPDATE ... WHERE id = $1` | Same |
 | `patch` | `UPDATE ... SET cols WHERE id = $N RETURNING <cols>` | Same |
-| `erase` | `SQL::delete_by_pk` (scans N partitions) | Opportunistic: `SQL::delete_with_partition` (`makePartitionHintParams`, 1 partition) if a hint is in L1/L2, else `delete_by_pk` |
+| `erase` | `SQL::delete_by_pk` (scans N partitions) | Opportunistic: `SQL::delete_with_partition` (`makePartitionHintParams`, 1 partition) if the row is in L1, else `delete_by_pk` |
 | `insert` | Standard | Standard |
 
 ## Namespace Organization
 
 ```
-jcailloux::relais::                     # Repo, PgRepo, RedisRepo, LocalRepo, ListMixin,
+jcailloux::relais::                     # Repo, PgRepo, LocalRepo, ListMixin,
                                         # InvalidationMixin, Entity<Struct, Mapping>;
                                         # Invalidate, InvalidateList, InvalidateVia,
                                         # InvalidateListVia, InvalidateOn, ListInvalidationTarget,
@@ -1247,14 +1046,14 @@ jcailloux::relais::config::             # CacheConfig, CacheLevel, UpdateStrateg
                                         # Duration, FixedString, presets
 jcailloux::relais::entity::             # FieldUpdate, heapCapacity()
 jcailloux::relais::cache::              # CacheTier, CacheView, MultiView, ChunkMap, CacheMetadata,
-                                        # TaggedEntry, GDSFPolicy, RedisCache, Metrics
+                                        # TaggedEntry, GDSFPolicy, Metrics
 jcailloux::relais::list::               # ListCache, ListWrapper, ListQuery, ModificationTracker,
-                                        # SortBounds, ListBoundsHeader, PaginationMode, Cursor
+                                        # SortBounds, Cursor
 jcailloux::relais::list::spec::         # Filter, Sort, ListDescriptor, FilterDescriptor,
                                         # SortDescriptor, HttpQueryParser, ParseUtils
 jcailloux::relais::runtime::            # CachedClock
 jcailloux::relais::io::                 # Task, PgPool, PgClient, PgResult, PgParams,
-                                        # RedisClient, RedisResult, IoContext
+                                        # IoContext
 ```
 
 ### Entity Headers (`entity/`)
@@ -1273,7 +1072,6 @@ entity/
 
 - **Entity serialization**: stateless — `json()`/`binary()` re-serialize on demand, no shared cache to guard.
 - **L1 Entity Cache**: `CacheTier` over a sharded ChunkMap, epoch-guarded reads (a `CacheView` borrows a slot under an `EpochGuard`).
-- **L2 Cache**: `RedisPool` of N `RedisClient`s (default 4), round-robin; each client serializes its own commands via a coroutine-mutex (pipelining per connection) — not a single connection.
 - **ListCache**: `CacheTier` + the generation/atomic-counter `ModificationTracker`.
 - **ModificationTracker**: `std::shared_mutex`-protected vectors + atomic `latest_generation_`; bitmaps mutated via `std::atomic_ref`.
 

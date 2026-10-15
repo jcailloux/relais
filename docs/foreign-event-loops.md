@@ -1,8 +1,8 @@
 # Writing an `IoContext` adapter (running relais on a foreign event loop)
 
 relais is generic over the [`IoContext`](../include/jcailloux/relais/io/IoContext.h)
-concept. `EpollIoContext` is the bundled implementation, but `PgPool<Io>`,
-`RedisPool<Io>` and the coroutine awaiter machinery accept **any** type that
+concept. `EpollIoContext` is the bundled implementation, but `PgPool<Io>`
+and the coroutine awaiter machinery accept **any** type that
 satisfies the concept. This lets you run relais **inline on another framework's
 event loop** instead of bridging across threads.
 
@@ -20,11 +20,11 @@ asio, libuv, seastar…), construct the relais pools **on those same loops**:
 - an **L1 cache hit** is then a pure in-process `ChunkMap` lookup (~50 ns, zero
   thread hops, zero syscalls — L1 is a process-global sharded cache, not per-loop
   state);
-- only real **L2/L3 misses** do async I/O, inline on the same thread.
+- only real **misses** do async I/O, inline on the same thread.
 
 Bridging from the framework's threads to dedicated relais loops instead costs a
 hop + two syscalls per request, even on an L1 hit. Co-locate unless you can't fit
-one DB/Redis pool per front-end loop within your connection budget.
+one DB pool per front-end loop within your connection budget.
 
 ## Ownership
 
@@ -77,7 +77,7 @@ public:
         using relais::io::IoEvent;
         auto ch = std::make_unique<trantor::Channel>(loop_, fd);
         // trantor splits events by type; relais gets one mono-bit call per type
-        // (PgConnection/RedisConnection test each bit, so that is fine).
+        // (PgConnection tests each bit, so that is fine).
         ch->setReadCallback ([cb] { cb(IoEvent::Read); });
         ch->setWriteCallback([cb] { cb(IoEvent::Write); });
         // EPOLLERR / EPOLLHUP → IoEvent::Error, like EpollIoContext does.
@@ -190,9 +190,8 @@ Two non-obvious pitfalls the harness will catch if you get them wrong:
   `fired == 1` checks (C1, C6) fail. The `queueInLoop(quit)` trick caps it to one
   turn per check.
 
-Once `runAll` passes, construct `PgPool<TrantorIoContext>` /
-`RedisPool<TrantorIoContext>` on each loop and `co_await` relais `Task`s
-directly inside your coroutine handlers — no thread hop.
+Once `runAll` passes, construct `PgPool<TrantorIoContext>` on each loop and
+`co_await` relais `Task`s directly inside your coroutine handlers — no thread hop.
 
 ## Bootstrapping the pools (and scaling to N loops)
 
@@ -246,13 +245,10 @@ runtime for its own `EpollIoContext`; external routers follow the same
 init-per-loop-thread contract shown above.)
 
 > **Wire your timeouts here.** `PgPoolConfig` also carries `acquire_timeout` and
-> `query_timeout` (and `RedisPoolConfig` the Redis `query_timeout`) — a foreign
-> adapter gets the liveness backstop **only if you pass them**, exactly as `IoPool`
-> does for its own loops. They are armed via your `postDelayed`/`cancelTimer`, so a
-> correct timer subsystem (conformance C8/C9/C11) is the prerequisite. For Redis
-> *self-heal* after an outage, build the pool with
-> `RedisPool::fromClients(clients, reconnectFactory)`; with no factory a dead client
-> degrades to L3 instead of rebuilding. See
+> `query_timeout` — a foreign adapter gets the liveness backstop **only if you
+> pass them**, exactly as `IoPool` does for its own loops. They are armed via your
+> `postDelayed`/`cancelTimer`, so a correct timer subsystem (conformance
+> C8/C9/C11) is the prerequisite. See
 > [runtime.md › Liveness & failure semantics](runtime.md#liveness--failure-semantics).
 
 Expose `isInLoopThread()` on your adapter and `PgProvider::init` will assert it
