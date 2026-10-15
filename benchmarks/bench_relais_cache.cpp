@@ -937,7 +937,7 @@ TEST_CASE("Benchmark - production simulation", "[benchmark][production]") {
         }
 
         auto msg = runProductionBench<L1TestItemRepo>(
-            "L1+DB (98R/1E/1I, no Redis)",
+            "L1+DB (98R/1E/1I)",
             ids, NUM_KEYS, CORO_COUNT, io_core);
         WARN(msg);
     }
