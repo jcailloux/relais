@@ -292,3 +292,38 @@ TEST_CASE("eraseWhere invalidates the purged group and prunes the orthogonal one
     // group-blind range invalidation (which would evict B too).
     CHECK(sync(TestArticleListRepo::query(qB))->size() == 2);
 }
+
+// ===========================================================================
+// Full-pattern list invalidation: InvalidateListVia falls back to
+// invalidateAllListGroups when its resolver returns nullopt. The empty
+// predicate is a wildcard on every filter with a full sort range, so ONE range
+// modification invalidates every cached page of every group.
+// ===========================================================================
+
+TEST_CASE("invalidateAllListGroups invalidates every cached L1 page",
+          "[where][fastpath][integration][db][list]") {
+    TransactionGuard tx;
+    TestInternals::resetListCacheState<TestArticleListRepo>();
+
+    auto A = insertTestUser("wall_a", "wall_a@x", 0);
+    auto B = insertTestUser("wall_b", "wall_b@x", 0);
+    insertTestArticle("tech", A, "A1", 10);
+    insertTestArticle("tech", B, "B1", 20);
+
+    auto qA = makeArticleQuery(std::nullopt, A);
+    auto qB = makeArticleQuery(std::nullopt, B);
+    REQUIRE(sync(TestArticleListRepo::query(qA))->size() == 1);  // warm A
+    REQUIRE(sync(TestArticleListRepo::query(qB))->size() == 1);  // warm B
+
+    // Direct L3 inserts into both groups — the cache does not know about them.
+    insertTestArticle("news", A, "A2", 30);
+    insertTestArticle("news", B, "B2", 40);
+    REQUIRE(sync(TestArticleListRepo::query(qA))->size() == 1);  // stale hit
+
+    sync(TestArticleListRepo::invalidateAllListGroups());
+
+    CHECK(TestInternals::pendingRangeCount<TestArticleListRepo>() == 1);
+    CHECK(TestInternals::pendingModificationCount<TestArticleListRepo>() == 0);
+    CHECK(sync(TestArticleListRepo::query(qA))->size() == 2);
+    CHECK(sync(TestArticleListRepo::query(qB))->size() == 2);
+}

@@ -529,8 +529,14 @@ public:
     }
 
     /// Full-pattern target of InvalidateListVia (the resolver returned
-    /// nullopt). No tier holds list groups to drop: returns 0.
+    /// nullopt). Records ONE RangeModification with an empty predicate on the
+    /// L1 tracker: every filter is a wildcard and the sort range is full, so
+    /// every cached page is invalidated lazily, in O(1). Returns 0: the pages
+    /// are dropped on their next read or sweep, not counted here.
     static io::Task<size_t> invalidateAllListGroups() {
+        if constexpr (kHasL1) {
+            listCache().onEntityRangeDeleted(DescriptorFilters{});
+        }
         co_return 0;
     }
 
