@@ -10,6 +10,7 @@
 
 #include "jcailloux/relais/PgProvider.h"
 #include "jcailloux/relais/repository/PgRepo.h"
+#include "jcailloux/relais/repository/Precaution.h"
 #include "jcailloux/relais/Log.h"
 #include "jcailloux/relais/list/ListCache.h"
 #include "jcailloux/relais/list/ListQuery.h"
@@ -381,20 +382,21 @@ public:
     static io::Task<cache::CacheView<Entity>> insert(const Entity& entity)
         requires MutableEntity<Entity> && (!Base::config.read_only)
     {
-        std::exception_ptr timeout;
         try {
             auto result = co_await Base::insert(entity);
             if (result) {
                 if constexpr (kHasL1) { listCache().onEntityCreated(*result); }
             }
             co_return result;
-        } catch (const io::PgUncertainError&) {
-            timeout = std::current_exception();
+        } catch (const io::PgUncertainError& e) {
+            // Uncertain: invalidate the own-list tier from the input entity (the
+            // L1 bump cannot fail), then rethrow.
+            if constexpr (kHasL1) {
+                detail::precautionSync(e.settleTicket(),
+                    [entity] { listCache().onEntityCreated(entity); });
+            }
+            throw;
         }
-        // Uncertain: invalidate the own-list tier from the input entity (the L1
-        // bump cannot fail), then rethrow.
-        if constexpr (kHasL1) { listCache().onEntityCreated(entity); }
-        std::rethrow_exception(timeout);
     }
 
     /// Insert-or-update and invalidate list caches. The create/update discriminant
@@ -444,16 +446,12 @@ public:
         if (!uncertain_before) uncertain_before = &own_before;
 
         typename Base::PatchedRow row;
-        std::exception_ptr timeout;
         try {
             row = co_await Base::template patchRow<true>(
                 id, uncertain_before, std::forward<Updates>(updates)...);
-        } catch (const io::PgUncertainError&) {
-            timeout = std::current_exception();
-        }
-        if (timeout) {
-            co_await invalidateListsUncertainPatch(*uncertain_before, "patch");
-            std::rethrow_exception(timeout);
+        } catch (const io::PgUncertainError& e) {
+            invalidateListsUncertainPatch(e.settleTicket(), *uncertain_before, "patch");
+            throw;
         }
         co_await invalidateListsPatched(row);
         co_return row;
@@ -472,16 +470,12 @@ public:
         if (!uncertain_before) uncertain_before = &own_before;
 
         std::optional<typename Base::PatchedRow> row;
-        std::exception_ptr timeout;
         try {
             row = co_await Base::template patchIfRow<true>(
                 id, uncertain_before, guard, std::forward<Updates>(updates)...);
-        } catch (const io::PgUncertainError&) {
-            timeout = std::current_exception();
-        }
-        if (timeout) {
-            co_await invalidateListsUncertainPatch(*uncertain_before, "patchIf");
-            std::rethrow_exception(timeout);
+        } catch (const io::PgUncertainError& e) {
+            invalidateListsUncertainPatch(e.settleTicket(), *uncertain_before, "patchIf");
+            throw;
         }
         if (row) co_await invalidateListsPatched(*row);
         co_return row;
@@ -646,23 +640,19 @@ protected:
         std::optional<Entity> own_before;
         if (!uncertain_before) uncertain_before = &own_before;
 
-        // co_await is illegal in a catch handler: capture the uncertain timeout,
-        // run the precautionary list invalidation after the try, then rethrow.
         typename Base::UpdateOutcome outcome;
-        std::exception_ptr timeout;
         try {
             outcome = co_await Base::template updateOutcome<true>(id, entity, uncertain_before);
-        } catch (const io::PgUncertainError&) {
-            timeout = std::current_exception();
-        }
-        if (timeout) {
+        } catch (const io::PgUncertainError& e) {
             // The L1 tracker bump cannot fail.
-            const auto& before = *uncertain_before;
             if constexpr (kHasL1) {
-                if (before) listCache().onEntityUpdated(*before, entity);
-                else listCache().onEntityCreated(entity);
+                detail::precautionSync(e.settleTicket(),
+                    [before = *uncertain_before, entity] {
+                        if (before) listCache().onEntityUpdated(*before, entity);
+                        else listCache().onEntityCreated(entity);
+                    });
             }
-            std::rethrow_exception(timeout);
+            throw;
         }
         if (outcome.affected.value_or(0) > 0) {
             // The committed row, not the input, is the new position: the
@@ -694,17 +684,16 @@ protected:
         if (!uncertain_before) uncertain_before = &own_before;
 
         typename Base::EraseOutcome outcome;
-        std::exception_ptr timeout;
         try {
             outcome = co_await Base::template eraseOutcome<true>(id, hint, uncertain_before);
-        } catch (const io::PgUncertainError&) {
-            timeout = std::current_exception();
-        }
-        if (timeout) {
+        } catch (const io::PgUncertainError& e) {
             if (const auto& before = *uncertain_before) {
-                if constexpr (kHasL1) { listCache().onEntityDeleted(*before); }
+                if constexpr (kHasL1) {
+                    detail::precautionSync(e.settleTicket(),
+                        [b = *before] { listCache().onEntityDeleted(b); });
+                }
             }
-            std::rethrow_exception(timeout);
+            throw;
         }
         if (outcome.before) {
             if constexpr (kHasL1) { listCache().onEntityDeleted(*outcome.before); }
@@ -724,28 +713,25 @@ protected:
     /// pages of `before` (a cache tier's copy, if it had one) for a position
     /// that cannot be known. Those pages are invalidated as for a deletion;
     /// the new position is left to l1_ttl (logged).
-    static io::Task<void> invalidateListsUncertainPatch(
+    static void invalidateListsUncertainPatch(
+        const std::shared_ptr<io::SettleTicket>& ticket,
         const std::optional<Entity>& before, const char* op) {
         RELAIS_LOG_ERROR << name() << ": " << op
             << " timeout — new row version unknowable, its list pages left to l1_ttl";
-        if (!before) co_return;
-        if constexpr (kHasL1) { listCache().onEntityDeleted(*before); }
+        if (!before) return;
+        if constexpr (kHasL1) {
+            detail::precautionSync(ticket, [b = *before] { listCache().onEntityDeleted(b); });
+        }
     }
 
     static io::Task<cache::CacheView<Entity>> upsertWithContext(
         const Entity& entity, const Entity* old_entity)
         requires UpsertableEntity<Entity, Key> && HasUpsertSql<Entity> && (!Base::config.read_only)
     {
-        // co_await is illegal in a catch handler: capture the uncertain timeout,
-        // run the precautionary list invalidation after the try, then rethrow.
         cache::CacheView<Entity> result;
-        std::exception_ptr timeout;
         try {
             result = co_await Base::upsert(entity);
-        } catch (const io::PgUncertainError&) {
-            timeout = std::current_exception();
-        }
-        if (timeout) {
+        } catch (const io::PgUncertainError& e) {
             // Uncertain: the ON CONFLICT statement may have committed as either
             // branch. Keyed on the pre-image — a known old migrates to the input
             // entity (its fields fully known), an unknown old appends. The L1
@@ -753,10 +739,15 @@ protected:
             // old position bounded by l1_ttl — the same residual update already
             // tolerates.
             if constexpr (kHasL1) {
-                if (old_entity) listCache().onEntityUpdated(*old_entity, entity);
-                else listCache().onEntityCreated(entity);
+                std::optional<Entity> old;
+                if (old_entity) old.emplace(*old_entity);
+                detail::precautionSync(e.settleTicket(),
+                    [old = std::move(old), entity] {
+                        if (old) listCache().onEntityUpdated(*old, entity);
+                        else listCache().onEntityCreated(entity);
+                    });
             }
-            std::rethrow_exception(timeout);
+            throw;
         }
         if (result) {
             // Committed: an existing row migrates (old → the RETURNING row), an

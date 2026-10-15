@@ -253,6 +253,10 @@ if(RELAIS_BUILD_TESTS)
     relais_add_test(test_io_context       tests/io/test_io_context.cpp            LABELS "io")
     relais_add_test(test_io_pg_types      tests/io/test_io_pg_types.cpp           LABELS "io")
     relais_add_test(test_number_text      tests/io/test_number_text.cpp           LABELS "io")
+    add_test(NAME precaution_sites
+             COMMAND ${CMAKE_COMMAND} -DROOT=${PROJECT_SOURCE_DIR}
+                     -P ${PROJECT_SOURCE_DIR}/cmake/CheckPrecautionSites.cmake)
+    set_tests_properties(precaution_sites PROPERTIES LABELS "lint")
     relais_add_test(test_io_pg_pool_compile tests/io/test_io_pg_pool_compile.cpp  LABELS "io")
     relais_add_test(test_epoll_io_context tests/io/test_epoll_io_context.cpp    LABELS "io;epoll")
     relais_add_test(test_batch_scheduler  tests/io/test_batch_scheduler.cpp     LABELS "io;batch")
