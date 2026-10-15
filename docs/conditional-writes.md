@@ -213,11 +213,11 @@ The caller has nothing to invalidate:
 - **`patchIf`** updates the cache like `patch`; the returned view is the committed
   row. A refusal or an error wrote nothing and leaves the cache as it was.
 - **`patchWhere` / `claim`**: when the call returns, the changed entities are out
-  of the cache, so the next `find` reads them from the database; Redis list pages
-  and cross-invalidation targets are refreshed just after, in the background.
+  of the cache, so the next `find` reads them from the database; cross-invalidation
+  targets are refreshed just after, in the background.
 - **Uncertain outcome**: `patchIf` evicts its entity; the rows of `patchWhere` or
   `claim` cannot be known. What cannot be invalidated stays cached until
-  `l1_ttl` / `l2_ttl`, and an error is logged. Decisions are unaffected: they are
+  `l1_ttl`, and an error is logged. Decisions are unaffected: they are
   taken in the database.
 
 ## Limits

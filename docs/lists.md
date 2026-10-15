@@ -1,14 +1,12 @@
 # List cache — ListMixin
 
-Paginated query results, cached in the tiers of the repo's preset with the same
-`l1_ttl` / `l2_ttl` as entities. Lists have no setting of their own.
+Paginated query results, cached like the repo's entities, with the same
+`l1_ttl`. Lists have no setting of their own.
 
 | Preset | List pages |
 |---|---|
 | `Uncached` | not cached: every `query()` reads PostgreSQL |
 | `Local` | L1 |
-| `Redis` | L2 |
-| `Both` | L1 + L2 |
 
 **Auto-activated** when the entity's Mapping carries an embedded `ListDescriptor`
 (detected by the `HasListDescriptor` concept). The generator emits a
@@ -101,7 +99,7 @@ differ from `in`:
 bounded by keyset pagination, not an index seek. Invalidation churn is higher
 than `in` — the complement is far less selective, so a write is more likely to
 fall inside a cached `nin` group and purge its page. Per-operation cost is
-identical to `in` (same `cmpin`/`skipset`, same Redis round-trip).
+identical to `in`.
 </details>
 
 ### `is_null` operator (nullity)
@@ -269,9 +267,7 @@ The full builder surface — every setter, its exact slot type, and
 [api-reference.md › QueryBuilder](api-reference.md#list-and-query-api). The
 example above is the common chain; `.build()` is the single sealing point.
 
-`items` is a `std::vector<Entity>` (by value). The `std::vector<EntityPtr>`
-inside `CachedListResult` is the internal L2/Redis representation — not the
-public `query()` API.
+`items` is a `std::vector<Entity>` (by value).
 
 ### Sealed query and the params escape hatch
 
@@ -350,8 +346,8 @@ never coincides with the declaration site and is a footgun.
 - **A failed query throws — it is not an empty page.** A DB error (timeout,
   connection lost) propagates out of `query()`/`queryJson()`/`queryBinary()`; only a
   *successful* query with no matching rows yields an empty page. Don't read an empty
-  result as "the query failed". A Redis L2 timeout is not an error here — the page is
-  rebuilt from L3. (See [runtime.md › Liveness & failure semantics](runtime.md#liveness--failure-semantics).)
+  result as "the query failed". (See [runtime.md › Liveness & failure
+  semantics](runtime.md#liveness--failure-semantics).)
 - **At least one `sortable` field is required.** The generator embeds a
   `ListDescriptor` **only when the entity has ≥1 sort**; `filterable` alone
   yields a `FilterSet` but no `ListDescriptor`, so `HasListDescriptor` fails and
@@ -361,16 +357,15 @@ never coincides with the declaration site and is a footgun.
 - **Composite keys are supported.** The keyset cursor spans every primary-key
   column, so an entity with a composite key (including an all-PK junction) can
   carry a `@relais_list`.
-- **Primary-key and sort fields must be integral.** Keyset pagination resumes
-  from a totally-ordered, fixed-width tiebreaker — so the cursor encodes the sort
-  value and every primary-key component as `int64_t`, compared Redis-side during
-  selective invalidation. This is inherent to cursor pagination, not a relais
-  restriction: a string key has no fixed-width order to seek from. A non-integral
-  PK, or a non-integral/non-enum sort field, is a **compile error** (`"list
-  keyset pagination requires an integer primary key"`); use an integer surrogate
-  instead (`bigserial` key, epoch-microsecond timestamp, not an ISO-8601 string).
-  The constraint binds the PK itself — a string-PK entity gets no `@relais_list`
-  at all.
+- **Primary-key and sort fields must be integral.** Keyset pagination resumes from a
+  totally-ordered, fixed-width tiebreaker — so the cursor encodes the sort value and
+  every primary-key component as `int64_t`. This is inherent to cursor pagination,
+  not a relais restriction: a string key has no fixed-width order to seek from. A
+  non-integral PK, or a non-integral/non-enum sort field, is a **compile error**
+  (`"list keyset pagination requires an integer primary key"`); use an integer
+  surrogate instead (`bigserial` key, epoch-microsecond timestamp, not an ISO-8601
+  string). The constraint binds the PK itself — a string-PK entity gets no
+  `@relais_list` at all.
 
 ## CRUD → list notification (automatic)
 
@@ -379,11 +374,9 @@ writes (`patchIf`, `patchWhere`, `claim`) to notify the list cache of entity
 changes. No manual `notifyCreated`/`notifyUpdated`/`notifyDeleted` for same-repo
 entities.
 
-- **L1**: the `ModificationTracker` records the change; cached pages are
-  validated **lazily** on the next `query()`. Another instance's L1 is not
-  notified: its pages expire with `l1_ttl`.
-- **L2**: the write deletes the affected pages at once, with one selective
-  script. This is best-effort: if Redis fails, the pages expire with `l2_ttl`.
+The `ModificationTracker` records the change; cached pages are validated
+**lazily** on the next `query()`. Another instance's L1 is not notified: its pages
+expire with `l1_ttl`.
 
 ```cpp
 // Done for you by ListMixin's CRUD interception:
@@ -410,16 +403,12 @@ differently.
 
 **`eraseWhere`** deletes the rows, so their pages must change. The entity tier is
 evicted per resolved row, but the **own-list** tier never iterates that id set —
-it is driven directly by the predicate, in O(1)/O(groups):
-
-- **L1**: one `RangeModification`. The `ModificationTracker` carries a second
-  track (predicate + generation) alongside the per-entity one, sharing the
-  generation counter and the bitmap/drain cycle. A cached page is dropped lazily
-  on the next `query()` when the predicate is *range-affecting* — group-compatible
-  **and** sort-range-overlapping. The per-entity check is the `lo == hi` special
-  case of this range check.
-- **L2**: one predicate-driven script over the cached groups (`pmatch` set-vs-set
-  + `chk_range` overlap), one Redis round-trip.
+it is driven directly by the predicate, in O(1): one `RangeModification`. The
+`ModificationTracker` carries a second track (predicate + generation) alongside
+the per-entity one, sharing the generation counter and the bitmap/drain cycle. A
+cached page is dropped lazily on the next `query()` when the predicate is
+*range-affecting* — group-compatible **and** sort-range-overlapping. The
+per-entity check is the `lo == hi` special case of this range check.
 
 This fast-path is **filter-aware and never-miss**: it prunes only groups the
 predicate provably cannot affect (EQ-different / IN-disjoint; an absent

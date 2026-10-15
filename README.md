@@ -1,18 +1,18 @@
 # relais
 
-**A header-only C++23 repository library for PostgreSQL, with an optional Redis L2
-tier** — L1/L2/L3 caching (RAM → Redis → PostgreSQL) assembled at compile time from
-template parameters: zero virtual calls, zero runtime configuration overhead.
+**A header-only C++23 repository library for PostgreSQL, with an in-process cache**
+— an L1 RAM cache in front of the database, assembled at compile time from template
+parameters: zero virtual calls, zero runtime configuration overhead.
 
-The backends are deliberate: batching, pipelining, and invalidation build on libpq's
-pipeline mode and Redis RESP, not a generic SQL/KV abstraction. Adopting relais means
-plugging in a component, not an ecosystem — its coroutine runtime, Redis client, and
-L1 map are all internal (see [Requirements](#requirements)).
+The backend is deliberate: batching, pipelining, and invalidation build on libpq's
+pipeline mode, not a generic SQL abstraction. Adopting relais means plugging in a
+component, not an ecosystem — its coroutine runtime and L1 map are internal (see
+[Requirements](#requirements)).
 
 ```cpp
-using UserRepo = relais::Repo<UserEntity, "User", config::Both>;
+using UserRepo = relais::Repo<UserEntity, "User", config::Local>;
 
-auto user = co_await UserRepo::find(123);   // L1 → L2 → L3, transparently
+auto user = co_await UserRepo::find(123);   // L1, else PostgreSQL, transparently
 ```
 
 One `using` alias declares a fully-cached repository. The cache tower, list
@@ -21,7 +21,7 @@ config and the entity's traits — you pay for exactly what you enable.
 
 ## Why relais
 
-- **Compile-time mixin tower.** `PgRepo → RedisRepo → LocalRepo → ListMixin →
+- **Compile-time mixin tower.** `PgRepo → LocalRepo → ListMixin →
   InvalidationMixin` is assembled by name-hiding (no CRTP, no virtuals). Layers
   you don't configure don't exist in the binary.
 - **NTTP configuration.** `CacheConfig` is a structural aggregate passed as a
@@ -48,28 +48,23 @@ config and the entity's traits — you pay for exactly what you enable.
 
 ## When relais fits
 
-relais always brokers the database; the cache tiers are **independent** additions
-on top — L1 and L2 are orthogonal, so it's a menu, not a ladder. The baseline (no
-cache) already carries the type-safety and the batching:
+relais always brokers the database; the cache is an addition on top. The baseline
+(no cache) already carries the type-safety and the batching:
 
-| Config | Tiers | Adds |
+| Config | Cache | Adds |
 |---|---|---|
-| `Uncached` | L3 only | Compile-time-checked API + SQL batching/pipelining + shared-nothing runtime — fewer round-trips and foot-guns, no cache, no Redis. |
-| `Local` | L1 only | In-process hot reads (~50 ns, no I/O). Per-instance, no Redis. |
-| `Redis` | L2 only | Out-of-process cache — outlives the process, scales past the L1 RAM budget, shareable across instances. |
-| `Both` | L1 + L2 | RAM reads backed by Redis (warm after a restart, shared across instances). |
+| `Uncached` | none | Compile-time-checked API + SQL batching/pipelining + shared-nothing runtime — fewer round-trips and foot-guns, no cache. |
+| `Local` | L1 | In-process hot reads (~50 ns, no I/O), per process. |
 
-**Multi-instance.** L1 coherence then depends on how data is partitioned across
-processes. Disjoint key ownership keeps every invalidation local — nothing extra.
-Shared keys need a finite `l1_ttl` (staleness ceiling) plus
-`l2_shared_across_instances`, which moves fill-validity to Redis so a fill
-straddling another instance's invalidation is rejected. Details:
-[caching.md](docs/caching.md) ·
-[api-reference.md › CacheConfig](docs/api-reference.md#cacheconfig).
+**Several instances.** L1 is per process: a write invalidates the L1 of the
+instance that made it, not another's. With one instance, or keys routed so each is
+written and read by one instance, L1 is exact. Instances that share keys see each
+other's writes once their own entry expires: `l1_ttl` is the staleness bound, and
+`Uncached` suits data that must never lag. Details:
+[caching.md › Several instances](docs/caching.md#several-instances).
 
 So relais is not "a read cache": the type-safety and the batching pay off even on a
-write-heavy, uncached, single-instance workload. Storage other than PostgreSQL
-(+ optional Redis) is out of scope.
+write-heavy, uncached workload. Storage other than PostgreSQL is out of scope.
 
 ## Requirements
 
@@ -81,13 +76,11 @@ either part of relais or a backing service you already run.
 - [glaze](https://github.com/stephenberry/glaze) — JSON/BEVE serialization (fetched automatically)
 - libpq — PostgreSQL client headers (`find_package(PostgreSQL)`)
 
-**Runtime services** — the assumed stack; processes you connect to, not libraries you link:
+**Runtime service** — the process you connect to, not a library you link:
 - PostgreSQL
-- Redis 7.0+ or Valkey — optional, only for the L2 tier
 
 **Internal to relais** — shipped with it, nothing to install or adopt:
 - The coroutine runtime (`io::Task`, `IoPool`) and per-loop connection pools
-- The Redis client — native RESP, no `hiredis` / `redis++`
 - The L1 hash map (`ChunkMap`) over a vendored lock-free backend (parlay_hash)
 
 ## Install
@@ -159,7 +152,7 @@ namespace relais  = jcailloux::relais;
 namespace config  = relais::config;
 
 using UserRepo = relais::Repo<UserEntity, "User">;                       // L1 (default)
-using FlagRepo = relais::Repo<FlagEntity, "Flag", config::Both>;          // L1 + L2
+using LogRepo  = relais::Repo<LogEntity, "Log", config::Uncached>;        // no cache
 using SessRepo = relais::Repo<SessionEntity, "Session",
     config::Local.with_l1_ttl(std::chrono::minutes{30}).with_read_only()>;
 ```
@@ -167,7 +160,7 @@ using SessRepo = relais::Repo<SessionEntity, "Session",
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `Entity` | type | — | `Entity<Struct, Mapping>` |
-| `Name` | `FixedString` | — | Repo name + Redis key prefix |
+| `Name` | `FixedString` | — | Repo name |
 | `Cfg` | `CacheConfig` | `config::Local` | Cache behavior (NTTP) |
 | `Invalidations...` | types | — | Cross-invalidation descriptors |
 
@@ -210,16 +203,14 @@ and running relais on a foreign loop (Drogon/asio/…) are in
 
 ## Cache presets
 
-| Preset | Tiers | Use case |
+| Preset | Cache | Use case |
 |---|---|---|
-| `config::Uncached` | none | Write-only tables, audit sinks |
-| `config::Local` | L1 | Per-instance data (default) |
-| `config::Redis` | L2 | Cross-instance, or cache that must outlive the process |
-| `config::Both` | L1 + L2 | High-read, feature flags |
+| `config::Uncached` | none | Write-only tables, audit sinks, rows several instances write |
+| `config::Local` | L1 | Read-heavy data (default) |
 
 Start from a preset and override with `.with_*()` chaining. Read path:
-`L1 → L2 → DB`, back-filling each tier on the way up. The API is identical on
-every preset: switching one never breaks compilation.
+`L1 → DB`, back-filling L1 on a miss. The API is identical on both presets:
+switching one never breaks compilation.
 
 ## Navigating this documentation
 
@@ -230,14 +221,14 @@ Each file owns one subject and reads on its own. Pick by what you're trying to d
 | **Learn** (5 min) | this README › [Quick start](#quick-start) | Struct → generate → repo → call. |
 | **Understand** the model | [docs/concepts.md](docs/concepts.md) | How the pieces fit: entity/mapping split, the compile-time mixin tower, read/write flow, shared-nothing runtime, type-safety by concepts. |
 | **Do** a task — entities | [docs/entities.md](docs/entities.md) | Struct, `@relais` annotations, the generator. |
-| **Do** a task — caching | [docs/caching.md](docs/caching.md) | `CacheConfig`, presets, `patch`, partition keys. |
+| **Do** a task — caching | [docs/caching.md](docs/caching.md) | `CacheConfig`, presets, several instances, `patch`, partition keys. |
 | **Do** a task — decisions under concurrency | [docs/conditional-writes.md](docs/conditional-writes.md) | `patchIf`, `claim`, `patchWhere`: guarded and relative writes (optimistic locking, job queues, reservations). |
 | **Do** a task — invalidation | [docs/invalidation.md](docs/invalidation.md) | The four `Invalidate*` mechanisms, resolvers. |
 | **Do** a task — lists | [docs/lists.md](docs/lists.md) | `filterable`/`sortable`, paginated `query()`, cursors, `countWhere`. |
 | **Do** a task — runtime | [docs/runtime.md](docs/runtime.md) | `IoPool`, N-loop scaling, the threading rule. |
 | **Look up** a signature | [docs/api-reference.md](docs/api-reference.md) | The exhaustive public surface — every method, config field, descriptor, list/query type, runtime type, annotation index. Every guide links here. |
 | **Integrate** on an existing loop | [docs/runtime.md](docs/runtime.md) → [docs/foreign-event-loops.md](docs/foreign-event-loops.md) | Co-locate relais on a framework loop (Drogon/asio/…) via an `IoContext` adapter — advanced, optional. |
-| **Dissect** the implementation | [docs/internals.md](docs/internals.md) | Mixin chain, layer selection, cache tiers, ListCache, ModificationTracker — for contributors. |
+| **Dissect** the implementation | [docs/internals.md](docs/internals.md) | Mixin chain, layer selection, L1 tier, ListCache, ModificationTracker — for contributors. |
 | **Run** an example | [examples/](examples/README.md) | CI-compiled counterparts to the runtime snippets. |
 
 **Reading paths**
@@ -253,9 +244,8 @@ numbers: [concepts.md › Performance model](docs/concepts.md#performance-model)
 
 ## Testing
 
-Tests need PostgreSQL (`relais_test`/`relais_test` @ `localhost:5432`) and Redis
-(`localhost:6379`). Each test rolls back via `TransactionGuard` (begin txn +
-flush Redis in ctor, rollback + flush in dtor).
+Tests need PostgreSQL (`relais_test`/`relais_test` @ `localhost:5432`). Each test
+runs under a `TransactionGuard`, which deletes the test data in its ctor and dtor.
 
 ```bash
 cmake -B .build/dev -DRELAIS_BUILD_TESTS=ON
@@ -264,7 +254,7 @@ ctest --test-dir .build/dev --output-on-failure
 ```
 
 Cache contamination across executables means specific suites should be run
-directly, e.g. `./.build/dev/test_relais_redis "[list-selective]"`. See
+directly, e.g. `./.build/dev/test_relais_decl_list_full`. See
 [tests/README.md](tests/README.md).
 
 ## License
