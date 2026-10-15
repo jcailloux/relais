@@ -22,9 +22,6 @@
 #include "jcailloux/relais/io/pg/PgPool.h"
 #include "jcailloux/relais/io/pg/PgResult.h"
 #include "jcailloux/relais/io/pg/PgParams.h"
-#include "jcailloux/relais/io/redis/RedisPool.h"
-#include "jcailloux/relais/io/redis/RedisResult.h"
-#include "jcailloux/relais/io/SelfHealQueue.h"
 #include "jcailloux/relais/io/batch/TimingEstimator.h"
 #include "jcailloux/relais/io/batch/WriteAffinity.h"
 
@@ -34,7 +31,7 @@ namespace relais_bench { struct BatchBenchAccessor; }
 
 namespace jcailloux::relais::io::batch {
 
-// BatchScheduler — single-threaded adaptive batching for PG and Redis.
+// BatchScheduler — single-threaded adaptive batching for PostgreSQL.
 //
 // This scheduler is mono-thread: one instance per event loop worker.
 // No internal mutexes — the PgProvider thread_local dispatch guarantees
@@ -44,12 +41,11 @@ namespace jcailloux::relais::io::batch {
 // - Reads: SELECT ... WHERE id = ANY($1) for entities of same repo,
 //   pipelining for different repos/lists, with sync between segments.
 // - Writes: pipelined with sync after each, preserving sequence order.
-// - Redis: reads + writes in the same pipeline (Redis guarantees order).
 // - Coalescing: identical queries share the same result, in a batch or with
 //   the direct read in flight.
 //
-// Budget: separate ConcurrencyGates cap in-flight PG and Redis sends
-// independently, so neither tier starves the other under mixed load.
+// Budget: one ConcurrencyGate caps the PG sends in flight, reads and writes
+// together.
 
 /// Result of a pipelined PG write, with coalescing indicator.
 /// Non-templated (independent of Io) so it can be named in the type-erased
@@ -80,14 +76,10 @@ class BatchScheduler : public std::enable_shared_from_this<BatchScheduler<Io>> {
 public:
     BatchScheduler(Io& io,
                    std::shared_ptr<PgPool<Io>> pg_pool,
-                   std::shared_ptr<RedisPool<Io>> redis_pool,
                    int max_concurrent = 8)
         : io_(io)
         , pg_pool_(std::move(pg_pool))
-        , redis_pool_(std::move(redis_pool))
-        , self_heal_(io_, redis_pool_)
         , pg_gate_{max_concurrent}
-        , redis_gate_{max_concurrent}
         , pg_write_fanout_{writeFanout(max_concurrent)}
     {}
 
@@ -190,33 +182,6 @@ public:
         co_return co_await submitPgWriteEntry(std::move(entry));
     }
 
-    /// Submit a Redis command (read or write — Redis pipeline handles both).
-    /// `args` is the full argv, verb first; the entry takes it over as is.
-    /// Return-direct: no coroutine frame of its own.
-    Task<RedisResult> submitRedis(std::vector<std::string> args) {
-        RedisEntry entry;
-        entry.args = std::move(args);
-        return submitRedisEntry(std::move(entry));
-    }
-
-    /// Same, from borrowed arguments copied before this returns: the pointers
-    /// need only be valid for the call.
-    Task<RedisResult> submitRedis(int argc, const char** argv, const size_t* argvlen) {
-        std::vector<std::string> args;
-        args.reserve(static_cast<std::size_t>(argc));
-        for (int i = 0; i < argc; ++i) {
-            args.emplace_back(argv[i], argvlen[i]);
-        }
-        return submitRedis(std::move(args));
-    }
-
-    /// Register a deferred cache-eviction retry whose UNLINK could not reach
-    /// Redis (self-heal of the L2/L1 staleness bound). Off the hot path; the
-    /// queue dedupes by key, rebuilds dead Redis slots, and drains on recovery.
-    void enqueueSelfHeal(std::string key, typename SelfHealQueue<Io>::Retry retry) {
-        self_heal_.enqueue(std::move(key), std::move(retry));
-    }
-
     /// Direct query bypass — for BEGIN/COMMIT/ROLLBACK/SET.
     /// Acquires a connection and executes directly, no batching.
     /// Counted as writes: a read submitted afterwards never shares the result of
@@ -242,11 +207,6 @@ public:
     /// Access the timing estimator (for testing/diagnostics).
     [[nodiscard]] const TimingEstimator& estimator() const noexcept { return estimator_; }
 
-    /// Redis commands sent inside a pipelined batch so far (for testing/diagnostics).
-    [[nodiscard]] uint64_t redisPipelinedEntries() const noexcept {
-        return redis_pipelined_entries_;
-    }
-
     /// PG read statements sent so far, one per distinct read once coalesced
     /// (for testing/diagnostics).
     [[nodiscard]] uint64_t pgReadsSent() const noexcept {
@@ -257,24 +217,17 @@ public:
     // Ordered teardown
     // =========================================================================
 
-    /// Begin ordered teardown (loop-thread, idempotent). Stops the self-heal
-    /// queue from re-arming so the loop can pump to quiescence. In-flight detached
-    /// fires are NOT cancelled — they drain on their own, each bounded by the
-    /// per-operation query/acquire timeouts (a hung fire times out, unwinds in
-    /// error, and self-destroys). See quiescentForTeardown().
-    void beginShutdown() noexcept { self_heal_.beginShutdown(); }
-
     /// True when no detached work remains in flight: no fire*Batch is running, no
     /// batch is still accumulating (its departure timer would otherwise leave
-    /// entries unfired), and no self-heal drain is executing. Ordered teardown
-    /// pumps the loop until this holds (or a grace deadline elapses). Loop-thread
-    /// only — no synchronization, since every mutation runs on the one loop.
+    /// entries unfired). Ordered teardown pumps the loop until this holds (or a
+    /// grace deadline elapses). In-flight fires are not cancelled: each is
+    /// bounded by the per-operation query/acquire timeouts (a hung fire times
+    /// out, unwinds in error, and self-destroys). Loop-thread only — no
+    /// synchronization, since every mutation runs on the one loop.
     [[nodiscard]] bool quiescentForTeardown() const noexcept {
         return detached_inflight_ == 0
             && pg_read_batch_.entries.empty()
-            && pg_write_batch_.entries.empty()
-            && redis_batch_.entries.empty()
-            && !self_heal_.draining();
+            && pg_write_batch_.entries.empty();
     }
 
     /// Diagnostic: in-flight detached fire coroutines (loop-thread only).
@@ -349,17 +302,6 @@ private:
         std::exception_ptr error;
     };
 
-    struct RedisEntry {
-        std::vector<std::string> args;   // Owned argv, verb first
-
-        std::coroutine_handle<> continuation{};
-        RedisResult result;
-
-        // Lifecycle / error
-        bool cancelled = false;
-        std::exception_ptr error;
-    };
-
     struct PgReadBatch {
         std::vector<PgReadEntry*> entries;
         double cost_ns = 0;
@@ -371,14 +313,8 @@ private:
         std::vector<PgWriteEntry*> entries;
     };
 
-    struct RedisBatch {
-        std::vector<RedisEntry*> entries;
-        TimerToken timer{0};
-        bool timer_active = false;
-    };
-
     // =========================================================================
-    // ConcurrencyGate — coroutine semaphore for a per-tier in-flight budget
+    // ConcurrencyGate — coroutine semaphore for the in-flight PG budget
     // =========================================================================
 
     struct ConcurrencyGate {
@@ -641,70 +577,6 @@ private:
         co_return co_await awaiter;
     }
 
-    struct RedisAwaiter {
-        BatchScheduler* self;
-        std::unique_ptr<RedisEntry> entry_owner;
-        RedisEntry* entry_ptr;
-        bool resumed = false;
-
-        RedisAwaiter(BatchScheduler* s, RedisEntry e)
-            : self(s)
-            , entry_owner(std::make_unique<RedisEntry>(std::move(e)))
-            , entry_ptr(entry_owner.get()) {}
-
-        RedisAwaiter(const RedisAwaiter&) = delete;
-        RedisAwaiter(RedisAwaiter&&) = delete;
-
-        bool await_ready() const noexcept { return false; }
-
-        void await_suspend(std::coroutine_handle<> h) {
-            entry_ptr->continuation = h;
-            self->addToRedisBatch(entry_owner.release());
-        }
-
-        RedisResult await_resume() {
-            resumed = true;
-            std::unique_ptr<RedisEntry> entry(entry_ptr);
-            if (entry->error) std::rethrow_exception(entry->error);
-            return std::move(entry->result);
-        }
-
-        ~RedisAwaiter() {
-            if (entry_owner)   return;
-            if (resumed)       return;
-            entry_ptr->cancelled = true;
-        }
-    };
-
-    Task<RedisResult> submitRedisEntry(RedisEntry entry) {
-        if (!redis_pool_ || redis_pool_->empty())
-            throw RedisError("Redis pool not configured");
-
-        if (estimator_.isRedisBootstrapping() || estimator_.isRedisStale()) {
-            co_return co_await sendSingleRedis(std::move(entry));
-        }
-
-        // Nagle: first query goes direct, subsequent accumulate during RTT
-        if (!redis_inflight_) {
-            redis_inflight_ = true;
-            RedisResult result;
-            try {
-                result = co_await sendSingleRedis(std::move(entry));
-            } catch (...) {
-                redis_inflight_ = false;
-                fireRedisBatchNow();
-                throw;
-            }
-            redis_inflight_ = false;
-            fireRedisBatchNow(); // flush accumulated during RTT
-            co_return result;
-        }
-
-        // In-flight → accumulate in batch
-        RedisAwaiter awaiter{this, std::move(entry)};
-        co_return co_await awaiter;
-    }
-
     // =========================================================================
     // Batch management
     // =========================================================================
@@ -779,16 +651,6 @@ private:
         if (pg_write_units_ == 0) firePgWriteBatchNow();
     }
 
-    void addToRedisBatch(RedisEntry* entry) {
-        if (redis_batch_.entries.empty()) {
-            redis_batch_.entries.push_back(entry);
-            scheduleRedisDeparture();
-        } else {
-            redis_batch_.entries.push_back(entry);
-            checkRedisBatchReady();
-        }
-    }
-
     // =========================================================================
     // Batch readiness checks
     // =========================================================================
@@ -800,12 +662,6 @@ private:
             static_cast<int>(pg_read_batch_.entries.size()) >= kMaxBatchEntries)
         {
             firePgReadBatchNow();
-        }
-    }
-
-    void checkRedisBatchReady() {
-        if (static_cast<int>(redis_batch_.entries.size()) >= kMaxBatchEntries) {
-            fireRedisBatchNow();
         }
     }
 
@@ -823,18 +679,6 @@ private:
             firePgReadBatchNow();
         });
         pg_read_batch_.timer_active = true;
-    }
-
-    void scheduleRedisDeparture() {
-        auto delay_ns = static_cast<int64_t>(estimator_.redis_network_time_ns);
-        if (delay_ns <= 0) delay_ns = 50'000; // 50us minimum
-        auto delay = std::chrono::nanoseconds(delay_ns);
-
-        redis_batch_.timer = io_.postDelayed(delay, [this] {
-            redis_batch_.timer_active = false;
-            fireRedisBatchNow();
-        });
-        redis_batch_.timer_active = true;
     }
 
     // =========================================================================
@@ -966,20 +810,6 @@ private:
         for (size_t i = 0; i < n; ++i) sorted[at[group[i]]++] = entries[i];
         std::copy_n(sorted, n, entries.begin());
         return used;
-    }
-
-    void fireRedisBatchNow() {
-        if (redis_batch_.entries.empty()) return;
-
-        if (redis_batch_.timer_active) {
-            io_.cancelTimer(redis_batch_.timer);
-            redis_batch_.timer_active = false;
-        }
-
-        auto entries = std::move(redis_batch_.entries);
-        redis_batch_ = {};
-
-        fireRedisBatch(std::move(entries));
     }
 
     // RAII counter for in-flight detached fire coroutines. One is constructed at
@@ -1322,107 +1152,6 @@ private:
     }
 
     // =========================================================================
-    // Redis batch execution
-    // =========================================================================
-
-    DetachedTask fireRedisBatch(std::vector<RedisEntry*> entries) {
-        // Keep the scheduler alive across the resume loop + drain-or-chain (see
-        // firePgReadBatch): a resumed continuation may drop the last external
-        // owner, and the chain below still touches `this`.
-        auto self = this->shared_from_this();
-        // In-flight detached accounting for ordered teardown (see firePgReadBatch).
-        InflightGuard inflight{detached_inflight_};
-        auto permit = co_await redis_gate_.acquire();
-
-        try {
-            auto& client = redis_pool_->next();
-
-            // Build argv arrays for each entry
-            struct CmdBuf {
-                std::vector<const char*> argv;
-                std::vector<size_t> argvlen;
-            };
-            std::vector<CmdBuf> bufs;
-            bufs.reserve(entries.size());
-            for (auto* e : entries) {
-                CmdBuf buf;
-                buf.argv.reserve(e->args.size());
-                buf.argvlen.reserve(e->args.size());
-                for (const auto& a : e->args) {
-                    buf.argv.push_back(a.data());
-                    buf.argvlen.push_back(a.size());
-                }
-                bufs.push_back(std::move(buf));
-            }
-
-            // Build pipeline command descriptors
-            using PCmd = typename RedisClient<Io>::PipelineCmd;
-            std::vector<PCmd> cmds;
-            cmds.reserve(entries.size());
-            for (auto& buf : bufs) {
-                cmds.push_back({static_cast<int>(buf.argv.size()),
-                                buf.argv.data(), buf.argvlen.data()});
-            }
-
-            // Pipeline: one lock, one flush, one read
-            redis_pipelined_entries_ += entries.size();
-            auto start = Clock::now();
-            auto results = co_await client.pipelineExec(
-                cmds.data(), static_cast<int>(cmds.size()));
-            auto elapsed_ns = static_cast<double>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    Clock::now() - start).count());
-
-            // Distribute results. An error reply fails its own entry only, with
-            // the exception the direct path throws; the rest of the batch keeps
-            // its results.
-            for (size_t i = 0; i < entries.size(); ++i) {
-                if (results[i].isError())
-                    entries[i]->error = redisReplyError(results[i].errorMessage());
-                else
-                    entries[i]->result = std::move(results[i]);
-            }
-
-            // Update network time estimator on single-entry batches
-            if (entries.size() == 1)
-                estimator_.updateRedisNetworkTime(elapsed_ns);
-
-        } catch (...) {
-            // Propagate exception to all waiters instead of silent RedisResult{}.
-            auto eptr = std::current_exception();
-            for (auto* e : entries) {
-                e->error = eptr;
-            }
-        }
-
-        permit.release();
-
-        // Collect handles BEFORE resuming any — symmetric transfer can destroy
-        // the resumed coroutine's frame, and we'd be iterating `entries` after
-        // the entry pointer has been deleted (await_resume reclaims via
-        // unique_ptr). Cancelled entries are deleted here.
-        std::vector<std::coroutine_handle<>> to_resume;
-        std::vector<RedisEntry*> to_delete;
-        to_resume.reserve(entries.size());
-        for (auto* e : entries) {
-            if (e->cancelled) {
-                to_delete.push_back(e);
-            } else if (e->continuation) {
-                to_resume.push_back(e->continuation);
-            }
-        }
-        for (auto h : to_resume) h.resume();
-        for (auto* e : to_delete) delete e;
-
-        // Chain: fire next accumulated batch or clear inflight
-        if (!redis_batch_.entries.empty()) {
-            fireRedisBatchNow();
-        } else {
-            redis_inflight_ = false;
-        }
-    }
-
-    // =========================================================================
     // Single query execution (bootstrap / staleness / fallback)
     // =========================================================================
 
@@ -1507,38 +1236,6 @@ private:
         co_return result;  // ~permit releases the slot here (or on any throw above)
     }
 
-    Task<RedisResult> sendSingleRedis(RedisEntry entry) {
-        auto permit = co_await redis_gate_.acquire();
-
-        RedisResult result;
-        auto start = Clock::now();
-
-        {
-            auto& client = redis_pool_->next();
-
-            std::vector<const char*> argv;
-            std::vector<size_t> argvlen;
-            argv.reserve(entry.args.size());
-            argvlen.reserve(entry.args.size());
-            for (const auto& a : entry.args) {
-                argv.push_back(a.data());
-                argvlen.push_back(a.size());
-            }
-
-            result = co_await client.execArgv(
-                static_cast<int>(argv.size()),
-                argv.data(), argvlen.data());
-        }
-
-        auto elapsed_ns = static_cast<double>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                Clock::now() - start).count());
-
-        estimator_.updateRedisNetworkTime(elapsed_ns);
-
-        co_return result;  // ~permit releases the slot here (or on any throw above)
-    }
-
     // =========================================================================
     // Helpers
     // =========================================================================
@@ -1603,18 +1300,9 @@ private:
 
     Io& io_;
     std::shared_ptr<PgPool<Io>> pg_pool_;
-    std::shared_ptr<RedisPool<Io>> redis_pool_;
-    // Deferred retry of cache evictions that could not reach Redis (self-heal of
-    // the L2/L1 staleness bound). Loop-local; rebuilds dead Redis slots before
-    // retrying. Declared after redis_pool_ — it borrows io_ and shares the pool.
-    SelfHealQueue<Io> self_heal_;
-    // Per-tier concurrency budgets. Split so a burst of in-flight Redis sends
-    // can never steal PG's connection slots (and vice-versa): under mixed
-    // PG+Redis load PG keeps its full budget. Both reads and writes share the
-    // PG gate; a write batch takes at most pg_write_fanout_ of it, leaving the
-    // rest to reads.
+    // In-flight PG budget. Reads and writes share it; a write batch takes at
+    // most pg_write_fanout_ of it, leaving the rest to reads.
     ConcurrencyGate pg_gate_;
-    ConcurrencyGate redis_gate_;
     TimingEstimator estimator_;
 
     // Connections a write batch may span: half the PG budget, so reads keep
@@ -1631,11 +1319,10 @@ private:
     // Current accumulating batches (one of each at a time)
     PgReadBatch pg_read_batch_;
     PgWriteBatch pg_write_batch_;
-    RedisBatch redis_batch_;
 
     // Nagle inflight latches — true while a direct send is in-flight, so
-    // subsequent same-tier queries accumulate into the batch instead of each
-    // paying its own round-trip.
+    // subsequent queries accumulate into the batch instead of each paying its
+    // own round-trip.
     //
     // Invariant (pg_read_inflight_, mono-thread): a plain bool, never atomic.
     // Every read and write of it runs on the one loop thread, only at points
@@ -1661,18 +1348,15 @@ private:
     // in flight never hold more than pg_write_fanout_ PG slots and never touch
     // one row from two connections. Loop-thread only, like the latches.
     size_t pg_write_units_ = 0;
-    bool redis_inflight_ = false;
 
-    // In-flight detached fire coroutines (the three fire*Batch). Plain size_t: it
+    // In-flight detached fire coroutines (firePgReadBatch, firePgWriteBatch). Plain size_t: it
     // is mutated only on the loop thread (an eager fire start ++ via InflightGuard,
     // its frame teardown --), and read only on that same thread by
     // quiescentForTeardown during ordered teardown — no synchronization needed.
     size_t detached_inflight_ = 0;
 
-    // Redis entries sent inside a pipelined batch (fireRedisBatch), and PG read
-    // statements sent (one per direct read, one per batch segment). Loop-thread
-    // only, like the latches above.
-    uint64_t redis_pipelined_entries_ = 0;
+    // PG read statements sent (one per direct read, one per batch segment).
+    // Loop-thread only, like the latches above.
     uint64_t pg_reads_sent_ = 0;
 
     // Write sequence counter

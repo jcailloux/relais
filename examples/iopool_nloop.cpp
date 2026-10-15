@@ -1,7 +1,7 @@
 // iopool_nloop.cpp — relais's built-in shared-nothing N-loop runtime.
 //
 // IoPool spins up N epoll loops (one per core), each pinned with its OWN
-// connection pools + BatchScheduler, each binding its OWN thread_local
+// connection pool + BatchScheduler, each binding its OWN thread_local
 // PgProvider. A query co_awaited on a worker routes to THAT worker's pool — no
 // cross-thread hop. Throughput scales ~linearly with loops at unchanged latency.
 //
@@ -9,7 +9,7 @@
 // the PostgreSQL backend PID it used — distinct per worker, demonstrating that
 // the loops share nothing.
 //
-// Requires PostgreSQL + Redis reachable. No table needed (it queries
+// Requires PostgreSQL reachable. No table needed (it queries
 // pg_backend_pid()). conninfo is empty → libpq reads the PG* environment.
 //
 // Build: cmake -B .build/dev -DRELAIS_BUILD_EXAMPLES=ON
@@ -58,8 +58,6 @@ int main() {
     IoPoolConfig cfg;
     cfg.num_workers = 3;
     cfg.pg_conninfo = "";          // empty → libpq reads PG* env
-    cfg.redis = RedisWorkerConfig{.host = "127.0.0.1", .port = 6379,
-                                  .conns_per_worker = 1};
     cfg.pin_to_cores = false;      // don't pin in a demo
     cfg.pg_min_conns_per_worker = 1;
     cfg.pg_max_conns_per_worker = 2;
@@ -69,7 +67,7 @@ int main() {
     try {
         pool = IoPool::create(cfg);  // blocks until all workers connect + bind
     } catch (const std::exception& e) {
-        std::cerr << "Could not start (is PostgreSQL/Redis reachable?): "
+        std::cerr << "Could not start (is PostgreSQL reachable?): "
                   << e.what() << '\n';
         return 1;
     }

@@ -17,7 +17,7 @@ namespace jcailloux::relais {
 // thread, without blocking the caller.
 //
 // A Task<T> is lazy and runs on the worker thread that owns the I/O resources
-// (PgPool/Redis/cache routed via thread_local). Code on *another* thread
+// (PgPool/cache routed via thread_local). Code on *another* thread
 // (e.g. a different framework's request handler, or a startup/bootstrap thread)
 // cannot co_await it directly. spawnOn bridges the gap:
 //
