@@ -309,8 +309,8 @@ struct Filter {
     static constexpr Op op = Operator;
 
     /// Set-semantics operator (IN / NOT IN): the active value is a set of elements
-    /// and the binary blob format is identical. Single extension point for every
-    /// place that must treat IN and NIN alike (filter_type, schema, blob, SQL param).
+    /// and the key encoding is identical. Single extension point for every place
+    /// that must treat IN and NIN alike (filter_type, key encoding, SQL param).
     static constexpr bool is_set_op = (Operator == Op::IN || Operator == Op::NIN);
 
     /// Nullity operator: the active value is a bool (true = IS NULL, false =
@@ -332,7 +332,7 @@ struct Filter {
     using member_type = detail::member_pointer_type_t<decltype(EntityMemberPtr)>;
 
     /// The unwrapped scalar element type (optional<T> -> T). For IN, this is the
-    /// type of a single set element; the schema element-type char is derived from it.
+    /// type of a single set element.
     using element_type = detail::unwrap_optional_t<member_type>;
 
     /// The scalar a query holds for this filter: bool for IS_NULL, the element
@@ -359,8 +359,6 @@ struct Filter {
         "IN/NOT IN filter: an enum element type requires a Via<Codec> converter");
     static_assert(!(is_set_op && !std::is_same_v<Converter, NoConvert> && !is_via_v<Converter>),
         "IN/NOT IN filter: value converter (e.g. AsString) not supported");
-    static_assert(sizeof(bool) == 1,
-        "IN/NOT IN filter: schema assumes 1-byte bool encoding");
 
     static_assert(detail::via_codec_matches<Converter, element_type>,
         "Via<Codec> filter: the codec's enum_type must be the member's enum type");

@@ -19,7 +19,7 @@ namespace jcailloux::relais::log {
 //
 // Usage:
 //   RELAIS_LOG_ERROR << "MyRepo: DB error - " << e.what();
-//   RELAIS_LOG_WARN  << "RedisCache GET error: " << e.what();
+//   RELAIS_LOG_WARN  << "MyRepo: slow query - " << ms << " ms";
 //   RELAIS_LOG_DEBUG << "MyRepo: warming up L1 cache...";
 //
 // Configuration (in application startup):

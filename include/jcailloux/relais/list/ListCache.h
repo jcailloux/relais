@@ -23,15 +23,6 @@ namespace relais_test { struct TestInternals; }
 namespace jcailloux::relais::list {
 
 // =============================================================================
-// PaginationMode - Distinguishes offset-based and cursor-based pagination
-// =============================================================================
-
-enum class PaginationMode : uint8_t {
-    Offset = 0,  // Traditional offset+limit (cascade invalidation for insert/delete)
-    Cursor = 1   // Keyset/cursor-based (localized invalidation)
-};
-
-// =============================================================================
 // ListCacheConfig - Configuration for ListCache behavior
 // =============================================================================
 
@@ -103,120 +94,6 @@ struct SortBounds {
             if (is_first_page) return lo <= last_value;        // (-∞, last]
             if (is_incomplete) return hi >= first_value;       // [first, +∞)
             return lo <= last_value && hi >= first_value;      // [first, last]
-        }
-    }
-};
-
-// =============================================================================
-// ListBoundsHeader - 19-byte binary header for Redis L2 list cache values
-// =============================================================================
-//
-// Prepended to cached list values in Redis for fine-grained invalidation.
-// A Lua script reads the header (via GETRANGE) to decide whether each page
-// should be invalidated, avoiding unnecessary deletes.
-//
-// Format (little-endian):
-//   Offset  Size  Field
-//   0       2     Magic bytes: 0x53 0x52 ("SR" = Relais)
-//   2       8     first_value (int64_t LE)
-//   10      8     last_value (int64_t LE)
-//   18      1     flags:
-//                   bit 0: sort_direction (0=ASC, 1=DESC)
-//                   bit 1: is_first_page
-//                   bit 2: is_incomplete
-//                   bit 3: pagination_mode (0=Offset, 1=Cursor)
-//                   bits 4-7: reserved
-//
-
-static constexpr size_t kListBoundsHeaderSize = 19;
-static constexpr uint8_t kListBoundsHeaderMagic[2] = {0x53, 0x52};
-
-struct ListBoundsHeader {
-    SortBounds bounds;
-    PaginationMode pagination_mode{PaginationMode::Offset};
-    bool is_first_page{true};
-    bool is_incomplete{false};
-    SortDirection sort_direction{SortDirection::Desc};
-
-    /// Serialize the header to 19 bytes at dst (little-endian).
-    void writeTo(uint8_t* dst) const noexcept {
-        dst[0] = kListBoundsHeaderMagic[0];
-        dst[1] = kListBoundsHeaderMagic[1];
-
-        // first_value (little-endian int64_t)
-        auto first = static_cast<uint64_t>(bounds.first_value);
-        std::memcpy(dst + 2, &first, 8);
-
-        // last_value (little-endian int64_t)
-        auto last = static_cast<uint64_t>(bounds.last_value);
-        std::memcpy(dst + 10, &last, 8);
-
-        // flags byte
-        uint8_t flags = 0;
-        if (sort_direction == SortDirection::Desc)      flags |= 0x01;
-        if (is_first_page)                              flags |= 0x02;
-        if (is_incomplete)                              flags |= 0x04;
-        if (pagination_mode == PaginationMode::Cursor)  flags |= 0x08;
-        dst[18] = flags;
-    }
-
-    /// Read a header from raw bytes. Returns nullopt if magic is invalid.
-    static std::optional<ListBoundsHeader> readFrom(const uint8_t* src, size_t len) noexcept {
-        if (len < kListBoundsHeaderSize) return std::nullopt;
-        if (src[0] != kListBoundsHeaderMagic[0] || src[1] != kListBoundsHeaderMagic[1]) {
-            return std::nullopt;
-        }
-
-        ListBoundsHeader h;
-
-        uint64_t first_raw, last_raw;
-        std::memcpy(&first_raw, src + 2, 8);
-        std::memcpy(&last_raw, src + 10, 8);
-        h.bounds.first_value = static_cast<int64_t>(first_raw);
-        h.bounds.last_value = static_cast<int64_t>(last_raw);
-        h.bounds.is_valid = true;
-
-        uint8_t flags = src[18];
-        h.sort_direction  = (flags & 0x01) ? SortDirection::Desc : SortDirection::Asc;
-        h.is_first_page   = (flags & 0x02) != 0;
-        h.is_incomplete   = (flags & 0x04) != 0;
-        h.pagination_mode = (flags & 0x08) ? PaginationMode::Cursor : PaginationMode::Offset;
-
-        return h;
-    }
-
-    /// Check if a insert or delete of an entity with this sort value affects this page.
-    [[nodiscard]] bool isAffectedByCreateOrDelete(int64_t entity_val) const noexcept {
-        if (!bounds.is_valid) return true;
-
-        bool is_desc = (sort_direction == SortDirection::Desc);
-
-        if (pagination_mode == PaginationMode::Offset) {
-            if (is_incomplete) return true;
-            return is_desc ? (entity_val >= bounds.last_value)
-                           : (entity_val <= bounds.last_value);
-        } else {
-            return bounds.isValueInRange(entity_val, is_first_page, is_incomplete, is_desc);
-        }
-    }
-
-    /// Check if an update moving sort value from old_val to new_val affects this page.
-    [[nodiscard]] bool isAffectedByUpdate(int64_t old_val, int64_t new_val) const noexcept {
-        if (!bounds.is_valid) return true;
-
-        bool is_desc = (sort_direction == SortDirection::Desc);
-
-        if (pagination_mode == PaginationMode::Offset) {
-            int64_t page_min = is_desc ? bounds.last_value : bounds.first_value;
-            int64_t page_max = is_desc ? bounds.first_value : bounds.last_value;
-            int64_t range_min = std::min(old_val, new_val);
-            int64_t range_max = std::max(old_val, new_val);
-
-            if (is_incomplete) return (page_min <= range_max);
-            return (page_min <= range_max) && (range_min <= page_max);
-        } else {
-            return bounds.isValueInRange(old_val, is_first_page, is_incomplete, is_desc)
-                || bounds.isValueInRange(new_val, is_first_page, is_incomplete, is_desc);
         }
     }
 };
