@@ -15,6 +15,7 @@
 #include "jcailloux/relais/Log.h"
 #include "jcailloux/relais/io/IoContext.h"
 #include "jcailloux/relais/io/Task.h"
+#include "jcailloux/relais/io/WhenAll.h"
 #include "jcailloux/relais/io/pg/PgConnection.h"
 #include "jcailloux/relais/io/pg/PgError.h"
 #include "jcailloux/relais/io/pg/PgParams.h"
@@ -98,6 +99,8 @@ public:
         for (const auto& job : jobs_) n += job.tickets.size();
         return n;
     }
+    /// Replays of settled tickets still running (a replay may read the database).
+    [[nodiscard]] size_t replaying() const noexcept { return replaying_; }
     /// Tickets settled so far.
     [[nodiscard]] uint64_t settled() const noexcept { return settled_; }
     /// Tickets given up: settling was refused and no statement_timeout bounds the write.
@@ -326,7 +329,9 @@ private:
 
     // In one synchronous step, every ticket of the job becomes Settled and gives
     // up its replays; a replay registered from now on runs at once. Then the
-    // replays run, each failure logged without stopping the next ones.
+    // replays start in registration order, together: one that reads the
+    // database does not hold back the evictions registered after it. A failure
+    // is logged without stopping the others.
     Task<void> settle() {
         std::vector<std::function<Task<void>()>> replays;
         for (auto& t : current_->tickets) {
@@ -337,15 +342,22 @@ private:
             t->replays.clear();
         }
         current_.reset();
-        for (auto& replay : replays) {
-            try {
-                co_await replay();
-            } catch (const std::exception& e) {
-                RELAIS_LOG_WARN << "relais: a replayed eviction failed: " << e.what();
-            } catch (...) {
-                RELAIS_LOG_WARN << "relais: a replayed eviction failed";
-            }
+        std::vector<Task<void>> runs;
+        runs.reserve(replays.size());
+        for (auto& replay : replays) runs.push_back(runReplay(std::move(replay)));
+        replaying_ += runs.size();
+        co_await whenAll(std::span<Task<void>>(runs));
+    }
+
+    Task<void> runReplay(std::function<Task<void>()> replay) {
+        try {
+            co_await replay();
+        } catch (const std::exception& e) {
+            RELAIS_LOG_WARN << "relais: a replayed eviction failed: " << e.what();
+        } catch (...) {
+            RELAIS_LOG_WARN << "relais: a replayed eviction failed";
         }
+        --replaying_;
     }
 
     Task<void> connect(std::optional<PgConnection<Io>>& conn) {
@@ -380,6 +392,7 @@ private:
 
     bool refusal_logged_ = false;
     uint64_t settled_ = 0;
+    size_t replaying_ = 0;
     uint64_t abandoned_ = 0;
     uint64_t statements_ = 0;
 #ifdef RELAIS_BUILDING_TESTS

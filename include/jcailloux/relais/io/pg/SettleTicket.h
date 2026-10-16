@@ -50,8 +50,9 @@ struct SettleTicket {
     BackendId backend;                  // Terminate / Await
     std::chrono::milliseconds delay{0}; // Delay
     State state = State::Pending;
-    // Run once settled, in registration order: the precautionary evictions,
-    // again. A failing replay does not stop the next ones.
+    // Started once settled, in registration order: the precautionary
+    // evictions, again, and the work that waited for the outcome (reading the
+    // row as committed). A failing replay does not stop the others.
     std::vector<std::function<Task<void>()>> replays;
 };
 

@@ -196,7 +196,7 @@ public:
 
     // The tracker carries predicate range modifications (eraseWhere fast-path)
     // as well as per-entity ones; the payload is a copy of the predicate filters.
-    using ModTracker = ModificationTracker<E, ChunkCount, FilterSet>;
+    using ModTracker = ModificationTracker<E, ChunkCount, FilterSet, Key>;
     using BitmapType = typename ModTracker::BitmapType;
 
     /// Whether Traits exposes the predicate fast-path hooks (only ListMixin's
@@ -352,6 +352,13 @@ public:
         modifications_.notifyRangeDeleted(predicate, generation_);
     }
 
+    /// Record that the row `key` left every page holding it, for a position
+    /// that cannot be known (uncertain write): those pages, and only those,
+    /// are invalidated lazily.
+    void onRowLeft(const Key& key) {
+        modifications_.notifyRowLeft(key, generation_);
+    }
+
     /// Invalidate a specific query.
     void invalidate(const Query& query) {
         tier_.evict(query.cacheKey());
@@ -445,6 +452,11 @@ private:
                     affected = true;
             });
         }
+        modifications_.forEachRowLeft([&](const Key& key, uint32_t gen) {
+            if (gen <= fetch_gen || gen > current) return;
+            ++seen;
+            if (!affected && isRowLeftAffecting(key, meta.query, result)) affected = true;
+        });
         return affected || seen != current - fetch_gen;
     }
 
@@ -476,6 +488,11 @@ private:
                     }
                 });
         }
+
+        modifications_.forEachRowLeft([&](const Key& key, uint32_t gen) {
+            if (affected || gen <= stored_gen) return;
+            if (isRowLeftAffecting(key, meta.query, result)) affected = true;
+        });
 
         return affected;
     }
@@ -517,7 +534,27 @@ private:
                 });
         }
 
+        modifications_.forEachRowLeftWithBitmap(
+            [&](const Key& key, uint32_t gen, BitmapType pending_chunks) {
+                if (affected) return;
+                if ((pending_chunks & (BitmapType{1} << chunk_id)) == 0) return;
+                if (gen <= stored_gen) return;
+                if (isRowLeftAffecting(key, meta.query, result)) affected = true;
+            });
+
         return affected;
+    }
+
+    /// Does a row that left its pages affect this one? A keyset page holds
+    /// the rows that follow its cursor: removing a row it does not hold moves
+    /// nothing in it. So it is affected iff it holds the row, whatever version
+    /// of the row it holds. An offset page past the first counts the rows
+    /// before it, which may include this one: always affected.
+    bool isRowLeftAffecting(const Key& key, const Query& query, const Result& result) const {
+        if (query.offset > 0) return true;
+        for (const auto& item : result.items)
+            if (Key(item.key()) == key) return true;
+        return false;
     }
 
     /// Check if a predicate range delete affects a cached page. Two gates, both

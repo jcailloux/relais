@@ -46,6 +46,20 @@ void precautionSync(const std::shared_ptr<io::SettleTicket>& ticket, Fn evict) {
     evict();
 }
 
+// Work that only makes sense once the write is settled (reading the row as it
+// was finally committed): registered without running. On a ticket already
+// settled, it runs when the returned task is awaited (after the handler); without
+// a ticket (settling Off), never.
+template<typename Fn>
+io::Task<void> onSettled(std::shared_ptr<io::SettleTicket> ticket, Fn fn) {
+    if (!ticket) co_return;
+    if (ticket->state == io::SettleTicket::State::Pending) {
+        ticket->replays.emplace_back([fn] { return runOwned(fn); });
+        co_return;
+    }
+    co_await fn();
+}
+
 } // namespace jcailloux::relais::detail
 
 #endif // JCX_RELAIS_REPOSITORY_PRECAUTION_H
