@@ -91,7 +91,8 @@ namespace detail {
 //
 
 template<typename E, size_t TotalSegments,
-         typename RangePayload = detail::NoRangePayload>
+         typename RangePayload = detail::NoRangePayload,
+         typename RowKey = int64_t>
 class ModificationTracker {
 public:
     static_assert(TotalSegments >= 2 && TotalSegments <= 64,
@@ -123,11 +124,25 @@ public:
         mutable BitmapType pending_segments;
     };
 
+    /// A row that left the pages holding it, at a position nobody knows (the
+    /// write that moved it was uncertain). Touches exactly the pages that
+    /// hold a row with this key. Same lifecycle as the other entries.
+    struct TrackedRowLeft {
+        RowKey key;
+        uint32_t generation;
+        alignas(std::atomic_ref<BitmapType>::required_alignment)
+        mutable BitmapType pending_segments;
+    };
+
 private:
     std::vector<TrackedModification> modifications_;
     std::vector<TrackedRange> ranges_;
+    std::vector<TrackedRowLeft> rows_left_;
     mutable std::shared_mutex mutex_;
     std::atomic<uint32_t> latest_generation_{0};
+    // rows_left_.size(), read without the lock: the readers skip that track
+    // when it is empty, which it is unless an uncertain write happened.
+    std::atomic<uint32_t> rows_left_count_{0};
 
     /// Atomic max into latest_generation_ (shared by entity + range tracks).
     void bumpLatest(uint32_t gen) {
@@ -189,6 +204,21 @@ public:
         return gen;
     }
 
+    /// Record a row that left its pages (see TrackedRowLeft).
+    uint32_t notifyRowLeft(RowKey key, std::atomic<uint32_t>& counter) {
+        std::unique_lock lock(mutex_);
+        uint32_t gen = counter.fetch_add(1, std::memory_order_seq_cst) + 1;
+        bumpLatest(gen);
+        rows_left_.push_back(TrackedRowLeft{
+            .key = std::move(key),
+            .generation = gen,
+            .pending_segments = initial_bitmap_
+        });
+        rows_left_count_.store(static_cast<uint32_t>(rows_left_.size()),
+                               std::memory_order_release);
+        return gen;
+    }
+
     /// The owning cache's generation, read as a sweep cutoff (see above).
     [[nodiscard]] uint32_t cutoff(const std::atomic<uint32_t>& counter) const {
         std::shared_lock lock(mutex_);
@@ -230,6 +260,7 @@ public:
     void drainChunk(uint32_t cutoff_gen, uint8_t chunk_id) {
         std::vector<size_t> to_erase;
         std::vector<size_t> to_erase_ranges;
+        std::vector<size_t> to_erase_rows;
         const BitmapType chunk_bit = BitmapType{1} << chunk_id;
         const auto clear = [&](BitmapType& slot) -> bool {
             std::atomic_ref<BitmapType> bitmap(slot);
@@ -249,9 +280,13 @@ public:
                 if (ranges_[i].generation > cutoff_gen) continue;
                 if (clear(ranges_[i].pending_segments)) to_erase_ranges.push_back(i);
             }
+            for (size_t i = 0; i < rows_left_.size(); ++i) {
+                if (rows_left_[i].generation > cutoff_gen) continue;
+                if (clear(rows_left_[i].pending_segments)) to_erase_rows.push_back(i);
+            }
         }
 
-        if (to_erase.empty() && to_erase_ranges.empty()) return;
+        if (to_erase.empty() && to_erase_ranges.empty() && to_erase_rows.empty()) return;
 
         std::unique_lock lock(mutex_);
         for (auto it = to_erase.rbegin(); it != to_erase.rend(); ++it) {
@@ -272,6 +307,17 @@ public:
                 ranges_.pop_back();
             }
         }
+        for (auto it = to_erase_rows.rbegin(); it != to_erase_rows.rend(); ++it) {
+            size_t idx = *it;
+            if (idx < rows_left_.size()) {
+                if (idx != rows_left_.size() - 1) {
+                    std::swap(rows_left_[idx], rows_left_.back());
+                }
+                rows_left_.pop_back();
+            }
+        }
+        rows_left_count_.store(static_cast<uint32_t>(rows_left_.size()),
+                               std::memory_order_release);
     }
 
     /// Erase all modifications with generation <= cutoff_gen in one pass.
@@ -284,6 +330,11 @@ public:
         std::erase_if(ranges_, [cutoff_gen](const TrackedRange& t) {
             return t.generation <= cutoff_gen;
         });
+        std::erase_if(rows_left_, [cutoff_gen](const TrackedRowLeft& t) {
+            return t.generation <= cutoff_gen;
+        });
+        rows_left_count_.store(static_cast<uint32_t>(rows_left_.size()),
+                               std::memory_order_release);
     }
 
     // =========================================================================
@@ -332,6 +383,30 @@ public:
         }
     }
 
+    /// Execute a callback for each row that left its pages, with its bitmap.
+    /// Callback signature: void(const RowKey&, uint32_t generation, BitmapType).
+    /// Nothing to visit, and no lock taken, while the track is empty.
+    template<typename Callback>
+    void forEachRowLeftWithBitmap(Callback&& callback) const {
+        if (rows_left_count_.load(std::memory_order_acquire) == 0) return;
+        std::shared_lock lock(mutex_);
+        for (const auto& tracked : rows_left_) {
+            std::atomic_ref<BitmapType> bitmap(tracked.pending_segments);
+            callback(tracked.key, tracked.generation,
+                     bitmap.load(std::memory_order_relaxed));
+        }
+    }
+
+    /// Execute a callback for each row that left its pages (without bitmap).
+    template<typename Callback>
+    void forEachRowLeft(Callback&& callback) const {
+        if (rows_left_count_.load(std::memory_order_acquire) == 0) return;
+        std::shared_lock lock(mutex_);
+        for (const auto& tracked : rows_left_) {
+            callback(tracked.key, tracked.generation);
+        }
+    }
+
     /// Check if there are modifications since the given generation.
     /// Use this for short-circuit optimization before iterating.
     [[nodiscard]] bool hasModificationsSince(uint32_t since_gen) const {
@@ -344,7 +419,7 @@ public:
 
     [[nodiscard]] bool empty() const {
         std::shared_lock lock(mutex_);
-        return modifications_.empty() && ranges_.empty();
+        return modifications_.empty() && ranges_.empty() && rows_left_.empty();
     }
 
     [[nodiscard]] size_t size() const {
@@ -355,6 +430,11 @@ public:
     [[nodiscard]] size_t rangeCount() const {
         std::shared_lock lock(mutex_);
         return ranges_.size();
+    }
+
+    [[nodiscard]] size_t rowLeftCount() const {
+        std::shared_lock lock(mutex_);
+        return rows_left_.size();
     }
 
     [[nodiscard]] uint32_t latestGeneration() const {

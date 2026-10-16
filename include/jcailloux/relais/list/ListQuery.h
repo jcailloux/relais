@@ -141,6 +141,7 @@ struct ListQuery {
     std::optional<Sort> sort;
     uint16_t limit{20};
     Cursor cursor;
+    uint32_t offset{0};     ///< Offset pagination (no cursor then)
     std::string cache_key;  ///< Canonical binary buffer (L1 cache key identity)
 
     /// Returns the canonical cache key

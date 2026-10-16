@@ -736,6 +736,30 @@ protected:
         co_return E::fromRow(result[0]);
     }
 
+#ifdef RELAIS_BUILDING_TESTS
+    /// Makes the next `count` calls of rereadRaw fail.
+    static inline int reread_faults = 0;
+#endif
+
+    /// The row as committed now, for the cache tiers once an uncertain write
+    /// is settled. Sent on the write path: a read is coalesced with an
+    /// identical one already in flight, which may have been sent before the
+    /// write committed. The write path never coalesces an exclusive statement,
+    /// and keeps it behind the writes queued on the same row.
+    static io::Task<std::optional<E>> rereadRaw(const Key& id) {
+#ifdef RELAIS_BUILDING_TESTS
+        if (reread_faults > 0) {
+            --reread_faults;
+            throw io::PgError("injected: reread failed");
+        }
+#endif
+        auto params = io::PgParams::fromKey(id);
+        auto w = co_await PgProvider::queryWrite(
+            Mapping::SQL::select_by_pk, params, io::batch::WriteMode::Exclusive, keyAt(0));
+        if (w.result.empty()) co_return std::nullopt;
+        co_return E::fromRow(w.result[0]);
+    }
+
     /// Batched find by IDs via WHERE pk = ANY($1). Returns one optional<E> per
     /// id, aligned on request order (nullopt for absent ids). Submits ONE
     /// multi-key entity entry: when it lands in a batch its keys fuse with

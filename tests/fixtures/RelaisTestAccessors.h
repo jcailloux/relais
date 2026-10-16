@@ -43,6 +43,24 @@ struct TestInternals {
         return Repo::listCache().modifications_.size();
     }
 
+    /// The L1 list cache of a repo, to drive it directly.
+    template<typename Repo>
+    static auto& listCacheOf() {
+        return Repo::listCache();
+    }
+
+    /// Rows that left their pages (uncertain writes) still tracked.
+    template<typename Repo>
+    static size_t pendingRowLeftCount() {
+        return Repo::listCache().modifications_.rowLeftCount();
+    }
+
+    /// Makes the next `n` rereads of a settled row fail.
+    template<typename Repo>
+    static void failRereads(int n) {
+        Repo::reread_faults = n;
+    }
+
     /// Number of pages held by the L1 list cache.
     template<typename Repo>
     static size_t listCacheSize() {
@@ -367,6 +385,8 @@ private:
         std::unique_lock lock(t.mutex_);
         t.modifications_.clear();
         t.ranges_.clear();  // predicate range deletes (eraseWhere fast-path)
+        t.rows_left_.clear();
+        t.rows_left_count_.store(0, std::memory_order_relaxed);
         t.latest_generation_.store(0, std::memory_order_relaxed);
     }
 };
