@@ -88,6 +88,15 @@ class ListMixin : public Base {
     static constexpr bool kHasL1 =
         Base::config.cache_level == config::CacheLevel::L1;
 
+    // The caller assigns the key an insert writes (no key column is filled by
+    // the database). A mapping that does not say is taken as database-assigned.
+    static constexpr bool kInsertKeyKnown = [] {
+        if constexpr (requires { { Mapping::insert_assigns_pk } -> std::convertible_to<bool>; })
+            return static_cast<bool>(Mapping::insert_assigns_pk);
+        else
+            return false;
+    }();
+
     // =========================================================================
     // Type aliases from list infrastructure
     // =========================================================================
@@ -245,6 +254,7 @@ class ListMixin : public Base {
         cq.filters = q.filters();
         cq.limit = q.limit();
         cq.cursor = q.cursor().raw();
+        cq.offset = q.offset();
         cq.cache_key = std::move(page_key);
         if (q.sort()) {
             cq.sort = *q.sort();
@@ -377,26 +387,38 @@ public:
     // CRUD interception — invalidates list caches on entity changes
     // =========================================================================
 
-    /// Insert and invalidate list caches. On an uncertain timeout (the INSERT may
-    /// have committed) the own-list tier is invalidated from the input entity.
+    /// Insert and invalidate list caches. Uncertain (the INSERT may commit
+    /// later): the input stands for the row until the write is settled. Then a
+    /// caller-assigned key realigns the pages on the row read again; a key the
+    /// database assigns cannot be read back, and every page is invalidated.
     static io::Task<cache::CacheView<Entity>> insert(const Entity& entity)
         requires MutableEntity<Entity> && (!Base::config.read_only)
     {
+        cache::CacheView<Entity> result;
+        std::exception_ptr uncertain;
+        std::shared_ptr<io::SettleTicket> ticket;
         try {
-            auto result = co_await Base::insert(entity);
-            if (result) {
-                if constexpr (kHasL1) { listCache().onEntityCreated(*result); }
-            }
-            co_return result;
+            result = co_await Base::insert(entity);
         } catch (const io::PgUncertainError& e) {
-            // Uncertain: invalidate the own-list tier from the input entity (the
-            // L1 bump cannot fail), then rethrow.
-            if constexpr (kHasL1) {
-                detail::precautionSync(e.settleTicket(),
-                    [entity] { listCache().onEntityCreated(entity); });
-            }
-            throw;
+            ticket = e.settleTicket();
+            uncertain = std::current_exception();
         }
+        if (uncertain) {
+            if constexpr (kHasL1) {
+                if constexpr (kInsertKeyKnown) {
+                    co_await realignUncertain(std::move(ticket), Key(entity.key()), entity);
+                } else {
+                    listCache().onEntityCreated(entity);
+                    co_await detail::onSettled(std::move(ticket),
+                        []() -> io::Task<void> { co_await invalidateAllListGroups(); });
+                }
+            }
+            std::rethrow_exception(uncertain);
+        }
+        if (result) {
+            if constexpr (kHasL1) { listCache().onEntityCreated(*result); }
+        }
+        co_return result;
     }
 
     /// Insert-or-update and invalidate list caches. The create/update discriminant
@@ -432,26 +454,26 @@ public:
     /// Partial update, then list invalidation (only if committed) from the row
     /// before and after, both returned by the write itself: the row leaves the
     /// pages of its old position and enters those of its new one. Uncertain:
-    /// the new version is unknown; the old position is invalidated from the
-    /// copy a cache tier kept before its precautionary evict
-    /// (`uncertain_before`, shared with a stacked InvalidationMixin), the new
-    /// one is left to l1_ttl (logged).
+    /// see realignUncertain (no estimate: the input is not a row).
     template<bool WithBefore, typename... Updates>
     static io::Task<typename Base::PatchedRow> patchRow(
         const Key& id, std::optional<Entity>* uncertain_before, Updates&&... updates)
         requires HasFieldUpdate<Entity> && (!Base::config.read_only)
     {
         static_assert(WithBefore, "this cascade reads the row before the write");
-        std::optional<Entity> own_before;
-        if (!uncertain_before) uncertain_before = &own_before;
-
         typename Base::PatchedRow row;
+        std::exception_ptr uncertain;
+        std::shared_ptr<io::SettleTicket> ticket;
         try {
             row = co_await Base::template patchRow<true>(
                 id, uncertain_before, std::forward<Updates>(updates)...);
         } catch (const io::PgUncertainError& e) {
-            invalidateListsUncertainPatch(e.settleTicket(), *uncertain_before, "patch");
-            throw;
+            ticket = e.settleTicket();
+            uncertain = std::current_exception();
+        }
+        if (uncertain) {
+            if constexpr (kHasL1) co_await realignUncertain(std::move(ticket), id, std::nullopt);
+            std::rethrow_exception(uncertain);
         }
         co_await invalidateListsPatched(row);
         co_return row;
@@ -466,16 +488,19 @@ public:
         requires HasFieldUpdate<Entity> && (!Base::config.read_only)
     {
         static_assert(WithBefore, "this cascade reads the row before the write");
-        std::optional<Entity> own_before;
-        if (!uncertain_before) uncertain_before = &own_before;
-
         std::optional<typename Base::PatchedRow> row;
+        std::exception_ptr uncertain;
+        std::shared_ptr<io::SettleTicket> ticket;
         try {
             row = co_await Base::template patchIfRow<true>(
                 id, uncertain_before, guard, std::forward<Updates>(updates)...);
         } catch (const io::PgUncertainError& e) {
-            invalidateListsUncertainPatch(e.settleTicket(), *uncertain_before, "patchIf");
-            throw;
+            ticket = e.settleTicket();
+            uncertain = std::current_exception();
+        }
+        if (uncertain) {
+            if constexpr (kHasL1) co_await realignUncertain(std::move(ticket), id, std::nullopt);
+            std::rethrow_exception(uncertain);
         }
         if (row) co_await invalidateListsPatched(*row);
         co_return row;
@@ -625,11 +650,8 @@ protected:
 
     /// Update, then list invalidation from the row before and after (the row
     /// leaves the pages of its old position and enters those of its new one).
-    /// Uncertain: the UPDATE returned nothing; the old position is keyed on the
-    /// copy a cache tier kept before its precautionary evict
-    /// (`uncertain_before`, shared with a stacked InvalidationMixin), the new
-    /// one on the input entity. Without a copy (row not in L1), the old
-    /// position is left to l1_ttl.
+    /// Uncertain: see realignUncertain, the input standing for the row until
+    /// the write is settled.
     template<bool WithBefore>
     static io::Task<typename Base::UpdateOutcome> updateOutcome(
         const Key& id, const Entity& entity,
@@ -637,22 +659,18 @@ protected:
         requires MutableEntity<Entity> && HasFullUpdate<Entity> && (!Base::config.read_only)
     {
         static_assert(WithBefore, "this cascade reads the row before the write");
-        std::optional<Entity> own_before;
-        if (!uncertain_before) uncertain_before = &own_before;
-
         typename Base::UpdateOutcome outcome;
+        std::exception_ptr uncertain;
+        std::shared_ptr<io::SettleTicket> ticket;
         try {
             outcome = co_await Base::template updateOutcome<true>(id, entity, uncertain_before);
         } catch (const io::PgUncertainError& e) {
-            // The L1 tracker bump cannot fail.
-            if constexpr (kHasL1) {
-                detail::precautionSync(e.settleTicket(),
-                    [before = *uncertain_before, entity] {
-                        if (before) listCache().onEntityUpdated(*before, entity);
-                        else listCache().onEntityCreated(entity);
-                    });
-            }
-            throw;
+            ticket = e.settleTicket();
+            uncertain = std::current_exception();
+        }
+        if (uncertain) {
+            if constexpr (kHasL1) co_await realignUncertain(std::move(ticket), id, entity);
+            std::rethrow_exception(uncertain);
         }
         if (outcome.affected.value_or(0) > 0) {
             // The committed row, not the input, is the new position: the
@@ -669,10 +687,7 @@ protected:
     }
 
     /// Erase, then list invalidation from the deleted row (the pages it lived
-    /// in). Uncertain: the DELETE returned nothing, so the pages are keyed on
-    /// the copy a cache tier kept before its precautionary evict
-    /// (`uncertain_before`, shared with a stacked InvalidationMixin). Without
-    /// one (row not in L1), the pages are left to l1_ttl.
+    /// in). Uncertain: see realignUncertain (no estimate: the row may be gone).
     template<bool WithBefore>
     static io::Task<typename Base::EraseOutcome> eraseOutcome(
         const Key& id, const Entity* hint = nullptr,
@@ -680,20 +695,18 @@ protected:
         requires (!Base::config.read_only)
     {
         static_assert(WithBefore, "this cascade reads the row before the write");
-        std::optional<Entity> own_before;
-        if (!uncertain_before) uncertain_before = &own_before;
-
         typename Base::EraseOutcome outcome;
+        std::exception_ptr uncertain;
+        std::shared_ptr<io::SettleTicket> ticket;
         try {
             outcome = co_await Base::template eraseOutcome<true>(id, hint, uncertain_before);
         } catch (const io::PgUncertainError& e) {
-            if (const auto& before = *uncertain_before) {
-                if constexpr (kHasL1) {
-                    detail::precautionSync(e.settleTicket(),
-                        [b = *before] { listCache().onEntityDeleted(b); });
-                }
-            }
-            throw;
+            ticket = e.settleTicket();
+            uncertain = std::current_exception();
+        }
+        if (uncertain) {
+            if constexpr (kHasL1) co_await realignUncertain(std::move(ticket), id, std::nullopt);
+            std::rethrow_exception(uncertain);
         }
         if (outcome.before) {
             if constexpr (kHasL1) { listCache().onEntityDeleted(*outcome.before); }
@@ -709,19 +722,34 @@ protected:
         co_return;
     }
 
-    /// List invalidation of an uncertain patch: the row may have left the
-    /// pages of `before` (a cache tier's copy, if it had one) for a position
-    /// that cannot be known. Those pages are invalidated as for a deletion;
-    /// the new position is left to l1_ttl (logged).
-    static void invalidateListsUncertainPatch(
-        const std::shared_ptr<io::SettleTicket>& ticket,
-        const std::optional<Entity>& before, const char* op) {
-        RELAIS_LOG_ERROR << name() << ": " << op
-            << " timeout — new row version unknowable, its list pages left to l1_ttl";
-        if (!before) return;
-        if constexpr (kHasL1) {
-            detail::precautionSync(ticket, [b = *before] { listCache().onEntityDeleted(b); });
+    /// The pages of an uncertain write of the row `id` (it may commit after
+    /// this, until the write is settled). The row leaves every page holding
+    /// it, whatever version they hold: now, and again once settled. Until
+    /// then, `estimate` (the input, when it is a whole row) stands for where it
+    /// may enter. Once settled, the row read again enters the pages of its
+    /// position as committed (realignOnSettled).
+    static io::Task<void> realignUncertain(std::shared_ptr<io::SettleTicket> ticket, Key id,
+                                           std::optional<Entity> estimate) {
+        detail::precautionSync(ticket, [id] { listCache().onRowLeft(id); });
+        if (estimate) listCache().onEntityCreated(*estimate);
+        co_await detail::onSettled(std::move(ticket), [id] { return realignOnSettled(id); });
+    }
+
+    /// The row as committed, once an uncertain write of it is settled: it
+    /// enters the pages of its position (it may differ from the caller's
+    /// version: trigger, generated column, rounding). If it cannot be read,
+    /// nothing tells that position: every page is invalidated.
+    static io::Task<void> realignOnSettled(Key id) {
+        std::optional<Entity> row;
+        try {
+            row = co_await Base::rereadRaw(id);
+        } catch (const std::exception& e) {
+            RELAIS_LOG_WARN << name() << ": row unreadable after an uncertain write, "
+                               "every list page invalidated - " << e.what();
+            listCache().onEntityRangeDeleted(DescriptorFilters{});
+            co_return;
         }
+        if (row) listCache().onEntityCreated(*row);
     }
 
     static io::Task<cache::CacheView<Entity>> upsertWithContext(
@@ -729,25 +757,19 @@ protected:
         requires UpsertableEntity<Entity, Key> && HasUpsertSql<Entity> && (!Base::config.read_only)
     {
         cache::CacheView<Entity> result;
+        std::exception_ptr uncertain;
+        std::shared_ptr<io::SettleTicket> ticket;
         try {
             result = co_await Base::upsert(entity);
         } catch (const io::PgUncertainError& e) {
-            // Uncertain: the ON CONFLICT statement may have committed as either
-            // branch. Keyed on the pre-image — a known old migrates to the input
-            // entity (its fields fully known), an unknown old appends. The L1
-            // tracker bump cannot fail. An update from an unknown old leaves that
-            // old position bounded by l1_ttl — the same residual update already
-            // tolerates.
-            if constexpr (kHasL1) {
-                std::optional<Entity> old;
-                if (old_entity) old.emplace(*old_entity);
-                detail::precautionSync(e.settleTicket(),
-                    [old = std::move(old), entity] {
-                        if (old) listCache().onEntityUpdated(*old, entity);
-                        else listCache().onEntityCreated(entity);
-                    });
-            }
-            throw;
+            ticket = e.settleTicket();
+            uncertain = std::current_exception();
+        }
+        if (uncertain) {
+            // Either branch may commit: the key is known in both.
+            if constexpr (kHasL1)
+                co_await realignUncertain(std::move(ticket), Key(entity.key()), entity);
+            std::rethrow_exception(uncertain);
         }
         if (result) {
             // Committed: an existing row migrates (old → the RETURNING row), an

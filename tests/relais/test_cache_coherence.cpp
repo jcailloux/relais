@@ -762,7 +762,7 @@ TEST_CASE("coherence: concurrent identical writes stay live and cache-consistent
 // Erase of an entity with lists — the DELETE returns the row it deleted and the
 // list pages are keyed on it: no read before the write, and the position is the
 // one PostgreSQL removed, not a cached copy. An uncertain erase returns nothing:
-// the pages are then keyed on the copy L1 still holds.
+// the pages holding the row are invalidated, whatever version they hold.
 // =============================================================================
 
 using CohArticleL1 = Repo<TestArticleEntity, "coh:article:l1">;
@@ -834,7 +834,7 @@ void eraseKeysOnDeletedRow(CohEnv& env) {
 }
 
 template<typename ListRepo>
-void uncertainEraseKeysOnL1Copy(CohEnv& env) {
+void uncertainEraseLeavesItsPages(CohEnv& env) {
     resetArticleCaches<ListRepo>(env);
     // Prepare the DELETE once, so the held erase waits only on its result.
     driveBounded(env.io, ListRepo::erase(seedArticle(env, "coh-unc")));
@@ -902,35 +902,42 @@ TEST_CASE("erase with lists: identical erases in flight invalidate the row's pag
     CHECK_FALSE(pageHolds<CohArticleL1>(env, "coh-twice", id));
 }
 
-TEST_CASE("erase with lists: an uncertain erase keys the pages on the L1 copy",
+TEST_CASE("erase with lists: an uncertain erase invalidates the pages holding the row",
           "[coherence][list][erase][scenarioA][integration]") {
     CohEnv env(300ms);
-    uncertainEraseKeysOnL1Copy<CohArticleL1>(env);
+    uncertainEraseLeavesItsPages<CohArticleL1>(env);
 }
 
-TEST_CASE("erase with lists: an uncertain erase with no cached copy only throws",
+TEST_CASE("erase with lists: an uncertain erase needs no cached copy of the row",
           "[coherence][list][erase][scenarioA][integration]") {
-    // The row is never read, so L1 holds no copy of it. Nothing tells which
-    // pages held the row: they are left to their TTL. The caller still gets the
-    // uncertain error, and nothing else.
+    // The row is never read, so L1 holds no copy of it: the pages holding it
+    // are found by its key.
     CohEnv env(300ms);
     resetArticleCaches<CohArticleL1>(env);
     driveBounded(env.io, CohArticleL1::erase(seedArticle(env, "coh-unc-nocopy")));
     auto id = seedArticle(env, "coh-unc-nocopy");
+    auto other = seedArticle(env, "coh-unc-nocopy-other");
+    REQUIRE(pageHolds<CohArticleL1>(env, "coh-unc-nocopy", id));
+    REQUIRE(pageHolds<CohArticleL1>(env, "coh-unc-nocopy-other", other));
+    // Written behind relais: a page still cached does not show it.
+    auto hidden = seedArticle(env, "coh-unc-nocopy-other");
 
     env.holdPg();
     CHECK_THROWS_AS(driveBounded(env.io, CohArticleL1::erase(id)), io::PgQueryTimeout);
     env.releasePg();
     CHECK_FALSE(articleExists(env, id));
+    CHECK_FALSE(pageHolds<CohArticleL1>(env, "coh-unc-nocopy", id));
+    CHECK_FALSE(pageHolds<CohArticleL1>(env, "coh-unc-nocopy-other", hidden));  // left alone
 }
 
 // =============================================================================
 // Update of an entity with lists — the UPDATE locks the row in a CTE and
 // returns it before and after: the pages of both positions are keyed on the
 // versions PostgreSQL replaced and committed, with no read before the write. An
-// uncertain update returns nothing: the old position is then keyed on the copy
-// L1 still holds, the new one on the input. A patch already returned both
-// versions; an uncertain one now invalidates the old position from that copy.
+// uncertain update returns nothing: the pages holding the row are invalidated,
+// and the input stands for its new position until the write is settled. A
+// patch already returned both versions; an uncertain one invalidates the pages
+// holding the row the same way.
 // =============================================================================
 
 namespace {
@@ -990,7 +997,7 @@ void updateKeysOnReplacedRow(CohEnv& env) {
 }
 
 template<typename ListRepo>
-void uncertainUpdateKeysOnL1Copy(CohEnv& env) {
+void uncertainUpdateMovesBothPositions(CohEnv& env) {
     resetArticleCaches<ListRepo>(env);
     // Prepare the UPDATE once, so the held update waits only on its result.
     auto warm = seedArticle(env, "coh-upd-unc-warm");
@@ -1011,7 +1018,7 @@ void uncertainUpdateKeysOnL1Copy(CohEnv& env) {
 }
 
 template<typename ListRepo>
-void uncertainPatchKeysOnL1Copy(CohEnv& env) {
+void uncertainPatchLeavesItsPages(CohEnv& env) {
     resetArticleCaches<ListRepo>(env);
     // Prepare the patch statement once, so the held one waits only on its result.
     driveBounded(env.io, ListRepo::patch(seedArticle(env, "coh-pat-unc-warm"),
@@ -1084,22 +1091,22 @@ TEST_CASE("update with lists: identical updates in flight invalidate both positi
     CHECK(pageHolds<CohArticleL1>(env, "coh-upd-twice-b", id));
 }
 
-TEST_CASE("update with lists: an uncertain update keys the old position on the L1 copy",
+TEST_CASE("update with lists: an uncertain update moves the row between both positions",
           "[coherence][list][update][scenarioA][integration]") {
     CohEnv env(300ms);
-    uncertainUpdateKeysOnL1Copy<CohArticleL1>(env);
+    uncertainUpdateMovesBothPositions<CohArticleL1>(env);
 }
 
-TEST_CASE("update with lists: an uncertain update with no cached copy keys the new position",
+TEST_CASE("update with lists: an uncertain update needs no cached copy of the row",
           "[coherence][list][update][scenarioA][integration]") {
-    // The row is never read, so L1 holds no copy of it. The old position is
-    // unknown and left to its TTL; the new one is the input. The caller still
-    // gets the uncertain error, and nothing else.
+    // The row is never read, so L1 holds no copy of it: the pages holding it
+    // are found by its key; the new position is the input.
     CohEnv env(300ms);
     resetArticleCaches<CohArticleL1>(env);
     auto warm = seedArticle(env, "coh-upd-nocopy-warm");
     driveBounded(env.io, CohArticleL1::update(warm, articleIn(warm, "coh-upd-nocopy-warm")));
     auto id = seedArticle(env, "coh-upd-nocopy-a");
+    REQUIRE(pageHolds<CohArticleL1>(env, "coh-upd-nocopy-a", id));
     REQUIRE_FALSE(pageHolds<CohArticleL1>(env, "coh-upd-nocopy-b", id));
 
     env.holdPg();
@@ -1108,13 +1115,14 @@ TEST_CASE("update with lists: an uncertain update with no cached copy keys the n
                     io::PgQueryTimeout);
     env.releasePg();
     CHECK(articleCategory(env, id) == "coh-upd-nocopy-b");
+    CHECK_FALSE(pageHolds<CohArticleL1>(env, "coh-upd-nocopy-a", id));
     CHECK(pageHolds<CohArticleL1>(env, "coh-upd-nocopy-b", id));
 }
 
-TEST_CASE("patch with lists: an uncertain patch invalidates the old position from the L1 copy",
+TEST_CASE("patch with lists: an uncertain patch invalidates the pages holding the row",
           "[coherence][list][patch][scenarioA][integration]") {
     CohEnv env(300ms);
-    uncertainPatchKeysOnL1Copy<CohArticleL1>(env);
+    uncertainPatchLeavesItsPages<CohArticleL1>(env);
 }
 
 // =============================================================================
@@ -1344,7 +1352,10 @@ bool pumpUntil(CohEnv& env, Pred pred, std::chrono::milliseconds budget) {
 
 Queue& queueOf(CohEnv& env) { return env.batcher->settleQueue(); }
 
-bool settledAll(CohEnv& env) { return queueOf(env).pending() == 0; }
+// Settled, and every replay done (a replay may read the row again).
+bool settledAll(CohEnv& env) {
+    return queueOf(env).pending() == 0 && queueOf(env).replaying() == 0;
+}
 
 // The settle connection carries the pool's application_name: count only the
 // backend named by the ticket.
@@ -1883,7 +1894,6 @@ TEST_CASE("replay: the pages of both positions follow a move committed late",
     auto warm = seedArticle(env, "coh-rep-warm");
     driveBounded(env.io, CohArticleL1::update(warm, articleIn(warm, "coh-rep-warm")));
     auto id = seedArticle(env, "coh-rep-a");
-    REQUIRE(driveBounded(env.io, CohArticleL1::find(id)));  // the L1 copy keys the old position
     std::optional<RowLock> lock;
     lock.emplace("relais_test_articles", "id=" + std::to_string(id));
 
@@ -1991,4 +2001,261 @@ TEST_CASE("replay: the second eviction is as narrow as the first",
     });
     CHECK_FALSE(inL1Item(id));
     CHECK(inL1Item(other));
+}
+
+// =============================================================================
+// Realigned list pages — after an uncertain write, the row leaves every page
+// holding it (found by its key, whatever version they hold), now and again
+// once the write is settled. Once settled, the row read again enters the pages
+// of its position as committed, which may not be the caller's version. Each
+// case also checks that a page of another group stays cached.
+// =============================================================================
+
+namespace {
+
+// A trigger on relais_test_articles for the length of a case.
+struct ArticleTrigger {
+    io::test::PgProbe& probe;
+    std::string name;
+    ArticleTrigger(CohEnv& env, std::string trigger, const std::string& timing,
+                   const std::string& body)
+        : probe(env.probe), name(std::move(trigger)) {
+        drop();
+        probe.query("CREATE FUNCTION " + name + "() RETURNS trigger AS $$ BEGIN " + body
+                    + " RETURN NEW; END $$ LANGUAGE plpgsql");
+        probe.query("CREATE TRIGGER " + name + " " + timing
+                    + " ON relais_test_articles FOR EACH ROW EXECUTE FUNCTION " + name + "()");
+    }
+    ~ArticleTrigger() {
+        try { drop(); } catch (...) {}
+    }
+    // Through the function, which the test role owns: dropping the trigger
+    // itself needs to own the table.
+    void drop() {
+        probe.query("SET client_min_messages = warning");
+        probe.query("DROP FUNCTION IF EXISTS " + name + "() CASCADE");
+    }
+};
+
+// Rows of a category's first page, as relais serves it.
+template<typename ListRepo>
+size_t pageCount(CohEnv& env, const std::string& category) {
+    using Desc = typename ListRepo::ListDescriptorType;
+    ld::ListQueryParams<Desc> p;
+    p.limit = 10;
+    p.filters.template get<"category">() = category;
+    return driveBounded(env.io, ListRepo::query(ld::seal<Desc>(std::move(p))))->items.size();
+}
+
+// Clears the injected reread failures whatever the outcome of the case.
+struct RereadFaultReset {
+    ~RereadFaultReset() { relais_test::TestInternals::failRereads<CohArticleL1>(0); }
+};
+
+}  // namespace
+
+TEST_CASE("realign: an update rewritten by a trigger enters the pages of the committed row",
+          "[coherence][settle][realign][list][integration]") {
+    CohEnv env(300ms, io::UncertainSettle::Await);
+    resetArticleCaches<CohArticleL1>(env);
+    ArticleTrigger trigger(env, "coh_rl_rewrite", "BEFORE UPDATE",
+        "IF NEW.category = 'coh-rl-input' THEN NEW.category := 'coh-rl-real'; END IF;");
+    auto warm = seedArticle(env, "coh-rl-warm");
+    driveBounded(env.io, CohArticleL1::update(warm, articleIn(warm, "coh-rl-warm")));
+    auto id = seedArticle(env, "coh-rl-old");
+    auto other = seedArticle(env, "coh-rl-other");
+    REQUIRE(pageHolds<CohArticleL1>(env, "coh-rl-other", other));
+    std::optional<RowLock> lock;
+    lock.emplace("relais_test_articles", "id=" + std::to_string(id));
+
+    settleAfterRefill(env, lock, CohArticleL1::update(id, articleIn(id, "coh-rl-input")), [&] {
+        CHECK(pageHolds<CohArticleL1>(env, "coh-rl-old", id));
+        CHECK_FALSE(pageHolds<CohArticleL1>(env, "coh-rl-real", id));
+    });
+    REQUIRE(articleCategory(env, id) == "coh-rl-real");
+    auto hidden = seedArticle(env, "coh-rl-other");  // a cached page does not show it
+    CHECK_FALSE(pageHolds<CohArticleL1>(env, "coh-rl-old", id));
+    CHECK(pageHolds<CohArticleL1>(env, "coh-rl-real", id));
+    CHECK_FALSE(pageHolds<CohArticleL1>(env, "coh-rl-other", hidden));
+}
+
+TEST_CASE("realign: a patch committed late moves the row between its pages",
+          "[coherence][settle][realign][list][integration]") {
+    CohEnv env(300ms, io::UncertainSettle::Await);
+    resetArticleCaches<CohArticleL1>(env);
+    driveBounded(env.io, CohArticleL1::patch(seedArticle(env, "coh-rl-pat-warm"),
+                                             setCategory("coh-rl-pat-warm")));
+    auto id = seedArticle(env, "coh-rl-pat-a");
+    auto other = seedArticle(env, "coh-rl-pat-other");
+    REQUIRE(pageHolds<CohArticleL1>(env, "coh-rl-pat-other", other));
+    std::optional<RowLock> lock;
+    lock.emplace("relais_test_articles", "id=" + std::to_string(id));
+
+    settleAfterRefill(env, lock, CohArticleL1::patch(id, setCategory("coh-rl-pat-b")), [&] {
+        CHECK(pageHolds<CohArticleL1>(env, "coh-rl-pat-a", id));
+        CHECK_FALSE(pageHolds<CohArticleL1>(env, "coh-rl-pat-b", id));
+    });
+    REQUIRE(articleCategory(env, id) == "coh-rl-pat-b");
+    auto hidden = seedArticle(env, "coh-rl-pat-other");
+    CHECK_FALSE(pageHolds<CohArticleL1>(env, "coh-rl-pat-a", id));
+    CHECK(pageHolds<CohArticleL1>(env, "coh-rl-pat-b", id));
+    CHECK_FALSE(pageHolds<CohArticleL1>(env, "coh-rl-pat-other", hidden));
+}
+
+TEST_CASE("realign: an erase committed late leaves the pages holding the row",
+          "[coherence][settle][realign][list][integration]") {
+    CohEnv env(300ms, io::UncertainSettle::Await);
+    resetArticleCaches<CohArticleL1>(env);
+    driveBounded(env.io, CohArticleL1::erase(seedArticle(env, "coh-rl-era-warm")));
+    auto id = seedArticle(env, "coh-rl-era");
+    auto other = seedArticle(env, "coh-rl-era-other");
+    REQUIRE(pageHolds<CohArticleL1>(env, "coh-rl-era-other", other));
+    std::optional<RowLock> lock;
+    lock.emplace("relais_test_articles", "id=" + std::to_string(id));
+
+    settleAfterRefill(env, lock, CohArticleL1::erase(id), [&] {
+        CHECK(pageHolds<CohArticleL1>(env, "coh-rl-era", id));  // no L1 copy of the row
+    });
+    REQUIRE_FALSE(articleExists(env, id));
+    auto hidden = seedArticle(env, "coh-rl-era-other");
+    CHECK_FALSE(pageHolds<CohArticleL1>(env, "coh-rl-era", id));
+    CHECK_FALSE(pageHolds<CohArticleL1>(env, "coh-rl-era-other", hidden));
+}
+
+TEST_CASE("realign: Terminate cancels the update, the pages match PostgreSQL",
+          "[coherence][settle][realign][list][integration]") {
+    CohEnv env(300ms);
+    resetArticleCaches<CohArticleL1>(env);
+    auto warm = seedArticle(env, "coh-rl-ter-warm");
+    driveBounded(env.io, CohArticleL1::update(warm, articleIn(warm, "coh-rl-ter-warm")));
+    auto id = seedArticle(env, "coh-rl-ter-a");
+    std::optional<RowLock> lock;
+    lock.emplace("relais_test_articles", "id=" + std::to_string(id));
+
+    queueOf(env).pause();
+    auto t = uncertainTicket(env, CohArticleL1::update(id, articleIn(id, "coh-rl-ter-b")));
+    REQUIRE(t);
+    CHECK(pageHolds<CohArticleL1>(env, "coh-rl-ter-a", id));
+    queueOf(env).resume();
+    REQUIRE(pumpUntil(env, [&] { return settledAll(env); }, 7s));
+    lock.reset();
+    REQUIRE(articleCategory(env, id) == "coh-rl-ter-a");
+    CHECK(pageHolds<CohArticleL1>(env, "coh-rl-ter-a", id));
+    CHECK_FALSE(pageHolds<CohArticleL1>(env, "coh-rl-ter-b", id));
+}
+
+TEST_CASE("realign: a row that cannot be read again invalidates every page",
+          "[coherence][settle][realign][list][integration]") {
+    CohEnv env(300ms, io::UncertainSettle::Await);
+    LogCapture logs;
+    RereadFaultReset faults;
+    resetArticleCaches<CohArticleL1>(env);
+    auto warm = seedArticle(env, "coh-rl-fail-warm");
+    driveBounded(env.io, CohArticleL1::update(warm, articleIn(warm, "coh-rl-fail-warm")));
+    auto id = seedArticle(env, "coh-rl-fail-a");
+    auto other = seedArticle(env, "coh-rl-fail-other");
+    REQUIRE(pageHolds<CohArticleL1>(env, "coh-rl-fail-other", other));
+    std::optional<RowLock> lock;
+    lock.emplace("relais_test_articles", "id=" + std::to_string(id));
+    relais_test::TestInternals::failRereads<CohArticleL1>(1);
+
+    settleAfterRefill(env, lock, CohArticleL1::update(id, articleIn(id, "coh-rl-fail-b")), [] {});
+    auto hidden = seedArticle(env, "coh-rl-fail-other");
+    CHECK(pageHolds<CohArticleL1>(env, "coh-rl-fail-other", hidden));  // dropped as well
+    CHECK(pageHolds<CohArticleL1>(env, "coh-rl-fail-b", id));
+    CHECK(LogCapture::count(log::Level::Warn, "row unreadable") == 1);
+}
+
+TEST_CASE("realign: an insert with a database-assigned key rewritten by a trigger is found",
+          "[coherence][settle][realign][list][integration]") {
+    CohEnv env(300ms, io::UncertainSettle::Await);
+    resetArticleCaches<CohArticleL1>(env);
+    ArticleTrigger trigger(env, "coh_rl_ins_rewrite", "BEFORE INSERT",
+        "IF NEW.category = 'coh-rl-ins-input' THEN NEW.category := 'coh-rl-ins-real'; END IF;");
+    driveBounded(env.io, CohArticleL1::insert(articleIn(0, "coh-rl-ins-warm")));
+    std::optional<RowLock> lock;
+    lock.emplace("relais_test_articles", "false");  // opens the transaction
+    lock->locker.query("LOCK TABLE relais_test_articles IN SHARE MODE");
+
+    settleAfterRefill(env, lock, CohArticleL1::insert(articleIn(0, "coh-rl-ins-input")), [&] {
+        CHECK(pageCount<CohArticleL1>(env, "coh-rl-ins-real") == 0);
+    });
+    REQUIRE(env.probe.query("SELECT count(*) FROM relais_test_articles "
+                            "WHERE category='coh-rl-ins-real'").get(0, 0) == "1");
+    CHECK(pageCount<CohArticleL1>(env, "coh-rl-ins-real") == 1);
+}
+
+TEST_CASE("realign: a page is tested against a row that left by the row's key",
+          "[coherence][settle][realign][list]") {
+    relais_test::TestInternals::resetListCacheState<CohArticleL1>();
+    auto& lc = relais_test::TestInternals::listCacheOf<CohArticleL1>();
+    using Cache = std::remove_reference_t<decltype(lc)>;
+    auto query = [](std::string key, uint32_t offset = 0) {
+        typename Cache::Query q;
+        q.limit = 10;
+        q.offset = offset;
+        q.cache_key = std::move(key);
+        return q;
+    };
+    auto rows = [](std::initializer_list<int64_t> ids) {
+        typename Cache::Result r;
+        for (auto id : ids) {
+            TestArticleEntity a;
+            a.id = id;
+            r.items.push_back(a);
+        }
+        return r;
+    };
+    const auto holds = query("realign:holds");
+    const auto other = query("realign:other");
+
+    SECTION("fetched before the row left, stored after: refused only if it holds the row") {
+        auto gen = lc.generation();
+        lc.onRowLeft(7);
+        lc.put(holds, rows({5, 7, 9}), gen);
+        lc.put(other, rows({5, 9}), gen);
+        CHECK_FALSE(lc.get(holds));
+        CHECK(lc.get(other));
+    }
+    SECTION("stored before: invalidated on its next read only if it holds the row") {
+        lc.put(holds, rows({5, 7, 9}), lc.generation());
+        lc.put(other, rows({5, 9}), lc.generation());
+        lc.onRowLeft(7);
+        CHECK_FALSE(lc.get(holds));
+        CHECK(lc.get(other));
+    }
+    SECTION("an offset page past the first counts the row before it: invalidated") {
+        const auto past = query("realign:offset", 10);
+        lc.put(past, rows({5, 9}), lc.generation());
+        lc.onRowLeft(7);
+        CHECK_FALSE(lc.get(past));
+    }
+    SECTION("the sweep drops the page holding the row, then forgets the row") {
+        lc.put(holds, rows({5, 7, 9}), lc.generation());
+        lc.put(other, rows({5, 9}), lc.generation());
+        lc.onRowLeft(7);
+        REQUIRE(relais_test::TestInternals::pendingRowLeftCount<CohArticleL1>() == 1);
+        for (long c = 0; c < static_cast<long>(Cache::chunkCount()); ++c) lc.sweep(c);
+        CHECK(relais_test::TestInternals::pendingRowLeftCount<CohArticleL1>() == 0);
+        CHECK_FALSE(lc.get(holds));
+        CHECK(lc.get(other));
+    }
+    relais_test::TestInternals::resetListCacheState<CohArticleL1>();
+}
+
+TEST_CASE("realign: writes that succeed leave no row behind and settle nothing",
+          "[coherence][settle][realign][list][integration]") {
+    CohEnv env(1s);
+    resetArticleCaches<CohArticleL1>(env);
+    auto created = driveBounded(env.io, CohArticleL1::insert(articleIn(0, "coh-rl-ok")));
+    REQUIRE(created);
+    auto id = created->id;
+    CHECK(pageHolds<CohArticleL1>(env, "coh-rl-ok", id));
+    driveBounded(env.io, CohArticleL1::update(id, articleIn(id, "coh-rl-ok-b")));
+    driveBounded(env.io, CohArticleL1::patch(id, setCategory("coh-rl-ok-c")));
+    CHECK(pageHolds<CohArticleL1>(env, "coh-rl-ok-c", id));
+    driveBounded(env.io, CohArticleL1::erase(id));
+    CHECK(relais_test::TestInternals::pendingRowLeftCount<CohArticleL1>() == 0);
+    CHECK(queueOf(env).settled() == 0);
+    CHECK(queueOf(env).pending() == 0);
 }

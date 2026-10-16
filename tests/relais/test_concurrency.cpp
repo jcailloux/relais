@@ -1273,6 +1273,47 @@ TEST_CASE("Concurrency - eraseWhere RangeModification vs concurrent sweep",
 }
 
 
+// -----------------------------------------------------------------------------
+//  Rows that left their pages (uncertain writes) vs concurrent reads and sweep
+//
+//  Producers record rows that left (the key of a row each cached page holds);
+//  queriers test their pages against them (forEachRowLeftWithBitmap, scanning
+//  the page's keys) and a sweeper drains them. A deterministic post-drain
+//  proves the track empty.
+// -----------------------------------------------------------------------------
+
+TEST_CASE("Concurrency - rows that left their pages vs concurrent reads and sweep",
+          "[integration][db][concurrency][tsan][tracker]")
+{
+    TransactionGuard tx;
+    TestInternals::resetListCacheState<TestArticleListRepo>();
+
+    auto A = insertTestUser("conc_rl_a", "conc_rl_a@x", 0);
+    std::vector<int64_t> ids;
+    for (int i = 0; i < 10; ++i)
+        ids.push_back(insertTestArticle("tech", A, "RL_" + std::to_string(i), i * 10));
+
+    auto qA = makeArticleQuery(std::nullopt, A);
+    auto& lists = TestInternals::listCacheOf<TestArticleListRepo>();
+
+    parallel(NUM_THREADS, [&](int t) {
+        for (int j = 0; j < OPS_PER_THREAD / 2; ++j) {
+            if (t == 0) {
+                trySweep<TestArticleListRepo>();
+            } else if (t == 1) {
+                lists.onRowLeft(ids[static_cast<size_t>(j) % ids.size()]);
+            } else {
+                sync(TestArticleListRepo::query(qA));
+            }
+        }
+    });
+
+    TestInternals::forceFullListCleanup<TestArticleListRepo>();
+    REQUIRE(TestInternals::pendingRowLeftCount<TestArticleListRepo>() == 0);
+    REQUIRE(sync(TestArticleListRepo::query(qA))->size() == ids.size());
+}
+
+
 // #############################################################################
 //
 //  15. Concurrent upsert on a shared assigned-PK key
