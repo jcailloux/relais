@@ -438,8 +438,8 @@ private:
                                       uint32_t fetch_gen, uint32_t current) const {
         uint32_t seen = 0;
         bool affected = false;
-        modifications_.forEachModification([&](const Modification& mod) {
-            if (mod.generation <= fetch_gen || mod.generation > current) return;
+        modifications_.forEachModification([&](const Modification& mod, uint32_t gen) {
+            if (gen <= fetch_gen || gen > current) return;
             ++seen;
             if (!affected && isModificationAffecting(mod, meta.query, meta.sort_bounds, result))
                 affected = true;
@@ -470,9 +470,9 @@ private:
 
         bool affected = false;
         modifications_.forEachModification(
-            [&](const Modification& mod) {
+            [&](const Modification& mod, uint32_t gen) {
                 if (affected) return;
-                if (mod.generation <= stored_gen) return;
+                if (gen <= stored_gen) return;
                 if (isModificationAffecting(mod, meta.query, meta.sort_bounds, result)) {
                     affected = true;
                 }
@@ -508,14 +508,14 @@ private:
 
         bool affected = false;
         modifications_.forEachModificationWithBitmap(
-            [&](const Modification& mod, BitmapType pending_chunks) {
+            [&](const Modification& mod, uint32_t gen, BitmapType pending_chunks) {
                 if (affected) return;
 
                 // Skip: chunk already cleaned for this modification
                 if ((pending_chunks & (BitmapType{1} << chunk_id)) == 0) return;
 
                 // Skip: data created after modification
-                if (mod.generation <= stored_gen) return;
+                if (gen <= stored_gen) return;
 
                 if (isModificationAffecting(mod, meta.query, meta.sort_bounds, result)) {
                     affected = true;

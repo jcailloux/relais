@@ -386,7 +386,6 @@ private:
         t.modifications_.clear();
         t.ranges_.clear();  // predicate range deletes (eraseWhere fast-path)
         t.rows_left_.clear();
-        t.rows_left_count_.store(0, std::memory_order_relaxed);
         t.latest_generation_.store(0, std::memory_order_relaxed);
     }
 };
