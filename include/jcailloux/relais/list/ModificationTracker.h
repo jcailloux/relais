@@ -5,8 +5,9 @@
 #include <cstdint>
 #include <memory>
 #include <shared_mutex>
-#include <type_traits>
 #include <vector>
+
+#include "jcailloux/relais/cache/PendingLane.h"
 
 #ifdef RELAIS_BUILDING_TESTS
 namespace relais_test { struct TestInternals; }
@@ -31,47 +32,33 @@ struct EntityModification {
     Type type;
     EntityPtr old_entity;   // nullptr for Created
     EntityPtr new_entity;   // nullptr for Deleted
-    uint32_t generation;    // monotonic generation number from the owning ListCache
 
-    // Factory methods — caller provides the generation number
-    static EntityModification created(const E& entity, uint32_t gen) {
+    static EntityModification created(const E& entity) {
         return EntityModification{
             .type = Type::Created,
             .old_entity = nullptr,
-            .new_entity = std::make_unique<const E>(entity),
-            .generation = gen
+            .new_entity = std::make_unique<const E>(entity)
         };
     }
 
-    static EntityModification updated(const E& old_entity, const E& new_entity, uint32_t gen) {
+    static EntityModification updated(const E& old_entity, const E& new_entity) {
         return EntityModification{
             .type = Type::Updated,
             .old_entity = std::make_unique<const E>(old_entity),
-            .new_entity = std::make_unique<const E>(new_entity),
-            .generation = gen
+            .new_entity = std::make_unique<const E>(new_entity)
         };
     }
 
-    static EntityModification deleted(const E& entity, uint32_t gen) {
+    static EntityModification deleted(const E& entity) {
         return EntityModification{
             .type = Type::Deleted,
             .old_entity = std::make_unique<const E>(entity),
-            .new_entity = nullptr,
-            .generation = gen
+            .new_entity = nullptr
         };
     }
 };
 
-// =============================================================================
-// SmallestUintFor - Compile-time bitmap type selection
-// =============================================================================
-
 namespace detail {
-    template<size_t N>
-    using SmallestUintFor = std::conditional_t<(N <= 8), uint8_t,
-                            std::conditional_t<(N <= 16), uint16_t,
-                            std::conditional_t<(N <= 32), uint32_t, uint64_t>>>;
-
     /// Default range-payload — an entity-only tracker carries no predicate ranges.
     struct NoRangePayload {};
 }
@@ -80,9 +67,9 @@ namespace detail {
 // ModificationTracker - Bitmap-based tracker for list cache invalidation
 // =============================================================================
 //
-// Each modification tracks a bitmap of pending chunk identities.
-// When a chunk is cleaned, its bit is cleared. When all bits are 0,
-// all chunks have seen this modification and it can be erased.
+// Three pending lanes (see PendingLane) under one lock and one generation
+// counter: entity modifications, predicate ranges, rows that left their pages.
+// Each entry is drained once every chunk has been swept past it.
 //
 // Uses monotonic generation numbers instead of timestamps.
 // Generation numbers come from the owning ListCache's atomic counter.
@@ -95,56 +82,30 @@ template<typename E, size_t TotalSegments,
          typename RowKey = int64_t>
 class ModificationTracker {
 public:
-    static_assert(TotalSegments >= 2 && TotalSegments <= 64,
-                  "TotalSegments must be between 2 and 64");
-
     using Modification = EntityModification<E>;
-    using BitmapType = detail::SmallestUintFor<TotalSegments>;
 
-    static constexpr BitmapType initial_bitmap_ =
-        TotalSegments >= sizeof(BitmapType) * 8
-            ? static_cast<BitmapType>(~BitmapType{0})
-            : static_cast<BitmapType>((BitmapType{1} << TotalSegments) - 1);
+    /// Entity modifications.
+    using ModificationLane = cache::PendingLane<Modification, TotalSegments>;
+    /// Predicate range modifications (eraseWhere fast-path): one entry stands
+    /// in for an unbounded set of deletes matching a predicate, instead of N
+    /// entity modifications.
+    using RangeLane = cache::PendingLane<RangePayload, TotalSegments>;
+    /// Rows that left the pages holding them, at a position nobody knows (the
+    /// write that moved them was uncertain). An entry touches exactly the
+    /// pages that hold a row with its key. Counted: readers skip it while it
+    /// is empty, which it is unless an uncertain write happened.
+    using RowLeftLane = cache::PendingLane<RowKey, TotalSegments, true>;
 
-    /// Wrapper that tracks which chunks have seen this modification via a bitmap.
-    struct TrackedModification {
-        Modification modification;
-        alignas(std::atomic_ref<BitmapType>::required_alignment)
-        mutable BitmapType pending_segments;
-    };
-
-    /// Predicate range modification (eraseWhere fast-path): one entry stands in
-    /// for an unbounded set of deletes matching a predicate, instead of N entity
-    /// modifications. Shares the generation counter and the per-chunk bitmap
-    /// drain lifecycle with entity modifications.
-    struct TrackedRange {
-        RangePayload predicate;
-        uint32_t generation;
-        alignas(std::atomic_ref<BitmapType>::required_alignment)
-        mutable BitmapType pending_segments;
-    };
-
-    /// A row that left the pages holding it, at a position nobody knows (the
-    /// write that moved it was uncertain). Touches exactly the pages that
-    /// hold a row with this key. Same lifecycle as the other entries.
-    struct TrackedRowLeft {
-        RowKey key;
-        uint32_t generation;
-        alignas(std::atomic_ref<BitmapType>::required_alignment)
-        mutable BitmapType pending_segments;
-    };
+    using BitmapType = typename ModificationLane::BitmapType;
 
 private:
-    std::vector<TrackedModification> modifications_;
-    std::vector<TrackedRange> ranges_;
-    std::vector<TrackedRowLeft> rows_left_;
+    ModificationLane modifications_;
+    RangeLane ranges_;
+    RowLeftLane rows_left_;
     mutable std::shared_mutex mutex_;
     std::atomic<uint32_t> latest_generation_{0};
-    // rows_left_.size(), read without the lock: the readers skip that track
-    // when it is empty, which it is unless an uncertain write happened.
-    std::atomic<uint32_t> rows_left_count_{0};
 
-    /// Atomic max into latest_generation_ (shared by entity + range tracks).
+    /// Atomic max into latest_generation_ (shared by every lane).
     void bumpLatest(uint32_t gen) {
         uint32_t current = latest_generation_.load(std::memory_order_relaxed);
         while (gen > current &&
@@ -152,6 +113,15 @@ private:
                    current, gen,
                    std::memory_order_release, std::memory_order_relaxed)) {
         }
+    }
+
+    template<typename Lane, typename Payload>
+    uint32_t track(Lane& lane, Payload payload, std::atomic<uint32_t>& counter) {
+        std::unique_lock lock(mutex_);
+        uint32_t gen = counter.fetch_add(1, std::memory_order_seq_cst) + 1;
+        bumpLatest(gen);
+        lane.push(std::move(payload), gen);
+        return gen;
     }
 
 public:
@@ -178,45 +148,27 @@ public:
     // before the drain clears its chunk bit. Returns the generation taken.
 
     uint32_t notifyCreated(const E& entity, std::atomic<uint32_t>& counter) {
-        return track(Modification::created(entity, 0), counter);
+        return track(modifications_, Modification::created(entity), counter);
     }
 
     uint32_t notifyUpdated(const E& old_entity, const E& new_entity,
                            std::atomic<uint32_t>& counter) {
-        return track(Modification::updated(old_entity, new_entity, 0), counter);
+        return track(modifications_, Modification::updated(old_entity, new_entity), counter);
     }
 
     uint32_t notifyDeleted(const E& entity, std::atomic<uint32_t>& counter) {
-        return track(Modification::deleted(entity, 0), counter);
+        return track(modifications_, Modification::deleted(entity), counter);
     }
 
     /// Record a predicate range delete (eraseWhere). One entry covers every row
     /// matching `predicate`; consumed lazily like entity modifications.
     uint32_t notifyRangeDeleted(RangePayload predicate, std::atomic<uint32_t>& counter) {
-        std::unique_lock lock(mutex_);
-        uint32_t gen = counter.fetch_add(1, std::memory_order_seq_cst) + 1;
-        bumpLatest(gen);
-        ranges_.push_back(TrackedRange{
-            .predicate = std::move(predicate),
-            .generation = gen,
-            .pending_segments = initial_bitmap_
-        });
-        return gen;
+        return track(ranges_, std::move(predicate), counter);
     }
 
-    /// Record a row that left its pages (see TrackedRowLeft).
+    /// Record a row that left its pages (see RowLeftLane).
     uint32_t notifyRowLeft(RowKey key, std::atomic<uint32_t>& counter) {
-        std::unique_lock lock(mutex_);
-        uint32_t gen = counter.fetch_add(1, std::memory_order_seq_cst) + 1;
-        bumpLatest(gen);
-        rows_left_.push_back(TrackedRowLeft{
-            .key = std::move(key),
-            .generation = gen,
-            .pending_segments = initial_bitmap_
-        });
-        rows_left_count_.store(static_cast<uint32_t>(rows_left_.size()),
-                               std::memory_order_release);
-        return gen;
+        return track(rows_left_, std::move(key), counter);
     }
 
     /// The owning cache's generation, read as a sweep cutoff (see above).
@@ -225,36 +177,22 @@ public:
         return counter.load(std::memory_order_seq_cst);
     }
 
-private:
-    uint32_t track(Modification mod, std::atomic<uint32_t>& counter) {
-        std::unique_lock lock(mutex_);
-        mod.generation = counter.fetch_add(1, std::memory_order_seq_cst) + 1;
-        bumpLatest(mod.generation);
-        uint32_t gen = mod.generation;
-        modifications_.push_back(TrackedModification{
-            .modification = std::move(mod),
-            .pending_segments = initial_bitmap_
-        });
-        return gen;
-    }
-
-public:
     // =========================================================================
     // Cleanup lifecycle
     // =========================================================================
 
     /// Called after each successful cleanup_chunk() of the cache.
-    /// Clears the bit for chunk_id in each modification's bitmap.
-    /// Erases modifications whose bitmap becomes 0 (all chunks processed).
+    /// Clears the bit for chunk_id in each entry's bitmap.
+    /// Erases entries whose bitmap becomes 0 (all chunks processed).
     ///
-    /// Only modifications with generation <= cutoff_gen are processed. The cutoff
-    /// must be captured BEFORE the chunk cleanup, so that modifications added
+    /// Only entries with generation <= cutoff_gen are processed. The cutoff
+    /// must be captured BEFORE the chunk cleanup, so that entries added
     /// during cleanup are excluded and not prematurely drained.
     ///
     /// Two-phase approach:
     /// - Phase 1 (shared_lock): clear bits via atomic_ref, collect fully-drained indices.
-    ///   Concurrent with forEachModificationWithBitmap — no conflict because
-    ///   forEachModificationWithBitmap reads via atomic_ref too.
+    ///   Concurrent with the forEach*WithBitmap readers — no conflict because
+    ///   they read via atomic_ref too.
     /// - Phase 2 (unique_lock): erase expired entries via swap-with-last.
     ///   Only taken when there are actual removals.
     void drainChunk(uint32_t cutoff_gen, uint8_t chunk_id) {
@@ -262,149 +200,78 @@ public:
         std::vector<size_t> to_erase_ranges;
         std::vector<size_t> to_erase_rows;
         const BitmapType chunk_bit = BitmapType{1} << chunk_id;
-        const auto clear = [&](BitmapType& slot) -> bool {
-            std::atomic_ref<BitmapType> bitmap(slot);
-            BitmapType remaining = bitmap.fetch_and(
-                static_cast<BitmapType>(~chunk_bit), std::memory_order_relaxed)
-                & static_cast<BitmapType>(~chunk_bit);
-            return remaining == 0;
-        };
 
         {
             std::shared_lock lock(mutex_);
-            for (size_t i = 0; i < modifications_.size(); ++i) {
-                if (modifications_[i].modification.generation > cutoff_gen) continue;
-                if (clear(modifications_[i].pending_segments)) to_erase.push_back(i);
-            }
-            for (size_t i = 0; i < ranges_.size(); ++i) {
-                if (ranges_[i].generation > cutoff_gen) continue;
-                if (clear(ranges_[i].pending_segments)) to_erase_ranges.push_back(i);
-            }
-            for (size_t i = 0; i < rows_left_.size(); ++i) {
-                if (rows_left_[i].generation > cutoff_gen) continue;
-                if (clear(rows_left_[i].pending_segments)) to_erase_rows.push_back(i);
-            }
+            modifications_.collectDrained(cutoff_gen, chunk_bit, to_erase);
+            ranges_.collectDrained(cutoff_gen, chunk_bit, to_erase_ranges);
+            rows_left_.collectDrained(cutoff_gen, chunk_bit, to_erase_rows);
         }
 
         if (to_erase.empty() && to_erase_ranges.empty() && to_erase_rows.empty()) return;
 
         std::unique_lock lock(mutex_);
-        for (auto it = to_erase.rbegin(); it != to_erase.rend(); ++it) {
-            size_t idx = *it;
-            if (idx < modifications_.size()) {
-                if (idx != modifications_.size() - 1) {
-                    std::swap(modifications_[idx], modifications_.back());
-                }
-                modifications_.pop_back();
-            }
-        }
-        for (auto it = to_erase_ranges.rbegin(); it != to_erase_ranges.rend(); ++it) {
-            size_t idx = *it;
-            if (idx < ranges_.size()) {
-                if (idx != ranges_.size() - 1) {
-                    std::swap(ranges_[idx], ranges_.back());
-                }
-                ranges_.pop_back();
-            }
-        }
-        for (auto it = to_erase_rows.rbegin(); it != to_erase_rows.rend(); ++it) {
-            size_t idx = *it;
-            if (idx < rows_left_.size()) {
-                if (idx != rows_left_.size() - 1) {
-                    std::swap(rows_left_[idx], rows_left_.back());
-                }
-                rows_left_.pop_back();
-            }
-        }
-        rows_left_count_.store(static_cast<uint32_t>(rows_left_.size()),
-                               std::memory_order_release);
+        modifications_.eraseDrained(to_erase);
+        ranges_.eraseDrained(to_erase_ranges);
+        rows_left_.eraseDrained(to_erase_rows);
     }
 
-    /// Erase all modifications with generation <= cutoff_gen in one pass.
+    /// Erase all entries with generation <= cutoff_gen in one pass.
     /// Used by purge() after processing all chunks at once.
     void drain(uint32_t cutoff_gen) {
         std::unique_lock lock(mutex_);
-        std::erase_if(modifications_, [cutoff_gen](const TrackedModification& t) {
-            return t.modification.generation <= cutoff_gen;
-        });
-        std::erase_if(ranges_, [cutoff_gen](const TrackedRange& t) {
-            return t.generation <= cutoff_gen;
-        });
-        std::erase_if(rows_left_, [cutoff_gen](const TrackedRowLeft& t) {
-            return t.generation <= cutoff_gen;
-        });
-        rows_left_count_.store(static_cast<uint32_t>(rows_left_.size()),
-                               std::memory_order_release);
+        modifications_.drain(cutoff_gen);
+        ranges_.drain(cutoff_gen);
+        rows_left_.drain(cutoff_gen);
     }
 
     // =========================================================================
     // Iteration for lazy validation
     // =========================================================================
+    //
+    // Callback signatures: void(const Payload&, uint32_t generation) and, for
+    // the *WithBitmap variants, void(const Payload&, uint32_t generation,
+    // BitmapType pending_segments). Thread-safe: shared_lock allows
+    // concurrent readers.
 
-    /// Execute a callback for each modification with its bitmap.
-    /// Callback signature: void(const Modification&, BitmapType pending_segments)
-    /// Thread-safe: shared_lock allows concurrent readers.
     template<typename Callback>
     void forEachModificationWithBitmap(Callback&& callback) const {
         std::shared_lock lock(mutex_);
-        for (const auto& tracked : modifications_) {
-            std::atomic_ref<BitmapType> bitmap(tracked.pending_segments);
-            callback(tracked.modification, bitmap.load(std::memory_order_relaxed));
-        }
+        modifications_.forEachWithBitmap(callback);
     }
 
-    /// Execute a callback for each modification (without bitmap).
     template<typename Callback>
     void forEachModification(Callback&& callback) const {
         std::shared_lock lock(mutex_);
-        for (const auto& tracked : modifications_) {
-            callback(tracked.modification);
-        }
+        modifications_.forEach(callback);
     }
 
-    /// Execute a callback for each predicate range modification with its bitmap.
-    /// Callback signature: void(const RangePayload&, uint32_t generation, BitmapType).
     template<typename Callback>
     void forEachRangeWithBitmap(Callback&& callback) const {
         std::shared_lock lock(mutex_);
-        for (const auto& tracked : ranges_) {
-            std::atomic_ref<BitmapType> bitmap(tracked.pending_segments);
-            callback(tracked.predicate, tracked.generation,
-                     bitmap.load(std::memory_order_relaxed));
-        }
+        ranges_.forEachWithBitmap(callback);
     }
 
-    /// Execute a callback for each predicate range modification (without bitmap).
     template<typename Callback>
     void forEachRange(Callback&& callback) const {
         std::shared_lock lock(mutex_);
-        for (const auto& tracked : ranges_) {
-            callback(tracked.predicate, tracked.generation);
-        }
+        ranges_.forEach(callback);
     }
 
-    /// Execute a callback for each row that left its pages, with its bitmap.
-    /// Callback signature: void(const RowKey&, uint32_t generation, BitmapType).
-    /// Nothing to visit, and no lock taken, while the track is empty.
+    /// Nothing to visit, and no lock taken, while the lane is empty.
     template<typename Callback>
     void forEachRowLeftWithBitmap(Callback&& callback) const {
-        if (rows_left_count_.load(std::memory_order_acquire) == 0) return;
+        if (rows_left_.skippable()) return;
         std::shared_lock lock(mutex_);
-        for (const auto& tracked : rows_left_) {
-            std::atomic_ref<BitmapType> bitmap(tracked.pending_segments);
-            callback(tracked.key, tracked.generation,
-                     bitmap.load(std::memory_order_relaxed));
-        }
+        rows_left_.forEachWithBitmap(callback);
     }
 
-    /// Execute a callback for each row that left its pages (without bitmap).
+    /// Nothing to visit, and no lock taken, while the lane is empty.
     template<typename Callback>
     void forEachRowLeft(Callback&& callback) const {
-        if (rows_left_count_.load(std::memory_order_acquire) == 0) return;
+        if (rows_left_.skippable()) return;
         std::shared_lock lock(mutex_);
-        for (const auto& tracked : rows_left_) {
-            callback(tracked.key, tracked.generation);
-        }
+        rows_left_.forEach(callback);
     }
 
     /// Check if there are modifications since the given generation.
@@ -441,7 +308,9 @@ public:
         return latest_generation_.load(std::memory_order_acquire);
     }
 
-    [[nodiscard]] static constexpr BitmapType initialBitmap() { return initial_bitmap_; }
+    [[nodiscard]] static constexpr BitmapType initialBitmap() {
+        return ModificationLane::initialBitmap();
+    }
 
 #ifdef RELAIS_BUILDING_TESTS
     friend struct ::relais_test::TestInternals;

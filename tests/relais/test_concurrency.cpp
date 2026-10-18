@@ -1238,7 +1238,7 @@ TEST_CASE("Concurrency - concurrent eraseWhere overlapping predicates",
 //  eraseWhere appends a RangeModification on every call (even at zero rows, the
 //  predicate fast-path still fires). Producers race a sweeper (drainChunk clears
 //  range bits under the two-phase lock) and a querier (forEachRangeWithBitmap
-//  consumes them lazily) — atomic_ref<BitmapType> on TrackedRange.pending_segments
+//  consumes them lazily) — atomic_ref<BitmapType> on the range lane entries
 //  under TSan. A deterministic post-drain proves both tracks empty and reusable.
 // -----------------------------------------------------------------------------
 
