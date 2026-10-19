@@ -315,6 +315,50 @@ TEST_CASE("liveness: acquire on a saturated pool trips PgPoolTimeout, no leaked 
     REQUIRE(pool->waiterCount() == 0);  // waiter dequeued, not stranded
 }
 
+TEST_CASE("liveness: a connection that dies under a queued acquire is replaced for it",
+          "[io][liveness][integration]") {
+    Io io;
+    auto pool = driveBounded(io, PgPool<Io>::create(io, getConnInfo(),
+        {.min_connections = 1, .max_connections = 1, .acquire_timeout = 3s,
+         .query_timeout = 150ms}));
+
+    // The only connection times out under a query while another acquire waits
+    // for it: the slot it frees must serve that acquire, not its acquire_timeout.
+    bool first_timed_out = false;
+    bool second_ok = false;
+    auto first = [&]() -> Task<void> {
+        auto guard = co_await pool->acquire();
+        const int fd = guard.conn().socket();
+        io.holdReads(fd);
+        try {
+            co_await guard.conn().query("SELECT 1");
+        } catch (const PgQueryTimeout&) {
+            first_timed_out = true;
+        }
+        io.releaseReads(fd);  // the replacement may reuse the fd number
+    };
+    auto second = [&]() -> Task<void> {
+        auto guard = co_await pool->acquire();
+        second_ok = (co_await guard.conn().query("SELECT 1")).ok();
+    };
+    std::vector<Task<void>> both;
+    both.push_back(first());
+    both.push_back(second());
+
+    const auto t0 = std::chrono::steady_clock::now();
+    driveBounded(io, [](std::vector<Task<void>> tasks) -> Task<void> {
+        co_await whenAll(std::move(tasks));
+    }(std::move(both)));
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+
+    REQUIRE(first_timed_out);
+    CHECK(second_ok);
+    CHECK(elapsed < 1500ms);  // query_timeout plus a connect, not acquire_timeout
+    CHECK(pool->totalConnections() == 1);
+    CHECK(pool->idleCount() == 1);
+    CHECK(pool->waiterCount() == 0);
+}
+
 TEST_CASE("liveness: a blackholed connect (path b) trips PgPoolTimeout and reclaims the slot",
           "[io][liveness][integration]") {
     SilentTcpServer silent;
