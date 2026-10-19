@@ -3,6 +3,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <type_traits>
 
@@ -101,6 +102,23 @@ template<auto F> inline constexpr SetOp set_op_v<FieldNowPlus<F>> = SetOp::NowPl
 /// database clock). Such writes must never be coalesced with an identical one.
 template<typename U>
 inline constexpr bool is_relative_update_v = set_op_v<std::remove_cvref_t<U>> != SetOp::Assign;
+
+/// The field an update assigns.
+template<typename U> struct update_field;
+template<auto F, typename V> struct update_field<FieldUpdate<F, V>> { static constexpr auto value = F; };
+template<auto F> struct update_field<FieldSetNull<F>> { static constexpr auto value = F; };
+template<auto F, typename V> struct update_field<FieldIncrement<F, V>> { static constexpr auto value = F; };
+template<auto F, typename V> struct update_field<FieldDecrement<F, V>> { static constexpr auto value = F; };
+template<auto F> struct update_field<FieldNowPlus<F>> { static constexpr auto value = F; };
+
+template<typename U>
+inline constexpr auto update_field_v = update_field<std::remove_cvref_t<U>>::value;
+
+/// True when the update assigns a value C++ knows, `value` (set<F>(v) with a
+/// non-optional v): not a relative update, the database clock or NULL.
+template<typename U> inline constexpr bool assigns_value_v = false;
+template<auto F, typename V> inline constexpr bool assigns_value_v<FieldUpdate<F, V>> = true;
+template<auto F, typename V> inline constexpr bool assigns_value_v<FieldUpdate<F, std::optional<V>>> = false;
 
 // =============================================================================
 // fieldColumnName / fieldValue — extractors for SQL binding in patch

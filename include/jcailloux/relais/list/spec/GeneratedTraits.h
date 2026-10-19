@@ -558,6 +558,50 @@ template<typename Descriptor>
 }
 
 // =============================================================================
+// RowsRange - rows nobody can name, located by what they hold
+// =============================================================================
+
+/// `predicate` holds the values the rows have on the filter columns (unset:
+/// unknown), `sorts` the range of their values per sort dimension. When
+/// `moved`, they are rows a write may have moved into new pages: only a group
+/// that filters on, or sorts by, a column the write changed (`moved_filters`,
+/// `moved_sorts`, bits by index) can have gained one.
+template<typename Descriptor>
+struct RowsRange {
+    static_assert(filter_count<Descriptor> <= 64 && sort_count<Descriptor> <= 64);
+
+    Filters<Descriptor> predicate;
+    std::array<SortRange, sort_count<Descriptor>> sorts{};
+    uint64_t moved_filters = 0;
+    uint64_t moved_sorts = 0;
+    bool moved = false;
+};
+
+/// Where in a cached group (its filter values `group`, sorted on
+/// `field_index`) rows of `rows` may be: nullopt if the group cannot hold
+/// one, else the range of their values on the sort dimension. Never-miss.
+template<typename Descriptor>
+    requires ValidListDescriptor<Descriptor>
+[[nodiscard]] std::optional<SortRange> rowsSortRange(
+    const RowsRange<Descriptor>& rows, const Filters<Descriptor>& group,
+    size_t field_index) noexcept {
+    if (rows.moved && !((rows.moved_sorts >> field_index) & 1)) {
+        const bool filters_moved = [&]<size_t... Is>(std::index_sequence<Is...>) {
+            return ((((rows.moved_filters >> Is) & 1) && std::get<Is>(group.values).has_value())
+                    || ...);
+        }(std::make_index_sequence<filter_count<Descriptor>>{});
+        if (!filters_moved) return std::nullopt;
+    }
+    if (!predicateGroupCompatible<Descriptor>(rows.predicate, group)) return std::nullopt;
+    SortRange r = predicateSortRange<Descriptor>(rows.predicate, field_index);
+    if (field_index < sort_count<Descriptor>) {
+        r.lo = std::max(r.lo, rows.sorts[field_index].lo);
+        r.hi = std::min(r.hi, rows.sorts[field_index].hi);
+    }
+    return r;
+}
+
+// =============================================================================
 // compareSortValues - Compare sort values with direction
 // =============================================================================
 
