@@ -706,6 +706,7 @@ private:
         for (size_t j = 0; j < missU.size(); ++j) {
             if (!fetched[j]) continue;
             if (!Recheck::changed(missIds[j], snaps[j])) {
+                Tier::tickSweep();
                 auto hit = tier().store(unique[missU[j]], std::move(*fetched[j]),
                                         buildMetadata());
                 // A mutation between the check and the store: evict this entry
