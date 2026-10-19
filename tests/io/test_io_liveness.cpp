@@ -23,6 +23,7 @@
 #include <fixtures/ControllableIoContext.h>
 #include <fixtures/EpollIoContext.h>
 #include <fixtures/PgProbe.h>
+#include <fixtures/TestConnInfo.h>
 
 #include <arpa/inet.h>
 #include <dirent.h>
@@ -51,8 +52,7 @@ using Io = ControllableIoContext;
 // =============================================================================
 
 static const char* getConnInfo() {
-    return "host=localhost port=5432 dbname=relais_test "
-           "user=relais_test password=relais_test";
+    return relais_test::kConnInfo;
 }
 
 // A TCP listener that accepts the kernel handshake (so connect() completes) but

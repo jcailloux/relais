@@ -20,6 +20,8 @@
 // PgProbe) — nothing in include/ knows it is under test.
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/reporters/catch_reporter_event_listener.hpp>
+#include <catch2/reporters/catch_reporter_registrars.hpp>
 
 #include <jcailloux/relais/repository/Repo.h>
 #include <jcailloux/relais/config/CacheConfig.h>
@@ -36,6 +38,7 @@
 #include <fixtures/ControllableIoContext.h>
 #include <fixtures/PgProbe.h>
 #include <fixtures/RelaisTestAccessors.h>
+#include <fixtures/TestConnInfo.h>
 #include "fixtures/generated/TestItemEntity.h"
 #include "fixtures/generated/TestAssignedKeyEntity.h"
 #include "fixtures/generated/TestArticleEntity.h"
@@ -51,6 +54,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <variant>
@@ -79,13 +83,12 @@ using ::entity::generated::TestGuardRowEntity;
 // probe's own session.
 static const char* kAppName = "relais_coh_under_test";
 
-static std::string poolConnInfo() {
-    return "host=localhost port=5432 dbname=relais_test user=relais_test "
-           "password=relais_test application_name=" + std::string(kAppName);
+// `settings`: more session settings (`-c name=value ...`).
+static std::string poolConnInfo(std::string_view settings = {}) {
+    return relais_test::connInfoWith(settings) + " application_name=" + kAppName;
 }
 static const char* probeConnInfo() {
-    return "host=localhost port=5432 dbname=relais_test "
-           "user=relais_test password=relais_test";
+    return relais_test::kConnInfo;
 }
 
 // =============================================================================
@@ -105,7 +108,8 @@ using CountPred = ::entity::generated::TestFilterOnlyMapping::FilterSet::Values;
 
 // =============================================================================
 // Bounded synchronous driver (mirrors test_io_liveness): a coherence suite must
-// never hang the runner, so every Task runs against a wall-clock budget.
+// never hang the runner, so every Task runs against a wall-clock budget. The
+// budget catches a hang only: it stays above every bound of the pool.
 // =============================================================================
 
 struct Starter {
@@ -122,7 +126,7 @@ struct Starter {
 };
 
 template<typename T>
-T driveBounded(Io& io, io::Task<T> task, std::chrono::milliseconds budget = 5s) {
+T driveBounded(Io& io, io::Task<T> task, std::chrono::milliseconds budget = 15s) {
     std::variant<std::monostate, T, std::exception_ptr> result;
     bool done = false;
     auto wrapper = [&](io::Task<T> t) -> io::Task<void> {
@@ -142,7 +146,7 @@ T driveBounded(Io& io, io::Task<T> task, std::chrono::milliseconds budget = 5s) 
 }
 
 inline void driveBounded(Io& io, io::Task<void> task,
-                         std::chrono::milliseconds budget = 5s) {
+                         std::chrono::milliseconds budget = 15s) {
     std::exception_ptr ex;
     bool done = false;
     auto wrapper = [&](io::Task<void> t) -> io::Task<void> {
@@ -162,7 +166,7 @@ inline void driveBounded(Io& io, io::Task<void> task,
 // find()/insert()/patch() return Immediate<T> (an L1 hit resolves synchronously);
 // resolve it directly when ready, otherwise drive its Task.
 template<typename T>
-T driveBounded(Io& io, io::Immediate<T> imm, std::chrono::milliseconds budget = 5s) {
+T driveBounded(Io& io, io::Immediate<T> imm, std::chrono::milliseconds budget = 15s) {
     if (imm.await_ready()) return imm.await_resume();
     return driveBounded(io, imm.take_task(), budget);
 }
@@ -181,19 +185,21 @@ struct CohEnv {
     int pg_fd = -1;
     std::chrono::milliseconds q_timeout_;
 
-    // `conninfo_extra` is appended to the pool's conninfo (the settle
-    // connection uses it too).
+    // `settings` are session settings of the pool's connections (the settle
+    // connection uses them too).
     explicit CohEnv(std::chrono::milliseconds query_timeout,
                     io::UncertainSettle settle = io::UncertainSettle::Terminate,
                     std::chrono::milliseconds settle_delay = 0ms,
-                    const std::string& conninfo_extra = "")
+                    std::string_view settings = {})
         : probe(probeConnInfo()), q_timeout_(query_timeout)
     {
         // min=max=1: a single connection serves every op, so holdReads(pg_fd)
         // deterministically withholds the result of whatever the repo runs.
-        pool = driveBounded(io, io::PgPool<Io>::create(io, poolConnInfo() + conninfo_extra,
+        // No case waits on an acquire: its bound only absorbs a late setup
+        // (connecting, naming the backend) on a busy machine.
+        pool = driveBounded(io, io::PgPool<Io>::create(io, poolConnInfo(settings),
             {.min_connections = 1, .max_connections = 1,
-             .acquire_timeout = 2s, .query_timeout = query_timeout,
+             .acquire_timeout = 10s, .query_timeout = query_timeout,
              .uncertain_settle = settle, .settle_delay = settle_delay}));
         pg_fd = io.lastAddedFd();  // the connection min_connections just built
 
@@ -1583,7 +1589,7 @@ TEST_CASE("settle queue: a refused termination falls back to statement_timeout",
     SECTION("statement_timeout bounds the write: settled after it") {
         LogCapture logs;
         CohEnv env(300ms, io::UncertainSettle::Terminate, 0ms,
-                   " options='-c statement_timeout=700'");
+                   "-c statement_timeout=700");
         resetItems(env);
         auto id = env.seedItem("settle", 1);
         auto lock = lockItem(id);
@@ -1674,7 +1680,7 @@ TEST_CASE("settle queue: Delay without a delay takes statement_timeout",
     SECTION("statement_timeout set: the ticket waits it plus a margin") {
         LogCapture logs;
         CohEnv env(300ms, io::UncertainSettle::Delay, 0ms,
-                   " options='-c statement_timeout=700'");
+                   "-c statement_timeout=700");
         CHECK(LogCapture::count(log::Level::Warn, "uncertain_settle is Delay") == 0);
         resetItems(env);
         auto id = env.seedItem("settle", 1);
@@ -3072,3 +3078,35 @@ TEST_CASE("cross: an uncertain eraseMany of rows nobody holds reaches every targ
     CHECK_FALSE(purchasePageHolds<CohPurchaseListL1>(env, r.u3, hidden3));
     dropUsers(env, r);
 }
+
+// =============================================================================
+// An L1 repo reads the catalog at its first use, in the background, on the
+// pool's only connection (see detail::ColumnFacts). Read once per process
+// (the facts are static), before any case: a case that withholds the
+// connection's results never withholds that read instead of its own.
+// =============================================================================
+
+namespace {
+
+template<typename... Repos>
+void primeColumnFacts(CohEnv& env) {
+    ([&] {
+        (void)TI::columnFacts<Repos>();  // first use: the read starts
+        if (!pumpUntil(env, [] { return TI::columnFacts<Repos>().known(); }, 5s))
+            throw std::runtime_error(std::string("column facts unread: ") + Repos::name());
+    }(), ...);
+}
+
+class PrimeColumnFacts : public Catch::EventListenerBase {
+public:
+    using Catch::EventListenerBase::EventListenerBase;
+    void testRunStarting(const Catch::TestRunInfo&) override {
+        CohEnv env(1s);
+        primeColumnFacts<CohItemL1, CohAkeyL1, CohArticleL1, CohUserL1, CohPurchaseL1,
+                         CohGuardL1, CohPurchaseListL1, CohPurchaseX>(env);
+    }
+};
+
+}  // namespace
+
+CATCH_REGISTER_LISTENER(PrimeColumnFacts)
