@@ -15,6 +15,7 @@
 #include "jcailloux/relais/repository/KeyDedup.h"
 #include "jcailloux/relais/repository/Precaution.h"
 #include "jcailloux/relais/repository/RecheckGuard.h"
+#include "jcailloux/relais/repository/RowNotes.h"
 #include "jcailloux/relais/Log.h"
 #include "jcailloux/relais/cache/CacheTier.h"
 #include "jcailloux/relais/cache/CacheMetadata.h"
@@ -65,6 +66,9 @@ class LocalRepo : public PgRepo<E, Name, Cfg, Key> {
     /// Read-fill recheck guard (one static slot array per Name/Key/SlotsLog2).
     using Recheck = RecheckGuard<Name, Key, Cfg.recheck_slots_log2>;
 
+    /// Rows an uncertain write may have changed (see noteRowsChanged).
+    using Notes = detail::RowNotes<E, Key, Cfg.l1_chunk_count_log2>;
+
     /// TTL in seconds (compile-time, for metadata construction).
     static constexpr uint32_t kTtlSec = static_cast<uint32_t>(
         std::chrono::duration_cast<std::chrono::seconds>(
@@ -90,7 +94,7 @@ public:
     /// Find by ID with L1 -> DB fallback.
     /// L1 hit: zero overhead (Immediate holds CacheView directly, no Task).
     static io::Immediate<cache::CacheView<E>> find(const Key& id) {
-        auto hit = tier().find(id);
+        auto hit = lookup(id);
         if (hit) {
             RELAIS_METRICS_INC(l1_counters_.hits);
             return cache::CacheView<E>(
@@ -124,7 +128,7 @@ public:
         std::vector<const E*> uniqueHit(unique.size(), nullptr);
         std::vector<size_t> missU;
         for (size_t k = 0; k < unique.size(); ++k) {
-            auto hit = tier().find(unique[k]);
+            auto hit = lookup(unique[k]);
             if (hit) {
                 RELAIS_METRICS_INC(l1_counters_.hits);
                 uniqueHit[k] = static_cast<const E*>(hit.value);
@@ -148,7 +152,7 @@ public:
 
     /// Find by ID and return JSON string (empty if not found).
     static io::Immediate<std::string> findJson(const Key& id) {
-        auto hit = tier().find(id);
+        auto hit = lookup(id);
         if (hit) {
             RELAIS_METRICS_INC(l1_counters_.hits);
             return hit.value->json();
@@ -161,7 +165,7 @@ public:
     static io::Immediate<std::vector<uint8_t>> findBinary(const Key& id)
         requires HasBinarySerialization<E>
     {
-        auto hit = tier().find(id);
+        auto hit = lookup(id);
         if (hit) {
             RELAIS_METRICS_INC(l1_counters_.hits);
             return hit.value->binary();
@@ -286,7 +290,7 @@ protected:
         std::optional<E> local_hint;
         if constexpr (HasPartitionHint<E>) {
             if (!hint) {
-                auto hit = tier().find(id);
+                auto hit = lookup(id);
                 if (hit) { local_hint.emplace(*hit.value); hint = &*local_hint; }
             }
         }
@@ -410,7 +414,7 @@ protected:
 
     /// Get from cache as CacheView.
     static cache::CacheView<E> getFromCache(const Key& key) {
-        auto hit = tier().find(key);
+        auto hit = lookup(key);
         if (!hit) return {};
         return cache::CacheView<E>(
             static_cast<const E*>(hit.value), std::move(hit.guard));
@@ -449,14 +453,27 @@ protected:
     }
 
     /// Returns the CacheTier singleton.
-    /// Hot path: single pointer check (no guard variable, no function call).
-    /// First call delegates to tier_init_slow() which constructs and registers.
-    static Tier& tier() {
-        // Acquire: pairs with the release stores in tier_init_slow() so a reader
-        // that observes the published pointer also observes the enrolled Tier.
-        auto* p = tier_ptr_.load(std::memory_order_acquire);
-        if (p) [[likely]] return *p;
-        return tier_init_slow();
+    static Tier& tier() { return state().tier; }
+
+    /// Rows an uncertain write may have changed, named by what they satisfied
+    /// (`pred`; empty: every row). Until `ticket` settles, a copy the predicate
+    /// may hold for is evicted whenever read. Once settled, only the copies
+    /// stored before the seal are, and a pass over the cache evicts those left.
+    /// Without a pending ticket, the note is settled at once.
+    static void noteRowsChanged(const std::shared_ptr<io::SettleTicket>& ticket,
+                                typename Notes::Predicate pred) {
+        auto& n = notes();
+        if (ticket && ticket->state == io::SettleTicket::State::Pending) {
+            const uint64_t id = n.addPending(std::move(pred), &Recheck::bumpAll);
+            detail::registerReplay(ticket, [id]() -> io::Task<void> {
+                notes().settle(id, &Recheck::bumpAll);
+                startNoteDrain();
+                co_return;
+            });
+            return;
+        }
+        n.addSettled(std::move(pred), &Recheck::bumpAll);
+        startNoteDrain();
     }
 
 private:
@@ -464,14 +481,31 @@ private:
     // CacheTier singleton
     // =========================================================================
 
-    static inline std::atomic<Tier*> tier_ptr_{nullptr};
+    struct State {
+        Tier tier;
+        Notes notes;
+    };
+
+    static inline std::atomic<State*> state_ptr_{nullptr};
+
+    /// Hot path: single pointer check (no guard variable, no function call).
+    /// First call delegates to state_init_slow() which constructs and registers.
+    static State& state() {
+        // Acquire: pairs with the release stores in state_init_slow() so a reader
+        // that observes the published pointer also observes the enrolled Tier.
+        auto* p = state_ptr_.load(std::memory_order_acquire);
+        if (p) [[likely]] return *p;
+        return state_init_slow();
+    }
+
+    static Notes& notes() { return state().notes; }
 
     /// Cold path: construct CacheTier, register with GDSFPolicy, cache pointer.
-    [[gnu::noinline]] static Tier& tier_init_slow() {
+    [[gnu::noinline]] static State& state_init_slow() {
         struct Holder {
-            Tier instance;
+            State instance;
             Holder() {
-                instance.enroll({
+                instance.tier.enroll({
                     .sweep_fn = +[](long chunk_id) -> bool {
                         return sweep(chunk_id);
                     },
@@ -481,13 +515,73 @@ private:
                     .name = static_cast<const char*>(Name)
                 });
                 // Release: publish only after the Tier is fully enrolled.
-                tier_ptr_.store(&instance, std::memory_order_release);
+                state_ptr_.store(&instance, std::memory_order_release);
             }
         };
         static Holder h;
         // Redundant publish after the thread-safe static guard completes.
-        tier_ptr_.store(&h.instance, std::memory_order_release);
+        state_ptr_.store(&h.instance, std::memory_order_release);
         return h.instance;
+    }
+
+    // =========================================================================
+    // Rows an uncertain write may have changed
+    // =========================================================================
+
+    /// L1 lookup as every read sees it: a copy a note touches is evicted and
+    /// reads as a miss. Without notes, one atomic load more than Tier::find.
+    static typename Tier::Hit lookup(const Key& id) {
+        auto& s = state();
+        auto hit = s.tier.find(id);
+        if (hit && s.notes.active()) [[unlikely]] return lookupNoted(s, id, std::move(hit));
+        return hit;
+    }
+
+    [[gnu::noinline]] static typename Tier::Hit lookupNoted(
+        State& s, const Key& id, typename Tier::Hit hit) {
+        if (!s.notes.touches(id, *hit.value, hit.key_hash)) return hit;
+        s.tier.evictIfSame(id, hit.value);
+        return {};
+    }
+
+    /// A copy read from the database (fetch started at `snap`) and stored:
+    /// exempt from the settled notes (see RowNotes::exemptStored).
+    static void exemptIfNoted(const Key& id, const E& value, uint64_t snap) {
+        auto& n = notes();
+        if (!n.active()) [[likely]] return;
+        n.exemptStored(id, value, [&id, snap] { return !Recheck::changed(id, snap); });
+    }
+
+    static void startNoteDrain() {
+        if (notes().claimDrain()) drainNotes();
+    }
+
+    /// Evict, chunk by chunk, the copies the settled notes touch, handing the
+    /// loop back between two chunks; ascending order (see RowNotes).
+    static io::DetachedTask drainNotes() {
+        auto& n = notes();
+        constexpr long kChunks = static_cast<long>(Notes::kChunks);
+        try {
+            do {
+                for (long chunk = 0; chunk < kChunks; ++chunk) {
+                    const uint32_t cutoff = n.cutoff();
+                    const auto c = static_cast<size_t>(chunk);
+                    tier().evictInChunk(chunk, kChunks, [&n, cutoff, c](const Key& key, const E& value) {
+                        return n.touchesSettled(key, value, cutoff, c);
+                    });
+                    n.drainChunk(cutoff, c);
+                    co_await PgProvider::yieldToLoop();
+                }
+            } while (n.continueDraining());
+        } catch (const std::exception& e) {
+            n.abortDraining();
+            RELAIS_LOG_ERROR << name() << ": draining the rows an uncertain write may have "
+                                          "changed failed: " << e.what();
+        } catch (...) {
+            n.abortDraining();
+            RELAIS_LOG_ERROR << name() << ": draining the rows an uncertain write may have "
+                                          "changed failed";
+        }
     }
 
     // =========================================================================
@@ -510,7 +604,7 @@ private:
     static void keepUncertainBefore(const Key& id, std::optional<E>* slot) noexcept {
         if (!slot || *slot) return;
         try {
-            if (auto hit = tier().find(id)) slot->emplace(*hit.value);
+            if (auto hit = lookup(id)) slot->emplace(*hit.value);
         } catch (...) {
         }
     }
@@ -539,6 +633,7 @@ private:
             [](const E&, float) -> Metadata { return buildMetadata(); },
             [&id, snap]() { return !Recheck::changed(id, snap); }
         );
+        if (hit.meta) exemptIfNoted(id, *hit.value, snap);
         if (hit) {
             co_return cache::CacheView<E>(
                 static_cast<const E*>(hit.value), std::move(hit.guard));
@@ -557,6 +652,7 @@ private:
             [](const E&, float) -> Metadata { return buildMetadata(); },
             [&id, snap]() { return !Recheck::changed(id, snap); }
         );
+        if (hit.meta) exemptIfNoted(id, *hit.value, snap);
         if (hit) co_return hit.value->json();
         co_return std::string{};
     }
@@ -574,6 +670,7 @@ private:
             [](const E&, float) -> Metadata { return buildMetadata(); },
             [&id, snap]() { return !Recheck::changed(id, snap); }
         );
+        if (hit.meta) exemptIfNoted(id, *hit.value, snap);
         if (hit) co_return hit.value->binary();
         co_return std::vector<uint8_t>{};
     }
@@ -615,6 +712,8 @@ private:
                 // again. The view's guard keeps the value readable.
                 if (Recheck::changedAfterStore(missIds[j], snaps[j]))
                     tier().evictIfSame(missIds[j], hit.value);
+                else
+                    exemptIfNoted(missIds[j], *hit.value, snaps[j]);
                 uniqueHit[missU[j]] = static_cast<const E*>(hit.value);
             } else {
                 // A mutation straddled the batch fetch → return the value to

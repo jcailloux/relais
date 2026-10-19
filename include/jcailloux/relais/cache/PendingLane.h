@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <type_traits>
 #include <vector>
 
@@ -104,6 +105,20 @@ public:
     void clear() {
         entries_.clear();
         publishCount();
+    }
+
+    /// Remove the first entry whose payload `match` selects, and return it.
+    template<typename Match>
+    std::optional<Payload> take(Match&& match) {
+        for (size_t i = 0; i < entries_.size(); ++i) {
+            if (!match(entries_[i].payload)) continue;
+            std::optional<Payload> out{std::move(entries_[i].payload)};
+            if (i != entries_.size() - 1) std::swap(entries_[i], entries_.back());
+            entries_.pop_back();
+            publishCount();
+            return out;
+        }
+        return std::nullopt;
     }
 
     // ---- shared lock -------------------------------------------------------

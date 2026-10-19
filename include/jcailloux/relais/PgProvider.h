@@ -2,6 +2,7 @@
 #define JCX_RELAIS_PG_PROVIDER_H
 
 #include <cassert>
+#include <coroutine>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -123,6 +124,20 @@ public:
         co_return co_await queryParams(sql, params);
     }
 
+    /// Resume the awaiting coroutine on a later turn of this thread's loop, so
+    /// that long work hands the loop back between its steps. At once on a
+    /// thread with no bound loop.
+    static auto yieldToLoop() noexcept {
+        struct Awaiter {
+            bool await_ready() const noexcept { return !post_; }
+            void await_suspend(std::coroutine_handle<> h) const {
+                post_([h] { h.resume(); });
+            }
+            void await_resume() const noexcept {}
+        };
+        return Awaiter{};
+    }
+
     /// Check if PgProvider has been initialized.
     [[nodiscard]] static bool initialized() noexcept {
         return pg_query_ != nullptr;
@@ -196,6 +211,7 @@ public:
                               io::batch::WriteAffinity affinity) {
             return batcher->submitPgWrite(sql, io::PgParams{params}, mode, affinity);
         };
+        post_ = [batcher](std::function<void()> cb) { batcher->post(std::move(cb)); };
     }
 
     /// Reset all providers (for testing).
@@ -205,6 +221,7 @@ public:
         pg_entity_query_ = nullptr;
         pg_entity_query_many_ = nullptr;
         pg_write_ = nullptr;
+        post_ = nullptr;
     }
 
     // =========================================================================
@@ -221,6 +238,7 @@ public:
     using PgWriteFn = std::function<io::Task<io::batch::PgWriteResult>(
         const char*, const io::PgParams&, io::batch::WriteMode,
         io::batch::WriteAffinity)>;
+    using PostFn = std::function<void(std::function<void()>)>;
 
     // thread_local: each event-loop thread binds its OWN pool/batcher by calling
     // init() on that thread (shared-nothing). A Task co_awaited on loop K then
@@ -231,6 +249,7 @@ public:
     static inline thread_local PgEntityQueryFn pg_entity_query_;
     static inline thread_local PgEntityQueryManyFn pg_entity_query_many_;
     static inline thread_local PgWriteFn pg_write_;
+    static inline thread_local PostFn post_;
 
     // IoPool needs to set these directly
     friend class io::IoPool;
