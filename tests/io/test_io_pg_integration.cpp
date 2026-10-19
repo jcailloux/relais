@@ -7,6 +7,7 @@
 
 #include <fixtures/EpollIoContext.h>
 #include <fixtures/TestRunner.h>
+#include <fixtures/TestConnInfo.h>
 
 #include <bit>
 #include <cfloat>
@@ -26,7 +27,7 @@ using jcailloux::relais::detail::parseNumber;
 // =============================================================================
 
 static const char* getConnInfo() {
-    return "host=localhost port=5432 dbname=relais_test user=relais_test password=relais_test";
+    return relais_test::kConnInfo;
 }
 
 // =============================================================================

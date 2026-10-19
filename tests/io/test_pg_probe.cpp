@@ -1,12 +1,13 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <fixtures/PgProbe.h>
+#include <fixtures/TestConnInfo.h>
 
 using jcailloux::relais::io::test::PgProbe;
 
 namespace {
 const char* conninfo() {
-    return "host=localhost port=5432 dbname=relais_test user=relais_test password=relais_test";
+    return relais_test::kConnInfo;
 }
 }  // namespace
 
