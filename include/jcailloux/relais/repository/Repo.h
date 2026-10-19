@@ -258,23 +258,11 @@ public:
             timeout = std::current_exception();
         }
         if (timeout) {
-            // Uncertain: the batch DELETE may have committed (lost ACK). Evict the
-            // known input key set from the entity tier (L1) by precaution — a
-            // possibly-deleted row must not stay cached. Per-key invalidate also
-            // runs cross-invalidation when the entity is still cached (the common
-            // case right after an erase). Fanned out with whenAll so the worst
-            // case — keys absent from cache while the DB is frozen, each falling
-            // through to a bounded L3 find — costs ONE query_timeout in parallel,
-            // not N sequentially (`keys` outlives the gather). Lists are NOT
-            // recoverable here: without the row bodies (no RETURNING) their
-            // filter/sort values are unknown, so that tier stays bounded by l1_ttl.
-            co_await detail::precaution(std::move(ticket),
-                [keys = std::move(keys)]() -> io::Task<void> {
-                    std::vector<io::Task<void>> evictions;
-                    evictions.reserve(keys.size());
-                    for (const auto& k : keys) evictions.push_back(Base::invalidate(k));
-                    co_await io::whenAll(std::move(evictions));
-                });
+            // Uncertain: the batch DELETE may have committed (lost ACK). Each
+            // tier evicts the rows of the input keys, without reading them.
+            if constexpr (kHasUncertainTail)
+                co_await Base::rowsMayHaveBeenErased(std::move(ticket),
+                                                     std::span<const Key>(keys), nullptr);
             std::rethrow_exception(timeout);
         }
         if (!deleted) co_return std::nullopt;  // DB error

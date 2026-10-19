@@ -1,11 +1,15 @@
 #ifndef JCX_RELAIS_REPOSITORY_KEYDEDUP_H
 #define JCX_RELAIS_REPOSITORY_KEYDEDUP_H
 
+#include <algorithm>
 #include <cstddef>
 #include <optional>
 #include <span>
+#include <type_traits>
+#include <unordered_set>
 #include <vector>
 
+#include "jcailloux/relais/cache/ChunkMap.h"   // cache::detail::AutoHash
 #include "jcailloux/relais/cache/MultiView.h"
 
 namespace jcailloux::relais::detail {
@@ -27,6 +31,23 @@ template<typename K>
     }
     return out;
 }
+
+/// A set of keys, for membership tests: hashed when the key hashes, scanned
+/// otherwise (a composite key may only model equality).
+template<typename K>
+class KeySet {
+    static constexpr bool kHashed = std::is_invocable_v<cache::detail::AutoHash<K>, const K&>;
+    std::conditional_t<kHashed, std::unordered_set<K, cache::detail::AutoHash<K>>,
+                       std::vector<K>> keys_;
+
+public:
+    explicit KeySet(std::span<const K> keys) : keys_(keys.begin(), keys.end()) {}
+
+    [[nodiscard]] bool contains(const K& key) const {
+        if constexpr (kHashed) return keys_.contains(key);
+        else return std::ranges::find(keys_, key) != keys_.end();
+    }
+};
 
 /// Distinct keys of a batch plus the position → distinct-index map.
 template<typename K>

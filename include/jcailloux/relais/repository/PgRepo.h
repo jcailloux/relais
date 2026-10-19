@@ -674,6 +674,18 @@ protected:
         [[maybe_unused]] const detail::RowPredicate<E>& rows,
         [[maybe_unused]] const Updates&... updates) {}
 
+    /// Rows an uncertain write may have erased, named by key. Each cache tier
+    /// above evicts them, now and again once `ticket` settles, keeping in
+    /// `before[i]` (if asked and still empty) the version it held of keys[i].
+    /// An erased row goes nowhere: nothing to read again once settled. L3 has
+    /// no cache: terminal no-op.
+    static io::Task<void> rowsMayHaveBeenErased(
+        [[maybe_unused]] std::shared_ptr<io::SettleTicket> ticket,
+        [[maybe_unused]] std::span<const Key> keys,
+        [[maybe_unused]] std::vector<std::optional<E>>* before) {
+        co_return;
+    }
+
     /// No cache tier read the catalog: no column is known to compare exactly.
     static const detail::ColumnFacts& columnFacts() {
         static const detail::ColumnFacts unknown;

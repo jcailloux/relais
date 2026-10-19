@@ -316,6 +316,46 @@ public:
     }
 
 protected:
+    /// Rows an uncertain write may have erased (see
+    /// PgRepo::rowsMayHaveBeenErased): the tiers below, then the targets of
+    /// each row from the version a tier kept, now and again once settled; for
+    /// a row none kept, every target that cannot locate it by its key. An
+    /// erased row has no new target.
+    static io::Task<void> rowsMayHaveBeenErased(std::shared_ptr<io::SettleTicket> ticket,
+                                                std::span<const Key> keys,
+                                                std::vector<std::optional<Entity>>* before) {
+        std::vector<std::optional<Entity>> own(keys.size());
+        if (!before) before = &own;
+        co_await Base::rowsMayHaveBeenErased(ticket, keys, before);
+
+        std::vector<Entity> kept;
+        std::vector<Key> unknown;
+        for (size_t i = 0; i < keys.size(); ++i) {
+            if ((*before)[i]) kept.push_back(std::move(*(*before)[i]));
+            else unknown.push_back(keys[i]);
+        }
+        if (!unknown.empty()) {
+            auto rows = std::make_shared<const detail::KeySet<Key>>(std::span<const Key>(unknown));
+            everyTargetOf("eraseMany", [&] {
+                return InvList::template invalidateUnknownRows<Entity>(ticket,
+                    [rows](const Entity& e) {
+                        return rows->contains(Key(e.key())) ? detail::RowMatch::Maybe
+                                                            : detail::RowMatch::No;
+                    });
+            });
+        }
+        if (!kept.empty()) {
+            co_await detail::precaution(std::move(ticket),
+                [kept = std::move(kept)]() -> io::Task<void> {
+                    try {
+                        co_await propagateDeleteMany<Entity, InvList>(std::span<const Entity>(kept));
+                    } catch (const std::exception& e) {
+                        logFailed("eraseMany", e);
+                    }
+                });
+        }
+    }
+
     /// Cross-invalidation of a committed patch (nothing if nothing was written).
     /// Best-effort: a committed patch never fails on cross-invalidation.
     static io::Task<void> propagatePatched(const typename Base::PatchedRow& row,
