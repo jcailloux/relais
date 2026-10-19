@@ -2259,3 +2259,160 @@ TEST_CASE("realign: writes that succeed leave no row behind and settle nothing",
     CHECK(queueOf(env).settled() == 0);
     CHECK(queueOf(env).pending() == 0);
 }
+
+// =============================================================================
+// Notes — a write that may have changed rows nobody can name leaves a note on
+// the entity tier: the predicate those rows satisfied. Until the write is
+// settled, every copy the predicate may hold for is evicted when read; once
+// settled, only the copies stored before the seal are, and a pass over the
+// cache drains the note. The probe changes rows behind relais: a read that
+// returns the probe's value read PostgreSQL, one that returns the old value was
+// served from L1.
+// =============================================================================
+
+namespace {
+
+using TI = relais_test::TestInternals;
+using detail::RowMatch;
+
+auto nameIs(std::string name) {
+    return [name = std::move(name)](const TestItemEntity& e) {
+        return e.name == name ? RowMatch::Maybe : RowMatch::No;
+    };
+}
+
+void probeSet(CohEnv& env, int64_t id, int32_t v) {
+    env.probe.query("UPDATE relais_test_items SET value=" + std::to_string(v)
+                    + " WHERE id=" + std::to_string(id));
+}
+
+std::shared_ptr<io::SettleTicket> pendingTicket() {
+    return ticketFor(io::UncertainSettle::Delay, {}, 1s);
+}
+
+// Settle `t` as the queue does, without a backend: its replays run at once.
+void settleByHand(CohEnv& env, const std::shared_ptr<io::SettleTicket>& t) {
+    t->state = io::SettleTicket::State::Settled;
+    auto replays = std::move(t->replays);
+    t->replays.clear();
+    for (auto& r : replays) driveBounded(env.io, r());
+}
+
+}  // namespace
+
+TEST_CASE("notes: a pending note evicts the copies it may touch, on every read",
+          "[coherence][settle][notes][integration]") {
+    CohEnv env(1s);
+    resetItems(env);
+    auto a = env.seedItem("note-a", 1);
+    auto b = env.seedItem("note-b", 1);
+    REQUIRE(cachedValue(env, a) == 1);
+    REQUIRE(cachedValue(env, b) == 1);
+
+    TI::noteRowsChanged<CohItemL1>(pendingTicket(), nameIs("note-a"));
+    REQUIRE(TI::rowNoteCount<CohItemL1>() == 1);
+
+    probeSet(env, a, 2);
+    probeSet(env, b, 2);
+    CHECK(cachedValue(env, a) == 2);  // touched: read again
+    CHECK(cachedValue(env, b) == 1);  // not touched: served
+    probeSet(env, a, 3);
+    CHECK(cachedValue(env, a) == 3);  // the write may still commit: evicted again
+    CHECK(TI::rowNoteCount<CohItemL1>() == 1);
+    clearL1();
+}
+
+TEST_CASE("notes: a read started before the seal is not kept",
+          "[coherence][settle][notes][integration]") {
+    CohEnv env(2s);
+    resetItems(env);
+    TI::holdRowNoteDrain<CohItemL1>(true);
+    auto a = env.seedItem("note-fill", 1);
+    auto t = pendingTicket();
+    TI::noteRowsChanged<CohItemL1>(t, nameIs("note-fill"));
+
+    bool done = false;
+    std::optional<int32_t> got;
+    auto read = [&]() -> io::Task<void> {
+        auto v = co_await CohItemL1::find(a);
+        if (v) got = v->value;
+        done = true;
+    };
+    env.holdPg();
+    auto s = [](io::Task<void> task) -> Starter { co_await std::move(task); }(read());
+    pumpUntil(env, [] { return false; }, 50ms);  // the SELECT is sent, its row held
+    REQUIRE_FALSE(done);
+    settleByHand(env, t);
+    env.releasePg();
+    REQUIRE(pumpUntil(env, [&] { return done; }, 2s));
+    if (s.handle) s.handle.destroy();
+    CHECK(got == 1);
+
+    probeSet(env, a, 2);
+    CHECK(cachedValue(env, a) == 2);  // the row read before the seal was not cached
+    clearL1();
+}
+
+TEST_CASE("notes: a copy read after the seal is served, never evicted again",
+          "[coherence][settle][notes][integration]") {
+    CohEnv env(1s);
+    resetItems(env);
+    TI::holdRowNoteDrain<CohItemL1>(true);
+    auto a = env.seedItem("note-fresh", 1);
+    REQUIRE(cachedValue(env, a) == 1);
+    auto t = pendingTicket();
+    TI::noteRowsChanged<CohItemL1>(t, nameIs("note-fresh"));
+    settleByHand(env, t);
+    REQUIRE(TI::rowNoteCount<CohItemL1>() == 1);
+
+    probeSet(env, a, 2);
+    CHECK(cachedValue(env, a) == 2);  // stored before the seal: read again
+    probeSet(env, a, 3);
+    CHECK(cachedValue(env, a) == 2);  // read after it: served
+    CHECK(cachedValue(env, a) == 2);
+    clearL1();
+}
+
+TEST_CASE("notes: the pass evicts what a settled note touches, then drops it",
+          "[coherence][settle][notes][integration]") {
+    CohEnv env(1s);
+    resetItems(env);
+    std::vector<int64_t> touched, kept;
+    for (int i = 0; i < 40; ++i) {
+        touched.push_back(env.seedItem("note-drain", i));
+        kept.push_back(env.seedItem("note-keep", i));
+    }
+    for (auto id : touched) cachedValue(env, id);
+    for (auto id : kept) cachedValue(env, id);
+
+    SECTION("settled by its ticket") {
+        auto t = pendingTicket();
+        TI::noteRowsChanged<CohItemL1>(t, nameIs("note-drain"));
+        settleByHand(env, t);
+    }
+    SECTION("without a pending ticket: settled at once") {
+        TI::noteRowsChanged<CohItemL1>(nullptr, nameIs("note-drain"));
+    }
+    REQUIRE(pumpUntil(env, [] { return TI::rowNoteCount<CohItemL1>() == 0; }, 2s));
+    CHECK_FALSE(TI::rowNotesActive<CohItemL1>());
+    for (auto id : touched) CHECK_FALSE(inL1Item(id));
+    for (auto id : kept) CHECK(inL1Item(id));
+    clearL1();
+}
+
+TEST_CASE("notes: without a note, a hit checks nothing",
+          "[coherence][settle][notes][integration]") {
+    CohEnv env(1s);
+    resetItems(env);
+    auto a = env.seedItem("note-none", 1);
+    REQUIRE(cachedValue(env, a) == 1);
+    REQUIRE(cachedValue(env, a) == 1);
+    CHECK_FALSE(TI::rowNotesActive<CohItemL1>());
+    CHECK(TI::rowNoteHitChecks<CohItemL1>() == 0);
+
+    TI::holdRowNoteDrain<CohItemL1>(true);
+    TI::noteRowsChanged<CohItemL1>(nullptr, nameIs("note-other"));
+    REQUIRE(cachedValue(env, a) == 1);
+    CHECK(TI::rowNoteHitChecks<CohItemL1>() == 1);
+    clearL1();
+}

@@ -10,6 +10,7 @@
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "jcailloux/relais/cache/ChunkMap.h"
@@ -425,6 +426,23 @@ public:
 
             return removed;
         }
+    }
+
+    /// Evict the entries of one chunk that pred(key, value) selects; ghosts
+    /// stay. Chunks split the buckets as sweepChunk does, in `n_chunks`.
+    template<typename Pred>
+    size_t evictInChunk(long chunk_id, long n_chunks, Pred&& pred) {
+        size_t removed = map_.cleanup_chunk(chunk_id, n_chunks,
+            [&pred](const Key& key, auto te) {
+                if constexpr (kHasGhosts) {
+                    if (te.isGhost()) return false;
+                }
+                auto* ce = static_cast<typename Map::CacheEntry*>(
+                    te.template asReal<typename Map::EntryHeader>());
+                return pred(key, std::as_const(ce->value));
+            });
+        if (removed > 0) map_.reclaim();
+        return removed;
     }
 
     // =========================================================================

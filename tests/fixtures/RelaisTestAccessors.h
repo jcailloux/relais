@@ -12,12 +12,15 @@
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <shared_mutex>
 #include <span>
 #include <vector>
 #include <jcailloux/relais/cache/GDSFPolicy.h>
 #include <jcailloux/relais/io/Task.h>
+#include <jcailloux/relais/io/pg/SettleTicket.h>
 
 namespace relais_test {
 
@@ -27,6 +30,44 @@ struct TestInternals {
     static void resetEntityCacheState() {
         auto& cache = Repo::cache();
         cache.full_cleanup([](const auto&, const auto&) { return true; });
+        auto& notes = Repo::notes();
+        std::unique_lock lock(notes.mutex_);
+        notes.lane_.clear();
+        notes.draining_ = false;
+        notes.hold_drain_ = false;
+        notes.hit_checks_.store(0, std::memory_order_relaxed);
+    }
+
+    /// Notes on the entity tier (rows an uncertain write may have changed).
+    template<typename Repo>
+    static size_t rowNoteCount() { return Repo::notes().size(); }
+
+    /// Whether a hit pays more than the note count's load.
+    template<typename Repo>
+    static bool rowNotesActive() { return Repo::notes().active(); }
+
+    /// Hits that checked a copy against the notes.
+    template<typename Repo>
+    static uint64_t rowNoteHitChecks() {
+        return Repo::notes().hit_checks_.load(std::memory_order_relaxed);
+    }
+
+    /// Keep the drain pass from starting (false: start it if a note is settled).
+    template<typename Repo>
+    static void holdRowNoteDrain(bool hold) {
+        {
+            auto& notes = Repo::notes();
+            std::unique_lock lock(notes.mutex_);
+            notes.hold_drain_ = hold;
+        }
+        if (!hold) Repo::startNoteDrain();
+    }
+
+    /// Leave a note, as an uncertain write does.
+    template<typename Repo, typename Pred>
+    static void noteRowsChanged(const std::shared_ptr<jcailloux::relais::io::SettleTicket>& ticket,
+                                Pred pred) {
+        Repo::noteRowsChanged(ticket, std::move(pred));
     }
 
     /// Reset list cache state: clear ChunkMap entries and modifications.
@@ -376,7 +417,7 @@ struct TestInternals {
     /// assertions on histogram entries and score denominators.
     template<typename Repo>
     static constexpr size_t bucketSlotSize() {
-        using TierType = std::remove_reference_t<decltype(*Repo::tier_ptr_)>;
+        using TierType = std::remove_reference_t<decltype(Repo::tier())>;
         return TierType::kBucketSlotSize;
     }
 
