@@ -14,16 +14,13 @@
 
 #include "jcailloux/relais/cache/ChunkMap.h"   // cache::detail::AutoHash
 #include "jcailloux/relais/cache/PendingLane.h"
+#include "jcailloux/relais/repository/RowMatch.h"
 
 #ifdef RELAIS_BUILDING_TESTS
 namespace relais_test { struct TestInternals; }
 #endif
 
 namespace jcailloux::relais::detail {
-
-/// What a predicate says of a cached copy: No only when it surely does not
-/// hold, Maybe otherwise.
-enum class RowMatch : uint8_t { No, Maybe };
 
 // =============================================================================
 // RowNotes - rows an uncertain write may have changed, for the entity tier
@@ -55,7 +52,7 @@ public:
     static constexpr size_t kChunks = size_t{1} << ChunkCountLog2;
 
     /// Empty: every row.
-    using Predicate = std::function<RowMatch(const E&)>;
+    using Predicate = RowPredicate<E>;
 
 private:
     struct Note {

@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <type_traits>
 
 #include "ListQuery.h"
@@ -194,17 +195,36 @@ public:
     using ResultView = jcailloux::relais::cache::CacheView<Result>;
     using Modification = EntityModification<E>;
 
-    // The tracker carries predicate range modifications (eraseWhere fast-path)
-    // as well as per-entity ones; the payload is a copy of the predicate filters.
-    using ModTracker = ModificationTracker<E, ChunkCount, FilterSet, Key>;
+private:
+    template<typename T>
+    struct RowsRangeOf { using type = FilterSet; };
+    template<typename T>
+        requires requires { typename T::RowsRange; }
+    struct RowsRangeOf<T> { using type = typename T::RowsRange; };
+
+public:
+    /// Rows nobody can name, described by what they hold (Traits::RowsRange);
+    /// see onRowsRanged.
+    using RowsRange = typename RowsRangeOf<Traits>::type;
+
+    /// Rows that left the pages holding them: the row `key` or, when `rows`
+    /// is set, every row it may hold for (the write named no row).
+    struct RowLeft {
+        Key key{};
+        std::function<bool(const E&)> rows;
+    };
+
+    // The tracker carries ranges of rows and rows that left their pages as
+    // well as per-entity modifications.
+    using ModTracker = ModificationTracker<E, ChunkCount, RowsRange, RowLeft>;
     using BitmapType = typename ModTracker::BitmapType;
 
-    /// Whether Traits exposes the predicate fast-path hooks (only ListMixin's
-    /// adapter does). The range consumption path is compiled out otherwise.
-    static constexpr bool kHasPredicateTraits = requires(const FilterSet& p, size_t i) {
-        { Traits::predicateGroupCompatible(p, p) } -> std::convertible_to<bool>;
-        Traits::predicateSortRange(p, i);
-    };
+    /// Whether Traits locates ranges of rows (only ListMixin's adapter does).
+    /// The range consumption path is compiled out otherwise.
+    static constexpr bool kHasPredicateTraits =
+        requires(const RowsRange& r, const FilterSet& g, SortFieldEnum f) {
+            { Traits::rowsSortRange(r, g, f) };
+        };
 
 private:
     using CacheKey = std::string;
@@ -346,13 +366,14 @@ public:
         Tier::tickSweep();
     }
 
-    /// Record a predicate range delete (eraseWhere fast-path): a single tracker
-    /// entry that invalidates every cached page a deleted row could have lived in,
-    /// instead of one entity modification per deleted row (O(1) vs O(N) tracker).
-    void onEntityRangeDeleted(const FilterSet& predicate) {
+    /// Record rows nobody can name, wherever `rows` says they may be (before
+    /// or after their write): a single tracker entry that invalidates every
+    /// cached page such a row could be in, instead of one entity modification
+    /// per row (O(1) vs O(N) tracker).
+    void onRowsRanged(RowsRange rows) {
         static_assert(kHasPredicateTraits,
-            "onEntityRangeDeleted requires Traits with predicate fast-path hooks");
-        modifications_.notifyRangeDeleted(predicate, generation_);
+            "onRowsRanged requires Traits that locate ranges of rows");
+        modifications_.notifyRangeDeleted(std::move(rows), generation_);
         Tier::tickSweep();
     }
 
@@ -360,7 +381,15 @@ public:
     /// that cannot be known (uncertain write): those pages, and only those,
     /// are invalidated lazily.
     void onRowLeft(const Key& key) {
-        modifications_.notifyRowLeft(key, generation_);
+        modifications_.notifyRowLeft(RowLeft{.key = key}, generation_);
+        Tier::tickSweep();
+    }
+
+    /// Record that every row `rows` may hold for left the pages holding it
+    /// (an uncertain write named no row): those pages, and only those, are
+    /// invalidated lazily.
+    void onRowsLeft(std::function<bool(const E&)> rows) {
+        modifications_.notifyRowLeft(RowLeft{.rows = std::move(rows)}, generation_);
         Tier::tickSweep();
     }
 
@@ -460,17 +489,17 @@ private:
                 affected = true;
         });
         if constexpr (kHasPredicateTraits) {
-            modifications_.forEachRange([&](const FilterSet& predicate, uint32_t gen) {
+            modifications_.forEachRange([&](const RowsRange& predicate, uint32_t gen) {
                 if (gen <= fetch_gen || gen > current) return;
                 ++seen;
                 if (!affected && isRangeAffecting(predicate, meta.query, meta.sort_bounds, result))
                     affected = true;
             });
         }
-        modifications_.forEachRowLeft([&](const Key& key, uint32_t gen) {
+        modifications_.forEachRowLeft([&](const RowLeft& row, uint32_t gen) {
             if (gen <= fetch_gen || gen > current) return;
             ++seen;
-            if (!affected && isRowLeftAffecting(key, meta.query, result)) affected = true;
+            if (!affected && isRowLeftAffecting(row, meta.query, result)) affected = true;
         });
         return affected || seen != current - fetch_gen;
     }
@@ -495,7 +524,7 @@ private:
 
         if constexpr (kHasPredicateTraits) {
             modifications_.forEachRange(
-                [&](const FilterSet& predicate, uint32_t gen) {
+                [&](const RowsRange& predicate, uint32_t gen) {
                     if (affected) return;
                     if (gen <= stored_gen) return;
                     if (isRangeAffecting(predicate, meta.query, meta.sort_bounds, result)) {
@@ -504,9 +533,9 @@ private:
                 });
         }
 
-        modifications_.forEachRowLeft([&](const Key& key, uint32_t gen) {
+        modifications_.forEachRowLeft([&](const RowLeft& row, uint32_t gen) {
             if (affected || gen <= stored_gen) return;
-            if (isRowLeftAffecting(key, meta.query, result)) affected = true;
+            if (isRowLeftAffecting(row, meta.query, result)) affected = true;
         });
 
         return affected;
@@ -539,7 +568,7 @@ private:
 
         if constexpr (kHasPredicateTraits) {
             modifications_.forEachRangeWithBitmap(
-                [&](const FilterSet& predicate, uint32_t gen, BitmapType pending_chunks) {
+                [&](const RowsRange& predicate, uint32_t gen, BitmapType pending_chunks) {
                     if (affected) return;
                     if ((pending_chunks & (BitmapType{1} << chunk_id)) == 0) return;
                     if (gen <= stored_gen) return;
@@ -550,42 +579,42 @@ private:
         }
 
         modifications_.forEachRowLeftWithBitmap(
-            [&](const Key& key, uint32_t gen, BitmapType pending_chunks) {
+            [&](const RowLeft& row, uint32_t gen, BitmapType pending_chunks) {
                 if (affected) return;
                 if ((pending_chunks & (BitmapType{1} << chunk_id)) == 0) return;
                 if (gen <= stored_gen) return;
-                if (isRowLeftAffecting(key, meta.query, result)) affected = true;
+                if (isRowLeftAffecting(row, meta.query, result)) affected = true;
             });
 
         return affected;
     }
 
-    /// Does a row that left its pages affect this one? A keyset page holds
+    /// Do rows that left their pages affect this one? A keyset page holds
     /// the rows that follow its cursor: removing a row it does not hold moves
-    /// nothing in it. So it is affected iff it holds the row, whatever version
-    /// of the row it holds. An offset page past the first counts the rows
-    /// before it, which may include this one: always affected.
-    bool isRowLeftAffecting(const Key& key, const Query& query, const Result& result) const {
+    /// nothing in it. So it is affected iff it holds one of them, whatever
+    /// version of the row it holds. An offset page past the first counts the
+    /// rows before it, which may include one: always affected.
+    bool isRowLeftAffecting(const RowLeft& row, const Query& query, const Result& result) const {
         if (query.offset > 0) return true;
-        for (const auto& item : result.items)
-            if (Key(item.key()) == key) return true;
+        for (const auto& item : result.items) {
+            if (row.rows ? row.rows(item) : Key(item.key()) == row.key) return true;
+        }
         return false;
     }
 
-    /// Check if a predicate range delete affects a cached page. Two gates, both
-    /// never-miss: the page's group must be filter-compatible with the predicate
-    /// (else no deleted row lived here), and the predicate's value range on the
-    /// page's sort dimension must overlap the page's [first,last].
-    bool isRangeAffecting(const FilterSet& predicate,
+    /// Check if a range of rows affects a cached page. Two gates, both
+    /// never-miss: Traits says whether the page's group can hold such a row
+    /// and, if so, the range of values it holds on the page's sort dimension,
+    /// which must overlap the page's [first,last].
+    bool isRangeAffecting(const RowsRange& predicate,
                           const Query& query,
                           const SortBounds& bounds,
                           const Result& result) const {
         if constexpr (kHasPredicateTraits) {
-            if (!Traits::predicateGroupCompatible(predicate, query.filters)) {
-                return false;
-            }
             const auto sort = query.sort.value_or(Traits::defaultSort());
-            const auto range = Traits::predicateSortRange(predicate, sort.field);
+            const auto located = Traits::rowsSortRange(predicate, query.filters, sort.field);
+            if (!located) return false;
+            const auto& range = *located;
             if (!bounds.is_valid) return true;
             const bool is_first_page = query.cursor.empty();
             const bool is_incomplete = result.items.size() < query.limit;

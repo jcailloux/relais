@@ -70,6 +70,32 @@ struct TestInternals {
         Repo::noteRowsChanged(ticket, std::move(pred));
     }
 
+    /// What the repo's catalog read says of its table's columns.
+    template<typename Repo>
+    static const jcailloux::relais::detail::ColumnFacts& columnFacts() {
+        return Repo::columnFacts();
+    }
+
+    /// Forget the column facts, so that the next readColumnFacts() reads the
+    /// catalog again, and make its next `faults` reads fail.
+    template<typename Repo>
+    static void resetColumnFacts(int faults = 0) {
+        const_cast<jcailloux::relais::detail::ColumnFacts&>(Repo::columnFacts()).reset();
+        Repo::column_facts_faults = faults;
+    }
+
+    /// The tiers' response to an uncertain predicate write (rows it may have
+    /// changed, values it set).
+    template<typename Repo, typename Pred, typename... Updates>
+    static void rowsMayHaveChanged(const std::shared_ptr<jcailloux::relais::io::SettleTicket>& ticket,
+                                   Pred pred, const Updates&... updates) {
+        Repo::rowsMayHaveChanged(ticket, std::move(pred), updates...);
+    }
+
+    /// Read the column facts now (on this loop thread) if they are not known.
+    template<typename Repo>
+    static void readColumnFacts() { Repo::readColumnFacts(); }
+
     /// Reset list cache state: clear ChunkMap entries and modifications.
     template<typename Repo>
     static void resetListCacheState() {

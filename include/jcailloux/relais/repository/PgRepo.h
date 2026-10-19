@@ -28,6 +28,7 @@
 #include "jcailloux/relais/entity/FieldUpdate.h"
 #include "jcailloux/relais/repository/ConditionalWrite.h"
 #include "jcailloux/relais/repository/GuardSql.h"
+#include "jcailloux/relais/repository/RowMatch.h"
 #include "jcailloux/relais/list/spec/GeneratedCriteria.h"
 
 namespace relais_test { struct TestInternals; }
@@ -657,6 +658,16 @@ protected:
         co_return;
     }
 
+    /// Rows an uncertain predicate write may have changed, named by what they
+    /// satisfied (`rows`), and the values it set (`updates`; none for a
+    /// delete). Each cache tier above evicts by them, now and again once
+    /// `ticket` settles. L3 has no cache: terminal no-op.
+    template<typename... Updates>
+    static void rowsMayHaveChanged(
+        [[maybe_unused]] const std::shared_ptr<io::SettleTicket>& ticket,
+        [[maybe_unused]] const detail::RowPredicate<E>& rows,
+        [[maybe_unused]] const Updates&... updates) {}
+
     // =====================================================================
     // Epoch memory pool for temporary entity allocations
     // =====================================================================
@@ -871,16 +882,17 @@ protected:
         std::vector<E> out;
         try {
             auto where = list::spec::buildWhereClause<Descriptor>(filters);
-            // Not interned: this DELETE runs on the read path, which coalesces
-            // identical statements in flight by pointer. Interned, two identical
-            // erases would share one DELETE and each report its rows.
-            const std::string sql = detail::buildDeleteWhereSql(
+            // The text depends only on which filters are set: interned, one per
+            // shape. Exclusive: two identical erases each run (each reports its
+            // rows), and an uncertain one carries its settle ticket.
+            const char* sql = detail::internSql(detail::buildDeleteWhereSql(
                 Mapping::table_name, Mapping::SQL::returning_columns,
-                where.sql, detail::kPgEraseChunk);
+                where.sql, detail::kPgEraseChunk));
 
             for (;;) {
-                auto result = co_await PgProvider::queryParams(
-                    sql.c_str(), where.params);
+                auto w = co_await PgProvider::queryWrite(
+                    sql, where.params, io::batch::WriteMode::Exclusive);
+                const auto& result = w.result;
                 const int n = result.rows();
                 if (n == 0) break;
                 out.reserve(out.size() + static_cast<size_t>(n));

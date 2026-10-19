@@ -476,6 +476,21 @@ protected:
         startNoteDrain();
     }
 
+    /// What the database says of this table's columns, for the predicates of
+    /// uncertain writes (see detail::ColumnFacts).
+    static const detail::ColumnFacts& columnFacts() { return state().facts; }
+
+    /// Rows an uncertain predicate write may have changed: a note on the
+    /// entity tier (see noteRowsChanged), then the tiers below.
+    template<typename... Updates>
+    static void rowsMayHaveChanged(const std::shared_ptr<io::SettleTicket>& ticket,
+                                   const detail::RowPredicate<E>& rows,
+                                   const Updates&... updates) {
+        readColumnFacts();  // a read that failed is tried again
+        noteRowsChanged(ticket, rows);
+        Base::rowsMayHaveChanged(ticket, rows, updates...);
+    }
+
 private:
     // =========================================================================
     // CacheTier singleton
@@ -484,6 +499,7 @@ private:
     struct State {
         Tier tier;
         Notes notes;
+        detail::ColumnFacts facts;
     };
 
     static inline std::atomic<State*> state_ptr_{nullptr};
@@ -521,7 +537,50 @@ private:
         static Holder h;
         // Redundant publish after the thread-safe static guard completes.
         state_ptr_.store(&h.instance, std::memory_order_release);
+        readColumnFacts();
         return h.instance;
+    }
+
+    /// Read the column facts from the catalog, once, without making the
+    /// caller wait. Needs a loop thread: from another, or on a failure, the
+    /// next uncertain predicate write tries again. Until read, every column
+    /// compares as Maybe.
+    static void readColumnFacts() {
+        if (!PgProvider::initialized()) return;
+        auto& facts = state_ptr_.load(std::memory_order_acquire)->facts;
+        if (facts.known() || !facts.claimRead()) return;
+        readColumnFactsTask(facts);
+    }
+
+#ifdef RELAIS_BUILDING_TESTS
+    /// Makes the next `count` reads of the column facts fail.
+    static inline int column_facts_faults = 0;
+#endif
+
+    static io::DetachedTask readColumnFactsTask(detail::ColumnFacts& facts) {
+        try {
+#ifdef RELAIS_BUILDING_TESTS
+            if (column_facts_faults > 0) {
+                --column_facts_faults;
+                throw io::PgError("injected: column facts unreadable");
+            }
+#endif
+            io::PgParams params;
+            params.push(std::string(E::MappingType::table_name));
+            auto result = co_await PgProvider::queryParams(detail::ColumnFacts::kSql, params);
+            std::vector<std::string> exact;
+            for (int r = 0; r < result.rows(); ++r) {
+                if (result[r].template get<bool>(1))
+                    exact.push_back(result[r].template get<std::string>(0));
+            }
+            facts.publish(std::move(exact));
+        } catch (const std::exception& e) {
+            facts.readFailed();
+            RELAIS_LOG_WARN << name() << ": column facts unreadable, read again on the next "
+                                         "uncertain predicate write - " << e.what();
+        } catch (...) {
+            facts.readFailed();
+        }
     }
 
     // =========================================================================

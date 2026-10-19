@@ -11,6 +11,7 @@
 #include "jcailloux/relais/PgProvider.h"
 #include "jcailloux/relais/repository/PgRepo.h"
 #include "jcailloux/relais/repository/Precaution.h"
+#include "jcailloux/relais/repository/RowMatch.h"
 #include "jcailloux/relais/Log.h"
 #include "jcailloux/relais/list/ListCache.h"
 #include "jcailloux/relais/list/ListQuery.h"
@@ -148,16 +149,13 @@ class ListMixin : public Base {
             return {ds.field_index, ds.direction};
         }
 
-        // Predicate fast-path hooks (eraseWhere) — see CanonicalEncoding /
-        // GeneratedTraits. Enable ListCache's RangeModification consumption.
-        static bool predicateGroupCompatible(const Filters& predicate,
-                                             const Filters& group) {
-            return list::spec::predicateGroupCompatible<Descriptor>(predicate, group);
-        }
+        // Ranges of rows (predicate writes) — see GeneratedTraits. Enable
+        // ListCache's range consumption.
+        using RowsRange = list::spec::RowsRange<Descriptor>;
 
-        static list::spec::SortRange predicateSortRange(const Filters& predicate,
-                                                        size_t field_index) {
-            return list::spec::predicateSortRange<Descriptor>(predicate, field_index);
+        static std::optional<list::spec::SortRange> rowsSortRange(
+            const RowsRange& rows, const Filters& group, size_t field_index) {
+            return list::spec::rowsSortRange<Descriptor>(rows, group, field_index);
         }
 
         static std::optional<size_t> parseSortField(std::string_view field) {
@@ -555,7 +553,7 @@ public:
     /// are dropped on their next read or sweep, not counted here.
     static io::Task<size_t> invalidateAllListGroups() {
         if constexpr (kHasL1) {
-            listCache().onEntityRangeDeleted(DescriptorFilters{});
+            listCache().onRowsRanged({});
         }
         co_return 0;
     }
@@ -626,9 +624,9 @@ protected:
         // ONE RangeModification on the L1 tracker (RAM, synchronous) — the
         // guard for L1 list reads, like the per-entity bump.
         if constexpr (kHasL1) {
-            DescriptorFilters local;
-            local.values = predicate.values;
-            listCache().onEntityRangeDeleted(local);
+            typename Traits::RowsRange rows;
+            rows.predicate.values = predicate.values;
+            listCache().onRowsRanged(std::move(rows));
         }
         co_await Base::template invalidateWhereListsCritical<Desc>(predicate);
     }
@@ -736,6 +734,101 @@ protected:
         co_await detail::onSettled(std::move(ticket), [id] { return realignOnSettled(id); });
     }
 
+    /// Rows an uncertain predicate write may have changed (see
+    /// PgRepo::rowsMayHaveChanged): they leave every page holding one of them,
+    /// and, for the values the write set, may enter the pages of the groups
+    /// that filter on, or sort by, a column it set. Now and again once
+    /// settled; the pages read in between are checked like the others.
+    template<typename... Updates>
+    static void rowsMayHaveChanged(const std::shared_ptr<io::SettleTicket>& ticket,
+                                   const detail::RowPredicate<Entity>& rows,
+                                   const Updates&... updates) {
+        if constexpr (kHasL1) {
+            if (rows) {
+                detail::precautionSync(ticket, [rows] {
+                    listCache().onRowsLeft([rows](const Entity& e) {
+                        return rows(e) == detail::RowMatch::Maybe;
+                    });
+                });
+            } else {
+                detail::precautionSync(ticket, [] { listCache().onRowsRanged({}); });
+            }
+            if constexpr (sizeof...(Updates) > 0) {
+                auto moved = rowsMoved(updates...);
+                if (moved.moved_filters != 0 || moved.moved_sorts != 0)
+                    detail::precautionSync(ticket, [moved] { listCache().onRowsRanged(moved); });
+            }
+        }
+        Base::rowsMayHaveChanged(ticket, rows, updates...);
+    }
+
+    /// Where rows `updates` were applied to may now be (see RowsRange).
+    template<typename... Updates>
+    static typename Traits::RowsRange rowsMoved(const Updates&... updates) {
+        typename Traits::RowsRange rows;
+        rows.moved = true;
+        (moveRows(rows, updates), ...);
+        return rows;
+    }
+
+    template<typename T, typename V>
+    static std::optional<T> setAs(const V& value) {
+        if constexpr (std::is_same_v<T, V>) return value;
+        else if constexpr ((std::is_arithmetic_v<T> || std::is_enum_v<T>)
+                           && std::is_convertible_v<V, T>)
+            return static_cast<T>(value);
+        else if constexpr (std::is_same_v<T, std::string>
+                           && std::is_constructible_v<std::string, const V&>)
+            return std::string(value);
+        else return std::nullopt;
+    }
+
+    template<typename U>
+    static void moveRows(typename Traits::RowsRange& rows, const U& update) {
+        constexpr auto F = entity::update_field_v<U>;
+        constexpr std::string_view column = detail::match::bareColumn(
+            Entity::TraitsType::template FieldInfo<F>::column_name);
+        constexpr bool sets_null = std::is_same_v<U, entity::FieldSetNull<F>>;
+
+        [&]<size_t... Is>(std::index_sequence<Is...>) {
+            ([&] {
+                using FT = list::spec::filter_at<Descriptor, Is>;
+                if constexpr (FT::column() == column) {
+                    rows.moved_filters |= uint64_t{1} << Is;
+                    auto& value = std::get<Is>(rows.predicate.values);
+                    if constexpr (FT::is_null_op) {
+                        if constexpr (sets_null) value = true;
+                        else if constexpr (entity::assigns_value_v<U>) value = false;
+                    } else if constexpr (entity::assigns_value_v<U>) {
+                        using T = typename FT::element_type;
+                        if (auto v = setAs<T>(update.value)) {
+                            if constexpr (FT::op == list::spec::Op::IN)
+                                value = std::vector<T>{std::move(*v)};
+                            else if constexpr (FT::op == list::spec::Op::EQ)
+                                value = std::move(*v);
+                        }
+                    }
+                }
+            }(), ...);
+        }(std::make_index_sequence<list::spec::filter_count<Descriptor>>{});
+
+        [&]<size_t... Ss>(std::index_sequence<Ss...>) {
+            ([&] {
+                using ST = list::spec::sort_at<Descriptor, Ss>;
+                if constexpr (ST::column() == column) {
+                    rows.moved_sorts |= uint64_t{1} << Ss;
+                    if constexpr (entity::assigns_value_v<U>) {
+                        using W = list::spec::detail::unwrap_optional_t<typename ST::value_type>;
+                        if (auto v = setAs<W>(update.value)) {
+                            const int64_t x = list::spec::detail::toInt64ForCursor(*v);
+                            rows.sorts[Ss] = {x, x};
+                        }
+                    }
+                }
+            }(), ...);
+        }(std::make_index_sequence<list::spec::sort_count<Descriptor>>{});
+    }
+
     /// The row as committed, once an uncertain write of it is settled: it
     /// enters the pages of its position (it may differ from the caller's
     /// version: trigger, generated column, rounding). If it cannot be read,
@@ -747,7 +840,7 @@ protected:
         } catch (const std::exception& e) {
             RELAIS_LOG_WARN << name() << ": row unreadable after an uncertain write, "
                                "every list page invalidated - " << e.what();
-            listCache().onEntityRangeDeleted(DescriptorFilters{});
+            listCache().onRowsRanged({});
             co_return;
         }
         if (row) listCache().onEntityCreated(*row);

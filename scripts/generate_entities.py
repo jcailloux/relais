@@ -1463,6 +1463,8 @@ class MappingGenerator:
             return []
 
         traits_path = f"{mapping_name}::TraitsType"
+        struct_fqn = (f"{entity.namespace}::{entity.class_name}"
+                      if entity.namespace else entity.class_name)
         lines = []
         for m in members:
             is_timestamp = m.name in a.timestamps
@@ -1483,6 +1485,8 @@ class MappingGenerator:
             lines.append(f'    static constexpr const char* column_name = "\\"{m.col_name}\\"";')
             lines.append(f"    static constexpr bool is_timestamp = {'true' if is_timestamp else 'false'};")
             lines.append(f"    static constexpr bool is_nullable = {'true' if is_nullable else 'false'};")
+            # The member the column reads into, to evaluate a guard on a cached copy.
+            lines.append(f"    static constexpr auto member = &{struct_fqn}::{m.name};")
             if enum_mapping and enum_mapping.pairs:
                 # C++ enum -> DB string, so a typed value (set, guards) binds the
                 # stored string. The field's codec holds the DB mapping, not the

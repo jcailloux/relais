@@ -343,24 +343,11 @@ public:
             timeout = std::current_exception();
         }
         if (timeout) {
-            // Uncertain: a chunk DELETE may have committed. The matched primary
-            // keys are unknowable after a lost ACK (a post-hoc SELECT no longer
-            // finds a committed delete), so the entity tier is left bounded by
-            // l1_ttl (logged). The LIST tier is still recoverable — the
-            // predicate drives it directly, no resolved id set needed.
-            RELAIS_LOG_ERROR << name()
-                << ": eraseWhere timeout — entity tier left to l1_ttl "
-                   "(matched keys unknowable), invalidating lists by predicate";
-            co_await detail::precaution(std::move(ticket),
-                [filters]() -> io::Task<void> {
-                    try {
-                        co_await Base::template invalidateWhereListsCritical<FD>(filters);
-                    } catch (const std::exception& e) {
-                        RELAIS_LOG_ERROR << name()
-                            << ": predicate list invalidate failed (eraseWhere timeout) - "
-                            << e.what();
-                    }
-                });
+            // Uncertain: a chunk DELETE may have committed, on rows nobody can
+            // name after a lost ACK. Each tier evicts what the predicate may
+            // hold for.
+            if constexpr (kHasCache)
+                Base::rowsMayHaveChanged(ticket, detail::filterPredicate<E>(filters, Base::columnFacts()));
             std::rethrow_exception(timeout);
         }
         if (!deleted) co_return std::nullopt;  // DB error
@@ -467,13 +454,13 @@ public:
         try {
             rows = co_await Base::template patchWhereRaw<kRows>(
                 pred, std::forward<Updates>(updates)...);
-        } catch (const io::PgUncertainError&) {
-            // precaution-exempt: the changed rows are unknowable after a lost
-            // ACK, and the predicate may still match them: nothing to
-            // invalidate by.
-            RELAIS_LOG_ERROR << name()
-                << ": patchWhere timeout — changed rows unknowable, entity and "
-                   "list tiers left to l1_ttl";
+        } catch (const io::PgUncertainError& e) {
+            // The changed rows are unknowable after a lost ACK: each tier
+            // evicts what the predicate may hold for, and where the values set
+            // may have moved them.
+            if constexpr (kHasCache)
+                Base::rowsMayHaveChanged(e.settleTicket(),
+                    detail::guardPredicate<E>(pred, Base::columnFacts()), updates...);
             throw;
         }
         if (!rows) co_return std::nullopt;  // DB error
@@ -526,6 +513,9 @@ private:
     /// is evicted before the write returns.
     static constexpr bool kHasDeferred = sizeof...(Invalidations) > 0;
 
+    /// Whether a cache tier (L1) sits above PostgreSQL.
+    static constexpr bool kHasCache = Cfg.cache_level != config::CacheLevel::None;
+
     /// Rows a predicate write returns for a caller asking `r`: at least what
     /// its cache tail reads (each version for the cascades above, the
     /// committed rows' keys for the entity tiers, nothing without a cache).
@@ -546,11 +536,12 @@ private:
         try {
             rows = co_await Base::template claimRaw<O, kRows, Order>(
                 pred, order, n, std::forward<Updates>(updates)...);
-        } catch (const io::PgUncertainError&) {
-            // precaution-exempt: the rows taken are unknowable after a lost ACK.
-            RELAIS_LOG_ERROR << name()
-                << ": claim timeout — rows taken unknowable, entity and "
-                   "list tiers left to l1_ttl";
+        } catch (const io::PgUncertainError& e) {
+            // The rows taken are unknowable after a lost ACK, but they matched
+            // the predicate: as for patchWhere.
+            if constexpr (kHasCache)
+                Base::rowsMayHaveChanged(e.settleTicket(),
+                    detail::guardPredicate<E>(pred, Base::columnFacts()), updates...);
             throw;
         }
         if (!rows) co_return std::nullopt;  // DB error
