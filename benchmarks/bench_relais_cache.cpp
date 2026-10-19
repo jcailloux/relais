@@ -72,21 +72,24 @@ TEST_CASE("Benchmark - L1 cache hit", "[benchmark][l1]")
 
     WARN(gdsf_banner());
 
-    // Bulk insert (single SQL round-trip)
+    // Bulk insert in slices: one statement for all rows can outlast the pool's
+    // query_timeout when WAL writes are slow (after the write benchmarks).
+    static constexpr int INSERT_SLICE = 100000;
     auto t_insert = Clock::now();
-    auto bulk = execQueryArgs(
-        "INSERT INTO relais_test_items (name, value, description, is_active) "
-        "SELECT 'bench_l1_' || i, i::int4, 'desc_' || i, true "
-        "FROM generate_series(0, $1::int) AS i "
-        "RETURNING id",
-        NUM_KEYS - 1);
-    auto insert_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-        Clock::now() - t_insert).count();
-
     std::vector<int64_t> ids;
     ids.reserve(NUM_KEYS);
-    for (int r = 0; r < bulk.rows(); ++r)
-        ids.push_back(bulk[r].get<int64_t>(0));
+    for (int first = 0; first < NUM_KEYS; first += INSERT_SLICE) {
+        auto bulk = execQueryArgs(
+            "INSERT INTO relais_test_items (name, value, description, is_active) "
+            "SELECT 'bench_l1_' || i, i::int4, 'desc_' || i, true "
+            "FROM generate_series($1::int, $2::int) AS i "
+            "RETURNING id",
+            first, std::min(first + INSERT_SLICE, NUM_KEYS) - 1);
+        for (int r = 0; r < bulk.rows(); ++r)
+            ids.push_back(bulk[r].get<int64_t>(0));
+    }
+    auto insert_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        Clock::now() - t_insert).count();
 
     // Warm both L1 caches (sequential find, each triggers DB fetch → L1 store)
     auto t_warm = Clock::now();
