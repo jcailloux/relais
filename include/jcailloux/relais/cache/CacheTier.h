@@ -459,6 +459,20 @@ public:
         return removed;
     }
 
+    /// Visit the metadata and value of every entry (ghosts skipped),
+    /// read-only. Linear in the table: never on a request's path.
+    template<typename Fn>
+    void forEachEntry(Fn&& fn) {
+        map_.for_each([&fn](const Key&, auto te) {
+            if constexpr (kHasGhosts) {
+                if (te.isGhost()) return;
+            }
+            auto* ce = static_cast<typename Map::CacheEntry*>(
+                te.template asReal<typename Map::EntryHeader>());
+            fn(std::as_const(ce->metadata), std::as_const(ce->value));
+        });
+    }
+
     // =========================================================================
     // Ghost write-path
     // =========================================================================

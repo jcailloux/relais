@@ -64,18 +64,12 @@ public:
             timeout = std::current_exception();
         }
         if (timeout) {
-            // Uncertain: the row may have been inserted (RETURNING id lost).
-            // Cross-invalidate from the INPUT entity — the dependent keys live in
-            // the entity's own fields, not the generated id. Best-effort.
-            co_await detail::precaution(std::move(ticket),
-                [entity]() -> io::Task<void> {
-                    try {
-                        co_await propagateCreate<Entity, InvList>(entity);
-                    } catch (const std::exception& e) {
-                        RELAIS_LOG_ERROR << name()
-                            << ": cross-invalidation failed (insert timeout) - " << e.what();
-                    }
-                });
+            // Uncertain: the row may have been inserted (RETURNING lost). No
+            // row before it.
+            std::optional<Key> id;
+            if constexpr (kInsertKeyKnown<Entity>) id = Key(entity.key());
+            co_await crossUncertain(std::move(ticket), std::move(id), RowBefore::absent(),
+                                    entity, "insert");
             std::rethrow_exception(timeout);
         }
         if (result) {
@@ -102,7 +96,19 @@ public:
     static io::Task<cache::CacheView<Entity>> upsert(const Entity& entity)
         requires UpsertableEntity<Entity, Key> && HasUpsertSql<Entity> && (!Base::config.read_only)
     {
-        std::optional<Entity> old = co_await findOldBestEffort(entity.key());
+        // A failed read leaves the row before unknown, not absent.
+        RowBefore before;
+        try {
+            auto view = co_await Base::find(entity.key());
+            if (view) before = RowBefore::of(Entity(*view));
+            else before = RowBefore::absent();
+        } catch (const io::PgError&) {
+            if constexpr (detail::HasListMixin<Base>) {
+                Base::keepPageCopy(entity.key(), &before.row);
+                if (before.row) before.known = true;
+            }
+        }
+        const std::optional<Entity>& old = before.row;
 
         cache::CacheView<Entity> result;
         std::exception_ptr timeout;
@@ -118,20 +124,9 @@ public:
             timeout = std::current_exception();
         }
         if (timeout) {
-            // Uncertain: cross-invalidate by precaution, keyed on the pre-image —
-            // old→input on the update branch, the input on the create branch. The
-            // list/entity tiers already evicted themselves as the exception unwound
-            // through the inner layers. Best-effort.
-            co_await detail::precaution(std::move(ticket),
-                [old, entity]() -> io::Task<void> {
-                    try {
-                        if (old) co_await propagateUpdate<Entity, InvList>(&*old, entity);
-                        else co_await propagateCreate<Entity, InvList>(entity);
-                    } catch (const std::exception& e) {
-                        RELAIS_LOG_ERROR << name()
-                            << ": cross-invalidation failed (upsert timeout) - " << e.what();
-                    }
-                });
+            // Uncertain: either branch may commit; the key is known in both.
+            co_await crossUncertain(std::move(ticket), Key(entity.key()), std::move(before),
+                                    entity, "upsert");
             std::rethrow_exception(timeout);
         }
         if (result) {
@@ -149,9 +144,8 @@ public:
 
     /// Update entity and propagate cross-invalidation from the row before and
     /// after, which the UPDATE returns (through ListMixin when present, which
-    /// invalidates the lists from the same rows). Uncertain: keyed on the copy
-    /// a cache tier kept before its precautionary evict (unknown without one)
-    /// and on the input entity.
+    /// invalidates the lists from the same rows). Uncertain: see
+    /// crossUncertain, the input standing for the row until settled.
     static io::Task<std::optional<size_t>> update(const Key& id, const Entity& entity)
         requires MutableEntity<Entity> && HasFullUpdate<Entity> && (!Base::config.read_only)
     {
@@ -166,18 +160,8 @@ public:
             timeout = std::current_exception();
         }
         if (timeout) {
-            // Best-effort: the uncertain exception must still surface. The
-            // list/entity tiers already evicted themselves as it unwound.
-            co_await detail::precaution(std::move(ticket),
-                [before = std::move(uncertain_before), entity]() -> io::Task<void> {
-                    try {
-                        co_await propagateUpdate<Entity, InvList>(
-                            before ? &*before : nullptr, entity);
-                    } catch (const std::exception& e) {
-                        RELAIS_LOG_ERROR << name()
-                            << ": cross-invalidation failed (update timeout) - " << e.what();
-                    }
-                });
+            co_await crossUncertain(std::move(ticket), id, RowBefore::kept(std::move(uncertain_before)),
+                                    entity, "update");
             std::rethrow_exception(timeout);
         }
         if (outcome.affected.value_or(0) > 0) {
@@ -196,9 +180,7 @@ public:
 
     /// Erase entity and propagate cross-invalidation from the deleted row, which
     /// the DELETE returns (through ListMixin when present, which invalidates the
-    /// lists from the same row). Uncertain: keyed on the copy a cache tier kept
-    /// before its precautionary evict; without one, the targets are left to
-    /// l*_ttl.
+    /// lists from the same row). Uncertain: see crossUncertain.
     static io::Task<std::optional<size_t>> erase(const Key& id)
         requires (!Base::config.read_only)
     {
@@ -213,18 +195,8 @@ public:
             timeout = std::current_exception();
         }
         if (timeout) {
-            // Best-effort: the uncertain exception must still surface.
-            if (uncertain_before) {
-                co_await detail::precaution(std::move(ticket),
-                    [before = std::move(*uncertain_before)]() -> io::Task<void> {
-                        try {
-                            co_await propagateDelete<Entity, InvList>(before);
-                        } catch (const std::exception& e) {
-                            RELAIS_LOG_ERROR << name()
-                                << ": cross-invalidation failed (erase timeout) - " << e.what();
-                        }
-                    });
-            }
+            co_await crossUncertain(std::move(ticket), id, RowBefore::kept(std::move(uncertain_before)),
+                                    std::nullopt, "erase");
             std::rethrow_exception(timeout);
         }
         if (outcome.before) {
@@ -240,10 +212,8 @@ public:
     }
 
     /// Partial update with cross-invalidation (only if committed), keyed on the
-    /// row before and after, both returned by the write itself. Uncertain: the
-    /// new version is unknown; the targets of the old one are invalidated from
-    /// the copy a cache tier kept before its precautionary evict, the others
-    /// are left to l*_ttl (logged).
+    /// row before and after, both returned by the write itself. Uncertain: see
+    /// crossUncertain (no estimate: the input is not a row).
     template<bool WithBefore, typename... Updates>
     static io::Task<typename Base::PatchedRow> patchRow(
         const Key& id, std::optional<Entity>* uncertain_before, Updates&&... updates)
@@ -264,7 +234,8 @@ public:
             timeout = std::current_exception();
         }
         if (timeout) {
-            co_await propagateUncertainPatch(std::move(ticket), *uncertain_before, "patch");
+            co_await crossUncertain(std::move(ticket), id, RowBefore::kept(std::move(*uncertain_before)),
+                                    std::nullopt, "patch");
             std::rethrow_exception(timeout);
         }
         co_await propagatePatched(row, "patch");
@@ -294,7 +265,8 @@ public:
             timeout = std::current_exception();
         }
         if (timeout) {
-            co_await propagateUncertainPatch(std::move(ticket), *uncertain_before, "patchIf");
+            co_await crossUncertain(std::move(ticket), id, RowBefore::kept(std::move(*uncertain_before)),
+                                    std::nullopt, "patchIf");
             std::rethrow_exception(timeout);
         }
         if (row) co_await propagatePatched(*row, "patchIf");
@@ -317,6 +289,32 @@ public:
         co_await Base::invalidate(id);
     }
 
+    /// Every row (see PgRepo::invalidateEveryRow), and, as invalidate does,
+    /// every target of them. A cycle of repos back to this one stops here.
+    static void invalidateEveryRow(const std::shared_ptr<io::SettleTicket>& ticket) {
+        Base::invalidateEveryRow(ticket);
+        static thread_local bool cascading = false;
+        if (cascading) return;
+        struct Reset { ~Reset() { cascading = false; } } reset;
+        cascading = true;
+        InvList::invalidateEvery(ticket);
+    }
+
+    /// Rows an uncertain predicate write may have changed (see
+    /// PgRepo::rowsMayHaveChanged): the tiers below, then their targets.
+    /// Nobody can name the rows, so a target is found only where the rows are
+    /// located by what they hold (a list repo over them); every other target
+    /// may be any.
+    template<typename... Updates>
+    static void rowsMayHaveChanged(const std::shared_ptr<io::SettleTicket>& ticket,
+                                   const detail::RowPredicate<Entity>& rows,
+                                   const Updates&... updates) {
+        Base::rowsMayHaveChanged(ticket, rows, updates...);
+        everyTargetOf("predicate write", [&] {
+            return InvList::template invalidateUnknownRows<Entity>(ticket, rows, updates...);
+        });
+    }
+
 protected:
     /// Cross-invalidation of a committed patch (nothing if nothing was written).
     /// Best-effort: a committed patch never fails on cross-invalidation.
@@ -331,26 +329,100 @@ protected:
         }
     }
 
-    /// Cross-invalidation of an uncertain patch: the targets of `before` (a
-    /// cache tier's copy, if it had one) are invalidated as for a deletion;
-    /// those of the unknowable new version are left to l*_ttl (logged).
+    /// The row before an uncertain write: a version of it, known absent, or
+    /// unknown (no cache tier held it and no page did).
+    struct RowBefore {
+        std::optional<Entity> row;
+        bool known = false;
+
+        static RowBefore of(Entity e) { return {std::move(e), true}; }
+        static RowBefore absent() { return {std::nullopt, true}; }
+        /// The copy a cache tier kept before its precautionary evict.
+        static RowBefore kept(std::optional<Entity> copy) {
+            const bool known = copy.has_value();
+            return {std::move(copy), known};
+        }
+    };
+
+    /// Cross-targets of an uncertain write of the row `id` (none: a key the
+    /// database assigns), which may commit until `ticket` settles:
+    /// - the targets of the row before: from its version, now and again once
+    ///   settled; unknown, every target that cannot locate it otherwise;
+    /// - until settled, those of `estimate` (the input, when a whole row);
+    /// - once settled, those of the row read again, as committed (trigger,
+    ///   generated column). Without a key, every target.
     /// Best-effort: the uncertain exception must still surface.
-    static io::Task<void> propagateUncertainPatch(
-        std::shared_ptr<io::SettleTicket> ticket,
-        const std::optional<Entity>& before, const char* op) {
-        RELAIS_LOG_ERROR << name() << ": " << op
-            << " timeout — new row version unknowable, its cross-invalidation "
-               "targets left to l*_ttl";
-        if (!before) co_return;
-        co_await detail::precaution(std::move(ticket),
-            [b = *before, op]() -> io::Task<void> {
-                try {
-                    co_await propagateDelete<Entity, InvList>(b);
-                } catch (const std::exception& e) {
-                    RELAIS_LOG_ERROR << name() << ": cross-invalidation failed (" << op
-                        << " timeout) - " << e.what();
-                }
+    static io::Task<void> crossUncertain(std::shared_ptr<io::SettleTicket> ticket,
+                                         std::optional<Key> id, RowBefore before,
+                                         std::optional<Entity> estimate, const char* op) {
+        if (before.row) {
+            co_await detail::precaution(ticket,
+                [b = std::move(*before.row), op]() -> io::Task<void> {
+                    try {
+                        co_await propagateDelete<Entity, InvList>(b);
+                    } catch (const std::exception& e) {
+                        logFailed(op, e);
+                    }
+                });
+        } else if (!before.known && id) {
+            everyTargetOf(op, [&] {
+                return InvList::template invalidateUnknownRow<Entity>(ticket, *id);
             });
+        }
+        if (estimate) {
+            try {
+                co_await propagateCreate<Entity, InvList>(*estimate);
+            } catch (const std::exception& e) {
+                logFailed(op, e);
+            }
+        }
+        if (id) {
+            co_await detail::onSettled(std::move(ticket),
+                [id = std::move(*id), op] { return crossOnSettled(id, op); });
+        } else {
+            co_await detail::onSettled(std::move(ticket), [op]() -> io::Task<void> {
+                everyTargetOf(op, [] { return InvList::invalidateEvery(nullptr); });
+                co_return;
+            });
+        }
+    }
+
+    /// The targets of the row as committed, once an uncertain write of it is
+    /// settled; if it cannot be read, every target.
+    static io::Task<void> crossOnSettled(Key id, const char* op) {
+        std::optional<Entity> row;
+        try {
+            row = co_await Base::rereadRaw(id);
+        } catch (const std::exception& e) {
+            RELAIS_LOG_WARN << name() << ": row unreadable after an uncertain " << op
+                            << " - " << e.what();
+            everyTargetOf(op, [] { return InvList::invalidateEvery(nullptr); });
+            co_return;
+        }
+        if (!row) co_return;
+        try {
+            co_await propagateCreate<Entity, InvList>(*row);
+        } catch (const std::exception& e) {
+            logFailed(op, e);
+        }
+    }
+
+    /// Runs `fallback` (true when a dependency invalidated every target) and
+    /// logs it. Best-effort, like the rest of the uncertain path.
+    template<typename Fallback>
+    static void everyTargetOf(const char* op, Fallback&& fallback) {
+        try {
+            if (fallback())
+                RELAIS_LOG_WARN << name() << ": uncertain " << op
+                                << " of rows unknown, a cross-invalidation invalidated every target";
+        } catch (const std::exception& e) {
+            logFailed(op, e);
+        }
+    }
+
+    static void logFailed(const char* op, const std::exception& e) {
+        RELAIS_LOG_ERROR << name() << ": cross-invalidation failed (" << op << " timeout) - "
+                         << e.what();
     }
 
     /// Best-effort pre-read for cross-invalidation context. The read path no

@@ -351,6 +351,13 @@ public:
         co_return;
     }
 
+    /// Every copy (see PgRepo::invalidateEveryRow): a note with an empty
+    /// predicate (see noteRowsChanged), O(1).
+    static void invalidateEveryRow(const std::shared_ptr<io::SettleTicket>& ticket) {
+        noteRowsChanged(ticket, {});
+        Base::invalidateEveryRow(ticket);
+    }
+
     /// Batch invalidation common path — L1 entity tier: point-evict L1 (one per
     /// key, never purgeAll). The L1 entity tier has no deferred work.
     template<bool WithLists = true>

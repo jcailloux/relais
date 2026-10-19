@@ -346,7 +346,7 @@ public:
             // Uncertain: a chunk DELETE may have committed, on rows nobody can
             // name after a lost ACK. Each tier evicts what the predicate may
             // hold for.
-            if constexpr (kHasCache)
+            if constexpr (kHasUncertainTail)
                 Base::rowsMayHaveChanged(ticket, detail::filterPredicate<E>(filters, Base::columnFacts()));
             std::rethrow_exception(timeout);
         }
@@ -458,7 +458,7 @@ public:
             // The changed rows are unknowable after a lost ACK: each tier
             // evicts what the predicate may hold for, and where the values set
             // may have moved them.
-            if constexpr (kHasCache)
+            if constexpr (kHasUncertainTail)
                 Base::rowsMayHaveChanged(e.settleTicket(),
                     detail::guardPredicate<E>(pred, Base::columnFacts()), updates...);
             throw;
@@ -516,6 +516,10 @@ private:
     /// Whether a cache tier (L1) sits above PostgreSQL.
     static constexpr bool kHasCache = Cfg.cache_level != config::CacheLevel::None;
 
+    /// Whether an uncertain predicate write has rows to evict: from a cache
+    /// tier, or from the cross-targets.
+    static constexpr bool kHasUncertainTail = kHasCache || kHasDeferred;
+
     /// Rows a predicate write returns for a caller asking `r`: at least what
     /// its cache tail reads (each version for the cascades above, the
     /// committed rows' keys for the entity tiers, nothing without a cache).
@@ -539,7 +543,7 @@ private:
         } catch (const io::PgUncertainError& e) {
             // The rows taken are unknowable after a lost ACK, but they matched
             // the predicate: as for patchWhere.
-            if constexpr (kHasCache)
+            if constexpr (kHasUncertainTail)
                 Base::rowsMayHaveChanged(e.settleTicket(),
                     detail::guardPredicate<E>(pred, Base::columnFacts()), updates...);
             throw;
