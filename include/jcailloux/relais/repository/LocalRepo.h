@@ -483,6 +483,19 @@ protected:
         startNoteDrain();
     }
 
+    /// Rows an uncertain write may have erased (see
+    /// PgRepo::rowsMayHaveBeenErased): their copies kept, then evicted.
+    static io::Task<void> rowsMayHaveBeenErased(std::shared_ptr<io::SettleTicket> ticket,
+                                                std::span<const Key> keys,
+                                                std::vector<std::optional<E>>* before) {
+        for (size_t i = 0; i < keys.size(); ++i)
+            keepUncertainBefore(keys[i], before ? &(*before)[i] : nullptr);
+        detail::precautionSync(ticket, [ids = std::vector<Key>(keys.begin(), keys.end())] {
+            for (const auto& id : ids) evict(id);
+        });
+        co_await Base::rowsMayHaveBeenErased(std::move(ticket), keys, before);
+    }
+
     /// What the database says of this table's columns, for the predicates of
     /// uncertain writes (see detail::ColumnFacts).
     static const detail::ColumnFacts& columnFacts() { return state().facts; }

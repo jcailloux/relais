@@ -3019,3 +3019,56 @@ TEST_CASE("cross: an uncertain predicate write reaches every target it cannot lo
     REQUIRE(pumpUntil(env, [&] { return settledAll(env); }, 7s));
     dropUsers(env, r);
 }
+
+TEST_CASE("cross: an uncertain eraseMany names the targets and pages of the rows it found",
+          "[coherence][settle][cross][list][integration]") {
+    CohEnv env(300ms, io::UncertainSettle::Await);
+    LogCapture logs;
+    auto r = resetCross(env, "coh-x-many");
+    auto p2 = seedPurchase(env, r.u2);
+    auto p3 = seedPurchase(env, r.u3);
+    REQUIRE(driveBounded(env.io, CohPurchaseX::find(r.pid)));  // an L1 copy
+    REQUIRE(purchasePageHolds<CohPurchaseX>(env, r.u2, p2));    // only a page
+    REQUIRE(purchasePageHolds<CohPurchaseX>(env, r.u3, p3));
+    REQUIRE_FALSE(TI::getFromCache<CohPurchaseX>(p2));
+    const std::vector<int64_t> ids{r.pid, p2};
+    std::optional<RowLock> lock;
+    lock.emplace("relais_test_purchases", "id=" + std::to_string(r.pid));
+
+    settleAfterRefill(env, lock, CohPurchaseX::eraseMany(std::span<const int64_t>(ids)),
+                      [&] { cacheUsers(env, {r.u1, r.u2, r.u3}); });
+    REQUIRE(env.probe.query("SELECT count(*) FROM relais_test_purchases WHERE id IN ("
+                            + std::to_string(r.pid) + ", " + std::to_string(p2) + ")")
+                .get(0, 0) == "0");  // committed late
+    CHECK_FALSE(userInL1(r.u1));  // from the L1 copy
+    CHECK_FALSE(userInL1(r.u2));  // from the page
+    CHECK(userInL1(r.u3));
+    CHECK(LogCapture::count(log::Level::Warn, kEveryTarget) == 0);
+    auto hidden3 = seedPurchase(env, r.u3);
+    CHECK_FALSE(purchasePageHolds<CohPurchaseX>(env, r.u2, p2));
+    CHECK_FALSE(purchasePageHolds<CohPurchaseX>(env, r.u3, hidden3));  // kept
+    dropUsers(env, r);
+}
+
+TEST_CASE("cross: an uncertain eraseMany of rows nobody holds reaches every target it cannot locate",
+          "[coherence][settle][cross][list][integration]") {
+    CohEnv env(300ms, io::UncertainSettle::Await);
+    LogCapture logs;
+    auto r = resetCross(env, "coh-x-many-none");
+    auto p3 = seedPurchase(env, r.u3);
+    REQUIRE(purchasePageHolds<CohPurchaseListL1>(env, r.u1, r.pid));
+    REQUIRE(purchasePageHolds<CohPurchaseListL1>(env, r.u3, p3));
+    const std::vector<int64_t> ids{r.pid};
+    std::optional<RowLock> lock;
+    lock.emplace("relais_test_purchases", "id=" + std::to_string(r.pid));
+
+    settleAfterRefill(env, lock, CohPurchaseX::eraseMany(std::span<const int64_t>(ids)),
+                      [&] { everyUserUntilSettled(env, r); });
+    CHECK(LogCapture::count(log::Level::Warn, kEveryTarget) == 1);
+    usersKeptOnceSettled(env, r);
+    // The list repo over the same rows: only the page holding the row went.
+    auto hidden3 = seedPurchase(env, r.u3);
+    CHECK_FALSE(purchasePageHolds<CohPurchaseListL1>(env, r.u1, r.pid));
+    CHECK_FALSE(purchasePageHolds<CohPurchaseListL1>(env, r.u3, hidden3));
+    dropUsers(env, r);
+}

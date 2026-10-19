@@ -10,6 +10,7 @@
 
 #include "jcailloux/relais/PgProvider.h"
 #include "jcailloux/relais/repository/PgRepo.h"
+#include "jcailloux/relais/repository/KeyDedup.h"
 #include "jcailloux/relais/repository/Precaution.h"
 #include "jcailloux/relais/repository/RowMatch.h"
 #include "jcailloux/relais/Log.h"
@@ -790,6 +791,24 @@ protected:
         detail::precautionSync(ticket, [id] { listCache().onRowLeft(id); });
         if (estimate) listCache().onEntityCreated(*estimate);
         co_await detail::onSettled(std::move(ticket), [id] { return realignOnSettled(id); });
+    }
+
+    /// Rows an uncertain write may have erased (see
+    /// PgRepo::rowsMayHaveBeenErased): the tiers below, then, for the keys
+    /// they kept no copy of, the copies the pages hold (see keepPageCopy);
+    /// then the rows leave every page holding one of them, in one entry.
+    static io::Task<void> rowsMayHaveBeenErased(std::shared_ptr<io::SettleTicket> ticket,
+                                                std::span<const Key> keys,
+                                                std::vector<std::optional<Entity>>* before) {
+        co_await Base::rowsMayHaveBeenErased(ticket, keys, before);
+        if constexpr (kHasL1) {
+            for (size_t i = 0; i < keys.size(); ++i)
+                keepPageCopy(keys[i], before ? &(*before)[i] : nullptr);
+            auto rows = std::make_shared<const detail::KeySet<Key>>(keys);
+            detail::precautionSync(ticket, [rows] {
+                listCache().onRowsLeft([rows](const Entity& e) { return rows->contains(Key(e.key())); });
+            });
+        }
     }
 
     /// Rows an uncertain predicate write may have changed (see
