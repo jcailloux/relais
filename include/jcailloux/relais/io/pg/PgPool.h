@@ -206,8 +206,7 @@ private:
             // Validate connection before handing to a waiter
             if (!conn.connected()) {
                 --total_;
-                // Waiter stays queued — next release() will serve it,
-                // or acquire() will create a new connection.
+                replenish();
                 return;
             }
             auto* waiter = waiters_.front();
@@ -226,6 +225,27 @@ private:
             idle_.push_back(std::move(conn));
         } else {
             --total_;
+        }
+    }
+
+    // A dead connection freed a slot while acquires wait: nothing else would
+    // connect for them (only a new acquire() does), so connect a replacement
+    // for the slot and hand it over as a release does. A failed connect gives
+    // the slot back; the waiters keep their acquire_timeout.
+    void replenish() {
+        if (waiters_.empty() || total_ >= cfg_.max_connections) return;
+        ++total_;
+        connectReplacement(this->shared_from_this());
+    }
+
+    static DetachedTask connectReplacement(std::shared_ptr<PgPool> self) {
+        try {
+            auto conn = co_await ConnectionType::connect(
+                self->io_, self->conninfo_.c_str(), self->cfg_.acquire_timeout,
+                self->cfg_.query_timeout, self->settleConfig());
+            self->release(std::move(conn));
+        } catch (...) {
+            --self->total_;
         }
     }
 
