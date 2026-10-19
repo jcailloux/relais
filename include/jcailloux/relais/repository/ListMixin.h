@@ -89,14 +89,7 @@ class ListMixin : public Base {
     static constexpr bool kHasL1 =
         Base::config.cache_level == config::CacheLevel::L1;
 
-    // The caller assigns the key an insert writes (no key column is filled by
-    // the database). A mapping that does not say is taken as database-assigned.
-    static constexpr bool kInsertKeyKnown = [] {
-        if constexpr (requires { { Mapping::insert_assigns_pk } -> std::convertible_to<bool>; })
-            return static_cast<bool>(Mapping::insert_assigns_pk);
-        else
-            return false;
-    }();
+    static constexpr bool kInsertKeyKnown = relais::kInsertKeyKnown<Entity>;
 
     // =========================================================================
     // Type aliases from list infrastructure
@@ -471,7 +464,10 @@ public:
             uncertain = std::current_exception();
         }
         if (uncertain) {
-            if constexpr (kHasL1) co_await realignUncertain(std::move(ticket), id, std::nullopt);
+            if constexpr (kHasL1) {
+                keepPageCopy(id, uncertain_before);
+                co_await realignUncertain(std::move(ticket), id, std::nullopt);
+            }
             std::rethrow_exception(uncertain);
         }
         co_await invalidateListsPatched(row);
@@ -498,7 +494,10 @@ public:
             uncertain = std::current_exception();
         }
         if (uncertain) {
-            if constexpr (kHasL1) co_await realignUncertain(std::move(ticket), id, std::nullopt);
+            if constexpr (kHasL1) {
+                keepPageCopy(id, uncertain_before);
+                co_await realignUncertain(std::move(ticket), id, std::nullopt);
+            }
             std::rethrow_exception(uncertain);
         }
         if (row) co_await invalidateListsPatched(*row);
@@ -575,6 +574,45 @@ public:
 
     static void notifyDeleted(const Entity& entity) {
         if constexpr (kHasL1) { listCache().onEntityDeleted(entity); }
+    }
+
+    // Uncertain writes of rows this repo pages, by a repo that reaches its
+    // pages through InvalidateList: the write may commit until settled. Each
+    // runs now and again once settled.
+
+    /// The row `key` left every page holding it.
+    static void notifyRowLeft(const std::shared_ptr<io::SettleTicket>& ticket, const Key& key) {
+        if constexpr (kHasL1) detail::precautionSync(ticket, [key] { listCache().onRowLeft(key); });
+    }
+
+    /// Rows `rows` may hold for left every page holding one of them (every
+    /// page, if empty) and, for the values `updates` set, may enter the
+    /// pages of the groups that filter on, or sort by, a column they set.
+    template<typename... Updates>
+    static void notifyRowsChanged(const std::shared_ptr<io::SettleTicket>& ticket,
+                                  const detail::RowPredicate<Entity>& rows,
+                                  const Updates&... updates) {
+        if constexpr (kHasL1) {
+            if (rows) {
+                detail::precautionSync(ticket, [rows] {
+                    listCache().onRowsLeft([rows](const Entity& e) {
+                        return rows(e) == detail::RowMatch::Maybe;
+                    });
+                });
+            } else {
+                detail::precautionSync(ticket, [] { listCache().onRowsRanged({}); });
+            }
+            if constexpr (sizeof...(Updates) > 0) {
+                auto moved = rowsMoved(updates...);
+                if (moved.moved_filters != 0 || moved.moved_sorts != 0)
+                    detail::precautionSync(ticket, [moved] { listCache().onRowsRanged(moved); });
+            }
+        }
+    }
+
+    /// Any row may have changed: every page.
+    static void notifyEveryRow(const std::shared_ptr<io::SettleTicket>& ticket) {
+        notifyRowsChanged(ticket, {});
     }
 
 #ifdef RELAIS_BUILDING_TESTS
@@ -668,7 +706,10 @@ protected:
             uncertain = std::current_exception();
         }
         if (uncertain) {
-            if constexpr (kHasL1) co_await realignUncertain(std::move(ticket), id, entity);
+            if constexpr (kHasL1) {
+                keepPageCopy(id, uncertain_before);
+                co_await realignUncertain(std::move(ticket), id, entity);
+            }
             std::rethrow_exception(uncertain);
         }
         if (outcome.affected.value_or(0) > 0) {
@@ -704,7 +745,10 @@ protected:
             uncertain = std::current_exception();
         }
         if (uncertain) {
-            if constexpr (kHasL1) co_await realignUncertain(std::move(ticket), id, std::nullopt);
+            if constexpr (kHasL1) {
+                keepPageCopy(id, uncertain_before);
+                co_await realignUncertain(std::move(ticket), id, std::nullopt);
+            }
             std::rethrow_exception(uncertain);
         }
         if (outcome.before) {
@@ -721,6 +765,20 @@ protected:
         co_return;
     }
 
+    /// For the cascade above (`slot` set), when no tier kept the row before an
+    /// uncertain write of it: the row as a cached page holds it (see
+    /// ListCache::findRow). Before the row leaves its pages, which would pass
+    /// over every page holding it. Best-effort: left empty on failure.
+    static void keepPageCopy(const Key& id, std::optional<Entity>* slot) noexcept {
+        if constexpr (kHasL1) {
+            if (!slot || *slot) return;
+            try {
+                *slot = listCache().findRow(id);
+            } catch (...) {
+            }
+        }
+    }
+
     /// The pages of an uncertain write of the row `id` (it may commit after
     /// this, until the write is settled). The row leaves every page holding
     /// it, whatever version they hold: now, and again once settled. Until
@@ -735,30 +793,14 @@ protected:
     }
 
     /// Rows an uncertain predicate write may have changed (see
-    /// PgRepo::rowsMayHaveChanged): they leave every page holding one of them,
-    /// and, for the values the write set, may enter the pages of the groups
-    /// that filter on, or sort by, a column it set. Now and again once
-    /// settled; the pages read in between are checked like the others.
+    /// PgRepo::rowsMayHaveChanged): their pages (see notifyRowsChanged; the
+    /// pages read before the write is settled are checked like the others),
+    /// then the tiers below.
     template<typename... Updates>
     static void rowsMayHaveChanged(const std::shared_ptr<io::SettleTicket>& ticket,
                                    const detail::RowPredicate<Entity>& rows,
                                    const Updates&... updates) {
-        if constexpr (kHasL1) {
-            if (rows) {
-                detail::precautionSync(ticket, [rows] {
-                    listCache().onRowsLeft([rows](const Entity& e) {
-                        return rows(e) == detail::RowMatch::Maybe;
-                    });
-                });
-            } else {
-                detail::precautionSync(ticket, [] { listCache().onRowsRanged({}); });
-            }
-            if constexpr (sizeof...(Updates) > 0) {
-                auto moved = rowsMoved(updates...);
-                if (moved.moved_filters != 0 || moved.moved_sorts != 0)
-                    detail::precautionSync(ticket, [moved] { listCache().onRowsRanged(moved); });
-            }
-        }
+        notifyRowsChanged(ticket, rows, updates...);
         Base::rowsMayHaveChanged(ticket, rows, updates...);
     }
 

@@ -489,6 +489,18 @@ public:
         return removed;
     }
 
+    /// Visit every entry, read-only, under one epoch guard.
+    /// Fn: void(const K&, TaggedEntry). Linear in the table.
+    template<typename Fn>
+    void for_each(Fn&& fn) {
+        auto guard = epoch::EpochGuard::acquire();
+        long nb = map_.num_buckets();
+        for (long i = 0; i < nb; ++i) {
+            map_.prefetch_bucket(i + 1);
+            map_.for_each_bucket(i, fn);
+        }
+    }
+
     /// Force a GC cycle on the epoch pool.
     void collect() {
         pool_.collect();

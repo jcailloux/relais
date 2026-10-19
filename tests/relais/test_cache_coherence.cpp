@@ -2016,18 +2016,18 @@ TEST_CASE("replay: the second eviction is as narrow as the first",
 
 namespace {
 
-// A trigger on relais_test_articles for the length of a case.
+// A trigger on `table` (relais_test_articles by default) for the length of a case.
 struct ArticleTrigger {
     io::test::PgProbe& probe;
     std::string name;
     ArticleTrigger(CohEnv& env, std::string trigger, const std::string& timing,
-                   const std::string& body)
+                   const std::string& body, const std::string& table = "relais_test_articles")
         : probe(env.probe), name(std::move(trigger)) {
         drop();
         probe.query("CREATE FUNCTION " + name + "() RETURNS trigger AS $$ BEGIN " + body
                     + " RETURN NEW; END $$ LANGUAGE plpgsql");
         probe.query("CREATE TRIGGER " + name + " " + timing
-                    + " ON relais_test_articles FOR EACH ROW EXECUTE FUNCTION " + name + "()");
+                    + " ON " + table + " FOR EACH ROW EXECUTE FUNCTION " + name + "()");
     }
     ~ArticleTrigger() {
         try { drop(); } catch (...) {}
@@ -2803,4 +2803,219 @@ TEST_CASE("predicate: an eraseWhere committed after its eviction is evicted agai
     CHECK_FALSE(pageHolds<CohArticleL1>(env, "coh-ew-src", src));
     CHECK(pageHolds<CohArticleL1>(env, "coh-ew-src", other));
     resetArticleCaches<CohArticleL1>(env);
+}
+
+// =============================================================================
+// Cross-invalidation of an uncertain write — the targets of the row before it
+// come from its L1 copy, else from a cached page no write has touched since it
+// was stored, else every target (logged); those of the row after, from the
+// row read again once settled. A list repo over the same rows locates them by
+// their key or by what they hold. Each case checks that a target the write
+// does not reach stays cached.
+// =============================================================================
+
+using PurchaseF = ::entity::generated::TestPurchaseEntity::Field;
+using CohPurchaseListL1 = Repo<::entity::generated::TestPurchaseEntity, "coh:purchase:list:l1">;
+using CohPurchaseX = Repo<::entity::generated::TestPurchaseEntity, "coh:purchase:x:l1",
+                          cfg::Local, Invalidate<CohUserL1, cohPurchaseUser>,
+                          InvalidateList<CohPurchaseListL1>>;
+
+namespace {
+
+constexpr std::string_view kEveryTarget = "invalidated every target";
+
+struct CrossRows {
+    int64_t u1, u2, u3;  // u1 owns the purchase, u3 is reached by nothing
+    int64_t pid;
+};
+
+CrossRows resetCross(CohEnv& env, const std::string& tag) {
+    env.probe.query("DELETE FROM relais_test_purchases");
+    TI::resetEntityCacheState<CohUserL1>();
+    TI::resetEntityCacheState<CohPurchaseX>();
+    TI::resetListCacheState<CohPurchaseX>();
+    TI::resetEntityCacheState<CohPurchaseListL1>();
+    TI::resetListCacheState<CohPurchaseListL1>();
+    CrossRows r{};
+    r.u1 = seedUser(env, tag + "-u1");
+    r.u2 = seedUser(env, tag + "-u2");
+    r.u3 = seedUser(env, tag + "-u3");
+    r.pid = seedPurchase(env, r.u1);
+    return r;
+}
+
+void dropUsers(CohEnv& env, const CrossRows& r) {
+    env.probe.query("DELETE FROM relais_test_purchases");
+    env.probe.query("DELETE FROM relais_test_users WHERE id IN (" + std::to_string(r.u1) + ", "
+                    + std::to_string(r.u2) + ", " + std::to_string(r.u3) + ")");
+}
+
+bool userInL1(int64_t u) {
+    return static_cast<bool>(TI::getFromCache<CohUserL1>(u));
+}
+
+void cacheUsers(CohEnv& env, std::initializer_list<int64_t> users) {
+    for (auto u : users) {
+        REQUIRE(driveBounded(env.io, CohUserL1::find(u)));
+        REQUIRE(userInL1(u));
+    }
+}
+
+// Every user is a target until the write is settled: a copy read meanwhile
+// is not kept. Once settled, one is.
+void everyUserUntilSettled(CohEnv& env, const CrossRows& r) {
+    for (auto u : {r.u1, r.u2, r.u3}) {
+        REQUIRE(driveBounded(env.io, CohUserL1::find(u)));
+        CHECK_FALSE(userInL1(u));
+    }
+}
+
+void usersKeptOnceSettled(CohEnv& env, const CrossRows& r) {
+    cacheUsers(env, {r.u1, r.u2, r.u3});
+}
+
+template<typename ListRepo>
+bool purchasePageHolds(CohEnv& env, int64_t user, int64_t id) {
+    using Desc = typename ListRepo::ListDescriptorType;
+    ld::ListQueryParams<Desc> p;
+    p.limit = 10;
+    p.filters.template get<"user_id">() = user;
+    auto page = driveBounded(env.io, ListRepo::query(ld::seal<Desc>(std::move(p))));
+    for (const auto& row : page->items)
+        if (row.id == id) return true;
+    return false;
+}
+
+// The purchase moved to `user`, its UPDATE prepared, its L1 copy dropped.
+::entity::generated::TestPurchaseEntity movedPurchase(CohEnv& env, int64_t pid, int64_t user) {
+    auto before = driveBounded(env.io, CohPurchaseX::find(pid));
+    REQUIRE(before);
+    ::entity::generated::TestPurchaseEntity moved(*before);
+    moved.user_id = user;
+    driveBounded(env.io, CohPurchaseX::update(pid, *before));
+    TI::evict<CohPurchaseX>(pid);
+    REQUIRE_FALSE(TI::getFromCache<CohPurchaseX>(pid));
+    return moved;
+}
+
+}  // namespace
+
+TEST_CASE("cross: a row only a page holds names its old target",
+          "[coherence][settle][cross][integration]") {
+    CohEnv env(300ms, io::UncertainSettle::Await);
+    LogCapture logs;
+    auto r = resetCross(env, "coh-x-page");
+    auto moved = movedPurchase(env, r.pid, r.u2);
+    REQUIRE(purchasePageHolds<CohPurchaseX>(env, r.u1, r.pid));  // the only copy
+    std::optional<RowLock> lock;
+    lock.emplace("relais_test_purchases", "id=" + std::to_string(r.pid));
+
+    settleAfterRefill(env, lock, CohPurchaseX::update(r.pid, moved),
+                      [&] { cacheUsers(env, {r.u1, r.u2, r.u3}); });
+    CHECK_FALSE(userInL1(r.u1));  // from the page
+    CHECK_FALSE(userInL1(r.u2));  // from the row read again
+    CHECK(userInL1(r.u3));
+    CHECK(LogCapture::count(log::Level::Warn, kEveryTarget) == 0);
+    dropUsers(env, r);
+}
+
+TEST_CASE("cross: a page touched since it was stored is passed over",
+          "[coherence][settle][cross][integration]") {
+    CohEnv env(300ms, io::UncertainSettle::Await);
+    LogCapture logs;
+    auto r = resetCross(env, "coh-x-touched");
+    auto moved = movedPurchase(env, r.pid, r.u2);
+    REQUIRE(purchasePageHolds<CohPurchaseX>(env, r.u1, r.pid));
+    ::entity::generated::TestPurchaseEntity sibling(moved);
+    sibling.id = 0;
+    sibling.user_id = r.u1;
+    REQUIRE(driveBounded(env.io, CohPurchaseX::insert(sibling)));  // touches the page
+    std::optional<RowLock> lock;
+    lock.emplace("relais_test_purchases", "id=" + std::to_string(r.pid));
+
+    settleAfterRefill(env, lock, CohPurchaseX::update(r.pid, moved),
+                      [&] { everyUserUntilSettled(env, r); });
+    CHECK(LogCapture::count(log::Level::Warn, kEveryTarget) == 1);  // no source
+    usersKeptOnceSettled(env, r);
+    dropUsers(env, r);
+}
+
+TEST_CASE("cross: without a copy, every target the row cannot locate otherwise",
+          "[coherence][settle][cross][list][integration]") {
+    CohEnv env(300ms, io::UncertainSettle::Await);
+    LogCapture logs;
+    auto r = resetCross(env, "coh-x-none");
+    auto moved = movedPurchase(env, r.pid, r.u2);
+    auto p3 = seedPurchase(env, r.u3);
+    REQUIRE(purchasePageHolds<CohPurchaseListL1>(env, r.u1, r.pid));
+    REQUIRE_FALSE(purchasePageHolds<CohPurchaseListL1>(env, r.u2, r.pid));
+    REQUIRE(purchasePageHolds<CohPurchaseListL1>(env, r.u3, p3));
+    std::optional<RowLock> lock;
+    lock.emplace("relais_test_purchases", "id=" + std::to_string(r.pid));
+
+    settleAfterRefill(env, lock, CohPurchaseX::update(r.pid, moved),
+                      [&] { everyUserUntilSettled(env, r); });
+    CHECK(LogCapture::count(log::Level::Warn, kEveryTarget) == 1);
+    usersKeptOnceSettled(env, r);
+    // The list repo over the same rows: the row left the page holding it,
+    // entered the one of its committed position, and no other page went.
+    auto hidden = seedPurchase(env, r.u3);
+    CHECK_FALSE(purchasePageHolds<CohPurchaseListL1>(env, r.u1, r.pid));
+    CHECK(purchasePageHolds<CohPurchaseListL1>(env, r.u2, r.pid));
+    CHECK_FALSE(purchasePageHolds<CohPurchaseListL1>(env, r.u3, hidden));
+    dropUsers(env, r);
+}
+
+TEST_CASE("cross: a foreign key rewritten by a trigger invalidates the real target",
+          "[coherence][settle][cross][integration]") {
+    CohEnv env(300ms, io::UncertainSettle::Await);
+    LogCapture logs;
+    auto r = resetCross(env, "coh-x-trigger");
+    ArticleTrigger trigger(env, "coh_x_rewrite", "BEFORE UPDATE",
+        "IF NEW.user_id = " + std::to_string(r.u2) + " THEN NEW.user_id := "
+            + std::to_string(r.u3) + "; END IF;",
+        "relais_test_purchases");
+    auto moved = movedPurchase(env, r.pid, r.u2);
+    REQUIRE(driveBounded(env.io, CohPurchaseX::find(r.pid)));  // the L1 copy keys u1
+    std::optional<RowLock> lock;
+    lock.emplace("relais_test_purchases", "id=" + std::to_string(r.pid));
+
+    settleAfterRefill(env, lock, CohPurchaseX::update(r.pid, moved),
+                      [&] { cacheUsers(env, {r.u1, r.u2, r.u3}); });
+    REQUIRE(env.probe.query("SELECT user_id FROM relais_test_purchases WHERE id = "
+                            + std::to_string(r.pid)).get(0, 0) == std::to_string(r.u3));
+    CHECK_FALSE(userInL1(r.u1));
+    CHECK_FALSE(userInL1(r.u3));  // the committed row's
+    CHECK(userInL1(r.u2));        // the input's, evicted once, never written
+    CHECK(LogCapture::count(log::Level::Warn, kEveryTarget) == 0);
+    dropUsers(env, r);
+}
+
+TEST_CASE("cross: an uncertain predicate write reaches every target it cannot locate",
+          "[coherence][settle][cross][predicate][list][integration]") {
+    CohEnv env(300ms);
+    LogCapture logs;
+    auto r = resetCross(env, "coh-x-pred");
+    auto p3 = seedPurchase(env, r.u3);
+    cacheUsers(env, {r.u1, r.u3});
+    REQUIRE(purchasePageHolds<CohPurchaseListL1>(env, r.u1, r.pid));
+    REQUIRE(purchasePageHolds<CohPurchaseListL1>(env, r.u3, p3));
+    const auto pred = en::when(en::eq<PurchaseF::user_id>(r.u1));
+    const auto amount = en::set<PurchaseF::amount>(int32_t{5});
+    std::optional<RowLock> lock;
+    lock.emplace("relais_test_purchases", "id=" + std::to_string(r.pid));
+    queueOf(env).pause();
+    REQUIRE(uncertainTicket(env, CohPurchaseX::patchWhere(pred, amount)));
+
+    CHECK_FALSE(userInL1(r.u1));
+    CHECK_FALSE(userInL1(r.u3));  // every user
+    CHECK(LogCapture::count(log::Level::Warn, kEveryTarget) == 1);
+    auto hidden1 = seedPurchase(env, r.u1);
+    auto hidden3 = seedPurchase(env, r.u3);
+    CHECK(purchasePageHolds<CohPurchaseListL1>(env, r.u1, hidden1));        // read again
+    CHECK_FALSE(purchasePageHolds<CohPurchaseListL1>(env, r.u3, hidden3));  // kept
+    lock.reset();
+    queueOf(env).resume();
+    REQUIRE(pumpUntil(env, [&] { return settledAll(env); }, 7s));
+    dropUsers(env, r);
 }
