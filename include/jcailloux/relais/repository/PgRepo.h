@@ -602,6 +602,12 @@ public:
         co_return 0;
     }
 
+    /// Last resort of a cross-invalidation that cannot name its target: any
+    /// row of this repo may be one, until `ticket` settles and on the copies
+    /// cached before. Each cache tier above evicts by it. L3 has no cache:
+    /// terminal no-op.
+    static void invalidateEveryRow([[maybe_unused]] const std::shared_ptr<io::SettleTicket>& ticket) {}
+
 protected:
 
     // =====================================================================
@@ -667,6 +673,12 @@ protected:
         [[maybe_unused]] const std::shared_ptr<io::SettleTicket>& ticket,
         [[maybe_unused]] const detail::RowPredicate<E>& rows,
         [[maybe_unused]] const Updates&... updates) {}
+
+    /// No cache tier read the catalog: no column is known to compare exactly.
+    static const detail::ColumnFacts& columnFacts() {
+        static const detail::ColumnFacts unknown;
+        return unknown;
+    }
 
     // =====================================================================
     // Epoch memory pool for temporary entity allocations
@@ -1292,7 +1304,7 @@ protected:
             co_return decodeRows<Rows>(w.result);
         } catch (const io::PgUncertainError&) {
             // Uncertain: the UPDATE may have committed, and the changed rows are
-            // unknowable. Propagate; the facade logs the residual staleness.
+            // unknowable. Propagate; the facade evicts by the predicate.
             throw;
         } catch (const io::PgError& e) {
             RELAIS_LOG_ERROR << name() << ": patchWhere error - " << e.what();
@@ -1362,7 +1374,7 @@ protected:
             }
         } catch (const io::PgUncertainError&) {
             // Uncertain: the claim may have committed, and the rows taken are
-            // unknowable. Propagate; the facade logs the residual staleness.
+            // unknowable. Propagate; the facade evicts by the predicate.
             throw;
         } catch (const io::PgError& e) {
             RELAIS_LOG_ERROR << name() << ": claim error - " << e.what();

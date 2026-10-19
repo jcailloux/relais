@@ -133,6 +133,16 @@ concept HasUpsertSql = requires {
     { E::MappingType::SQL::upsert } -> std::convertible_to<const char*>;
 };
 
+/// The caller assigns the key an insert of E writes (no key column is filled
+/// by the database). A mapping that does not say is taken as database-assigned.
+template<typename E>
+inline constexpr bool kInsertKeyKnown = [] {
+    if constexpr (requires { { E::MappingType::insert_assigns_pk } -> std::convertible_to<bool>; })
+        return static_cast<bool>(E::MappingType::insert_assigns_pk);
+    else
+        return false;
+}();
+
 }  // namespace jcailloux::relais
 
 #endif  // JCX_RELAIS_ENTITY_CONCEPTS_H

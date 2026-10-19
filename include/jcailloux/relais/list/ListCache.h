@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <functional>
+#include <optional>
 #include <type_traits>
 
 #include "ListQuery.h"
@@ -391,6 +392,24 @@ public:
     void onRowsLeft(std::function<bool(const E&)> rows) {
         modifications_.notifyRowLeft(RowLeft{.rows = std::move(rows)}, generation_);
         Tier::tickSweep();
+    }
+
+    /// The row `key` as a cached page holds it, from a page no modification
+    /// has touched since it was stored: every write of the row touches the
+    /// pages holding it, so such a page holds its last version. A touched
+    /// page may hold an older one and is passed over. Visits every page: for
+    /// the error path only.
+    [[nodiscard]] std::optional<E> findRow(const Key& key) {
+        std::optional<E> found;
+        tier_.forEachEntry([&](const MetadataImpl& meta, const Result& page) {
+            if (found) return;
+            for (const auto& item : page.items) {
+                if (Key(item.key()) != key) continue;
+                if (!isAffectedByModifications(meta, page)) found = item;
+                return;
+            }
+        });
+        return found;
     }
 
     /// Invalidate a specific query.
