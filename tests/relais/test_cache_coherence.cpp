@@ -42,11 +42,13 @@
 #include "fixtures/generated/TestFilterOnlyEntity.h"
 #include "fixtures/generated/TestUserEntity.h"
 #include "fixtures/generated/TestPurchaseEntity.h"
+#include "fixtures/generated/TestGuardRowEntity.h"
 
 #include <array>
 #include <chrono>
 #include <coroutine>
 #include <exception>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -66,6 +68,7 @@ using Io = io::test::ControllableIoContext;
 using ::entity::generated::TestItemEntity;
 using ::entity::generated::TestAssignedKeyEntity;
 using ::entity::generated::TestArticleEntity;
+using ::entity::generated::TestGuardRowEntity;
 
 // =============================================================================
 // Connection strings
@@ -2415,4 +2418,389 @@ TEST_CASE("notes: without a note, a hit checks nothing",
     REQUIRE(cachedValue(env, a) == 1);
     CHECK(TI::rowNoteHitChecks<CohItemL1>() == 1);
     clearL1();
+}
+
+// =============================================================================
+// Predicates — a predicate write that fails uncertainly names no row: each tier
+// evicts what its predicate may hold for, evaluated on the cached copies by a
+// prudent evaluator that says No only where PostgreSQL surely says false. The
+// list pages holding such a row are invalidated, and the values the write set
+// say which other pages the rows may have entered.
+// =============================================================================
+
+namespace {
+
+namespace en = jcailloux::relais::entity;
+using CohGuardL1 = Repo<TestGuardRowEntity, "coh:guard:l1">;
+using GuardF = TestGuardRowEntity::Field;
+using ArticleF = TestArticleEntity::Field;
+using ArticleL1Desc = CohArticleL1::ListDescriptorType;
+
+// The column facts of the guard table, read from the catalog.
+const detail::ColumnFacts& guardFacts(CohEnv& env) {
+    TI::readColumnFacts<CohGuardL1>();
+    REQUIRE(pumpUntil(env, [] { return TI::columnFacts<CohGuardL1>().known(); }, 2s));
+    return TI::columnFacts<CohGuardL1>();
+}
+
+// Rows with bounds, NULL, NaN, accented and case-folded text, padded char(n),
+// and the copies relais caches of them.
+std::vector<TestGuardRowEntity> seedGuardRows(CohEnv& env) {
+    env.probe.query("DELETE FROM relais_test_guard_rows");
+    TI::resetEntityCacheState<CohGuardL1>();
+    const char* rows[] = {
+        "(5, 7, true, 'NaN', 'Élan', 'ab', 'ab', 'Pending', 'high', '2026-01-01 00:00:00+00')",
+        "(-3, NULL, false, 1.5, 'élan', 'abc', 'abcd', 'pending', 'low', NULL)",
+        "(2147483647, -9223372036854775808, false, 0, '', '', '', '', 'low', NULL)",
+        "(0, 0, true, -2.5, 'a', 'ab ', 'ab  ', 'PENDING', 'high', '2030-01-01 00:00:00+00')",
+    };
+    std::vector<TestGuardRowEntity> out;
+    for (const char* r : rows) {
+        auto id = std::stoll(env.probe.query(
+            std::string("INSERT INTO relais_test_guard_rows "
+                        "(num, big, flag, ratio, name, label, code, tag, tone, at) VALUES ")
+            + r + " RETURNING id").get(0, 0));
+        auto v = driveBounded(env.io, CohGuardL1::find(id));
+        REQUIRE(v);
+        out.push_back(*v);
+    }
+    return out;
+}
+
+// What PostgreSQL says of `guard` on the row `id`: true, or false / NULL.
+template<typename G>
+bool pgHolds(CohEnv& env, const G& guard, int64_t id) {
+    using Sql = detail::GuardSql<TestGuardRowEntity::TraitsType, G>;
+    std::string sql = "SELECT COALESCE((";
+    size_t param = 1;
+    Sql::emit(sql, param, {});
+    sql += "), false) FROM relais_test_guard_rows WHERE id = $" + std::to_string(param);
+    io::PgParams params;
+    Sql::bind(params, guard);
+    params.push(id);
+    auto r = driveBounded(env.io, PgProvider::queryParams(sql.c_str(), params));
+    REQUIRE(r.rows() == 1);
+    return r[0].get<bool>(0);
+}
+
+// The evaluator against PostgreSQL on every row: never No where the guard
+// holds; when `certain`, No exactly where it does not.
+template<typename G>
+void differential(CohEnv& env, const std::vector<TestGuardRowEntity>& rows,
+                  const detail::ColumnFacts& facts, const char* what, bool certain,
+                  const G& guard) {
+    for (const auto& row : rows) {
+        const bool holds = pgHolds(env, guard, row.id);
+        const auto verdict = detail::guardMatch(row, guard, facts);
+        INFO(what << " on row " << row.id << ": PostgreSQL says " << holds);
+        CHECK_FALSE((holds && verdict == RowMatch::No));
+        if (certain) CHECK((verdict == RowMatch::No) == !holds);
+    }
+}
+
+int64_t seedAuthored(CohEnv& env, const std::string& category, int64_t author,
+                     int32_t view_count = 0) {
+    return std::stoll(env.probe.query(
+        "INSERT INTO relais_test_articles (category, author_id, title, view_count) VALUES ('"
+        + category + "', " + std::to_string(author) + ", 'pred', "
+        + std::to_string(view_count) + ") RETURNING id").get(0, 0));
+}
+
+bool inL1Article(int64_t id) {
+    return static_cast<bool>(TI::getFromCache<CohArticleL1>(id));
+}
+
+bool authorPageHolds(CohEnv& env, int64_t author, int64_t id) {
+    ld::ListQueryParams<ArticleL1Desc> p;
+    p.limit = 10;
+    p.filters.template get<"author_id">() = author;
+    auto page = driveBounded(env.io, CohArticleL1::query(ld::seal<ArticleL1Desc>(std::move(p))));
+    for (const auto& a : page->items)
+        if (a.id == id) return true;
+    return false;
+}
+
+// A page of `category` in view_count order.
+auto viewPage(CohEnv& env, const std::string& category,
+              std::optional<ld::TypedCursor<ArticleL1Desc>> cursor = std::nullopt) {
+    ld::ListQueryParams<ArticleL1Desc> p;
+    p.limit = 10;
+    p.sort = ld::sortAsc<ArticleL1Desc, "view_count">();
+    if (cursor) p.cursor = *cursor;
+    p.filters.template get<"category">() = category;
+    return driveBounded(env.io, CohArticleL1::query(ld::seal<ArticleL1Desc>(std::move(p))));
+}
+
+template<typename Page>
+bool holds(const Page& page, int64_t id) {
+    for (const auto& a : page->items)
+        if (a.id == id) return true;
+    return false;
+}
+
+auto byAuthor(int64_t author) { return en::when(en::eq<ArticleF::author_id>(author)); }
+
+// Runs `op` against a lock on `locked` (it fails uncertainly), runs `check`
+// while its ticket is pending, then lets the queue settle it.
+template<typename Op, typename Check>
+void whilePending(CohEnv& env, int64_t locked, Op op, Check check) {
+    std::optional<RowLock> lock;
+    lock.emplace("relais_test_articles", "id=" + std::to_string(locked));
+    queueOf(env).pause();
+    REQUIRE(uncertainTicket(env, std::move(op)));
+    check();
+    queueOf(env).resume();
+    REQUIRE(pumpUntil(env, [&] { return settledAll(env); }, 7s));
+}
+
+}  // namespace
+
+TEST_CASE("predicate: the catalog tells the columns PostgreSQL compares as C++ does",
+          "[coherence][settle][predicate][integration]") {
+    CohEnv env(1s);
+    auto rows = seedGuardRows(env);
+
+    SECTION("exact: integers, boolean, text and varchar under the default collation, enum text") {
+        const auto& facts = guardFacts(env);
+        for (const char* column : {"id", "num", "big", "flag", "name", "label", "tone"})
+            CHECK(facts.exactEquality(column));
+        for (const char* column : {"ratio", "code", "tag", "at", "missing"})
+            CHECK_FALSE(facts.exactEquality(column));
+    }
+    SECTION("a catalog read that fails leaves text Maybe, and is tried again") {
+        LogCapture logs;
+        TI::resetColumnFacts<CohGuardL1>(1);
+        TI::readColumnFacts<CohGuardL1>();
+        pumpUntil(env, [] { return false; }, 50ms);
+        const auto& facts = TI::columnFacts<CohGuardL1>();
+        REQUIRE_FALSE(facts.known());
+        CHECK(LogCapture::count(log::Level::Warn, "column facts unreadable") == 1);
+        const auto other = en::when(en::eq<GuardF::name>(std::string("nobody")));
+        CHECK(detail::guardMatch(rows[0], other, facts) == RowMatch::Maybe);
+
+        // The next uncertain predicate write reads it again.
+        TI::holdRowNoteDrain<CohGuardL1>(true);
+        TI::rowsMayHaveChanged<CohGuardL1>(nullptr,
+            detail::guardPredicate<TestGuardRowEntity>(other, facts));
+        REQUIRE(pumpUntil(env, [&] { return facts.known(); }, 2s));
+        CHECK(detail::guardMatch(rows[0], other, facts) == RowMatch::No);
+        TI::holdRowNoteDrain<CohGuardL1>(false);
+        REQUIRE(pumpUntil(env, [] { return TI::rowNoteCount<CohGuardL1>() == 0; }, 2s));
+    }
+    TI::resetEntityCacheState<CohGuardL1>();
+}
+
+TEST_CASE("predicate: the evaluator never says No where PostgreSQL says true",
+          "[coherence][settle][predicate][integration]") {
+    CohEnv env(1s);
+    auto rows = seedGuardRows(env);
+    const auto& facts = guardFacts(env);
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    using relais_test::GuardTone;
+
+    // Certain: integers, booleans, nullity, equality of exact text and enums.
+    differential(env, rows, facts, "num = 5", true, en::when(en::eq<GuardF::num>(5)));
+    differential(env, rows, facts, "num != 5", true, en::when(en::ne<GuardF::num>(5)));
+    differential(env, rows, facts, "num > 5", true, en::when(en::gt<GuardF::num>(5)));
+    differential(env, rows, facts, "num >= max", true,
+                 en::when(en::ge<GuardF::num>(std::numeric_limits<int32_t>::max())));
+    differential(env, rows, facts, "num <= -3", true, en::when(en::le<GuardF::num>(-3)));
+    differential(env, rows, facts, "big = 7", true, en::when(en::eq<GuardF::big>(int64_t{7})));
+    differential(env, rows, facts, "big != 7", true, en::when(en::ne<GuardF::big>(int64_t{7})));
+    differential(env, rows, facts, "big < 0", true, en::when(en::lt<GuardF::big>(int64_t{0})));
+    differential(env, rows, facts, "flag = true", true, en::when(en::eq<GuardF::flag>(true)));
+    differential(env, rows, facts, "flag != false", true, en::when(en::ne<GuardF::flag>(false)));
+    differential(env, rows, facts, "num in", true, en::when(en::in<GuardF::num>({1, 5, 9})));
+    differential(env, rows, facts, "num not in", true, en::when(en::notIn<GuardF::num>({5})));
+    differential(env, rows, facts, "big in", true, en::when(en::in<GuardF::big>({int64_t{7}})));
+    differential(env, rows, facts, "big not in {}", true,
+                 en::when(en::notIn<GuardF::big>(std::vector<int64_t>{})));
+    differential(env, rows, facts, "big in {}", true,
+                 en::when(en::in<GuardF::big>(std::vector<int64_t>{})));
+    differential(env, rows, facts, "name = 'Élan'", true,
+                 en::when(en::eq<GuardF::name>(std::string("Élan"))));
+    differential(env, rows, facts, "name != 'élan'", true,
+                 en::when(en::ne<GuardF::name>(std::string("élan"))));
+    differential(env, rows, facts, "name in", true,
+                 en::when(en::in<GuardF::name>({std::string("a"), std::string("Élan")})));
+    differential(env, rows, facts, "label = 'ab'", true,
+                 en::when(en::eq<GuardF::label>(std::string("ab"))));
+    differential(env, rows, facts, "tone = high", true,
+                 en::when(en::eq<GuardF::tone>(GuardTone::High)));
+    differential(env, rows, facts, "tone in", true, en::when(en::in<GuardF::tone>({GuardTone::Low})));
+    differential(env, rows, facts, "big is null", true, en::when(en::isNull<GuardF::big>()));
+    differential(env, rows, facts, "at is not null", true, en::when(en::isNotNull<GuardF::at>()));
+    differential(env, rows, facts, "and", true,
+                 en::when(en::eq<GuardF::num>(5), en::ne<GuardF::name>(std::string("élan"))));
+    differential(env, rows, facts, "or", true,
+                 en::when(en::anyOf(en::eq<GuardF::num>(-3),
+                                    en::allOf(en::eq<GuardF::flag>(true),
+                                              en::lt<GuardF::big>(int64_t{1})))));
+
+    // Prudent: what C++ cannot decide as PostgreSQL does.
+    differential(env, rows, facts, "code = 'ab' (char(n))", false,
+                 en::when(en::eq<GuardF::code>(std::string("ab"))));
+    differential(env, rows, facts, "tag = 'pending' (case-insensitive)", false,
+                 en::when(en::eq<GuardF::tag>(std::string("pending"))));
+    differential(env, rows, facts, "tag in (case-insensitive)", false,
+                 en::when(en::in<GuardF::tag>({std::string("pending")})));
+    differential(env, rows, facts, "ratio = NaN", false, en::when(en::eq<GuardF::ratio>(nan)));
+    differential(env, rows, facts, "ratio < 1", false, en::when(en::lt<GuardF::ratio>(1.0)));
+    differential(env, rows, facts, "name > 'b' (collation order)", false,
+                 en::when(en::gt<GuardF::name>(std::string("b"))));
+    differential(env, rows, facts, "tone > low (rank)", false,
+                 en::when(en::gt<GuardF::tone>(GuardTone::Low)));
+    differential(env, rows, facts, "at <= now()", false, en::when(en::le<GuardF::at>(en::dbNow)));
+    differential(env, rows, facts, "at = literal", false,
+                 en::when(en::eq<GuardF::at>(std::string("2026-01-01 00:00:00+00"))));
+
+    // Text the catalog does not call exact is never decided.
+    CHECK(detail::guardMatch(rows[1], en::when(en::eq<GuardF::code>(std::string("zz"))), facts)
+          == RowMatch::Maybe);
+    CHECK(detail::guardMatch(rows[1], en::when(en::eq<GuardF::tag>(std::string("zz"))), facts)
+          == RowMatch::Maybe);
+    CHECK(detail::guardMatch(rows[1], en::when(en::eq<GuardF::name>(std::string("zz"))), facts)
+          == RowMatch::No);
+    TI::resetEntityCacheState<CohGuardL1>();
+}
+
+TEST_CASE("predicate: an uncertain patchWhere evicts the copies and pages its rows may be in",
+          "[coherence][settle][predicate][list][integration]") {
+    CohEnv env(300ms);
+    resetArticleCaches<CohArticleL1>(env);
+    auto src = seedAuthored(env, "coh-pw-src", 77);
+    auto src2 = seedAuthored(env, "coh-pw-src", 77);
+    auto other = seedAuthored(env, "coh-pw-oth", 5);
+    // The task refers to its predicate and updates: they outlive it.
+    const auto pred = byAuthor(77);
+    const auto title = en::set<ArticleF::title>(std::string("patched"));
+    auto op = [&] { return CohArticleL1::patchWhere(pred, title); };
+
+    SECTION("cached rows: the copies and pages that may hold one") {
+        for (auto id : {src, src2, other}) REQUIRE(driveBounded(env.io, CohArticleL1::find(id)));
+        REQUIRE(pageHolds<CohArticleL1>(env, "coh-pw-src", src));
+        REQUIRE(pageHolds<CohArticleL1>(env, "coh-pw-oth", other));
+        REQUIRE(authorPageHolds(env, 5, other));
+
+        whilePending(env, src, op(), [&] {
+            CHECK_FALSE(inL1Article(src));
+            CHECK_FALSE(inL1Article(src2));
+            CHECK(inL1Article(other));
+            auto hidden_src = seedAuthored(env, "coh-pw-src", 5);
+            auto hidden_oth = seedAuthored(env, "coh-pw-oth", 5);
+            CHECK(pageHolds<CohArticleL1>(env, "coh-pw-src", hidden_src));        // read again
+            CHECK_FALSE(pageHolds<CohArticleL1>(env, "coh-pw-oth", hidden_oth));  // kept
+            CHECK_FALSE(authorPageHolds(env, 5, hidden_oth));                     // kept
+        });
+    }
+    SECTION("rows without a copy or a page: nothing else goes") {
+        REQUIRE(driveBounded(env.io, CohArticleL1::find(other)));
+        REQUIRE(pageHolds<CohArticleL1>(env, "coh-pw-oth", other));
+        REQUIRE(authorPageHolds(env, 5, other));
+
+        whilePending(env, src, op(), [&] {
+            CHECK(inL1Article(other));
+            auto hidden = seedAuthored(env, "coh-pw-oth", 5);
+            CHECK_FALSE(pageHolds<CohArticleL1>(env, "coh-pw-oth", hidden));
+            CHECK_FALSE(authorPageHolds(env, 5, hidden));
+        });
+    }
+    resetArticleCaches<CohArticleL1>(env);
+}
+
+TEST_CASE("predicate: rows an uncertain patchWhere may have moved enter only the pages they may reach",
+          "[coherence][settle][predicate][list][integration]") {
+    CohEnv env(300ms);
+    resetArticleCaches<CohArticleL1>(env);
+    auto src = seedAuthored(env, "coh-pw-src", 77, 100);
+    seedAuthored(env, "coh-pw-src", 77, 100);
+
+    SECTION("a sort column set to one value: the pages around it") {
+        for (int32_t v = 1; v <= 25; ++v) seedAuthored(env, "coh-pw-sort", 1, v);
+        auto first = viewPage(env, "coh-pw-sort");
+        REQUIRE(first->items.size() == 10);
+        auto cursor = ld::TypedCursor<ArticleL1Desc>::decode(first->cursor());
+        REQUIRE(cursor);
+        REQUIRE(viewPage(env, "coh-pw-sort", cursor)->items.front().view_count == 11);
+
+        whilePending(env, src,
+            CohArticleL1::patchWhere(byAuthor(77), en::set<ArticleF::view_count>(15)), [&] {
+                auto below = seedAuthored(env, "coh-pw-sort", 1, 0);
+                auto around = seedAuthored(env, "coh-pw-sort", 1, 12);
+                CHECK_FALSE(holds(viewPage(env, "coh-pw-sort"), below));      // kept
+                CHECK(holds(viewPage(env, "coh-pw-sort", cursor), around));   // read again
+            });
+    }
+    SECTION("a filter column set: the pages of the groups it admits, whole") {
+        auto dst = seedAuthored(env, "coh-pw-dst", 1);
+        auto oth = seedAuthored(env, "coh-pw-oth", 5);
+        REQUIRE(pageHolds<CohArticleL1>(env, "coh-pw-dst", dst));
+        REQUIRE(pageHolds<CohArticleL1>(env, "coh-pw-oth", oth));
+        REQUIRE(authorPageHolds(env, 5, oth));
+
+        whilePending(env, src,
+            CohArticleL1::patchWhere(byAuthor(77),
+                                     en::set<ArticleF::category>(std::string("coh-pw-dst"))), [&] {
+                auto hidden_dst = seedAuthored(env, "coh-pw-dst", 1);
+                auto hidden_oth = seedAuthored(env, "coh-pw-oth", 5);
+                CHECK(pageHolds<CohArticleL1>(env, "coh-pw-dst", hidden_dst));        // read again
+                CHECK_FALSE(pageHolds<CohArticleL1>(env, "coh-pw-oth", hidden_oth));  // incompatible
+                CHECK_FALSE(authorPageHolds(env, 5, hidden_oth));  // filters no column it set
+            });
+    }
+    resetArticleCaches<CohArticleL1>(env);
+}
+
+TEST_CASE("predicate: an uncertain eraseWhere or claim evicts the copies and pages its rows may be in",
+          "[coherence][settle][predicate][list][integration]") {
+    CohEnv env(300ms);
+    resetArticleCaches<CohArticleL1>(env);
+    auto src = seedAuthored(env, "coh-pw-src", 77);
+    auto other = seedAuthored(env, "coh-pw-oth", 5);
+    for (auto id : {src, other}) REQUIRE(driveBounded(env.io, CohArticleL1::find(id)));
+    REQUIRE(pageHolds<CohArticleL1>(env, "coh-pw-src", src));
+    REQUIRE(pageHolds<CohArticleL1>(env, "coh-pw-oth", other));
+    REQUIRE(authorPageHolds(env, 5, other));
+
+    auto check = [&] {
+        CHECK_FALSE(inL1Article(src));
+        CHECK(inL1Article(other));
+        auto hidden_src = seedAuthored(env, "coh-pw-src", 5);
+        auto hidden_oth = seedAuthored(env, "coh-pw-oth", 5);
+        CHECK(pageHolds<CohArticleL1>(env, "coh-pw-src", hidden_src));
+        CHECK_FALSE(pageHolds<CohArticleL1>(env, "coh-pw-oth", hidden_oth));
+        CHECK_FALSE(authorPageHolds(env, 5, hidden_oth));
+    };
+    SECTION("eraseWhere") {
+        whilePending(env, src, CohArticleL1::eraseWhere({.author_id = int64_t{77}}), check);
+    }
+    SECTION("claim") {
+        whilePending(env, src,
+            CohArticleL1::claim<ClaimOptions{.lock = Lock::Wait}>(
+                byAuthor(77), 1, en::set<ArticleF::title>(std::string("taken"))),
+            check);
+    }
+    resetArticleCaches<CohArticleL1>(env);
+}
+
+
+TEST_CASE("predicate: an eraseWhere committed after its eviction is evicted again once settled",
+          "[coherence][settle][predicate][replay][list][integration]") {
+    CohEnv env(300ms, io::UncertainSettle::Await);
+    resetArticleCaches<CohArticleL1>(env);
+    auto src = seedAuthored(env, "coh-ew-src", 77);
+    auto other = seedAuthored(env, "coh-ew-src", 5);
+    std::optional<RowLock> lock;
+    lock.emplace("relais_test_articles", "id=" + std::to_string(src));
+
+    settleAfterRefill(env, lock, CohArticleL1::eraseWhere({.author_id = int64_t{77}}), [&] {
+        // The DELETE waits on the lock: the row is read again and cached.
+        REQUIRE(driveBounded(env.io, CohArticleL1::find(src)));
+        CHECK(pageHolds<CohArticleL1>(env, "coh-ew-src", src));
+    });
+    REQUIRE_FALSE(articleExists(env, src));  // committed late
+    CHECK_FALSE(driveBounded(env.io, CohArticleL1::find(src)));
+    CHECK_FALSE(pageHolds<CohArticleL1>(env, "coh-ew-src", src));
+    CHECK(pageHolds<CohArticleL1>(env, "coh-ew-src", other));
+    resetArticleCaches<CohArticleL1>(env);
 }

@@ -79,22 +79,23 @@ namespace detail {
 
 template<typename E, size_t TotalSegments,
          typename RangePayload = detail::NoRangePayload,
-         typename RowKey = int64_t>
+         typename RowLeft = int64_t>
 class ModificationTracker {
 public:
     using Modification = EntityModification<E>;
 
     /// Entity modifications.
     using ModificationLane = cache::PendingLane<Modification, TotalSegments>;
-    /// Predicate range modifications (eraseWhere fast-path): one entry stands
-    /// in for an unbounded set of deletes matching a predicate, instead of N
-    /// entity modifications.
+    /// Ranges of rows (predicate writes): one entry stands in for an unbounded
+    /// set of rows located by what they hold, instead of N entity
+    /// modifications.
     using RangeLane = cache::PendingLane<RangePayload, TotalSegments>;
     /// Rows that left the pages holding them, at a position nobody knows (the
     /// write that moved them was uncertain). An entry touches exactly the
-    /// pages that hold a row with its key. Counted: readers skip it while it
-    /// is empty, which it is unless an uncertain write happened.
-    using RowLeftLane = cache::PendingLane<RowKey, TotalSegments, true>;
+    /// pages that hold one of its rows (the owner says which). Counted:
+    /// readers skip it while it is empty, which it is unless an uncertain
+    /// write happened.
+    using RowLeftLane = cache::PendingLane<RowLeft, TotalSegments, true>;
 
     using BitmapType = typename ModificationLane::BitmapType;
 
@@ -160,15 +161,15 @@ public:
         return track(modifications_, Modification::deleted(entity), counter);
     }
 
-    /// Record a predicate range delete (eraseWhere). One entry covers every row
-    /// matching `predicate`; consumed lazily like entity modifications.
+    /// Record a range of rows (see RangeLane). One entry covers every row the
+    /// payload locates; consumed lazily like entity modifications.
     uint32_t notifyRangeDeleted(RangePayload predicate, std::atomic<uint32_t>& counter) {
         return track(ranges_, std::move(predicate), counter);
     }
 
-    /// Record a row that left its pages (see RowLeftLane).
-    uint32_t notifyRowLeft(RowKey key, std::atomic<uint32_t>& counter) {
-        return track(rows_left_, std::move(key), counter);
+    /// Record rows that left their pages (see RowLeftLane).
+    uint32_t notifyRowLeft(RowLeft rows, std::atomic<uint32_t>& counter) {
+        return track(rows_left_, std::move(rows), counter);
     }
 
     /// The owning cache's generation, read as a sweep cutoff (see above).
