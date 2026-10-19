@@ -17,6 +17,7 @@
 
 #include <fixtures/EpollIoContext.h>
 #include <fixtures/TestRunner.h>
+#include <fixtures/TestConnInfo.h>
 #include <jcailloux/relais/cache/GDSFPolicy.h>
 
 #include <catch2/reporters/catch_reporter_event_listener.hpp>
@@ -276,7 +277,7 @@ inline void execSql(const std::string& sql) {
  * Get the connection string for the test database.
  */
 inline const char* getConnInfo() {
-    return "host=localhost port=5432 dbname=relais_test user=relais_test password=relais_test";
+    return relais_test::kConnInfo;
 }
 
 /**

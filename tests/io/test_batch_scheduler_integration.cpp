@@ -1,6 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <fixtures/EpollIoContext.h>
+#include <fixtures/TestConnInfo.h>
 #include <jcailloux/relais/io/pg/PgPool.h>
 #include <jcailloux/relais/io/pg/PgParams.h>
 #include <jcailloux/relais/io/batch/BatchScheduler.h>
@@ -17,8 +18,7 @@ using namespace jcailloux::relais::io;
 using namespace jcailloux::relais::io::batch;
 using Io = test::EpollIoContext;
 
-static constexpr const char* CONNINFO =
-    "host=localhost port=5432 dbname=relais_test user=relais_test password=relais_test";
+static constexpr const char* CONNINFO = relais_test::kConnInfo;
 
 // =============================================================================
 // TimeoutGuard — prevents tests from hanging on deadlocks

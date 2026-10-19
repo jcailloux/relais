@@ -4,6 +4,8 @@
 #include <jcailloux/relais/PgProvider.h>
 #include <jcailloux/relais/io/Task.h>
 
+#include <fixtures/TestConnInfo.h>
+
 #include <chrono>
 #include <future>
 
@@ -19,8 +21,7 @@ using namespace jcailloux::relais::io;
 namespace {
 
 const char* connInfo() {
-    return "host=localhost port=5432 dbname=relais_test "
-           "user=relais_test password=relais_test";
+    return relais_test::kConnInfo;
 }
 
 struct Probe {

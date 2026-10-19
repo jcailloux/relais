@@ -5,6 +5,7 @@
 
 #include <fixtures/EpollIoContext.h>
 #include <fixtures/TestRunner.h>
+#include <fixtures/TestConnInfo.h>
 
 #include <cstdint>
 #include <string>
@@ -121,8 +122,7 @@ TEST_CASE("PgProvider: init with PgPool", "[dbprovider][integration]") {
 
     EpollIoContext io;
 
-    auto conninfo = std::string("host=localhost port=5432 dbname=relais_test "
-                                "user=relais_test password=relais_test");
+    auto conninfo = std::string(relais_test::kConnInfo);
 
     runTask(io, [](EpollIoContext& io, const std::string& conninfo) -> jcailloux::relais::io::Task<void> {
         auto pool = co_await jcailloux::relais::io::PgPool<EpollIoContext>::create(
