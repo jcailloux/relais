@@ -87,6 +87,13 @@ struct RecheckGuard {
         slots_[slotOf(id)].fetch_add(1, std::memory_order_seq_cst);
         std::atomic_thread_fence(std::memory_order_seq_cst);
     }
+
+    /// bump() for every key: rows nobody can name may have changed. Every fill
+    /// in flight fails its recheck.
+    static void bumpAll() {
+        for (auto& slot : slots_) slot.fetch_add(1, std::memory_order_seq_cst);
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+    }
 };
 
 }  // namespace jcailloux::relais

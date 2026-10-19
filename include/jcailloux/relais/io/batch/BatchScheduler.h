@@ -243,6 +243,9 @@ public:
     [[nodiscard]] SettleQueue<Io>& settleQueue() noexcept { return settle_queue_; }
 #endif
 
+    /// Run `cb` on a later turn of this scheduler's loop.
+    void post(std::function<void()> cb) { io_.post(std::move(cb)); }
+
 private:
     // =========================================================================
     // Internal data structures

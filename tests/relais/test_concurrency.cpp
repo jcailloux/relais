@@ -35,6 +35,7 @@
 #include "fixtures/TestQueryHelpers.h"
 #include "fixtures/RelaisTestAccessors.h"
 
+#include <chrono>
 #include <thread>
 #include <vector>
 #include <latch>
@@ -1311,6 +1312,53 @@ TEST_CASE("Concurrency - rows that left their pages vs concurrent reads and swee
     TestInternals::forceFullListCleanup<TestArticleListRepo>();
     REQUIRE(TestInternals::pendingRowLeftCount<TestArticleListRepo>() == 0);
     REQUIRE(sync(TestArticleListRepo::query(qA))->size() == ids.size());
+}
+
+
+TEST_CASE("Concurrency - entity notes vs concurrent reads, fills, seals and drains",
+          "[integration][db][concurrency][tsan][notes]")
+{
+    using jcailloux::relais::detail::RowMatch;
+    namespace rio = jcailloux::relais::io;
+
+    TransactionGuard tx;
+    TestInternals::resetEntityCacheState<L1TestItemRepo>();
+
+    std::vector<int64_t> ids;
+    for (int i = 0; i < 20; ++i)
+        ids.push_back(insertTestItem("conc_note_" + std::to_string(i % 2), i));
+    for (auto id : ids) sync(L1TestItemRepo::find(id));
+
+    auto touched = [](const auto& e) {
+        return e.name == "conc_note_0" ? RowMatch::Maybe : RowMatch::No;
+    };
+
+    parallel(NUM_THREADS, [&](int t) {
+        std::mt19937 rng(static_cast<unsigned>(t) * 17u);
+        for (int j = 0; j < OPS_PER_THREAD; ++j) {
+            auto id = ids[rng() % ids.size()];
+            if (t == 0) {
+                // A note, then its seal (its replays), which starts the drain.
+                auto ticket = std::make_shared<rio::SettleTicket>();
+                TestInternals::noteRowsChanged<L1TestItemRepo>(ticket, touched);
+                ticket->state = rio::SettleTicket::State::Settled;
+                auto replays = std::move(ticket->replays);
+                for (auto& r : replays) sync(r());
+            } else if (t == 1) {
+                L1TestItemRepo::evict(id);  // the next read fills
+            } else {
+                sync(L1TestItemRepo::find(id));
+            }
+        }
+    });
+
+    // The pass runs on the loop: every note is drained once it is quiet.
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (TestInternals::rowNoteCount<L1TestItemRepo>() != 0
+           && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    REQUIRE(TestInternals::rowNoteCount<L1TestItemRepo>() == 0);
+    for (auto id : ids) REQUIRE(sync(L1TestItemRepo::find(id)) != nullptr);
 }
 
 
