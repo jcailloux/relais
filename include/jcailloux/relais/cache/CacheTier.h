@@ -4,6 +4,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <cassert>
 #include <coroutine>
 #include <cstdint>
 #include <exception>
@@ -168,16 +169,21 @@ public:
     // =========================================================================
 
     /// Upsert value + metadata. Returns Hit pointing to the stored entry.
-    /// Upsert value + metadata. Returns Hit pointing to the stored entry.
-    /// Does NOT tick the sweep counter — ticking is the admission path's
-    /// responsibility (fetchAndAdmit ticks on real insertions and blocked
-    /// qualified ghosts).
+    /// Does NOT tick the sweep counter: a caller storing what it read from the
+    /// database calls tickSweep() (fetchAndAdmit does).
     Hit store(const Key& key, Value&& v, Metadata m) {
         auto hk = Map::make_key(key);
         auto r = map_.upsert(hk, std::move(v), std::move(m));
         auto* ce = r.asReal();
         return Hit{&ce->value, &ce->metadata, std::move(r.guard),
                     Map::get_hash(hk)};
+    }
+
+    /// Count one addition of memory toward the maintenance sweep, which runs
+    /// one chunk every few hundred ticks: a store read from the database, or a
+    /// list modification tracked. A tier with nothing to sweep pays nothing.
+    static void tickSweep() {
+        if constexpr (kHasCleanup) GDSFPolicy::instance().tickInsertion();
     }
 
     /// Remove real entry + ghost for the given key.
@@ -312,9 +318,18 @@ public:
     /// Returns SweepResult with chunk_id for post-sweep operations (e.g., drainChunk).
     template<typename ExtraPred>
     SweepResult sweepChunk(long chunk_id, ExtraPred&& extra) {
+        return sweepChunk(chunk_id, GDSFPolicy::instance().chunkCount(),
+                          std::forward<ExtraPred>(extra));
+    }
+
+    /// Sweep chunk `chunk_id` of the buckets split in `n_chunks`, for a caller
+    /// that counts its own chunks (a list cache and its tracker).
+    template<typename ExtraPred>
+    SweepResult sweepChunk(long chunk_id, long n_chunks, ExtraPred&& extra) {
         if constexpr (!kHasCleanup) {
             return {};
         } else {
+            assert(map_.num_buckets() >= n_chunks);
             auto& policy = GDSFPolicy::instance();
             CleanupContext ctx{runtime::CachedClock::now(),
                                kHasGDSF ? policy.threshold() : 0.0f};
@@ -325,8 +340,6 @@ public:
                 ctx.ghost_candidates = &candidates;
                 ctx.ghost_decays = &ghost_decays;
             }
-
-            long n_chunks = policy.chunkCount();
 
             size_t removed = 0;
 
@@ -432,6 +445,7 @@ public:
     /// stay. Chunks split the buckets as sweepChunk does, in `n_chunks`.
     template<typename Pred>
     size_t evictInChunk(long chunk_id, long n_chunks, Pred&& pred) {
+        assert(map_.num_buckets() >= n_chunks);
         size_t removed = map_.cleanup_chunk(chunk_id, n_chunks,
             [&pred](const Key& key, auto te) {
                 if constexpr (kHasGhosts) {
@@ -740,6 +754,9 @@ private:
             // Read-fill recheck (see GDSF branch).
             if (!gate()) co_return transientHit(std::move(*opt));
 
+            // Before the store: the sweep it may run reclaims more without a
+            // guard held (see the GDSF branch).
+            tickSweep();
             auto meta = mb(*opt, 0.0f);
             auto r = map_.upsert(Map::make_key(key), std::move(*opt), std::move(meta));
             auto* ce = r.asReal();

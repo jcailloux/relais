@@ -1072,6 +1072,132 @@ TEST_CASE("[DeclListRepo] Bitmap skip optimization",
 
 // #############################################################################
 //
+//  Maintenance sweep: driven by memory growth, with or without GDSF
+//
+// #############################################################################
+
+TEST_CASE("[DeclListRepo] The tracker drains as memory grows, without manual sweeps",
+          "[integration][db][list][sweep]")
+{
+    TransactionGuard guard;
+    TestInternals::resetListCacheState<TestArticleListRepo>();
+
+    auto alice_id = insertTestUser("alice_sweep", "alice_sweep@test.com", 0);
+    const size_t cycle = TestInternals::sweepCycleTicks();
+
+    SECTION("[sweep] writes alone, no page ever read again") {
+        for (size_t i = 0; i < 2 * cycle; ++i) {
+            TestArticleListRepo::notifyCreated(makeArticle(
+                100000 + static_cast<int64_t>(i), "tech", alice_id, "w",
+                static_cast<int32_t>(i)));
+        }
+        // Every chunk was swept after each write of the first cycle.
+        CHECK(TestInternals::pendingModificationCount<TestArticleListRepo>() <= cycle);
+    }
+
+    SECTION("[sweep] reads from the database drain the writes before them") {
+        for (int i = 0; i < 10; ++i) {
+            TestArticleListRepo::notifyCreated(makeArticle(100000 + i, "tech", alice_id, "w", i));
+        }
+        REQUIRE(TestInternals::pendingModificationCount<TestArticleListRepo>() == 10);
+
+        auto ids = insertTestItems(cycle);
+        auto view = sync(L1TestItemRepo::findMany(ids));
+        REQUIRE(view.size() == cycle);
+
+        CHECK(TestInternals::pendingModificationCount<TestArticleListRepo>() == 0);
+    }
+
+    SECTION("[sweep] a write and a page read from the database count once each") {
+        const auto before = TestInternals::sweepTicks();
+        TestArticleListRepo::notifyCreated(makeArticle(100000, "tech", alice_id, "w", 1));
+        CHECK(TestInternals::sweepTicks() == before + 1);
+
+        auto q = makeViewCountQuery("tech", 10);
+        sync(TestArticleListRepo::query(q));
+        CHECK(TestInternals::sweepTicks() == before + 2);
+
+        sync(TestArticleListRepo::query(q));  // hit
+        CHECK(TestInternals::sweepTicks() == before + 2);
+    }
+}
+
+namespace {
+/// 2 list chunks, against the policy's 8.
+using FewChunksArticleListRepo =
+    Repo<TestArticleEntity, "test:article:list:k2", test_config::FewChunks>;
+/// 16 list chunks, against the policy's 8.
+using ManyChunksArticleListRepo = Repo<TestArticleEntity, "test:article:list:k16",
+    jcailloux::relais::config::Local.with_l1_chunk_count_log2(4)>;
+
+/// makeViewCountQuery, for the descriptor of repo R.
+template<typename R>
+auto viewCountQueryOf(std::string_view category, uint16_t limit) {
+    using D = typename R::ListDescriptorType;
+    decl::ListQueryParams<D> p;
+    p.limit = limit;
+    p.filters.template get<"category">() = std::string(category);
+    p.sort = jcailloux::relais::list::SortSpec<size_t>{1, jcailloux::relais::list::SortDirection::Desc};
+    return decl::seal<D>(std::move(p));
+}
+}  // namespace
+
+TEST_CASE("[DeclListRepo] Each list cache sweeps over its own chunk count",
+          "[integration][db][list][sweep][chunks]")
+{
+    TransactionGuard guard;
+    const long policy_chunks = jcailloux::relais::cache::GDSFPolicy::instance().chunkCount();
+    REQUIRE(policy_chunks == 8);
+
+    auto alice_id = insertTestUser("alice_chunks", "alice_chunks@test.com", 0);
+    for (int vc = 10; vc <= 50; vc += 10) {
+        insertTestArticle("tech", alice_id, "chunks_" + std::to_string(vc), vc);
+    }
+
+    SECTION("[chunks] fewer list chunks than the policy's: no stale page") {
+        using R = FewChunksArticleListRepo;
+        TestInternals::resetListCacheState<R>();
+
+        // A page outside the policy's chunk of the same index as its list chunk.
+        std::optional<decltype(viewCountQueryOf<R>("", 0))> page;
+        long list_chunk = -1;
+        for (uint16_t limit = 10; limit < 64 && !page; ++limit) {
+            auto q = viewCountQueryOf<R>("tech", limit);
+            REQUIRE(sync(R::query(q))->size() == 5);
+            auto in_list = TestInternals::listEntryChunkIn<R>(q.cacheKey(), 2);
+            auto in_policy = TestInternals::listEntryChunkIn<R>(q.cacheKey(), policy_chunks);
+            REQUIRE(in_list);
+            REQUIRE(in_policy);
+            if (*in_policy != *in_list) {
+                page = q;
+                list_chunk = *in_list;
+            }
+        }
+        REQUIRE(page);
+
+        auto id = insertTestArticle("tech", alice_id, "chunks_new", 35);
+        R::notifyCreated(makeArticle(id, "tech", alice_id, "chunks_new", 35));
+
+        TestInternals::listCacheOf<R>().sweep(list_chunk);
+
+        CHECK(sync(R::query(*page))->size() == 6);
+    }
+
+    SECTION("[chunks] more list chunks than the policy's: one cycle drains the tracker") {
+        using R = ManyChunksArticleListRepo;
+        TestInternals::resetListCacheState<R>();
+
+        R::notifyCreated(makeArticle(9001, "tech", alice_id, "chunks_new", 35));
+        REQUIRE(TestInternals::pendingModificationCount<R>() == 1);
+
+        for (long c = 0; c < policy_chunks; ++c) TestInternals::listCacheOf<R>().sweep(c);
+
+        CHECK(TestInternals::pendingModificationCount<R>() == 0);
+    }
+}
+
+// #############################################################################
+//
 //  Concurrent list reads on different repositories (one pipelined batch)
 //
 // #############################################################################

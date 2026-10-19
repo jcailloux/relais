@@ -566,6 +566,50 @@ TEST_CASE("LocalRepo - FewChunks config",
     }
 }
 
+/// No TTL and no GDSF: nothing to free, nothing to sweep.
+using BareTestItemRepo = Repo<TestItemEntity, "test:bare", test_config::BareL1>;
+
+TEST_CASE("LocalRepo - stores from the database drive the maintenance sweep",
+          "[integration][db][cached][cleanup][sweep]")
+{
+    TransactionGuard tx;
+    TestInternals::resetEntityCacheState<ShortTTLTestItemRepo>();
+
+    SECTION("[sweep] an expired copy never read again is freed") {
+        auto id = insertTestItem("expires", 1);
+        sync(ShortTTLTestItemRepo::find(id));
+        REQUIRE(getCacheSize<ShortTTLTestItemRepo>() == 1);
+
+        // CachedClock uses uint32_t seconds: worst-case quantization adds ~1s
+        waitForExpiration(std::chrono::milliseconds{2200});
+
+        const size_t cycle = TestInternals::sweepCycleTicks();
+        auto ids = insertTestItems(cycle);
+        auto view = sync(L1TestItemRepo::findMany(ids));
+        REQUIRE(view.size() == cycle);
+
+        CHECK(getCacheSize<ShortTTLTestItemRepo>() == 0);
+    }
+
+    SECTION("[sweep] each store after a miss counts once, on a tier with something to sweep") {
+        auto ids = insertTestItems(3);
+        const auto before = TestInternals::sweepTicks();
+
+        sync(BareTestItemRepo::find(ids[0]));
+        sync(BareTestItemRepo::findMany(std::span<const int64_t>(ids).subspan(1)));
+        CHECK(getCacheSize<BareTestItemRepo>() >= 3);
+        CHECK(TestInternals::sweepTicks() == before);
+
+        sync(L1TestItemRepo::find(ids[0]));
+        CHECK(TestInternals::sweepTicks() == before + 1);
+        sync(L1TestItemRepo::findMany(std::span<const int64_t>(ids).subspan(1)));
+        CHECK(TestInternals::sweepTicks() == before + 3);
+
+        sync(L1TestItemRepo::find(ids[0]));  // hit
+        CHECK(TestInternals::sweepTicks() == before + 3);
+    }
+}
+
 
 // #############################################################################
 //
