@@ -205,13 +205,13 @@ class ListMixin : public Base {
         };
     }
 
+    /// Enrolled in the maintenance sweep, which drains the modification
+    /// tracker, with or without GDSF.
     static ListCacheType& listCache() {
-        static ListCacheType instance(listCacheConfig());
-        if constexpr (HasGDSF) {
-            static std::once_flag gdsf_flag;
-            std::call_once(gdsf_flag, []() {
-                static const std::string list_name =
-                    std::string(Base::name()) + ":list";
+        struct Holder {
+            std::string name = std::string(Base::name()) + ":list";
+            ListCacheType instance{listCacheConfig()};
+            Holder() {
                 instance.tier().enroll({
                     .sweep_fn = +[](long chunk_id) -> bool {
                         return listCache().sweep(chunk_id);
@@ -219,11 +219,12 @@ class ListMixin : public Base {
                     .size_fn = +[]() -> size_t {
                         return listCache().size();
                     },
-                    .name = list_name.c_str()
+                    .name = name.c_str()
                 });
-            });
-        }
-        return instance;
+            }
+        };
+        static Holder h;
+        return h.instance;
     }
 
     // Epoch pool for list wrappers (non-L1 paths only)

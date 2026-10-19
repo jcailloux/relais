@@ -296,6 +296,14 @@ struct TestInternals {
         return static_cast<uint8_t>(chunk);
     }
 
+    /// The chunk of a cached page when the list table is split in `n_chunks`.
+    template<typename Repo>
+    static std::optional<long> listEntryChunkIn(const std::string& cache_key, long n_chunks) {
+        long chunk = Repo::listCache().tier_.map().key_chunk(cache_key, n_chunks);
+        if (chunk < 0) return std::nullopt;
+        return chunk;
+    }
+
     /// Full GDSF-safe cache reset: remove all entries,
     /// drain epoch pool, then reset all GDSF state (including memory counters).
     template<typename Repo>
@@ -313,6 +321,19 @@ struct TestInternals {
     /// Reset GDSF global state (generations, memory counters, correction).
     static void resetGDSF() {
         jcailloux::relais::cache::GDSFPolicy::instance().reset();
+    }
+
+    /// Ticks counted toward the maintenance sweep since the last reset.
+    static uint32_t sweepTicks() {
+        return jcailloux::relais::cache::GDSFPolicy::instance()
+            .insertion_counter_.load(std::memory_order_relaxed);
+    }
+
+    /// Ticks of one full sweep cycle: every chunk of the policy swept once.
+    static size_t sweepCycleTicks() {
+        using Policy = jcailloux::relais::cache::GDSFPolicy;
+        return (Policy::kCleanupMask + 1)
+            * static_cast<size_t>(Policy::instance().chunkCount());
     }
 
     /// Reset per-repo GDSF state (avg_construction_time).

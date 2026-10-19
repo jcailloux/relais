@@ -31,6 +31,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <sys/eventfd.h>
 #include <unistd.h>
@@ -416,6 +417,18 @@ inline int64_t insertTestItem(
         );
         return result[0].get<int64_t>(0);
     }
+}
+
+/// Insert `n` items in one statement; returns their ids.
+inline std::vector<int64_t> insertTestItems(size_t n, const std::string& prefix = "bulk") {
+    auto result = execQueryArgs(
+        "INSERT INTO relais_test_items (name, value, is_active) "
+        "SELECT $1 || g, g, true FROM generate_series(1, $2::int) g RETURNING id",
+        prefix, static_cast<int32_t>(n));
+    std::vector<int64_t> ids;
+    ids.reserve(static_cast<size_t>(result.rows()));
+    for (int i = 0; i < result.rows(); ++i) ids.push_back(result[i].get<int64_t>(0));
+    return ids;
 }
 
 inline void deleteTestItem(int64_t id) {

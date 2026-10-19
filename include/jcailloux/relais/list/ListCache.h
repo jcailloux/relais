@@ -301,11 +301,8 @@ public:
             tier_.evictIfSame(key, hit.value);
         }
 
-        // Record construction cost in EMA + trigger deterministic cleanup
         tier_.recordCost(construction_time_us);
-        if constexpr (GDSF && cache::GDSFPolicy::enabled) {
-            cache::GDSFPolicy::instance().tickInsertion();
-        }
+        Tier::tickSweep();
 
         return ResultView(hit.value, std::move(hit.guard));
     }
@@ -327,20 +324,26 @@ public:
     // =========================================================================
     // Modification tracking
     // =========================================================================
+    //
+    // Each entry tracked counts toward the maintenance sweep, which drains
+    // them: writes whose pages are never read again cause no store.
 
     /// Record entity creation for invalidation
     void onEntityCreated(const E& entity) {
         modifications_.notifyCreated(entity, generation_);
+        Tier::tickSweep();
     }
 
     /// Record entity update for invalidation
     void onEntityUpdated(const E& old_entity, const E& new_entity) {
         modifications_.notifyUpdated(old_entity, new_entity, generation_);
+        Tier::tickSweep();
     }
 
     /// Record entity deletion for invalidation
     void onEntityDeleted(const E& entity) {
         modifications_.notifyDeleted(entity, generation_);
+        Tier::tickSweep();
     }
 
     /// Record a predicate range delete (eraseWhere fast-path): a single tracker
@@ -350,6 +353,7 @@ public:
         static_assert(kHasPredicateTraits,
             "onEntityRangeDeleted requires Traits with predicate fast-path hooks");
         modifications_.notifyRangeDeleted(predicate, generation_);
+        Tier::tickSweep();
     }
 
     /// Record that the row `key` left every page holding it, for a position
@@ -357,6 +361,7 @@ public:
     /// are invalidated lazily.
     void onRowLeft(const Key& key) {
         modifications_.notifyRowLeft(key, generation_);
+        Tier::tickSweep();
     }
 
     /// Invalidate a specific query.
@@ -368,19 +373,29 @@ public:
     // Cleanup API — delegates to CacheTier with modification extra predicate
     // =========================================================================
 
-    /// Sweep given chunk (lock-free, always succeeds).
-    /// The cutoff is read under the tracker's lock, so every modification it
-    /// covers is already tracked when the scan runs; with the fence, a page
-    /// stored before a modification is notified is seen by the sweep that
-    /// drains it (see put()).
+    /// Sweep for the policy's chunk `chunk_id` (lock-free, always succeeds).
+    /// The pages and the tracker count ChunkCount chunks, the policy its own:
+    /// this sweeps the list chunks chunk_id, chunk_id + policy's count, ...
+    /// so that each is swept once per cycle of the policy.
+    /// Per chunk, the cutoff is read under the tracker's lock, so every
+    /// modification it covers is already tracked when the scan runs; with the
+    /// fence, a page stored before a modification is notified is seen by the
+    /// sweep that drains it (see put()).
     bool sweep(long chunk_id) {
-        uint32_t cutoff_gen = modifications_.cutoff(generation_);
-        std::atomic_thread_fence(std::memory_order_seq_cst);
-        auto result = tier_.sweepChunk(chunk_id, modificationPred());
-        if (result.chunk_id >= 0) {
-            modifications_.drainChunk(cutoff_gen, static_cast<uint8_t>(result.chunk_id));
+        const long policy_chunks = cache::GDSFPolicy::instance().chunkCount();
+        bool removed_any = false;
+        for (long chunk = chunk_id; chunk < static_cast<long>(ChunkCount);
+             chunk += policy_chunks) {
+            uint32_t cutoff_gen = modifications_.cutoff(generation_);
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            auto result = tier_.sweepChunk(chunk, static_cast<long>(ChunkCount),
+                                           modificationPred());
+            if (result.chunk_id >= 0) {
+                modifications_.drainChunk(cutoff_gen, static_cast<uint8_t>(chunk));
+            }
+            removed_any = removed_any || result.removed_any;
         }
-        return result.removed_any;
+        return removed_any;
     }
 
     /// Sweep all chunks.
