@@ -2611,6 +2611,60 @@ TEST_CASE("realign: a page is tested against a row that left by the row's key",
     relais_test::TestInternals::resetListCacheState<CohArticleL1>();
 }
 
+TEST_CASE("realign: a page found untouched is not checked again against the same rows",
+          "[coherence][settle][realign][list]") {
+    using TI = relais_test::TestInternals;
+    TI::resetListCacheState<CohArticleL1>();
+    auto& lc = TI::listCacheOf<CohArticleL1>();
+    using Cache = std::remove_reference_t<decltype(lc)>;
+    auto query = [](std::string key) {
+        typename Cache::Query q;
+        q.limit = 10;
+        q.cache_key = std::move(key);
+        return q;
+    };
+    auto rows = [](std::initializer_list<int64_t> ids) {
+        typename Cache::Result r;
+        for (auto id : ids) {
+            TestArticleEntity a;
+            a.id = id;
+            r.items.push_back(a);
+        }
+        return r;
+    };
+    const auto page = query("restamp:page");
+
+    SECTION("a read that finds the page untouched keeps the generation it checked") {
+        lc.put(page, rows({5, 7, 9}), lc.generation());
+        lc.onRowLeft(3);
+        lc.onRowLeft(4);
+        const auto checked = lc.generation();
+        REQUIRE(lc.get(page));
+        CHECK(TI::listPageGeneration<CohArticleL1>(page.cache_key) == checked);
+    }
+    SECTION("a row that leaves after that read still invalidates the page") {
+        lc.put(page, rows({5, 7, 9}), lc.generation());
+        lc.onRowLeft(3);
+        REQUIRE(lc.get(page));
+        lc.onRowLeft(7);
+        CHECK_FALSE(lc.get(page));
+    }
+    SECTION("a row replayed once settled invalidates a page read while it waited") {
+        // An uncertain write notifies its row when it fails and again once
+        // settled; the page, read in between, does not hold the row yet.
+        lc.onRowLeft(7);
+        lc.put(page, rows({5, 9}), lc.generation());
+        lc.onRowLeft(3);
+        REQUIRE(lc.get(page));
+        lc.put(page, rows({5, 7, 9}), lc.generation());
+        lc.onRowLeft(4);
+        REQUIRE(lc.get(page));
+        lc.onRowLeft(7);
+        CHECK_FALSE(lc.get(page));
+    }
+    TI::resetListCacheState<CohArticleL1>();
+}
+
 TEST_CASE("realign: writes that succeed leave no row behind and settle nothing",
           "[coherence][settle][realign][list][integration]") {
     CohEnv env(1s);

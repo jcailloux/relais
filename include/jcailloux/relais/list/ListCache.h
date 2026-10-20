@@ -113,7 +113,10 @@ struct ListCacheMetadataImpl : cache::CacheMetadata<true, true> {
     using Base = cache::CacheMetadata<true, true>;
 
     ListQuery<FilterSet, SortFieldEnum> query;
-    uint32_t stored_generation{0};     // generation of the owning ListCache at cache time
+    // Generation of the owning ListCache the page is checked from: no
+    // modification up to it touches the page. Set when the page is stored,
+    // raised by a read that finds it untouched (see ListCache::getByKey).
+    std::atomic<uint32_t> stored_generation{0};
     SortBounds sort_bounds;
     uint16_t result_count{0};
     float construction_time_us{0.0f};  // diagnostics only
@@ -142,7 +145,7 @@ struct ListCacheMetadataImpl : cache::CacheMetadata<true, true> {
     ListCacheMetadataImpl(ListCacheMetadataImpl&& o) noexcept
         : Base(std::move(o))
         , query(std::move(o.query))
-        , stored_generation(o.stored_generation)
+        , stored_generation(o.stored_generation.load(std::memory_order_relaxed))
         , sort_bounds(o.sort_bounds)
         , result_count(o.result_count)
         , construction_time_us(o.construction_time_us)
@@ -151,7 +154,8 @@ struct ListCacheMetadataImpl : cache::CacheMetadata<true, true> {
     ListCacheMetadataImpl& operator=(ListCacheMetadataImpl&& o) noexcept {
         Base::operator=(std::move(o));
         query = std::move(o.query);
-        stored_generation = o.stored_generation;
+        stored_generation.store(o.stored_generation.load(std::memory_order_relaxed),
+                                std::memory_order_relaxed);
         sort_bounds = o.sort_bounds;
         result_count = o.result_count;
         construction_time_us = o.construction_time_us;
@@ -274,9 +278,22 @@ public:
             (hit.key_hash >> (48 - ChunkCountLog2)) & (ChunkCount - 1));
 
         // Modification validation — if entry is stale, evict and return miss.
-        if (isAffectedByModificationsForChunk(*hit.meta, *hit.value, chunk_id)) {
-            tier_.evictIfSame(key, hit.value);
-            return {};
+        // A page found untouched is so up to `latest`, and later reads check
+        // only what comes after: a verdict never changes (the page and each
+        // modification are immutable, and whether one touches the other
+        // depends on nothing else); every modification up to `latest` is
+        // tracked once `latest` is read (tracked before the latest generation
+        // is raised, under the tracker's lock), or was dropped by a sweep that
+        // checked this page first; and `hit.meta` is this page's own (a store
+        // makes a new entry, which the epoch guard keeps alive). Two reads may
+        // race to raise it: a lower value written last only costs a check.
+        const uint32_t latest = modifications_.latestGeneration();
+        if (latest > hit.meta->stored_generation.load(std::memory_order_relaxed)) {
+            if (isAffectedByModificationsForChunk(*hit.meta, *hit.value, chunk_id)) {
+                tier_.evictIfSame(key, hit.value);
+                return {};
+            }
+            hit.meta->stored_generation.store(latest, std::memory_order_relaxed);
         }
 
         return ResultView(hit.value, std::move(hit.guard));
@@ -526,7 +543,7 @@ private:
     /// Check if any recent modifications affect the cached result (no bitmap).
     bool isAffectedByModifications(const MetadataImpl& meta,
                                     const Result& result) const {
-        uint32_t stored_gen = meta.stored_generation;
+        uint32_t stored_gen = meta.stored_generation.load(std::memory_order_relaxed);
         if (!modifications_.hasModificationsSince(stored_gen)) {
             return false;
         }
@@ -564,7 +581,7 @@ private:
     bool isAffectedByModificationsForChunk(const MetadataImpl& meta,
                                             const Result& result,
                                             long chunk_id) const {
-        uint32_t stored_gen = meta.stored_generation;
+        uint32_t stored_gen = meta.stored_generation.load(std::memory_order_relaxed);
         if (!modifications_.hasModificationsSince(stored_gen)) {
             return false;
         }
