@@ -322,6 +322,15 @@ struct TestInternals {
         return static_cast<uint8_t>(chunk);
     }
 
+    /// The generation a cached page is checked from: modifications up to it
+    /// are known not to touch it. nullopt if the page is not cached.
+    template<typename Repo>
+    static std::optional<uint32_t> listPageGeneration(const std::string& cache_key) {
+        auto r = Repo::listCache().tier_.map().find(cache_key);
+        if (!r || r.isGhost()) return std::nullopt;
+        return r.asReal()->metadata.stored_generation;
+    }
+
     /// The chunk of a cached page when the list table is split in `n_chunks`.
     template<typename Repo>
     static std::optional<long> listEntryChunkIn(const std::string& cache_key, long n_chunks) {
