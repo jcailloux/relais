@@ -1,5 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 
+#include <chrono>
+
 #include <fixtures/EpollIoContext.h>
 #include <fixtures/TestConnInfo.h>
 #include <jcailloux/relais/io/pg/PgPool.h>
@@ -103,5 +105,53 @@ TEST_CASE("PgConnection pipeline: error in one segment doesn't affect others",
 
     task();
     io.runUntil([&] { return done; });
+    REQUIRE(done);
+}
+
+TEST_CASE("PgConnection pipeline: a failed commit fails its own segment",
+          "[io][pg][pipeline][integration]") {
+    Io io;
+    bool done = false;
+
+    auto task = [&]() -> DetachedTask {
+        auto pool = co_await PgPool<Io>::create(io, CONNINFO, {.min_connections = 1, .max_connections = 1});
+        auto guard = co_await pool->acquire();
+        auto& conn = guard.conn();
+
+        // The duplicate is refused at commit, when the server processes the
+        // segment's sync, after the INSERT itself succeeded.
+        co_await conn.query("CREATE TEMP TABLE pipeline_deferred "
+                            "(id int, UNIQUE (id) DEFERRABLE INITIALLY DEFERRED)");
+        co_await conn.query("INSERT INTO pipeline_deferred VALUES (1)");
+
+        conn.enterPipelineMode();
+        const char* insert = "INSERT INTO pipeline_deferred VALUES ($1::int)";
+        const char* echo = "SELECT $1::int";
+        if (conn.ensurePreparedPipelined(insert, 1)) conn.pipelineSync();
+        conn.sendPreparedPipelined(insert, PgParams::make(1));
+        conn.pipelineSync();
+        if (conn.ensurePreparedPipelined(echo, 1)) conn.pipelineSync();
+        conn.sendPreparedPipelined(echo, PgParams::make(42));
+        conn.pipelineSync();
+        co_await conn.flushPipeline();
+
+        std::vector<PgConnection<Io>::PipelineResult> results;
+        co_await conn.readPipelineResults(2, results);
+        conn.exitPipelineMode();
+
+        REQUIRE(results.size() == 2);
+        CHECK_FALSE(results[0].result.ok());
+        REQUIRE(results[1].result.ok());
+        REQUIRE(results[1].result.rows() == 1);
+        CHECK(results[1].result[0].get<int32_t>(0) == 42);
+
+        auto count = co_await conn.query("SELECT count(*)::int FROM pipeline_deferred");
+        CHECK(count[0].get<int32_t>(0) == 1);
+        done = true;
+    };
+
+    task();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    io.runUntil([&] { return done || std::chrono::steady_clock::now() > deadline; });
     REQUIRE(done);
 }

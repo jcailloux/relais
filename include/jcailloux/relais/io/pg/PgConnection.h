@@ -352,8 +352,10 @@ public:
             auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(now - prev);
             prev = now;
 
-            // Consume the sync point result (PGRES_PIPELINE_SYNC)
-            co_await consumePipelineSync();
+            // The sync commits the segment's implicit transaction: a refused
+            // commit fails the segment, whatever its statement answered.
+            if (auto failed = co_await consumePipelineSync())
+                query_result = std::move(*failed);
 
             results.emplace_back(std::move(query_result), elapsed.count());
         }
@@ -482,8 +484,13 @@ private:
         }
     }
 
-    // Consume the pipeline sync point result.
-    Task<void> consumePipelineSync() {
+    // Consume the pipeline sync point result (PGRES_PIPELINE_SYNC). The server
+    // commits the implicit transaction when it processes the sync: a refused
+    // commit (deferred constraint, serialization failure) comes as an error
+    // result, then the NULL ending it, ahead of the sync. That error is returned.
+    Task<std::optional<PgResult>> consumePipelineSync() {
+        std::optional<PgResult> failed;
+        bool after_null = false;
         while (true) {
             if (!PQconsumeInput(conn_))
                 // Post-send (reading the result): a dropped socket is uncertain.
@@ -495,16 +502,21 @@ private:
             }
 
             PGresult* r = PQgetResult(conn_);
-            if (r) {
-                auto status = PQresultStatus(r);
-                PQclear(r);
-                if (status == PGRES_PIPELINE_SYNC)
-                    co_return;
-                // If not sync, keep reading
+            if (!r) {
+                // Two NULLs in a row: nothing is queued, no sync will come.
+                if (after_null) co_return failed;
+                after_null = true;
                 continue;
             }
-            // NULL without sync — unexpected, but don't loop forever
-            co_return;
+            after_null = false;
+            if (PQresultStatus(r) == PGRES_PIPELINE_SYNC) {
+                PQclear(r);
+                co_return failed;
+            }
+            if (!failed && PQresultStatus(r) == PGRES_FATAL_ERROR)
+                failed.emplace(r);
+            else
+                PQclear(r);
         }
     }
 

@@ -1816,6 +1816,39 @@ TEST_CASE("Write fan-out: a failed statement fails only its own write",
     });
 }
 
+TEST_CASE("Write fan-out: a write whose commit fails fails alone",
+          "[io][batch][fanout][integration]")
+{
+    runFanout([](Io& io, std::shared_ptr<BatchScheduler<Io>> b) -> Task<void> {
+        // A duplicate is refused at commit, after its INSERT succeeded.
+        co_await b->directQuery("DROP TABLE IF EXISTS relais_test_deferred");
+        co_await b->directQuery("CREATE TABLE relais_test_deferred "
+                                "(id INT, UNIQUE (id) DEFERRABLE INITIALLY DEFERRED)");
+        co_await b->directQuery("INSERT INTO relais_test_deferred VALUES (1)");
+        static constexpr const char* kInsertDeferred =
+            "INSERT INTO relais_test_deferred SELECT $1::int WHERE $2::int >= 0 "
+            "RETURNING id, pg_backend_pid()";
+
+        Outcome lead;   // sent alone, not pipelined
+        std::array<Outcome, 3> outs;
+        fanoutWrite(b, lead, kInsertDeferred, 1, 0, kOrdered);
+        fanoutWrite(b, outs[0], kInsertDeferred, 10, 0, kOrdered);
+        fanoutWrite(b, outs[1], kInsertDeferred, 1, 1, kOrdered);
+        fanoutWrite(b, outs[2], kInsertDeferred, 11, 0, kOrdered);
+        co_await settle(io, outs);
+        co_await settle(io, std::span(&lead, 1));
+
+        CHECK(lead.failed);
+        CHECK_FALSE(outs[0].failed);
+        CHECK(outs[0].value == 10);
+        CHECK(outs[1].failed);
+        CHECK_FALSE(outs[2].failed);
+        CHECK(outs[2].value == 11);
+        CHECK(outs[0].pid == outs[2].pid);   // one pipeline
+        co_await b->directQuery("DROP TABLE relais_test_deferred");
+    });
+}
+
 TEST_CASE("Write fan-out: a cancelled write in one group leaves the others whole",
           "[io][batch][fanout][integration]")
 {
