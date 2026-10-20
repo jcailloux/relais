@@ -50,6 +50,10 @@ struct SettleTicket {
     BackendId backend;                  // Terminate / Await
     std::chrono::milliseconds delay{0}; // Delay
     State state = State::Pending;
+    // Writes of the failure whose end was never read, in one pipeline. With
+    // more than one, the transaction the backend runs may be any of them, and
+    // those ahead of it may have committed.
+    uint32_t unresolved = 1;
     // Started once settled, in registration order: the precautionary
     // evictions, again, and the work that waited for the outcome (reading the
     // row as committed). A failing replay does not stop the others.
