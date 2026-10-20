@@ -465,17 +465,21 @@ protected:
     /// Rows an uncertain write may have changed, named by what they satisfied
     /// (`pred`; empty: every row). Until `ticket` settles, a copy the predicate
     /// may hold for is evicted whenever read. Once settled, only the copies
-    /// stored before the seal are, and a pass over the cache evicts those left.
-    /// Without a pending ticket, the note is settled at once.
+    /// stored before the seal are, and a pass over the cache evicts those left;
+    /// found aborted, the note is dropped. Without a pending ticket, the note
+    /// is settled at once.
     static void noteRowsChanged(const std::shared_ptr<io::SettleTicket>& ticket,
                                 typename Notes::Predicate pred) {
         auto& n = notes();
         if (ticket && ticket->state == io::SettleTicket::State::Pending) {
             const uint64_t id = n.addPending(std::move(pred), &Recheck::bumpAll);
-            detail::registerReplay(ticket, [id]() -> io::Task<void> {
+            ticket->replays.emplace_back([id](io::WriteOutcome outcome) -> io::Task<void> {
+                if (outcome == io::WriteOutcome::Aborted) {
+                    notes().discard(id);
+                    co_return;
+                }
                 notes().settle(id, &Recheck::bumpAll);
                 startNoteDrain();
-                co_return;
             });
             return;
         }

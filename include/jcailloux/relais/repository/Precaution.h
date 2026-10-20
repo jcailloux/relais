@@ -16,19 +16,24 @@ namespace jcailloux::relais::detail {
 // commit. On a ticket already settled (or without one), the eviction runs at
 // once only: nothing can commit after it.
 //
+// A write found aborted at settle left the database as it was: the cache is
+// already right, and nothing registered here runs.
+//
 // Registered before it runs: the ticket may settle while the eviction is
 // suspended, and the replay must not be lost. The eviction owns what it uses
 // (key, copies): its replay runs after the caller's frame is gone.
 
 template<typename Fn>
-io::Task<void> runOwned(Fn evict) {
+io::Task<void> runOwned(Fn evict, io::WriteOutcome outcome) {
+    if (outcome == io::WriteOutcome::Aborted) co_return;
     co_await evict();
 }
 
 template<typename Fn>
 void registerReplay(const std::shared_ptr<io::SettleTicket>& ticket, const Fn& replay) {
     if (ticket && ticket->state == io::SettleTicket::State::Pending)
-        ticket->replays.emplace_back([replay](io::WriteOutcome) { return runOwned(replay); });
+        ticket->replays.emplace_back(
+            [replay](io::WriteOutcome outcome) { return runOwned(replay, outcome); });
 }
 
 // Asynchronous eviction: `evict` returns io::Task<void>. Await it after the
@@ -54,10 +59,11 @@ template<typename Fn>
 io::Task<void> onSettled(std::shared_ptr<io::SettleTicket> ticket, Fn fn) {
     if (!ticket) co_return;
     if (ticket->state == io::SettleTicket::State::Pending) {
-        ticket->replays.emplace_back([fn](io::WriteOutcome) { return runOwned(fn); });
+        ticket->replays.emplace_back(
+            [fn](io::WriteOutcome outcome) { return runOwned(fn, outcome); });
         co_return;
     }
-    co_await fn();
+    co_await runOwned(std::move(fn), ticket->outcome);
 }
 
 } // namespace jcailloux::relais::detail
