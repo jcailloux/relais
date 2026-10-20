@@ -120,8 +120,11 @@ private:
     uint32_t track(Lane& lane, Payload payload, std::atomic<uint32_t>& counter) {
         std::unique_lock lock(mutex_);
         uint32_t gen = counter.fetch_add(1, std::memory_order_seq_cst) + 1;
-        bumpLatest(gen);
+        // Pushed before the latest generation is raised: a reader that sees
+        // `gen` as latest also sees the entry, even in a lane it reads
+        // without the lock while that lane looks empty.
         lane.push(std::move(payload), gen);
+        bumpLatest(gen);
         return gen;
     }
 
