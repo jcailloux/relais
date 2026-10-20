@@ -1884,6 +1884,27 @@ TEST_CASE("settle outcome: a write terminated while it waits for a row lock was 
     CHECK(probeValue(env, id) == "1");
 }
 
+TEST_CASE("settle outcome: a write that reads the row it replaces has its id while it waits",
+          "[coherence][settle][outcome][list][integration]") {
+    CohEnv env(300ms);
+    resetArticleCaches<CohArticleL1>(env);
+    auto warm = seedArticle(env, "coh-so-pre-warm");
+    driveBounded(env.io, CohArticleL1::update(warm, articleIn(warm, "coh-so-pre-warm")));
+    auto id = seedArticle(env, "coh-so-pre-a");
+    std::optional<RowLock> lock;
+    lock.emplace("relais_test_articles", "id=" + std::to_string(id));
+
+    // Its pages need the row it replaces: the UPDATE reads it FOR UPDATE, and
+    // waits there for the lock.
+    queueOf(env).pause();
+    auto t = uncertainTicket(env, CohArticleL1::update(id, articleIn(id, "coh-so-pre-b")));
+    REQUIRE(t);
+    CHECK(settleSeen(env, t) == io::WriteOutcome::Aborted);
+    lock.reset();
+    CHECK(articleCategory(env, id) == "coh-so-pre-a");
+    resetArticleCaches<CohArticleL1>(env);
+}
+
 TEST_CASE("settle outcome: under Await, a write that commits once unblocked was committed",
           "[coherence][settle][outcome][integration]") {
     CohEnv env(300ms, io::UncertainSettle::Await);

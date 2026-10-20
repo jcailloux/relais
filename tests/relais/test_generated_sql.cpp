@@ -95,7 +95,7 @@ TEST_CASE("mono UPDATE - update_returning_changes returns the row before and aft
           "[generator][sql][update]") {
     SECTION("[SQL] scalar key: locking CTE, same SET and parameters, both versions") {
         CHECK(std::string(UserSQL::update_returning_changes) ==
-              "WITH o AS (SELECT id, username, email, balance, created_at "
+              "WITH o AS (SELECT id, username, email, balance, created_at, pg_current_xact_id() "
               "FROM relais_test_users WHERE id = $1 FOR UPDATE) "
               "UPDATE relais_test_users AS t SET username=$2, email=$3, balance=$4 "
               "FROM o WHERE t.id=o.id "
@@ -105,7 +105,7 @@ TEST_CASE("mono UPDATE - update_returning_changes returns the row before and aft
 
     SECTION("[SQL] composite key: the CTE joins on every key column") {
         CHECK(std::string(MembershipSQL::update_returning_changes) ==
-              "WITH o AS (SELECT user_id, group_id, role, joined_at "
+              "WITH o AS (SELECT user_id, group_id, role, joined_at, pg_current_xact_id() "
               "FROM relais_test_memberships WHERE user_id = $1 AND group_id = $2 FOR UPDATE) "
               "UPDATE relais_test_memberships AS t SET role=$3 "
               "FROM o WHERE t.user_id=o.user_id AND t.group_id=o.group_id "
