@@ -328,10 +328,11 @@ public:
     /// Each segment: first discard the prepare queued ahead of it, if any, then
     /// read PQgetResult until NULL (= one query's result), then read the sync
     /// result (PGRES_PIPELINE_SYNC).
-    /// Returns exactly n PipelineResults in pipeline order.
-    Task<std::vector<PipelineResult>> readPipelineResults(int n) {
-        std::vector<PipelineResult> results;
-        results.reserve(n);
+    /// Appends to `results` in pipeline order, a segment once its sync is read:
+    /// its implicit transaction has then ended, committed or not. On a throw,
+    /// `results` holds the segments read in full; the others are unresolved.
+    Task<void> readPipelineResults(int n, std::vector<PipelineResult>& results) {
+        results.reserve(results.size() + n);
 
         auto prev = std::chrono::steady_clock::now();
 
@@ -351,13 +352,11 @@ public:
             auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(now - prev);
             prev = now;
 
-            results.emplace_back(std::move(query_result), elapsed.count());
-
             // Consume the sync point result (PGRES_PIPELINE_SYNC)
             co_await consumePipelineSync();
-        }
 
-        co_return results;
+            results.emplace_back(std::move(query_result), elapsed.count());
+        }
     }
 
 private:
