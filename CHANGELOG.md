@@ -13,6 +13,13 @@
   a `std::optional`.
 - **`countWhere(pred)`** returns the number of rows matching a `FilterSet`
   predicate, on every preset. It is not cached: each call queries PostgreSQL.
+- **Uncertain writes are settled** (see Fixed). `uncertain_settle`
+  (`PgPoolConfig`, `IoPoolConfig`) chooses how: `Terminate` (default), `Await`,
+  `Delay` with `settle_delay`, or `Off`. See `docs/runtime.md › Settling an
+  uncertain write`.
+- **`PgPoolConfig::client_check_interval`** (default 1 s) is sent as the
+  session's `client_connection_check_interval`: the server aborts a statement
+  whose client relais abandoned on a timeout. `0` sends nothing.
 
 ### Changed (Breaking)
 
@@ -43,6 +50,11 @@
   different rows issued without a `co_await` between them (a parent row and its
   child in a `whenAll`) may commit in either order. Order dependent writes with
   `co_await`; see `docs/runtime.md › Write ordering`.
+- **PostgreSQL 14 or later is required.**
+- **Behind a transaction pooler, set `uncertain_settle = Delay`** and a
+  `statement_timeout` on the role or database: the default `Terminate` ends the
+  server backend that ran an uncertain write, which the pooler may have handed
+  to another client since.
 
 ### Changed
 
@@ -88,6 +100,25 @@
   filtered column**: a `nin` filter with an empty set did not see the row, which
   SQL includes. `ne` and range filters no longer invalidate pages for such rows,
   which SQL excludes.
+- **An uncertain write could leave L1 stale until `l1_ttl`**: the statement
+  could still commit after the precautionary eviction, behind a read that
+  cached the prior value. relais now waits until the write can no longer commit,
+  then evicts again, one extra connection per event loop while it waits.
+- **An uncertain `eraseWhere`, `patchWhere` or `claim` left the rows it changed
+  in L1**, and an uncertain write could leave list pages and cross-invalidation
+  targets stale, notably when the database rewrote the row (trigger, generated
+  column). They are now invalidated, from the row as the database stored it.
+- **A write in a concurrent batch could be reported committed while its commit
+  failed** (deferred constraint, serialization failure), and its row cached; the
+  next write of the batch received the error instead.
+- **A batched write that committed threw `PgUncertainError`** when a later write
+  of the same batch timed out. Only writes whose outcome is unknown throw.
+- **When a connection died, calls waiting for one waited until
+  `acquire_timeout`** and failed, though the pool could reconnect. A replacement
+  is now opened for them.
+- **Without GDSF (the default), L1 was never swept**: the list cache kept a copy
+  of every written row, so memory grew and list reads slowed with every write,
+  and expired entries never read again stayed in memory.
 - **List and cross-invalidation after `update` and `erase` could miss the
   affected pages**: the row's old value came from its cached copy, stale if the
   row had changed elsewhere, and `update` took its new value from the caller's
