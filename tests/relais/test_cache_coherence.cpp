@@ -2072,7 +2072,8 @@ TEST_CASE("replay: Terminate settles before the commit, the cache matches Postgr
     CHECK(cachedValue(env, id) == 1);
     queueOf(env).resume();
     REQUIRE(pumpUntil(env, [&] { return settledAll(env); }, 7s));
-    CHECK_FALSE(inL1Item(id));  // replayed
+    REQUIRE(t->outcome == io::WriteOutcome::Aborted);
+    CHECK(inL1Item(id));  // aborted: the copy read meanwhile is right, kept
     lock.reset();
     CHECK(probeValue(env, id) == "1");
     CHECK(cachedValue(env, id) == 1);
@@ -3381,6 +3382,147 @@ TEST_CASE("cross: an uncertain eraseMany of rows nobody holds reaches every targ
     CHECK_FALSE(purchasePageHolds<CohPurchaseListL1>(env, r.u1, r.pid));
     CHECK_FALSE(purchasePageHolds<CohPurchaseListL1>(env, r.u3, hidden3));
     dropUsers(env, r);
+}
+
+// =============================================================================
+// Aborted at settle — a write the server terminated before it committed left
+// the database as it was: the cache, evicted once when the write failed, is
+// already right. Nothing runs again: no second eviction, no row read again, no
+// page invalidated as a last resort, and a note is dropped without a pass.
+// =============================================================================
+
+namespace {
+
+// Lets the paused queue settle `t`, and requires the write found aborted.
+void settleAborted(CohEnv& env, const std::shared_ptr<io::SettleTicket>& t) {
+    queueOf(env).resume();
+    REQUIRE(pumpUntil(env, [&] { return settledAll(env); }, 7s));
+    REQUIRE(t->outcome == io::WriteOutcome::Aborted);
+}
+
+}  // namespace
+
+TEST_CASE("outcome: an aborted update is neither evicted again nor read again",
+          "[coherence][settle][outcome][list][integration]") {
+    CohEnv env(300ms);
+    LogCapture logs;
+    RereadFaultReset faults;
+    resetArticleCaches<CohArticleL1>(env);
+    auto warm = seedArticle(env, "coh-oa-upd-warm");
+    driveBounded(env.io, CohArticleL1::update(warm, articleIn(warm, "coh-oa-upd-warm")));
+    auto id = seedArticle(env, "coh-oa-upd-a");
+    std::optional<RowLock> lock;
+    lock.emplace("relais_test_articles", "id=" + std::to_string(id));
+    // A row read again once settled would fail, and invalidate every page.
+    relais_test::TestInternals::failRereads<CohArticleL1>(1);
+
+    queueOf(env).pause();
+    auto t = uncertainTicket(env, CohArticleL1::update(id, articleIn(id, "coh-oa-upd-b")));
+    REQUIRE(t);
+    REQUIRE(driveBounded(env.io, CohArticleL1::find(id)));  // read again after the eviction
+    REQUIRE(pageHolds<CohArticleL1>(env, "coh-oa-upd-a", id));
+    const auto rows_left = TI::pendingRowLeftCount<CohArticleL1>();
+
+    settleAborted(env, t);
+    CHECK(inL1Article(id));
+    CHECK(TI::pendingRowLeftCount<CohArticleL1>() == rows_left);
+    CHECK(LogCapture::count(log::Level::Warn, "row unreadable") == 0);
+    auto hidden = seedArticle(env, "coh-oa-upd-a");
+    CHECK_FALSE(pageHolds<CohArticleL1>(env, "coh-oa-upd-a", hidden));  // page kept
+    lock.reset();
+    REQUIRE(articleCategory(env, id) == "coh-oa-upd-a");
+    resetArticleCaches<CohArticleL1>(env);
+}
+
+TEST_CASE("outcome: an aborted update leaves its cross targets as read meanwhile",
+          "[coherence][settle][outcome][integration]") {
+    CohEnv env(300ms);
+    env.probe.query("DELETE FROM relais_test_purchases");
+    relais_test::TestInternals::resetEntityCacheState<CohUserL1>();
+    relais_test::TestInternals::resetEntityCacheState<CohPurchaseL1>();
+    auto u1 = seedUser(env, "coh-oa-u1");
+    auto u2 = seedUser(env, "coh-oa-u2");
+    auto pid = seedPurchase(env, u1);
+    auto before = driveBounded(env.io, CohPurchaseL1::find(pid));
+    REQUIRE(before);
+    auto moved = ::entity::generated::TestPurchaseEntity(*before);
+    moved.user_id = u2;
+    driveBounded(env.io, CohPurchaseL1::update(pid, *before));  // prepares the UPDATE
+    REQUIRE(driveBounded(env.io, CohPurchaseL1::find(pid)));
+    std::optional<RowLock> lock;
+    lock.emplace("relais_test_purchases", "id=" + std::to_string(pid));
+    auto inL1User = [](int64_t u) {
+        return static_cast<bool>(relais_test::TestInternals::getFromCache<CohUserL1>(u));
+    };
+
+    queueOf(env).pause();
+    auto t = uncertainTicket(env, CohPurchaseL1::update(pid, moved));
+    REQUIRE(t);
+    REQUIRE(driveBounded(env.io, CohUserL1::find(u1)));
+    REQUIRE(driveBounded(env.io, CohUserL1::find(u2)));
+
+    settleAborted(env, t);
+    CHECK(inL1User(u1));  // the row before: not evicted again
+    CHECK(inL1User(u2));  // the row as committed: not read again
+    lock.reset();
+    env.probe.query("DELETE FROM relais_test_purchases WHERE id = " + std::to_string(pid));
+    env.probe.query("DELETE FROM relais_test_users WHERE id IN (" + std::to_string(u1) + ", "
+                    + std::to_string(u2) + ")");
+}
+
+TEST_CASE("outcome: an aborted patchWhere drops its note without a pass",
+          "[coherence][settle][outcome][predicate][integration]") {
+    CohEnv env(300ms);
+    resetArticleCaches<CohArticleL1>(env);
+    TI::holdRowNoteDrain<CohArticleL1>(true);
+    auto src = seedAuthored(env, "coh-oa-pw", 77);
+    REQUIRE(driveBounded(env.io, CohArticleL1::find(src)));
+    std::optional<RowLock> lock;
+    lock.emplace("relais_test_articles", "id=" + std::to_string(src));
+    // The task refers to its predicate and updates: they outlive it.
+    const auto pred = byAuthor(77);
+    const auto title = en::set<ArticleF::title>(std::string("patched"));
+
+    queueOf(env).pause();
+    auto t = uncertainTicket(env, CohArticleL1::patchWhere(pred, title));
+    REQUIRE(t);
+    REQUIRE(TI::rowNoteCount<CohArticleL1>() == 1);
+
+    settleAborted(env, t);
+    CHECK(TI::rowNoteCount<CohArticleL1>() == 0);  // dropped, though no pass may run
+    CHECK_FALSE(TI::rowNotesActive<CohArticleL1>());
+    lock.reset();
+    auto copy = driveBounded(env.io, CohArticleL1::find(src));
+    REQUIRE(copy);
+    CHECK(copy->title == "pred");
+    env.probe.query("UPDATE relais_test_articles SET title = 'behind' WHERE id = "
+                    + std::to_string(src));
+    copy = driveBounded(env.io, CohArticleL1::find(src));
+    REQUIRE(copy);
+    CHECK(copy->title == "pred");  // served
+    resetArticleCaches<CohArticleL1>(env);
+}
+
+TEST_CASE("outcome: an aborted insert with a database-assigned key invalidates no other page",
+          "[coherence][settle][outcome][list][integration]") {
+    CohEnv env(300ms);
+    resetArticleCaches<CohArticleL1>(env);
+    // Waits once its row is written: the write has a transaction id.
+    ArticleTrigger trigger(env, "coh_oa_ins_sleep", "AFTER INSERT",
+        "IF NEW.category = 'coh-oa-ins' THEN PERFORM pg_sleep(30); END IF;");
+    driveBounded(env.io, CohArticleL1::insert(articleIn(0, "coh-oa-ins-warm")));
+    auto other = seedArticle(env, "coh-oa-ins-other");
+    REQUIRE(pageHolds<CohArticleL1>(env, "coh-oa-ins-other", other));
+
+    queueOf(env).pause();
+    auto t = uncertainTicket(env, CohArticleL1::insert(articleIn(0, "coh-oa-ins")));
+    REQUIRE(t);
+
+    settleAborted(env, t);
+    auto hidden = seedArticle(env, "coh-oa-ins-other");
+    CHECK_FALSE(pageHolds<CohArticleL1>(env, "coh-oa-ins-other", hidden));  // page kept
+    CHECK(pageCount<CohArticleL1>(env, "coh-oa-ins") == 0);
+    resetArticleCaches<CohArticleL1>(env);
 }
 
 // =============================================================================

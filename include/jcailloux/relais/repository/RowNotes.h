@@ -36,7 +36,7 @@ namespace jcailloux::relais::detail {
 // exempt (its key is recorded when it is stored). A pass over the chunks then
 // evicts the touched copies left; each chunk it covers clears its bit in the
 // note (see PendingLane), and the note goes with its last bit. A Pending note
-// is never drained.
+// is never drained. A note whose write is found aborted is dropped at once.
 //
 // No per-copy state: while no note exists, a hit pays one atomic load.
 //
@@ -134,6 +134,13 @@ public:
         bumpAll();
         if (auto note = lane_.take([id](const Note& n) { return n.id == id; }))
             pushSettled(std::move(*note));
+    }
+
+    /// Drop note `id`: its write was aborted, the rows it named are as they
+    /// were, and every copy stored meanwhile was read from them.
+    void discard(uint64_t id) {
+        std::unique_lock lock(mutex_);
+        lane_.take([id](const Note& n) { return n.id == id; });
     }
 
     /// Record a copy read from the database and stored as exempt from the

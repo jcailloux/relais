@@ -316,7 +316,7 @@ TEST_CASE("buildKeyedPatchSql", "[base_repo][sql]") {
         auto sql = detail::buildKeyedPatchSql<Traits, void>(
             "my_table", "id", {"\"name\""}, "id, name", Returns::Changes);
         REQUIRE(sql ==
-            "WITH o AS (SELECT id, name FROM my_table WHERE \"id\"=$2 FOR UPDATE) "
+            "WITH o AS (SELECT id, name,pg_current_xact_id() FROM my_table WHERE \"id\"=$2 FOR UPDATE) "
             "UPDATE my_table AS t SET \"name\"=$1 FROM o WHERE t.\"id\"=o.\"id\" "
             "RETURNING o.id,o.name,t.id,t.name");
     }
@@ -347,7 +347,7 @@ TEST_CASE("buildKeyedPatchSql", "[base_repo][sql]") {
             M::table_name, M::primary_key_column,
             {"\"name\"", "\"value\""}, M::SQL::returning_columns, Returns::Changes);
         REQUIRE(sql.find("WITH o AS (SELECT id, name, value, description, is_active, "
-                         "created_at FROM relais_test_items WHERE \"id\"=$3 FOR UPDATE)")
+                         "created_at,pg_current_xact_id() FROM relais_test_items WHERE \"id\"=$3 FOR UPDATE)")
                 == 0);
         REQUIRE(sql.find("RETURNING *") == std::string::npos);
         REQUIRE(sql.find("o.*") == std::string::npos);
