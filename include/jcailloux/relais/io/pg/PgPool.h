@@ -41,6 +41,11 @@ namespace jcailloux::relais::io {
 //       server's statement_timeout, and 0 takes that timeout plus a margin), Off
 //       settles nothing. Settling runs over a connection of its own, outside the
 //       pool, with the same conninfo.
+//     - client_check_interval is set as the session's client_connection_check_interval
+//       (PostgreSQL 14+, Linux server): the server aborts a statement whose client
+//       has closed its socket, often before settling gets to it. Never sent under
+//       Delay, where a session setting would leak through the pooler to other
+//       clients; ignored by a server that refuses it. 0 sends nothing.
 struct PgPoolConfig {
     size_t min_connections = 2;
     size_t max_connections = 16;
@@ -48,6 +53,7 @@ struct PgPoolConfig {
     std::chrono::milliseconds query_timeout{30000};
     UncertainSettle uncertain_settle = UncertainSettle::Terminate;
     std::chrono::milliseconds settle_delay{0};
+    std::chrono::milliseconds client_check_interval{1000};
 };
 
 // PgPool — bounded connection pool with coroutine wait queue
@@ -198,7 +204,7 @@ private:
     {}
 
     [[nodiscard]] SettleConfig settleConfig() const noexcept {
-        return {cfg_.uncertain_settle, cfg_.settle_delay};
+        return {cfg_.uncertain_settle, cfg_.settle_delay, cfg_.client_check_interval};
     }
 
     void release(ConnectionType conn) {
