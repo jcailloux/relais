@@ -432,28 +432,28 @@ if(RELAIS_BUILD_BENCHMARKS)
     target_include_directories(bench_relais_cache PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks
         ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-    target_compile_definitions(bench_relais_cache PRIVATE RELAIS_BUILDING_TESTS RELAIS_ENABLE_METRICS=1)
+    target_compile_definitions(bench_relais_cache PRIVATE RELAIS_BENCHMARK RELAIS_BUILDING_TESTS RELAIS_ENABLE_METRICS=1)
     target_link_libraries(bench_relais_cache PRIVATE jcailloux::relais Catch2::Catch2WithMain)
 
     add_executable(bench_io_pg benchmarks/bench_io_pg.cpp)
     target_include_directories(bench_io_pg PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks
         ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-    target_compile_definitions(bench_io_pg PRIVATE RELAIS_ENABLE_METRICS=1)
+    target_compile_definitions(bench_io_pg PRIVATE RELAIS_BENCHMARK RELAIS_ENABLE_METRICS=1)
     target_link_libraries(bench_io_pg PRIVATE jcailloux::relais Catch2::Catch2WithMain)
 
     add_executable(bench_io_batch benchmarks/bench_io_batch.cpp)
     target_include_directories(bench_io_batch PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks
         ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-    target_compile_definitions(bench_io_batch PRIVATE RELAIS_BUILDING_TESTS RELAIS_ENABLE_METRICS=1)
+    target_compile_definitions(bench_io_batch PRIVATE RELAIS_BENCHMARK RELAIS_BUILDING_TESTS RELAIS_ENABLE_METRICS=1)
     target_link_libraries(bench_io_batch PRIVATE jcailloux::relais Catch2::Catch2WithMain)
 
     add_executable(bench_gdsf benchmarks/bench_gdsf.cpp)
     target_include_directories(bench_gdsf PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks
         ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-    target_compile_definitions(bench_gdsf PRIVATE RELAIS_BUILDING_TESTS RELAIS_GDSF_ENABLED=1 RELAIS_ENABLE_METRICS=1)
+    target_compile_definitions(bench_gdsf PRIVATE RELAIS_BENCHMARK RELAIS_BUILDING_TESTS RELAIS_GDSF_ENABLED=1 RELAIS_ENABLE_METRICS=1)
     target_link_libraries(bench_gdsf PRIVATE jcailloux::relais Catch2::Catch2WithMain)
 endif()
 
