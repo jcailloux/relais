@@ -42,7 +42,8 @@ TEST_CASE("PgConnection pipeline: multiple SELECTs", "[io][pg][pipeline][integra
         co_await conn.flushPipeline();
 
         // Read 3 query results (the prepare's result is consumed internally)
-        auto results = co_await conn.readPipelineResults(3);
+        std::vector<PgConnection<Io>::PipelineResult> results;
+        co_await conn.readPipelineResults(3, results);
 
         conn.exitPipelineMode();
 
@@ -90,7 +91,8 @@ TEST_CASE("PgConnection pipeline: error in one segment doesn't affect others",
         co_await conn.flushPipeline();
 
         // Read good result (the prepare's result is consumed internally)
-        auto results = co_await conn.readPipelineResults(1);
+        std::vector<PgConnection<Io>::PipelineResult> results;
+        co_await conn.readPipelineResults(1, results);
         REQUIRE(results.size() == 1);
         REQUIRE(results[0].result.ok());
         REQUIRE(results[0].result[0].get<int32_t>(0) == 1);

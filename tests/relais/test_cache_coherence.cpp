@@ -1302,6 +1302,113 @@ TEST_CASE("settle ticket: every caller of a failed batch shares one ticket",
     CHECK(backendAlive(env, tickets[0]->backend));
 }
 
+namespace {
+
+struct WaveWrite {
+    bool uncertain = false;
+    bool coalesced = false;
+    int64_t affected = -1;
+    std::shared_ptr<io::SettleTicket> ticket;
+};
+
+// Sends one write alone, then `writes` (row, value) batched behind it into one
+// pipeline, in order; the settle queue is paused.
+std::vector<WaveWrite> pipelinedWave(CohEnv& env, int64_t alone,
+                                     std::vector<std::pair<int64_t, int32_t>> writes) {
+    static constexpr const char* kSql =
+        "UPDATE relais_test_items SET value = $1 WHERE id = $2";
+    env.batcher->settleQueue().pause();
+    std::vector<WaveWrite> out(writes.size());
+    auto write = [&](WaveWrite* w, int64_t id, int32_t value) -> io::Task<void> {
+        try {
+            auto [r, coalesced] =
+                co_await env.batcher->submitPgWrite(kSql, io::PgParams::make(value, id));
+            if (w) { w->affected = r.affectedRows(); w->coalesced = coalesced; }
+        } catch (const io::PgUncertainError& e) {
+            if (w) { w->uncertain = true; w->ticket = e.settleTicket(); }
+        }
+    };
+    // Past the estimator's bootstrap, writes submitted while one is in flight
+    // are batched instead of sent one by one.
+    for (int i = 0; i < 6; ++i) driveBounded(env.io, write(nullptr, alone, i));
+    auto wave = [&]() -> io::Task<void> {
+        std::vector<io::Task<void>> tasks;
+        tasks.push_back(write(nullptr, alone, 100));
+        for (size_t i = 0; i < writes.size(); ++i)
+            tasks.push_back(write(&out[i], writes[i].first, writes[i].second));
+        co_await io::whenAll(std::move(tasks));
+    };
+    driveBounded(env.io, wave());
+    return out;
+}
+
+}  // namespace
+
+TEST_CASE("settle ticket: a pipelined write whose end was read is not uncertain",
+          "[coherence][settle][integration]") {
+    CohEnv env(300ms);
+    resetItems(env);
+    auto alone = env.seedItem("resolved-alone", 0);
+    auto a = env.seedItem("resolved-a", 0);
+    auto b = env.seedItem("resolved-b", 0);
+    auto locked = env.seedItem("resolved-locked", 0);
+
+    auto lock = lockItem(locked);
+    auto out = pipelinedWave(env, alone, {{a, 1}, {b, 2}, {locked, 3}});
+
+    CHECK_FALSE(out[0].uncertain);
+    CHECK(out[0].affected == 1);
+    CHECK_FALSE(out[1].uncertain);
+    CHECK(out[1].affected == 1);
+    REQUIRE(out[2].uncertain);
+    REQUIRE(out[2].ticket);
+    CHECK(out[2].ticket->unresolved == 1);
+    CHECK(probeValue(env, a) == "1");
+    CHECK(probeValue(env, b) == "2");
+}
+
+TEST_CASE("settle ticket: the writes behind an unresolved one stay uncertain",
+          "[coherence][settle][integration]") {
+    CohEnv env(300ms);
+    resetItems(env);
+    auto alone = env.seedItem("unresolved-alone", 0);
+    auto a = env.seedItem("unresolved-a", 0);
+    auto locked = env.seedItem("unresolved-locked", 0);
+    auto b = env.seedItem("unresolved-b", 0);
+
+    auto lock = lockItem(locked);
+    auto out = pipelinedWave(env, alone, {{a, 1}, {locked, 2}, {b, 3}});
+
+    CHECK_FALSE(out[0].uncertain);
+    CHECK(out[0].affected == 1);
+    REQUIRE(out[1].uncertain);
+    REQUIRE(out[2].uncertain);
+    REQUIRE(out[1].ticket);
+    CHECK(out[2].ticket == out[1].ticket);
+    CHECK(out[1].ticket->unresolved == 2);
+}
+
+TEST_CASE("settle ticket: followers of a resolved write get its result",
+          "[coherence][settle][integration]") {
+    CohEnv env(300ms);
+    resetItems(env);
+    auto alone = env.seedItem("follower-alone", 0);
+    auto a = env.seedItem("follower-a", 0);
+    auto locked = env.seedItem("follower-locked", 0);
+
+    auto lock = lockItem(locked);
+    auto out = pipelinedWave(env, alone, {{a, 1}, {a, 1}, {locked, 2}});
+
+    CHECK_FALSE(out[0].uncertain);
+    CHECK(out[0].affected == 1);
+    CHECK_FALSE(out[1].uncertain);
+    CHECK(out[1].coalesced);
+    CHECK(out[1].affected == 1);
+    REQUIRE(out[2].uncertain);
+    REQUIRE(out[2].ticket);
+    CHECK(out[2].ticket->unresolved == 1);
+}
+
 TEST_CASE("settle ticket: the mode decides what the ticket names",
           "[coherence][settle][integration]") {
     SECTION("Await names the backend") {
@@ -1991,6 +2098,59 @@ TEST_CASE("replay: writes of one pipeline share one ticket and replay every evic
     REQUIRE(pumpUntil(env, [&] { return settledAll(env); }, 7s));
     CHECK(queueOf(env).statements() == 1);
     CHECK_FALSE(inL1Item(locked));
+    lock.reset();
+    CHECK(probeValue(env, locked) == "0");
+}
+
+TEST_CASE("replay: writes of a pipeline whose end was read succeed and replay nothing",
+          "[coherence][settle][replay][integration]") {
+    // Writes on distinct rows in one pipeline, whatever the rows.
+    io::batch::BatchScheduler<Io>::write_fanout_override = 1;
+    struct Reset {
+        ~Reset() { io::batch::BatchScheduler<Io>::write_fanout_override = 0; }
+    } reset;
+    CohEnv env(300ms);
+    resetItems(env);
+    auto first = env.seedItem("through-first", 0);
+    auto a = env.seedItem("through-a", 0);
+    auto b = env.seedItem("through-b", 0);
+    auto locked = env.seedItem("through-locked", 0);
+
+    // Past the estimator's bootstrap, writes submitted while one is in flight
+    // are batched instead of sent one by one.
+    for (int i = 0; i < 6; ++i)
+        driveBounded(env.io, CohItemL1::update(first, item(first, "through-first", i)));
+
+    queueOf(env).pause();
+    std::optional<RowLock> lock;
+    lock.emplace("relais_test_items", "id=" + std::to_string(locked));
+    std::array<bool, 3> failed{};
+    std::shared_ptr<io::SettleTicket> ticket;
+    auto write = [&](int slot, int64_t id, int32_t value) -> io::Task<void> {
+        try {
+            (void)co_await CohItemL1::update(id, item(id, "through", value));
+        } catch (const io::PgUncertainError& e) {
+            if (slot >= 0) { failed[slot] = true; ticket = e.settleTicket(); }
+        }
+    };
+    auto wave = [&]() -> io::Task<void> {
+        std::vector<io::Task<void>> tasks;
+        tasks.push_back(write(-1, first, 100));  // sent alone, completes
+        tasks.push_back(write(0, a, 1));         // one pipeline, in order
+        tasks.push_back(write(1, b, 2));
+        tasks.push_back(write(2, locked, 3));
+        co_await io::whenAll(std::move(tasks));
+    };
+    driveBounded(env.io, wave());
+
+    CHECK(failed == std::array<bool, 3>{false, false, true});
+    REQUIRE(ticket);
+    CHECK(ticket->replays.size() == 1);  // the locked row's eviction only
+    CHECK(cachedValue(env, a) == 1);
+    CHECK(cachedValue(env, b) == 2);
+
+    queueOf(env).resume();
+    REQUIRE(pumpUntil(env, [&] { return settledAll(env); }, 7s));
     lock.reset();
     CHECK(probeValue(env, locked) == "0");
 }

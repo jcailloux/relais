@@ -967,8 +967,8 @@ private:
             co_await conn.flushPipeline();
 
             // Prepare results are consumed in send order by readPipelineResults
-            auto results = co_await conn.readPipelineResults(
-                static_cast<int>(segments.size()));
+            std::vector<typename PgPool<Io>::ConnectionType::PipelineResult> results;
+            co_await conn.readPipelineResults(static_cast<int>(segments.size()), results);
 
             conn.exitPipelineMode();
 
@@ -1089,6 +1089,18 @@ private:
         // DetachedTask and strand every batched waiter + follower forever.
         std::optional<typename ConcurrencyGate::Permit> permit;
         std::optional<typename PgPool<Io>::ConnectionGuard> guard;
+        // Filled as the pipeline is read: a failure leaves the writes whose
+        // end was read with their own result, known.
+        std::vector<typename PgPool<Io>::ConnectionType::PipelineResult> results;
+        auto deliver = [&] {
+            for (size_t i = 0; i < results.size(); ++i) {
+                entries[i]->result = std::move(results[i].result);
+                entries[i]->processing_time_us = results[i].processing_time_us;
+                for (auto* f : entries[i]->followers) {
+                    f->result = entries[i]->result; // shared_ptr copy
+                }
+            }
+        };
         try {
             permit.emplace(co_await pg_gate_.acquire());
             guard.emplace(co_await pg_pool_->acquire());
@@ -1106,32 +1118,27 @@ private:
             co_await conn.flushPipeline();
 
             // Prepare results are consumed in send order by readPipelineResults
-            auto results = co_await conn.readPipelineResults(
-                static_cast<int>(entries.size()));
+            co_await conn.readPipelineResults(static_cast<int>(entries.size()), results);
 
             conn.exitPipelineMode();
 
-            // Distribute results to leaders and their followers
-            for (size_t i = 0; i < entries.size(); ++i) {
-                entries[i]->result = std::move(results[i].result);
-                entries[i]->processing_time_us = results[i].processing_time_us;
-                for (auto* f : entries[i]->followers) {
-                    f->result = entries[i]->result; // shared_ptr copy
-                }
-            }
+            deliver();
 
         } catch (...) {
-            // Propagate exception to all waiters instead of silent PgResult{} —
-            // covers both the acquire timeout (no conn yet) and a pipeline error.
-            // The ticket goes on before the exception_ptr is taken: every waiter
-            // and follower then shares it.
-            if (guard) settleUncertain(guard->conn());
+            // Propagate exception to the unresolved waiters instead of silent
+            // PgResult{}: every one on the acquire timeout (no conn yet), those
+            // whose end was not read on a pipeline error. The ticket goes on
+            // before the exception_ptr is taken: every waiter and follower then
+            // shares it.
+            const auto unresolved = static_cast<uint32_t>(entries.size() - results.size());
+            if (guard && unresolved > 0) settleUncertain(guard->conn(), unresolved);
             auto eptr = std::current_exception();
             if (guard) { try { guard->conn().exitPipelineMode(); } catch (...) {} }
-            for (auto* e : entries) {
-                e->error = eptr;
-                for (auto* f : e->followers) f->error = eptr;
+            for (size_t i = results.size(); i < entries.size(); ++i) {
+                entries[i]->error = eptr;
+                for (auto* f : entries[i]->followers) f->error = eptr;
             }
+            deliver();
         }
         ++pg_writes_done_;
 
@@ -1264,11 +1271,13 @@ private:
     /// Called from a handler on the write path: an uncertain failure gets the
     /// settle ticket of the connection that sent the write, and the ticket is
     /// queued. Reads never call it: they change nothing, there is nothing to settle.
-    void settleUncertain(const typename PgPool<Io>::ConnectionType& conn) {
+    void settleUncertain(const typename PgPool<Io>::ConnectionType& conn,
+                         uint32_t unresolved = 1) {
         try {
             throw;
         } catch (const PgUncertainError& e) {
             auto ticket = conn.settleTicket();
+            if (ticket) ticket->unresolved = unresolved;
             e.attachSettleTicket(ticket);
             settle_queue_.enqueue(std::move(ticket));
         } catch (...) {}
