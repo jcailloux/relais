@@ -25,6 +25,8 @@ enum class UncertainSettle : uint8_t {
 struct SettleConfig {
     UncertainSettle mode = UncertainSettle::Off;
     std::chrono::milliseconds delay{0};  // Delay only; 0 = the server's statement_timeout
+    // Sent as client_connection_check_interval, except under Delay; 0 sends nothing.
+    std::chrono::milliseconds client_check_interval{0};
 };
 
 // Added to the server's statement_timeout when it bounds a write: the statement
