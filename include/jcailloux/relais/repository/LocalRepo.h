@@ -616,15 +616,18 @@ private:
     static typename Tier::Hit lookup(const Key& id) {
         auto& s = state();
         auto hit = s.tier.find(id);
-        if (hit && s.notes.active()) [[unlikely]] return lookupNoted(s, id, std::move(hit));
-        return hit;
+        if (hit && s.notes.active()) [[unlikely]] {
+            if (evictNoted(s, id, hit)) hit = {};
+        }
+        return hit;  // one named return: the hit is built in place, never moved
     }
 
-    [[gnu::noinline]] static typename Tier::Hit lookupNoted(
-        State& s, const Key& id, typename Tier::Hit hit) {
-        if (!s.notes.touches(id, *hit.value, hit.key_hash)) return hit;
+    /// Evict the copy `hit` holds if a note touches it.
+    [[gnu::noinline]] static bool evictNoted(State& s, const Key& id,
+                                             const typename Tier::Hit& hit) {
+        if (!s.notes.touches(id, *hit.value, hit.key_hash)) return false;
         s.tier.evictIfSame(id, hit.value);
-        return {};
+        return true;
     }
 
     /// A copy read from the database (fetch started at `snap`) and stored:

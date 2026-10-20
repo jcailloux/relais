@@ -9,10 +9,16 @@ namespace relais_test {
 // (synchronous_commit=off): a case sees what it commits as it otherwise
 // would, but never waits on the disk, which the short query timeouts of the
 // settle cases would take for a lost round trip. Durability is not under test.
+// Benchmarks keep the server's setting: a write waits on its commit as in
+// production.
 
 #define RELAIS_TEST_SERVER \
     "host=localhost port=5432 dbname=relais_test user=relais_test password=relais_test"
+#ifdef RELAIS_BENCHMARK
+#define RELAIS_TEST_SETTINGS ""
+#else
 #define RELAIS_TEST_SETTINGS "-c synchronous_commit=off"
+#endif
 
 inline constexpr const char* kConnInfo =
     RELAIS_TEST_SERVER " options='" RELAIS_TEST_SETTINGS "'";
