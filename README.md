@@ -77,7 +77,7 @@ either part of relais or a backing service you already run.
 - libpq — PostgreSQL client headers (`find_package(PostgreSQL)`)
 
 **Runtime service** — the process you connect to, not a library you link:
-- PostgreSQL
+- PostgreSQL 14+
 
 **Internal to relais** — shipped with it, nothing to install or adopt:
 - The coroutine runtime (`io::Task`, `IoPool`) and per-loop connection pools
