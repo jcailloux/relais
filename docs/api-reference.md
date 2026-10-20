@@ -139,7 +139,7 @@ static Task<ResultFor<E, O.returns>> claim(const Guards<Gs...>& pred, const Orde
 - **ordering**: `claim` without `order` takes rows in primary-key order; `order` is always closed by the primary key, and results come back in the order.
 - **`n == 0`**: `claim` returns empty without a query.
 - **rows**: `patchWhere`/`claim` return entities by value, not views.
-- **cache**: `patchIf` settles like `patch`; a refusal or DB error leaves the cache untouched. `patchWhere`/`claim` evict the entities and list pages before returning, cross-targets detached. Uncertain: `patchIf` evicts its row; the rows of `patchWhere`/`claim` are unknowable and left to `l1_ttl` (logged).
+- **cache**: `patchIf` settles like `patch`; a refusal or DB error leaves the cache untouched. `patchWhere`/`claim` evict the entities and list pages before returning, cross-targets detached. Uncertain: every cached row the write may have changed is evicted, then again once the write is settled ([runtime.md › Settling](runtime.md#settling-an-uncertain-write)).
 
 Guide: [conditional-writes.md](conditional-writes.md).
 
@@ -834,6 +834,20 @@ static std::unique_ptr<IoPool> create(const IoPoolConfig& config);   // io/IoPoo
 | `acquire_timeout` | `std::chrono::milliseconds` | `5000` | Bounds each connection acquire, including the startup warm-up connect — an unreachable DB fails `create()` instead of hanging. |
 | `query_timeout` | `std::chrono::milliseconds` | `30000` | Bounds each per-connection I/O wait. A liveness backstop, not an SLA; `0` disables it (discouraged). See [runtime.md › Liveness & failure semantics](runtime.md#liveness--failure-semantics). |
 | `startup_timeout` | `std::chrono::milliseconds` | `30000` | Bounds `create()`'s wait for all workers to report ready — a worker that hangs at boot (e.g. an unreachable dependency) makes `create()` throw `io::IoPoolStartupError` rather than block forever. |
+| `uncertain_settle` | `io::UncertainSettle` | `Terminate` | How an uncertain write is settled, as `PgPoolConfig::uncertain_settle`. |
+| `settle_delay` | `std::chrono::milliseconds` | `0` | As `PgPoolConfig::settle_delay`. |
+
+`PgPoolConfig` (`io/pg/PgPool.h`) — the per-loop pool, passed to `PgPool<Io>::create(io, conninfo, cfg)`:
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `min_connections` | `size_t` | `2` | Connections opened at creation. |
+| `max_connections` | `size_t` | `16` | Pool ceiling. |
+| `acquire_timeout` | `std::chrono::milliseconds` | `5000` | As in `IoPoolConfig`. |
+| `query_timeout` | `std::chrono::milliseconds` | `30000` | As in `IoPoolConfig`. |
+| `uncertain_settle` | `io::UncertainSettle` | `Terminate` | What settling an uncertain write waits for: `Terminate` (relais ends the backend that ran it), `Await` (that backend exits), `Delay` (`settle_delay`; behind a transaction pooler), `Off` (no settling). See [runtime.md › Settling](runtime.md#settling-an-uncertain-write). |
+| `settle_delay` | `std::chrono::milliseconds` | `0` | `Delay` only: must exceed the server's `statement_timeout`; `0` takes that timeout + 1 s, and settles nothing without one. |
+| `client_check_interval` | `std::chrono::milliseconds` | `1000` | Sent as the session's `client_connection_check_interval`: the server aborts a statement whose client is gone. Not sent under `Delay`; `0` sends nothing. |
 
 ### Task / Immediate / DetachedTask
 
@@ -1022,7 +1036,7 @@ Any other `T` is a compile error.
 | `io::PgNoRows` | `PgError` | Query returned no rows. |
 | `io::PgConnectionError` | `PgError` | Connection-level PG failure (deterministic — DB untouched). |
 | `io::PgPoolTimeout` | `PgError` | `acquire_timeout` exceeded (queue wait or connect handshake). Deterministic — DB never touched, retry-safe. |
-| `io::PgUncertainError` | `PgError` | **Category** — the request was in flight when the wait failed, so the DB *may* have committed. The write path evicts the affected caches before rethrowing. |
+| `io::PgUncertainError` | `PgError` | **Category** — the request was in flight when the wait failed, so the DB *may* have committed. The write path evicts the affected caches before rethrowing, and again once the write is settled. |
 | `io::PgQueryTimeout` | `PgUncertainError` | A per-connection I/O wait exceeded `query_timeout`. |
 | `io::PgConnectionLost` | `PgUncertainError` | The connection dropped (RST/EOF) after the request was flushed or while its result was read. |
 

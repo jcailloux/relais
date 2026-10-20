@@ -228,10 +228,10 @@ store-through, no read.
 An **uncertain** write (timeout, mid-request connection loss) may have committed
 over a key that already held a value, so on `io::PgUncertainError` `upsert` **evicts
 the affected L1 entry and invalidates the possibly-affected pages by precaution**,
-then rethrows (see the limit in [runtime.md › Failures and the
-cache](runtime.md#failures-and-the-cache)). (`insert` evicts nothing on an uncertain
-write; there was no prior value to go stale.) A *deterministic* failure returns an
-empty view with nothing cached.
+then rethrows, and evicts them again once the write is settled (see
+[runtime.md › Settling an uncertain write](runtime.md#settling-an-uncertain-write)).
+(`insert` evicts nothing on an uncertain write; there was no prior value to go
+stale.) A *deterministic* failure returns an empty view with nothing cached.
 
 The insert-vs-update decision is read a moment before the statement runs, so a row
 inserted concurrently in that window resolves as an update in SQL but propagates as

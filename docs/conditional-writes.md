@@ -215,10 +215,10 @@ The caller has nothing to invalidate:
 - **`patchWhere` / `claim`**: when the call returns, the changed entities are out
   of the cache, so the next `find` reads them from the database; cross-invalidation
   targets are refreshed just after, in the background.
-- **Uncertain outcome**: `patchIf` evicts its entity; the rows of `patchWhere` or
-  `claim` cannot be known. What cannot be invalidated stays cached until
-  `l1_ttl`, and an error is logged. Decisions are unaffected: they are
-  taken in the database.
+- **Uncertain outcome**: every cached row the write may have changed is evicted,
+  then again once the write is settled (see
+  [runtime.md › Settling an uncertain write](runtime.md#settling-an-uncertain-write)).
+  Decisions are unaffected: they are taken in the database.
 
 ## Limits
 

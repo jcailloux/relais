@@ -154,7 +154,11 @@ precise; the client timer is the independent floor underneath them. Setting eith
 to `0` disables it (discouraged — it reopens the hang).
 
 A wait that trips its timer throws, and the connection it owns is **poisoned and
-rebuilt**: the next `acquire()` reconnects transparently.
+rebuilt**: the next `acquire()` reconnects transparently. The server does not see
+the client leave until it next reads the socket, so relais sets each session's
+`client_connection_check_interval` to `PgPoolConfig::client_check_interval`
+(default 1 s): the server then aborts the abandoned statement within that interval
+instead of running it to the end. `0` sends nothing.
 
 ### Failures and the cache
 
@@ -172,11 +176,51 @@ plays out in three cases:
   outcome is an exception, not an ambiguous `nullopt`, a caller never mistakes
   "maybe committed" for "definitely failed" and double-writes.
 
-**Limit.** The abandoned statement can still commit in PostgreSQL after the
-eviction. A read that refills L1 in between caches the prior value, which stays
-until `l1_ttl`.
-
 > The error *type* is the signal: `io::PgUncertainError` (base of `PgQueryTimeout`
 > and `PgConnectionLost`) is the "maybe committed" category; a plain `io::PgError`
 > means the DB is unchanged. See
 > [api-reference.md › errors](api-reference.md#pgprovider--pgresult--row--errors).
+
+### Settling an uncertain write
+
+The abandoned statement can still commit after the eviction, and a read in between
+can cache the prior value. relais therefore **settles** every uncertain write: off
+the request path, it waits until the write can no longer commit, then evicts the
+same entries again. **No failure leaves the cache stale past its settling.**
+
+- **Window.** Until the write is settled, a read may return the prior value.
+  Settling takes a few round-trips when PostgreSQL answers (`settle_delay` under
+  `Delay`); while it does not, relais retries (from 50 ms, doubling up to 2 s),
+  and the window lasts until it answers.
+- **Rolled back.** When the server reports the write rolled back, nothing more is
+  evicted.
+- **Connections.** Settling runs on a connection of its own per event loop, outside
+  the pool, open only while a write waits: count one more per loop against the
+  server's `max_connections`.
+- **PostgreSQL 14** or later.
+
+`uncertain_settle` (`PgPoolConfig`, `IoPoolConfig`) chooses what settling waits for:
+
+| Mode | The write is settled once… | Use it when |
+|---|---|---|
+| `Terminate` (default) | relais has terminated the server backend that ran it (`pg_terminate_backend`) | relais connects to PostgreSQL directly |
+| `Await` | that backend has exited on its own, once the statement ended (`client_check_interval` cuts it short) | relais must not end server sessions |
+| `Delay` | `settle_delay` has elapsed; `0` takes the session's `statement_timeout` + 1 s | a transaction pooler sits in front of PostgreSQL |
+| `Off` | never: the first eviction is the only one | stale reads after a failure are acceptable |
+
+**Behind a transaction pooler** (PgBouncer `pool_mode = transaction`), a client
+connection changes server backend from one transaction to the next: `Terminate` and
+`Await` would watch, or end, a backend now serving another client, and a session
+setting would leak to other clients. Use `Delay` (it sends no session setting), and
+bound every write with a `statement_timeout` on the role or the database: a
+`settle_delay` shorter than it settles too early.
+
+**Where the promise stops.** In these cases a prior value read during the failure
+stays cached until `l1_ttl`:
+
+- `Off`;
+- `Delay` with neither `settle_delay` nor a `statement_timeout` (warned at pool
+  creation);
+- the server refusing to settle (the role may not terminate the backend) when no
+  `statement_timeout` applies; with one, settling waits it out (+ 1 s) instead. The
+  refusal is logged as an error.
