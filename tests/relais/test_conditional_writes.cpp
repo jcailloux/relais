@@ -152,7 +152,7 @@ TEST_CASE("[relative] SET fragments and write-mode trait", "[relative][sql]")
              d::SetColumn("\"d\"", Op::NowPlus)},
             "id", jr::Returns::Changes);
         REQUIRE(sql ==
-            "WITH o AS (SELECT id FROM tb WHERE \"id\"=$5 FOR UPDATE) "
+            "WITH o AS (SELECT id,pg_current_xact_id() FROM tb WHERE \"id\"=$5 FOR UPDATE) "
             "UPDATE tb AS t SET \"a\"=$1,\"b\"=t.\"b\"+$2,\"c\"=t.\"c\"-$3,"
             "\"d\"=now()+interval '1 microsecond'*$4 FROM o WHERE t.\"id\"=o.\"id\" "
             "RETURNING o.id,t.id");
@@ -776,7 +776,7 @@ TEST_CASE("[patchIf] SQL: SET values, then the key, then the guard", "[patchIf][
              d::SetColumn(std::string_view("\"version\""), jr::entity::SetOp::Add)},
             "id, version", jr::Returns::Changes);
         REQUIRE(sql ==
-            "WITH o AS (SELECT id, version FROM relais_test_slots WHERE \"id\"=$3 "
+            "WITH o AS (SELECT id, version,pg_current_xact_id() FROM relais_test_slots WHERE \"id\"=$3 "
             "AND \"version\"=$4 AND (\"holder\" IS NULL OR \"expires_at\"<now()) FOR UPDATE) "
             "UPDATE relais_test_slots AS t SET \"holder\"=$1,\"version\"=t.\"version\"+$2 "
             "FROM o WHERE t.\"id\"=o.\"id\" RETURNING o.id,o.version,t.id,t.version");
@@ -791,7 +791,7 @@ TEST_CASE("[patchIf] SQL: SET values, then the key, then the guard", "[patchIf][
             {d::SetColumn(std::string_view("\"hits\""), jr::entity::SetOp::Add)},
             "group_id, bucket, hits", jr::Returns::Changes);
         REQUIRE(sql ==
-            "WITH o AS (SELECT group_id, bucket, hits FROM relais_test_slot_tallies "
+            "WITH o AS (SELECT group_id, bucket, hits,pg_current_xact_id() FROM relais_test_slot_tallies "
             "WHERE \"group_id\"=$2 AND \"bucket\"=$3 AND \"hits\"<$4 FOR UPDATE) "
             "UPDATE relais_test_slot_tallies AS t SET \"hits\"=t.\"hits\"+$1 FROM o "
             "WHERE t.\"group_id\"=o.\"group_id\" AND t.\"bucket\"=o.\"bucket\" "
@@ -1108,7 +1108,7 @@ TEST_CASE("[patchWhere] SQL: locking CTE, qualified SET, before and after return
              d::SetColumn(std::string_view("\"counter\""), jr::entity::SetOp::Add)},
             "id, holder, counter", jr::Returns::Changes);
         REQUIRE(sql ==
-            "WITH o AS (SELECT id, holder, counter FROM relais_test_slots "
+            "WITH o AS (SELECT id, holder, counter,pg_current_xact_id() FROM relais_test_slots "
             "WHERE \"group_id\"=$3 AND \"expires_at\"<now() FOR UPDATE) "
             "UPDATE relais_test_slots AS t SET \"holder\"=$1,\"counter\"=t.\"counter\"+$2 "
             "FROM o WHERE t.\"id\"=o.\"id\" "
@@ -1125,7 +1125,7 @@ TEST_CASE("[patchWhere] SQL: locking CTE, qualified SET, before and after return
             {d::SetColumn(std::string_view("\"hits\""), jr::entity::SetOp::Add)},
             TallyMapping::SQL::returning_columns, jr::Returns::Changes);
         REQUIRE(sql ==
-            "WITH o AS (SELECT group_id, bucket, hits FROM relais_test_slot_tallies "
+            "WITH o AS (SELECT group_id, bucket, hits,pg_current_xact_id() FROM relais_test_slot_tallies "
             "WHERE \"hits\"<$2 FOR UPDATE) "
             "UPDATE relais_test_slot_tallies AS t SET \"hits\"=t.\"hits\"+$1 "
             "FROM o WHERE t.\"group_id\"=o.\"group_id\" AND t.\"bucket\"=o.\"bucket\" "

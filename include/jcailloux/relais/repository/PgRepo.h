@@ -180,7 +180,8 @@ void appendPkJoin(std::string& sql, const std::array<const char*, N>& pk_columns
 /// Build the UPDATE of the rows `emit_where` matches, returning per `rows`:
 ///   Count:   UPDATE tbl SET <sets> WHERE <where>
 ///   After:   UPDATE tbl SET <sets> WHERE <where> RETURNING <cols>
-///   Changes: WITH o AS (SELECT <cols> FROM tbl WHERE <where> FOR UPDATE)
+///   Changes: WITH o AS (SELECT <cols>, pg_current_xact_id() FROM tbl
+///                       WHERE <where> FOR UPDATE)
 ///            UPDATE tbl AS t SET <sets> FROM o WHERE t.pk=o.pk
 ///            RETURNING o.<cols>, t.<cols>
 /// Either way a row locked by a concurrent writer is waited on, then re-checked
@@ -189,6 +190,13 @@ void appendPkJoin(std::string& sql, const std::array<const char*, N>& pk_columns
 /// asked for when that version is used. Its SET right-hand sides are qualified
 /// with `t.`: unqualified, a column would be ambiguous between the target and
 /// the CTE. Parameters: SET values, then those of <where>.
+///
+/// A plain UPDATE takes its transaction id before it waits on a locked row; a
+/// FOR UPDATE waits first. The CTE projects pg_current_xact_id() so that the
+/// write has its id while it waits, as a plain UPDATE does: a write terminated
+/// there can then be found aborted when settled. Projected, it is evaluated
+/// only on a row <where> matched, which the UPDATE writes anyway: a write that
+/// matches nothing takes no id.
 template<typename Pk, typename EmitWhere>
 std::string buildUpdateSql(
     std::string_view table_name,
@@ -219,7 +227,7 @@ std::string buildUpdateSql(
     }
     sql += "WITH o AS (SELECT ";
     sql += columns;
-    sql += " FROM ";
+    sql += ",pg_current_xact_id() FROM ";
     sql += table_name;
     sql += " WHERE ";
     emit_where(sql, param);
