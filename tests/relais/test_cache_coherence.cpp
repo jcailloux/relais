@@ -186,11 +186,13 @@ struct CohEnv {
     std::chrono::milliseconds q_timeout_;
 
     // `settings` are session settings of the pool's connections (the settle
-    // connection uses them too).
+    // connection uses them too). No client check by default: the server would
+    // abort a blocked write once its client left, before the cases settle it.
     explicit CohEnv(std::chrono::milliseconds query_timeout,
                     io::UncertainSettle settle = io::UncertainSettle::Terminate,
                     std::chrono::milliseconds settle_delay = 0ms,
-                    std::string_view settings = {})
+                    std::string_view settings = {},
+                    std::chrono::milliseconds client_check_interval = 0ms)
         : probe(probeConnInfo()), q_timeout_(query_timeout)
     {
         // min=max=1: a single connection serves every op, so holdReads(pg_fd)
@@ -200,7 +202,8 @@ struct CohEnv {
         pool = driveBounded(io, io::PgPool<Io>::create(io, poolConnInfo(settings),
             {.min_connections = 1, .max_connections = 1,
              .acquire_timeout = 10s, .query_timeout = query_timeout,
-             .uncertain_settle = settle, .settle_delay = settle_delay}));
+             .uncertain_settle = settle, .settle_delay = settle_delay,
+             .client_check_interval = client_check_interval}));
         pg_fd = io.lastAddedFd();  // the connection min_connections just built
 
         // Build the batcher directly (not PgProvider::init) so the cases can read
@@ -1957,6 +1960,57 @@ TEST_CASE("settle outcome: a write behind another unresolved one is unknown",
 
     CHECK(settleSeen(env, t) == io::WriteOutcome::Unknown);
     CHECK_FALSE(backendAlive(env, t->backend));
+    lock.reset();
+    CHECK(probeValue(env, id) == "1");
+}
+
+// =============================================================================
+// Client check — the pool's connections ask the server to abort a statement
+// whose client has closed its socket (client_connection_check_interval). A
+// write that timed out then ends server-side on its own, settled or not.
+// =============================================================================
+
+namespace {
+
+// The pool connection's value of the setting, and where it comes from.
+std::pair<std::string, std::string> clientCheckOf(CohEnv& env) {
+    auto r = driveBounded(env.io, io::PgClient<Io>(env.pool).query(
+        "SELECT setting, source FROM pg_settings "
+        "WHERE name = 'client_connection_check_interval'"));
+    REQUIRE(r.rows() == 1);
+    return {r[0].get<std::string>(0), r[0].get<std::string>(1)};
+}
+
+}  // namespace
+
+TEST_CASE("client check: the pool's connections carry the configured interval",
+          "[coherence][settle][client_check][integration]") {
+    SECTION("set on the session") {
+        CohEnv env(300ms, io::UncertainSettle::Terminate, 0ms, {}, 1500ms);
+        CHECK(clientCheckOf(env) == std::pair<std::string, std::string>{"1500", "session"});
+    }
+    SECTION("0 sends nothing") {
+        CohEnv env(300ms);
+        CHECK(clientCheckOf(env).second == "default");
+    }
+    SECTION("never sent under Delay") {
+        CohEnv env(300ms, io::UncertainSettle::Delay, 1s, {}, 1500ms);
+        CHECK(clientCheckOf(env).second == "default");
+    }
+}
+
+TEST_CASE("client check: a blocked write whose client left ends server-side unsettled",
+          "[coherence][settle][client_check][integration]") {
+    CohEnv env(300ms, io::UncertainSettle::Terminate, 0ms, {}, 200ms);
+    resetItems(env);
+    auto id = env.seedItem("client-check", 1);
+    std::optional<RowLock> lock;
+    lock.emplace("relais_test_items", "id=" + std::to_string(id));
+    auto t = blockedUpdate(env, id, 2);
+
+    // The queue is paused: only the server's own check can end the backend.
+    CHECK(pumpUntil(env, [&] { return !backendAlive(env, t->backend); }, 3s));
+    CHECK(queueOf(env).pending() == 1);
     lock.reset();
     CHECK(probeValue(env, id) == "1");
 }

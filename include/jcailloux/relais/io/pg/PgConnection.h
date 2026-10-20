@@ -129,7 +129,8 @@ public:
     // `settle` decides what a write failing uncertainly on this connection must
     // wait for (settleTicket()). Terminate and Await name the backend, and Delay
     // without a delay reads the server's statement_timeout, both here within
-    // acquire_timeout; a given delay and Off add no round-trip.
+    // acquire_timeout; a given delay and Off add no round-trip. A non-zero
+    // client_check_interval adds one, except under Delay.
     static Task<PgConnection> connect(Io& io, const char* conninfo,
                                       std::chrono::nanoseconds acquire_timeout = {},
                                       std::chrono::nanoseconds query_timeout = {},
@@ -151,6 +152,8 @@ public:
             co_await pgconn.readBackendId(acquire_timeout);
         else if (settle.mode == UncertainSettle::Delay && settle.delay.count() <= 0)
             co_await pgconn.readStatementTimeout(acquire_timeout);
+        if (settle.mode != UncertainSettle::Delay && settle.client_check_interval.count() > 0)
+            co_await pgconn.setClientCheckInterval(settle.client_check_interval, acquire_timeout);
         co_return std::move(pgconn);
     }
 
@@ -391,10 +394,21 @@ private:
         }
     }
 
+    // Refused by a server before 14 (unknown parameter) or not on Linux: the
+    // statement then runs to its end after the client left, as before.
+    Task<void> setClientCheckInterval(std::chrono::milliseconds interval,
+                                      std::chrono::nanoseconds acquire_timeout) {
+        const std::string sql = "SET client_connection_check_interval = "
+            + std::to_string(interval.count());
+        (void)co_await settleQuery(sql.c_str(), acquire_timeout,
+            "client_connection_check_interval not set", log::Level::Debug);
+    }
+
     // Runs a settle setup query, nullopt when the server refuses it.
     Task<std::optional<PgResult>> settleQuery(const char* sql,
                                               std::chrono::nanoseconds acquire_timeout,
-                                              const char* refused) {
+                                              const char* refused,
+                                              log::Level level = log::Level::Warn) {
         const auto query_timeout = std::exchange(query_timeout_, acquire_timeout);
         std::optional<PgResult> r;
         try {
@@ -404,7 +418,7 @@ private:
         } catch (const PgConnectionLost& e) {
             throw PgConnectionError(e.what());
         } catch (const PgError& e) {
-            RELAIS_LOG_WARN << "relais: " << refused << ": " << e.what();
+            log::LogStream(level) << "relais: " << refused << ": " << e.what();
         }
         query_timeout_ = query_timeout;
         co_return r;
