@@ -28,7 +28,7 @@ io::Task<void> runOwned(Fn evict) {
 template<typename Fn>
 void registerReplay(const std::shared_ptr<io::SettleTicket>& ticket, const Fn& replay) {
     if (ticket && ticket->state == io::SettleTicket::State::Pending)
-        ticket->replays.emplace_back([replay] { return runOwned(replay); });
+        ticket->replays.emplace_back([replay](io::WriteOutcome) { return runOwned(replay); });
 }
 
 // Asynchronous eviction: `evict` returns io::Task<void>. Await it after the
@@ -54,7 +54,7 @@ template<typename Fn>
 io::Task<void> onSettled(std::shared_ptr<io::SettleTicket> ticket, Fn fn) {
     if (!ticket) co_return;
     if (ticket->state == io::SettleTicket::State::Pending) {
-        ticket->replays.emplace_back([fn] { return runOwned(fn); });
+        ticket->replays.emplace_back([fn](io::WriteOutcome) { return runOwned(fn); });
         co_return;
     }
     co_await fn();

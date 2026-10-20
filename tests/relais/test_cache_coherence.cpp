@@ -1549,13 +1549,19 @@ TEST_CASE("settle queue: a ticket runs its replays once, in order, past a failin
     CohEnv env(300ms);
     std::vector<int> ran;
     auto t = ticketFor(io::UncertainSettle::Delay, {}, 50ms);
-    t->replays.push_back([&ran]() -> io::Task<void> { ran.push_back(1); co_return; });
-    t->replays.push_back([&ran]() -> io::Task<void> {
+    t->replays.push_back([&ran](io::WriteOutcome) -> io::Task<void> {
+        ran.push_back(1);
+        co_return;
+    });
+    t->replays.push_back([&ran](io::WriteOutcome) -> io::Task<void> {
         ran.push_back(2);
         throw std::runtime_error("replay failure");
         co_return;
     });
-    t->replays.push_back([&ran]() -> io::Task<void> { ran.push_back(3); co_return; });
+    t->replays.push_back([&ran](io::WriteOutcome) -> io::Task<void> {
+        ran.push_back(3);
+        co_return;
+    });
 
     LogCapture logs;
     queueOf(env).enqueue(t);
@@ -1591,6 +1597,9 @@ TEST_CASE("settle queue: tickets of one backend are settled by one statement",
     CHECK(twin->state == io::SettleTicket::State::Settled);
     CHECK(queueOf(env).settled() == 2);
     CHECK(queueOf(env).statements() == 1);
+    // Either ticket may be the transaction seen running.
+    CHECK(t->outcome == io::WriteOutcome::Unknown);
+    CHECK(twin->outcome == io::WriteOutcome::Unknown);
 }
 
 TEST_CASE("settle queue: start time guards against a reused pid",
@@ -1627,6 +1636,7 @@ TEST_CASE("settle queue: a backend already gone is settled",
     REQUIRE(pumpUntil(env, [&] { return settledAll(env); }, 3s));
     CHECK(t->state == io::SettleTicket::State::Settled);
     CHECK(queueOf(env).statements() == 1);
+    CHECK(t->outcome == io::WriteOutcome::Unknown);
 }
 
 TEST_CASE("settle queue: Await waits for the backend to end on its own",
@@ -1668,6 +1678,7 @@ TEST_CASE("settle queue: Delay settles after the delay, without a statement",
     CHECK(std::chrono::steady_clock::now() - sent >= 300ms + 400ms);
     CHECK(t->state == io::SettleTicket::State::Settled);
     CHECK(queueOf(env).statements() == 0);
+    CHECK(t->outcome == io::WriteOutcome::Unknown);
 }
 
 TEST_CASE("settle queue: PostgreSQL unreachable, settling is retried with a growing wait",
@@ -1710,6 +1721,7 @@ TEST_CASE("settle queue: a refused termination falls back to statement_timeout",
         REQUIRE(pumpUntil(env, [&] { return settledAll(env); }, 3s));
         CHECK(std::chrono::steady_clock::now() - start >= 1700ms);
         CHECK(t->state == io::SettleTicket::State::Settled);
+        CHECK(t->outcome == io::WriteOutcome::Unknown);
         CHECK(queueOf(env).abandoned() == 0);
         CHECK(LogCapture::count(log::Level::Error, "statement_timeout instead") == 1);
     }
@@ -1720,7 +1732,7 @@ TEST_CASE("settle queue: a refused termination falls back to statement_timeout",
         auto id = env.seedItem("settle", 1);
         auto lock = lockItem(id);
         auto t = blockedUpdate(env, id, 2);
-        t->replays.push_back([]() -> io::Task<void> { co_return; });
+        t->replays.push_back([](io::WriteOutcome) -> io::Task<void> { co_return; });
 
         Queue::fault = {.kind = Queue::Fault::Kind::Refused, .count = 1};
         queueOf(env).resume();
@@ -1815,6 +1827,117 @@ TEST_CASE("settle queue: destroyed with pending tickets, it abandons them",
         CHECK(t->replays.size() == 1);  // dropped with the queue, never run
     }
     CHECK(LogCapture::count(log::Level::Warn, "abandoned unsettled") == 1);
+}
+
+// =============================================================================
+// Settle outcome — once the backend is gone, the queue reads what became of the
+// write: the transaction seen running on its backend, then its status. Only a
+// ticket that is its backend's sole unresolved write owns that transaction.
+// =============================================================================
+
+namespace {
+
+// Holds a lock on the whole table in an open transaction until destroyed: a
+// write waits for it before any change, so before it has a transaction id.
+struct TableLock {
+    io::test::PgProbe locker{probeConnInfo()};
+    explicit TableLock(const std::string& table) {
+        locker.query("BEGIN");
+        locker.query("LOCK TABLE " + table + " IN SHARE MODE");
+    }
+    ~TableLock() {
+        try { locker.query("ROLLBACK"); } catch (...) {}
+    }
+};
+
+// Settles `t` once resumed; returns the outcome its replays received.
+std::optional<io::WriteOutcome> settleSeen(CohEnv& env,
+                                           const std::shared_ptr<io::SettleTicket>& t) {
+    auto seen = std::make_shared<std::optional<io::WriteOutcome>>();
+    t->replays.push_back([seen](io::WriteOutcome o) -> io::Task<void> {
+        *seen = o;
+        co_return;
+    });
+    queueOf(env).resume();
+    REQUIRE(pumpUntil(env, [&] { return settledAll(env); }, 7s));
+    REQUIRE(t->state == io::SettleTicket::State::Settled);
+    return *seen;
+}
+
+}  // namespace
+
+TEST_CASE("settle outcome: a write terminated while it waits for a row lock was aborted",
+          "[coherence][settle][outcome][integration]") {
+    CohEnv env(300ms);
+    resetItems(env);
+    auto id = env.seedItem("outcome", 1);
+    std::optional<RowLock> lock;
+    lock.emplace("relais_test_items", "id=" + std::to_string(id));
+    auto t = blockedUpdate(env, id, 2);
+
+    // The write took a transaction id before waiting for the row: it is known.
+    CHECK(settleSeen(env, t) == io::WriteOutcome::Aborted);
+    CHECK(t->outcome == io::WriteOutcome::Aborted);
+    CHECK(queueOf(env).settledAs(io::WriteOutcome::Aborted) == 1);
+    CHECK_FALSE(backendAlive(env, t->backend));
+    lock.reset();
+    CHECK(probeValue(env, id) == "1");
+}
+
+TEST_CASE("settle outcome: under Await, a write that commits once unblocked was committed",
+          "[coherence][settle][outcome][integration]") {
+    CohEnv env(300ms, io::UncertainSettle::Await);
+    resetItems(env);
+    auto id = env.seedItem("outcome", 1);
+    std::optional<RowLock> lock;
+    lock.emplace("relais_test_items", "id=" + std::to_string(id));
+    auto t = blockedUpdate(env, id, 2);
+
+    queueOf(env).resume();
+    pumpUntil(env, [] { return false; }, 400ms);
+    REQUIRE(queueOf(env).pending() == 1);
+    queueOf(env).pause();
+    lock.reset();
+
+    CHECK(settleSeen(env, t) == io::WriteOutcome::Committed);
+    CHECK(queueOf(env).settledAs(io::WriteOutcome::Committed) == 1);
+    CHECK(probeValue(env, id) == "2");
+}
+
+TEST_CASE("settle outcome: a write terminated while it waits for a table lock is unknown",
+          "[coherence][settle][outcome][integration]") {
+    CohEnv env(300ms);
+    resetItems(env);
+    auto id = env.seedItem("outcome", 1);
+    std::optional<TableLock> lock;
+    lock.emplace("relais_test_items");
+    auto t = blockedUpdate(env, id, 2);
+
+    // No change made yet, no transaction id: the write may have taken one and
+    // committed between the read and the termination.
+    CHECK(settleSeen(env, t) == io::WriteOutcome::Unknown);
+    CHECK(queueOf(env).settledAs(io::WriteOutcome::Unknown) == 1);
+    CHECK_FALSE(backendAlive(env, t->backend));
+    lock.reset();
+    CHECK(probeValue(env, id) == "1");
+}
+
+TEST_CASE("settle outcome: a write behind another unresolved one is unknown",
+          "[coherence][settle][outcome][integration]") {
+    CohEnv env(300ms);
+    resetItems(env);
+    auto id = env.seedItem("outcome", 1);
+    std::optional<RowLock> lock;
+    lock.emplace("relais_test_items", "id=" + std::to_string(id));
+    auto t = blockedUpdate(env, id, 2);
+    // As in a pipeline whose last two writes were never read: the transaction
+    // seen running may be either one, and the first may have committed.
+    t->unresolved = 2;
+
+    CHECK(settleSeen(env, t) == io::WriteOutcome::Unknown);
+    CHECK_FALSE(backendAlive(env, t->backend));
+    lock.reset();
+    CHECK(probeValue(env, id) == "1");
 }
 
 // =============================================================================
@@ -2464,7 +2587,7 @@ void settleByHand(CohEnv& env, const std::shared_ptr<io::SettleTicket>& t) {
     t->state = io::SettleTicket::State::Settled;
     auto replays = std::move(t->replays);
     t->replays.clear();
-    for (auto& r : replays) driveBounded(env.io, r());
+    for (auto& r : replays) driveBounded(env.io, r(t->outcome));
 }
 
 }  // namespace
