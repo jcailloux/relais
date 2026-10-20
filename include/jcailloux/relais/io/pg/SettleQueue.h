@@ -2,6 +2,7 @@
 #define JCX_RELAIS_IO_PG_SETTLE_QUEUE_H
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <coroutine>
 #include <cstdint>
@@ -9,6 +10,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -29,8 +31,13 @@ namespace jcailloux::relais::io {
 // A write abandoned on a timeout or a lost connection may still commit
 // server-side. For each ticket, the queue waits until it no longer can — its
 // backend terminated (Terminate) or gone (Await), or its delay elapsed (Delay) —
-// then marks the ticket settled and runs its replays. Settling never decides
-// whether the write committed.
+// then marks the ticket settled and runs its replays.
+//
+// On the way, it reads what became of the write when the server can tell: the
+// transaction its backend was running, then whether that transaction committed
+// or aborted. Only when the ticket is the backend's sole unresolved write is
+// that transaction known to be the write's; otherwise, or when the backend was
+// never seen running one, the outcome stays Unknown.
 //
 // Off the hot path: the queue works only while a ticket waits. It talks to
 // PostgreSQL over a connection of its own, outside the pool: the pool may be
@@ -107,6 +114,10 @@ public:
     [[nodiscard]] uint64_t abandoned() const noexcept { return abandoned_; }
     /// Statements sent to settle a backend (terminate, or presence check).
     [[nodiscard]] uint64_t statements() const noexcept { return statements_; }
+    /// Tickets settled with this outcome.
+    [[nodiscard]] uint64_t settledAs(WriteOutcome o) const noexcept {
+        return outcomes_[static_cast<size_t>(o)];
+    }
 
 #ifdef RELAIS_BUILDING_TESTS
     /// Makes the next `count` attempts fail. Unreachable: PostgreSQL cannot be
@@ -134,13 +145,26 @@ private:
     static constexpr std::chrono::milliseconds kTerminateWait{5000};
 
     // pid alone may name a later backend: backend_start pins the one that ran
-    // the write. No row = that backend is gone.
+    // the write. No row = that backend is gone. Both also read the transaction
+    // the backend runs (NULL before its first change), as read before the
+    // termination. backend_xid is 32 bits; pg_xact_status takes an xid8: the
+    // widened xid is the one nearest the current snapshot's xmax, which a
+    // running transaction may be just above or below.
     static constexpr const char* kTerminateSql =
-        "SELECT pg_terminate_backend(pid, 5000) FROM pg_stat_activity "
-        "WHERE pid = $1 AND backend_start = $2::timestamptz";
+        "SELECT pg_terminate_backend(a.pid, 5000), "
+        "v.e - ((((v.e - v.x) & 4294967295) # 2147483648) - 2147483648) "
+        "FROM pg_stat_activity a, LATERAL (SELECT "
+        "pg_snapshot_xmax(pg_current_snapshot())::text::bigint AS e, "
+        "a.backend_xid::text::bigint AS x) v "
+        "WHERE a.pid = $1 AND a.backend_start = $2::timestamptz";
     static constexpr const char* kPresentSql =
-        "SELECT 1 FROM pg_stat_activity "
-        "WHERE pid = $1 AND backend_start = $2::timestamptz";
+        "SELECT v.e - ((((v.e - v.x) & 4294967295) # 2147483648) - 2147483648) "
+        "FROM pg_stat_activity a, LATERAL (SELECT "
+        "pg_snapshot_xmax(pg_current_snapshot())::text::bigint AS e, "
+        "a.backend_xid::text::bigint AS x) v "
+        "WHERE a.pid = $1 AND a.backend_start = $2::timestamptz";
+    static constexpr const char* kXactStatusSql =
+        "SELECT pg_xact_status($1::bigint::text::xid8)";
     static constexpr const char* kStatementTimeoutSql =
         "SELECT setting::bigint FROM pg_settings WHERE name = 'statement_timeout'";
 
@@ -151,9 +175,10 @@ private:
         Clock::time_point next{};         // next attempt, or the end of the delay
         Clock::duration retry = kRetryFirst;
         std::vector<std::shared_ptr<SettleTicket>> tickets;
+        std::optional<int64_t> xid;       // a transaction seen running on the backend
     };
 
-    enum class Outcome : uint8_t { Settled, Retry, Refused };
+    enum class Step : uint8_t { Settled, Retry, Refused };
 
     // Owned, eager: the queue destroys the frame, suspended or finished.
     struct Worker {
@@ -236,15 +261,15 @@ private:
             current_ = std::move(*due);
             jobs_.erase(due);
 
-            auto outcome = co_await attempt(*current_, conn);
-            if (outcome == Outcome::Refused)
-                outcome = co_await fallBack(*current_, conn);
+            auto step = co_await attempt(*current_, conn);
+            if (step == Step::Refused)
+                step = co_await fallBack(*current_, conn);
 
-            if (outcome == Outcome::Settled) {
-                co_await settle();
+            if (step == Step::Settled) {
+                co_await settle(conn);
                 continue;
             }
-            if (outcome == Outcome::Retry) {
+            if (step == Step::Retry) {
                 current_->next = Clock::now() + current_->retry;
                 current_->retry = std::min(current_->retry * 2, kRetryMax);
             }
@@ -256,8 +281,8 @@ private:
 
     // One step on the job's backend. A connection failure, or a statement that
     // may not have run, is retried; a server refusal is reported.
-    Task<Outcome> attempt(Job& job, std::optional<PgConnection<Io>>& conn) {
-        if (job.mode == UncertainSettle::Delay) co_return Outcome::Settled;
+    Task<Step> attempt(Job& job, std::optional<PgConnection<Io>>& conn) {
+        if (job.mode == UncertainSettle::Delay) co_return Step::Settled;
         try {
             co_await connect(conn);
 #ifdef RELAIS_BUILDING_TESTS
@@ -270,44 +295,45 @@ private:
             ++statements_;
             PgResult r = co_await conn->queryParams(terminate ? kTerminateSql : kPresentSql,
                 PgParams::make(job.backend.pid, job.backend.backend_start));
-            if (r.rows() == 0) co_return Outcome::Settled;            // gone
-            if (terminate && r[0].get<bool>(0)) co_return Outcome::Settled;
-            co_return Outcome::Retry;  // still there (Await), or not out after the wait
+            if (r.rows() == 0) co_return Step::Settled;            // gone
+            if (auto xid = r[0].getOpt<int64_t>(terminate ? 1 : 0)) job.xid = xid;
+            if (terminate && r[0].get<bool>(0)) co_return Step::Settled;
+            co_return Step::Retry;  // still there (Await), or not out after the wait
         } catch (const PgUncertainError& e) {
             RELAIS_LOG_DEBUG << "relais: settling postponed: " << e.what();
         } catch (const PgError& e) {
             // Still connected: the server answered, and refused.
             if (conn && conn->connected()) {
                 RELAIS_LOG_DEBUG << "relais: settling refused: " << e.what();
-                co_return Outcome::Refused;
+                co_return Step::Refused;
             }
             RELAIS_LOG_DEBUG << "relais: settling postponed: " << e.what();
         } catch (const std::exception& e) {
             RELAIS_LOG_DEBUG << "relais: settling postponed: " << e.what();
         }
         conn.reset();
-        co_return Outcome::Retry;
+        co_return Step::Retry;
     }
 
     // The server refuses to settle the backend: the write is still bounded by
     // the statement_timeout of the role, if any. The job then waits that long.
-    Task<Outcome> fallBack(Job& job, std::optional<PgConnection<Io>>& conn) {
+    Task<Step> fallBack(Job& job, std::optional<PgConnection<Io>>& conn) {
         int64_t ms = 0;
         try {
             PgResult r = co_await conn->query(kStatementTimeoutSql);
             if (r.rows() == 1) ms = r[0].get<int64_t>(0);
         } catch (const PgUncertainError&) {
             conn.reset();
-            co_return Outcome::Retry;
+            co_return Step::Retry;
         } catch (const PgError&) {
             // Refused as well: nothing bounds the write that relais can read.
             if (!conn->connected()) {
                 conn.reset();
-                co_return Outcome::Retry;
+                co_return Step::Retry;
             }
         } catch (const std::exception&) {
             conn.reset();
-            co_return Outcome::Retry;
+            co_return Step::Retry;
         }
         if (!refusal_logged_) {
             refusal_logged_ = true;
@@ -319,39 +345,64 @@ private:
         if (ms > 0) {
             job.mode = UncertainSettle::Delay;
             job.next = Clock::now() + std::chrono::milliseconds{ms} + kSettleMargin;
-            co_return Outcome::Refused;  // requeued as is, until its delay ends
+            co_return Step::Refused;  // requeued as is, until its delay ends
         }
         abandoned_ += job.tickets.size();
         for (auto& t : job.tickets) t->replays.clear();
         job.tickets.clear();
-        co_return Outcome::Refused;
+        co_return Step::Refused;
     }
 
-    // In one synchronous step, every ticket of the job becomes Settled and gives
-    // up its replays; a replay registered from now on runs at once. Then the
-    // replays start in registration order, together: one that reads the
-    // database does not hold back the evictions registered after it. A failure
-    // is logged without stopping the others.
-    Task<void> settle() {
-        std::vector<std::function<Task<void>()>> replays;
+    // The backend is gone, or its delay elapsed. With one ticket, itself the
+    // backend's sole unresolved write, the transaction seen running was the
+    // write's: the server tells whether it committed. Anything else is Unknown.
+    Task<WriteOutcome> readOutcome(const Job& job, std::optional<PgConnection<Io>>& conn) {
+        if (job.mode == UncertainSettle::Delay || !job.xid || job.tickets.size() != 1
+            || job.tickets.front()->unresolved != 1 || !conn || !conn->connected())
+            co_return WriteOutcome::Unknown;
+        try {
+            PgResult r = co_await conn->queryParams(kXactStatusSql, PgParams::make(*job.xid));
+            const auto status = r.rows() == 1 ? r[0].getOpt<std::string>(0) : std::nullopt;
+            if (status == "aborted") co_return WriteOutcome::Aborted;
+            if (status == "committed") co_return WriteOutcome::Committed;
+        } catch (const std::exception& e) {
+            RELAIS_LOG_DEBUG << "relais: the outcome of an uncertain write is unknown: "
+                             << e.what();
+            if (!conn->connected()) conn.reset();
+        }
+        co_return WriteOutcome::Unknown;
+    }
+
+    // In one synchronous step, every ticket of the job takes the outcome,
+    // becomes Settled and gives up its replays; a replay registered from now on
+    // runs at once. Then the replays start in registration order, together: one
+    // that reads the database does not hold back the evictions registered after
+    // it. A failure is logged without stopping the others.
+    Task<void> settle(std::optional<PgConnection<Io>>& conn) {
+        auto outcome = co_await readOutcome(*current_, conn);
+        // A ticket joined while the status was read: the transaction may be its.
+        if (current_->tickets.size() != 1) outcome = WriteOutcome::Unknown;
+        std::vector<std::function<Task<void>(WriteOutcome)>> replays;
         for (auto& t : current_->tickets) {
             if (t->state == SettleTicket::State::Settled) continue;
+            t->outcome = outcome;
             t->state = SettleTicket::State::Settled;
             ++settled_;
+            ++outcomes_[static_cast<size_t>(outcome)];
             for (auto& r : t->replays) replays.push_back(std::move(r));
             t->replays.clear();
         }
         current_.reset();
         std::vector<Task<void>> runs;
         runs.reserve(replays.size());
-        for (auto& replay : replays) runs.push_back(runReplay(std::move(replay)));
+        for (auto& replay : replays) runs.push_back(runReplay(std::move(replay), outcome));
         replaying_ += runs.size();
         co_await whenAll(std::span<Task<void>>(runs));
     }
 
-    Task<void> runReplay(std::function<Task<void>()> replay) {
+    Task<void> runReplay(std::function<Task<void>(WriteOutcome)> replay, WriteOutcome outcome) {
         try {
-            co_await replay();
+            co_await replay(outcome);
         } catch (const std::exception& e) {
             RELAIS_LOG_WARN << "relais: a replayed eviction failed: " << e.what();
         } catch (...) {
@@ -395,6 +446,7 @@ private:
     size_t replaying_ = 0;
     uint64_t abandoned_ = 0;
     uint64_t statements_ = 0;
+    std::array<uint64_t, 3> outcomes_{};
 #ifdef RELAIS_BUILDING_TESTS
     bool paused_ = false;
 #endif

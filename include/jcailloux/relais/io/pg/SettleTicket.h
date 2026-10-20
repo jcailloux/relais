@@ -40,6 +40,11 @@ struct BackendId {
     [[nodiscard]] bool known() const noexcept { return pid != 0; }
 };
 
+// What settling learned of an uncertain write. Aborted and Committed are read
+// from the server; Unknown whenever it cannot tell which transaction was the
+// write's, or what became of it.
+enum class WriteOutcome : uint8_t { Unknown, Aborted, Committed };
+
 // Carried by a PgUncertainError raised on the write path: names what must end
 // before the write's outcome is final. Every caller that received the same
 // failure shares one ticket.
@@ -50,14 +55,16 @@ struct SettleTicket {
     BackendId backend;                  // Terminate / Await
     std::chrono::milliseconds delay{0}; // Delay
     State state = State::Pending;
+    WriteOutcome outcome = WriteOutcome::Unknown;  // set before state becomes Settled
     // Writes of the failure whose end was never read, in one pipeline. With
     // more than one, the transaction the backend runs may be any of them, and
     // those ahead of it may have committed.
     uint32_t unresolved = 1;
     // Started once settled, in registration order: the precautionary
     // evictions, again, and the work that waited for the outcome (reading the
-    // row as committed). A failing replay does not stop the others.
-    std::vector<std::function<Task<void>()>> replays;
+    // row as committed). Each receives the outcome. A failing replay does not
+    // stop the others.
+    std::vector<std::function<Task<void>(WriteOutcome)>> replays;
 };
 
 } // namespace jcailloux::relais::io

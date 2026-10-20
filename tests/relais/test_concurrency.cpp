@@ -1343,7 +1343,7 @@ TEST_CASE("Concurrency - entity notes vs concurrent reads, fills, seals and drai
                 TestInternals::noteRowsChanged<L1TestItemRepo>(ticket, touched);
                 ticket->state = rio::SettleTicket::State::Settled;
                 auto replays = std::move(ticket->replays);
-                for (auto& r : replays) sync(r());
+                for (auto& r : replays) sync(r(ticket->outcome));
             } else if (t == 1) {
                 L1TestItemRepo::evict(id);  // the next read fills
             } else {
