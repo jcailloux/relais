@@ -156,9 +156,9 @@ to `0` disables it (discouraged — it reopens the hang).
 A wait that trips its timer throws, and the connection it owns is **poisoned and
 rebuilt**: the next `acquire()` reconnects transparently. The server does not see
 the client leave until it next reads the socket, so relais sets each session's
-`client_connection_check_interval` to `PgPoolConfig::client_check_interval`
-(default 1 s): the server then aborts the abandoned statement within that interval
-instead of running it to the end. `0` sends nothing.
+`client_connection_check_interval` to `client_check_interval` (`PgPoolConfig`,
+`IoPoolConfig`; default 1 s): the server then aborts the abandoned statement
+within that interval instead of running it to the end. `0` sends nothing.
 
 ### Failures and the cache
 

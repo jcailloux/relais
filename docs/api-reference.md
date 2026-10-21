@@ -836,6 +836,7 @@ static std::unique_ptr<IoPool> create(const IoPoolConfig& config);   // io/IoPoo
 | `startup_timeout` | `std::chrono::milliseconds` | `30000` | Bounds `create()`'s wait for all workers to report ready — a worker that hangs at boot (e.g. an unreachable dependency) makes `create()` throw `io::IoPoolStartupError` rather than block forever. |
 | `uncertain_settle` | `io::UncertainSettle` | `Terminate` | How an uncertain write is settled, as `PgPoolConfig::uncertain_settle`. |
 | `settle_delay` | `std::chrono::milliseconds` | `0` | As `PgPoolConfig::settle_delay`. |
+| `client_check_interval` | `std::chrono::milliseconds` | `1000` | As `PgPoolConfig::client_check_interval`. |
 
 `PgPoolConfig` (`io/pg/PgPool.h`) — the per-loop pool, passed to `PgPool<Io>::create(io, conninfo, cfg)`:
 
