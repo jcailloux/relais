@@ -600,30 +600,20 @@ TEST_CASE("liveness: ordered teardown drains an in-flight detached fire, no leak
         REQUIRE(r.ok());
     }
 
-    // Force both connections to exist, learn their fds, then withhold their reads:
-    // now the leader and the detached follower fire each take a held connection and
-    // hang on the result, bounded by query_timeout.
-    int fd1 = -1, fd2 = -1;
-    {
-        auto g1 = driveBounded(io, pool->acquire());
-        auto g2 = driveBounded(io, pool->acquire());
-        fd1 = g1.conn().socket();
-        fd2 = g2.conn().socket();
-    }
-    io.holdReads(fd1);
-    io.holdReads(fd2);
-
-    // Two concurrent reads: the leader goes direct on one held connection; the
-    // follower accumulates and, when its departure timer fires, runs as a DETACHED
-    // fire on the other held connection. Drive it without awaiting the result so
-    // the in-flight fire is observable mid-teardown.
+    // Two concurrent reads: the leader goes direct on one connection; the follower
+    // accumulates and, when its departure timer fires, runs as a DETACHED fire on
+    // the other. Both statements outlast query_timeout on the server, so each read
+    // hangs until its bound: withholding read-readiness would not do, since a
+    // pipelined batch reads its socket before waiting on it and, on a slow client
+    // (sanitizers), finds the answer already there. Drive it without awaiting the
+    // result so the in-flight fire is observable mid-teardown.
     bool done = false;
     std::exception_ptr ex;
     auto runner = [&]() -> Task<void> {
         try {
             co_await whenAll(
-                batcher->submitQueryRead("SELECT 1", PgParams{}),
-                batcher->submitQueryRead("SELECT 2", PgParams{}));
+                batcher->submitQueryRead("SELECT 1 FROM pg_sleep(2)", PgParams{}),
+                batcher->submitQueryRead("SELECT 2 FROM pg_sleep(2)", PgParams{}));
         } catch (...) { ex = std::current_exception(); }
         done = true;
     };
@@ -631,7 +621,7 @@ TEST_CASE("liveness: ordered teardown drains an in-flight detached fire, no leak
     auto s = starter(runner());
 
     // The departure timer fires the follower as a detached fire; it suspends on the
-    // withheld read, well before the 400ms query bound.
+    // pending answer, well before the 400ms query bound.
     pump(io, 100ms);
     REQUIRE(batcher->inflightDetached() >= 1);
     REQUIRE_FALSE(batcher->quiescentForTeardown());
@@ -648,8 +638,6 @@ TEST_CASE("liveness: ordered teardown drains an in-flight detached fire, no leak
     REQUIRE(batcher->inflightDetached() == 0);
     REQUIRE(done);  // both waiters saw PgQueryTimeout; the driver frame completed
 
-    io.releaseReads(fd1);
-    io.releaseReads(fd2);
     if (s.handle) s.handle.destroy();
     pump(io);  // a leaked fire frame / stray timer would surface here under ASan
 }
