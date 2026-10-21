@@ -17,9 +17,9 @@
   (`PgPoolConfig`, `IoPoolConfig`) chooses how: `Terminate` (default), `Await`,
   `Delay` with `settle_delay`, or `Off`. See `docs/runtime.md › Settling an
   uncertain write`.
-- **`PgPoolConfig::client_check_interval`** (default 1 s) is sent as the
-  session's `client_connection_check_interval`: the server aborts a statement
-  whose client relais abandoned on a timeout. `0` sends nothing.
+- **`client_check_interval`** (`PgPoolConfig`, `IoPoolConfig`; default 1 s) is
+  sent as the session's `client_connection_check_interval`: the server aborts a
+  statement whose client relais abandoned on a timeout. `0` sends nothing.
 
 ### Changed (Breaking)
 
