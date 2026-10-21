@@ -248,7 +248,11 @@ init-per-loop-thread contract shown above.)
 > `query_timeout` — a foreign adapter gets the liveness backstop **only if you
 > pass them**, exactly as `IoPool` does for its own loops. They are armed via your
 > `postDelayed`/`cancelTimer`, so a correct timer subsystem (conformance
-> C8/C9/C11) is the prerequisite. See
+> C8/C9/C11) is the prerequisite. Its `uncertain_settle`, `settle_delay` and
+> `client_check_interval` default to a direct connection; behind a transaction
+> pooler, set them as
+> [runtime.md › Settling an uncertain write](runtime.md#settling-an-uncertain-write)
+> says. See
 > [runtime.md › Liveness & failure semantics](runtime.md#liveness--failure-semantics).
 
 Expose `isInLoopThread()` on your adapter and `PgProvider::init` will assert it
