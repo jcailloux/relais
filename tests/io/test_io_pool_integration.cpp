@@ -86,3 +86,34 @@ TEST_CASE("IoPool: each worker binds its own provider and routes PG locally",
 
     pool->stop();
 }
+
+// Each worker's sessions run with the configured client_check_interval.
+TEST_CASE("IoPool: client_check_interval reaches every worker's sessions",
+          "[io][iopool][integration]") {
+    IoPoolConfig cfg;
+    cfg.num_workers = 1;
+    cfg.pg_conninfo = connInfo();
+    cfg.pin_to_cores = false;
+    cfg.pg_min_conns_per_worker = 1;
+    cfg.pg_max_conns_per_worker = 1;
+    cfg.client_check_interval = std::chrono::milliseconds{2500};
+
+    auto pool = IoPool::create(cfg);
+
+    std::promise<std::string> p;
+    auto fut = p.get_future();
+    pool->workerIo(0).post([&p] {
+        [](std::promise<std::string>& pr) -> DetachedTask {
+            std::string value;
+            try {
+                auto r = co_await PgProvider::query("SHOW client_connection_check_interval");
+                if (r.rows() == 1) value = r[0].get<std::string>(0);
+            } catch (...) {}
+            pr.set_value(value);
+        }(p);
+    });
+    REQUIRE(fut.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
+    REQUIRE(fut.get() == "2500ms");
+
+    pool->stop();
+}

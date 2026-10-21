@@ -64,6 +64,8 @@ struct IoPoolConfig {
     // How an uncertain write is settled; see PgPoolConfig.
     UncertainSettle uncertain_settle = UncertainSettle::Terminate;
     std::chrono::milliseconds settle_delay{0};
+    // Sent as each session's client_connection_check_interval; see PgPoolConfig.
+    std::chrono::milliseconds client_check_interval{1000};
 
     // Core pinning
     bool pin_to_cores = true;
@@ -204,7 +206,8 @@ public:
                              .acquire_timeout = config.acquire_timeout,
                              .query_timeout = config.query_timeout,
                              .uncertain_settle = config.uncertain_settle,
-                             .settle_delay = config.settle_delay});
+                             .settle_delay = config.settle_delay,
+                             .client_check_interval = config.client_check_interval});
 
                         // Batch scheduler — owned per worker (shared so the
                         // thread_local providers can co-own it).
