@@ -14,7 +14,7 @@ This document describes the internal architecture of relais for contributors and
 1. [Repository Mixin Chain](#repository-mixin-chain) — method-hiding tower, `CacheLayerSelector`/`MixinStack`, conditional layer selection
 2. [Configuration System — CacheConfig NTTP](#configuration-system--cacheconfig-nttp) — compile-time config plumbing
 3. [L1 Cache: CacheTier](#l1-cache-cachetier) — RAM tier over ChunkMap: by-value storage, singleton, TTL, cleanup
-4. [Cache Flow on Operations](#cache-flow-on-operations) — read/delete/write paths
+4. [Cache Flow on Operations](#cache-flow-on-operations) — read/delete/write paths, uncertain writes
 5. [ListMixin — Automatic List Caching](#listmixin--automatic-list-caching) — detection, descriptor augmentation, interception
 6. [InvalidationMixin — Cross-Repository Invalidation](#invalidationmixin--cross-repository-invalidation) — the four mechanisms, propagation
 7. [List Cache Architecture](#list-cache-architecture) — `ListCache`, sort bounds
@@ -327,7 +327,7 @@ PgRepo::eraseOutcome(id, hint)
     |     SQL::delete_by_pk                   // PK only -> scans N partitions
     |
     (back in LocalRepo: evict L1 after the commit;
-     on PgUncertainError: evict L1 by precaution, then rethrow)
+     on PgUncertainError: evict L1 now and once settled, then rethrow)
 ```
 
 So the order is **DB delete → L1 evict**. A reader racing the delete can at worst
@@ -381,6 +381,51 @@ The create/update discriminant is `old.has_value()` from the pre-image — the s
 machinery `update` uses. `onMutation` + `bumpGeneration` on the L1 store (both
 absent from `insert`) let a pre-existing L1 slot be superseded without a concurrent
 read-fill reinstating the old value.
+
+### Uncertain writes: precaution and settling
+
+A write that fails with `io::PgUncertainError` may still commit after the failure.
+Each layer handles it twice: a **precaution** at once, and the same work again once
+the write is **settled**, i.e. can no longer commit
+([runtime.md › Settling](runtime.md#settling-an-uncertain-write) gives the contract).
+
+```
+BatchScheduler, write handler
+    |-- PgUncertainError: attach the connection's SettleTicket, enqueue it
+    v       (one ticket per failure, shared by every caller it fails)
+each layer, in its catch
+    |-- precaution(ticket, evict)   // registers evict as a replay, then runs it
+    |-- onSettled(ticket, work)     // registers work that needs the committed row
+    |-- rethrow
+SettleQueue, one per loop, off the request path
+    |-- Terminate: pg_terminate_backend | Await: backend gone | Delay: settle_delay
+    |-- outcome read when the server can tell it: Committed, Aborted or Unknown
+    |-- ticket Settled -> replays run in registration order, given the outcome
+```
+
+- **`SettleTicket`** (`io/pg/SettleTicket.h`) names the backend by pid **and**
+  `backend_start` (a pid is reused once its backend exits). The outcome is known
+  only when the ticket is its backend's sole unresolved write: a pipeline failure
+  leaves several, and the backend's transaction may be any of them.
+- **Replays** (`repository/Precaution.h`) are registered before the eviction runs
+  (the ticket may settle while it is suspended), own their captures (they outlive
+  the caller's frame), and are skipped on `Aborted`. On a ticket already settled,
+  the eviction runs once.
+- **`SettleQueue`** (`io/pg/SettleQueue.h`) uses a connection of its own, outside
+  the pool, closed once the queue is empty: the pool may be exhausted by
+  connections blocked on the very lock the uncertain write holds. Tickets naming
+  one backend are settled by one statement.
+
+What each layer evicts, now and once settled:
+
+| Layer | Precaution | Once settled |
+|---|---|---|
+| `LocalRepo` | evict the key; a write by predicate (`eraseWhere`, `patchWhere`, `claim`) leaves a `RowNotes` note instead, evicting any copy its predicate may match when read | the same; a settled note spares copies stored after the seal and is drained by a chunk pass |
+| `ListMixin` | the row leaves every page holding it (`RowLeft` lane); a whole-row input enters as an estimate | the row is read again and enters the pages of its committed position (every page if unreadable) |
+| `InvalidationMixin` | targets of the L1 copy and of the input | targets of the row read again (every target if unreadable) |
+
+The healthy path pays one atomic load per hit: an L1 hit checks that no note exists,
+a list hit that the `RowLeft` lane is empty.
 
 ## ListMixin — Automatic List Caching
 
@@ -470,9 +515,8 @@ an `UPDATE` that locks the row in a CTE and returns it before and after;
 notification and, one layer up, `propagateUpdate`/`propagateDelete`. On an
 uncertain write nothing comes back; `LocalRepo` copies its L1 entry (still the
 targeted version: L1 changes only after a commit) into a slot the upper layers pass
-down, just before its precautionary evict. An uncertain `update` keys the old
-position on that copy and the new one on its input; an uncertain `patch` knows only
-the old position and invalidates it as for a deletion. `upsert` keeps a
+down, just before its precautionary evict, and the row's pages are realigned as
+[Uncertain writes](#uncertain-writes-precaution-and-settling) describes. `upsert` keeps a
 best-effort pre-read (`findOldBestEffort`): an absent row cannot be locked, so the
 statement cannot tell create from update. `onEntityUpdated` then has the
 `ModificationTracker` record the change at the current generation; list pages are validated lazily on
@@ -763,7 +807,10 @@ class ModificationTracker {
 modification starts with every chunk bit set (`initial_bitmap_`). The **`TrackedRange`**
 track lets one entry stand in for an unbounded `eraseWhere` delete set
 (`notifyRangeDeleted(predicate, gen)`) instead of N per-row modifications — it
-shares the generation counter and the drain lifecycle.
+shares the generation counter and the drain lifecycle. A third lane, **`RowLeft`**,
+records rows an uncertain write moved to an unknown position: an entry touches
+exactly the pages holding one of its rows. It is counted, so readers skip it without
+the lock while it is empty.
 
 ### Chunk-bitmap drain
 
@@ -998,7 +1045,7 @@ The public `patch` goes down through **`patchRow`** (`LocalRepo`) to **`patchRaw
 LocalRepo::patchRow(id, set<F>(v)...)
     |-- patched = co_await Base::patchRaw(id, updates...)  // L1 untouched until the commit
     |-- settlePatched(id, *patched)          // store the committed RETURNING row in L1
-    |-- on PgUncertainError: evict L1, rethrow
+    |-- on PgUncertainError: evict L1 now and once settled, rethrow
     v
 PgRepo::patchRaw(id, updates...)
     |-- sql = buildUpdateReturning(table, pk, {set-cols...}, SQL::returning_columns)
