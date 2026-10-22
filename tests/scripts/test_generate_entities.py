@@ -133,6 +133,137 @@ class MemberParsing(GeneratorCase):
         self.assertEqual(m.tags, {"primary_key"})
 
 
+class CodeStripping(unittest.TestCase):
+    """_strip_code: the code of a line, without comments and literal contents."""
+
+    def strip(self, line: str, state: str = "") -> tuple[str, str]:
+        return gen.StructParser._strip_code(line, state)
+
+    def test_comments(self):
+        self.assertEqual(self.strip("int a = 0;  // }"), ("int a = 0;  ", ""))
+        self.assertEqual(self.strip("int a; /* { */ int b;"), ("int a;   int b;", ""))
+        self.assertEqual(self.strip("// @relais primary_key"), ("", ""))
+
+    def test_block_comment_across_lines(self):
+        self.assertEqual(self.strip("int a; /* opens {"), ("int a;  ", "*/"))
+        self.assertEqual(self.strip("   } still inside", "*/"), ("", "*/"))
+        self.assertEqual(self.strip("   ends */ int b;", "*/"), (" int b;", ""))
+
+    def test_string_and_char_literals(self):
+        self.assertEqual(self.strip('std::string s = "a{b\\"}";'), ('std::string s = "";', ""))
+        self.assertEqual(self.strip("char c = '}';"), ("char c = '';", ""))
+        self.assertEqual(self.strip("char c = '\\'';"), ("char c = '';", ""))
+        self.assertEqual(self.strip('auto s = u8"{";'), ('auto s = u8"";', ""))
+        self.assertEqual(self.strip('auto s = "// not a comment";'), ('auto s = "";', ""))
+
+    def test_digit_separators_are_not_char_literals(self):
+        line = "std::array<int64_t, 2> a = {1'000'000, 0xF'FF'F};"
+        self.assertEqual(self.strip(line), (line, ""))
+
+    def test_raw_strings(self):
+        self.assertEqual(self.strip('auto r = R"x(a } )" b)x";'), ('auto r = R"";', ""))
+        self.assertEqual(self.strip('auto r = R"(opens {'), ('auto r = R""', ')"'))
+        self.assertEqual(self.strip('  } )" ;', ')"'), (" ;", ""))
+
+
+class BraceCounting(GeneratorCase):
+    """Braces in comments and literals do not delimit the struct body."""
+
+    def names(self, body: str) -> list:
+        return [(e.class_name, [m.name for m in e.members]) for e in self.parse(body)]
+
+    def test_closing_brace_in_a_comment(self):
+        self.assertEqual(self.names("""
+            // @relais table=t
+            struct T {
+                int64_t id = 0;     // @relais primary_key
+                std::string title;  // shown as "{title}"
+                std::string body;   // ends with }
+                int32_t views = 0;
+            };
+        """), [("T", ["id", "title", "body", "views"])])
+
+    def test_opening_brace_in_a_comment(self):
+        self.assertEqual(self.names("""
+            // @relais table=t
+            struct T {
+                int64_t id = 0;     // @relais primary_key
+                std::string label;  // format { key: value
+                int32_t views = 0;
+            };
+
+            struct Internal {
+                std::string secret;
+            };
+        """), [("T", ["id", "label", "views"])])
+
+    def test_block_comment_spanning_lines(self):
+        self.assertEqual(self.names("""
+            // @relais table=t
+            struct T {
+                int64_t id = 0;  // @relais primary_key
+                /* legacy layout: {
+                       name, }} */
+                std::string name;
+                int32_t views = 0;
+            };
+        """), [("T", ["id", "name", "views"])])
+
+    def test_braces_in_literals(self):
+        self.assertEqual(self.names("""
+            // @relais table=t
+            struct T {
+                int64_t id = 0;  // @relais primary_key
+                std::string open = "{";
+                char close = '}';
+                static constexpr const char* kQuoted = R"(say "}")";
+                int32_t views = 0;
+            };
+        """), [("T", ["id", "open", "close", "views"])])
+
+    def test_a_struct_right_after_the_entity_is_not_absorbed(self):
+        self.assertEqual(self.names("""
+            // @relais table=a
+            struct A {
+                int64_t id = 0;  // @relais primary_key
+            };
+            struct Helper {
+                int32_t leaked = 0;
+            };
+        """), [("A", ["id"])])
+
+    def test_struct_and_namespace_closed_on_one_line(self):
+        self.assertEqual(self.names("""
+            namespace ns {
+            // @relais table=a
+            struct A {
+                int64_t id = 0;  // @relais primary_key
+            }; }
+
+                inline constexpr int32_t leaked = 0;
+        """), [("A", ["id"])])
+
+    def test_the_word_struct_in_a_comment_is_not_a_declaration(self):
+        self.assertEqual(self.names("""
+            // @relais table=t
+            // This struct maps the t table.
+            struct T {
+                int64_t id = 0;  // @relais primary_key
+            };
+        """), [("T", ["id"])])
+
+    def test_a_struct_never_closed_is_rejected(self):
+        self.header("Open.h", """
+            // @relais table=t
+            struct T {
+                int64_t id = 0;  // @relais primary_key
+        """)
+        r = self.run_generator()
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("never closed", r.stderr)
+        self.assertFalse(self.out.exists() and any(self.out.iterdir()))
+
+
 class EntityAnnotations(GeneratorCase):
 
     def test_table_and_namespace(self):
