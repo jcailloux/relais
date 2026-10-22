@@ -121,9 +121,8 @@ The generator also emits, **at global scope** (outside `entity::generated`):
 
 | Annotation | Effect |
 |---|---|
-| `@relais table=users` | PostgreSQL table name (required; otherwise derived from the class name with a warning). |
+| `@relais table=users` | PostgreSQL table name. Required: an entity without it is a generation error. |
 | `@relais read_only` | Marks the entity read-only — no `toInsertParams`, no `update`/`patch`. Still emits an (empty) `Field` enum (see [below](#the-traitstypefield-contract)). |
-| `@relais model=name` | Parsed but **ignored** for the table name — `table=` is authoritative. Suppresses the generic no-annotation warning, but the table-name-derivation warning still fires when `table=` is absent. |
 | `@relais_list limits=10,25,50` | Pagination limits for a list entity. Values are sorted and de-duplicated: smallest = `defaultLimit`, largest = `maxLimit`. |
 | `@relais_list entity=Fqn` | Override the fully-qualified entity name embedded in the generated list descriptor. |
 
@@ -135,7 +134,6 @@ The generator also emits, **at global scope** (outside `entity::generated`):
 | `db_managed` | Excluded from `INSERT` (DB-generated, e.g. serial id, default timestamp). |
 | `timestamp` | Stored as `std::string` (ISO 8601). |
 | `column=db_name` | Override the DB column name (defaults to the field name). |
-| `raw_json` | Stored verbatim as a string column — but **detected from the field's C++ type** (`glz::raw_json_t`, or any type whose spelling contains `raw_json`); the annotation itself is inert (tokenized but never consulted for codegen). |
 | `json_field` | Struct (or `vector<Struct>`) serialized to/from a JSON column. For arrays of *scalars*, use a native array column instead — see [Array columns](#array-columns). |
 | `enum` | Auto-resolve the DB↔enum mapping from `glz::meta<EnumType>` in the source header. |
 | `enum=db1:Variant1,db2:Variant2` | Explicit DB↔enum mapping (overrides `glz::meta`). |
@@ -147,6 +145,9 @@ The generator also emits, **at global scope** (outside `entity::generated`):
 > `std::optional<T>` — the generator sets `FieldInfo<F>::is_nullable` from the
 > type alone, and that flag is what gates `setNull<F>()` in
 > [`patch`](caching.md#partial-updates-with-patch).
+
+> **Raw JSON is not an annotation either.** A field typed `glz::raw_json` holds its
+> column's text verbatim: it is read and written without being parsed.
 
 ## Array columns
 

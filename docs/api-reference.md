@@ -1053,9 +1053,8 @@ Any other `T` is a compile error.
 
 | Annotation | Role (one line) | Details |
 |---|---|---|
-| `@relais table=name` | PostgreSQL table name (else derived from class name with a warning). | [entities.md](entities.md#struct-level) |
+| `@relais table=name` | PostgreSQL table name (required). | [entities.md](entities.md#struct-level) |
 | `@relais read_only` (or `read_only=true`) | Read-only entity: no insert/update/patch, empty `Field` enum. | [entities.md](entities.md#struct-level) |
-| `@relais model=name` | Parsed but ignored — `table=` is authoritative. | [entities.md](entities.md#struct-level) |
 | `@relais_list limits=10,25,50` | List pagination limits (first = default, last = max). | [entities.md](entities.md#struct-level) |
 | `@relais_list entity=Fqn` | Override the fully-qualified entity name for the list Descriptor. | [entities.md](entities.md#struct-level) |
 | `primary_key` | Marks a primary-key field (repeat for a composite key). | [entities.md](entities.md#field-level) |
@@ -1063,7 +1062,6 @@ Any other `T` is a compile error.
 | `db_managed` | Excluded from `INSERT` (DB-generated, e.g. serial id). | [entities.md](entities.md#field-level) |
 | `timestamp` | Stored as `std::string` (ISO 8601). | [entities.md](entities.md#field-level) |
 | `column=db_name` | Override the DB column name (defaults to field name). | [entities.md](entities.md#field-level) |
-| `raw_json` | `glz::raw_json_t` — stored verbatim as a string column. | [entities.md](entities.md#field-level) |
 | `json_field` | Struct (or `vector<Struct>`) serialized to/from a JSON column. | [entities.md](entities.md#field-level) |
 | `enum` | Auto-resolve the DB↔enum mapping from `glz::meta<EnumType>`. | [entities.md](entities.md#field-level) |
 | `enum=db1:V1,db2:V2` | Explicit DB↔enum mapping (overrides `glz::meta`). | [entities.md](entities.md#field-level) |
