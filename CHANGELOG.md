@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [4.0.0] - 2026-10-22
+
 ### Added
 
 - **Every number type is accepted** as a query argument, unsigned integers
@@ -37,8 +39,7 @@
   `ListMixin` and `InvalidationMixin`, `runtime::detail::CachedClock`, among
   others. `PgProvider::bindBatcher` and `entityQueryParams`,
   `PgResult::sliceRow`/`sliceRows`/`pipelineAborted`, `TypedCursor::raw` and
-  `Repo::ListTraits` are no longer documented. Generated entity headers must be
-  regenerated.
+  `Repo::ListTraits` are no longer documented.
 - **The `FILTER(filters, name)` macro is removed**: write
   `filters.get<"name">()`, or `filters.template get<"name">()` in a template.
 - **The repository API no longer depends on the preset.** Every method has the
@@ -59,10 +60,11 @@
   `total_count` key leaves the JSON and BEVE output: `query()` left it at `0`,
   `fromRows` set it to the page size. Use `size()` for the page and
   `countWhere` for a total.
-- **Generated entity headers must be regenerated**: the repositories use new
-  SQL constants (`update_returning`, `update_returning_changes`,
-  `delete_by_pk_returning`, `delete_with_partition_returning`). The generator
-  now also rejects a filter parameter declared twice in one entity.
+- **Generated entity headers must be regenerated**: they name helpers moved to
+  `detail`, and the repositories use new SQL constants (`update_returning`,
+  `update_returning_changes`, `delete_by_pk_returning`,
+  `delete_with_partition_returning`). The generator now also rejects a filter
+  parameter declared twice in one entity.
 - **The entity generator rejects every annotation it does not recognize**: an
   unknown tag, a tag at the wrong level or a malformed one is an error, where it
   was ignored or read as something else. Tags run to the end of the comment:
