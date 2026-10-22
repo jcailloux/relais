@@ -10,6 +10,7 @@
 #include <vector>
 
 using namespace jcailloux::relais::io;
+using namespace jcailloux::relais::io::detail;
 
 // =============================================================================
 // PgParam tests

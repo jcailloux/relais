@@ -5,7 +5,7 @@
 #include <cstdint>
 #include <unordered_map>
 
-namespace jcailloux::relais::io::batch {
+namespace jcailloux::relais::io::batch::detail {
 
 // TimingEstimator — adaptive estimation of network and per-query costs
 // for batch scheduling decisions.
@@ -124,6 +124,6 @@ struct TimingEstimator {
     }
 };
 
-} // namespace jcailloux::relais::io::batch
+}  // namespace jcailloux::relais::io::batch::detail
 
 #endif // JCX_RELAIS_IO_BATCH_TIMING_ESTIMATOR_H

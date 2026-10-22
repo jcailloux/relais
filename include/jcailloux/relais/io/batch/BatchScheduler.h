@@ -69,6 +69,8 @@ struct PgWriteResult {
 ///   order; only the fusion is disabled.
 enum class WriteMode : uint8_t { Idempotent, Exclusive };
 
+namespace detail {
+
 template<IoContext Io>
 class BatchScheduler : public std::enable_shared_from_this<BatchScheduler<Io>> {
     using Clock = std::chrono::steady_clock;
@@ -238,9 +240,9 @@ public:
     /// The queue settling this loop's uncertain writes (for testing/diagnostics).
     /// Its pending tickets do not hold teardown back: destroying the scheduler
     /// abandons them, and the process exits with the caches they protect.
-    [[nodiscard]] const SettleQueue<Io>& settleQueue() const noexcept { return settle_queue_; }
+    [[nodiscard]] const io::detail::SettleQueue<Io>& settleQueue() const noexcept { return settle_queue_; }
 #ifdef RELAIS_BUILDING_TESTS
-    [[nodiscard]] SettleQueue<Io>& settleQueue() noexcept { return settle_queue_; }
+    [[nodiscard]] io::detail::SettleQueue<Io>& settleQueue() noexcept { return settle_queue_; }
 #endif
 
     /// Run `cb` on a later turn of this scheduler's loop.
@@ -1414,12 +1416,14 @@ private:
     uint64_t pg_read_lead_writes_ = 0;
 
     // Declared last: destroyed first, while the pool it reads is still held.
-    SettleQueue<Io> settle_queue_;
+    io::detail::SettleQueue<Io> settle_queue_;
 
 #ifdef RELAIS_BUILDING_TESTS
     friend struct ::relais_bench::BatchBenchAccessor;
 #endif
 };
+
+}  // namespace detail
 
 } // namespace jcailloux::relais::io::batch
 

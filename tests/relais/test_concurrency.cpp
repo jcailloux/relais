@@ -1348,9 +1348,9 @@ TEST_CASE("Concurrency - entity notes vs concurrent reads, fills, seals and drai
             auto id = ids[rng() % ids.size()];
             if (t == 0) {
                 // A note, then its seal (its replays), which starts the drain.
-                auto ticket = std::make_shared<rio::SettleTicket>();
+                auto ticket = std::make_shared<rio::detail::SettleTicket>();
                 TestInternals::noteRowsChanged<L1TestItemRepo>(ticket, touched);
-                ticket->state = rio::SettleTicket::State::Settled;
+                ticket->state = rio::detail::SettleTicket::State::Settled;
                 auto replays = std::move(ticket->replays);
                 for (auto& r : replays) sync(r(ticket->outcome));
             } else if (t == 1) {

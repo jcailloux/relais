@@ -20,9 +20,27 @@
 - **`client_check_interval`** (`PgPoolConfig`, `IoPoolConfig`; default 1 s) is
   sent as the session's `client_connection_check_interval`: the server aborts a
   statement whose client relais abandoned on a timeout. `0` sends nothing.
+- **Now documented, hence covered by semantic versioning:** the log callback
+  (`log::setCallback`), `io::whenAll`, `cache::GDSFPolicy::configure` and
+  `maxMemory`, the `MetricsSnapshot` fields, `spec::sortBy`/`sortAsc`/`sortDesc`,
+  `spec::parseSortField`, `spec::kMaxInListElements` (formerly in `detail`) and
+  the `Version.h` macros.
 
 ### Changed (Breaking)
 
+- **The public API is what `docs/api-reference.md` documents**; semantic
+  versioning covers it and nothing else (`docs/api-reference.md › Stability`).
+  Implementation types move to `detail` namespaces: `cache::detail::CacheTier`
+  and `ChunkMap`, `io::detail::PgConnection` and `PgParam`,
+  `io::batch::detail::BatchScheduler`, `list::detail::ListCache`,
+  `ModificationTracker` and `Cursor`, `detail::PgRepo`, `LocalRepo`,
+  `ListMixin` and `InvalidationMixin`, `runtime::detail::CachedClock`, among
+  others. `PgProvider::bindBatcher` and `entityQueryParams`,
+  `PgResult::sliceRow`/`sliceRows`/`pipelineAborted`, `TypedCursor::raw` and
+  `Repo::ListTraits` are no longer documented. Generated entity headers must be
+  regenerated.
+- **The `FILTER(filters, name)` macro is removed**: write
+  `filters.get<"name">()`, or `filters.template get<"name">()` in a template.
 - **The repository API no longer depends on the preset.** Every method has the
   same signature, return type included, on `Uncached` and `Local`: changing
   `cache_level` never breaks compilation. `find`, `findJson` and `findBinary`
@@ -167,6 +185,12 @@
   were read as fields. Members are now read from the struct body only.
 - **Two entities with the same class name overwrote each other's generated
   header.** This is now a generation error naming both.
+- **`parseListQueryStrict` kept only 256 elements of a larger IN/NOT IN
+  set**, silently: a truncated NOT IN returned rows the caller excluded. It now
+  rejects a set above 256 distinct elements with `InvalidValue`;
+  `parseListQuery` still keeps the first 256.
+- **`log::setCallback` raced with the threads that log.** It can now be called
+  from any thread at any time.
 
 ## [3.2.1] - 2026-09-27
 

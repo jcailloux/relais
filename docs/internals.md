@@ -204,7 +204,7 @@ inline constexpr CacheConfig Local{ .cache_level = CacheLevel::L1 };
 
 ## L1 Cache: CacheTier
 
-The L1 (RAM) cache is a `cache::CacheTier<Key, E, Metadata>` (`cache/CacheTier.h`),
+The L1 (RAM) cache is a `cache::detail::CacheTier<Key, E, Metadata>` (`cache/CacheTier.h`),
 which wraps a `ChunkMap` (`cache/ChunkMap.h`, relais's own sharded map over the
 vendored `parlay_hash` lock-free table) and adds GDSF admission/scoring, ghost
 lifecycle, inflight-fetch dedup, TTL, and cleanup behind one interface. Two facts drive everything below:
@@ -221,14 +221,14 @@ lifecycle, inflight-fetch dedup, TTL, and cleanup behind one interface. Two fact
 
 ```cpp
 // LocalRepo.h
-using Metadata = cache::CacheMetadata<HasGDSF, HasTTL>;
-using Tier     = cache::CacheTier<Key, E, Metadata>;
+using Metadata = cache::detail::CacheMetadata<HasGDSF, HasTTL>;
+using Tier     = cache::detail::CacheTier<Key, E, Metadata>;
 using FindResultType = cache::CacheView<E>;
 ```
 
 `Metadata` is assembled at compile time from two flags: `HasGDSF`
 (`GDSFPolicy::enabled`) adds a GDSF score, `HasTTL` (`Cfg.l1_ttl > 0`) adds a
-`uint32_t` expiration in **seconds** (from `runtime::CachedClock::now()`, not a
+`uint32_t` expiration in **seconds** (from `runtime::detail::CachedClock::now()`, not a
 `time_point`). `buildMetadata(now_sec)` stamps `now_sec + kTtlSec`. `store()`
 deliberately does **not** tick the cleanup counter — the sweep cadence is driven
 by fetch paths (DB misses), not by API-side mutations (`store`/`insert`).
@@ -460,12 +460,12 @@ A list-enabled repo owns **two independent `CacheTier` instantiations** (distinc
 singletons — no collision):
 
 - **Entity cache** (from LocalRepo): `CacheTier<Key, E, Metadata>` — entities by value, keys = PK values.
-- **List cache** (from ListMixin): a `list::ListCache` wrapping `CacheTier<std::string, ListWrapper<E>, MetadataImpl>` — results stored **by value**, keyed by the **canonical binary query string**.
+- **List cache** (from ListMixin): a `list::detail::ListCache` wrapping `CacheTier<std::string, ListWrapper<E>, MetadataImpl>` — results stored **by value**, keyed by the **canonical binary query string**.
 
 ### List Cache Storage
 
 ```cpp
-using ListCacheType = list::ListCache<Entity, Base::config.l1_chunk_count_log2,
+using ListCacheType = list::detail::ListCache<Entity, Base::config.l1_chunk_count_log2,
                                       Key, Traits, HasGDSF>;   // 5 template params
 
 static ListCacheType& listCache() {
@@ -479,7 +479,7 @@ static ListCacheType& listCache() {
 `ListCacheConfig` carries a single field, derived from the entity `CacheConfig`:
 
 ```cpp
-static list::ListCacheConfig listCacheConfig() {
+static list::detail::ListCacheConfig listCacheConfig() {
     // duration_cast<seconds>(l1_ttl).count() — a uint32_t, NOT std::chrono::seconds
     return { .default_ttl_sec = toSec(Base::config.l1_ttl) };
 }
@@ -490,7 +490,7 @@ static list::ListCacheConfig listCacheConfig() {
 
 ### Traits Adapter
 
-`ListMixin` provides a `Traits` struct that bridges the declarative filter/sort helpers (`list::spec`) to the `list::ListCache` interface, delegating to compile-time descriptor helpers:
+`ListMixin` provides a `Traits` struct that bridges the declarative filter/sort helpers (`list::spec`) to the `list::detail::ListCache` interface, delegating to compile-time descriptor helpers:
 
 ```cpp
 struct Traits {
@@ -499,7 +499,7 @@ struct Traits {
 
     static bool matchesFilters(const Entity& e, const Filters& f);
     static int compare(const Entity& a, const Entity& b, SortField, SortDirection);
-    static list::Cursor extractCursor(const Entity&, const SortSpec<size_t>&);
+    static list::detail::Cursor extractCursor(const Entity&, const SortSpec<size_t>&);
     static constexpr SortSpec<size_t> defaultSort();
     static uint16_t normalizeLimit(uint16_t requested);
     // ...
@@ -673,7 +673,7 @@ the result **by value**, with generation-stamped metadata:
 
 ```cpp
 template<typename FilterSet, typename SortFieldEnum>
-struct ListCacheMetadataImpl : cache::CacheMetadata<true, true> {
+struct ListCacheMetadataImpl : cache::detail::CacheMetadata<true, true> {
     uint32_t  stored_generation{0};   // tracker generation at cache time (NOT a timestamp)
     SortBounds sort_bounds;
     // + GDSF score + TTL (uint32_t seconds) from CacheMetadata<true,true>
@@ -684,7 +684,7 @@ template<typename E, uint8_t ChunkCountLog2 = 3, typename Key = int64_t,
 class ListCache {
     using CacheKey  = std::string;                       // canonical query buffer
     using Result    = list::ListWrapper<E>;
-    using Tier      = cache::CacheTier<CacheKey, Result, ListCacheMetadataImpl<...>>;
+    using Tier      = cache::detail::CacheTier<CacheKey, Result, ListCacheMetadataImpl<...>>;
 
     Tier                 tier_;          // owns its own ChunkMap + GDSF + cleanup
     ModTracker           modifications_; // ModificationTracker<E, ChunkCount, FilterSet>
@@ -1085,24 +1085,34 @@ when `@relais partition_key` is used.
 
 ## Namespace Organization
 
+Each namespace keeps its implementation in a nested `detail` namespace, and a new internal type goes in the `detail` of its module. A name outside `detail` is public only if [api-reference.md](api-reference.md) documents it ([Stability](api-reference.md#stability)).
+
 ```
-jcailloux::relais::                     # Repo, PgRepo, LocalRepo, ListMixin,
-                                        # InvalidationMixin, Entity<Struct, Mapping>;
-                                        # Invalidate, InvalidateList, InvalidateVia,
-                                        # InvalidateListVia, InvalidateOn, ListInvalidationTarget,
-                                        # propagateCreate/Update/Delete
-jcailloux::relais::config::             # CacheConfig, CacheLevel, UpdateStrategy,
-                                        # Duration, FixedString, presets
-jcailloux::relais::entity::             # FieldUpdate, heapCapacity()
-jcailloux::relais::cache::              # CacheTier, CacheView, MultiView, ChunkMap, CacheMetadata,
-                                        # TaggedEntry, GDSFPolicy, Metrics
-jcailloux::relais::list::               # ListCache, ListWrapper, ListQuery, ModificationTracker,
-                                        # SortBounds, Cursor
-jcailloux::relais::list::spec::         # Filter, Sort, ListDescriptor, FilterDescriptor,
-                                        # SortDescriptor, HttpQueryParser, ParseUtils
-jcailloux::relais::runtime::            # CachedClock
-jcailloux::relais::io::                 # Task, PgPool, PgClient, PgResult, PgParams,
-                                        # IoContext
+jcailloux::relais::                       # Repo, Entity<Struct, Mapping>, entity concepts,
+                                          # Invalidate, InvalidateList, InvalidateVia,
+                                          # InvalidateListVia, InvalidateOn, ListInvalidationTarget,
+                                          # Outcome, spawnOn, PgProvider
+jcailloux::relais::detail::               # PgRepo, LocalRepo, ListMixin, InvalidationMixin,
+                                          # RecheckGuard, propagateCreate/Update/Delete, type traits
+jcailloux::relais::config::               # CacheConfig, CacheLevel, UpdateStrategy,
+                                          # Duration, FixedString, presets
+jcailloux::relais::entity::               # set/setNull/increment/decrement/nowPlus, guards, ordering
+jcailloux::relais::entity::detail::       # heapCapacity(), MappedEnumCodec, patch SQL extractors
+jcailloux::relais::cache::                # CacheView, MultiView, MetricsSnapshot, GDSFPolicy
+jcailloux::relais::cache::detail::        # CacheTier, ChunkMap, CacheMetadata, TaggedEntry,
+                                          # PendingLane, ScoreHistogram, counters
+jcailloux::relais::list::                 # ListWrapper, SortDirection, SortSpec
+jcailloux::relais::list::detail::         # ListCache, ListCacheTraits, ModificationTracker, Cursor
+jcailloux::relais::list::spec::           # Filter, Sort, ListQueryParams, ListQuery, seal,
+                                          # ListQueryBuilder, TypedCursor, HTTP parsers
+jcailloux::relais::list::spec::detail::   # canonical encoding, WHERE builder, list traits, parsing
+jcailloux::relais::runtime::detail::      # CachedClock, CachedMemory, RuntimeThread
+jcailloux::relais::io::                   # Task, Immediate, whenAll, IoContext, EpollIoContext,
+                                          # IoPool, PgPool, PgResult, PgParams, Pg* errors
+jcailloux::relais::io::detail::           # PgConnection, PgClient, PgParam, SettleQueue, SettleTicket
+jcailloux::relais::io::batch::            # WriteMode, PgWriteResult
+jcailloux::relais::io::batch::detail::    # BatchScheduler, TimingEstimator, WriteAffinity
+jcailloux::relais::log::                  # Level, setCallback
 ```
 
 ### Entity Headers (`entity/`)

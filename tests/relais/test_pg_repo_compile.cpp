@@ -23,10 +23,11 @@
 #include "fixtures/generated/TestProductEntity.h"
 
 using namespace jcailloux::relais;
+using jcailloux::relais::detail::PgRepo;
 using jcailloux::relais::entity::set;
 using jcailloux::relais::entity::setNull;
-using jcailloux::relais::entity::fieldColumnName;
-using jcailloux::relais::entity::fieldValue;
+using jcailloux::relais::entity::detail::fieldColumnName;
+using jcailloux::relais::entity::detail::fieldValue;
 
 // =========================================================================
 // Instantiate PgRepo with each entity type to verify compilation.
@@ -334,7 +335,7 @@ TEST_CASE("buildKeyedPatchSql", "[base_repo][sql]") {
 
     SECTION("without the row before: a plain UPDATE, SET values unqualified") {
         auto sql = detail::buildKeyedPatchSql<Traits, void>(
-            "my_table", "id", {"\"name\"", detail::SetColumn("\"value\"", jcailloux::relais::entity::SetOp::Add)},
+            "my_table", "id", {"\"name\"", detail::SetColumn("\"value\"", jcailloux::relais::entity::detail::SetOp::Add)},
             "id, name, value", Returns::After);
         REQUIRE(sql ==
             "UPDATE my_table SET \"name\"=$1,\"value\"=\"value\"+$2 WHERE \"id\"=$3 "

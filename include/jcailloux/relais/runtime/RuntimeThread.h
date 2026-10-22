@@ -9,7 +9,7 @@
 #include "jcailloux/relais/runtime/CachedClock.h"
 #include "jcailloux/relais/runtime/CachedMemory.h"
 
-namespace jcailloux::relais::runtime {
+namespace jcailloux::relais::runtime::detail {
 
 /// RuntimeThread — single background thread for periodic runtime tasks.
 ///
@@ -55,6 +55,6 @@ private:
     static inline std::once_flag start_flag_;
 };
 
-}  // namespace jcailloux::relais::runtime
+}  // namespace jcailloux::relais::runtime::detail
 
 #endif  // JCX_RELAIS_RUNTIME_THREAD_H

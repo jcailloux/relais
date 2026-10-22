@@ -65,7 +65,7 @@ struct TestInternals {
 
     /// Leave a note, as an uncertain write does.
     template<typename Repo, typename Pred>
-    static void noteRowsChanged(const std::shared_ptr<jcailloux::relais::io::SettleTicket>& ticket,
+    static void noteRowsChanged(const std::shared_ptr<jcailloux::relais::io::detail::SettleTicket>& ticket,
                                 Pred pred) {
         Repo::noteRowsChanged(ticket, std::move(pred));
     }
@@ -87,7 +87,7 @@ struct TestInternals {
     /// The tiers' response to an uncertain predicate write (rows it may have
     /// changed, values it set).
     template<typename Repo, typename Pred, typename... Updates>
-    static void rowsMayHaveChanged(const std::shared_ptr<jcailloux::relais::io::SettleTicket>& ticket,
+    static void rowsMayHaveChanged(const std::shared_ptr<jcailloux::relais::io::detail::SettleTicket>& ticket,
                                    Pred pred, const Updates&... updates) {
         Repo::rowsMayHaveChanged(ticket, std::move(pred), updates...);
     }

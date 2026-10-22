@@ -31,8 +31,8 @@
 
 using namespace relais_test;
 using GDSFPolicy = jcailloux::relais::cache::GDSFPolicy;
-using GDSFScoreData = jcailloux::relais::cache::GDSFScoreData;
-using ScoreHistogram = jcailloux::relais::cache::ScoreHistogram;
+using GDSFScoreData = jcailloux::relais::cache::detail::GDSFScoreData;
+using ScoreHistogram = jcailloux::relais::cache::detail::ScoreHistogram;
 
 // Compile-time check: this TU must be compiled with GDSF enabled
 static_assert(GDSFPolicy::enabled,

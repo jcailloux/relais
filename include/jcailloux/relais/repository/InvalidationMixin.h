@@ -16,7 +16,6 @@ namespace detail {
 /// Detect whether Base is (or derives from) ListMixin.
 template<typename T>
 concept HasListMixin = requires { typename T::ListDescriptorType; };
-}  // namespace detail
 
 /**
  * Optional mixin layer for cross-repository cache invalidation.
@@ -56,7 +55,7 @@ public:
         // run the precautionary cross-invalidation after the try, then rethrow.
         cache::CacheView<Entity> result;
         std::exception_ptr timeout;
-        std::shared_ptr<io::SettleTicket> ticket;
+        std::shared_ptr<io::detail::SettleTicket> ticket;
         try {
             result = co_await Base::insert(entity);
         } catch (const io::PgUncertainError& e) {
@@ -112,7 +111,7 @@ public:
 
         cache::CacheView<Entity> result;
         std::exception_ptr timeout;
-        std::shared_ptr<io::SettleTicket> ticket;
+        std::shared_ptr<io::detail::SettleTicket> ticket;
         try {
             if constexpr (detail::HasListMixin<Base>) {
                 result = co_await Base::upsertWithContext(entity, old ? &*old : nullptr);
@@ -152,7 +151,7 @@ public:
         std::optional<Entity> uncertain_before;
         typename Base::UpdateOutcome outcome;
         std::exception_ptr timeout;
-        std::shared_ptr<io::SettleTicket> ticket;
+        std::shared_ptr<io::detail::SettleTicket> ticket;
         try {
             outcome = co_await Base::template updateOutcome<true>(id, entity, &uncertain_before);
         } catch (const io::PgUncertainError& e) {
@@ -187,7 +186,7 @@ public:
         std::optional<Entity> uncertain_before;
         typename Base::EraseOutcome outcome;
         std::exception_ptr timeout;
-        std::shared_ptr<io::SettleTicket> ticket;
+        std::shared_ptr<io::detail::SettleTicket> ticket;
         try {
             outcome = co_await Base::template eraseOutcome<true>(id, nullptr, &uncertain_before);
         } catch (const io::PgUncertainError& e) {
@@ -225,7 +224,7 @@ public:
 
         typename Base::PatchedRow row;
         std::exception_ptr timeout;
-        std::shared_ptr<io::SettleTicket> ticket;
+        std::shared_ptr<io::detail::SettleTicket> ticket;
         try {
             row = co_await Base::template patchRow<true>(
                 id, uncertain_before, std::forward<Updates>(updates)...);
@@ -256,7 +255,7 @@ public:
 
         std::optional<typename Base::PatchedRow> row;
         std::exception_ptr timeout;
-        std::shared_ptr<io::SettleTicket> ticket;
+        std::shared_ptr<io::detail::SettleTicket> ticket;
         try {
             row = co_await Base::template patchIfRow<true>(
                 id, uncertain_before, guard, std::forward<Updates>(updates)...);
@@ -291,7 +290,7 @@ public:
 
     /// Every row (see PgRepo::invalidateEveryRow), and, as invalidate does,
     /// every target of them. A cycle of repos back to this one stops here.
-    static void invalidateEveryRow(const std::shared_ptr<io::SettleTicket>& ticket) {
+    static void invalidateEveryRow(const std::shared_ptr<io::detail::SettleTicket>& ticket) {
         Base::invalidateEveryRow(ticket);
         static thread_local bool cascading = false;
         if (cascading) return;
@@ -306,7 +305,7 @@ public:
     /// located by what they hold (a list repo over them); every other target
     /// may be any.
     template<typename... Updates>
-    static void rowsMayHaveChanged(const std::shared_ptr<io::SettleTicket>& ticket,
+    static void rowsMayHaveChanged(const std::shared_ptr<io::detail::SettleTicket>& ticket,
                                    const detail::RowPredicate<Entity>& rows,
                                    const Updates&... updates) {
         Base::rowsMayHaveChanged(ticket, rows, updates...);
@@ -321,7 +320,7 @@ protected:
     /// each row from the version a tier kept, now and again once settled; for
     /// a row none kept, every target that cannot locate it by its key. An
     /// erased row has no new target.
-    static io::Task<void> rowsMayHaveBeenErased(std::shared_ptr<io::SettleTicket> ticket,
+    static io::Task<void> rowsMayHaveBeenErased(std::shared_ptr<io::detail::SettleTicket> ticket,
                                                 std::span<const Key> keys,
                                                 std::vector<std::optional<Entity>>* before) {
         std::vector<std::optional<Entity>> own(keys.size());
@@ -392,7 +391,7 @@ protected:
     /// - once settled, those of the row read again, as committed (trigger,
     ///   generated column). Without a key, every target.
     /// Best-effort: the uncertain exception must still surface.
-    static io::Task<void> crossUncertain(std::shared_ptr<io::SettleTicket> ticket,
+    static io::Task<void> crossUncertain(std::shared_ptr<io::detail::SettleTicket> ticket,
                                          std::optional<Key> id, RowBefore before,
                                          std::optional<Entity> estimate, const char* op) {
         if (before.row) {
@@ -510,6 +509,8 @@ protected:
 
     friend struct ::relais_test::TestInternals;
 };
+
+}  // namespace detail
 
 }  // namespace jcailloux::relais
 

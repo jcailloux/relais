@@ -222,7 +222,7 @@ inline T parseArrayElement(std::string_view sv) {
 /// type stays non-optional.
 template<typename T>
 inline std::vector<T> parsePgArray(std::string_view s) {
-    static_assert(!is_optional_v<T>,
+    static_assert(!relais::detail::is_optional_v<T>,
                   "vector<optional<T>> is unsupported: NULL array elements are rejected");
     static_assert(!std::is_same_v<T, std::string_view>,
                   "vector<string_view> is unsafe: unescaped elements would dangle, use std::string");
@@ -274,7 +274,7 @@ inline T PgResult::Row::get(int col) const {
     if constexpr (relais::detail::TextNumber<T>) {
         return detail::parsePgNumber<T>(rawValue(col),
                                         [col] { return "column " + std::to_string(col); });
-    } else if constexpr (is_std_vector_v<T>) {
+    } else if constexpr (relais::detail::is_std_vector_v<T>) {
         return detail::parsePgArray<typename T::value_type>(rawValue(col));
     } else {
         static_assert(false, "PgResult::Row::get<T>: unsupported type");

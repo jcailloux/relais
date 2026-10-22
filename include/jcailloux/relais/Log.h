@@ -1,6 +1,7 @@
 #ifndef JCX_RELAIS_LOG_H
 #define JCX_RELAIS_LOG_H
 
+#include <atomic>
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
@@ -34,17 +35,23 @@ enum class Level : uint8_t { Debug, Warn, Error };
 using Callback = void(*)(Level level, const char* msg, size_t len);
 
 namespace detail {
-    inline Callback& ref() noexcept {
-        static Callback cb = nullptr;
+    inline std::atomic<Callback>& ref() noexcept {
+        static std::atomic<Callback> cb{nullptr};
         return cb;
     }
 }  // namespace detail
 
-/// Set the log callback. Pass nullptr to disable logging.
-inline void setCallback(Callback cb) noexcept { detail::ref() = cb; }
+/// Set the log callback, from any thread, at any time. Pass nullptr to disable
+/// logging. Release/acquire: whatever the application set up before installing
+/// the callback is visible to the threads that call it.
+inline void setCallback(Callback cb) noexcept {
+    detail::ref().store(cb, std::memory_order_release);
+}
 
 /// Get the current log callback.
-inline Callback getCallback() noexcept { return detail::ref(); }
+inline Callback getCallback() noexcept {
+    return detail::ref().load(std::memory_order_acquire);
+}
 
 // =============================================================================
 // LogStream — accumulates a log message and dispatches on destruction

@@ -152,7 +152,7 @@ public:
 
         // L1 entity counters
         if constexpr (Cfg.cache_level == config::CacheLevel::L1) {
-            using CachedLayer = LocalRepo<E, Name, Cfg, Key>;
+            using CachedLayer = detail::LocalRepo<E, Name, Cfg, Key>;
             snap.l1_hits   = CachedLayer::l1_counters_.hits.load();
             snap.l1_misses = CachedLayer::l1_counters_.misses.load();
         }
@@ -160,7 +160,7 @@ public:
         // List counters
         if constexpr (HasListDescriptor<E>) {
             using CacheLayer = typename detail::CacheLayerSelector<E, Name, Cfg, Key>::type;
-            using ListLayer = ListMixin<CacheLayer>;
+            using ListLayer = detail::ListMixin<CacheLayer>;
             snap.list_l1_hits   = ListLayer::list_l1_counters_.hits.load();
             snap.list_l1_misses = ListLayer::list_l1_counters_.misses.load();
         }
@@ -177,14 +177,14 @@ public:
 
     static void resetMetrics() {
         if constexpr (Cfg.cache_level == config::CacheLevel::L1) {
-            using CachedLayer = LocalRepo<E, Name, Cfg, Key>;
+            using CachedLayer = detail::LocalRepo<E, Name, Cfg, Key>;
             CachedLayer::l1_counters_.hits.reset();
             CachedLayer::l1_counters_.misses.reset();
         }
 
         if constexpr (HasListDescriptor<E>) {
             using CacheLayer = typename detail::CacheLayerSelector<E, Name, Cfg, Key>::type;
-            using ListLayer = ListMixin<CacheLayer>;
+            using ListLayer = detail::ListMixin<CacheLayer>;
             ListLayer::list_l1_counters_.hits.reset();
             ListLayer::list_l1_counters_.misses.reset();
         }
@@ -250,7 +250,7 @@ public:
         // evict the input key set after the try, then rethrow.
         std::optional<std::vector<E>> deleted;
         std::exception_ptr timeout;
-        std::shared_ptr<io::SettleTicket> ticket;
+        std::shared_ptr<io::detail::SettleTicket> ticket;
         try {
             deleted = co_await Base::eraseManyRaw(std::span<const Key>(keys));
         } catch (const io::PgUncertainError& e) {
@@ -323,7 +323,7 @@ public:
         filters.values = pred.toFilterTuple();
         std::optional<std::vector<E>> deleted;
         std::exception_ptr timeout;
-        std::shared_ptr<io::SettleTicket> ticket;
+        std::shared_ptr<io::detail::SettleTicket> ticket;
         try {
             deleted = co_await Base::template eraseWhereRaw<FD>(filters);
         } catch (const io::PgUncertainError& e) {

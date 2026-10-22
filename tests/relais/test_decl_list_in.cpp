@@ -128,26 +128,26 @@ TEST_CASE("[DeclListIn] IN string membership", "[list][in][unit]") {
     decl::Filters<DescInString> f;
     f.get<"category">() = std::vector<std::string>{"science", "tech"};
 
-    CHECK(decl::matchesFilters<DescInString>(makeArticle(1, "tech", 0), f));
-    CHECK(decl::matchesFilters<DescInString>(makeArticle(2, "science", 0), f));
-    CHECK_FALSE(decl::matchesFilters<DescInString>(makeArticle(3, "news", 0), f));
-    CHECK_FALSE(decl::matchesFilters<DescInString>(makeArticle(4, "", 0), f));
+    CHECK(decl::detail::matchesFilters<DescInString>(makeArticle(1, "tech", 0), f));
+    CHECK(decl::detail::matchesFilters<DescInString>(makeArticle(2, "science", 0), f));
+    CHECK_FALSE(decl::detail::matchesFilters<DescInString>(makeArticle(3, "news", 0), f));
+    CHECK_FALSE(decl::detail::matchesFilters<DescInString>(makeArticle(4, "", 0), f));
 }
 
 TEST_CASE("[DeclListIn] IN int64 membership", "[list][in][unit]") {
     decl::Filters<DescInInt64> f;
     f.get<"author_id">() = std::vector<int64_t>{1, 2, 3};
 
-    CHECK(decl::matchesFilters<DescInInt64>(makeArticle(1, "x", 2), f));
-    CHECK_FALSE(decl::matchesFilters<DescInInt64>(makeArticle(2, "x", 9), f));
+    CHECK(decl::detail::matchesFilters<DescInInt64>(makeArticle(1, "x", 2), f));
+    CHECK_FALSE(decl::detail::matchesFilters<DescInInt64>(makeArticle(2, "x", 9), f));
 
     SECTION("negatives and extremes") {
         f.get<"author_id">() = std::vector<int64_t>{INT64_MIN, -1, 0, INT64_MAX};
-        CHECK(decl::matchesFilters<DescInInt64>(makeArticle(1, "x", INT64_MIN), f));
-        CHECK(decl::matchesFilters<DescInInt64>(makeArticle(2, "x", -1), f));
-        CHECK(decl::matchesFilters<DescInInt64>(makeArticle(3, "x", 0), f));
-        CHECK(decl::matchesFilters<DescInInt64>(makeArticle(4, "x", INT64_MAX), f));
-        CHECK_FALSE(decl::matchesFilters<DescInInt64>(makeArticle(5, "x", 1), f));
+        CHECK(decl::detail::matchesFilters<DescInInt64>(makeArticle(1, "x", INT64_MIN), f));
+        CHECK(decl::detail::matchesFilters<DescInInt64>(makeArticle(2, "x", -1), f));
+        CHECK(decl::detail::matchesFilters<DescInInt64>(makeArticle(3, "x", 0), f));
+        CHECK(decl::detail::matchesFilters<DescInInt64>(makeArticle(4, "x", INT64_MAX), f));
+        CHECK_FALSE(decl::detail::matchesFilters<DescInInt64>(makeArticle(5, "x", 1), f));
     }
 }
 
@@ -155,12 +155,12 @@ TEST_CASE("[DeclListIn] IN int32 on optional member", "[list][in][unit]") {
     decl::Filters<DescInOptInt32> f;
     f.get<"view_count">() = std::vector<int32_t>{10, 20, INT32_MIN, INT32_MAX};
 
-    CHECK(decl::matchesFilters<DescInOptInt32>(makeArticle(1, "x", 0, 20), f));
-    CHECK(decl::matchesFilters<DescInOptInt32>(makeArticle(2, "x", 0, INT32_MIN), f));
-    CHECK_FALSE(decl::matchesFilters<DescInOptInt32>(makeArticle(3, "x", 0, 5), f));
+    CHECK(decl::detail::matchesFilters<DescInOptInt32>(makeArticle(1, "x", 0, 20), f));
+    CHECK(decl::detail::matchesFilters<DescInOptInt32>(makeArticle(2, "x", 0, INT32_MIN), f));
+    CHECK_FALSE(decl::detail::matchesFilters<DescInOptInt32>(makeArticle(3, "x", 0, 5), f));
 
     SECTION("null member is in no set") {
-        CHECK_FALSE(decl::matchesFilters<DescInOptInt32>(
+        CHECK_FALSE(decl::detail::matchesFilters<DescInOptInt32>(
             makeArticle(4, "x", 0, std::nullopt), f));
     }
 }
@@ -170,13 +170,13 @@ TEST_CASE("[DeclListIn] IN bool membership", "[list][in][unit]") {
 
     SECTION("set {true}") {
         f.get<"is_published">() = std::vector<bool>{true};
-        CHECK(decl::matchesFilters<DescInBool>(makeArticle(1, "x", 0, std::nullopt, true), f));
-        CHECK_FALSE(decl::matchesFilters<DescInBool>(makeArticle(2, "x", 0, std::nullopt, false), f));
+        CHECK(decl::detail::matchesFilters<DescInBool>(makeArticle(1, "x", 0, std::nullopt, true), f));
+        CHECK_FALSE(decl::detail::matchesFilters<DescInBool>(makeArticle(2, "x", 0, std::nullopt, false), f));
     }
     SECTION("set {true,false} matches both") {
         f.get<"is_published">() = std::vector<bool>{false, true};
-        CHECK(decl::matchesFilters<DescInBool>(makeArticle(1, "x", 0, std::nullopt, true), f));
-        CHECK(decl::matchesFilters<DescInBool>(makeArticle(2, "x", 0, std::nullopt, false), f));
+        CHECK(decl::detail::matchesFilters<DescInBool>(makeArticle(1, "x", 0, std::nullopt, true), f));
+        CHECK(decl::detail::matchesFilters<DescInBool>(makeArticle(2, "x", 0, std::nullopt, false), f));
     }
 }
 
@@ -188,9 +188,9 @@ TEST_CASE("[DeclListIn] singleton set behaves like EQ", "[list][in][unit]") {
     decl::Filters<DescInString> f;
     f.get<"category">() = std::vector<std::string>{"tech"};
 
-    CHECK(decl::matchesFilters<DescInString>(makeArticle(1, "tech", 0), f));
-    CHECK_FALSE(decl::matchesFilters<DescInString>(makeArticle(2, "science", 0), f));
-    CHECK_FALSE(decl::matchesFilters<DescInString>(makeArticle(3, "news", 0), f));
+    CHECK(decl::detail::matchesFilters<DescInString>(makeArticle(1, "tech", 0), f));
+    CHECK_FALSE(decl::detail::matchesFilters<DescInString>(makeArticle(2, "science", 0), f));
+    CHECK_FALSE(decl::detail::matchesFilters<DescInString>(makeArticle(3, "news", 0), f));
 }
 
 TEST_CASE("[DeclListIn] empty set matches nothing", "[list][in][unit]") {
@@ -199,16 +199,16 @@ TEST_CASE("[DeclListIn] empty set matches nothing", "[list][in][unit]") {
     f.get<"category">() = std::vector<std::string>{};
     REQUIRE(f.get<"category">().has_value());
 
-    CHECK_FALSE(decl::matchesFilters<DescInString>(makeArticle(1, "tech", 0), f));
-    CHECK_FALSE(decl::matchesFilters<DescInString>(makeArticle(2, "", 0), f));
+    CHECK_FALSE(decl::detail::matchesFilters<DescInString>(makeArticle(1, "tech", 0), f));
+    CHECK_FALSE(decl::detail::matchesFilters<DescInString>(makeArticle(2, "", 0), f));
 }
 
 TEST_CASE("[DeclListIn] inactive IN filter matches every entity", "[list][in][unit]") {
     decl::Filters<DescInString> f;  // filter left unset (nullopt)
     REQUIRE_FALSE(f.get<"category">().has_value());
 
-    CHECK(decl::matchesFilters<DescInString>(makeArticle(1, "tech", 0), f));
-    CHECK(decl::matchesFilters<DescInString>(makeArticle(2, "anything", 0), f));
+    CHECK(decl::detail::matchesFilters<DescInString>(makeArticle(1, "tech", 0), f));
+    CHECK(decl::detail::matchesFilters<DescInString>(makeArticle(2, "anything", 0), f));
 }
 
 // =============================================================================
@@ -222,26 +222,26 @@ TEST_CASE("[DeclListIn] EQ + IN + range combination", "[list][in][unit]") {
     f.get<"view_count">() = int32_t{10};                              // GE view_count >= 10
 
     SECTION("all three satisfied") {
-        CHECK(decl::matchesFilters<DescCombo>(makeArticle(1, "tech", 42, 15), f));
-        CHECK(decl::matchesFilters<DescCombo>(makeArticle(2, "news", 42, 10), f));
+        CHECK(decl::detail::matchesFilters<DescCombo>(makeArticle(1, "tech", 42, 15), f));
+        CHECK(decl::detail::matchesFilters<DescCombo>(makeArticle(2, "news", 42, 10), f));
     }
     SECTION("EQ fails") {
-        CHECK_FALSE(decl::matchesFilters<DescCombo>(makeArticle(3, "tech", 7, 15), f));
+        CHECK_FALSE(decl::detail::matchesFilters<DescCombo>(makeArticle(3, "tech", 7, 15), f));
     }
     SECTION("IN fails") {
-        CHECK_FALSE(decl::matchesFilters<DescCombo>(makeArticle(4, "sports", 42, 15), f));
+        CHECK_FALSE(decl::detail::matchesFilters<DescCombo>(makeArticle(4, "sports", 42, 15), f));
     }
     SECTION("range fails") {
-        CHECK_FALSE(decl::matchesFilters<DescCombo>(makeArticle(5, "tech", 42, 5), f));
+        CHECK_FALSE(decl::detail::matchesFilters<DescCombo>(makeArticle(5, "tech", 42, 5), f));
     }
     SECTION("range filter on null member excludes (range, not IN)") {
-        CHECK_FALSE(decl::matchesFilters<DescCombo>(makeArticle(6, "tech", 42, std::nullopt), f));
+        CHECK_FALSE(decl::detail::matchesFilters<DescCombo>(makeArticle(6, "tech", 42, std::nullopt), f));
     }
     SECTION("only IN active — EQ and range inactive") {
         decl::Filters<DescCombo> g;
         g.get<"category">() = std::vector<std::string>{"tech"};
-        CHECK(decl::matchesFilters<DescCombo>(makeArticle(7, "tech", 999, std::nullopt), g));
-        CHECK_FALSE(decl::matchesFilters<DescCombo>(makeArticle(8, "other", 999, std::nullopt), g));
+        CHECK(decl::detail::matchesFilters<DescCombo>(makeArticle(7, "tech", 999, std::nullopt), g));
+        CHECK_FALSE(decl::detail::matchesFilters<DescCombo>(makeArticle(8, "other", 999, std::nullopt), g));
     }
 }
 
@@ -254,7 +254,7 @@ TEST_CASE("[DeclListIn] EQ + IN + range combination", "[list][in][unit]") {
 
 namespace {
 
-std::string paramStr(const jcailloux::relais::io::PgParam& p) {
+std::string paramStr(const jcailloux::relais::io::detail::PgParam& p) {
     return p.isNull() ? std::string("<null>")
                       : std::string(p.data(), static_cast<size_t>(p.length()));
 }
@@ -265,7 +265,7 @@ TEST_CASE("[DeclListIn] SQL: IN emits = ANY with one array param", "[list][in][u
     decl::Filters<DescInString> f;
     f.get<"category">() = std::vector<std::string>{"science", "tech"};
 
-    auto wc = decl::buildWhereClause<DescInString>(f);
+    auto wc = decl::detail::buildWhereClause<DescInString>(f);
     CHECK(wc.sql == "\"category\" = ANY($1)");
     REQUIRE(wc.params.params.size() == 1);          // exactly one param — the array
     CHECK(paramStr(wc.params.params[0]) == "{science,tech}");  // order preserved here
@@ -276,14 +276,14 @@ TEST_CASE("[DeclListIn] SQL: IN int64 array literal", "[list][in][unit][sql]") {
     decl::Filters<DescInInt64> f;
     f.get<"author_id">() = std::vector<int64_t>{1, 2, 3};
 
-    auto wc = decl::buildWhereClause<DescInInt64>(f);
+    auto wc = decl::detail::buildWhereClause<DescInInt64>(f);
     CHECK(wc.sql == "\"author_id\" = ANY($1)");
     REQUIRE(wc.params.params.size() == 1);
     CHECK(paramStr(wc.params.params[0]) == "{1,2,3}");
 
     SECTION("negatives are not quoted") {
         f.get<"author_id">() = std::vector<int64_t>{-2, -1, 0};
-        auto wc2 = decl::buildWhereClause<DescInInt64>(f);
+        auto wc2 = decl::detail::buildWhereClause<DescInInt64>(f);
         CHECK(paramStr(wc2.params.params[0]) == "{-2,-1,0}");
     }
 }
@@ -292,7 +292,7 @@ TEST_CASE("[DeclListIn] SQL: singleton set", "[list][in][unit][sql]") {
     decl::Filters<DescInString> f;
     f.get<"category">() = std::vector<std::string>{"tech"};
 
-    auto wc = decl::buildWhereClause<DescInString>(f);
+    auto wc = decl::detail::buildWhereClause<DescInString>(f);
     CHECK(wc.sql == "\"category\" = ANY($1)");
     CHECK(paramStr(wc.params.params[0]) == "{tech}");
 }
@@ -302,7 +302,7 @@ TEST_CASE("[DeclListIn] SQL: empty set yields = ANY('{}')", "[list][in][unit][sq
     f.get<"category">() = std::vector<std::string>{};  // present-but-empty
     REQUIRE(f.get<"category">().has_value());
 
-    auto wc = decl::buildWhereClause<DescInString>(f);
+    auto wc = decl::detail::buildWhereClause<DescInString>(f);
     CHECK(wc.sql == "\"category\" = ANY($1)");
     REQUIRE(wc.params.params.size() == 1);
     CHECK(paramStr(wc.params.params[0]) == "{}");  // ANY('{}') → zero rows
@@ -313,7 +313,7 @@ TEST_CASE("[DeclListIn] SQL: strings with array delimiters are quoted/escaped",
     decl::Filters<DescInString> f;
     f.get<"category">() = std::vector<std::string>{"a,b", "x{y}", "q\"z", ""};
 
-    auto wc = decl::buildWhereClause<DescInString>(f);
+    auto wc = decl::detail::buildWhereClause<DescInString>(f);
     // Each special element is quoted; embedded quote is backslash-escaped; empty
     // string is quoted. Plain elements would stay bare (none here).
     CHECK(paramStr(wc.params.params[0]) == R"({"a,b","x{y}","q\"z",""})");
@@ -325,7 +325,7 @@ TEST_CASE("[DeclListIn] SQL: EQ + IN + range $n numbering", "[list][in][unit][sq
     f.get<"category">() = std::vector<std::string>{"news", "tech"};  // IN category
     f.get<"view_count">() = int32_t{10};                               // GE view_count
 
-    auto wc = decl::buildWhereClause<DescCombo>(f);
+    auto wc = decl::detail::buildWhereClause<DescCombo>(f);
     CHECK(wc.sql == "\"author_id\"=$1 AND \"category\" = ANY($2) AND \"view_count\">=$3");
     REQUIRE(wc.params.params.size() == 3);     // IN contributes exactly one param
     CHECK(paramStr(wc.params.params[0]) == "42");
@@ -336,7 +336,7 @@ TEST_CASE("[DeclListIn] SQL: EQ + IN + range $n numbering", "[list][in][unit][sq
     SECTION("only IN active — EQ/range skipped, IN takes $1") {
         decl::Filters<DescCombo> g;
         g.get<"category">() = std::vector<std::string>{"tech"};
-        auto wc2 = decl::buildWhereClause<DescCombo>(g);
+        auto wc2 = decl::detail::buildWhereClause<DescCombo>(g);
         CHECK(wc2.sql == "\"category\" = ANY($1)");
         REQUIRE(wc2.params.params.size() == 1);
         CHECK(wc2.next_param == 2);
@@ -357,7 +357,7 @@ template<typename Desc, typename Vec>
 std::string groupKeyForSet(Vec v) {
     decl::ListQueryParams<Desc> q;
     std::get<0>(q.filters.values) = std::move(v);
-    return decl::groupKey<Desc>(q.filters, q.sort);
+    return decl::detail::groupKey<Desc>(q.filters, q.sort);
 }
 
 }  // namespace
@@ -385,7 +385,7 @@ TEST_CASE("[DeclListIn] binary: int64 set canonicalization", "[list][in][unit][b
 TEST_CASE("[DeclListIn] binary: presence byte and count layout", "[list][in][unit][binary]") {
     // Inactive filter: a single 0x00 presence byte, no count, no elements.
     decl::ListQueryParams<DescInInt64> q_inactive;
-    const std::string key_inactive = decl::groupKey<DescInInt64>(q_inactive.filters, q_inactive.sort);
+    const std::string key_inactive = decl::detail::groupKey<DescInInt64>(q_inactive.filters, q_inactive.sort);
 
     // Present-but-empty: presence 0x01 + count 0 (4 bytes) + no elements.
     const std::string key_empty = groupKeyForSet<DescInInt64>(std::vector<int64_t>{});
@@ -449,6 +449,40 @@ TEST_CASE("[DeclListIn] parse: element count capped at 256", "[list][in][unit][p
     CHECK(q.filters().get<"author_id">()->size() == 256);
 }
 
+
+namespace {
+
+std::string intCsv(int count, int distinct) {
+    std::string csv;
+    for (int i = 0; i < count; ++i) {
+        if (i) csv += ',';
+        csv += std::to_string(i % distinct);
+    }
+    return csv;
+}
+
+}  // namespace
+
+TEST_CASE("[DeclListIn] parse: strict rejects a set above 256 distinct elements",
+          "[list][in][unit][parse]") {
+    SECTION("257 distinct → InvalidValue on the filter") {
+        auto r = decl::parseListQueryStrict<DescInInt64>(Params{{"author_id", intCsv(257, 257)}});
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().type == decl::QueryValidationError::Type::InvalidValue);
+        CHECK(r.error().field == "author_id");
+    }
+    SECTION("256 distinct → accepted whole") {
+        auto r = decl::parseListQueryStrict<DescInInt64>(Params{{"author_id", intCsv(256, 256)}});
+        REQUIRE(r.has_value());
+        CHECK(r->filters().get<"author_id">()->size() == 256);
+    }
+    SECTION("duplicates do not count toward the cap") {
+        auto r = decl::parseListQueryStrict<DescInInt64>(Params{{"author_id", intCsv(400, 200)}});
+        REQUIRE(r.has_value());
+        CHECK(r->filters().get<"author_id">()->size() == 200);
+    }
+}
+
 TEST_CASE("[DeclListIn] parse: strict rejects undeclared filter, accepts IN",
           "[list][in][unit][parse]") {
     SECTION("undeclared param → error") {
@@ -495,9 +529,9 @@ void crossTierProperty(const std::vector<Entity>& entities,
             decl::Filters<Desc> f;
             std::get<0>(f.values) = sets[i];
 
-            const bool l1 = decl::matchesFilters<Desc>(e, f);
+            const bool l1 = decl::detail::matchesFilters<Desc>(e, f);
 
-            auto wc = decl::buildWhereClause<Desc>(f);
+            auto wc = decl::detail::buildWhereClause<Desc>(f);
             const std::string arr = paramStr(wc.params.params[0]);
             const auto fld = getField(e);
             const bool l3 = fld.has_value() && sqlAnyVerdict(*fld, arr, cast);

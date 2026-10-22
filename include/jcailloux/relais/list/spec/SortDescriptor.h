@@ -63,7 +63,7 @@ struct Sort {
     using value_type = detail::member_pointer_type_t<decltype(EntityMemberPtr)>;
     using converter = Converter;
 
-    static_assert(std::is_same_v<Converter, NoConvert> || is_via_v<Converter>,
+    static_assert(std::is_same_v<Converter, NoConvert> || detail::is_via_v<Converter>,
         "Sort converter must be NoConvert or Via<Codec>");
     static_assert(detail::via_codec_matches<Converter,
                       detail::unwrap_optional_t<std::remove_cvref_t<value_type>>>,
@@ -96,6 +96,8 @@ struct Sort {
 // Sort specification (runtime)
 // =============================================================================
 
+namespace detail {
+
 /// Runtime sort specification with field index
 template<typename Descriptor>
 struct SortSpec {
@@ -104,6 +106,8 @@ struct SortSpec {
 
     bool operator==(const SortSpec&) const = default;
 };
+
+}  // namespace detail
 
 }  // namespace jcailloux::relais::list::spec
 

@@ -65,6 +65,8 @@ struct Guards {
     std::tuple<Gs...> guards;
 };
 
+namespace detail {
+
 // -----------------------------------------------------------------------------
 // Structure traits
 // -----------------------------------------------------------------------------
@@ -93,12 +95,6 @@ template<typename G> inline constexpr bool valid_all_of_child_v = is_guard_leaf_
 template<typename G> inline constexpr bool valid_any_of_child_v = is_guard_leaf_v<G> || is_all_of_v<G>;
 template<typename G> inline constexpr bool valid_when_child_v = is_guard_leaf_v<G> || is_any_of_v<G>;
 
-// -----------------------------------------------------------------------------
-// Factories
-// -----------------------------------------------------------------------------
-
-namespace detail {
-
 template<typename V>
 inline constexpr bool is_optional_like_v = false;
 template<typename T>
@@ -119,6 +115,10 @@ auto compare(V&& value) {
 }
 
 }  // namespace detail
+
+// -----------------------------------------------------------------------------
+// Factories
+// -----------------------------------------------------------------------------
 
 template<auto F> auto eq(auto&& v) { return detail::compare<F, Cmp::Eq>(std::forward<decltype(v)>(v)); }
 template<auto F> auto ne(auto&& v) { return detail::compare<F, Cmp::Ne>(std::forward<decltype(v)>(v)); }
@@ -156,7 +156,7 @@ template<auto F> auto isNotNull() { return NullGuard<F, true>{}; }
 template<typename... Gs>
 auto allOf(Gs&&... gs) {
     static_assert(sizeof...(Gs) > 0, "allOf requires at least one guard");
-    static_assert((valid_all_of_child_v<std::decay_t<Gs>> && ...),
+    static_assert((detail::valid_all_of_child_v<std::decay_t<Gs>> && ...),
         "allOf children must be leaf guards (eq, in, isNull, ...)");
     return AllOf<std::decay_t<Gs>...>{{std::forward<Gs>(gs)...}};
 }
@@ -165,7 +165,7 @@ auto allOf(Gs&&... gs) {
 template<typename... Gs>
 auto anyOf(Gs&&... gs) {
     static_assert(sizeof...(Gs) > 0, "anyOf requires at least one guard");
-    static_assert((valid_any_of_child_v<std::decay_t<Gs>> && ...),
+    static_assert((detail::valid_any_of_child_v<std::decay_t<Gs>> && ...),
         "anyOf children must be leaf guards or allOf(...)");
     return AnyOf<std::decay_t<Gs>...>{{std::forward<Gs>(gs)...}};
 }
@@ -175,7 +175,7 @@ template<typename... Gs>
 auto when(Gs&&... gs) {
     static_assert(sizeof...(Gs) > 0,
         "when requires at least one guard (a write without a predicate targets the whole table)");
-    static_assert((valid_when_child_v<std::decay_t<Gs>> && ...),
+    static_assert((detail::valid_when_child_v<std::decay_t<Gs>> && ...),
         "when children must be leaf guards or anyOf(...); list conjunctions directly");
     return Guards<std::decay_t<Gs>...>{{std::forward<Gs>(gs)...}};
 }
@@ -204,12 +204,16 @@ struct OrderBy {
     std::tuple<Ks...> keys;
 };
 
+namespace detail {
+
 template<typename K> inline constexpr bool is_order_key_v = false;
 template<auto F, bool D, Nulls N> inline constexpr bool is_order_key_v<OrderKey<F, D, N>> = true;
 template<typename G> inline constexpr bool is_order_key_v<FirstKey<G>> = true;
 
 template<typename K> inline constexpr bool is_order_by_v = false;
 template<typename... Ks> inline constexpr bool is_order_by_v<OrderBy<Ks...>> = true;
+
+}  // namespace detail
 
 template<auto F, Nulls N = Nulls::Default> auto asc() { return OrderKey<F, false, N>{}; }
 template<auto F, Nulls N = Nulls::Default> auto desc() { return OrderKey<F, true, N>{}; }
@@ -218,7 +222,7 @@ template<auto F, Nulls N = Nulls::Default> auto desc() { return OrderKey<F, true
 /// evaluates to NULL counts as not satisfied.
 template<typename G>
 auto first(G&& guard) {
-    static_assert(is_guard_v<std::decay_t<G>>,
+    static_assert(detail::is_guard_v<std::decay_t<G>>,
         "first() takes a guard (eq, in, isNull, anyOf, allOf, ...)");
     return FirstKey<std::decay_t<G>>{std::forward<G>(guard)};
 }
@@ -226,7 +230,7 @@ auto first(G&& guard) {
 template<typename... Ks>
 auto orderBy(Ks&&... keys) {
     static_assert(sizeof...(Ks) > 0, "orderBy requires at least one key");
-    static_assert((is_order_key_v<std::decay_t<Ks>> && ...),
+    static_assert((detail::is_order_key_v<std::decay_t<Ks>> && ...),
         "orderBy takes asc<F>(), desc<F>() or first(guard)");
     return OrderBy<std::decay_t<Ks>...>{{std::forward<Ks>(keys)...}};
 }

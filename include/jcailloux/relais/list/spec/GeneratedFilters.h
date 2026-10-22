@@ -65,13 +65,13 @@ constexpr size_t find_filter_index() {
     }
 }
 
-}  // namespace detail
-
 // Forward declaration — Filters::matchesFilters takes entity-side tags, which
 // are stored in the decoupled FilterTags struct (scalar tag_type slots).
 template<typename Descriptor>
     requires ValidFilterSet<Descriptor>
 struct FilterTags;
+
+}  // namespace detail
 
 /// Generated Filters struct that holds filter values
 template<typename Descriptor>
@@ -110,7 +110,7 @@ struct Filters {
     /// Check whether an entity (its extracted tags) matches this query's filters.
     /// `this` holds the query filters; `tags` holds the entity-side scalar values.
     /// Returns true if the entity satisfies every active filter.
-    [[nodiscard]] bool matchesFilters(const FilterTags<Descriptor>& tags) const noexcept {
+    [[nodiscard]] bool matchesFilters(const detail::FilterTags<Descriptor>& tags) const noexcept {
         return [&]<size_t... Is>(std::index_sequence<Is...>) {
             return (matchesFilterAt<Is>(tags) && ...);
         }(std::make_index_sequence<std::tuple_size_v<detail::FiltersTuple<Descriptor>>>{});
@@ -119,7 +119,7 @@ struct Filters {
 private:
     /// Check if entity tag at index I satisfies the query filter at same index.
     template<size_t I>
-    [[nodiscard]] bool matchesFilterAt(const FilterTags<Descriptor>& tags) const noexcept {
+    [[nodiscard]] bool matchesFilterAt(const detail::FilterTags<Descriptor>& tags) const noexcept {
         const auto& tag_value = std::get<I>(tags.values);     // optional<element>
         const auto& filter_value = std::get<I>(values);       // optional<element | vector<element>>
 
@@ -169,13 +169,7 @@ public:
     bool operator==(const Filters&) const = default;
 };
 
-// =============================================================================
-// Named filter access helper macro
-// =============================================================================
-
-/// Helper to access filter by string name (for use in controllers)
-/// Usage: FILTER(filters, "guild_id") = 123;
-#define FILTER(filters, name) (filters).template get<name>()
+namespace detail {
 
 // =============================================================================
 // FilterTags - extracted from entity for fast matching
@@ -189,18 +183,18 @@ template<typename Descriptor>
     requires ValidFilterSet<Descriptor>
 struct FilterTags {
     /// Tuple storing the entity's scalar tag values (each as std::optional<element>)
-    detail::TagsTuple<Descriptor> values{};
+    TagsTuple<Descriptor> values{};
 
     /// Access tag by name (compile-time lookup)
     template<FixedString Name>
     [[nodiscard]] auto& get() noexcept {
-        constexpr size_t idx = detail::find_filter_index<Descriptor, Name>();
+        constexpr size_t idx = find_filter_index<Descriptor, Name>();
         return std::get<idx>(values);
     }
 
     template<FixedString Name>
     [[nodiscard]] const auto& get() const noexcept {
-        constexpr size_t idx = detail::find_filter_index<Descriptor, Name>();
+        constexpr size_t idx = find_filter_index<Descriptor, Name>();
         return std::get<idx>(values);
     }
 
@@ -230,6 +224,8 @@ template<typename Descriptor>
 
     return tags;
 }
+
+}  // namespace detail
 
 }  // namespace jcailloux::relais::list::spec
 

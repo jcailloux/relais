@@ -1,7 +1,7 @@
 /**
  * test_write_affinity.cpp
  *
- * Which row a write declares to the scheduler (io::batch::WriteAffinity), and
+ * Which row a write declares to the scheduler (io::batch::detail::WriteAffinity), and
  * what each repository write declares. No database: the write provider is
  * replaced by one that records the declaration and answers an empty result.
  */
@@ -25,7 +25,7 @@ using namespace relais_test;
 
 namespace jr = jcailloux::relais;
 namespace batch = jr::io::batch;
-using batch::WriteAffinity;
+using batch::detail::WriteAffinity;
 using jr::io::PgParams;
 using jr::entity::set;
 using jr::entity::increment;
@@ -40,7 +40,7 @@ namespace {
 
 /// Hash of the row whose key fills `params` from `first`, in `table`.
 uint64_t hashAt(std::string_view table, const PgParams& params, size_t first, size_t count) {
-    return batch::rowHash(batch::rowAt(batch::tableTag(table), first, count), params);
+    return batch::detail::rowHash(batch::detail::rowAt(batch::detail::tableTag(table), first, count), params);
 }
 
 uint64_t hashOf(std::string_view table, const auto&... key) {
@@ -53,7 +53,7 @@ struct WriteRecorder {
     struct Write {
         WriteAffinity affinity;
         PgParams params;
-        uint64_t hash() const { return batch::rowHash(affinity, params); }
+        uint64_t hash() const { return batch::detail::rowHash(affinity, params); }
     };
     std::vector<Write> writes;
 
@@ -116,7 +116,7 @@ TEST_CASE("WriteAffinity: a row is named by its table and key text", "[affinity]
     }
 
     SECTION("different tables, same key: different values") {
-        CHECK(batch::tableTag("relais_test_items") != batch::tableTag("relais_test_users"));
+        CHECK(batch::detail::tableTag("relais_test_items") != batch::detail::tableTag("relais_test_users"));
         CHECK(hashOf("relais_test_items", int64_t{1}) != hashOf("relais_test_users", int64_t{1}));
     }
 
@@ -127,23 +127,23 @@ TEST_CASE("WriteAffinity: a row is named by its table and key text", "[affinity]
 
     SECTION("what is not a row hashes to zero: the write stays ordered") {
         const auto params = PgParams::make(int64_t{1});
-        CHECK(batch::rowHash(batch::kOrdered, params) == 0);
-        CHECK(batch::rowHash(batch::kFree, params) == 0);
+        CHECK(batch::detail::rowHash(batch::detail::kOrdered, params) == 0);
+        CHECK(batch::detail::rowHash(batch::detail::kFree, params) == 0);
         CHECK(hashAt("t", params, 1, 1) == 0);   // beyond the parameters
         CHECK(hashAt("t", params, 0, 2) == 0);
     }
 
     SECTION("positions that do not fit fall back to kOrdered") {
-        CHECK(batch::rowAt(1, 0, 0) == batch::kOrdered);
-        CHECK(batch::rowAt(1, 256, 1) == batch::kOrdered);
-        CHECK(batch::rowAt(1, 0, WriteAffinity::kFreeCount) == batch::kOrdered);
-        CHECK(batch::rowAt(1, 255, 2).row());
+        CHECK(batch::detail::rowAt(1, 0, 0) == batch::detail::kOrdered);
+        CHECK(batch::detail::rowAt(1, 256, 1) == batch::detail::kOrdered);
+        CHECK(batch::detail::rowAt(1, 0, WriteAffinity::kFreeCount) == batch::detail::kOrdered);
+        CHECK(batch::detail::rowAt(1, 255, 2).row());
     }
 
     SECTION("the default is kOrdered") {
-        CHECK(WriteAffinity{} == batch::kOrdered);
-        CHECK(batch::kOrdered.ordered());
-        CHECK(batch::kFree.free());
+        CHECK(WriteAffinity{} == batch::detail::kOrdered);
+        CHECK(batch::detail::kOrdered.ordered());
+        CHECK(batch::detail::kFree.free());
     }
 }
 
@@ -180,7 +180,7 @@ TEST_CASE("WriteAffinity: each repository write names its row", "[affinity]") {
 
     SECTION("insert with a database-assigned key: free") {
         CHECK(rec.only(UncachedTestItemRepo::insert(makeTestItem("a"))).affinity
-              == batch::kFree);
+              == batch::detail::kFree);
     }
 
     SECTION("every write on one assigned-key row names it alike") {
@@ -232,18 +232,18 @@ TEST_CASE("WriteAffinity: each repository write names its row", "[affinity]") {
 
     SECTION("several rows, or rows known only once it runs: ordered") {
         const std::vector<int64_t> ids{1, 2, 3};
-        CHECK(rec.only(UncachedTestItemRepo::eraseMany(ids)).affinity == batch::kOrdered);
+        CHECK(rec.only(UncachedTestItemRepo::eraseMany(ids)).affinity == batch::detail::kOrdered);
         CHECK(rec.only(UncachedTestSlotRepo::patchWhere(
                   when(eq<SlotF::group_id>(int64_t{1})), increment<SlotF::counter>(1)))
-                  .affinity == batch::kOrdered);
+                  .affinity == batch::detail::kOrdered);
         CHECK(rec.only(UncachedTestSlotRepo::claim(
                   when(eq<SlotF::group_id>(int64_t{1})), 2, set<SlotF::counter>(int32_t{1})))
-                  .affinity == batch::kOrdered);
+                  .affinity == batch::detail::kOrdered);
     }
 
     SECTION("raw queryWrite: ordered") {
         PgParams params;
         CHECK(rec.only(jr::PgProvider::queryWrite("UPDATE t SET x = 1", params)).affinity
-              == batch::kOrdered);
+              == batch::detail::kOrdered);
     }
 }

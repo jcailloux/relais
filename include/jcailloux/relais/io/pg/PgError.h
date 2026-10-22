@@ -50,16 +50,16 @@ class PgUncertainError : public PgError {
 public:
     using PgError::PgError;
 
-    void attachSettleTicket(std::shared_ptr<SettleTicket> ticket) const noexcept {
+    void attachSettleTicket(std::shared_ptr<detail::SettleTicket> ticket) const noexcept {
         ticket_ = std::move(ticket);
     }
-    [[nodiscard]] const std::shared_ptr<SettleTicket>& settleTicket() const noexcept {
+    [[nodiscard]] const std::shared_ptr<detail::SettleTicket>& settleTicket() const noexcept {
         return ticket_;
     }
 
 private:
     // mutable: handlers catch by const reference.
-    mutable std::shared_ptr<SettleTicket> ticket_;
+    mutable std::shared_ptr<detail::SettleTicket> ticket_;
 };
 
 // Client-side query timeout: an I/O wait exceeded PgPoolConfig::query_timeout.

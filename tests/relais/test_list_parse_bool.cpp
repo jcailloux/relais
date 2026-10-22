@@ -27,7 +27,7 @@
 #include <jcailloux/relais/list/spec/SortDescriptor.h>
 
 namespace decl = jcailloux::relais::list::spec;
-namespace parse = jcailloux::relais::list::spec::parse;
+namespace parse = jcailloux::relais::list::spec::detail::parse;
 using relais_test::TestArticle;
 using Entity = entity::generated::TestArticleEntity;
 
@@ -89,13 +89,13 @@ TEST_CASE("HTTP scalar bool EQ filter activates via parseValue",
     auto q = parseOne<BoolEqDesc>("true");
     REQUIRE(q.filters().template get<"is_published">().has_value());
     CHECK(*q.filters().template get<"is_published">() == true);
-    CHECK(decl::matchesFilters<BoolEqDesc>(makeArticle(true), q.filters()));
-    CHECK_FALSE(decl::matchesFilters<BoolEqDesc>(makeArticle(false), q.filters()));
+    CHECK(decl::detail::matchesFilters<BoolEqDesc>(makeArticle(true), q.filters()));
+    CHECK_FALSE(decl::detail::matchesFilters<BoolEqDesc>(makeArticle(false), q.filters()));
 
     auto qOff = parseOne<BoolEqDesc>("off");
     REQUIRE(qOff.filters().template get<"is_published">().has_value());
     CHECK(*qOff.filters().template get<"is_published">() == false);
-    CHECK(decl::matchesFilters<BoolEqDesc>(makeArticle(false), qOff.filters()));
+    CHECK(decl::detail::matchesFilters<BoolEqDesc>(makeArticle(false), qOff.filters()));
 
     // Junk leaves the filter inactive rather than defaulting to false.
     auto qJunk = parseOne<BoolEqDesc>("maybe");
@@ -112,8 +112,8 @@ TEST_CASE("HTTP bool IN list parses, dedups and canonicalizes",
     auto qSingleton = parseOne<BoolInDesc>("t");
     REQUIRE(qSingleton.filters().template get<"is_published">().has_value());
     CHECK(*qSingleton.filters().template get<"is_published">() == std::vector<bool>{true});
-    CHECK(decl::matchesFilters<BoolInDesc>(makeArticle(true), qSingleton.filters()));
-    CHECK_FALSE(decl::matchesFilters<BoolInDesc>(makeArticle(false), qSingleton.filters()));
+    CHECK(decl::detail::matchesFilters<BoolInDesc>(makeArticle(true), qSingleton.filters()));
+    CHECK_FALSE(decl::detail::matchesFilters<BoolInDesc>(makeArticle(false), qSingleton.filters()));
 
     // Invalid elements dropped; an all-invalid list leaves the filter inactive.
     auto qBad = parseOne<BoolInDesc>("maybe,perhaps");

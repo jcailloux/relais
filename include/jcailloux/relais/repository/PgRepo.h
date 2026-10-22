@@ -73,11 +73,11 @@ namespace detail {
 /// Implicit from a column name for the plain `col=$n` form.
 struct SetColumn {
     std::string_view column;
-    entity::SetOp op = entity::SetOp::Assign;
+    entity::detail::SetOp op = entity::detail::SetOp::Assign;
 
     template<typename S>
         requires std::convertible_to<const S&, std::string_view>
-    SetColumn(const S& col, entity::SetOp o = entity::SetOp::Assign)
+    SetColumn(const S& col, entity::detail::SetOp o = entity::detail::SetOp::Assign)
         : column(col), op(o) {}
 };
 
@@ -94,19 +94,19 @@ inline size_t appendSetClause(std::string& sql, std::initializer_list<SetColumn>
         sql += s.column;
         sql += '=';
         switch (s.op) {
-            case entity::SetOp::Assign:
+            case entity::detail::SetOp::Assign:
                 break;
-            case entity::SetOp::Add:
+            case entity::detail::SetOp::Add:
                 sql += qual;
                 sql += s.column;
                 sql += '+';
                 break;
-            case entity::SetOp::Subtract:
+            case entity::detail::SetOp::Subtract:
                 sql += qual;
                 sql += s.column;
                 sql += '-';
                 break;
-            case entity::SetOp::NowPlus:
+            case entity::detail::SetOp::NowPlus:
                 sql += "now()+interval '1 microsecond'*";
                 break;
         }
@@ -420,8 +420,6 @@ inline const char* internSql(std::string sql) {
     return texts.insert(std::move(sql)).first->c_str();
 }
 
-}  // namespace detail
-
 // =========================================================================
 // PgRepo - CRUD operations with L3 (database) access only
 // =========================================================================
@@ -614,7 +612,7 @@ public:
     /// row of this repo may be one, until `ticket` settles and on the copies
     /// cached before. Each cache tier above evicts by it. L3 has no cache:
     /// terminal no-op.
-    static void invalidateEveryRow([[maybe_unused]] const std::shared_ptr<io::SettleTicket>& ticket) {}
+    static void invalidateEveryRow([[maybe_unused]] const std::shared_ptr<io::detail::SettleTicket>& ticket) {}
 
 protected:
 
@@ -678,7 +676,7 @@ protected:
     /// `ticket` settles. L3 has no cache: terminal no-op.
     template<typename... Updates>
     static void rowsMayHaveChanged(
-        [[maybe_unused]] const std::shared_ptr<io::SettleTicket>& ticket,
+        [[maybe_unused]] const std::shared_ptr<io::detail::SettleTicket>& ticket,
         [[maybe_unused]] const detail::RowPredicate<E>& rows,
         [[maybe_unused]] const Updates&... updates) {}
 
@@ -688,7 +686,7 @@ protected:
     /// An erased row goes nowhere: nothing to read again once settled. L3 has
     /// no cache: terminal no-op.
     static io::Task<void> rowsMayHaveBeenErased(
-        [[maybe_unused]] std::shared_ptr<io::SettleTicket> ticket,
+        [[maybe_unused]] std::shared_ptr<io::detail::SettleTicket> ticket,
         [[maybe_unused]] std::span<const Key> keys,
         [[maybe_unused]] std::vector<std::optional<E>>* before) {
         co_return;
@@ -913,7 +911,7 @@ protected:
     {
         std::vector<E> out;
         try {
-            auto where = list::spec::buildWhereClause<Descriptor>(filters);
+            auto where = list::spec::detail::buildWhereClause<Descriptor>(filters);
             // The text depends only on which filters are set: interned, one per
             // shape. Exclusive: two identical erases each run (each reports its
             // rows), and an uncertain one carries its settle ticket.
@@ -964,7 +962,7 @@ protected:
         // surfaces a resolve failure instead of silently evicting nothing.
         // The text depends only on which filters are set: interned, it is one
         // prepared statement per shape and identical selects in flight coalesce.
-        auto where = list::spec::buildWhereClause<Descriptor>(filters);
+        auto where = list::spec::detail::buildWhereClause<Descriptor>(filters);
         std::string sql;
         sql.reserve(128);
         sql += "SELECT ";
@@ -994,7 +992,7 @@ protected:
         requires list::spec::ValidFilterSet<Descriptor>
     static io::Task<size_t> countWhereRaw(const list::spec::Filters<Descriptor>& filters)
     {
-        auto where = list::spec::buildWhereClause<Descriptor>(filters);
+        auto where = list::spec::detail::buildWhereClause<Descriptor>(filters);
         const char* sql = detail::internSql(
             detail::buildCountWhereSql(Mapping::table_name, where.sql));
         auto result = co_await PgProvider::queryParams(sql, where.params);
@@ -1073,7 +1071,7 @@ protected:
     static io::PgParams setParams(size_t extra, Updates&&... updates) {
         io::PgParams params;
         params.params.reserve(sizeof...(Updates) + extra);
-        (params.push(entity::fieldValue<typename E::TraitsType>(
+        (params.push(entity::detail::fieldValue<typename E::TraitsType>(
             std::forward<Updates>(updates))), ...);
         return params;
     }
@@ -1088,19 +1086,19 @@ protected:
 
     /// The row whose key starts at parameter `first`, for the write scheduler
     /// (see WriteAffinity).
-    static constexpr io::batch::WriteAffinity keyAt(size_t first) noexcept {
-        constexpr uint16_t kTable = io::batch::tableTag(Mapping::table_name);
-        return io::batch::rowAt(kTable, first, io::PgParams::keyParamCount<Key>());
+    static constexpr io::batch::detail::WriteAffinity keyAt(size_t first) noexcept {
+        constexpr uint16_t kTable = io::batch::detail::tableTag(Mapping::table_name);
+        return io::batch::detail::rowAt(kTable, first, io::PgParams::keyParamCount<Key>());
     }
 
     /// The row an insert or upsert targets: its key, bound first, when the
     /// caller supplies it; none other can be targeted when the database
     /// assigns it. A mapping that does not say keeps the write ordered.
-    static constexpr io::batch::WriteAffinity insertAffinity() noexcept {
+    static constexpr io::batch::detail::WriteAffinity insertAffinity() noexcept {
         if constexpr (requires { { Mapping::insert_assigns_pk } -> std::convertible_to<bool>; })
-            return Mapping::insert_assigns_pk ? keyAt(0) : io::batch::kFree;
+            return Mapping::insert_assigns_pk ? keyAt(0) : io::batch::detail::kFree;
         else
-            return io::batch::kOrdered;
+            return io::batch::detail::kOrdered;
     }
 
     /// One row of a conditional write returning `Rows`, if it decodes.
@@ -1144,8 +1142,8 @@ protected:
             return detail::buildKeyedPatchSql<Traits, Guard>(
                 Mapping::table_name, pk,
                 {detail::SetColumn(
-                    entity::fieldColumnName<Traits>(std::remove_cvref_t<Updates>{}),
-                    entity::set_op_v<std::remove_cvref_t<Updates>>)...},
+                    entity::detail::fieldColumnName<Traits>(std::remove_cvref_t<Updates>{}),
+                    entity::detail::set_op_v<std::remove_cvref_t<Updates>>)...},
                 Mapping::SQL::returning_columns, Rows);
         });
     }
@@ -1194,7 +1192,7 @@ protected:
         // A relative update re-applies on every execution: two identical ones
         // must both run, so the write opts out of coalescing.
         constexpr auto mode =
-            (entity::is_relative_update_v<Updates> || ...)
+            (entity::detail::is_relative_update_v<Updates> || ...)
                 ? io::batch::WriteMode::Exclusive
                 : io::batch::WriteMode::Idempotent;
         try {
@@ -1315,8 +1313,8 @@ protected:
                 return detail::buildPatchWhereSql<Traits, Pred>(
                     Mapping::table_name, pk,
                     {detail::SetColumn(
-                        entity::fieldColumnName<Traits>(std::remove_cvref_t<Updates>{}),
-                        entity::set_op_v<std::remove_cvref_t<Updates>>)...},
+                        entity::detail::fieldColumnName<Traits>(std::remove_cvref_t<Updates>{}),
+                        entity::detail::set_op_v<std::remove_cvref_t<Updates>>)...},
                     Mapping::SQL::returning_columns, Rows);
             });
 
@@ -1362,8 +1360,8 @@ protected:
                 return detail::buildClaimSql<Traits, Pred, Order>(
                     Mapping::table_name, pk,
                     {detail::SetColumn(
-                        entity::fieldColumnName<Traits>(std::remove_cvref_t<Updates>{}),
-                        entity::set_op_v<std::remove_cvref_t<Updates>>)...},
+                        entity::detail::fieldColumnName<Traits>(std::remove_cvref_t<Updates>{}),
+                        entity::detail::set_op_v<std::remove_cvref_t<Updates>>)...},
                     Mapping::SQL::returning_columns, O.mode, O.lock, Rows);
             });
 
@@ -1544,6 +1542,8 @@ protected:
 
     friend struct ::relais_test::TestInternals;
 };
+
+}  // namespace detail
 
 }  // namespace jcailloux::relais
 

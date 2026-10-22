@@ -26,19 +26,22 @@ namespace jcailloux::relais::list::spec {
 // HTTP Query Parser - Auto-parse filters from HTTP request
 // =============================================================================
 
+/// Hard cap on IN-set cardinality parsed from a query string (abuse mitigation).
+inline constexpr size_t kMaxInListElements = 256;
+
 namespace detail {
 
 /// Parse a single filter value from string based on its type
 template<typename T>
 std::optional<T> parseValue(const std::string& str) {
     if constexpr (std::is_same_v<T, int64_t>) {
-        return jcailloux::relais::list::spec::parse::toInt64(str);
+        return jcailloux::relais::list::spec::detail::parse::toInt64(str);
     } else if constexpr (std::is_same_v<T, int32_t> || std::is_same_v<T, int>) {
-        return jcailloux::relais::list::spec::parse::toInt(str);
+        return jcailloux::relais::list::spec::detail::parse::toInt(str);
     } else if constexpr (std::is_same_v<T, bool>) {
-        return jcailloux::relais::list::spec::parse::toBool(str);
+        return jcailloux::relais::list::spec::detail::parse::toBool(str);
     } else if constexpr (std::is_same_v<T, std::string>) {
-        if (jcailloux::relais::list::spec::parse::isSafeLength(str)) {
+        if (jcailloux::relais::list::spec::detail::parse::isSafeLength(str)) {
             return str;
         }
         return std::nullopt;
@@ -49,9 +52,6 @@ std::optional<T> parseValue(const std::string& str) {
         return std::nullopt;
     }
 }
-
-/// Hard cap on IN-set cardinality parsed from a query string (abuse mitigation).
-inline constexpr size_t kMaxInListElements = 256;
 
 /// Parse one IN-set element with STRICT validation. Unlike scalar parseValue
 /// (which maps a malformed int to 0 via parse::toInt64), an integral element is
@@ -97,12 +97,12 @@ std::optional<typename FilterType::element_type> parseFilterElement(const std::s
 }
 
 /// Parse a comma-separated query value into a canonical set for an IN filter:
-/// split on ',' → parseFilterElement per element (dropping invalid ones, and
-/// setting `rejected` if there were any) → sort → unique → truncate to
-/// kMaxInListElements. The truncation happens AFTER sort+unique so the
-/// resulting group key is deterministic regardless of the arrival order or
-/// duplicate count — `tech,science` and `science,tech,tech` yield
-/// byte-identical keys.
+/// split on ',' → parseFilterElement per element (dropping invalid ones) →
+/// sort → unique → truncate to kMaxInListElements. `rejected` is set when the
+/// set lost an element, invalid or beyond the cap. The truncation happens AFTER
+/// sort+unique so the resulting group key is deterministic regardless of the
+/// arrival order or duplicate count — `tech,science` and `science,tech,tech`
+/// yield byte-identical keys.
 template<typename FilterType>
 std::vector<typename FilterType::element_type> parseInList(const std::string& str, bool& rejected) {
     std::vector<typename FilterType::element_type> out;
@@ -122,6 +122,7 @@ std::vector<typename FilterType::element_type> parseInList(const std::string& st
     out.erase(std::unique(out.begin(), out.end()), out.end());
     if (out.size() > kMaxInListElements) {
         out.erase(out.begin() + kMaxInListElements, out.end());
+        rejected = true;
     }
     return out;
 }
@@ -186,7 +187,7 @@ ListQuery<Descriptor> parseListQuery(const Map& params) {
     // Parse limit
     if (auto it = params.find("limit"); it != params.end()) {
         query.limit = normalizeLimit<Descriptor>(
-            static_cast<uint16_t>(jcailloux::relais::list::spec::parse::toInt(it->second)));
+            static_cast<uint16_t>(jcailloux::relais::list::spec::detail::parse::toInt(it->second)));
     } else {
         // No limit param → the descriptor's declared default page size.
         query.limit = defaultLimit<Descriptor>();
@@ -204,7 +205,7 @@ ListQuery<Descriptor> parseListQuery(const Map& params) {
     // Parse offset (ignored if cursor is present — cursor takes precedence)
     if (query.cursor.empty()) {
         if (auto it = params.find("offset"); it != params.end()) {
-            query.offset = static_cast<uint32_t>(jcailloux::relais::list::spec::parse::toInt(it->second));
+            query.offset = static_cast<uint32_t>(jcailloux::relais::list::spec::detail::parse::toInt(it->second));
         }
     }
 
@@ -218,7 +219,7 @@ ListQuery<Descriptor> parseListQuery(const Map& params) {
 
 /// Parse and validate ListQuery from HTTP request parameters
 /// Returns error if any parameter is invalid (unknown filter, filter value that
-/// does not parse, invalid sort, bad limit)
+/// does not parse, set above kMaxInListElements, invalid sort, bad limit)
 template<typename Descriptor, typename Map = std::unordered_map<std::string, std::string>>
     requires ValidListDescriptor<Descriptor>
 std::expected<ListQuery<Descriptor>, QueryValidationError> parseListQueryStrict(
@@ -322,7 +323,7 @@ std::expected<ListQuery<Descriptor>, QueryValidationError> parseListQueryStrict(
 
     // Parse and validate limit
     if (auto it = params.find("limit"); it != params.end()) {
-        auto parsed_limit = static_cast<uint16_t>(jcailloux::relais::list::spec::parse::toInt(it->second));
+        auto parsed_limit = static_cast<uint16_t>(jcailloux::relais::list::spec::detail::parse::toInt(it->second));
 
         if (!isLimitAllowed<Descriptor>(parsed_limit)) {
             return std::unexpected(QueryValidationError{
@@ -354,7 +355,7 @@ std::expected<ListQuery<Descriptor>, QueryValidationError> parseListQueryStrict(
 
     // Parse offset
     if (auto it = params.find("offset"); it != params.end()) {
-        query.offset = static_cast<uint32_t>(jcailloux::relais::list::spec::parse::toInt(it->second));
+        query.offset = static_cast<uint32_t>(jcailloux::relais::list::spec::detail::parse::toInt(it->second));
     }
 
     // Reject conflicting pagination: cursor + offset

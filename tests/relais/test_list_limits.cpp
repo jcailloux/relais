@@ -28,6 +28,7 @@
 #include <jcailloux/relais/repository/Repo.h>
 
 using namespace jcailloux::relais::list::spec;
+using namespace jcailloux::relais::list::spec::detail;
 
 namespace {
 
@@ -65,11 +66,11 @@ struct NoGrid {
 };
 
 namespace lst = jcailloux::relais::list;
-static_assert(lst::HasLimitConfig<FakeTraits<1>, int>, "size-1 grid satisfies HasLimitConfig");
-static_assert(lst::HasLimitConfig<FakeTraits<3>, int>, "size-3 grid satisfies HasLimitConfig");
-static_assert(lst::HasLimitConfig<FakeTraits<4>, int>, "size-4 grid still satisfies HasLimitConfig");
-static_assert(lst::HasLimitConfig<FakeTraits<5>, int>, "size-5 grid satisfies HasLimitConfig");
-static_assert(!lst::HasLimitConfig<NoGrid, int>, "no grid -> not satisfied");
+static_assert(lst::detail::HasLimitConfig<FakeTraits<1>, int>, "size-1 grid satisfies HasLimitConfig");
+static_assert(lst::detail::HasLimitConfig<FakeTraits<3>, int>, "size-3 grid satisfies HasLimitConfig");
+static_assert(lst::detail::HasLimitConfig<FakeTraits<4>, int>, "size-4 grid still satisfies HasLimitConfig");
+static_assert(lst::detail::HasLimitConfig<FakeTraits<5>, int>, "size-5 grid satisfies HasLimitConfig");
+static_assert(!lst::detail::HasLimitConfig<NoGrid, int>, "no grid -> not satisfied");
 
 // --- ListMixin::ListTraits derives its grid from the descriptor -----------
 // limitSteps/maxLimit must mirror the model's allowedLimits, not a fixed

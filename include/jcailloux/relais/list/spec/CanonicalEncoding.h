@@ -177,8 +177,6 @@ std::string encodeReserved(Encode&& encode) {
     return out;
 }
 
-}  // namespace detail
-
 // =============================================================================
 // Canonical Cache Key Computation — deterministic binary encoding from values
 // =============================================================================
@@ -237,7 +235,7 @@ std::string groupKey(
 template<typename Descriptor>
     requires ValidListDescriptor<Descriptor>
 std::string cacheKey(const std::string& group_key, const ListQueryParams<Descriptor>& params) {
-    detail::ByteCounter suffix;
+    ByteCounter suffix;
     detail::appendPagination<Descriptor>(suffix, params);
     std::string key;
     key.reserve(group_key.size() + suffix.size);
@@ -246,6 +244,8 @@ std::string cacheKey(const std::string& group_key, const ListQueryParams<Descrip
     return key;
 }
 
+}  // namespace detail
+
 /// Seal a mutable params bundle into an immutable ListQuery: canonicalizes the
 /// IN/NIN sets in place, so that equal queries encode equal keys. The sole
 /// producer of a ListQuery outside the fluent builder — query() accepts
@@ -253,7 +253,7 @@ std::string cacheKey(const std::string& group_key, const ListQueryParams<Descrip
 template<typename Descriptor>
     requires ValidListDescriptor<Descriptor>
 ListQuery<Descriptor> seal(ListQueryParams<Descriptor> params) {
-    canonicalize<Descriptor>(params.filters);
+    detail::canonicalize<Descriptor>(params.filters);
     return ListQuery<Descriptor>(std::move(params));
 }
 

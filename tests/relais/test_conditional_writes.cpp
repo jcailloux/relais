@@ -141,7 +141,7 @@ std::optional<double> dbExpiresInSeconds(int64_t id) {
 TEST_CASE("[relative] SET fragments and write-mode trait", "[relative][sql]")
 {
     namespace d = jr::detail;
-    using Op = jr::entity::SetOp;
+    using Op = jr::entity::detail::SetOp;
 
     SECTION("each op emits its own right-hand side, values numbered in order") {
         auto sql = d::buildKeyedPatchSql<TestSlotEntity::TraitsType, void>(
@@ -170,15 +170,15 @@ TEST_CASE("[relative] SET fragments and write-mode trait", "[relative][sql]")
     }
 
     SECTION("only relative updates are marked non-idempotent") {
-        STATIC_REQUIRE_FALSE(jr::entity::is_relative_update_v<
+        STATIC_REQUIRE_FALSE(jr::entity::detail::is_relative_update_v<
             decltype(set<SlotF::counter>(1))>);
-        STATIC_REQUIRE_FALSE(jr::entity::is_relative_update_v<
+        STATIC_REQUIRE_FALSE(jr::entity::detail::is_relative_update_v<
             decltype(jr::entity::setNull<SlotF::holder>())>);
-        STATIC_REQUIRE(jr::entity::is_relative_update_v<
+        STATIC_REQUIRE(jr::entity::detail::is_relative_update_v<
             decltype(increment<SlotF::counter>(1))>);
-        STATIC_REQUIRE(jr::entity::is_relative_update_v<
+        STATIC_REQUIRE(jr::entity::detail::is_relative_update_v<
             decltype(decrement<SlotF::counter>(1))>);
-        STATIC_REQUIRE(jr::entity::is_relative_update_v<
+        STATIC_REQUIRE(jr::entity::detail::is_relative_update_v<
             decltype(nowPlus<SlotF::expires_at>(5s))&>);
     }
 
@@ -489,6 +489,7 @@ TEST_CASE("[guard] bounded disjunctive normal form", "[guard][sql]")
     }
 
     SECTION("each node accepts only its allowed children") {
+        using namespace jr::entity::detail;
         using Leaf = decltype(eq<SlotF::counter>(1));
         using All = decltype(allOf(eq<SlotF::counter>(1)));
         using Any = decltype(anyOf(eq<SlotF::counter>(1)));
@@ -549,7 +550,7 @@ TEST_CASE("[guard] ordering", "[guard][sql][order]")
 TEST_CASE("[guard] parameter numbering across SET, predicate and ordering", "[guard][sql]")
 {
     namespace d = jr::detail;
-    using Op = jr::entity::SetOp;
+    using Op = jr::entity::detail::SetOp;
 
     auto pred = when(eq<SlotF::group_id>(int64_t{1}), lt<SlotF::expires_at>(dbNow),
                      in<SlotF::state>({SlotState::Free}));
@@ -773,7 +774,7 @@ TEST_CASE("[patchIf] SQL: SET values, then the key, then the guard", "[patchIf][
         auto sql = d::buildKeyedPatchSql<SlotTraits, G>(
             SlotMapping::table_name, SlotMapping::primary_key_column,
             {d::SetColumn(std::string_view("\"holder\"")),
-             d::SetColumn(std::string_view("\"version\""), jr::entity::SetOp::Add)},
+             d::SetColumn(std::string_view("\"version\""), jr::entity::detail::SetOp::Add)},
             "id, version", jr::Returns::Changes);
         REQUIRE(sql ==
             "WITH o AS (SELECT id, version,pg_current_xact_id() FROM relais_test_slots WHERE \"id\"=$3 "
@@ -788,7 +789,7 @@ TEST_CASE("[patchIf] SQL: SET values, then the key, then the guard", "[patchIf][
         using G = decltype(when(lt<TallyF::hits>(int64_t{0})));
         auto sql = d::buildKeyedPatchSql<TallyTraits, G>(
             TallyMapping::table_name, TallyMapping::primary_key_columns,
-            {d::SetColumn(std::string_view("\"hits\""), jr::entity::SetOp::Add)},
+            {d::SetColumn(std::string_view("\"hits\""), jr::entity::detail::SetOp::Add)},
             "group_id, bucket, hits", jr::Returns::Changes);
         REQUIRE(sql ==
             "WITH o AS (SELECT group_id, bucket, hits,pg_current_xact_id() FROM relais_test_slot_tallies "
@@ -802,7 +803,7 @@ TEST_CASE("[patchIf] SQL: SET values, then the key, then the guard", "[patchIf][
         using G = decltype(when(eq<SlotF::version>(int64_t{0})));
         auto sql = d::buildKeyedPatchSql<SlotTraits, G>(
             SlotMapping::table_name, SlotMapping::primary_key_column,
-            {d::SetColumn(std::string_view("\"version\""), jr::entity::SetOp::Add)},
+            {d::SetColumn(std::string_view("\"version\""), jr::entity::detail::SetOp::Add)},
             "id, version", jr::Returns::After);
         REQUIRE(sql ==
             "UPDATE relais_test_slots SET \"version\"=\"version\"+$1 "
@@ -1105,7 +1106,7 @@ TEST_CASE("[patchWhere] SQL: locking CTE, qualified SET, before and after return
         auto sql = d::buildPatchWhereSql<SlotTraits, P>(
             SlotMapping::table_name, SlotMapping::primary_key_column,
             {d::SetColumn(std::string_view("\"holder\"")),
-             d::SetColumn(std::string_view("\"counter\""), jr::entity::SetOp::Add)},
+             d::SetColumn(std::string_view("\"counter\""), jr::entity::detail::SetOp::Add)},
             "id, holder, counter", jr::Returns::Changes);
         REQUIRE(sql ==
             "WITH o AS (SELECT id, holder, counter,pg_current_xact_id() FROM relais_test_slots "
@@ -1122,7 +1123,7 @@ TEST_CASE("[patchWhere] SQL: locking CTE, qualified SET, before and after return
         using P = decltype(when(lt<TallyF::hits>(int64_t{3})));
         auto sql = d::buildPatchWhereSql<TallyTraits, P>(
             TallyMapping::table_name, TallyMapping::primary_key_columns,
-            {d::SetColumn(std::string_view("\"hits\""), jr::entity::SetOp::Add)},
+            {d::SetColumn(std::string_view("\"hits\""), jr::entity::detail::SetOp::Add)},
             TallyMapping::SQL::returning_columns, jr::Returns::Changes);
         REQUIRE(sql ==
             "WITH o AS (SELECT group_id, bucket, hits,pg_current_xact_id() FROM relais_test_slot_tallies "
@@ -1136,14 +1137,14 @@ TEST_CASE("[patchWhere] SQL: locking CTE, qualified SET, before and after return
         using P = decltype(when(lt<SlotF::expires_at>(dbNow)));
         const auto after = d::buildPatchWhereSql<SlotTraits, P>(
             SlotMapping::table_name, SlotMapping::primary_key_column,
-            {d::SetColumn(std::string_view("\"counter\""), jr::entity::SetOp::Add)},
+            {d::SetColumn(std::string_view("\"counter\""), jr::entity::detail::SetOp::Add)},
             "id, counter", jr::Returns::After);
         REQUIRE(after ==
             "UPDATE relais_test_slots SET \"counter\"=\"counter\"+$1 "
             "WHERE \"expires_at\"<now() RETURNING id, counter");
         const auto count = d::buildPatchWhereSql<SlotTraits, P>(
             SlotMapping::table_name, SlotMapping::primary_key_column,
-            {d::SetColumn(std::string_view("\"counter\""), jr::entity::SetOp::Add)},
+            {d::SetColumn(std::string_view("\"counter\""), jr::entity::detail::SetOp::Add)},
             "id, counter", jr::Returns::Count);
         REQUIRE(count ==
             "UPDATE relais_test_slots SET \"counter\"=\"counter\"+$1 "
@@ -1461,7 +1462,7 @@ TEST_CASE("[claim] SQL: locked candidates ranked, count check, both versions and
         auto sql = d::buildClaimSql<SlotTraits, decltype(pred), decltype(order)>(
             SlotMapping::table_name, SlotMapping::primary_key_column,
             {d::SetColumn(std::string_view("\"holder\"")),
-             d::SetColumn(std::string_view("\"expires_at\""), jr::entity::SetOp::NowPlus)},
+             d::SetColumn(std::string_view("\"expires_at\""), jr::entity::detail::SetOp::NowPlus)},
             "id, holder, priority", jr::ClaimMode::Exact, jr::Lock::SkipLocked, jr::Returns::Changes);
         const std::string ord =
             "ORDER BY CASE WHEN \"holder\"=$6 THEN 0 ELSE 1 END,\"priority\" DESC,\"id\"";
@@ -1482,7 +1483,7 @@ TEST_CASE("[claim] SQL: locked candidates ranked, count check, both versions and
         using P = decltype(when(lt<TallyF::hits>(int64_t{3})));
         auto sql = d::buildClaimSql<TallyTraits, P, void>(
             TallyMapping::table_name, TallyMapping::primary_key_columns,
-            {d::SetColumn(std::string_view("\"hits\""), jr::entity::SetOp::Add)},
+            {d::SetColumn(std::string_view("\"hits\""), jr::entity::detail::SetOp::Add)},
             TallyMapping::SQL::returning_columns, jr::ClaimMode::UpTo, jr::Lock::Wait, jr::Returns::Changes);
         REQUIRE(sql ==
             "WITH l AS (SELECT group_id, bucket, hits FROM relais_test_slot_tallies "
@@ -1553,7 +1554,7 @@ size_t freeCount() {
 /// Created and destroyed on the event loop; closing it rolls back.
 class LockSession {
 public:
-    using Conn = io::PgConnection<IoCtx>;
+    using Conn = io::detail::PgConnection<IoCtx>;
 
     LockSession() {
         conn_ = sync([]() -> io::Task<std::shared_ptr<Conn>> {

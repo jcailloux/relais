@@ -148,15 +148,15 @@ void checkParams(const decl::ListQueryParams<D>& p,
     const auto q = decl::seal<D>(p);
     CHECK(hex(q.groupKey()) == group);
     CHECK(hex(q.cacheKey()) == page);
-    CHECK(hex(decl::groupKey<D>(p.filters, p.sort)) == group);
-    CHECK(hex(decl::cacheKey<D>(q.groupKey(), p)) == page);
+    CHECK(hex(decl::detail::groupKey<D>(p.filters, p.sort)) == group);
+    CHECK(hex(decl::detail::cacheKey<D>(q.groupKey(), p)) == page);
 
     const std::string prefix = "p:";
     std::string appended = prefix;
-    decl::appendGroupKey<D>(appended, q);
+    decl::detail::appendGroupKey<D>(appended, q);
     CHECK(hex(appended) == hex(prefix) + std::string(group));
     appended = prefix;
-    decl::appendPageKey<D>(appended, q);
+    decl::detail::appendPageKey<D>(appended, q);
     CHECK(hex(appended) == hex(prefix) + std::string(page));
 }
 

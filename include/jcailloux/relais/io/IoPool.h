@@ -72,6 +72,8 @@ struct IoPoolConfig {
     int first_core = 1;  // Avoid core 0 (OS/IRQ)
 };
 
+namespace detail {
+
 // BootTask — an eager, owned coroutine for per-worker startup.
 //
 // Unlike DetachedTask (which self-destroys at final_suspend and hands back no
@@ -120,6 +122,8 @@ struct BootTask {
     BootTask& operator=(const BootTask&) = delete;
     ~BootTask() { if (handle) handle.destroy(); }
 };
+
+}  // namespace detail
 
 // IoPool — N event loops pinned on N cores, each with its own resources.
 //
@@ -196,7 +200,7 @@ public:
                 }
 
                 // Initialize resources on the event loop
-                auto initTask = [&]() -> BootTask {
+                auto initTask = [&]() -> detail::BootTask {
                     try {
                         // PG pool — acquire_timeout bounds the warm-up connect.
                         w.pg_pool = co_await PgPool<Io>::create(
@@ -211,7 +215,7 @@ public:
 
                         // Batch scheduler — owned per worker (shared so the
                         // thread_local providers can co-own it).
-                        w.batcher = std::make_shared<batch::BatchScheduler<Io>>(
+                        w.batcher = std::make_shared<batch::detail::BatchScheduler<Io>>(
                             *w.io, w.pg_pool, config.max_concurrent_per_worker);
 
                         // Bind THIS worker thread's providers to its own batcher.
@@ -327,9 +331,9 @@ private:
         // destruction (reverse order) reclaims it BEFORE `io`: a boot still
         // suspended on a connect at fail-fast is destroyed while its loop is
         // alive, so its connection dtors' removeWatch lands on a live IoContext.
-        BootTask init_task;
+        detail::BootTask init_task;
         std::shared_ptr<PgPool<Io>> pg_pool;
-        std::shared_ptr<batch::BatchScheduler<Io>> batcher;
+        std::shared_ptr<batch::detail::BatchScheduler<Io>> batcher;
         std::jthread thread;
         std::exception_ptr init_error;  // set if this worker's init threw
         int worker_id = 0;

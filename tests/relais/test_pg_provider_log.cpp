@@ -7,8 +7,10 @@
 #include <fixtures/TestRunner.h>
 #include <fixtures/TestConnInfo.h>
 
+#include <atomic>
 #include <cstdint>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace jcailloux::relais;
@@ -28,6 +30,32 @@ namespace {
     void testLogCallback(log::Level level, const char* msg, size_t len) {
         captured_logs.push_back({level, std::string(msg, len)});
     }
+}
+
+TEST_CASE("Log: the callback can change while other threads log", "[log]") {
+    static std::atomic<int> calls{0};
+    auto counting = [](log::Level, const char*, size_t) {
+        calls.fetch_add(1, std::memory_order_relaxed);
+    };
+
+    std::atomic<bool> stop{false};
+    std::vector<std::thread> loggers;
+    for (int t = 0; t < 4; ++t) {
+        loggers.emplace_back([&] {
+            while (!stop.load(std::memory_order_relaxed)) RELAIS_LOG_DEBUG << "tick";
+        });
+    }
+    for (int i = 0; i < 1000; ++i) {
+        log::setCallback(i % 2 ? +counting : nullptr);
+    }
+    stop.store(true, std::memory_order_relaxed);
+    for (auto& th : loggers) th.join();
+
+    log::setCallback(counting);
+    const int before = calls.load();
+    RELAIS_LOG_DEBUG << "after";
+    CHECK(calls.load() == before + 1);
+    log::setCallback(nullptr);
 }
 
 TEST_CASE("Log: no callback means no crash", "[log]") {

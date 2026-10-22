@@ -7,7 +7,7 @@
 
 #include "ListQuery.h"
 
-namespace jcailloux::relais::list {
+namespace jcailloux::relais::list::detail {
 
 // =============================================================================
 // Concepts for ListCacheTraits requirements
@@ -220,6 +220,6 @@ struct ListCacheTraits<entity::MyEntity> {
 };
 */
 
-}  // namespace jcailloux::relais::list
+}  // namespace jcailloux::relais::list::detail
 
 #endif  // JCX_RELAIS_LIST_LISTCACHETRAITS_H

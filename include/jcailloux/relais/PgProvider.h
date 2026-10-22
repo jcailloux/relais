@@ -24,7 +24,7 @@ namespace jcailloux::relais {
 // =============================================================================
 // PgProvider — Type-erased service locator for PostgreSQL
 //
-// Wraps the per-loop io::batch::BatchScheduler<Io> behind std::function to
+// Wraps the per-loop io::batch::detail::BatchScheduler<Io> behind std::function to
 // decouple relais from the concrete IoContext type. The application
 // initializes once at startup with the appropriate IoContext.
 //
@@ -103,14 +103,14 @@ public:
         const char* sql, const io::PgParams& params,
         const io::batch::WriteMode mode = io::batch::WriteMode::Idempotent)
     {
-        return queryWrite(sql, params, mode, io::batch::kOrdered);
+        return queryWrite(sql, params, mode, io::batch::detail::kOrdered);
     }
 
     /// queryWrite naming the row the write targets (internal: the repositories
-    /// know it, raw SQL does not). See io::batch::WriteAffinity.
+    /// know it, raw SQL does not). See io::batch::detail::WriteAffinity.
     static io::Task<io::batch::PgWriteResult> queryWrite(
         const char* sql, const io::PgParams& params,
-        const io::batch::WriteMode mode, const io::batch::WriteAffinity affinity)
+        const io::batch::WriteMode mode, const io::batch::detail::WriteAffinity affinity)
     {
         if (!pg_write_) throw std::logic_error("PgProvider::queryWrite() called before init() on this thread (providers are thread_local — init() must run on each loop thread)");
         return pg_write_(sql, params, mode, affinity);
@@ -171,7 +171,7 @@ public:
                 "thread_local — call it once per loop thread for N-loop)");
         }
 
-        bindBatcher<Io>(std::make_shared<io::batch::BatchScheduler<Io>>(
+        bindBatcher<Io>(std::make_shared<io::batch::detail::BatchScheduler<Io>>(
             io, std::move(pool), max_concurrent));
     }
 
@@ -181,7 +181,7 @@ public:
     /// objects co-own `batcher` via shared_ptr — it lives until reset() or the
     /// thread exits.
     template<typename Io>
-    static void bindBatcher(std::shared_ptr<io::batch::BatchScheduler<Io>> batcher) {
+    static void bindBatcher(std::shared_ptr<io::batch::detail::BatchScheduler<Io>> batcher) {
         pg_query_ = [batcher](const char* sql) {
             return batcher->directQuery(sql);
         };
@@ -208,7 +208,7 @@ public:
         // so no co_await/co_return wrapper — zero added coroutine frame on the write path.
         pg_write_ = [batcher](const char* sql, const io::PgParams& params,
                               io::batch::WriteMode mode,
-                              io::batch::WriteAffinity affinity) {
+                              io::batch::detail::WriteAffinity affinity) {
             return batcher->submitPgWrite(sql, io::PgParams{params}, mode, affinity);
         };
         post_ = [batcher](std::function<void()> cb) { batcher->post(std::move(cb)); };
@@ -237,7 +237,7 @@ public:
         const char*, const char*, std::vector<io::PgParams>)>;
     using PgWriteFn = std::function<io::Task<io::batch::PgWriteResult>(
         const char*, const io::PgParams&, io::batch::WriteMode,
-        io::batch::WriteAffinity)>;
+        io::batch::detail::WriteAffinity)>;
     using PostFn = std::function<void(std::function<void()>)>;
 
     // thread_local: each event-loop thread binds its OWN pool/batcher by calling

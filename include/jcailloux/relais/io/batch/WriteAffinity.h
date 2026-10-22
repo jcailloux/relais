@@ -7,7 +7,7 @@
 
 #include "jcailloux/relais/io/pg/PgParams.h"
 
-namespace jcailloux::relais::io::batch {
+namespace jcailloux::relais::io::batch::detail {
 
 // WriteAffinity — which row a write targets, as far as ordering is concerned.
 //
@@ -91,7 +91,7 @@ inline uint64_t rowHash(WriteAffinity a, const PgParams& params) noexcept {
         return 0;
     uint64_t h = write_affinity::mixLength(write_affinity::kFnvOffset, a.table);
     for (size_t i = a.first; i < size_t{a.first} + a.count; ++i) {
-        const PgParam& p = params.params[i];
+        const io::detail::PgParam& p = params.params[i];
         if (p.isNull()) {
             h = write_affinity::mixLength(h, ~uint64_t{0});
         } else {
@@ -103,6 +103,6 @@ inline uint64_t rowHash(WriteAffinity a, const PgParams& params) noexcept {
     return h != 0 ? h : 1;
 }
 
-}  // namespace jcailloux::relais::io::batch
+}  // namespace jcailloux::relais::io::batch::detail
 
 #endif  // JCX_RELAIS_IO_BATCH_WRITE_AFFINITY_H

@@ -24,7 +24,7 @@
 #include "jcailloux/relais/io/pg/PgResult.h"
 #include "jcailloux/relais/io/pg/SettleTicket.h"
 
-namespace jcailloux::relais::io {
+namespace jcailloux::relais::io::detail {
 
 // PgConnection — RAII async PostgreSQL connection using libpq + IoContext
 
@@ -807,6 +807,6 @@ private:
     BackendId backend_{};
 };
 
-} // namespace jcailloux::relais::io
+}  // namespace jcailloux::relais::io::detail
 
 #endif // JCX_RELAIS_IO_PG_CONNECTION_H
