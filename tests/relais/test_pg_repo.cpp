@@ -1,7 +1,7 @@
 /**
  * test_base_repository.cpp
  *
- * Tests for PgRepo (L3 - direct database access, no caching).
+ * Tests for PgRepo (direct database access, no caching).
  * Uses Uncached configurations that resolve to PgRepo via Repo<>.
  *
  *   1. TestItem    — CRUD, edge cases, multiple entities, serialization

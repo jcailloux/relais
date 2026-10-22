@@ -1,6 +1,6 @@
 /**
  * test_decl_list_in.cpp
- * The IN filter operator on every tier. Invariant: L1 and L3 give the same
+ * The IN filter operator on every tier. Invariant: L1 and PostgreSQL give the same
  * verdict — "entity scalar ∈ query set".
  *
  * L1 matching (transport-free, hand-built descriptors with IN filters and a
@@ -12,10 +12,10 @@
  * - combinations EQ + IN + range
  * - optional member null ∉ any set
  *
- * L3 SQL generation, binary group key and HTTP parsing (transport-free).
+ * SQL generation, binary group key and HTTP parsing (transport-free).
  *
  * Cross-tier property suite: a fixed-seed test forces L1 `matchesFilters` and
- * L3 PostgreSQL `= ANY` through the same (entity, set) pairs and asserts
+ * PostgreSQL `= ANY` through the same (entity, set) pairs and asserts
  * identical verdicts. Covers all four element encodings
  * (string/int64/int32-optional/bool), negatives/extremes, empty sets, null
  * members, and array-literal escaping that round-trips through PG.
@@ -246,7 +246,7 @@ TEST_CASE("[DeclListIn] EQ + IN + range combination", "[list][in][unit]") {
 }
 
 // =============================================================================
-// L3 SQL generation — buildWhereClause IN branch (transport-free).
+// SQL generation — buildWhereClause IN branch (transport-free).
 // Validates the `= ANY($n)` clause, the single-array-param invariant, $n
 // numbering when combined with EQ/range, empty-set literal, and escaping.
 // (Live-DB round-trip + cursor/offset coverage lands with the IN fixtures.)
@@ -498,10 +498,10 @@ TEST_CASE("[DeclListIn] parse: strict rejects undeclared filter, accepts IN",
 }
 
 // =============================================================================
-// Cross-tier consistency — L1 and L3 agree under load.
+// Cross-tier consistency — L1 and PostgreSQL agree under load.
 //
 // For each (entity, set) pair both tiers must agree on "entity scalar ∈ set":
-// L1 `matchesFilters` (pure C++) and L3 PostgreSQL `= ANY` (the real array
+// L1 `matchesFilters` (pure C++) and PostgreSQL `= ANY` (the real array
 // parser, fed buildWhereClause's array literal so escaping round-trips through
 // PG). Data is generated from a fixed seed (deterministic, reproducible).
 // =============================================================================
@@ -534,10 +534,10 @@ void crossTierProperty(const std::vector<Entity>& entities,
             auto wc = decl::detail::buildWhereClause<Desc>(f);
             const std::string arr = paramStr(wc.params.params[0]);
             const auto fld = getField(e);
-            const bool l3 = fld.has_value() && sqlAnyVerdict(*fld, arr, cast);
+            const bool sql = fld.has_value() && sqlAnyVerdict(*fld, arr, cast);
 
-            CAPTURE(e.id, i, arr, l1, l3);
-            CHECK(l1 == l3);   // L1 vs L3 SQL
+            CAPTURE(e.id, i, arr, l1, sql);
+            CHECK(l1 == sql);   // L1 vs SQL
         }
     }
 }
@@ -591,7 +591,7 @@ std::vector<Entity> makeEntities(std::mt19937& gen, size_t n) {
 
 }  // namespace
 
-TEST_CASE("[DeclListIn][xtier] L1/L3 agree on string membership",
+TEST_CASE("[DeclListIn][xtier] L1/PG agree on string membership",
           "[integration][db][list][in][xtier]") {
     TransactionGuard tx;
     std::mt19937 gen(0xC0FFEE01);
@@ -602,7 +602,7 @@ TEST_CASE("[DeclListIn][xtier] L1/L3 agree on string membership",
         [](const Entity& e) { return std::optional<std::string>(e.category); });
 }
 
-TEST_CASE("[DeclListIn][xtier] L1/L3 agree on int64 membership",
+TEST_CASE("[DeclListIn][xtier] L1/PG agree on int64 membership",
           "[integration][db][list][in][xtier]") {
     TransactionGuard tx;
     std::mt19937 gen(0xC0FFEE02);
@@ -613,7 +613,7 @@ TEST_CASE("[DeclListIn][xtier] L1/L3 agree on int64 membership",
         [](const Entity& e) { return std::optional<int64_t>(e.author_id); });
 }
 
-TEST_CASE("[DeclListIn][xtier] L1/L3 agree on int32 optional membership",
+TEST_CASE("[DeclListIn][xtier] L1/PG agree on int32 optional membership",
           "[integration][db][list][in][xtier]") {
     TransactionGuard tx;
     std::mt19937 gen(0xC0FFEE03);
@@ -625,7 +625,7 @@ TEST_CASE("[DeclListIn][xtier] L1/L3 agree on int32 optional membership",
         [](const Entity& e) { return e.view_count; });
 }
 
-TEST_CASE("[DeclListIn][xtier] L1/L3 agree on bool membership",
+TEST_CASE("[DeclListIn][xtier] L1/PG agree on bool membership",
           "[integration][db][list][in][xtier]") {
     TransactionGuard tx;
     std::mt19937 gen(0xC0FFEE04);

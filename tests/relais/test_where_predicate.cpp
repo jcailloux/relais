@@ -278,7 +278,7 @@ TEST_CASE("eraseWhere invalidates the purged group and prunes the orthogonal one
     REQUIRE(sync(TestArticleListRepo::query(qA))->size() == 3);  // warm A
     REQUIRE(sync(TestArticleListRepo::query(qB))->size() == 2);  // warm B
 
-    // Direct L3 insert into B's group — the cache does not know about it. A read
+    // Direct SQL insert into B's group — the cache does not know about it. A read
     // that hits the (surviving) cache returns the stale 2; a re-fetch returns 3.
     insertTestArticle("tech", B, "B3", 60);
 
@@ -315,7 +315,7 @@ TEST_CASE("invalidateAllListGroups invalidates every cached L1 page",
     REQUIRE(sync(TestArticleListRepo::query(qA))->size() == 1);  // warm A
     REQUIRE(sync(TestArticleListRepo::query(qB))->size() == 1);  // warm B
 
-    // Direct L3 inserts into both groups — the cache does not know about them.
+    // Direct SQL inserts into both groups — the cache does not know about them.
     insertTestArticle("news", A, "A2", 30);
     insertTestArticle("news", B, "B2", 40);
     REQUIRE(sync(TestArticleListRepo::query(qA))->size() == 1);  // stale hit

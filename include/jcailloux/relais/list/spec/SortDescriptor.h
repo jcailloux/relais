@@ -7,6 +7,7 @@
 
 #include "jcailloux/relais/config/FixedString.h"
 #include "jcailloux/relais/list/SortDirection.h"
+#include "jcailloux/relais/TypeTraits.h"
 #include "FilterDescriptor.h"  // For detail::member_pointer_type_t
 
 namespace jcailloux::relais::list::spec {
@@ -30,8 +31,8 @@ using list::SortDirection;
 /// will produce a compile error. Use an integer timestamp field instead.
 template<typename T>
 concept CursorEncodable =
-    std::is_integral_v<detail::unwrap_optional_t<std::remove_cvref_t<T>>> ||
-    std::is_enum_v<detail::unwrap_optional_t<std::remove_cvref_t<T>>>;
+    std::is_integral_v<relais::detail::unwrap_optional_t<std::remove_cvref_t<T>>> ||
+    std::is_enum_v<relais::detail::unwrap_optional_t<std::remove_cvref_t<T>>>;
 
 // =============================================================================
 // Sort declaration template
@@ -66,7 +67,7 @@ struct Sort {
     static_assert(std::is_same_v<Converter, NoConvert> || detail::is_via_v<Converter>,
         "Sort converter must be NoConvert or Via<Codec>");
     static_assert(detail::via_codec_matches<Converter,
-                      detail::unwrap_optional_t<std::remove_cvref_t<value_type>>>,
+                      relais::detail::unwrap_optional_t<std::remove_cvref_t<value_type>>>,
         "Via<Codec> on a sort requires Codec::enum_type to be the field's enum type");
 
     static_assert(CursorEncodable<value_type>,

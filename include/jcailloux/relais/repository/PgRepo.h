@@ -421,7 +421,7 @@ inline const char* internSql(std::string sql) {
 }
 
 // =========================================================================
-// PgRepo - CRUD operations with L3 (database) access only
+// PgRepo - CRUD operations against the database, no cache
 // =========================================================================
 //
 // find() returns epoch-guarded CacheView. findJson()/findBinary() return
@@ -442,7 +442,7 @@ public:
     static constexpr const char* name() { return Name; }
 
     // =====================================================================
-    // Find by ID (L3: database only)
+    // Find by ID (database only)
     // =====================================================================
 
     /// Find by ID. Returns epoch-guarded CacheView (empty if not found).
@@ -451,18 +451,18 @@ public:
     }
 
     // =====================================================================
-    // Find by ID — JSON serialization (L3: database only)
+    // Find by ID — JSON serialization (database only)
     // =====================================================================
 
     /// Find by ID and return JSON string (empty if not found). A successful but
-    /// empty result is the only "absent" signal; every L3 error propagates (a
+    /// empty result is the only "absent" signal; every DB error propagates (a
     /// read timeout or DB-down must not masquerade as a missing row).
     static io::Immediate<std::string> findJson(const Key& id) {
         return findJsonTask(id);
     }
 
     // =====================================================================
-    // Find by ID — binary serialization (L3: database only)
+    // Find by ID — binary serialization (database only)
     // =====================================================================
 
     /// Find by ID and return binary (BEVE) vector (empty if not found).
@@ -473,7 +473,7 @@ public:
     }
 
     // =====================================================================
-    // Batched find (L3: database only)
+    // Batched find (database only)
     // =====================================================================
 
     /// Batched multi-id read: one WHERE pk = ANY($1) over the distinct ids.
@@ -610,7 +610,7 @@ public:
 
     /// Last resort of a cross-invalidation that cannot name its target: any
     /// row of this repo may be one, until `ticket` settles and on the copies
-    /// cached before. Each cache tier above evicts by it. L3 has no cache:
+    /// cached before. Each cache tier above evicts by it. PgRepo has no cache:
     /// terminal no-op.
     static void invalidateEveryRow([[maybe_unused]] const std::shared_ptr<io::detail::SettleTicket>& ticket) {}
 
@@ -629,7 +629,7 @@ protected:
     //     (InvalidationMixin), whose resolvers may query the database. Fired
     //     fire-and-forget by the facade (invalidate-stale tolerated, bounded by
     //     the targets' l1_ttl).
-    // L3 (this layer) owns no cache, so both passes are no-op terminators.
+    // PgRepo owns no cache, so both passes are no-op terminators.
     //
     // WithLists gates the OWN-list tier (ListMixin): eraseMany passes true (the
     // entity left the table → its list pages change, like mono erase), while
@@ -650,7 +650,7 @@ protected:
     /// Batch cascade for rows changed in place (patchWhere): same critical /
     /// deferred split as above, fed with each row before and after the write.
     /// The row still exists, so its own lists move from the old version's
-    /// pages to the new one's. L3 has no cache: terminal no-ops.
+    /// pages to the new one's. PgRepo has no cache: terminal no-ops.
     static io::Task<void> invalidateManyUpdatedCritical(
         [[maybe_unused]] std::span<const Change<E>> changes) {
         co_return;
@@ -661,7 +661,7 @@ protected:
         co_return;
     }
 
-    /// Terminal no-op for the predicate list fast-path (eraseWhere). L3 has no
+    /// Terminal no-op for the predicate list fast-path (eraseWhere). PgRepo has no
     /// list cache; the real work lives in ListMixin when present. Always-present
     /// bottom of the chain so the call resolves even without a ListDescriptor.
     template<typename Desc>
@@ -673,7 +673,7 @@ protected:
     /// Rows an uncertain predicate write may have changed, named by what they
     /// satisfied (`rows`), and the values it set (`updates`; none for a
     /// delete). Each cache tier above evicts by them, now and again once
-    /// `ticket` settles. L3 has no cache: terminal no-op.
+    /// `ticket` settles. PgRepo has no cache: terminal no-op.
     template<typename... Updates>
     static void rowsMayHaveChanged(
         [[maybe_unused]] const std::shared_ptr<io::detail::SettleTicket>& ticket,
@@ -683,7 +683,7 @@ protected:
     /// Rows an uncertain write may have erased, named by key. Each cache tier
     /// above evicts them, now and again once `ticket` settles, keeping in
     /// `before[i]` (if asked and still empty) the version it held of keys[i].
-    /// An erased row goes nowhere: nothing to read again once settled. L3 has
+    /// An erased row goes nowhere: nothing to read again once settled. PgRepo has
     /// no cache: terminal no-op.
     static io::Task<void> rowsMayHaveBeenErased(
         [[maybe_unused]] std::shared_ptr<io::detail::SettleTicket> ticket,
@@ -771,7 +771,7 @@ protected:
         auto result = co_await PgProvider::entityQueryParams(
             Mapping::SQL::select_by_pk_batch,
             Mapping::SQL::select_by_pk, params);
-        // A successful empty result means "absent"; any L3 error propagates so a
+        // A successful empty result means "absent"; any DB error propagates so a
         // read timeout / DB-down is never confused with a missing row.
         if (result.empty()) co_return std::nullopt;
         co_return E::fromRow(result[0]);
@@ -820,7 +820,7 @@ protected:
             keyParams.push_back(io::PgParams::fromKey(id));
 
         // A successful query yields the matched rows (absent ids stay nullopt);
-        // any L3 error propagates rather than collapsing into an all-absent
+        // any DB error propagates rather than collapsing into an all-absent
         // vector that a caller could not tell apart from a genuine no-match.
         auto result = co_await PgProvider::entityQueryParamsMany(
             Mapping::SQL::select_by_pk_batch,
@@ -958,7 +958,7 @@ protected:
         const list::spec::Filters<Descriptor>& filters)
     {
         // Read path: a successful query (even empty) returns the matched set;
-        // any L3 error propagates (no swallow-to-nullopt), so invalidateWhere
+        // any DB error propagates (no swallow-to-nullopt), so invalidateWhere
         // surfaces a resolve failure instead of silently evicting nothing.
         // The text depends only on which filters are set: interned, it is one
         // prepared statement per shape and identical selects in flight coalesce.
@@ -985,7 +985,7 @@ protected:
         co_return out;
     }
 
-    /// Predicate count: SELECT count(*) FROM t WHERE pred. A read: any L3 error
+    /// Predicate count: SELECT count(*) FROM t WHERE pred. A read: any DB error
     /// propagates. The text depends only on which filters are set, so it is
     /// interned and two identical counts in flight share one query.
     template<typename Descriptor>
@@ -1493,7 +1493,7 @@ protected:
     /// cross-invalidation cascades get the exact pre-image without reading the
     /// row first. `uncertain_before` is for the cache tiers above: on an
     /// uncertain outcome, they fill it with their copy of the row before
-    /// evicting it. L3 holds no copy and leaves it untouched.
+    /// evicting it. PgRepo holds no copy and leaves it untouched.
     template<bool WithBefore = false>
     static io::Task<EraseOutcome> eraseOutcome(
         const Key& id, const E* hint = nullptr,

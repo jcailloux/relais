@@ -1,6 +1,6 @@
 /**
  * test_decl_list_not_in.cpp
- * The NOT IN (anti-set) filter operator on every tier. Invariant: L1 and L3
+ * The NOT IN (anti-set) filter operator on every tier. Invariant: L1 and PostgreSQL
  * give the same verdict — "entity scalar ∉ query set" — including on the two
  * NOT IN pitfalls:
  *   NULL: a null optional member is excluded from IN and from a non-empty
@@ -15,7 +15,7 @@
  * `Filters::matchesFilters(extractTags(entity))` (GeneratedFilters.h), the
  * FilterTags scalar-tag matching path.
  *
- * L3 SQL generation (transport-free): the `buildWhereClause` NIN branch emits
+ * SQL generation (transport-free): the `buildWhereClause` NIN branch emits
  * `!= ALL($n)` (mirror of IN's `= ANY($n)`) with exactly one array param,
  * preserving the $n numbering — checked against EQ/range combinations and
  * IN+NIN coexistence.
@@ -30,7 +30,7 @@
  *
  * Cross-tier property suite (DB): a fixed-seed sweep of ~25 entities (some
  * with NULL members) × ~10 varied sets per element type. (1) The NIN verdict from
- * L1 `matchesFilters` and L3 PostgreSQL `!= ALL` is identical.
+ * L1 `matchesFilters` and PostgreSQL `!= ALL` is identical.
  * (2) For a present member `NIN(S,v) == !IN(S,v)`.
  * (3) For a null member `IN(S,NULL)` is false and `NIN(S,NULL)` holds only for an
  * empty S — the duality does NOT hold, the most natural implementer error
@@ -322,7 +322,7 @@ TEST_CASE("[DeclListNin] IN and NIN coexist on distinct columns", "[list][nin][u
 }
 
 // =============================================================================
-// L3 SQL generation — buildWhereClause NIN branch (transport-free).
+// SQL generation — buildWhereClause NIN branch (transport-free).
 // Validates `!= ALL($n)` (mirror of IN's `= ANY($n)`), the single-array-param
 // invariant (NIN contributes exactly one $n like IN), $n numbering with EQ/range,
 // the empty-set literal (`!= ALL('{}')` → universe), and IN+NIN coexistence
@@ -550,10 +550,10 @@ TEST_CASE("[DeclListNin] update reaches a group when old or new is excluded from
 }
 
 // =============================================================================
-// Cross-tier consistency + duality — L1 and L3 agree under load.
+// Cross-tier consistency + duality — L1 and PostgreSQL agree under load.
 //
 // For each (entity, set) both tiers must agree on the NIN verdict "entity
-// scalar ∉ set": L1 `matchesFilters` (pure C++) and L3 PostgreSQL `!= ALL` (the
+// scalar ∉ set": L1 `matchesFilters` (pure C++) and PostgreSQL `!= ALL` (the
 // real array parser, fed buildWhereClause's literal so escaping round-trips
 // through PG). Plus the two dualité properties:
 //   (2) non-null member: NIN(S,v) == !IN(S,v) — the negation holds;
@@ -618,14 +618,14 @@ void crossTierNinProperty(const std::vector<Entity>& entities,
             auto wc = decl::detail::buildWhereClause<DescNin>(fn);
             const std::string arr = paramStr(wc.params.params[0]);
             const auto fld = getField(e);
-            const bool ninL3 = sqlAllVerdict(fld, arr, cast);
+            const bool ninSql = sqlAllVerdict(fld, arr, cast);
 
             decl::Filters<DescIn> fi;
             std::get<0>(fi.values) = sets[i];
             const bool inL1 = decl::detail::matchesFilters<DescIn>(e, fi);
 
-            CAPTURE(e.id, i, arr, ninL1, ninL3, inL1, fld.has_value());
-            CHECK(ninL1 == ninL3);          // cross-tier: L1 == L3 SQL
+            CAPTURE(e.id, i, arr, ninL1, ninSql, inL1, fld.has_value());
+            CHECK(ninL1 == ninSql);          // cross-tier: L1 == SQL
             if (fld.has_value())
                 CHECK(ninL1 == !inL1);      // duality holds for a present member
             else {
@@ -684,7 +684,7 @@ std::vector<Entity> makeEntities(std::mt19937& gen, size_t n) {
 
 }  // namespace
 
-TEST_CASE("[DeclListNin][xtier] L1/L3 agree + dualité on string anti-membership",
+TEST_CASE("[DeclListNin][xtier] L1/PG agree + dualité on string anti-membership",
           "[integration][db][list][nin][xtier]") {
     TransactionGuard tx;
     std::mt19937 gen(0xC0FFEE01);
@@ -695,7 +695,7 @@ TEST_CASE("[DeclListNin][xtier] L1/L3 agree + dualité on string anti-membership
         [](const Entity& e) { return std::optional<std::string>(e.category); });
 }
 
-TEST_CASE("[DeclListNin][xtier] L1/L3 agree + dualité on int64 anti-membership",
+TEST_CASE("[DeclListNin][xtier] L1/PG agree + dualité on int64 anti-membership",
           "[integration][db][list][nin][xtier]") {
     TransactionGuard tx;
     std::mt19937 gen(0xC0FFEE02);
@@ -706,7 +706,7 @@ TEST_CASE("[DeclListNin][xtier] L1/L3 agree + dualité on int64 anti-membership"
         [](const Entity& e) { return std::optional<int64_t>(e.author_id); });
 }
 
-TEST_CASE("[DeclListNin][xtier] L1/L3 agree + NULL break on int32 optional anti-membership",
+TEST_CASE("[DeclListNin][xtier] L1/PG agree + NULL break on int32 optional anti-membership",
           "[integration][db][list][nin][xtier]") {
     TransactionGuard tx;
     std::mt19937 gen(0xC0FFEE03);
@@ -719,7 +719,7 @@ TEST_CASE("[DeclListNin][xtier] L1/L3 agree + NULL break on int32 optional anti-
         [](const Entity& e) { return e.view_count; });
 }
 
-TEST_CASE("[DeclListNin][xtier] L1/L3 agree + dualité on bool anti-membership",
+TEST_CASE("[DeclListNin][xtier] L1/PG agree + dualité on bool anti-membership",
           "[integration][db][list][nin][xtier]") {
     TransactionGuard tx;
     std::mt19937 gen(0xC0FFEE04);

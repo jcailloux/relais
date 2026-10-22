@@ -76,17 +76,19 @@ Each mixin layer can override methods from its `Base` by declaring a method with
 Repo methods are **`static`**: all state (tiers, trackers) is process-global per
 repo *type* (see [§3](#l1-cache-cachetier)), there is no per-instance state to carry.
 
-Example: `ListMixin::update()` hides `LocalRepo::update()`:
+Example: `ListMixin::update()` hides `LocalRepo::update()` (simplified: the
+uncertain-write path is left out):
 
 ```cpp
 template<typename Base>
 class ListMixin : public Base {
-    static io::Task<bool> update(const Key& id, const Entity& entity) {
-        std::optional<Entity> old;                   // snapshot old via a CacheView
-        if (auto v = co_await Base::find(id); v) old.emplace(*v);
-        bool ok = co_await Base::update(id, entity); // delegates down
-        if (ok && old) listCache().onEntityUpdated(*old, entity);
-        co_return ok;
+    static io::Task<std::optional<size_t>> update(const Key& id, const Entity& entity) {
+        // Delegates down; WithBefore = true asks the UPDATE to return the row
+        // before and after it, so nothing is read first.
+        auto outcome = co_await Base::template updateOutcome<true>(id, entity);
+        if (outcome.before && outcome.after)
+            listCache().onEntityUpdated(*outcome.before, *outcome.after);
+        co_return outcome.affected;
     }
 };
 ```
