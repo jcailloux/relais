@@ -123,12 +123,10 @@ class SortConfig:
 class EntityAnnotation:
     """Parsed @relais annotations for an entity."""
     table: str = ""       # PostgreSQL table name
-    model: str = ""       # Parsed but ignored (table= is used instead)
     primary_keys: list[str] = field(default_factory=list)  # multiple @relais primary_key fields
     partition_keys: list[str] = field(default_factory=list)
     db_managed: list[str] = field(default_factory=list)
     timestamps: list[str] = field(default_factory=list)
-    raw_json: list[str] = field(default_factory=list)
     json_fields: list[str] = field(default_factory=list)
     enums: list[EnumMapping] = field(default_factory=list)
     read_only: bool = False
@@ -204,11 +202,10 @@ class StructParser:
     PARAM_RE = re.compile(r'[A-Za-z_][A-Za-z0-9_]*')
 
     # Field tags that only mark the member
-    FLAG_TAGS = ("primary_key", "partition_key", "db_managed", "timestamp", "raw_json",
-                 "json_field")
+    FLAG_TAGS = ("primary_key", "partition_key", "db_managed", "timestamp", "json_field")
     # Tags of each annotation level, and where a misplaced one belongs
     TAGS = {
-        "struct": (("table=", "model=", "read_only", "read_only=true"),
+        "struct": (("table=", "read_only", "read_only=true"),
                    "on the // @relais line above the struct"),
         "list": (("limits=", "entity="),
                  "on a // @relais_list line above the struct"),
@@ -367,6 +364,11 @@ class StructParser:
             try:
                 # Parse annotation key=value pairs
                 annot = self._parse_annotations(annotations)
+                # An error on those lines may be a misspelled or unread table=
+                if not annot.table and len(self.errors) == errors_before:
+                    self._error(i + 1, class_match.start(1) + 1,
+                                f"entity '{class_name}' has no table= tag; "
+                                f"write it {self.TAGS['struct'][1]}")
 
                 # Find namespace
                 ns = self._find_namespace(content, lines[i])
@@ -418,8 +420,6 @@ class StructParser:
         """Apply a tag of a @relais line; False if it is not one."""
         if token.startswith("table="):
             annot.table = self._value(token, line, col)
-        elif token.startswith("model="):
-            annot.model = self._value(token, line, col)
         elif token in ("read_only", "read_only=true"):
             annot.read_only = True
         else:
@@ -504,8 +504,6 @@ class StructParser:
                 annot.db_managed.append(m.name)
             if 'timestamp' in m.tags:
                 annot.timestamps.append(m.name)
-            if 'raw_json' in m.tags:
-                annot.raw_json.append(m.name)
             if 'json_field' in m.tags:
                 annot.json_fields.append(m.name)
             if m.enum_pairs:
@@ -725,19 +723,6 @@ class MappingGenerator:
     def __init__(self):
         pass
 
-    def _resolve_table_name(self, entity: ParsedEntity) -> str:
-        """Resolve PostgreSQL table name from annotations."""
-        a = entity.annotation
-        if a.table:
-            return a.table
-        # Fallback: derive from class name (snake_case)
-        name = entity.class_name
-        # CamelCase -> snake_case
-        s = re.sub(r'(?<!^)(?=[A-Z])', '_', name).lower()
-        print(f"  Warning: No table= annotation for {entity.class_name}, "
-              f"using derived name '{s}'", file=sys.stderr)
-        return s
-
     def generate(self, entity: ParsedEntity, output_file: Path) -> str:
         """Generate the complete wrapper header."""
         a = entity.annotation
@@ -870,7 +855,7 @@ class MappingGenerator:
     def _generate_mapping_struct(self, entity: ParsedEntity, mapping_name: str,
                                    updateable: list[DataMember]) -> list[str]:
         a = entity.annotation
-        table_name = self._resolve_table_name(entity)
+        table_name = a.table
 
         lines = [
             f"struct {mapping_name} {{",
@@ -2045,11 +2030,6 @@ def main():
     for filepath in sorted(files.values()):
         entities = struct_parser.parse_file(filepath)
         for entity in entities:
-            # Validate: warn if @relais annotation lacks table=
-            if not entity.annotation.table and not entity.annotation.model:
-                print(f"  Warning: {filepath}: entity '{entity.class_name}' has "
-                      f"@relais annotations but no table= (using derived name)",
-                      file=sys.stderr)
             filename = f"{entity.class_name}Entity.h"
             output_path = output_dir / filename
 

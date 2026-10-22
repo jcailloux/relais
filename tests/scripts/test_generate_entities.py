@@ -131,9 +131,11 @@ class MemberParsing(GeneratorCase):
         self.assertEqual([m.name for m in e.members], ["id", "label"])
 
     def test_every_flag_tag(self):
-        flags = {"primary_key", "partition_key", "db_managed", "timestamp", "raw_json",
-                 "json_field"}
+        flags = {"primary_key", "partition_key", "db_managed", "timestamp", "json_field"}
         self.assertEqual(self.member("// @relais " + " ".join(sorted(flags))).tags, flags)
+
+    def test_raw_json_follows_the_type(self):
+        self.assertTrue(self.member("", "glz::raw_json metadata;").is_raw_json)
 
     def test_prose_before_the_marker_is_ignored(self):
         m = self.member("// assigned by the caller — @relais primary_key",
@@ -649,13 +651,16 @@ class UnknownTags(GeneratorCase):
         ])
 
     def test_spellings_that_used_to_pass(self):
+        prose = "tags run to the end of the comment, so prose goes before @relais"
         cases = {
             "// @relais table=t output=gen/T.h": "unknown struct tag 'output=gen/T.h'",
+            "// @relais table=t model=T": "unknown struct tag 'model=T'",
             "// @relais table=t read_only=false":
                 "unknown struct tag 'read_only=false'; did you mean 'read_only'?",
-            "// @relais nullable": "unknown field tag 'nullable'",
-            "// @relais auto_enum": "unknown field tag 'auto_enum'",
-            "// @relais filterable_by_name": "unknown field tag 'filterable_by_name'",
+            "// @relais nullable": f"unknown field tag 'nullable'; {prose}",
+            "// @relais raw_json": f"unknown field tag 'raw_json'; {prose}",
+            "// @relais auto_enum": f"unknown field tag 'auto_enum'; {prose}",
+            "// @relais filterable_by_name": f"unknown field tag 'filterable_by_name'; {prose}",
             "// @relais sortablex": "unknown field tag 'sortablex'; did you mean 'sortable'?",
             "// @relais primary_key:x":
                 "unknown field tag 'primary_key:x'; did you mean 'primary_key'?",
@@ -671,7 +676,7 @@ class UnknownTags(GeneratorCase):
                         std::optional<int32_t> views;  {field_tags}
                     }};
                 """)
-                self.assertIn(message, errors[0])
+                self.assertEqual(errors[0].split(": error: ")[-1], message)
 
     def test_a_key_without_value(self):
         _, errors = self.errors("""
@@ -689,6 +694,76 @@ class UnknownTags(GeneratorCase):
             "'column=' has no value",
             "'enum=' has no value",
         ])
+
+
+class TableTag(GeneratorCase):
+    """An entity names its table: none is derived from the class name."""
+
+    def test_an_entity_without_table_is_an_error(self):
+        for annotation in ("// @relais read_only", "// @relais_list limits=10"):
+            with self.subTest(annotation=annotation):
+                bad = self.header("Bad.h", f"""
+                    {annotation}
+                    struct UserView {{
+                        int64_t id = 0;  // @relais primary_key
+                    }};
+                """)
+                r = self.run_generator()
+                self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+                self.assertEqual(r.stderr.splitlines(), [
+                    f"{bad}:2:8: error: entity 'UserView' has no table= tag; "
+                    "write it on the // @relais line above the struct",
+                    "1 error, no file written",
+                ])
+                self.assertFalse(self.out.exists())
+
+    def test_an_error_in_another_entity_does_not_hide_it(self):
+        bad = self.header("Bad.h", """
+            // @relais table=a
+            struct A {
+                int64_t id = 0;  // @relais primary_key db_managd
+            };
+            // @relais read_only
+            struct B {
+                int64_t id = 0;  // @relais primary_key
+            };
+        """)
+        r = self.run_generator()
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertEqual(r.stderr.splitlines(), [
+            f"{bad}:3:45: error: unknown field tag 'db_managd'; did you mean 'db_managed'?",
+            f"{bad}:6:8: error: entity 'B' has no table= tag; "
+            "write it on the // @relais line above the struct",
+            "2 errors, no file written",
+        ])
+
+    def test_an_error_on_the_annotation_lines_is_not_repeated(self):
+        """A misspelled or unread table= is reported once, at its tag."""
+        for annotation in ("// @relais tabel=users", "// @relais_list table=users",
+                           "// @relais read_only -- users table=users"):
+            with self.subTest(annotation=annotation):
+                self.header("Bad.h", f"""
+                    {annotation}
+                    struct User {{
+                        int64_t id = 0;  // @relais primary_key
+                    }};
+                """)
+                r = self.run_generator()
+                self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+                self.assertEqual(r.stderr.splitlines()[-1], "1 error, no file written")
+
+    def test_the_table_is_the_one_named(self):
+        self.header("UserAccount.h", """
+            // @relais table=accounts
+            struct UserAccount {
+                int64_t id = 0;  // @relais primary_key db_managed
+            };
+        """)
+        r = self.run_generator()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stderr, "")
+        self.assertIn('table_name = "accounts";',
+                      (self.out / "UserAccountEntity.h").read_text())
 
 
 class GeneratorRun(GeneratorCase):
