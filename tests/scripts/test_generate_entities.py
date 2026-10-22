@@ -50,7 +50,10 @@ class GeneratorCase(unittest.TestCase):
         return path
 
     def parse(self, body: str) -> list:
-        return gen.StructParser().parse_file(self.header("Entity.h", body))
+        parser = gen.StructParser()
+        entities = parser.parse_file(self.header("Entity.h", body))
+        self.assertEqual([str(d) for d in parser.errors], [])
+        return entities
 
     def entity(self, body: str):
         entities = self.parse(body)
@@ -134,36 +137,37 @@ class MemberParsing(GeneratorCase):
 
 
 class CodeStripping(unittest.TestCase):
-    """_strip_code: the code of a line, without comments and literal contents."""
+    """_strip_code: the code of a line, comments and literal contents blanked."""
 
     def strip(self, line: str, state: str = "") -> tuple[str, str]:
         return gen.StructParser._strip_code(line, state)
 
     def test_comments(self):
         self.assertEqual(self.strip("int a = 0;  // }"), ("int a = 0;  ", ""))
-        self.assertEqual(self.strip("int a; /* { */ int b;"), ("int a;   int b;", ""))
+        self.assertEqual(self.strip("int a; /* { */ int b;"), ("int a;         int b;", ""))
         self.assertEqual(self.strip("// @relais primary_key"), ("", ""))
 
     def test_block_comment_across_lines(self):
-        self.assertEqual(self.strip("int a; /* opens {"), ("int a;  ", "*/"))
+        self.assertEqual(self.strip("int a; /* opens {"), ("int a;   ", "*/"))
         self.assertEqual(self.strip("   } still inside", "*/"), ("", "*/"))
-        self.assertEqual(self.strip("   ends */ int b;", "*/"), (" int b;", ""))
+        self.assertEqual(self.strip("   ends */ int b;", "*/"), ("           int b;", ""))
 
     def test_string_and_char_literals(self):
-        self.assertEqual(self.strip('std::string s = "a{b\\"}";'), ('std::string s = "";', ""))
-        self.assertEqual(self.strip("char c = '}';"), ("char c = '';", ""))
-        self.assertEqual(self.strip("char c = '\\'';"), ("char c = '';", ""))
-        self.assertEqual(self.strip('auto s = u8"{";'), ('auto s = u8"";', ""))
-        self.assertEqual(self.strip('auto s = "// not a comment";'), ('auto s = "";', ""))
+        self.assertEqual(self.strip('std::string s = "a{b\\"}";'), ('std::string s = "      ";', ""))
+        self.assertEqual(self.strip("char c = '}';"), ("char c = ' ';", ""))
+        self.assertEqual(self.strip("char c = '\\'';"), ("char c = '  ';", ""))
+        self.assertEqual(self.strip('auto s = u8"{";'), ('auto s = u8" ";', ""))
+        self.assertEqual(self.strip('auto s = "// x";'), ('auto s = "    ";', ""))
 
     def test_digit_separators_are_not_char_literals(self):
         line = "std::array<int64_t, 2> a = {1'000'000, 0xF'FF'F};"
         self.assertEqual(self.strip(line), (line, ""))
 
     def test_raw_strings(self):
-        self.assertEqual(self.strip('auto r = R"x(a } )" b)x";'), ('auto r = R"";', ""))
-        self.assertEqual(self.strip('auto r = R"(opens {'), ('auto r = R""', ')"'))
-        self.assertEqual(self.strip('  } )" ;', ')"'), (" ;", ""))
+        self.assertEqual(self.strip('auto r = R"x(a } )" b)x";'),
+                         ('auto r = R"            ";', ""))
+        self.assertEqual(self.strip('auto r = R"(opens {'), ('auto r = R" ', ')"'))
+        self.assertEqual(self.strip('  } )" ;', ')"'), ('     " ;', ""))
 
 
 class BraceCounting(GeneratorCase):
@@ -416,6 +420,18 @@ class EntityAnnotations(GeneratorCase):
         self.assertTrue(e.annotation.is_composite)
         self.assertEqual(e.annotation.partition_keys, ["region"])
 
+    def test_tags_separated_by_any_whitespace(self):
+        for gap in ("  ", "\t"):
+            with self.subTest(gap=gap):
+                e = self.entity(f"""
+                    // @relais table=v{gap}read_only
+                    struct V {{
+                        int64_t id = 0;  // @relais primary_key
+                    }};
+                """)
+                self.assertEqual(e.annotation.table, "v")
+                self.assertTrue(e.annotation.read_only)
+
     def test_list_limits_are_sorted_and_deduplicated(self):
         e = self.entity("""
             // @relais table=t
@@ -596,6 +612,206 @@ class Rejections(GeneratorCase):
                 int32_t b = 0;  // @relais filterable:x
             };
         """, "filter parameter 'x' is declared twice")
+
+
+class Diagnostics(GeneratorCase):
+    """Every error of a run, each as path:line:column: error: message."""
+
+    def errors(self, *sources: Path) -> list:
+        r = self.run_generator(*sources)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        return r.stderr.splitlines()
+
+    def test_errors_point_at_the_faulty_token(self):
+        bad = self.header("Bad.h", """
+            // @relais table=t
+            // @relais_list limits=10,0
+            struct T {
+                int64_t id = 0;  // @relais primary_key
+                int32_t a = 0;   // @relais filterable:x
+                int32_t b = 0;   // @relais sortable filterable:x
+                std::string c;   // @relais filterable:none:is_null
+            };
+        """)
+        self.assertEqual(self.errors()[:3], [
+            f"{bad}:2:27: error: limits= value 0 out of range [1, 65535]",
+            f"{bad}:6:42: error: filter parameter 'x' is declared twice; "
+            f"name one of them (filterable:<param>:<op>)",
+            f"{bad}:7:33: error: is_null requires a std::optional member; "
+            f"'c' is std::string",
+        ])
+
+    def test_structural_errors_point_at_the_struct_name(self):
+        fwd = self.header("Fwd.h", """
+            // @relais table=t
+            struct T;
+        """)
+        open_ = self.header("Open.h", """
+            // @relais table=o
+            struct Open {
+                int64_t id = 0;  // @relais primary_key
+        """)
+        errors = self.errors()
+        self.assertTrue(errors[0].startswith(f"{fwd}:2:8: error: 'T' is declared but not defined"),
+                        errors)
+        self.assertTrue(errors[1].startswith(f"{open_}:2:8: error: the body of 'Open' is never closed"),
+                        errors)
+
+    def test_every_error_of_the_run_is_reported(self):
+        a = self.header("A.h", """
+            // @relais table=a
+            // @relais_list limits=ten
+            struct A {
+                int64_t id = 0;  // @relais primary_key
+            };
+        """)
+        b = self.header("B.h", """
+            // @relais table=b
+            struct B {
+                int64_t id = 0;  // @relais primary_key filterable:id:is_null
+            };
+        """)
+        missing = self.src / "Missing.h"
+        errors = self.errors(missing, self.src)
+        self.assertEqual([e.split(": error: ")[0] for e in errors[:-1]],
+                         [str(missing), f"{a}:2:24", f"{b}:3:45"])
+        self.assertEqual(errors[-1], "3 errors, no file written")
+
+    def test_an_entity_with_an_error_is_left_out(self):
+        parser = gen.StructParser()
+        entities = parser.parse_file(self.header("Two.h", """
+            // @relais table=a
+            // @relais_list limits=0
+            struct A {
+                int64_t id = 0;  // @relais primary_key
+            };
+
+            // @relais table=b
+            struct B {
+                int64_t id = 0;  // @relais primary_key
+            };
+        """))
+        self.assertEqual([e.class_name for e in entities], ["B"])
+        self.assertEqual(len(parser.errors), 1)
+
+    def test_an_unreadable_header(self):
+        link = self.src / "Gone.h"
+        link.symlink_to(self.src / "nowhere.h")
+        self.assertEqual(self.errors()[0].split(": error: ")[0], str(link))
+
+    def test_an_error_found_while_generating(self):
+        bad = self.header("Bad.h", """
+            // @relais table=t
+            struct T {
+                int64_t id = 0;  // @relais primary_key
+                State state = State::Open;  // @relais enum
+            };
+        """)
+        self.assertTrue(self.errors()[0].startswith(
+            f"{bad}:4:44: error: @relais enum on field 'state': no glz::meta<State>"))
+
+    def test_a_name_collision_with_an_entity_that_fails(self):
+        (self.src / "a").mkdir()
+        (self.src / "b").mkdir()
+        first = self.header("a/T.h", """
+            // @relais table=t
+            struct T {
+                int64_t id = 0;  // @relais primary_key
+                State state = State::Open;  // @relais enum
+            };
+        """)
+        second = self.header("b/T.h", """
+            // @relais table=t
+            struct T {
+                int64_t id = 0;  // @relais primary_key
+            };
+        """)
+        self.assertEqual([e.split(": ")[:2] for e in self.errors()[:-1]],
+                         [[f"{first}:4:44", "error"],
+                          [f"{second}:2:8", "error"],
+                          [f"{first}:2:8", "note"]])
+
+
+class SafeOutput(GeneratorCase):
+    """A failed run writes nothing; one generated header per entity name."""
+
+    VALID = """
+        // @relais table={t}
+        struct {t} {{
+            int64_t id = 0;  // @relais primary_key db_managed
+        }};
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.out.mkdir()
+        self.kept = self.out / "Kept.h"
+        self.kept.write_text("previous run\n")
+        self.kept_mtime = self.kept.stat().st_mtime_ns
+
+    def assertNothingWritten(self, r: subprocess.CompletedProcess):
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertEqual([p.name for p in self.out.iterdir()], ["Kept.h"])
+        self.assertEqual(self.kept.read_text(), "previous run\n")
+        self.assertEqual(self.kept.stat().st_mtime_ns, self.kept_mtime)
+
+    def test_a_parse_error_after_valid_entities(self):
+        a = self.header("A.h", self.VALID.format(t="A"))
+        b = self.header("B.h", """
+            // @relais table=b
+            // @relais_list limits=0
+            struct B {
+                int64_t id = 0;  // @relais primary_key
+            };
+        """)
+        c = self.header("C.h", self.VALID.format(t="C"))
+        self.assertNothingWritten(self.run_generator(a, b, c))
+
+    def test_a_generation_error_after_valid_entities(self):
+        a = self.header("A.h", self.VALID.format(t="A"))
+        b = self.header("B.h", """
+            // @relais table=b
+            struct B {
+                int64_t id = 0;  // @relais primary_key
+                State state = State::Open;  // @relais enum
+            };
+        """)
+        self.assertNothingWritten(self.run_generator(a, b))
+
+    def test_two_entities_generating_the_same_header(self):
+        (self.src / "admin").mkdir()
+        (self.src / "app").mkdir()
+        first = self.header("admin/User.h", """
+            namespace admin {
+            // @relais table=admins
+            struct User {
+                int64_t id = 0;  // @relais primary_key
+            };
+            }
+        """)
+        second = self.header("app/User.h", """
+            namespace app {
+            // @relais table=users
+            struct User {
+                int64_t id = 0;  // @relais primary_key
+            };
+            }
+        """)
+        r = self.run_generator()
+        self.assertNothingWritten(r)
+        self.assertEqual(r.stderr.splitlines(), [
+            f"{second}:3:8: error: 'app::User' generates UserEntity.h, as does 'admin::User'",
+            f"{first}:3:8: note: 'admin::User' is declared here",
+            "1 error, no file written",
+        ])
+
+    def test_a_header_given_twice_is_generated_once(self):
+        self.header("A.h", self.VALID.format(t="A"))
+        (self.src / "sub").mkdir()
+        again = self.src / "sub" / ".."
+        r = self.run_generator(again, again / "A.h")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(sorted(p.name for p in self.out.iterdir()), ["AEntity.h", "Kept.h"])
 
 
 if __name__ == "__main__":
