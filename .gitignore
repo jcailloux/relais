@@ -13,6 +13,7 @@ cmake-build-*/
 # Tooling
 .cache/
 compile_commands.json
+__pycache__/
 
 # Generated (from generate_entities.py)
 tests/fixtures/generated/*

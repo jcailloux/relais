@@ -301,6 +301,10 @@ if(RELAIS_BUILD_TESTS)
     relais_add_generator_reject_test(generator_rejects_duplicate_filter_param
         ${PROJECT_SOURCE_DIR}/tests/generator/is_null_duplicate_param
         "filter parameter 'published_at' is declared twice")
+    # Unit tests of the entity generator itself (stdlib unittest, no dependency)
+    add_test(NAME generator_unit_tests
+             COMMAND ${Python3_EXECUTABLE} -m unittest discover -s ${PROJECT_SOURCE_DIR}/tests/scripts)
+    set_tests_properties(generator_unit_tests PROPERTIES LABELS "relais;generator")
     relais_add_test(test_relais_gen_list_limits tests/relais/test_gen_list_limits.cpp      DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;list;limits;generator")
     relais_add_test(test_relais_list_limits     tests/relais/test_list_limits.cpp          DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;list;limits")
     relais_add_test(test_relais_list_parse_bool tests/relais/test_list_parse_bool.cpp      DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;list;parse;bool")
