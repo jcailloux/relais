@@ -144,11 +144,17 @@ class StructParser:
     ANNOTATION_RE = re.compile(r'//\s*@relais(?:_list)?\s+(.*)')
     # Regex: class/struct Name [: public ...] {
     CLASS_RE = re.compile(r'(?:class|struct)\s+(\w+)')
-    # Regex: data member — type name [= default]; [// @relais ...]
-    MEMBER_RE = re.compile(
-        r'^\s+([\w:<>,\s]+?)\s+(\w+)\s*(?:=\s*([^;]+))?\s*;(.*)',
-        re.MULTILINE
-    )
+    # Regex: data member, on the code view — type name [= init | {init}];
+    MEMBER_RE = re.compile(r'^\s*([\w:<>,\s]+?)\s+(\w+)\s*(=\s*[^;]+|\{[^;]*\})?\s*;')
+    # Regex: body declarations that never declare a data member
+    NON_MEMBER_RE = re.compile(
+        r'^\s*(?:(?:using|typedef|friend|static|inline|template|enum)\b'
+        r'|(?:struct|class|union)\s+\w+\s*[;{:])')
+    # Regex: access specifier
+    ACCESS_RE = re.compile(r'^\s*(public|protected|private)\s*:')
+    # Regex: the @relais tags of a member, in its trailing line comment
+    MEMBER_TAGS_RE = re.compile(r'//.*?@relais\b(.*)')
+    NOT_DEFINED = "declared but not defined here; @relais annotates the struct definition"
     # Regex: namespace ... {
     NAMESPACE_RE = re.compile(r'namespace\s+([\w:]+)\s*\{')
     # Raw string literal prefixes: the identifier right before the opening quote
@@ -503,67 +509,56 @@ class StructParser:
 
     def _parse_members(self, lines: list[str], codes: list[str],
                        class_line_idx: int) -> list[DataMember]:
-        """Parse data members from a class/struct body.
+        """Parse the data members of the struct declared on lines[class_line_idx].
 
         Braces are counted on `codes` (comments and literal contents removed),
-        so a brace in a comment or a string never opens or closes the body.
+        so a brace in a comment or a string never opens or closes the body. A
+        data member is a declaration starting a line of the body itself (depth
+        1); its @relais tags are read from the raw line's comment.
         """
         members = []
-        brace_depth = 0
+        decl = self.CLASS_RE.search(codes[class_line_idx])
+        in_public = decl.group(0).startswith("struct")
+        depth = 0
         opened = False
-        in_public = False
-        is_struct = 'struct ' in codes[class_line_idx]
 
         for i in range(class_line_idx, len(lines)):
-            line = lines[i]
             code = codes[i]
-            brace_depth += code.count('{') - code.count('}')
-            opened = opened or '{' in code
-            if opened and brace_depth <= 0:
-                break  # the body's closing brace; the rest of the line is outside
-            if '{' in code:
-                if i == class_line_idx and is_struct:
-                    in_public = True
+            start = depth
+            for ch in code[decl.start():] if i == class_line_idx else code:
+                if ch == '{':
+                    depth += 1
+                    opened = True
+                elif ch == '}':
+                    depth -= 1
+                    if depth == 0:
+                        return members  # the body's closing brace
+                elif ch == ';' and not opened:
+                    raise ValueError(self.NOT_DEFINED)
+            if start != 1:
+                continue  # before the body, or inside a nested scope
+
+            access = self.ACCESS_RE.match(code)
+            if access:
+                in_public = access.group(1) == "public"
+                continue
+            if not in_public or self.NON_MEMBER_RE.match(code):
                 continue
 
-            stripped = line.strip()
-            if stripped == "public:":
-                in_public = True
-                continue
-            if stripped in ("private:", "protected:"):
-                in_public = False
-                continue
-
-            if not in_public:
-                continue
-
-            code_part = stripped
-            for _marker in ("//", "/*"):
-                _pos = code_part.find(_marker)
-                if _pos != -1:
-                    code_part = code_part[:_pos]
-            if "[[nodiscard]]" in code_part or "(" in code_part:
-                continue
-            if stripped.startswith("//") or stripped.startswith("using "):
-                continue
-            if not stripped or stripped == "};":
-                continue
-
-            m = self.MEMBER_RE.match(line)
+            m = self.MEMBER_RE.match(code)
             if m:
                 cpp_type = m.group(1).strip()
                 name = m.group(2)
-                default = m.group(3).strip() if m.group(3) else ""
+                init = m.group(3) or ""
+                default = init[1:].strip() if init.startswith("=") else init
                 tags = set()
                 db_column = ""
                 enum_pairs = []
                 flt_configs = []
                 srt_configs = []
-                trailing = m.group(4).strip() if m.group(4) else ""
-                if '@relais' in trailing:
-                    idx = trailing.index('@relais') + len('@relais')
-                    tag_text = trailing[idx:].strip()
-                    for tag in tag_text.split():
+                tag_match = self.MEMBER_TAGS_RE.search(lines[i])
+                if tag_match:
+                    for tag in tag_match.group(1).split():
                         if tag.startswith('enum='):
                             for pair in tag[5:].split(','):
                                 parts = pair.split(':')
@@ -585,9 +580,9 @@ class StructParser:
                     name, cpp_type, default, db_column, tags, enum_pairs,
                     flt_configs, srt_configs))
 
-        if opened and brace_depth > 0:
+        if opened:
             raise ValueError("unbalanced braces: the struct body is never closed")
-        return members
+        raise ValueError(self.NOT_DEFINED)
 
 
 # =============================================================================
