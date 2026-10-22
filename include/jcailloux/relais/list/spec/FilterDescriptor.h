@@ -113,26 +113,6 @@ inline constexpr bool is_via_v = is_via<T>::value;
 // Type traits helpers
 // =============================================================================
 
-/// Check if T is std::optional<U>
-template<typename T>
-struct is_optional : std::false_type {};
-
-template<typename T>
-struct is_optional<std::optional<T>> : std::true_type {};
-
-template<typename T>
-inline constexpr bool is_optional_v = is_optional<T>::value;
-
-/// Unwrap std::optional<T> to T, otherwise keep T
-template<typename T>
-struct unwrap_optional { using type = T; };
-
-template<typename T>
-struct unwrap_optional<std::optional<T>> { using type = T; };
-
-template<typename T>
-using unwrap_optional_t = typename unwrap_optional<T>::type;
-
 /// Extract the class type from a member pointer (data or function)
 template<typename T>
 struct member_pointer_class;
@@ -329,7 +309,7 @@ struct Filter {
 
     /// The unwrapped scalar element type (optional<T> -> T). For IN, this is the
     /// type of a single set element.
-    using element_type = detail::unwrap_optional_t<member_type>;
+    using element_type = relais::detail::unwrap_optional_t<member_type>;
 
     /// The scalar a query holds for this filter: bool for IS_NULL, the element
     /// type otherwise.
@@ -360,7 +340,7 @@ struct Filter {
         "Via<Codec> filter: the codec's enum_type must be the member's enum type");
 
     /// Whether the entity member is optional
-    static constexpr bool is_optional_member = detail::is_optional_v<member_type>;
+    static constexpr bool is_optional_member = relais::detail::is_optional_v<member_type>;
 
     static_assert(!is_null_op || is_optional_member,
         "IS_NULL filter requires a std::optional member");

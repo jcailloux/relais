@@ -109,7 +109,7 @@ TEST_CASE("generator emits a functional NIN descriptor (both forms)", "[list][ni
     CHECK(*q.filters().template get<"category">()
           == std::vector<std::string>{"science", "tech"});
 
-    SECTION("L3: both NIN filters compile to `!= ALL`") {
+    SECTION("SQL: both NIN filters compile to `!= ALL`") {
         auto wc = decl::detail::buildWhereClause<GenDesc>(q.filters());
         CHECK(countNotAll(wc.sql) == 2);
         // Two NIN sets => exactly two array params, no $n drift.

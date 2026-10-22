@@ -235,7 +235,7 @@ public:
     // equality first (composite/partition Keys model == but not <), then drive
     // the shared invalidateManyImpl cascade resolved at the top of the chain.
 
-    /// Delete the enumerated rows from L3, then evict the deleted set across the
+    /// Delete the enumerated rows from the DB, then evict the deleted set across the
     /// cache hierarchy (L1 + own lists + deduplicated cross-inval). Returns
     /// the number of rows actually deleted (duplicates and absent ids contribute
     /// nothing) — parité mono erase: nullopt signals a DB error, 0 a non-matching
@@ -277,7 +277,7 @@ public:
     }
 
     /// Evict the enumerated entities from the cache hierarchy without deleting
-    /// them from L3 — a later find repopulates from the DB. Materializes each
+    /// them from the DB — a later find reloads them. Materializes each
     /// entity through the cache-first read path (exactly mono invalidate's
     /// `find` + propagate), then runs the cascade with WithLists=false: lists are
     /// left intact because the rows still exist (parité mono invalidate). Best
@@ -302,13 +302,13 @@ public:
     //
     // The predicate is the generated named aggregate FilterSet<E>, built with
     // designated initializers: repo.eraseWhere({.author_id = 42}). It bridges to
-    // the positional Filters<Descriptor> the L3 raw methods consume via
+    // the positional Filters<Descriptor> PgRepo's raw methods consume via
     // toFilterTuple() — index-aligned because both follow the same param-sorted
     // filter order. Pred is a defaulted template parameter so the signature stays
     // well-formed (SFINAE) for entities without a FilterSet, and so a braced
     // initializer (a non-deduced context) falls back to FilterSet<E>.
 
-    /// Delete every row matching the predicate from L3, then evict the deleted
+    /// Delete every row matching the predicate from the DB, then evict the deleted
     /// set across the cache hierarchy (WithLists=true — the rows leave the table,
     /// so their lists change, exactly like eraseMany). Returns the number of rows
     /// deleted across all K_pg chunks; nullopt signals a DB error.
@@ -355,7 +355,7 @@ public:
     }
 
     /// Evict every row matching the predicate from the cache hierarchy without
-    /// deleting it from L3 — a later find/list repopulates from the DB. Resolves
+    /// deleting it from the DB — a later find/list reloads it. Resolves
     /// the affected set via selectWhereRaw (SELECT WHERE pred), then runs the
     /// cascade with WithLists=false: the rows still exist, so lists stay valid
     /// (parité mono invalidate; oracle invalidateWhere(P) ≡ invalidateMany(ids)).
@@ -375,7 +375,7 @@ public:
     }
 
     /// Number of rows matching the predicate; an empty predicate counts the
-    /// table. Always read from L3, never cached: it may differ from a list page
+    /// table. Always read from the DB, never cached: it may differ from a list page
     /// served from cache. Throws io::PgError like find().
     template<typename Pred = typename WherePredicate<E>::type>
     static io::Task<size_t> countWhere(Pred pred)

@@ -16,6 +16,7 @@
 #include "jcailloux/relais/entity/FieldGuard.h"
 #include "jcailloux/relais/entity/FieldUpdate.h"
 #include "jcailloux/relais/list/spec/GeneratedFilters.h"
+#include "jcailloux/relais/TypeTraits.h"
 
 namespace jcailloux::relais::detail {
 
@@ -121,12 +122,6 @@ namespace match {
     return column;
 }
 
-template<typename T> inline constexpr bool is_optional_v = false;
-template<typename T> inline constexpr bool is_optional_v<std::optional<T>> = true;
-
-template<typename T> struct unwrap { using type = T; };
-template<typename T> struct unwrap<std::optional<T>> { using type = T; };
-
 /// How far C++ comparison agrees with the database for a column type.
 enum class Kind : uint8_t {
     Ordered,     // every comparison (integers)
@@ -210,7 +205,7 @@ struct Guard<Traits, entity::FieldGuard<F, C, V>> {
     static RowMatch eval(const E& e, const entity::FieldGuard<F, C, V>& g, const ColumnFacts& facts) {
         const auto& m = member<Info>(e);
         using M = std::remove_cvref_t<decltype(m)>;
-        using U = typename unwrap<M>::type;
+        using U = unwrap_optional_t<M>;
         if constexpr (is_optional_v<M>) {
             if (!m) return RowMatch::No;  // NULL compared to anything is not true
         }
@@ -236,7 +231,7 @@ struct Guard<Traits, entity::FieldIn<F, Negated, V>> {
     static RowMatch eval(const E& e, const entity::FieldIn<F, Negated, V>& g, const ColumnFacts& facts) {
         const auto& m = member<Info>(e);
         using M = std::remove_cvref_t<decltype(m)>;
-        using U = typename unwrap<M>::type;
+        using U = unwrap_optional_t<M>;
         if constexpr (is_optional_v<M>) {
             // NULL = ANY(set) is not true; NULL != ALL(set) is, on an empty set.
             if (!m) return of(Negated && g.values.empty());
@@ -353,7 +348,7 @@ RowMatch filterAt(const E& e, const list::spec::Filters<Descriptor>& filters,
     if (!fv.has_value()) return RowMatch::Maybe;  // inactive: holds
     const auto& m = list::spec::detail::extractMemberValue<FT::entity_ptr>(e);
     using M = std::remove_cvref_t<decltype(m)>;
-    using U = typename unwrap<M>::type;
+    using U = unwrap_optional_t<M>;
 
     if constexpr (FT::is_null_op) {
         return of(m.has_value() == *fv);

@@ -107,7 +107,7 @@ TEST_CASE("generator emits a functional IN descriptor (both forms)", "[list][in]
     CHECK(*q.filters().template get<"category">()
           == std::vector<std::string>{"science", "tech"});
 
-    SECTION("L3: both IN filters compile to `= ANY`") {
+    SECTION("SQL: both IN filters compile to `= ANY`") {
         auto wc = decl::detail::buildWhereClause<GenDesc>(q.filters());
         CHECK(countAny(wc.sql) == 2);
         // Two IN sets => exactly two array params, no $n drift.

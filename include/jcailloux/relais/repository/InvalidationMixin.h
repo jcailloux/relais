@@ -74,7 +74,7 @@ public:
         if (result) {
             // The write committed; cross-invalidation is best-effort. A dependency
             // may resolve its target keys through a DB read (InvalidateVia) that can
-            // now surface an L3 error — never let that turn a committed write into an
+            // now surface a DB error — never let that turn a committed write into an
             // apparent failure (the caller would retry → double-write). Log and
             // return success; an un-invalidated cross-target is TTL-bounded.
             try {
@@ -465,7 +465,7 @@ protected:
     }
 
     /// Best-effort pre-read for cross-invalidation context. The read path no
-    /// longer swallows L3 errors, so this pre-read can throw; a failure is
+    /// longer swallows DB errors, so this pre-read can throw; a failure is
     /// treated as "old unknown" and the caller proceeds with the write +
     /// precautionary invalidation rather than aborting on a preliminary read.
     static io::Task<std::optional<Entity>> findOldBestEffort(const Key& id) {

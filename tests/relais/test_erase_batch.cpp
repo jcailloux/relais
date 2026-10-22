@@ -1,6 +1,6 @@
 /**
  * test_erase_batch.cpp
- * Batched / predicate erase at L3 (PgRepo::eraseManyRaw / eraseWhereRaw).
+ * Batched / predicate erase in the database (PgRepo::eraseManyRaw / eraseWhereRaw).
  *
  * Covers:
  *   - eraseManyRaw(span<Key>)  → delete_by_pk_batch (WHERE pk=ANY RETURNING *),
@@ -9,12 +9,12 @@
  *     returns every deleted entity across chunks.
  *
  * Raw methods are protected (like findManyRaw) — reached via TestInternals on
- * Uncached* repos so we exercise the pure L3 path (no L1 interference).
+ * Uncached* repos so we exercise the pure database path (no L1 interference).
  *
  * SECTION tags:
  *   [erasemany]      — eraseManyRaw by enumerated keys
  *   [erasewhere]     — eraseWhereRaw by predicate
- *   [pg]             — pure L3
+ *   [pg]             — pure database
  *   [partition-key]  — cross-partition pk=ANY
  *   [chunking]       — real > K_pg loop convergence
  */

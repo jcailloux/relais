@@ -1,7 +1,6 @@
 #ifndef JCX_RELAIS_LIST_LISTQUERY_H
 #define JCX_RELAIS_LIST_LISTQUERY_H
 
-#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -166,24 +165,6 @@ struct ListQuery {
     }
 
     bool operator==(const ListQuery&) const = default;
-};
-
-// =============================================================================
-// CachedListResult - Result stored in cache
-// =============================================================================
-
-template<typename E>
-struct CachedListResult {
-    using EntityPtr = std::shared_ptr<const E>;
-    using Clock = std::chrono::steady_clock;
-    using TimePoint = Clock::time_point;
-
-    std::vector<EntityPtr> items;
-    std::optional<Cursor> next_cursor;  // nullopt if no more pages
-    TimePoint cached_at;
-
-    [[nodiscard]] bool empty() const noexcept { return items.empty(); }
-    [[nodiscard]] size_t size() const noexcept { return items.size(); }
 };
 
 }  // namespace detail
