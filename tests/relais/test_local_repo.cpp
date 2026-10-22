@@ -527,6 +527,44 @@ TEST_CASE("LocalRepo - WriteThrough config",
         CHECK(cached->name == "Updated WT");
         CHECK(cached->value == 2);
     }
+
+    SECTION("[write-through] update caches the row the database committed") {
+        // A BEFORE UPDATE trigger rewrites the row; created_at is db_managed,
+        // so the caller's entity does not carry it either.
+        struct Trigger {
+            Trigger() {
+                drop();
+                execSql("CREATE FUNCTION relais_test_wt_rewrite() RETURNS trigger AS $$ "
+                        "BEGIN NEW.name := NEW.name || ' (db)'; NEW.value := NEW.value * 10; "
+                        "RETURN NEW; END $$ LANGUAGE plpgsql");
+                execSql("CREATE TRIGGER relais_test_wt_rewrite BEFORE UPDATE ON relais_test_items "
+                        "FOR EACH ROW EXECUTE FUNCTION relais_test_wt_rewrite()");
+            }
+            ~Trigger() { try { drop(); } catch (...) {} }
+            // Through the function, which the test role owns.
+            static void drop() {
+                execSql("SET client_min_messages = warning");
+                execSql("DROP FUNCTION IF EXISTS relais_test_wt_rewrite() CASCADE");
+            }
+        } trigger;
+
+        auto id = insertTestItem("Original", 1);
+        sync(WriteThroughTestItemRepo::find(id));
+
+        auto affected = sync(WriteThroughTestItemRepo::update(
+            id, makeTestItem("Updated WT", 2, "", true, id)));
+        REQUIRE(affected == 1);
+
+        auto committed = sync(UncachedTestItemRepo::find(id));
+        REQUIRE(committed != nullptr);
+        REQUIRE(committed->name == "Updated WT (db)");
+
+        auto cached = sync(WriteThroughTestItemRepo::find(id));
+        REQUIRE(cached != nullptr);
+        CHECK(cached->name == committed->name);
+        CHECK(cached->value == committed->value);
+        CHECK(cached->created_at == committed->created_at);
+    }
 }
 
 TEST_CASE("LocalRepo - FewChunks config",

@@ -312,8 +312,9 @@ protected:
     }
 
     /// Update returning full outcome (WithBefore: see PgRepo::updateOutcome).
-    /// On an uncertain outcome, the L1 entry is kept in `uncertain_before`
-    /// before the precautionary evict, as for eraseOutcome.
+    /// Write-through stores the committed row, as the database wrote it, not
+    /// the caller's entity. On an uncertain outcome, the L1 entry is kept in
+    /// `uncertain_before` before the precautionary evict, as for eraseOutcome.
     template<bool WithBefore = false>
     static io::Task<typename Base::UpdateOutcome> updateOutcome(
         const Key& id, const E& entity,
@@ -321,17 +322,24 @@ protected:
         requires MutableEntity<E> && HasFullUpdate<E> && (!Cfg.read_only)
     {
         using enum config::UpdateStrategy;
+        constexpr bool kWriteThrough = Cfg.update_strategy == PopulateImmediately;
 
         try {
-            auto outcome = co_await Base::template updateOutcome<WithBefore>(
-                id, entity, uncertain_before);
+            auto outcome = co_await Base::template updateOutcome<
+                WithBefore, WithBefore || kWriteThrough>(id, entity, uncertain_before);
             if (outcome.affected.value_or(0) > 0 && !outcome.coalesced) {
-                if constexpr (Cfg.update_strategy == InvalidateAndLazyReload) {
+                if constexpr (!kWriteThrough) {
+                    evict(id);
+                } else if (!outcome.after) {
                     evict(id);
                 } else {
                     tier().onMutation(id);
                     bumpGeneration(id);
-                    tier().store(id, E(entity), buildMetadata());
+                    // The tiers above read `after` only with the pre-image.
+                    if constexpr (WithBefore)
+                        tier().store(id, E(*outcome.after), buildMetadata());
+                    else
+                        tier().store(id, std::move(*outcome.after), buildMetadata());
                 }
             }
             co_return outcome;

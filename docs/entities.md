@@ -262,7 +262,7 @@ For each entity the generator produces, inside `entity::generated`:
 - **`{Class}Mapping`** — `table_name`, `primary_key_column(s)`,
   `insert_assigns_pk` (no PK column is `db_managed`; `SQL::insert` then binds
   the key first, in key order), a `Col` index
-  enum, a `SQL` struct (`select_by_pk`, `insert`, `update`,
+  enum, a `SQL` struct (`select_by_pk`, `insert`, `update`, `update_returning`,
   `update_returning_changes`, `delete_by_pk`, `delete_by_pk_returning`,
   `delete_by_pk_batch`, `select_by_pk_batch`, `returning_columns`),
   `fromRow`/`toInsertParams`/`key`, a `RowView` + `rowToJson`/`rowToBeve` for
@@ -299,7 +299,7 @@ column and receive an empty `enum class Field : uint8_t {}`:
 
 An entity with no non-key, non-`db_managed` column has no `UPDATE ... SET` to
 generate. For such entities the generator omits `SQL::update`,
-`SQL::update_returning_changes` and `toUpdateParams`,
+`SQL::update_returning`, `SQL::update_returning_changes` and `toUpdateParams`,
 and the repository gates the full-update path (`update`, `updateOutcome`,
 `updateJson`, `updateBinary`) on the `HasFullUpdate`
 concept:

@@ -238,7 +238,7 @@ Neither `std::chrono::duration` (private members) nor a raw string literal is a 
 | Value | Meaning |
 |---|---|
 | `InvalidateAndLazyReload` | Safe (default): the write invalidates the cached entry; the next read repopulates it. |
-| `PopulateImmediately` | Optimistic write-through: the write also stores the new value into the cache, so a subsequent read hits without a DB round-trip. |
+| `PopulateImmediately` | Optimistic write-through: `update` also stores the row as the database committed it (returned by the write itself) into the cache, so a subsequent read hits without a DB round-trip. |
 
 ### Fields
 

@@ -1150,6 +1150,7 @@ The `scripts/generate_entities.py` script generates standalone ORM Mapping struc
 - A nested `SQL` block of `static constexpr const char*` statements:
   `select_by_pk`, `select_by_pk_batch`, `insert`, `update`, `returning_columns`,
   `delete_by_pk`, `delete_by_pk_batch` (composite keys use the matching forms);
+  `update_returning` is the same update returning the committed row;
   `update_returning_changes` and `delete_by_pk_returning` are the same writes
   returning the prior row (and, for the update, the committed one)
 - `template<typename Entity> fromRow(const PgResult::Row&) -> optional<Entity>`
