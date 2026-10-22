@@ -604,7 +604,7 @@ TEST_CASE("LocalRepo - FewChunks config",
     }
 }
 
-/// No TTL and no GDSF: nothing to free, nothing to sweep.
+/// No TTL: without GDSF compiled in, nothing to free, nothing to sweep.
 using BareTestItemRepo = Repo<TestItemEntity, "test:bare", test_config::BareL1>;
 
 TEST_CASE("LocalRepo - stores from the database drive the maintenance sweep",
@@ -630,21 +630,23 @@ TEST_CASE("LocalRepo - stores from the database drive the maintenance sweep",
     }
 
     SECTION("[sweep] each store after a miss counts once, on a tier with something to sweep") {
+        // With GDSF compiled in, every L1 tier has something to sweep.
+        constexpr uint32_t bare = jcailloux::relais::cache::GDSFPolicy::enabled ? 3 : 0;
         auto ids = insertTestItems(3);
         const auto before = TestInternals::sweepTicks();
 
         sync(BareTestItemRepo::find(ids[0]));
         sync(BareTestItemRepo::findMany(std::span<const int64_t>(ids).subspan(1)));
         CHECK(getCacheSize<BareTestItemRepo>() >= 3);
-        CHECK(TestInternals::sweepTicks() == before);
+        CHECK(TestInternals::sweepTicks() == before + bare);
 
         sync(L1TestItemRepo::find(ids[0]));
-        CHECK(TestInternals::sweepTicks() == before + 1);
+        CHECK(TestInternals::sweepTicks() == before + bare + 1);
         sync(L1TestItemRepo::findMany(std::span<const int64_t>(ids).subspan(1)));
-        CHECK(TestInternals::sweepTicks() == before + 3);
+        CHECK(TestInternals::sweepTicks() == before + bare + 3);
 
         sync(L1TestItemRepo::find(ids[0]));  // hit
-        CHECK(TestInternals::sweepTicks() == before + 3);
+        CHECK(TestInternals::sweepTicks() == before + bare + 3);
     }
 }
 
