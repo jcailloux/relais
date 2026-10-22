@@ -127,6 +127,10 @@
 - **`update` with `PopulateImmediately` cached the caller's entity**, not the
   row the database committed (triggers, rounding, `db_managed` columns), until
   `l1_ttl`. It now caches the committed row.
+- **Two event loops writing the same row could leave L1 with the older row**,
+  or with a deleted one, until `l1_ttl`, after `patch`, `upsert`, `insert` with a
+  caller-assigned key or `update` with `PopulateImmediately`. L1 now keeps the
+  last committed row, or nothing.
 - **List reads prepared a new statement per `limit`/`offset`** on every
   connection, without bound, and identical list reads in flight were never
   merged.

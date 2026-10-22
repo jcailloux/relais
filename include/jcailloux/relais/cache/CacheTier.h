@@ -207,6 +207,16 @@ public:
         });
     }
 
+    /// Return a value to the caller WITHOUT caching it — kept alive by the
+    /// returned EpochGuard in the transient pool. Used when the recheck
+    /// rejects a fill (a mutation straddled the fetch) or a store-through.
+    Hit transientHit(Value&& v) {
+        auto guard = epoch::EpochGuard::acquire();
+        auto* ptr = transientPool().New(std::move(v));
+        transientPool().Retire(ptr);
+        return Hit{ptr, nullptr, std::move(guard)};
+    }
+
     // =========================================================================
     // Cold path — async, deduped, GDSF admission
     // =========================================================================
@@ -643,16 +653,6 @@ private:
     // =========================================================================
     // Fetch + admission
     // =========================================================================
-
-    /// Return a value to the caller WITHOUT caching it — kept alive by the
-    /// returned EpochGuard in the transient pool. Used when the read-fill
-    /// recheck rejects the fill (a mutation straddled the fetch).
-    Hit transientHit(Value&& v) {
-        auto guard = epoch::EpochGuard::acquire();
-        auto* ptr = transientPool().New(std::move(v));
-        transientPool().Retire(ptr);
-        return Hit{ptr, nullptr, std::move(guard)};
-    }
 
     /// Second half of the read-fill recheck, once the fetched value is stored.
     /// The gate checked before the store is a check-then-act: a writer on

@@ -1001,18 +1001,20 @@ protected:
         co_return static_cast<size_t>(result[0].template get<int64_t>(0));
     }
 
-    /// Insert entity in database, returning entity by value.
-    static io::Task<std::optional<E>> insertRaw(const E& entity)
+    /// Insert entity in database, returning entity by value. `coalesced`, if
+    /// given, tells a follower of an identical insert (the leader's row).
+    static io::Task<std::optional<E>> insertRaw(const E& entity, bool* coalesced = nullptr)
         requires MutableEntity<E> && (!Cfg.read_only)
     {
         try {
             auto params = E::toInsertParams(entity);
             // Write path (seq-ordered): keeps insert in seq with update/erase of
-            // the same PK. coalesced ignored — two inserts with identical params
-            // yield distinct PKs, so coalescing is effectively unreachable.
+            // the same PK. Only inserts of a caller-assigned key can coalesce:
+            // with a database-assigned one, identical params yield distinct PKs.
             auto w = co_await PgProvider::queryWrite(
                 Mapping::SQL::insert, params, io::batch::WriteMode::Idempotent,
                 insertAffinity());
+            if (coalesced) *coalesced = w.coalesced;
             if (w.result.empty()) co_return std::nullopt;
             co_return E::fromRow(w.result[0]);
         } catch (const io::PgUncertainError&) {
@@ -1030,8 +1032,9 @@ protected:
     /// insert ($1..$n); the ON CONFLICT SET pulls its values from the proposed
     /// row (EXCLUDED), so no extra parameters. RETURNING projects all columns —
     /// the returned entity is the row after conflict resolution (create OR
-    /// update), reconstructed by fromRow exactly like insert.
-    static io::Task<std::optional<E>> upsertRaw(const E& entity)
+    /// update), reconstructed by fromRow exactly like insert. `coalesced` as
+    /// for insertRaw.
+    static io::Task<std::optional<E>> upsertRaw(const E& entity, bool* coalesced = nullptr)
         requires UpsertableEntity<E, Key> && HasUpsertSql<E> && (!Cfg.read_only)
     {
         try {
@@ -1039,6 +1042,7 @@ protected:
             auto w = co_await PgProvider::queryWrite(
                 Mapping::SQL::upsert, params, io::batch::WriteMode::Idempotent,
                 insertAffinity());
+            if (coalesced) *coalesced = w.coalesced;
             if (w.result.empty()) co_return std::nullopt;
             co_return E::fromRow(w.result[0]);
         } catch (const io::PgUncertainError&) {
@@ -1147,10 +1151,12 @@ protected:
     }
 
     /// The committed row of a keyed patch, with the row it replaced when the
-    /// tiers above asked for it (WithBefore).
+    /// tiers above asked for it (WithBefore). `coalesced`: a follower of an
+    /// identical patch, holding the leader's rows.
     struct Patched {
         std::optional<E> before;
         E after;
+        bool coalesced = false;
     };
 
     template<bool WithBefore>
@@ -1205,7 +1211,9 @@ protected:
             // always runs on its own.
             auto w = co_await PgProvider::queryWrite(
                 sql.c_str(), params, mode, affinity);
-            co_return decodePatched<WithBefore>(w.result);
+            auto patched = decodePatched<WithBefore>(w.result);
+            if (patched) patched->coalesced = w.coalesced;
+            co_return patched;
         } catch (const io::PgUncertainError&) {
             // Uncertain: the UPDATE may have committed. Propagate; the cache
             // tiers above evict by precaution as it unwinds.
