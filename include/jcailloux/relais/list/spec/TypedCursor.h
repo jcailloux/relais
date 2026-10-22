@@ -2,12 +2,14 @@
 #define JCX_RELAIS_LIST_SPEC_TYPEDCURSOR_H
 
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
 
 #include "jcailloux/relais/list/ListQuery.h"  // list::Cursor (opaque byte token)
+#include "jcailloux/relais/list/spec/FilterDescriptor.h"  // detail::keyComponentCount
 
 namespace jcailloux::relais::list::spec {
 
@@ -23,7 +25,8 @@ namespace jcailloux::relais::list::spec {
 // to list::Cursor, and the keyset SQL / cache-key machinery reads raw(). Only
 // the construction boundary is typed.
 //
-// Cross-descriptor confusion is the only type-level contract reachable here.
+// decode() also checks the width, the one property of the token fixed by the
+// descriptor: a non-empty cursor is exactly sizeof(int64_t) * (1 + N) bytes.
 // Intra-descriptor coherence (cursor vs the request's current sort) stays a
 // runtime concern by design: the sort varies per request and the token arrives
 // off the wire, so it cannot be a compile-time type.
@@ -37,9 +40,19 @@ public:
     /// nullopt on a malformed token (trust boundary); an empty token decodes to
     /// an empty (first-page) cursor. This is the sole runtime entry point — the
     /// type tag is conferred here, at the trust boundary.
+    ///
+    /// The width is part of the format: the sort value and the N primary-key
+    /// components, int64 each, N fixed per entity. A token of any other width
+    /// is truncated, extended or forged; accepted, it would reach the keyset SQL
+    /// short and serve page 1 under a cache key naming page N. The width is
+    /// computed in the body so that the entity is needed only when decoding.
     [[nodiscard]] static std::optional<TypedCursor> decode(std::string_view token) {
+        // An absent token is the first page; a token that decodes to nothing is not.
+        if (token.empty()) return TypedCursor{};
+        constexpr std::size_t kWidth =
+            sizeof(int64_t) * (1 + detail::keyComponentCount<typename Descriptor::Entity>);
         auto raw = list::Cursor::decode(token);
-        if (!raw) return std::nullopt;
+        if (!raw || raw->size() != kWidth) return std::nullopt;
         return TypedCursor{std::move(*raw)};
     }
 

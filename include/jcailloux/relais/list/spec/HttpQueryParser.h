@@ -192,7 +192,9 @@ ListQuery<Descriptor> parseListQuery(const Map& params) {
         query.limit = defaultLimit<Descriptor>();
     }
 
-    // Parse cursor — descriptor-tagged at the trust boundary.
+    // Parse cursor — descriptor-tagged at the trust boundary. A token decode()
+    // rejects is dropped: tolerance serves the first page, under its own key.
+    // parseListQueryStrict reports it as InvalidCursor.
     if (auto it = params.find("after"); it != params.end()) {
         if (auto cursor = TypedCursor<Descriptor>::decode(it->second)) {
             query.cursor = std::move(*cursor);
@@ -336,11 +338,18 @@ std::expected<ListQuery<Descriptor>, QueryValidationError> parseListQueryStrict(
         query.limit = defaultLimit<Descriptor>();
     }
 
-    // Parse cursor (no validation needed, just decoding) — descriptor-tagged.
+    // Parse cursor — descriptor-tagged; a token decode() rejects (alphabet or
+    // width) is an error, reported before any pagination conflict.
     if (auto it = params.find("after"); it != params.end()) {
-        if (auto cursor = TypedCursor<Descriptor>::decode(it->second)) {
-            query.cursor = std::move(*cursor);
+        auto cursor = TypedCursor<Descriptor>::decode(it->second);
+        if (!cursor) {
+            return std::unexpected(QueryValidationError{
+                .type = QueryValidationError::Type::InvalidCursor,
+                .field = "after",
+                .limit = 0
+            });
         }
+        query.cursor = std::move(*cursor);
     }
 
     // Parse offset

@@ -647,7 +647,8 @@ struct QueryValidationError {
         InvalidSort,
         InvalidLimit,
         ConflictingPagination,
-        InvalidValue
+        InvalidValue,
+        InvalidCursor
     };
 
     Type type;
@@ -666,6 +667,8 @@ struct QueryValidationError {
                 return "Cannot use both 'after' (cursor) and 'offset' simultaneously";
             case Type::InvalidValue:
                 return "Invalid value for filter: " + field;
+            case Type::InvalidCursor:
+                return "Invalid pagination cursor: " + field;
         }
         return "Unknown validation error";
     }

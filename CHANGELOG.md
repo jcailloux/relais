@@ -51,6 +51,14 @@
   child in a `whenAll`) may commit in either order. Order dependent writes with
   `co_await`; see `docs/runtime.md › Write ordering`.
 - **PostgreSQL 14 or later is required.**
+- **`QueryValidationError::Type` gains `InvalidCursor`**, returned by
+  `parseListQueryStrict` for a malformed `after` token (see Fixed). An
+  exhaustive `switch` on it must handle the new value.
+- **Keyset tokens are standard padded base64**: the encoder wrote `A` where
+  padding belonged, so a token decoded to extra bytes. Tokens issued before 4.0
+  may be rejected (always, for a single-column key): a client paginating across
+  the upgrade restarts at page 1 with the tolerant parser, or gets
+  `InvalidCursor` with the strict one.
 - **Behind a transaction pooler, set `uncertain_settle = Delay`** and a
   `statement_timeout` on the role or database: the default `Terminate` ends the
   server backend that ran an uncertain write, which the pooler may have handed
@@ -132,6 +140,12 @@
   caller-assigned key or `update` with `PopulateImmediately`. L1 now keeps the
   last committed row, or nothing. An `insert` with a database-assigned key no
   longer caches its row: the first read fetches it.
+- **A truncated or extended keyset token was served as page 1**, under a cache
+  key naming another page, and `parseListQueryStrict` dropped an unreadable
+  token. `Repo::Cursor::decode` now rejects a token whose decoded width is not
+  the format's (`8 × (1 + N)` bytes, N the primary-key columns); the strict
+  parser reports it as `InvalidCursor`, the tolerant parser serves page 1 under
+  its own key.
 - **List reads prepared a new statement per `limit`/`offset`** on every
   connection, without bound, and identical list reads in flight were never
   merged.

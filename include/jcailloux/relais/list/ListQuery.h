@@ -44,18 +44,20 @@ struct Cursor {
         std::string result;
         result.reserve((data.size() + 2) / 3 * 4);
 
-        size_t i = 0;
-        while (i < data.size()) {
-            uint32_t octet_a = static_cast<uint8_t>(data[i++]);
-            uint32_t octet_b = i < data.size() ? static_cast<uint8_t>(data[i++]) : 0;
-            uint32_t octet_c = i < data.size() ? static_cast<uint8_t>(data[i++]) : 0;
+        // A short final group is padded with '=', so decode() returns exactly
+        // the bytes encoded.
+        for (size_t i = 0; i < data.size(); i += 3) {
+            const size_t left = data.size() - i;
+            uint32_t octet_a = static_cast<uint8_t>(data[i]);
+            uint32_t octet_b = left > 1 ? static_cast<uint8_t>(data[i + 1]) : 0;
+            uint32_t octet_c = left > 2 ? static_cast<uint8_t>(data[i + 2]) : 0;
 
             uint32_t triple = (octet_a << 16) | (octet_b << 8) | octet_c;
 
             result += alphabet[(triple >> 18) & 0x3F];
             result += alphabet[(triple >> 12) & 0x3F];
-            result += (i > data.size() + 1) ? '=' : alphabet[(triple >> 6) & 0x3F];
-            result += (i > data.size()) ? '=' : alphabet[triple & 0x3F];
+            result += left > 1 ? alphabet[(triple >> 6) & 0x3F] : '=';
+            result += left > 2 ? alphabet[triple & 0x3F] : '=';
         }
         return result;
     }

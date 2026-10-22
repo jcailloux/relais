@@ -113,6 +113,8 @@ void appendPagination(Out& out, const ListQueryParams<Descriptor>& params) {
     appendToBuffer(out, params.limit);
 
     // Cursor — the opaque byte token behind the descriptor tag: [len:u32][bytes].
+    // Its width is checked at decode, so every byte keyed here is read by the
+    // keyset SQL.
     const auto& cursor_data = params.cursor.raw().data;
     if (!cursor_data.empty()) {
         appendToBuffer(out, static_cast<uint32_t>(cursor_data.size()));
