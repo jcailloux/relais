@@ -243,18 +243,19 @@ TEST_CASE("PartitionKey<TestEvent> - L1 caching",
         CHECK(result2->title == "Cacheable");
     }
 
-    SECTION("[insert] populates L1 cache") {
+    SECTION("[insert] returns the row, uncached when the database assigns the key") {
         auto created = sync(L1TestEventRepo::insert(
             makeTestEvent("eu", userId, "Created via L1")));
         REQUIRE(created != nullptr);
+        CHECK(created->title == "Created via L1");
 
         // Modify in DB
         updateTestEvent(created->id, "DB Modified", 99);
 
-        // L1 returns cached (pre-modification) value
-        auto cached = sync(L1TestEventRepo::find(created->id));
-        REQUIRE(cached != nullptr);
-        CHECK(cached->title == "Created via L1");
+        // Not cached by the insert: the first read fetches the row
+        auto fetched = sync(L1TestEventRepo::find(created->id));
+        REQUIRE(fetched != nullptr);
+        CHECK(fetched->title == "DB Modified");
     }
 
     SECTION("[update] invalidates L1 cache") {

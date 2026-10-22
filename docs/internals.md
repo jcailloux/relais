@@ -893,7 +893,7 @@ Composed concepts used in repository `requires` clauses:
 | `ReadableEntity<E>` | `Readable` (provides `fromRow`) | `PgRepo` |
 | `CacheableEntity<E>` | `Readable + Serializable` | `LocalRepo` |
 | `MutableEntity<E>` | `Readable + Writable` (provides `toInsertParams`) | `insert()`, `update()` |
-| `CreatableEntity<E, K>` | `Mutable + Keyed` | `insert()` with cache population |
+| `CreatableEntity<E, K>` | `Mutable + Keyed` | `insert()` |
 
 Detection concepts in the same header gate the optional features:
 `HasListDescriptor<E>` (`E::MappingType::ListDescriptor` exists → list caching) and

@@ -178,11 +178,13 @@ public:
     // Mutations
     // =========================================================================
 
-    /// Insert entity and cache it. Returns epoch-guarded view. With a key the
-    /// caller assigns, another loop may write that key meanwhile: the row is
-    /// stored through as an update's (see storeThrough). A key the database
-    /// assigns has no slot to read before the statement is sent: the row is
-    /// stored as is.
+    /// Insert entity. Returns epoch-guarded view of the committed row. With a
+    /// key the caller assigns, another loop may write that key meanwhile: the
+    /// row is stored through as an update's (see storeThrough). A key the
+    /// database assigns has no slot to read before the statement is sent, yet
+    /// another loop may learn it from the committed row and write it before
+    /// this result is handled: the row is returned uncached, the first read
+    /// fetches it.
     static io::Task<cache::CacheView<E>> insert(const E& entity)
         requires CreatableEntity<E, Key> && (!Cfg.read_only)
     {
@@ -194,10 +196,7 @@ public:
             if (result) co_return settleKeyed(key, snap, coalesced, std::move(*result));
         } else {
             auto result = co_await Base::insertRaw(entity);
-            if (result) {
-                bumpGeneration(result->key());
-                co_return storeAndView(result->key(), std::move(*result));
-            }
+            if (result) co_return uncachedView(std::move(*result));
         }
         co_return {};
     }
@@ -696,7 +695,7 @@ private:
     }
 
     // =========================================================================
-    // Store + view helper
+    // Store-through
     // =========================================================================
 
     /// Store a committed patch through (see storeThrough). A coalesced
@@ -767,13 +766,6 @@ private:
             if (auto hit = lookup(id)) slot->emplace(*hit.value);
         } catch (...) {
         }
-    }
-
-    /// Store entity in cache and return CacheView.
-    static cache::CacheView<E> storeAndView(const Key& key, E&& src) {
-        auto hit = tier().store(key, std::move(src), buildMetadata());
-        return cache::CacheView<E>(
-            static_cast<const E*>(hit.value), std::move(hit.guard));
     }
 
     // =========================================================================
