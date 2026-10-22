@@ -355,7 +355,7 @@ TEST_CASE("LocalRepo<TestItem> - insert",
 {
     TransactionGuard tx;
 
-    SECTION("[insert] inserts entity and populates L1 cache") {
+    SECTION("[insert] returns the row, uncached when the database assigns the key") {
         auto created = sync(L1TestItemRepo::insert(makeTestItem("New Item", 100, "Created via repo")));
         REQUIRE(created != nullptr);
         REQUIRE(created->id > 0);
@@ -365,10 +365,10 @@ TEST_CASE("LocalRepo<TestItem> - insert",
         // Modify in DB directly
         updateTestItem(created->id, "DB Modified", 999);
 
-        // L1 cache populated by insert → returns stale value
-        auto cached = sync(L1TestItemRepo::find(created->id));
-        REQUIRE(cached != nullptr);
-        CHECK(cached->name == "New Item");  // From L1 cache
+        // Not cached by the insert: the first read fetches the row
+        auto fetched = sync(L1TestItemRepo::find(created->id));
+        REQUIRE(fetched != nullptr);
+        CHECK(fetched->name == "DB Modified");
     }
 }
 

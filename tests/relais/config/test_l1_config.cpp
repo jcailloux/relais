@@ -231,15 +231,14 @@ TEST_CASE("L1 Config - update_strategy",
     SECTION("[strategy] PopulateImmediately: cache survives DB-direct modification") {
         auto id = insertTestItem("pop_stale", 10);
 
-        // Populate via create
-        auto entity = makeTestItem("pop_created", 30);
-        auto created = sync(PopImmediateRepo::insert(entity));
+        // Populate via update (write-through)
+        sync(PopImmediateRepo::update(id, makeTestItem("pop_updated", 30, "", true, id)));
 
         // Direct DB modification not visible
-        updateTestItem(created->id, "invisible", 0);
+        updateTestItem(id, "invisible", 0);
 
-        auto item = sync(PopImmediateRepo::find(created->id));
-        REQUIRE(item->name == "pop_created");
+        auto item = sync(PopImmediateRepo::find(id));
+        REQUIRE(item->name == "pop_updated");
     }
 }
 
