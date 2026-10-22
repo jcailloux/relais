@@ -803,6 +803,12 @@ class MappingGenerator:
             lines.append(
                 f'            "UPDATE {table_name} SET {update_set} '
                 f'WHERE {pk_where}";')
+            # Same UPDATE, returning the committed row: what a write-through
+            # cache stores (triggers, rounding and db_managed columns applied).
+            lines.append(f"        static constexpr const char* update_returning =")
+            lines.append(
+                f'            "UPDATE {table_name} SET {update_set} '
+                f'WHERE {pk_where} RETURNING {all_cols_str}";')
             # Same UPDATE, returning the row it replaced then the committed
             # one: the pre-image that list and cross-invalidation need, locked
             # and exact, in the write's own round-trip. Same parameters. The
