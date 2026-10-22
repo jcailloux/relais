@@ -189,7 +189,7 @@ struct CacheConfig {
 
 **`FixedString`:** lets string literals be template arguments. `FixedString<N>` stores `char[N]` and is implicitly convertible to `const char*`.
 
-**`recheck_slots_log2`** sizes the read-fill recheck guard — a sharded generation counter that rejects a cache fill if a mutation landed during the fetch (pessimistic miss, never stale). It is process-local: it does not see another instance's writes.
+**`recheck_slots_log2`** sizes the read-fill recheck guard — a sharded generation counter that rejects a cache fill if a mutation landed during the fetch (pessimistic miss, never stale). It gates a write that stores its committed row the same way: if a mutation on the key landed since the write was sent, the key is evicted instead. It is process-local: it does not see another instance's writes.
 
 **Presets:**
 
@@ -367,7 +367,7 @@ Fetch old entity (pre-image; only if lists/cross-inval in the chain)
       v
 INSERT … ON CONFLICT DO UPDATE … RETURNING
       |
-      +-- success ------> store-through L1 (onMutation + bumpGeneration + storeAndView)
+      +-- success ------> store-through L1 (onMutation + storeThrough)
       |                    lists: old ? onEntityUpdated(old,new) : onEntityCreated(new)
       |                    cross: old ? propagateUpdate(old,new)  : propagateCreate(new)
       |
@@ -378,9 +378,11 @@ INSERT … ON CONFLICT DO UPDATE … RETURNING
 ```
 
 The create/update discriminant is `old.has_value()` from the pre-image — the same
-machinery `update` uses. `onMutation` + `bumpGeneration` on the L1 store (both
-absent from `insert`) let a pre-existing L1 slot be superseded without a concurrent
-read-fill reinstating the old value.
+machinery `update` uses. `onMutation` (absent from `insert`) applies the update
+penalty to a ghost. `storeThrough` bumps the key's recheck slot, so a concurrent
+read-fill cannot reinstate the old value, and evicts the key instead of storing
+when the slot moved since the statement was sent: another write on the key was
+handled meanwhile, possibly one committed later on another loop.
 
 ### Uncertain writes: precaution and settling
 

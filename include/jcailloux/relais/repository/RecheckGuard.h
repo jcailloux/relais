@@ -36,6 +36,12 @@ namespace jcailloux::relais {
 /// key's slot → that other key's fill is skipped (one extra miss) — pessimistic,
 /// NEVER stale.
 ///
+/// A write that stores its committed row through is gated the same way, its
+/// window being the write itself: PostgreSQL orders two writes on one row, but
+/// each result is handled by the loop that sent it, the older one possibly
+/// last. A write that finds the slot moved since it was sent may be the older
+/// one: it evicts the key instead of storing (see bumpFrom).
+///
 /// No wraparound, any width: the comparison window is the FETCH duration
 /// (µs–ms), not the entry lifetime. A false "unchanged" would need 2⁶⁴ bumps
 /// during one fetch → impossible. `uint64_t` for comfort; no backstop needed.
@@ -86,6 +92,17 @@ struct RecheckGuard {
     static void bump(const Key& id) {
         slots_[slotOf(id)].fetch_add(1, std::memory_order_seq_cst);
         std::atomic_thread_fence(std::memory_order_seq_cst);
+    }
+
+    /// bump() for a write that stores its committed row through: true if the
+    /// slot had not moved since `snap`, read before the write was sent. False:
+    /// another mutation on the key, or on a key sharing its slot, landed
+    /// meanwhile. The slot then holds snap + 1 when true, for the check after
+    /// the store (changedAfterStore).
+    static bool bumpFrom(const Key& id, uint64_t snap) {
+        const uint64_t before = slots_[slotOf(id)].fetch_add(1, std::memory_order_seq_cst);
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        return before == snap;
     }
 
     /// bump() for every key: rows nobody can name may have changed. Every fill

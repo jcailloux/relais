@@ -178,33 +178,46 @@ public:
     // Mutations
     // =========================================================================
 
-    /// Insert entity and cache it. Returns epoch-guarded view.
+    /// Insert entity and cache it. Returns epoch-guarded view. With a key the
+    /// caller assigns, another loop may write that key meanwhile: the row is
+    /// stored through as an update's (see storeThrough). A key the database
+    /// assigns has no slot to read before the statement is sent: the row is
+    /// stored as is.
     static io::Task<cache::CacheView<E>> insert(const E& entity)
         requires CreatableEntity<E, Key> && (!Cfg.read_only)
     {
-        auto result = co_await Base::insertRaw(entity);
-        if (result) {
-            bumpGeneration(result->key());
-            co_return storeAndView(result->key(), std::move(*result));
+        if constexpr (kInsertKeyKnown<E>) {
+            const Key key = entity.key();
+            const uint64_t snap = Recheck::snapshot(key);
+            bool coalesced = false;
+            auto result = co_await Base::insertRaw(entity, &coalesced);
+            if (result) co_return settleKeyed(key, snap, coalesced, std::move(*result));
+        } else {
+            auto result = co_await Base::insertRaw(entity);
+            if (result) {
+                bumpGeneration(result->key());
+                co_return storeAndView(result->key(), std::move(*result));
+            }
         }
         co_return {};
     }
 
-    /// Upsert entity and cache it (store-through the committed row). Returns
-    /// epoch-guarded view. Unlike insert, a pre-existing L1 value must be
-    /// superseded cleanly: onMutation drives the read-fill recheck and
-    /// bumpGeneration rejects a straddling stale fetch — this is upsert-L1 =
-    /// update-L1, not insert. On an uncertain outcome, evict L1 by precaution
-    /// (local, cannot fail).
+    /// Upsert entity and cache it (store-through the committed row, see
+    /// storeThrough). Returns epoch-guarded view. Unlike insert, a pre-existing
+    /// L1 value must be superseded cleanly: onMutation applies the update
+    /// penalty to a ghost — this is upsert-L1 = update-L1, not insert. On an
+    /// uncertain outcome, evict L1 by precaution (local, cannot fail).
     static io::Task<cache::CacheView<E>> upsert(const E& entity)
         requires UpsertableEntity<E, Key> && HasUpsertSql<E> && (!Cfg.read_only)
     {
         try {
-            auto result = co_await Base::upsertRaw(entity);
+            const Key key = entity.key();
+            const uint64_t snap = Recheck::snapshot(key);
+            bool coalesced = false;
+            auto result = co_await Base::upsertRaw(entity, &coalesced);
             if (result) {
-                tier().onMutation(result->key());
-                bumpGeneration(result->key());
-                co_return storeAndView(result->key(), std::move(*result));
+                if (!coalesced) tier().onMutation(result->key());
+                co_return settleKeyed(key, snap, coalesced, std::move(*result));
             }
             co_return {};
         } catch (const io::PgUncertainError& e) {
@@ -233,10 +246,11 @@ public:
         requires HasFieldUpdate<E> && (!Cfg.read_only)
     {
         try {
+            const uint64_t snap = Recheck::snapshot(id);
             auto patched = co_await Base::template patchRaw<WithBefore>(
                 id, std::forward<Updates>(updates)...);
             if (!patched) co_return typename Base::PatchedRow{};
-            co_return settlePatched(id, std::move(*patched));
+            co_return settlePatched(id, snap, std::move(*patched));
         } catch (const io::PgUncertainError& e) {
             keepUncertainBefore(id, uncertain_before);
             detail::precautionSync(e.settleTicket(), [id] { evict(id); });
@@ -254,11 +268,12 @@ public:
         requires HasFieldUpdate<E> && (!Cfg.read_only)
     {
         try {
+            const uint64_t snap = Recheck::snapshot(id);
             auto outcome = co_await Base::template patchIfRaw<WithBefore>(
                 id, guard, std::forward<Updates>(updates)...);
             if (outcome.error) co_return std::nullopt;
             if (!outcome.patched) co_return typename Base::PatchedRow{};
-            co_return settlePatched(id, std::move(*outcome.patched));
+            co_return settlePatched(id, snap, std::move(*outcome.patched));
         } catch (const io::PgUncertainError& e) {
             keepUncertainBefore(id, uncertain_before);
             detail::precautionSync(e.settleTicket(), [id] { evict(id); });
@@ -313,8 +328,9 @@ protected:
 
     /// Update returning full outcome (WithBefore: see PgRepo::updateOutcome).
     /// Write-through stores the committed row, as the database wrote it, not
-    /// the caller's entity. On an uncertain outcome, the L1 entry is kept in
-    /// `uncertain_before` before the precautionary evict, as for eraseOutcome.
+    /// the caller's entity (see storeThrough). On an uncertain outcome, the L1
+    /// entry is kept in `uncertain_before` before the precautionary evict, as
+    /// for eraseOutcome.
     template<bool WithBefore = false>
     static io::Task<typename Base::UpdateOutcome> updateOutcome(
         const Key& id, const E& entity,
@@ -325,6 +341,8 @@ protected:
         constexpr bool kWriteThrough = Cfg.update_strategy == PopulateImmediately;
 
         try {
+            uint64_t snap = 0;
+            if constexpr (kWriteThrough) snap = Recheck::snapshot(id);
             auto outcome = co_await Base::template updateOutcome<
                 WithBefore, WithBefore || kWriteThrough>(id, entity, uncertain_before);
             if (outcome.affected.value_or(0) > 0 && !outcome.coalesced) {
@@ -334,12 +352,11 @@ protected:
                     evict(id);
                 } else {
                     tier().onMutation(id);
-                    bumpGeneration(id);
                     // The tiers above read `after` only with the pre-image.
                     if constexpr (WithBefore)
-                        tier().store(id, E(*outcome.after), buildMetadata());
+                        storeThrough(id, snap, std::as_const(*outcome.after));
                     else
-                        tier().store(id, std::move(*outcome.after), buildMetadata());
+                        storeThrough(id, snap, std::move(*outcome.after));
                 }
             }
             co_return outcome;
@@ -682,14 +699,63 @@ private:
     // Store + view helper
     // =========================================================================
 
-    /// Store a committed patch through, after a generation bump: a read-fill
-    /// that fetched the previous version (its snapshot predates the bump)
-    /// fails its recheck, before its store or right after it.
-    static typename Base::PatchedRow settlePatched(const Key& id,
+    /// Store a committed patch through (see storeThrough). A coalesced
+    /// follower leaves L1 to its leader, which wrote the same row.
+    static typename Base::PatchedRow settlePatched(const Key& id, uint64_t snap,
                                                    typename Base::Patched&& patched) {
+        if (patched.coalesced)
+            return {std::move(patched.before), uncachedView(std::move(patched.after))};
         tier().onMutation(id);
-        bumpGeneration(id);
-        return {std::move(patched.before), storeAndView(id, std::move(patched.after))};
+        return {std::move(patched.before),
+                storeThroughAndView(id, snap, std::move(patched.after))};
+    }
+
+    /// The committed row of an insert or upsert keyed by the caller, `snap`
+    /// read on `key` before the statement was sent. A coalesced follower
+    /// leaves L1 to its leader. A row the database stored under another key (a
+    /// trigger rewrote it) has no slot read before the statement: that key is
+    /// evicted.
+    static cache::CacheView<E> settleKeyed(const Key& key, uint64_t snap, bool coalesced,
+                                           E&& row) {
+        if (coalesced) return uncachedView(std::move(row));
+        if (!(row.key() == key)) {
+            evict(row.key());
+            return uncachedView(std::move(row));
+        }
+        return storeThroughAndView(key, snap, std::move(row));
+    }
+
+    /// Store a committed row through. `snap` is the key's recheck slot, read
+    /// before the write was sent. The bump makes a read-fill that fetched the
+    /// previous version fail its recheck. PostgreSQL orders two writes on one
+    /// row, but each result is handled by the loop that sent it, the older one
+    /// possibly last: if the slot moved since `snap`, this row may be older
+    /// than what L1 holds, and the key is evicted instead (empty hit). `row`
+    /// is moved or copied only once the bump succeeded. A mutation landing
+    /// during the store is caught by the check after it, as for a read-fill
+    /// (see RecheckGuard::changed).
+    template<typename Row>
+    static typename Tier::Hit storeThrough(const Key& id, uint64_t snap, Row&& row) {
+        if (!Recheck::bumpFrom(id, snap)) {
+            tier().evict(id);
+            return {};
+        }
+        auto hit = tier().store(id, E(std::forward<Row>(row)), buildMetadata());
+        if (Recheck::changedAfterStore(id, snap + 1)) tier().evictIfSame(id, hit.value);
+        return hit;
+    }
+
+    /// storeThrough, viewed: a row not stored is still returned, uncached.
+    static cache::CacheView<E> storeThroughAndView(const Key& id, uint64_t snap, E&& row) {
+        auto hit = storeThrough(id, snap, std::move(row));
+        if (!hit) return uncachedView(std::move(row));  // not consumed: not stored
+        return cache::CacheView<E>(static_cast<const E*>(hit.value), std::move(hit.guard));
+    }
+
+    /// A committed row returned to the caller without being cached.
+    static cache::CacheView<E> uncachedView(E&& row) {
+        auto hit = tier().transientHit(std::move(row));
+        return cache::CacheView<E>(static_cast<const E*>(hit.value), std::move(hit.guard));
     }
 
     /// Copy the L1 entry into `slot` (if asked and still empty): the version

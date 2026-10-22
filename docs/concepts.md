@@ -97,6 +97,10 @@ caches) rather than overwriting them. The next read re-fetches and re-fills. Thi
 — it can never leave a stale value cached, because it leaves *nothing* cached.
 (An optimistic `PopulateImmediately` write-through exists for read-after-write-heavy
 paths; see [api-reference.md › CacheConfig](api-reference.md#cacheconfig).)
+The writes that return the row (`patch`, `upsert`, `insert`) store the committed
+row instead. Two loops writing one row may handle their results out of commit
+order: a write that finds another write on the key handled since it was sent
+evicts the key rather than storing a row that may be the older one.
 
 **Staleness is bounded by timing, never by scope.** The cross-target invalidation of
 batch and predicate writes propagates detached (fire-and-forget), so a dependent
