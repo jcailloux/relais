@@ -151,6 +151,85 @@ class StructParser:
     )
     # Regex: namespace ... {
     NAMESPACE_RE = re.compile(r'namespace\s+([\w:]+)\s*\{')
+    # Raw string literal prefixes: the identifier right before the opening quote
+    RAW_PREFIXES = ("R", "u8R", "uR", "UR", "LR")
+
+    @staticmethod
+    def _strip_code(line: str, state: str = "") -> tuple[str, str]:
+        """Return the code of `line` without comments or literal contents, and
+        the state carried to the next line.
+
+        `state` is the terminator still awaited from a previous line: "" in
+        code, "*/" in a block comment, ')delim"' in a raw string. A block
+        comment becomes a space; a literal keeps its quotes and loses its
+        contents. Braces and declarations are read from this view only: the
+        raw line still carries the @relais tags and the member's initializer.
+        """
+        out = []
+        i, n = 0, len(line)
+        while i < n:
+            if state:
+                end = line.find(state, i)
+                if end < 0:
+                    break
+                i = end + len(state)
+                state = ""
+                continue
+            ch = line[i]
+            if line.startswith("//", i):
+                break
+            if line.startswith("/*", i):
+                out.append(" ")
+                state = "*/"
+                i += 2
+            elif ch in "\"'":
+                prefix = StructParser._token_before(line, i)
+                if ch == "'" and prefix[:1].isdigit():  # digit separator: 1'000
+                    out.append(ch)
+                    i += 1
+                    continue
+                out.append(ch + ch)
+                open_paren = line.find("(", i + 1)
+                if ch == '"' and prefix in StructParser.RAW_PREFIXES and open_paren >= 0:
+                    state = ")" + line[i + 1:open_paren] + '"'
+                    i = open_paren + 1
+                else:
+                    i = StructParser._literal_end(line, i)
+            else:
+                out.append(ch)
+                i += 1
+        return "".join(out), state
+
+    @staticmethod
+    def _token_before(line: str, i: int) -> str:
+        """The identifier or number that ends right before line[i]."""
+        j = i
+        while j > 0 and (line[j - 1].isalnum() or line[j - 1] in "_'."):
+            j -= 1
+        return line[j:i]
+
+    @staticmethod
+    def _literal_end(line: str, i: int) -> int:
+        """Index just past the literal whose opening quote is line[i]."""
+        quote = line[i]
+        j = i + 1
+        while j < len(line):
+            if line[j] == "\\":
+                j += 2
+            elif line[j] == quote:
+                return j + 1
+            else:
+                j += 1
+        return len(line)
+
+    @classmethod
+    def _code_lines(cls, lines: list[str]) -> list[str]:
+        """_strip_code over a file, block comments and raw strings spanning lines."""
+        codes, state = [], ""
+        for line in lines:
+            code, state = cls._strip_code(line, state)
+            codes.append(code)
+        return codes
 
     def parse_file(self, filepath: Path) -> list[ParsedEntity]:
         """Parse a header file and return all annotated entities."""
@@ -164,6 +243,7 @@ class StructParser:
 
         # Find all @relais annotation blocks followed by a class/struct declaration
         lines = content.split('\n')
+        codes = self._code_lines(lines)
         i = 0
         while i < len(lines):
             # Look for @relais annotation block
@@ -182,7 +262,7 @@ class StructParser:
                 continue
 
             # Find class/struct declaration (may follow immediately or after blank lines)
-            while i < len(lines) and not self.CLASS_RE.search(lines[i]):
+            while i < len(lines) and not self.CLASS_RE.search(codes[i]):
                 i += 1
                 if i >= len(lines):
                     break
@@ -190,7 +270,7 @@ class StructParser:
             if i >= len(lines):
                 break
 
-            class_match = self.CLASS_RE.search(lines[i])
+            class_match = self.CLASS_RE.search(codes[i])
             if not class_match:
                 i += 1
                 continue
@@ -211,7 +291,7 @@ class StructParser:
                     annot.entity_fqn = class_name
 
                 # Parse data members from the class body (with inline annotations)
-                members = self._parse_members(lines, i)
+                members = self._parse_members(lines, codes, i)
 
                 # Apply inline member annotations to the EntityAnnotation
                 self._apply_member_annotations(annot, members)
@@ -421,25 +501,30 @@ class StructParser:
         matches = list(self.NAMESPACE_RE.finditer(before))
         return matches[-1].group(1) if matches else ""
 
-    def _parse_members(self, lines: list[str], class_line_idx: int) -> list[DataMember]:
-        """Parse data members from a class/struct body."""
+    def _parse_members(self, lines: list[str], codes: list[str],
+                       class_line_idx: int) -> list[DataMember]:
+        """Parse data members from a class/struct body.
+
+        Braces are counted on `codes` (comments and literal contents removed),
+        so a brace in a comment or a string never opens or closes the body.
+        """
         members = []
         brace_depth = 0
+        opened = False
         in_public = False
-        is_struct = 'struct ' in lines[class_line_idx]
+        is_struct = 'struct ' in codes[class_line_idx]
 
         for i in range(class_line_idx, len(lines)):
             line = lines[i]
-            if '{' in line:
-                brace_depth += line.count('{') - line.count('}')
+            code = codes[i]
+            brace_depth += code.count('{') - code.count('}')
+            opened = opened or '{' in code
+            if opened and brace_depth <= 0:
+                break  # the body's closing brace; the rest of the line is outside
+            if '{' in code:
                 if i == class_line_idx and is_struct:
                     in_public = True
                 continue
-
-            if brace_depth == 0 and i > class_line_idx:
-                break
-
-            brace_depth += line.count('{') - line.count('}')
 
             stripped = line.strip()
             if stripped == "public:":
@@ -500,6 +585,8 @@ class StructParser:
                     name, cpp_type, default, db_column, tags, enum_pairs,
                     flt_configs, srt_configs))
 
+        if opened and brace_depth > 0:
+            raise ValueError("unbalanced braces: the struct body is never closed")
         return members
 
 
