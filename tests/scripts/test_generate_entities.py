@@ -130,6 +130,11 @@ class MemberParsing(GeneratorCase):
         """)
         self.assertEqual([m.name for m in e.members], ["id", "label"])
 
+    def test_every_flag_tag(self):
+        flags = {"primary_key", "partition_key", "db_managed", "timestamp", "raw_json",
+                 "json_field"}
+        self.assertEqual(self.member("// @relais " + " ".join(sorted(flags))).tags, flags)
+
     def test_prose_before_the_marker_is_ignored(self):
         m = self.member("// assigned by the caller — @relais primary_key",
                         "int64_t key_id = 0;")
@@ -519,6 +524,32 @@ class FilterAndSortTags(GeneratorCase):
         self.assertEqual([(s.param, s.direction) for s in m.sort_configs],
                          [("views", "asc")])
 
+    def test_malformed_forms_point_at_the_faulty_segment(self):
+        bad = self.header("Bad.h", """
+            // @relais table=t
+            struct T {
+                int64_t id = 0;  // @relais primary_key
+                int32_t a = 0;   // @relais filterable:x:gt2
+                int32_t b = 0;   // @relais sortable:y:ascending
+                int32_t c = 0;   // @relais filterable:x:ge:z
+                int32_t d = 0;   // @relais sortable::asc
+                int32_t e = 0;   // @relais filterable:date-from
+            };
+        """)
+        r = self.run_generator()
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertEqual(r.stderr.splitlines(), [
+            f"{bad}:4:46: error: unknown filter operator 'gt2'; did you mean 'gt'?",
+            f"{bad}:5:44: error: unknown sort direction 'ascending'; expected asc or desc",
+            f"{bad}:6:49: error: 'filterable:x:ge:z' has too many segments; "
+            f"expected filterable[:param][:op]",
+            f"{bad}:7:42: error: 'sortable::asc' has an empty parameter name; "
+            f"expected sortable[:param][:direction]",
+            f"{bad}:8:44: error: invalid parameter name 'date-from'; "
+            f"use letters, digits and '_'",
+            "5 errors, no file written",
+        ])
+
 
 class EnumTags(GeneratorCase):
 
@@ -536,6 +567,128 @@ class EnumTags(GeneratorCase):
     def test_bare_enum_reads_the_mapping_from_glaze(self):
         m = self.member("// @relais enum", "State state = State::Open;")
         self.assertIn("auto_enum", m.tags)
+
+    def test_each_malformed_pair_is_an_error(self):
+        bad = self.header("Bad.h", """
+            // @relais table=t
+            struct T {
+                int64_t id = 0;  // @relais primary_key
+                State state = State::Open;  // @relais enum=open:Open,closed,:X,a:b:c,
+            };
+        """)
+        r = self.run_generator()
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        expected = "expected <db value>:<enumerator>"
+        self.assertEqual(r.stderr.splitlines(), [
+            f"{bad}:4:59: error: malformed enum= pair 'closed'; {expected}",
+            f"{bad}:4:66: error: malformed enum= pair ':X'; {expected}",
+            f"{bad}:4:69: error: malformed enum= pair 'a:b:c'; {expected}",
+            f"{bad}:4:75: error: malformed enum= pair ''; {expected}",
+            "4 errors, no file written",
+        ])
+
+
+class UnknownTags(GeneratorCase):
+    """Each annotation level reads its own tags only; any other token is an error."""
+
+    def errors(self, body: str) -> tuple[Path, list]:
+        bad = self.header("Bad.h", body)
+        r = self.run_generator()
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        return bad, r.stderr.splitlines()
+
+    def test_a_typo_names_the_closest_tag(self):
+        bad, errors = self.errors("""
+            // @relais tabel=users
+            // @relais_list limit=10
+            struct T {
+                int64_t id = 0;  // @relais primary_key db_managd
+                std::string email;  // @relais colum=mail
+            };
+        """)
+        self.assertEqual(errors, [
+            f"{bad}:1:12: error: unknown struct tag 'tabel=users'; did you mean 'table='?",
+            f"{bad}:2:17: error: unknown list tag 'limit=10'; did you mean 'limits='?",
+            f"{bad}:4:45: error: unknown field tag 'db_managd'; did you mean 'db_managed'?",
+            f"{bad}:5:36: error: unknown field tag 'colum=mail'; did you mean 'column='?",
+            "4 errors, no file written",
+        ])
+
+    def test_a_tag_at_the_wrong_level_says_where_it_goes(self):
+        _, errors = self.errors("""
+            // @relais table=t limits=10
+            // @relais sortable:asc
+            // @relais_list read_only
+            struct T {
+                int64_t id = 0;  // @relais primary_key table=t
+                std::string name;  // @relais read_only=true
+            };
+        """)
+        self.assertEqual([e.split(": error: ")[-1] for e in errors[:-1]], [
+            "'limits=10' is a list tag; write it on a // @relais_list line above the struct",
+            "'sortable:asc' is a field tag; write it in the comment of a member",
+            "'read_only' is a struct tag; write it on the // @relais line above the struct",
+            "'table=t' is a struct tag; write it on the // @relais line above the struct",
+            "'read_only=true' is a struct tag; write it on the // @relais line above the struct",
+        ])
+
+    def test_prose_after_the_tags(self):
+        bad, errors = self.errors("""
+            // @relais table=t  -- the t table
+            struct T {
+                int64_t id = 0;  // @relais primary_key   (assigned, NOT db_managed)
+                int32_t views = 0;  // @relais filterable count of views
+            };
+        """)
+        prose = "tags run to the end of the comment, so prose goes before @relais"
+        self.assertEqual(errors, [
+            f"{bad}:1:21: error: unknown struct tag '--'",
+            f"{bad}:3:47: error: unknown field tag '(assigned,'; {prose}",
+            f"{bad}:4:47: error: unknown field tag 'count'; {prose}",
+            "3 errors, no file written",
+        ])
+
+    def test_spellings_that_used_to_pass(self):
+        cases = {
+            "// @relais table=t output=gen/T.h": "unknown struct tag 'output=gen/T.h'",
+            "// @relais table=t read_only=false":
+                "unknown struct tag 'read_only=false'; did you mean 'read_only'?",
+            "// @relais nullable": "unknown field tag 'nullable'",
+            "// @relais auto_enum": "unknown field tag 'auto_enum'",
+            "// @relais filterable_by_name": "unknown field tag 'filterable_by_name'",
+            "// @relais sortablex": "unknown field tag 'sortablex'; did you mean 'sortable'?",
+            "// @relais primary_key:x":
+                "unknown field tag 'primary_key:x'; did you mean 'primary_key'?",
+        }
+        for comment, message in cases.items():
+            with self.subTest(comment=comment):
+                struct_tags, field_tags = ((comment, "") if "table=" in comment
+                                           else ("// @relais table=t", comment))
+                _, errors = self.errors(f"""
+                    {struct_tags}
+                    struct T {{
+                        int64_t id = 0;  // @relais primary_key
+                        std::optional<int32_t> views;  {field_tags}
+                    }};
+                """)
+                self.assertIn(message, errors[0])
+
+    def test_a_key_without_value(self):
+        _, errors = self.errors("""
+            // @relais table=
+            // @relais_list entity=
+            struct T {
+                int64_t id = 0;  // @relais primary_key
+                std::string name;  // @relais column=
+                State state = State::Open;  // @relais enum=
+            };
+        """)
+        self.assertEqual([e.split(": error: ")[-1] for e in errors[:-1]], [
+            "'table=' has no value",
+            "'entity=' has no value",
+            "'column=' has no value",
+            "'enum=' has no value",
+        ])
 
 
 class GeneratorRun(GeneratorCase):

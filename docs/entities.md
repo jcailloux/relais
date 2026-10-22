@@ -53,10 +53,6 @@ python scripts/generate_entities.py --sources entities/ --output-dir entities/ge
   entity is written to `{ClassName}Entity.h` in that directory — e.g.
   `User` → `entities/generated/UserEntity.h`.
 
-> **There is no per-entity output path.** Some older examples showed a
-> `@relais output=...` annotation — it is **not parsed** and has no effect.
-> Output location is governed entirely by `--output-dir`.
-
 ### Generated-file include path is **relative**
 
 The generated header re-includes its source struct with a path computed
@@ -150,8 +146,7 @@ The generator also emits, **at global scope** (outside `entity::generated`):
 > **Nullability is not an annotation.** A field is nullable iff its C++ type is
 > `std::optional<T>` — the generator sets `FieldInfo<F>::is_nullable` from the
 > type alone, and that flag is what gates `setNull<F>()` in
-> [`patch`](caching.md#partial-updates-with-patch). A `// @relais nullable`
-> marker is inert (not parsed).
+> [`patch`](caching.md#partial-updates-with-patch).
 
 ## Array columns
 

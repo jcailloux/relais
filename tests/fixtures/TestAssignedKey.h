@@ -17,7 +17,7 @@ namespace relais_test {
 //
 // @relais table=relais_test_assigned_keys
 struct TestAssignedKey {
-    int64_t key_id = 0;    // @relais primary_key   (assigned, NOT db_managed)
+    int64_t key_id = 0;    // assigned, NOT db_managed — @relais primary_key
     int64_t payload = 0;
     std::string note;
 };

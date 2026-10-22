@@ -1070,7 +1070,7 @@ Any other `T` is a compile error.
 | `filterable[...]` | List filter — `filterable[:param][:op]`. Ops: `eq`/`ne`/`gt`/`ge`/`lt`/`le`/`in`/`nin`/`is_null` (aliases `gte`→`ge`, `lte`→`le`, `not_in`→`nin`); default `eq`. `is_null` requires a `std::optional` field; a parameter declared twice is an error. | [lists.md](lists.md) |
 | `sortable[...]` | List sort — `sortable[:param][:asc\|\|desc]`; default direction `desc`. | [lists.md](lists.md) |
 
-> **`nullable` is not a `@relais` annotation.** Field optionality (and thus `setNull` support in `patch`) derives from the C++ type being `std::optional<T>` — `FieldInfo<F>::is_nullable` mirrors the type, not a marker. Writing `// @relais nullable` adds an inert tag the generator does not consume.
+> **`nullable` is not a `@relais` annotation.** Field optionality (and thus `setNull` support in `patch`) derives from the C++ type being `std::optional<T>` — `FieldInfo<F>::is_nullable` mirrors the type, not a marker.
 
 > Full reference, examples, and constraints: **[entities.md](entities.md)**.
 
