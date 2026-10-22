@@ -26,6 +26,8 @@
  *  11a. ModificationTracker drains after concurrent storm
  *  11b. Progressive tracker reduction via trySweep
  *  15. Concurrent upsert on a shared assigned-PK key (+ upsert‖update‖erase)
+ *  16. Store-through on one key, results handled out of commit order
+ *  17. Store-through of identical writes coalesced in one batch
  */
 
 #include <catch2/catch_test_macros.hpp>
@@ -34,8 +36,15 @@
 #include "fixtures/TestRepositories.h"
 #include "fixtures/TestQueryHelpers.h"
 #include "fixtures/RelaisTestAccessors.h"
+#include "fixtures/PgProbe.h"
+#include "jcailloux/relais/io/IoPool.h"
+#include "jcailloux/relais/io/WhenAll.h"
+#include "jcailloux/relais/runtime/Spawn.h"
 
 #include <chrono>
+#include <future>
+#include <memory>
+#include <string>
 #include <thread>
 #include <vector>
 #include <latch>
@@ -1452,5 +1461,345 @@ TEST_CASE("Concurrency - concurrent upsert on shared key",
     }
     SECTION("[L1] upsert || update || erase on the same key") {
         runUpsertUpdateEraseSameKey<L1TestAssignedKeyRepo>(700003);
+    }
+}
+
+
+// #############################################################################
+//
+//  16. Store-through on one key, results handled out of commit order
+//
+//  A write stores the row it committed into L1. Two loops write the same row:
+//  PostgreSQL orders the two writes, but each loop handles its own result, so
+//  the older write may be handled last. Made deterministic: a transaction on a
+//  probe connection makes write A wait in the server, A's loop is then held,
+//  the transaction ends (A commits), write B runs to completion on the other
+//  loop, and A's loop is released. A is older than B: L1 must not keep it.
+//  Handled in commit order, the last row stays in L1.
+//
+// #############################################################################
+
+namespace {
+
+namespace jr = jcailloux::relais;
+using jcailloux::relais::io::test::PgProbe;
+
+/// Polls `done` on the test thread until it holds, for at most five seconds.
+template<typename Pred>
+bool eventually(Pred done) {
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!done()) {
+        if (std::chrono::steady_clock::now() > deadline) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    return true;
+}
+
+/// Two event loops sharing the process and its L1, one connection each.
+class TwoLoops {
+public:
+    TwoLoops() : locker_(getConnInfo()), probe_(getConnInfo()) {
+        io::IoPoolConfig cfg;
+        cfg.num_workers = 2;
+        cfg.pg_conninfo = getConnInfo();
+        cfg.pin_to_cores = false;
+        cfg.pg_min_conns_per_worker = 1;
+        cfg.pg_max_conns_per_worker = 1;
+        pool_ = io::IoPool::create(cfg);
+    }
+
+    ~TwoLoops() {
+        // A failed check may leave A blocked in the server or its loop held.
+        if (PQtransactionStatus(locker_.raw()) != PQTRANS_IDLE) {
+            try { locker_.query("ROLLBACK"); } catch (...) {}
+        }
+        if (hold_) hold_->release();
+        pool_->stop();
+    }
+
+    TwoLoops(const TwoLoops&) = delete;
+    TwoLoops& operator=(const TwoLoops&) = delete;
+
+    PgProbe& probe() { return probe_; }
+
+    /// Runs `task` to completion on loop `w`.
+    void runOn(int w, io::Task<void> task) { start(w, std::move(task)).get(); }
+
+    /// A on loop 0, then B on loop 1, each handled before the next starts.
+    void inOrder(io::Task<void> a, io::Task<void> b) {
+        runOn(0, std::move(a));
+        runOn(1, std::move(b));
+    }
+
+    /// `block` runs in a transaction on another connection and makes A wait in
+    /// the server; `unblock` ends that transaction. `committed` tells, through
+    /// the probe, that A has committed. A runs on loop 0, B on loop 1.
+    template<typename Committed>
+    void outOfOrder(const std::string& block, const std::string& unblock,
+             io::Task<void> a, Committed committed, io::Task<void> b) {
+        locker_.query("BEGIN");
+        locker_.query(block);
+        auto done_a = start(0, std::move(a));
+        REQUIRE(eventually([&] { return waitingOnLock(); }));
+        holdLoop(0);
+        locker_.query(unblock);
+        REQUIRE(eventually(committed));
+        start(1, std::move(b)).get();
+        hold_->release();
+        done_a.get();
+    }
+
+private:
+    struct Hold {
+        std::latch entered{1};
+        std::latch released{1};
+        bool done = false;  // test thread only
+        void release() {
+            if (done) return;
+            done = true;
+            released.count_down();
+        }
+    };
+
+    std::future<void> start(int w, io::Task<void> task) {
+        auto done = std::make_shared<std::promise<void>>();
+        auto f = done->get_future();
+        jr::spawnOn(pool_->workerIo(w), std::move(task), [done](jr::Outcome<void> r) {
+            if (r) done->set_value();
+            else done->set_exception(r.error());
+        });
+        return f;
+    }
+
+    /// Blocks loop `w` until the hold is released: a result it receives
+    /// meanwhile waits in its socket.
+    void holdLoop(int w) {
+        hold_ = std::make_shared<Hold>();
+        pool_->workerIo(w).post([h = hold_] {
+            h->entered.count_down();
+            h->released.wait();
+        });
+        hold_->entered.wait();
+    }
+
+    bool waitingOnLock() {
+        return probe_.query(
+            "SELECT count(*) FROM pg_stat_activity "
+            "WHERE datname = current_database() AND wait_event_type = 'Lock'").get(0) != "0";
+    }
+
+    PgProbe locker_;
+    PgProbe probe_;
+    std::unique_ptr<io::IoPool> pool_;
+    std::shared_ptr<Hold> hold_;
+};
+
+std::string itemValue(PgProbe& probe, int64_t id) {
+    auto r = probe.query("SELECT value FROM relais_test_items WHERE id = " + std::to_string(id));
+    return r.empty() ? "<absent>" : r.get(0);
+}
+
+std::string akeyPayload(PgProbe& probe, int64_t key) {
+    auto r = probe.query(
+        "SELECT payload FROM relais_test_assigned_keys WHERE key_id = " + std::to_string(key));
+    return r.empty() ? "<absent>" : r.get(0);
+}
+
+std::string lockItem(int64_t id) {
+    return "SELECT 1 FROM relais_test_items WHERE id = " + std::to_string(id) + " FOR UPDATE";
+}
+
+std::string lockAkey(int64_t key) {
+    return "SELECT 1 FROM relais_test_assigned_keys WHERE key_id = " + std::to_string(key)
+         + " FOR UPDATE";
+}
+
+io::Task<void> writeThroughUpdate(int64_t id, int32_t value) {
+    (void)co_await WriteThroughTestItemRepo::update(id, makeTestItem("ooo", value, "", true, id));
+}
+
+io::Task<void> patchValue(int64_t id, int32_t value) {
+    using jcailloux::relais::entity::set;
+    (void)co_await L1TestItemRepo::patch(id, set<TestItemEntity::Field::value>(value));
+}
+
+io::Task<void> eraseItem(int64_t id) {
+    (void)co_await L1TestItemRepo::erase(id);
+}
+
+io::Task<void> upsertAkey(int64_t key, int64_t payload) {
+    (void)co_await L1TestAssignedKeyRepo::upsert(makeTestAssignedKey(key, payload));
+}
+
+io::Task<void> insertAkey(int64_t key, int64_t payload) {
+    (void)co_await L1TestAssignedKeyRepo::insert(makeTestAssignedKey(key, payload));
+}
+
+io::Task<void> updateAkey(int64_t key, int64_t payload) {
+    (void)co_await L1TestAssignedKeyRepo::update(key, makeTestAssignedKey(key, payload));
+}
+
+}  // namespace
+
+TEST_CASE("Concurrency - store-through handled in commit order",
+          "[integration][db][concurrency][tsan][store-through]")
+{
+    TransactionGuard tx;
+    TwoLoops w;
+    auto& probe = w.probe();
+
+    SECTION("write-through update") {
+        auto id = insertTestItem("ooo", 0);
+        w.inOrder(writeThroughUpdate(id, 1), writeThroughUpdate(id, 2));
+        auto cached = TestInternals::getFromCache<WriteThroughTestItemRepo>(id);
+        REQUIRE(cached);
+        CHECK(cached->value == 2);
+    }
+
+    SECTION("patch") {
+        auto id = insertTestItem("ooo", 0);
+        w.inOrder(patchValue(id, 1), patchValue(id, 2));
+        auto cached = TestInternals::getFromCache<L1TestItemRepo>(id);
+        REQUIRE(cached);
+        CHECK(cached->value == 2);
+    }
+
+    SECTION("insert with a caller-assigned key, then upsert") {
+        constexpr int64_t key = 700103;
+        w.runOn(0, insertAkey(key, 1));
+        {
+            auto inserted = TestInternals::getFromCache<L1TestAssignedKeyRepo>(key);
+            REQUIRE(inserted);
+            CHECK(inserted->payload == 1);
+        }
+
+        w.runOn(1, upsertAkey(key, 2));
+        REQUIRE(akeyPayload(probe, key) == "2");
+        auto cached = TestInternals::getFromCache<L1TestAssignedKeyRepo>(key);
+        REQUIRE(cached);
+        CHECK(cached->payload == 2);
+    }
+}
+
+TEST_CASE("Concurrency - store-through handled out of commit order",
+          "[integration][db][concurrency][tsan][store-through]")
+{
+    TransactionGuard tx;
+    TwoLoops w;
+    auto& probe = w.probe();
+
+    SECTION("write-through update, then update") {
+        auto id = insertTestItem("ooo", 0);
+        auto a_committed = [&] { return itemValue(probe, id) == "1"; };
+        w.outOfOrder(lockItem(id), "COMMIT", writeThroughUpdate(id, 1), a_committed,
+              writeThroughUpdate(id, 2));
+
+        REQUIRE(itemValue(probe, id) == "2");
+        auto cached = TestInternals::getFromCache<WriteThroughTestItemRepo>(id);
+        CHECK((!cached || cached->value == 2));
+    }
+
+    SECTION("patch, then patch") {
+        auto id = insertTestItem("ooo", 0);
+        auto a_committed = [&] { return itemValue(probe, id) == "1"; };
+        w.outOfOrder(lockItem(id), "COMMIT", patchValue(id, 1), a_committed, patchValue(id, 2));
+
+        REQUIRE(itemValue(probe, id) == "2");
+        auto cached = TestInternals::getFromCache<L1TestItemRepo>(id);
+        CHECK((!cached || cached->value == 2));
+    }
+
+    SECTION("patch, then erase") {
+        auto id = insertTestItem("ooo", 0);
+        auto a_committed = [&] { return itemValue(probe, id) == "1"; };
+        w.outOfOrder(lockItem(id), "COMMIT", patchValue(id, 1), a_committed, eraseItem(id));
+
+        REQUIRE(itemValue(probe, id) == "<absent>");
+        CHECK(!TestInternals::getFromCache<L1TestItemRepo>(id));
+    }
+
+    SECTION("upsert, then upsert") {
+        constexpr int64_t key = 700101;
+        probe.query("INSERT INTO relais_test_assigned_keys (key_id, payload) VALUES (700101, 0)");
+        auto a_committed = [&] { return akeyPayload(probe, key) == "1"; };
+        w.outOfOrder(lockAkey(key), "COMMIT", upsertAkey(key, 1), a_committed, upsertAkey(key, 2));
+
+        REQUIRE(akeyPayload(probe, key) == "2");
+        auto cached = TestInternals::getFromCache<L1TestAssignedKeyRepo>(key);
+        CHECK((!cached || cached->payload == 2));
+    }
+
+    SECTION("insert with a caller-assigned key, then update") {
+        constexpr int64_t key = 700102;
+        // A waits for the transaction that holds the same key, rolled back.
+        auto a_committed = [&] { return akeyPayload(probe, key) == "1"; };
+        w.outOfOrder("INSERT INTO relais_test_assigned_keys (key_id, payload) VALUES (700102, 0)",
+              "ROLLBACK", insertAkey(key, 1), a_committed, updateAkey(key, 2));
+
+        REQUIRE(akeyPayload(probe, key) == "2");
+        auto cached = TestInternals::getFromCache<L1TestAssignedKeyRepo>(key);
+        CHECK((!cached || cached->payload == 2));
+    }
+}
+
+
+// #############################################################################
+//
+//  17. Store-through of identical writes coalesced in one batch
+//
+//  Identical idempotent writes in one batch run once: the follower receives
+//  the leader's row. Both had read the key's slot before the statement; the
+//  leader stores the row, and the follower must leave it in L1.
+//
+// #############################################################################
+
+namespace {
+
+io::Task<void> patchUncached(int64_t id, int32_t value) {
+    using jcailloux::relais::entity::set;
+    (void)co_await UncachedTestItemRepo::patch(id, set<TestItemEntity::Field::value>(value));
+}
+
+/// `first` departs alone; `a` and `b` wait for it in one batch.
+io::Task<void> behind(io::Task<void> first, io::Task<void> a, io::Task<void> b) {
+    std::vector<io::Task<void>> tasks;
+    tasks.push_back(std::move(first));
+    tasks.push_back(std::move(a));
+    tasks.push_back(std::move(b));
+    co_await io::whenAll(std::move(tasks));
+}
+
+}  // namespace
+
+TEST_CASE("Concurrency - store-through of identical writes coalesced in one batch",
+          "[integration][db][concurrency][store-through]")
+{
+    TransactionGuard tx;
+    // The scheduler batches writes once it has timed a few round-trips.
+    auto other = insertTestItem("other", 0);
+    for (int i = 0; i < 6; ++i) sync(UncachedTestItemRepo::find(other));
+
+    SECTION("patch") {
+        auto id = insertTestItem("coalesced", 0);
+        sync(behind(patchUncached(other, 1), patchValue(id, 5), patchValue(id, 5)));
+        auto cached = TestInternals::getFromCache<L1TestItemRepo>(id);
+        REQUIRE(cached);
+        CHECK(cached->value == 5);
+    }
+
+    SECTION("upsert") {
+        constexpr int64_t key = 700104;
+        sync(behind(patchUncached(other, 1), upsertAkey(key, 5), upsertAkey(key, 5)));
+        auto cached = TestInternals::getFromCache<L1TestAssignedKeyRepo>(key);
+        REQUIRE(cached);
+        CHECK(cached->payload == 5);
+    }
+
+    SECTION("insert with a caller-assigned key") {
+        constexpr int64_t key = 700105;
+        sync(behind(patchUncached(other, 1), insertAkey(key, 5), insertAkey(key, 5)));
+        auto cached = TestInternals::getFromCache<L1TestAssignedKeyRepo>(key);
+        REQUIRE(cached);
+        CHECK(cached->payload == 5);
     }
 }
