@@ -18,6 +18,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import difflib
 import os
 import re
 import sys
@@ -196,6 +197,30 @@ class StructParser:
     MEMBER_TAGS_RE = re.compile(r'//.*?@relais\b(.*)')
     # Regex: namespace ... {
     NAMESPACE_RE = re.compile(r'namespace\s+([\w:]+)\s*\{')
+    # Regex: the spelling a tag is looked up by — its key up to '=', or its
+    # name before the first ':'
+    SPELLING_RE = re.compile(r'[^=:]*=?')
+    # Regex: an HTTP parameter name given to filterable or sortable
+    PARAM_RE = re.compile(r'[A-Za-z_][A-Za-z0-9_]*')
+
+    # Field tags that only mark the member
+    FLAG_TAGS = ("primary_key", "partition_key", "db_managed", "timestamp", "raw_json",
+                 "json_field")
+    # Tags of each annotation level, and where a misplaced one belongs
+    TAGS = {
+        "struct": (("table=", "model=", "read_only", "read_only=true"),
+                   "on the // @relais line above the struct"),
+        "list": (("limits=", "entity="),
+                 "on a // @relais_list line above the struct"),
+        "field": (FLAG_TAGS + ("enum", "enum=", "column=", "filterable", "sortable"),
+                  "in the comment of a member"),
+    }
+    # Operators of filterable[:param][:op]; `not_in` is a readable alias for `nin`
+    FILTER_OPS = ("eq", "ne", "gt", "ge", "lt", "le", "gte", "lte",
+                  "in", "nin", "not_in", "is_null")
+    OP_ALIASES = {"gte": "ge", "lte": "le", "not_in": "nin"}
+    # Directions of sortable[:param][:direction]
+    SORT_DIRECTIONS = ("asc", "desc")
     # Raw string literal prefixes: the identifier right before the opening quote
     RAW_PREFIXES = ("R", "u8R", "uR", "UR", "LR")
 
@@ -376,26 +401,70 @@ class StructParser:
 
     def _parse_annotations(self, annotations: list[tuple[bool, int, list[tuple[int, str]]]]
                            ) -> EntityAnnotation:
-        """Parse annotation key=value pairs."""
+        """Read the tags of the @relais and @relais_list lines above a struct.
+        An unknown tag ends its line: what follows it is not read."""
         annot = EntityAnnotation()
 
         for is_list, line, tokens in annotations:
-            if is_list:
-                for col, token in tokens:
-                    if token.startswith("limits="):
-                        annot.limits = self._parse_limits(token[7:], line, col + 7)
-                    elif token.startswith("entity="):
-                        annot.entity_fqn = token[7:]
-            else:
-                for col, token in tokens:
-                    if token.startswith("table="):
-                        annot.table = token[6:]
-                    elif token.startswith("model="):
-                        annot.model = token[6:]
-                    elif token == "read_only" or token == "read_only=true":
-                        annot.read_only = True
+            for col, token in tokens:
+                if not (self._list_tag(annot, token, line, col) if is_list
+                        else self._struct_tag(annot, token, line, col)):
+                    self._unknown_tag(line, col, token, "list" if is_list else "struct")
+                    break
 
         return annot
+
+    def _struct_tag(self, annot: EntityAnnotation, token: str, line: int, col: int) -> bool:
+        """Apply a tag of a @relais line; False if it is not one."""
+        if token.startswith("table="):
+            annot.table = self._value(token, line, col)
+        elif token.startswith("model="):
+            annot.model = self._value(token, line, col)
+        elif token in ("read_only", "read_only=true"):
+            annot.read_only = True
+        else:
+            return False
+        return True
+
+    def _list_tag(self, annot: EntityAnnotation, token: str, line: int, col: int) -> bool:
+        """Apply a tag of a @relais_list line; False if it is not one."""
+        if token.startswith("limits="):
+            annot.limits = self._parse_limits(token[7:], line, col + 7)
+        elif token.startswith("entity="):
+            annot.entity_fqn = self._value(token, line, col)
+        else:
+            return False
+        return True
+
+    def _value(self, token: str, line: int, col: int) -> str:
+        """The value of a key=value tag, which must not be empty."""
+        value = token[token.index("=") + 1:]
+        if not value:
+            self._error(line, col, f"'{token}' has no value")
+        return value
+
+    def _unknown_tag(self, line: int, col: int, token: str, level: str):
+        """Report a tag that `level` (a key of TAGS) does not know: where it
+        belongs when another level knows it, else the closest known tag."""
+        spelling = self.SPELLING_RE.match(token).group()
+        for other, (tags, where) in self.TAGS.items():
+            if other != level and (token in tags or spelling in tags):
+                self._error(line, col, f"'{token}' is a {other} tag; write it {where}")
+                return
+        if close := self._closest(spelling, self.TAGS[level][0]):
+            hint = f"; did you mean '{close}'?"
+        elif level == "field":
+            hint = "; tags run to the end of the comment, so prose goes before @relais"
+        else:
+            hint = ""
+        self._error(line, col, f"unknown {level} tag '{token}'{hint}")
+
+    @staticmethod
+    def _closest(word: str, candidates: tuple[str, ...]) -> Optional[str]:
+        """The candidate `word` is likely a typo of. The cutoff is high enough
+        that a word of prose is not taken for a typo."""
+        close = difflib.get_close_matches(word, candidates, n=1, cutoff=0.75)
+        return close[0] if close else None
 
     def _parse_limits(self, spec: str, line: int, col: int) -> list[int]:
         """Parse, validate, sort and dedup a `limits=` annotation value, which
@@ -423,18 +492,6 @@ class StructParser:
             values.add(v)
         return sorted(values)
 
-    def _parse_enum_mapping(self, text: str) -> EnumMapping:
-        """Parse enum=field:val1:Enum1,val2:Enum2"""
-        parts = text.split(":")
-        field_name = parts[0]
-        rest = ":".join(parts[1:])
-        pairs = []
-        for pair_str in rest.split(","):
-            pair_parts = pair_str.split(":")
-            if len(pair_parts) == 2:
-                pairs.append((pair_parts[0], pair_parts[1]))
-        return EnumMapping(field_name, pairs)
-
     def _apply_member_annotations(self, annot: EntityAnnotation,
                                     members: list[DataMember]):
         """Populate EntityAnnotation fields from inline member @relais tags."""
@@ -458,9 +515,9 @@ class StructParser:
             annot.filters.extend(m.filter_configs)
             annot.sorts.extend(m.sort_configs)
 
-    @staticmethod
-    def _parse_filterable_tag(field_name: str, tag: str) -> FilterConfig:
-        """Parse filterable[:param[:op]] from an inline annotation.
+    def _parse_filterable_tag(self, field_name: str, tag: str, line: int,
+                              col: int) -> Optional[FilterConfig]:
+        """Parse filterable[:param][:op], None if malformed.
 
         Examples:
             filterable              -> EQ on field_name
@@ -473,53 +530,81 @@ class StructParser:
             filterable:cats:not_in  -> custom param + NIN operator (alias)
             filterable:parent_null:is_null -> custom param + IS_NULL (bool value)
         """
-        # Every op must be known so its short form (`filterable:in`) is parsed as
-        # an operator. Without it, `:in` falls through to the custom-param branch
-        # and silently becomes an EQ filter on an HTTP param named "in". `not_in`
-        # is a readable alias for `nin`.
-        KNOWN_OPS = {"eq", "ne", "gt", "ge", "lt", "le", "gte", "lte",
-                     "in", "nin", "not_in", "is_null"}
+        split = self._param_and_value(tag, line, col, self.FILTER_OPS, "filter operator",
+                                      "filterable[:param][:op]")
+        if split is None:
+            return None
+        param, op = split
+        return FilterConfig(param=param or field_name, field=field_name,
+                            op=self.OP_ALIASES.get(op, op or "eq"))
 
-        def _norm(o: str) -> str:
-            return (o.replace("gte", "ge").replace("lte", "le")
-                     .replace("not_in", "nin"))
-
-        parts = tag.split(":")
-        if len(parts) == 1:
-            return FilterConfig(param=field_name, field=field_name)
-        elif len(parts) == 2:
-            val = parts[1]
-            if val in KNOWN_OPS:
-                return FilterConfig(param=field_name, field=field_name,
-                                    op=_norm(val))
-            return FilterConfig(param=val, field=field_name)
-        else:
-            return FilterConfig(param=parts[1], field=field_name,
-                                op=_norm(parts[2]))
-
-    @staticmethod
-    def _parse_sortable_tag(field_name: str, tag: str) -> SortConfig:
-        """Parse sortable[:direction] or sortable[:param:direction].
+    def _parse_sortable_tag(self, field_name: str, tag: str, line: int,
+                            col: int) -> Optional[SortConfig]:
+        """Parse sortable[:param][:direction], None if malformed.
 
         Examples:
             sortable            -> DESC (default)
             sortable:asc        -> ASC
             sortable:desc       -> DESC
+            sortable:by_name    -> custom param, DESC
             sortable:name:asc   -> custom param + ASC
         """
-        DIRECTIONS = {"asc", "desc"}
-        parts = tag.split(":")
-        if len(parts) == 1:
-            return SortConfig(param=field_name, field=field_name)
-        elif len(parts) == 2:
-            val = parts[1]
-            if val in DIRECTIONS:
-                return SortConfig(param=field_name, field=field_name,
-                                  direction=val)
-            return SortConfig(param=val, field=field_name)
-        else:
-            return SortConfig(param=parts[1], field=field_name,
-                              direction=parts[2])
+        split = self._param_and_value(tag, line, col, self.SORT_DIRECTIONS, "sort direction",
+                                      "sortable[:param][:direction]")
+        if split is None:
+            return None
+        param, direction = split
+        return SortConfig(param=param or field_name, field=field_name,
+                          direction=direction or "desc")
+
+    def _param_and_value(self, tag: str, line: int, col: int, values: tuple[str, ...],
+                         what: str, form: str) -> Optional[tuple[str, str]]:
+        """Split `name[:param][:value]` into (param, value), each '' when absent.
+
+        A single segment is the value when it is one of `values` (so
+        `filterable:in` is an operator), else the parameter. Returns None after
+        reporting a malformed tag at its faulty segment.
+        """
+        name, *segments = tag.split(":")
+        cols, c = [], col + len(name) + 1
+        for s in segments:
+            cols.append(c)
+            c += len(s) + 1
+        if len(segments) > 2:
+            self._error(line, cols[2], f"'{tag}' has too many segments; expected {form}")
+            return None
+        if len(segments) == 1 and segments[0] in values:
+            return "", segments[0]
+        param, value = (segments + ["", ""])[:2]
+        if segments and not param:
+            self._error(line, cols[0], f"'{tag}' has an empty parameter name; expected {form}")
+            return None
+        if segments and not self.PARAM_RE.fullmatch(param):
+            self._error(line, cols[0], f"invalid parameter name '{param}'; "
+                                       f"use letters, digits and '_'")
+            return None
+        if len(segments) == 2 and value not in values:
+            close = self._closest(value, values)
+            hint = (f"did you mean '{close}'?" if close else
+                    f"expected {', '.join(values[:-1])} or {values[-1]}")
+            self._error(line, cols[1], f"unknown {what} '{value}'; {hint}")
+            return None
+        return param, value
+
+    def _parse_enum_pairs(self, tag: str, line: int, col: int) -> list[tuple[str, str]]:
+        """Parse the pairs of enum=db1:Enumerator1,db2:Enumerator2; each
+        malformed pair is reported at its column."""
+        value = self._value(tag, line, col)
+        pairs, c = [], col + len("enum=")
+        for pair in value.split(",") if value else []:
+            parts = pair.split(":")
+            if len(parts) == 2 and all(parts):
+                pairs.append((parts[0], parts[1]))
+            else:
+                self._error(line, c, f"malformed enum= pair '{pair}'; "
+                                     f"expected <db value>:<enumerator>")
+            c += len(pair) + 1
+        return pairs
 
     def _find_namespace(self, content: str, class_line: str) -> str:
         """Find the namespace enclosing the class declaration."""
@@ -591,22 +676,25 @@ class StructParser:
                            filter_params: set[str]):
         """Apply to `m` the tags of its line's @relais comment, matched by
         MEMBER_TAGS_RE. `filter_params` holds the filter parameters of the
-        members before it."""
+        members before it. An unknown tag ends the comment: what follows it is
+        not read."""
         for t in self.TOKEN_RE.finditer(tags.group(1)):
             tag, col = t.group(), tags.start(1) + t.start() + 1
-            if tag.startswith('enum='):
-                for pair in tag[5:].split(','):
-                    parts = pair.split(':')
-                    if len(parts) == 2:
-                        m.enum_pairs.append((parts[0], parts[1]))
+            name = tag.split(':', 1)[0]
+            if tag in self.FLAG_TAGS:
+                m.tags.add(tag)
+            elif tag.startswith('enum='):
+                m.enum_pairs.extend(self._parse_enum_pairs(tag, line, col))
                 m.enum_pos = (line, col)
             elif tag == 'enum':
                 m.tags.add('auto_enum')
                 m.enum_pos = (line, col)
             elif tag.startswith('column='):
-                m.db_column = tag[7:]
-            elif tag.startswith('filterable'):
-                fc = self._parse_filterable_tag(m.name, tag)
+                m.db_column = self._value(tag, line, col)
+            elif name == 'filterable':
+                fc = self._parse_filterable_tag(m.name, tag, line, col)
+                if fc is None:
+                    continue
                 if fc.op == "is_null" and not m.is_optional:
                     self._error(line, col, f"is_null requires a std::optional member; "
                                            f"'{m.name}' is {m.cpp_type}")
@@ -615,10 +703,13 @@ class StructParser:
                                            f"twice; name one of them (filterable:<param>:<op>)")
                 filter_params.add(fc.param)
                 m.filter_configs.append(fc)
-            elif tag.startswith('sortable'):
-                m.sort_configs.append(self._parse_sortable_tag(m.name, tag))
+            elif name == 'sortable':
+                sc = self._parse_sortable_tag(m.name, tag, line, col)
+                if sc is not None:
+                    m.sort_configs.append(sc)
             else:
-                m.tags.add(tag)
+                self._unknown_tag(line, col, tag, "field")
+                break
 
 
 # =============================================================================
