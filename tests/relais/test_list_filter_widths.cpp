@@ -114,7 +114,7 @@ struct DescFloat {
 /// The entity belongs to the group: a write of it reaches the group's pages.
 template<typename D>
 bool matches(const decl::ListQueryParams<D>& group, const Wide& e) {
-    return decl::matchesFilters<D>(e, group.filters);
+    return decl::detail::matchesFilters<D>(e, group.filters);
 }
 
 /// An update reaches the group when the old or the new state belongs to it.
@@ -127,7 +127,7 @@ bool reachedByUpdate(const decl::ListQueryParams<D>& group, const Wide& oldE, co
 template<typename D>
 bool reachedByPredicate(const decl::ListQueryParams<D>& group,
                         const decl::ListQueryParams<D>& predicate) {
-    return decl::predicateGroupCompatible<D>(predicate.filters, group.filters);
+    return decl::detail::predicateGroupCompatible<D>(predicate.filters, group.filters);
 }
 
 decl::ListQueryParams<DescTemp> tempParams(int16_t temp, int64_t owner) {

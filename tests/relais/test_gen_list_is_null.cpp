@@ -77,8 +77,8 @@ const std::optional<std::string> kSet = std::string("2026-01-01 00:00:00+00");
 // and Filters::matchesFilters over extracted tags.
 template<typename D>
 bool l1Match(const GenEntity& e, const decl::Filters<D>& f) {
-    const bool viaFree = decl::matchesFilters<D>(e, f);
-    const bool viaTags = f.matchesFilters(decl::extractTags<D>(e));
+    const bool viaFree = decl::detail::matchesFilters<D>(e, f);
+    const bool viaTags = f.matchesFilters(decl::detail::extractTags<D>(e));
     CHECK(viaFree == viaTags);
     return viaFree;
 }
@@ -110,19 +110,19 @@ TEST_CASE("IS_NULL SQL: true, false, inactive", "[list][is_null][unit][sql]") {
     decl::Filters<GenDesc> f;
 
     f.get<"published_null">() = true;
-    auto w = decl::buildWhereClause<GenDesc>(f);
+    auto w = decl::detail::buildWhereClause<GenDesc>(f);
     CHECK(w.sql == "\"published_at\" IS NULL");
     CHECK(w.params.params.empty());
     CHECK(w.next_param == 1);
 
     f.get<"published_null">() = false;
-    w = decl::buildWhereClause<GenDesc>(f);
+    w = decl::detail::buildWhereClause<GenDesc>(f);
     CHECK(w.sql == "\"published_at\" IS NOT NULL");
     CHECK(w.params.params.empty());
     CHECK(w.next_param == 1);
 
     f.get<"published_null">().reset();
-    w = decl::buildWhereClause<GenDesc>(f);
+    w = decl::detail::buildWhereClause<GenDesc>(f);
     CHECK(w.sql.empty());
     CHECK(w.next_param == 1);
 }
@@ -134,13 +134,13 @@ TEST_CASE("IS_NULL SQL binds nothing: the $n numbering stays continuous",
     f.get<"published_null">() = true;
     f.get<"views_in">() = std::vector<int32_t>{3, 1};
 
-    auto w = decl::buildWhereClause<GenDesc>(f);
+    auto w = decl::detail::buildWhereClause<GenDesc>(f);
     CHECK(w.sql == "\"category\"=$1 AND \"published_at\" IS NULL AND \"view_count\" = ANY($2)");
     CHECK(w.params.params.size() == 2);
     CHECK(w.next_param == 3);  // the keyset cursor binds from $3
 
     f.get<"published_null">() = false;
-    w = decl::buildWhereClause<GenDesc>(f);
+    w = decl::detail::buildWhereClause<GenDesc>(f);
     CHECK(w.sql == "\"category\"=$1 AND \"published_at\" IS NOT NULL AND \"view_count\" = ANY($2)");
     CHECK(w.params.params.size() == 2);
     CHECK(w.next_param == 3);
@@ -194,12 +194,12 @@ TEST_CASE("IS_NULL predicate compatibility", "[list][is_null][unit][compat]") {
     isNull.get<"published_null">() = true;
     notNull.get<"published_null">() = false;
 
-    CHECK_FALSE(decl::predicateGroupCompatible<GenDesc>(isNull, notNull));
-    CHECK_FALSE(decl::predicateGroupCompatible<GenDesc>(notNull, isNull));
-    CHECK(decl::predicateGroupCompatible<GenDesc>(isNull, isNull));
-    CHECK(decl::predicateGroupCompatible<GenDesc>(notNull, notNull));
-    CHECK(decl::predicateGroupCompatible<GenDesc>(isNull, open));  // group wildcard
-    CHECK(decl::predicateGroupCompatible<GenDesc>(open, notNull)); // predicate wildcard
+    CHECK_FALSE(decl::detail::predicateGroupCompatible<GenDesc>(isNull, notNull));
+    CHECK_FALSE(decl::detail::predicateGroupCompatible<GenDesc>(notNull, isNull));
+    CHECK(decl::detail::predicateGroupCompatible<GenDesc>(isNull, isNull));
+    CHECK(decl::detail::predicateGroupCompatible<GenDesc>(notNull, notNull));
+    CHECK(decl::detail::predicateGroupCompatible<GenDesc>(isNull, open));  // group wildcard
+    CHECK(decl::detail::predicateGroupCompatible<GenDesc>(open, notNull)); // predicate wildcard
 }
 
 TEST_CASE("IS_NULL on the sort column leaves the sort range full",
@@ -209,7 +209,7 @@ TEST_CASE("IS_NULL on the sort column leaves the sort range full",
     for (bool v : {true, false}) {
         decl::Filters<SortedOnNullable> pred;
         pred.get<"views_null">() = v;
-        auto r = decl::predicateSortRange<SortedOnNullable>(pred, 0);
+        auto r = decl::detail::predicateSortRange<SortedOnNullable>(pred, 0);
         CHECK(r.lo == kMin);
         CHECK(r.hi == kMax);
     }

@@ -168,8 +168,8 @@ namespace detail {
         return loop;
     }
 
-    inline std::shared_ptr<io::PgClient<IoCtx>>& testPg() {
-        static std::shared_ptr<io::PgClient<IoCtx>> pg;
+    inline std::shared_ptr<io::detail::PgClient<IoCtx>>& testPg() {
+        static std::shared_ptr<io::detail::PgClient<IoCtx>> pg;
         return pg;
     }
 
@@ -306,12 +306,12 @@ inline void initTest() {
             {.min_connections = static_cast<size_t>(pg_min),
              .max_connections = static_cast<size_t>(pg_max)}));
 
-    detail::testPg() = std::make_shared<io::PgClient<IoCtx>>(pool);
+    detail::testPg() = std::make_shared<io::detail::PgClient<IoCtx>>(pool);
 
 #ifdef RELAIS_BUILDING_TESTS
     // Connections a write batch may span; unset or 0 derives it from pg_max.
     if (auto* env = std::getenv("BENCH_WRITE_FANOUT"))
-        io::batch::BatchScheduler<IoCtx>::write_fanout_override =
+        io::batch::detail::BatchScheduler<IoCtx>::write_fanout_override =
             static_cast<size_t>(std::max(0, std::atoi(env)));
 #endif
 

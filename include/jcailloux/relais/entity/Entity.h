@@ -14,7 +14,7 @@
 #include "jcailloux/relais/io/pg/PgParams.h"
 #include "jcailloux/relais/entity/Format.h"
 
-namespace jcailloux::relais::entity {
+namespace jcailloux::relais::entity::detail {
 
 /// Heap capacity of a std::string, excluding SSO buffer (already in sizeof).
 /// Portable: checks if data() points outside the string object.
@@ -24,7 +24,7 @@ inline size_t heapCapacity(const std::string& s) {
     return (p < obj || p >= obj + sizeof(std::string)) ? s.capacity() : 0;
 }
 
-}  // namespace jcailloux::relais::entity
+}  // namespace jcailloux::relais::entity::detail
 
 namespace jcailloux::relais {
 

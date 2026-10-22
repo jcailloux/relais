@@ -22,7 +22,7 @@
 namespace relais_test { struct TestInternals; }
 #endif
 
-namespace jcailloux::relais::list {
+namespace jcailloux::relais::list::detail {
 
 // =============================================================================
 // ListCacheConfig - Configuration for ListCache behavior
@@ -109,8 +109,8 @@ struct SortBounds {
 // modification tracking — exact precision, no clock issues.
 
 template<typename FilterSet, typename SortFieldEnum>
-struct ListCacheMetadataImpl : cache::CacheMetadata<true, true> {
-    using Base = cache::CacheMetadata<true, true>;
+struct ListCacheMetadataImpl : cache::detail::CacheMetadata<true, true> {
+    using Base = cache::detail::CacheMetadata<true, true>;
 
     ListQuery<FilterSet, SortFieldEnum> query;
     // Generation of the owning ListCache the page is checked from: no
@@ -128,7 +128,7 @@ struct ListCacheMetadataImpl : cache::CacheMetadata<true, true> {
                           uint32_t ttl_expiration,
                           SortBounds bounds, uint16_t count,
                           float cost_us = 0.0f)
-        : Base(cache::GDSFScoreData::kCountScale, ttl_expiration)
+        : Base(cache::detail::GDSFScoreData::kCountScale, ttl_expiration)
         , query(std::move(q))
         , stored_generation(gen)
         , sort_bounds(bounds)
@@ -234,7 +234,7 @@ public:
 private:
     using CacheKey = std::string;
     using MetadataImpl = ListCacheMetadataImpl<FilterSet, SortFieldEnum>;
-    using Tier = cache::CacheTier<CacheKey, Result, MetadataImpl>;
+    using Tier = cache::detail::CacheTier<CacheKey, Result, MetadataImpl>;
 
     /// Backward-compat alias for test accessors.
     using L1Cache = typename Tier::Map;
@@ -323,7 +323,7 @@ public:
     ResultView put(const Query& query, Result result, uint32_t fetch_gen,
                    SortBounds bounds = {}, float construction_time_us = 0.0f) {
         const auto& key = query.cacheKey();
-        uint32_t now_sec = runtime::CachedClock::now();
+        uint32_t now_sec = runtime::detail::CachedClock::now();
 
         MetadataImpl meta(
             query, fetch_gen, now_sec + config_.default_ttl_sec, bounds,
@@ -745,6 +745,6 @@ private:
     }
 };
 
-}  // namespace jcailloux::relais::list
+}  // namespace jcailloux::relais::list::detail
 
 #endif  // JCX_RELAIS_LIST_LISTCACHE_H

@@ -48,8 +48,8 @@
 using namespace relais_test;
 using namespace relais_bench;
 using GDSFPolicy = jcailloux::relais::cache::GDSFPolicy;
-using CachedMemory = jcailloux::relais::runtime::CachedMemory;
-using RuntimeThread = jcailloux::relais::runtime::RuntimeThread;
+using CachedMemory = jcailloux::relais::runtime::detail::CachedMemory;
+using RuntimeThread = jcailloux::relais::runtime::detail::RuntimeThread;
 
 static_assert(GDSFPolicy::enabled,
     "bench_gdsf.cpp must be compiled with RELAIS_GDSF_ENABLED=1");

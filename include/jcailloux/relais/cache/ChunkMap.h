@@ -21,7 +21,7 @@
 namespace relais_test { struct TestInternals; }
 #endif
 
-namespace jcailloux::relais::cache {
+namespace jcailloux::relais::cache::detail {
 
 // =============================================================================
 // Mergeable concept — metadata that preserves access history across upserts
@@ -33,8 +33,6 @@ concept Mergeable = requires(T& a, const T& b) { a.mergeFrom(b); };
 // =============================================================================
 // Fast hashing — splitmix64 for integers, wyhash for strings/bytes
 // =============================================================================
-
-namespace detail {
 
 // Splitmix64 finalizer — proven avalanche properties, ~3 cycles.
 inline size_t mix(size_t x) {
@@ -126,7 +124,6 @@ struct AutoHash<std::tuple<Ts...>> {
     }
 };
 
-}  // namespace detail
 
 // =============================================================================
 // ChunkMap<K, V, Metadata, HasGhost> — lock-free hash map with epoch-based reclamation
@@ -148,7 +145,7 @@ struct AutoHash<std::tuple<Ts...>> {
 
 template<typename K, typename V, typename Metadata = std::monostate,
          bool HasGhost = false,
-         typename Hash = detail::AutoHash<K>>
+         typename Hash = AutoHash<K>>
 class ChunkMap {
 public:
     // Base: metadata accessible without downcast
@@ -548,6 +545,6 @@ private:
 #endif
 };
 
-}  // namespace jcailloux::relais::cache
+}  // namespace jcailloux::relais::cache::detail
 
 #endif  // JCX_RELAIS_CACHE_CHUNK_MAP_H

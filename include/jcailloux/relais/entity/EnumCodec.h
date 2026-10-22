@@ -86,7 +86,6 @@ inline constexpr auto rank_cases = [] {
     return out;
 }();
 
-}  // namespace detail
 
 template<typename Derived, typename E>
 struct MappedEnumCodec {
@@ -120,6 +119,8 @@ struct MappedEnumCodec {
         sql += rankCases();
     }
 };
+
+}  // namespace detail
 
 }  // namespace jcailloux::relais::entity
 

@@ -1312,7 +1312,7 @@ class MappingGenerator:
         Uses heapCapacity() for std::string to exclude SSO buffer (already in sizeof).
         """
         a = entity.annotation
-        hc = "jcailloux::relais::entity::heapCapacity"
+        hc = "jcailloux::relais::entity::detail::heapCapacity"
         # Collect fields with dynamic heap allocations
         dynamic_fields = []
         for m in entity.members:
@@ -1922,7 +1922,7 @@ class MappingGenerator:
         for m, em in self._mapped_enum_members(entity):
             enum_fqn = self._qualify_type(entity, em.cpp_type)
             name = self._codec_name(m.name)
-            lines.append(f"    struct {name} : jcailloux::relais::entity::MappedEnumCodec<{name}, {enum_fqn}> {{")
+            lines.append(f"    struct {name} : jcailloux::relais::entity::detail::MappedEnumCodec<{name}, {enum_fqn}> {{")
             lines.append(f"        static constexpr std::array<std::pair<enum_type, std::string_view>, {len(em.pairs)}> pairs{{{{")
             for i, (db_val, enum_val) in enumerate(em.pairs):
                 comma = "," if i < len(em.pairs) - 1 else ""

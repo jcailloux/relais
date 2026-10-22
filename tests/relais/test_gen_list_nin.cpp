@@ -110,7 +110,7 @@ TEST_CASE("generator emits a functional NIN descriptor (both forms)", "[list][ni
           == std::vector<std::string>{"science", "tech"});
 
     SECTION("L3: both NIN filters compile to `!= ALL`") {
-        auto wc = decl::buildWhereClause<GenDesc>(q.filters());
+        auto wc = decl::detail::buildWhereClause<GenDesc>(q.filters());
         CHECK(countNotAll(wc.sql) == 2);
         // Two NIN sets => exactly two array params, no $n drift.
         CHECK(wc.params.params.size() == 2);
@@ -118,11 +118,11 @@ TEST_CASE("generator emits a functional NIN descriptor (both forms)", "[list][ni
 
     SECTION("L1: matchesFilters honors the generated Op::NIN (anti-membership)") {
         // author ∉ {1,2} AND category ∉ {science,tech} -> matches.
-        CHECK(decl::matchesFilters<GenDesc>(makeEntity(9, "news"), q.filters()));
+        CHECK(decl::detail::matchesFilters<GenDesc>(makeEntity(9, "news"), q.filters()));
         // author 1 ∈ {1,2} -> excluded.
-        CHECK_FALSE(decl::matchesFilters<GenDesc>(makeEntity(1, "news"), q.filters()));
+        CHECK_FALSE(decl::detail::matchesFilters<GenDesc>(makeEntity(1, "news"), q.filters()));
         // category "tech" ∈ {science,tech} -> excluded.
-        CHECK_FALSE(decl::matchesFilters<GenDesc>(makeEntity(9, "tech"), q.filters()));
+        CHECK_FALSE(decl::detail::matchesFilters<GenDesc>(makeEntity(9, "tech"), q.filters()));
     }
 }
 
@@ -132,10 +132,10 @@ TEST_CASE("generator NIN empty-set is the universe", "[list][nin][gen]") {
     decl::Filters<GenDesc> f;
     f.template get<"authors">() = std::vector<int64_t>{};  // authors NOT IN {}
 
-    CHECK(decl::matchesFilters<GenDesc>(makeEntity(1, "x"), f));
-    CHECK(decl::matchesFilters<GenDesc>(makeEntity(999, "y"), f));
+    CHECK(decl::detail::matchesFilters<GenDesc>(makeEntity(1, "x"), f));
+    CHECK(decl::detail::matchesFilters<GenDesc>(makeEntity(999, "y"), f));
 
-    auto wc = decl::buildWhereClause<GenDesc>(f);
+    auto wc = decl::detail::buildWhereClause<GenDesc>(f);
     CHECK(countNotAll(wc.sql) == 1);
     CHECK(wc.params.params.size() == 1);
 }
@@ -151,15 +151,15 @@ TEST_CASE("generator NIN coexists with EQ and range neighbors", "[list][nin][gen
     f.template get<"is_published">() = true;                     // is_published EQ true
     f.template get<"views_min">() = 10;                        // views_min GE 10
 
-    CHECK(decl::matchesFilters<GenDesc>(makeEntity(7, "x", 20, true), f));
+    CHECK(decl::detail::matchesFilters<GenDesc>(makeEntity(7, "x", 20, true), f));
     // author 1 ∈ {1} (NIN, first position — excluded; proves alignment past it holds)
-    CHECK_FALSE(decl::matchesFilters<GenDesc>(makeEntity(1, "x", 20, true), f));
+    CHECK_FALSE(decl::detail::matchesFilters<GenDesc>(makeEntity(1, "x", 20, true), f));
     // view_count 5 < 10 (range)
-    CHECK_FALSE(decl::matchesFilters<GenDesc>(makeEntity(7, "x", 5, true), f));
+    CHECK_FALSE(decl::detail::matchesFilters<GenDesc>(makeEntity(7, "x", 5, true), f));
     // is_published false (EQ)
-    CHECK_FALSE(decl::matchesFilters<GenDesc>(makeEntity(7, "x", 20, false), f));
+    CHECK_FALSE(decl::detail::matchesFilters<GenDesc>(makeEntity(7, "x", 20, false), f));
 
-    auto wc = decl::buildWhereClause<GenDesc>(f);
+    auto wc = decl::detail::buildWhereClause<GenDesc>(f);
     CHECK(countNotAll(wc.sql) == 1);       // only the NIN filter uses != ALL
     CHECK(wc.params.params.size() == 3);    // NIN array + EQ bool + GE int
 }

@@ -26,6 +26,8 @@ struct SortSpec {
     bool operator==(const SortSpec&) const = default;
 };
 
+namespace detail {
+
 // =============================================================================
 // Cursor - Opaque pagination token for keyset pagination
 // =============================================================================
@@ -184,6 +186,8 @@ struct CachedListResult {
     [[nodiscard]] size_t size() const noexcept { return items.size(); }
 };
 
+}  // namespace detail
+
 }  // namespace jcailloux::relais::list
 
 // =============================================================================
@@ -197,7 +201,7 @@ struct glz::meta<jcailloux::relais::list::SortDirection> {
 };
 
 template<>
-struct glz::meta<jcailloux::relais::list::Cursor> {
+struct glz::meta<jcailloux::relais::list::detail::Cursor> {
     static constexpr auto value = object(
         "data", [](auto& self) -> auto& {
             // Serialize as base64 string

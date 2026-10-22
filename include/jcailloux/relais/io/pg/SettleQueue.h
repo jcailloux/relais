@@ -24,7 +24,7 @@
 #include "jcailloux/relais/io/pg/PgPool.h"
 #include "jcailloux/relais/io/pg/SettleTicket.h"
 
-namespace jcailloux::relais::io {
+namespace jcailloux::relais::io::detail {
 
 // SettleQueue — settles the uncertain writes of one event loop.
 //
@@ -452,6 +452,6 @@ private:
 #endif
 };
 
-} // namespace jcailloux::relais::io
+}  // namespace jcailloux::relais::io::detail
 
 #endif // JCX_RELAIS_IO_PG_SETTLE_QUEUE_H

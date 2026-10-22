@@ -41,7 +41,9 @@
 #include <vector>
 
 using namespace jcailloux::relais::io;
+using namespace jcailloux::relais::io::detail;
 using namespace jcailloux::relais::io::batch;
+using namespace jcailloux::relais::io::batch::detail;
 using namespace jcailloux::relais::io::test;
 using namespace std::chrono_literals;
 

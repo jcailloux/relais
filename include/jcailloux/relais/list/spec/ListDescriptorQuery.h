@@ -54,6 +54,8 @@ template<typename Descriptor>
     requires ValidListDescriptor<Descriptor>
 ListQuery<Descriptor> seal(ListQueryParams<Descriptor> params);
 
+namespace detail {
+
 template<typename Descriptor>
     requires ValidListDescriptor<Descriptor>
 void appendGroupKey(std::string& out, const ListQuery<Descriptor>& query);
@@ -61,6 +63,8 @@ void appendGroupKey(std::string& out, const ListQuery<Descriptor>& query);
 template<typename Descriptor>
     requires ValidListDescriptor<Descriptor>
 void appendPageKey(std::string& out, const ListQuery<Descriptor>& query);
+
+}  // namespace detail
 
 /// Sealed, immutable list query. Constructible only via seal() — every
 /// instance carries canonical params, from which its keys are encoded.
@@ -79,14 +83,14 @@ public:
     /// Canonical key for filters+sort (the page key's prefix), computed on each call.
     [[nodiscard]] std::string groupKey() const {
         std::string key;
-        appendGroupKey<Descriptor>(key, *this);
+        detail::appendGroupKey<Descriptor>(key, *this);
         return key;
     }
 
     /// Full canonical key: group key + limit + cursor + offset, computed on each call.
     [[nodiscard]] std::string cacheKey() const {
         std::string key;
-        appendPageKey<Descriptor>(key, *this);
+        detail::appendPageKey<Descriptor>(key, *this);
         return key;
     }
 

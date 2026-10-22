@@ -108,19 +108,19 @@ TEST_CASE("generator emits a functional IN descriptor (both forms)", "[list][in]
           == std::vector<std::string>{"science", "tech"});
 
     SECTION("L3: both IN filters compile to `= ANY`") {
-        auto wc = decl::buildWhereClause<GenDesc>(q.filters());
+        auto wc = decl::detail::buildWhereClause<GenDesc>(q.filters());
         CHECK(countAny(wc.sql) == 2);
         // Two IN sets => exactly two array params, no $n drift.
         CHECK(wc.params.params.size() == 2);
     }
 
     SECTION("L1: matchesFilters honors the generated Op::IN on both fields") {
-        CHECK(decl::matchesFilters<GenDesc>(makeEntity(1, "tech"), q.filters()));
-        CHECK(decl::matchesFilters<GenDesc>(makeEntity(2, "science"), q.filters()));
+        CHECK(decl::detail::matchesFilters<GenDesc>(makeEntity(1, "tech"), q.filters()));
+        CHECK(decl::detail::matchesFilters<GenDesc>(makeEntity(2, "science"), q.filters()));
         // author_id ∉ {1,2}
-        CHECK_FALSE(decl::matchesFilters<GenDesc>(makeEntity(9, "tech"), q.filters()));
+        CHECK_FALSE(decl::detail::matchesFilters<GenDesc>(makeEntity(9, "tech"), q.filters()));
         // category ∉ {science,tech}
-        CHECK_FALSE(decl::matchesFilters<GenDesc>(makeEntity(1, "news"), q.filters()));
+        CHECK_FALSE(decl::detail::matchesFilters<GenDesc>(makeEntity(1, "news"), q.filters()));
     }
 }
 
@@ -135,15 +135,15 @@ TEST_CASE("generator IN coexists with EQ and range neighbors", "[list][in][gen]"
     f.template get<"is_published">() = true;                     // is_published EQ true
     f.template get<"views_min">() = 10;                        // views_min GE 10
 
-    CHECK(decl::matchesFilters<GenDesc>(makeEntity(1, "x", 20, true), f));
+    CHECK(decl::detail::matchesFilters<GenDesc>(makeEntity(1, "x", 20, true), f));
     // view_count 5 < 10 (range)
-    CHECK_FALSE(decl::matchesFilters<GenDesc>(makeEntity(1, "x", 5, true), f));
+    CHECK_FALSE(decl::detail::matchesFilters<GenDesc>(makeEntity(1, "x", 5, true), f));
     // is_published false (EQ)
-    CHECK_FALSE(decl::matchesFilters<GenDesc>(makeEntity(1, "x", 20, false), f));
+    CHECK_FALSE(decl::detail::matchesFilters<GenDesc>(makeEntity(1, "x", 20, false), f));
     // author ∉ {1} (IN, first position — proves alignment past it holds)
-    CHECK_FALSE(decl::matchesFilters<GenDesc>(makeEntity(7, "x", 20, true), f));
+    CHECK_FALSE(decl::detail::matchesFilters<GenDesc>(makeEntity(7, "x", 20, true), f));
 
-    auto wc = decl::buildWhereClause<GenDesc>(f);
+    auto wc = decl::detail::buildWhereClause<GenDesc>(f);
     CHECK(countAny(wc.sql) == 1);          // only the IN filter uses = ANY
     CHECK(wc.params.params.size() == 3);    // IN array + EQ bool + GE int
 }

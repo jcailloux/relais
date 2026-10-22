@@ -5,6 +5,7 @@
 #include <functional>
 
 using namespace jcailloux::relais::io;
+using namespace jcailloux::relais::io::detail;
 
 // Mock IoContext for compilation testing
 struct TestIo {

@@ -8,7 +8,7 @@
 #include <string_view>
 #include <utility>
 
-#include "jcailloux/relais/list/ListQuery.h"  // list::Cursor (opaque byte token)
+#include "jcailloux/relais/list/ListQuery.h"  // list::detail::Cursor (opaque byte token)
 #include "jcailloux/relais/list/spec/FilterDescriptor.h"  // detail::keyComponentCount
 
 namespace jcailloux::relais::list::spec {
@@ -16,13 +16,13 @@ namespace jcailloux::relais::list::spec {
 // =============================================================================
 // TypedCursor<Descriptor> — phantom-typed keyset cursor.
 //
-// Wraps the opaque byte-level list::Cursor and tags it with its owning
+// Wraps the opaque byte-level list::detail::Cursor and tags it with its owning
 // Descriptor. A cursor minted for one list therefore cannot be handed to
 // another list's query()/builder: the two are distinct types, so the confusion
 // is a COMPILE error, not a runtime mis-decode against the wrong sort/key shape.
 //
 // The base64 wire token is unchanged — decode()/encode() pass straight through
-// to list::Cursor, and the keyset SQL / cache-key machinery reads raw(). Only
+// to list::detail::Cursor, and the keyset SQL / cache-key machinery reads raw(). Only
 // the construction boundary is typed.
 //
 // decode() also checks the width, the one property of the token fixed by the
@@ -51,7 +51,7 @@ public:
         if (token.empty()) return TypedCursor{};
         constexpr std::size_t kWidth =
             sizeof(int64_t) * (1 + detail::keyComponentCount<typename Descriptor::Entity>);
-        auto raw = list::Cursor::decode(token);
+        auto raw = list::detail::Cursor::decode(token);
         if (!raw || raw->size() != kWidth) return std::nullopt;
         return TypedCursor{std::move(*raw)};
     }
@@ -61,14 +61,14 @@ public:
     [[nodiscard]] std::size_t size() const noexcept { return raw_.size(); }
 
     /// The opaque byte-level cursor — for the keyset SQL / cache-key machinery.
-    [[nodiscard]] const list::Cursor& raw() const noexcept { return raw_; }
+    [[nodiscard]] const list::detail::Cursor& raw() const noexcept { return raw_; }
 
     bool operator==(const TypedCursor&) const = default;
 
 private:
-    explicit TypedCursor(list::Cursor raw) noexcept : raw_(std::move(raw)) {}
+    explicit TypedCursor(list::detail::Cursor raw) noexcept : raw_(std::move(raw)) {}
 
-    list::Cursor raw_;
+    list::detail::Cursor raw_;
 };
 
 }  // namespace jcailloux::relais::list::spec

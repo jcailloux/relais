@@ -70,7 +70,7 @@ private:
         }
     };
 
-    using Lane = cache::PendingLane<Note, kChunks, true>;
+    using Lane = cache::detail::PendingLane<Note, kChunks, true>;
 
 public:
     using BitmapType = typename Lane::BitmapType;

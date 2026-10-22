@@ -9,7 +9,7 @@
 #include "jcailloux/relais/cache/ChunkMap.h"   // cache::detail::AutoHash
 #include "jcailloux/relais/config/FixedString.h"
 
-namespace jcailloux::relais {
+namespace jcailloux::relais::detail {
 
 /// Read-fill recheck guard — a sharded generation counter for the L1 tier
 /// (LocalRepo) of a single repository.
@@ -113,6 +113,6 @@ struct RecheckGuard {
     }
 };
 
-}  // namespace jcailloux::relais
+}  // namespace jcailloux::relais::detail
 
 #endif  // JCX_RELAIS_RECHECKGUARD_H

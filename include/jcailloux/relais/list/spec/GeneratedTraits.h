@@ -19,18 +19,18 @@
 #include "SortDescriptor.h"
 #include "ListDescriptor.h"
 #include "GeneratedFilters.h"
-#include "jcailloux/relais/list/ListQuery.h"  // list::Cursor (std::byte)
+#include "jcailloux/relais/list/ListQuery.h"  // list::detail::Cursor (std::byte)
 
 namespace jcailloux::relais::list::spec {
 
-// Unified cursor type — same as list::Cursor (std::byte based)
-using Cursor = list::Cursor;
+namespace detail {
+
+// Unified cursor type — same as list::detail::Cursor (std::byte based)
+using Cursor = list::detail::Cursor;
 
 // =============================================================================
 // matchesFilters - Check if entity matches all active filters
 // =============================================================================
-
-namespace detail {
 
 /// Compare values with the given operator
 template<Op op, typename T>
@@ -43,8 +43,6 @@ template<Op op, typename T>
     else if constexpr (op == Op::LE) return entity_val <= filter_val;
     else return true;
 }
-
-}  // namespace detail
 
 /// Check if entity matches all active filters
 template<typename Descriptor>
@@ -104,8 +102,6 @@ template<typename Descriptor>
 // compare - Compare two entities for sorting
 // =============================================================================
 
-namespace detail {
-
 /// Compare two values, returns <0, 0, >0
 template<typename T>
 [[nodiscard]] int compareValues(const T& a, const T& b) noexcept {
@@ -120,8 +116,6 @@ template<typename T>
         return (a < b) ? -1 : (a > b) ? 1 : 0;
     }
 }
-
-}  // namespace detail
 
 /// Compare two entities based on sort specification
 template<typename Descriptor>
@@ -150,8 +144,6 @@ template<typename Descriptor>
 // extractCursor / isBeforeOrAtCursor - Cursor-based pagination
 // =============================================================================
 
-namespace detail {
-
 /// Extract sort value as int64 for cursor encoding
 template<typename T>
 [[nodiscard]] int64_t toInt64ForCursor(const T& value) noexcept {
@@ -166,8 +158,6 @@ template<typename T>
     }
 }
 
-}  // namespace detail
-
 /// Extract cursor from entity for pagination
 template<typename Descriptor>
     requires ValidListDescriptor<Descriptor>
@@ -175,7 +165,7 @@ template<typename Descriptor>
     const typename Descriptor::Entity& entity,
     const SortSpec<Descriptor>& sort
 ) noexcept {
-    constexpr size_t N = detail::keyComponentCount<typename Descriptor::Entity>;
+    constexpr size_t N = keyComponentCount<typename Descriptor::Entity>;
     Cursor cursor;
     cursor.data.resize(sizeof(int64_t) * (1 + N));  // sort_value + N key components
 
@@ -211,7 +201,7 @@ template<typename Descriptor>
     const Cursor& cursor,
     const SortSpec<Descriptor>& sort
 ) noexcept {
-    constexpr size_t N = detail::keyComponentCount<typename Descriptor::Entity>;
+    constexpr size_t N = keyComponentCount<typename Descriptor::Entity>;
     if (cursor.empty()) return true;
     if (cursor.data.size() < sizeof(int64_t) * (1 + N)) return true;
 
@@ -258,21 +248,8 @@ template<typename Descriptor>
 }
 
 // =============================================================================
-// parseSortField / sortFieldName - String <-> index conversion
+// Sort fields - index to name, name to index at compile time, SQL expression
 // =============================================================================
-
-/// Parse sort field name to index
-template<typename Descriptor>
-    requires ValidListDescriptor<Descriptor>
-[[nodiscard]] std::optional<size_t> parseSortField(std::string_view field) noexcept {
-    std::optional<size_t> result;
-
-    [&]<size_t... Is>(std::index_sequence<Is...>) {
-        ((sort_at<Descriptor, Is>::name.view() == field ? (result = Is, true) : false) || ...);
-    }(std::make_index_sequence<sort_count<Descriptor>>{});
-
-    return result;
-}
 
 /// Get sort field name from index
 template<typename Descriptor>
@@ -301,12 +278,6 @@ void appendSortExpression(std::string& sql, size_t field_index) {
     }(std::make_index_sequence<sort_count<Descriptor>>{});
 }
 
-// =============================================================================
-// sortBy / sortAsc / sortDesc - Compile-time sort by field name
-// =============================================================================
-
-namespace detail {
-
 /// Find the index of a sort field by name (compile-time). Mirror of
 /// find_filter_index: walks Descriptor::sorts, static_asserts on an unknown
 /// name. Resolves against the SAME name table as the runtime parseSortField,
@@ -323,33 +294,6 @@ constexpr size_t find_sort_index() {
     }
 }
 
-}  // namespace detail
-
-/// Build a DescriptorSortSpec (list::SortSpec<size_t>) from a sort field NAME,
-/// resolved and verified at compile time. Replaces the bare positional index
-/// (SortSpec<size_t>{index, dir}): reordering the Sort<> tuple now turns a wrong
-/// name into a compile error instead of silently sorting on the wrong column.
-/// Zero runtime cost — the index is a compile-time constant.
-template<typename Descriptor, FixedString Name, SortDirection Dir = SortDirection::Asc>
-    requires ValidListDescriptor<Descriptor>
-[[nodiscard]] consteval list::SortSpec<size_t> sortBy() noexcept {
-    return list::SortSpec<size_t>{detail::find_sort_index<Descriptor, Name>(), Dir};
-}
-
-/// Ascending sugar for sortBy.
-template<typename Descriptor, FixedString Name>
-    requires ValidListDescriptor<Descriptor>
-[[nodiscard]] consteval list::SortSpec<size_t> sortAsc() noexcept {
-    return sortBy<Descriptor, Name, SortDirection::Asc>();
-}
-
-/// Descending sugar for sortBy.
-template<typename Descriptor, FixedString Name>
-    requires ValidListDescriptor<Descriptor>
-[[nodiscard]] consteval list::SortSpec<size_t> sortDesc() noexcept {
-    return sortBy<Descriptor, Name, SortDirection::Desc>();
-}
-
 // =============================================================================
 // Default sort specification
 // =============================================================================
@@ -363,54 +307,18 @@ template<typename Descriptor>
 }
 
 // =============================================================================
-// Limit normalization
+// Page-size grid detection
 // =============================================================================
-
-/// Fallback page-size grid for descriptors without a `limits=` annotation.
-inline constexpr std::array<uint16_t, 4> kDefaultLimits = {10, 25, 50, 100};
 
 template<typename Descriptor>
 concept HasAllowedLimits = requires {
     { Descriptor::allowedLimits } -> std::convertible_to<decltype(Descriptor::allowedLimits)>;
 };
 
-/// Round a requested limit up to the first allowed page size; the largest
-/// allowed size if it exceeds the grid. Reads the descriptor's `allowedLimits`
-/// (sorted ascending by the generator) when present, else falls back to
-/// kDefaultLimits. The grid drives the canonical cache key, so this must stay
-/// deterministic per descriptor.
-template<typename Descriptor>
-[[nodiscard]] constexpr uint16_t normalizeLimit(uint16_t requested) noexcept {
-    if constexpr (HasAllowedLimits<Descriptor>) {
-        for (auto step : Descriptor::allowedLimits) {
-            if (requested <= step) return step;
-        }
-        return Descriptor::allowedLimits.back();
-    } else {
-        for (auto step : kDefaultLimits) {
-            if (requested <= step) return step;
-        }
-        return kDefaultLimits.back();
-    }
-}
-
 template<typename Descriptor>
 concept HasDefaultLimit = requires {
     { Descriptor::defaultLimit } -> std::convertible_to<uint16_t>;
 };
-
-/// Default page size when a request omits the `limit` param: the descriptor's
-/// declared default (allowedLimits.front(), emitted by the generator), else 20 —
-/// the ListQuery struct default (ListQuery.h) — for hand-written descriptors
-/// without a `limits=` grid.
-template<typename Descriptor>
-[[nodiscard]] constexpr uint16_t defaultLimit() noexcept {
-    if constexpr (HasDefaultLimit<Descriptor>) {
-        return Descriptor::defaultLimit;
-    } else {
-        return 20;
-    }
-}
 
 // =============================================================================
 // extractSortValue - Extract sort field value from entity
@@ -451,8 +359,6 @@ struct SortRange {
     int64_t lo{std::numeric_limits<int64_t>::min()};
     int64_t hi{std::numeric_limits<int64_t>::max()};
 };
-
-namespace detail {
 
 /// Intersect predicate filter I into the running [lo,hi]. Only EQ / IN /
 /// comparison on an arithmetic column narrow it; GT/LT are loosened to GE/LE
@@ -525,8 +431,6 @@ template<typename Descriptor, size_t I>
         return true;
     }
 }
-
-}  // namespace detail
 
 /// Range of sort-field values any row matching the predicate can hold, for the
 /// sort dimension `field_index`. A page whose [first,last] does not overlap this
@@ -637,6 +541,95 @@ template<typename Descriptor>
     return isInSortRange(entity_sort_value, first_sort_value, last_sort_value, sort.direction);
 }
 
+}  // namespace detail
+
+// =============================================================================
+// parseSortField - Sort field name to index, at runtime
+// =============================================================================
+
+/// Resolve a sort field name to its index in the descriptor's sorts, for
+/// list::SortSpec<size_t>{index, direction}; nullopt for an unknown name.
+template<typename Descriptor>
+    requires ValidListDescriptor<Descriptor>
+[[nodiscard]] std::optional<size_t> parseSortField(std::string_view field) noexcept {
+    std::optional<size_t> result;
+
+    [&]<size_t... Is>(std::index_sequence<Is...>) {
+        ((sort_at<Descriptor, Is>::name.view() == field ? (result = Is, true) : false) || ...);
+    }(std::make_index_sequence<sort_count<Descriptor>>{});
+
+    return result;
+}
+
+// =============================================================================
+// sortBy / sortAsc / sortDesc - Compile-time sort by field name
+// =============================================================================
+
+/// Build a DescriptorSortSpec (list::SortSpec<size_t>) from a sort field NAME,
+/// resolved and verified at compile time. Replaces the bare positional index
+/// (SortSpec<size_t>{index, dir}): reordering the Sort<> tuple now turns a wrong
+/// name into a compile error instead of silently sorting on the wrong column.
+/// Zero runtime cost — the index is a compile-time constant.
+template<typename Descriptor, FixedString Name, SortDirection Dir = SortDirection::Asc>
+    requires ValidListDescriptor<Descriptor>
+[[nodiscard]] consteval list::SortSpec<size_t> sortBy() noexcept {
+    return list::SortSpec<size_t>{detail::find_sort_index<Descriptor, Name>(), Dir};
+}
+
+/// Ascending sugar for sortBy.
+template<typename Descriptor, FixedString Name>
+    requires ValidListDescriptor<Descriptor>
+[[nodiscard]] consteval list::SortSpec<size_t> sortAsc() noexcept {
+    return sortBy<Descriptor, Name, SortDirection::Asc>();
+}
+
+/// Descending sugar for sortBy.
+template<typename Descriptor, FixedString Name>
+    requires ValidListDescriptor<Descriptor>
+[[nodiscard]] consteval list::SortSpec<size_t> sortDesc() noexcept {
+    return sortBy<Descriptor, Name, SortDirection::Desc>();
+}
+
+// =============================================================================
+// Limit normalization
+// =============================================================================
+
+/// Fallback page-size grid for descriptors without a `limits=` annotation.
+inline constexpr std::array<uint16_t, 4> kDefaultLimits = {10, 25, 50, 100};
+
+/// Round a requested limit up to the first allowed page size; the largest
+/// allowed size if it exceeds the grid. Reads the descriptor's `allowedLimits`
+/// (sorted ascending by the generator) when present, else falls back to
+/// kDefaultLimits. The grid drives the canonical cache key, so this must stay
+/// deterministic per descriptor.
+template<typename Descriptor>
+[[nodiscard]] constexpr uint16_t normalizeLimit(uint16_t requested) noexcept {
+    if constexpr (detail::HasAllowedLimits<Descriptor>) {
+        for (auto step : Descriptor::allowedLimits) {
+            if (requested <= step) return step;
+        }
+        return Descriptor::allowedLimits.back();
+    } else {
+        for (auto step : kDefaultLimits) {
+            if (requested <= step) return step;
+        }
+        return kDefaultLimits.back();
+    }
+}
+
+/// Default page size when a request omits the `limit` param: the descriptor's
+/// declared default (allowedLimits.front(), emitted by the generator), else 20 —
+/// the ListQuery struct default (ListQuery.h) — for hand-written descriptors
+/// without a `limits=` grid.
+template<typename Descriptor>
+[[nodiscard]] constexpr uint16_t defaultLimit() noexcept {
+    if constexpr (detail::HasDefaultLimit<Descriptor>) {
+        return Descriptor::defaultLimit;
+    } else {
+        return 20;
+    }
+}
+
 // =============================================================================
 // Query Validation
 // =============================================================================
@@ -676,7 +669,7 @@ struct QueryValidationError {
 
 template<typename Descriptor>
 [[nodiscard]] bool isLimitAllowed(uint16_t limit) noexcept {
-    if constexpr (HasAllowedLimits<Descriptor>) {
+    if constexpr (detail::HasAllowedLimits<Descriptor>) {
         for (auto allowed : Descriptor::allowedLimits) {
             if (limit == allowed) return true;
         }
@@ -688,6 +681,8 @@ template<typename Descriptor>
         return false;
     }
 }
+
+namespace detail {
 
 template<typename Descriptor>
     requires ValidListDescriptor<Descriptor>
@@ -723,7 +718,7 @@ template<typename Descriptor>
 template<typename Descriptor>
 [[nodiscard]] std::string getAllowedLimitsString() {
     std::string result;
-    if constexpr (HasAllowedLimits<Descriptor>) {
+    if constexpr (detail::HasAllowedLimits<Descriptor>) {
         for (size_t i = 0; i < Descriptor::allowedLimits.size(); ++i) {
             if (i > 0) result += ", ";
             result += std::to_string(Descriptor::allowedLimits[i]);
@@ -736,6 +731,8 @@ template<typename Descriptor>
     }
     return result;
 }
+
+}  // namespace detail
 
 }  // namespace jcailloux::relais::list::spec
 

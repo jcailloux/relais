@@ -9,7 +9,9 @@
 #include <vector>
 
 using namespace jcailloux::relais::io;
+using namespace jcailloux::relais::io::detail;
 using namespace jcailloux::relais::io::batch;
+using namespace jcailloux::relais::io::batch::detail;
 
 TEST_CASE("TimingEstimator: bootstrap state", "[io][batch]") {
     TimingEstimator est;

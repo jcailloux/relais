@@ -1,22 +1,25 @@
 # API Reference
 
-The exhaustive public surface of relais in one file: every repository method, every `CacheConfig` field and preset, the invalidation descriptors, the list/query types, the entity surface and concept hierarchy, the runtime/I/O layer, and the `@relais` annotation index. Each entry is terse and uniform — signature, return, constraints (`requires` + config gating), one-line semantics, and which presets/tiers expose it — and links back to the guide that explains the *why*.
+The public API of relais in one file: every repository method, every `CacheConfig` field and preset, the invalidation descriptors, the list/query types, the entity surface and concept hierarchy, the runtime/I/O layer, and the `@relais` annotation index. Each entry is terse and uniform — signature, return, constraints (`requires` + config gating), one-line semantics, and which presets/tiers expose it — and links back to the guide that explains the *why*.
 
 > **This file is the single source of truth for signatures.** The guides teach and give examples; they link here rather than restate a signature. Annotations are the one exception: their canonical home is [entities.md](entities.md), and the [Annotations](#annotations) section here is only an index.
 >
 > Reads return a borrowed, epoch-guarded view (`cache::CacheView<E>`, or `MultiView<E>` for `findMany`) — never a `shared_ptr` or owning handle. See [Reads](#repository-api).
+>
+> **Semantic versioning covers what this file documents.** The rest of the headers is implementation and may change in any release: see [Stability](#stability).
 
-New to relais? Read [concepts.md](concepts.md) first for the mental model, then use this file as a lookup. Section anchors are stable (`#repository-api`, `#cacheconfig`, `#invalidation-descriptors`, `#list-and-query-api`, `#entity-and-concepts`, `#runtime-and-io`, `#annotations`) — guides link at the section level plus the method name.
+New to relais? Read [concepts.md](concepts.md) first for the mental model, then use this file as a lookup. Section anchors are stable (`#repository-api`, `#cacheconfig`, `#invalidation-descriptors`, `#list-and-query-api`, `#entity-and-concepts`, `#runtime-and-io`, `#annotations`, `#stability`) — guides link at the section level plus the method name.
 
 ## Contents
 
 1. [Repository API](#repository-api) — every method on the final `Repo` (reads, writes, conditional writes, deletes/invalidation, list, maintenance, metrics) and its type aliases.
-2. [CacheConfig](#cacheconfig) — cache level, TTL, sizing, update strategy: all fields, presets, `consteval with_*()` modifiers, and `RELAIS_L1_MAX_MEMORY`.
+2. [CacheConfig](#cacheconfig) — cache level, TTL, sizing, update strategy: all fields, presets, `consteval with_*()` modifiers, and the L1 memory budget.
 3. [Invalidation descriptors](#invalidation-descriptors) — the four `Invalidate*` templates, resolver contracts, `InvalidationData`, `ListInvalidationTarget`, and wiring.
 4. [List and query API](#list-and-query-api) — `ListDescriptor`, filter operators, sort directions, the fluent builder, `ListQuery`/`ListQueryParams`/`TypedCursor`, HTTP parsers, and `FilterSet`.
 5. [Entity and concepts](#entity-and-concepts) — the `Entity<Struct, Mapping>` surface, partial-update factories, guards and ordering, and the full concept hierarchy (what each requires, what each enables).
-6. [Runtime and I/O](#runtime-and-io) — `IoPool`/`IoPoolConfig`, the `Task`/`Immediate`/`DetachedTask` family, `Outcome`, `spawnOn`, the `IoContext` concept and its conformance harness, and `PgProvider` with its result/error types.
+6. [Runtime and I/O](#runtime-and-io) — `IoPool`/`IoPoolConfig`, the `Task`/`Immediate`/`DetachedTask` family and `whenAll`, `Outcome`, `spawnOn`, the `IoContext` concept and its conformance harness, `PgProvider` with its result/error types, and the log callback.
 7. [Annotations](#annotations) — index of `@relais` annotations (canonical home: [entities.md](entities.md)).
+8. [Stability](#stability) — what semantic versioning covers, what it does not, and the version macros.
 
 ---
 
@@ -41,7 +44,7 @@ Three contracts hold across the whole surface:
 | `WrapperType` | `E` | Same as `EntityType`. |
 | `FindResultType` | `cache::CacheView<E>` | The guarded view `find` resolves to. |
 
-> List configs additionally expose `ListQuery`, `ListQueryParams`, `QueryBuilder`, `Cursor`, `ListResult`, `ListTraits`, `ListDescriptorType`; all but `ListResult` are distinct per repo (see [Repo re-exports](#repo-re-exports-list-enabled-config)).
+> List configs additionally expose `ListQuery`, `ListQueryParams`, `QueryBuilder`, `Cursor`, `ListResult`, `ListDescriptorType`; all but `ListResult` are distinct per repo (see [Repo re-exports](#repo-re-exports-list-enabled-config)).
 
 ### Reads
 
@@ -198,7 +201,17 @@ static cache::MetricsSnapshot metrics();   // aggregated L1/list/sweep counters
 static void                  resetMetrics();
 #endif
 ```
-- **availability**: `metrics`/`resetMetrics` exist **only** when compiled with `RELAIS_ENABLE_METRICS`. The snapshot fields populate per active cache (L1 entities, L1 lists) plus the global sweep counters; without L1 they stay zero.
+- **availability**: `metrics`/`resetMetrics` exist **only** when the CMake option `RELAIS_ENABLE_METRICS` is `ON` (default `OFF`). The snapshot fields populate per active cache (L1 entities, L1 lists) plus the global sweep counters; without L1 they stay zero.
+
+`cache::MetricsSnapshot` (`cache/Metrics.h`), all counters `uint64_t`:
+
+| Member | Meaning |
+|---|---|
+| `l1_hits` / `l1_misses` | Entity lookups served by L1 / sent to the database. |
+| `list_l1_hits` / `list_l1_misses` | The same for list pages. |
+| `sweep_count`, `sweep_total_ns`, `sweep_last_ns`, `sweep_max_ns` | L1 maintenance sweeps of the process: count, then total, last and longest duration. |
+| `l1HitRatio()` / `listL1HitRatio()` | `double`, `0` before any lookup. |
+| `sweepAvgUs()` | `double`, mean sweep duration in µs, `0` before any sweep. |
 
 <details><summary>Public-but-internal members (not part of the supported surface)</summary>
 
@@ -291,7 +304,16 @@ Each preset is an `inline constexpr CacheConfig`. Fields not listed take the str
 
 The L1 memory budget (in **bytes**) is read **once**, at first construction of the process-wide `GDSFPolicy`, from the `RELAIS_L1_MAX_MEMORY` environment variable. A positive integer sets the budget; unset or non-positive means **no limit** (`maxMemory() == 0`). When the estimated live L1 heap would exceed the budget, GDSF eviction is triggered on the cache-miss admission path.
 
-> **Gotcha — `l1_ttl = 0` plus a memory budget.** With `l1_ttl = Duration{0}` (no time expiry), L1 entries are reclaimed *only* by GDSF eviction. That makes `RELAIS_L1_MAX_MEMORY` the sole bound on L1 growth: if the variable is unset (no limit), an untimed L1 cache can grow without an eviction trigger. Pair `l1_ttl = 0` with a configured `RELAIS_L1_MAX_MEMORY`.
+The budget acts only when GDSF eviction is compiled in: CMake option `RELAIS_GDSF_ENABLED` (default `OFF`), set before relais is added to the build. `cache::GDSFPolicy` (`cache/GDSFPolicy.h`) exposes it:
+
+| Member | Semantics |
+|---|---|
+| `static constexpr bool enabled` | Whether GDSF eviction is compiled in. |
+| `static GDSFPolicy& instance()` | The process-wide policy. |
+| `void configure(const GDSFConfig& cfg)` | Call once at startup, before any repository access. A positive `cfg.max_memory` (bytes) replaces the budget read from the environment. `GDSFConfig`'s other fields tune the eviction algorithm and are not covered. |
+| `size_t maxMemory() const` | The budget in force; `0` = no limit. |
+
+> **Gotcha — `l1_ttl = 0`.** With `l1_ttl = Duration{0}` (no time expiry), L1 entries are reclaimed *only* by GDSF eviction, which needs both `RELAIS_GDSF_ENABLED` and a budget in `RELAIS_L1_MAX_MEMORY`. Without both, an untimed L1 cache grows without bound.
 
 → Guide: [caching.md](caching.md)
 
@@ -417,7 +439,7 @@ concept HasInvalidates = requires { typename T::Invalidates; };
 
 ### Wiring — the `Invalidations...` pack
 
-`InvalidationMixin<Base, Invalidations...>` aliases the pack as `InvList = InvalidateOn<Invalidations...>` and re-exports it as `using Invalidates = InvList;` (this is what `HasInvalidates` keys on). It sits at the top of the chain (`InvalidationMixin → [ListMixin] → [LocalRepo] → PgRepo`) and hides `insert`/`update`/`erase`/`patch`/`invalidate`: each calls `Base::method()` down the chain, and on success awaits the matching free helper — `propagateCreate<E, InvList>` / `propagateUpdate<E, InvList>` / `propagateDelete<E, InvList>` (free function templates in `jcailloux::relais`, not mixin members), which forward to `InvList::propagateWithData` / `propagateDeleteMany`. The layer is only assembled when the pack is non-empty.
+`InvalidationMixin<Base, Invalidations...>` aliases the pack as `InvList = InvalidateOn<Invalidations...>` and re-exports it as `using Invalidates = InvList;` (this is what `HasInvalidates` keys on). It sits at the top of the chain (`InvalidationMixin → [ListMixin] → [LocalRepo] → PgRepo`) and hides `insert`/`update`/`erase`/`patch`/`invalidate`: each calls `Base::method()` down the chain, and on success awaits the matching free helper — `propagateCreate<E, InvList>` / `propagateUpdate<E, InvList>` / `propagateDelete<E, InvList>` (internal free function templates, not mixin members), which forward to `InvList::propagateWithData` / `propagateDeleteMany`. The layer is only assembled when the pack is non-empty.
 
 <details>
 <summary>Writes read nothing first; batch split critical vs deferred</summary>
@@ -453,7 +475,7 @@ A `ListDescriptor` is a struct embedded in the entity's `Mapping` (`Mapping::Lis
 | `sorts` | `static constexpr std::tuple<Sort<...>...>` | The declared sortable fields (≥1). `sorts[0]` with its `default_direction` is the default sort. |
 | `allowedLimits` | `static constexpr std::array<uint16_t, N>` *(optional)* | The page-size grid, ascending. Drives limit normalization + cache-key bucketing. Absent → `kDefaultLimits = {10, 25, 50, 100}`. |
 | `defaultLimit` | `static constexpr uint16_t` *(optional)* | Page size when a request omits `limit`. Absent → `20` (the `ListQuery` struct default). |
-| `maxLimit` | `static constexpr uint16_t` *(optional)* | `allowedLimits.back()` — the largest grid value (also exposed as `ListTraits::maxLimit`). |
+| `maxLimit` | `static constexpr uint16_t` *(optional)* | `allowedLimits.back()` — the largest grid value. |
 
 The generator emits the embedded `FilterSet` (predicate spec: `filters` + the named-optionals `Values` struct) and an embedded `ListDescriptor : FilterSet` (adding `sorts` + the limit grid):
 
@@ -536,7 +558,7 @@ Sort<"state", &Ticket::state, "state", SortDirection::Asc, Via<TicketMapping::St
 
 > **Sort fields must be cursor-encodable.** `CursorEncodable<T>` requires an integral or enum type (optionally `optional<>`-wrapped) — string sorts are a **compile error**, because keyset cursors encode each sort value as `int64_t`. Use an integer timestamp (microseconds since epoch) instead of a string date.
 
-At query time a sort is referenced by **name** (compile-checked) or, in HTTP, by the `sort=field:dir` param. Internally a sort resolves to `list::SortSpec<size_t>{ field, direction }` (member `field` is the index into the descriptor's `sorts` tuple). Do not confuse it with `spec::SortSpec<Descriptor>`, whose member is named `field_index`.
+At query time a sort is referenced by **name** (compile-checked) or, in HTTP, by the `sort=field:dir` param. Its value is a `list::SortSpec<size_t>{ field, direction }`, where `field` is the index of the sort in the descriptor's `sorts` tuple; `sortBy<D, Name, Dir>()` builds one by name (see [ListQueryParams](#listquery--listqueryparams--the-type-state-seal)). A name known only at runtime resolves through `parseSortField<D>(std::string_view name)` (`GeneratedTraits.h`), which returns the index, or `std::nullopt` for an unknown name.
 
 ### QueryBuilder
 
@@ -547,7 +569,7 @@ At query time a sort is referenced by **name** (compile-checked) or, in HTTP, by
 | `filter<Name>(V&& value)` | `ListQueryBuilder&` | Set filter `Name`; slot type resolved via `Filters::get<Name>()` (scalar `optional<element>` or set `optional<vector<element>>`). |
 | `sortBy<Name, Dir = Asc>()` | `ListQueryBuilder&` | Set sort by name; index resolved + checked at compile time. |
 | `sortAsc<Name>()` / `sortDesc<Name>()` | `ListQueryBuilder&` | Sugar for `sortBy<Name, Asc/Desc>()`. |
-| `sort(DescriptorSortSpec spec)` | `ListQueryBuilder&` | Escape hatch: set a pre-resolved `SortSpec<size_t>` (e.g. from `parseSortField`). |
+| `sort(DescriptorSortSpec spec)` | `ListQueryBuilder&` | Set a `list::SortSpec<size_t>` built beforehand, e.g. by `sortBy<D, Name, Dir>()`. |
 | `limit(uint16_t n)` | `ListQueryBuilder&` | **Exact** page size — no grid normalization (trusted path; caller owns cache-key cardinality). |
 | `after(TypedCursor<D> cursor)` | `ListQueryBuilder&` | Keyset cursor for the next page. Mutually exclusive with `offset` — cursor wins in the cache key. |
 | `offset(uint32_t n)` | `ListQueryBuilder&` | Offset+limit pagination. Ignored once a cursor is set. |
@@ -570,7 +592,7 @@ co_await Repo::query(q);
 
 Two types enforce one invariant: *a query reaching `query()` always carries validated, canonical params* (`ListDescriptorQuery.h`).
 
-- **`ListQueryParams<Descriptor>`** — the mutable form. Public fields: `Filters<D> filters`, `optional<SortSpec<size_t>> sort`, `uint16_t limit{20}`, `TypedCursor<D> cursor`, `uint32_t offset{0}`. Holds **no** keys. This is what you fill (by hand or via the builder).
+- **`ListQueryParams<Descriptor>`** — the mutable form. Public fields: `Filters<D> filters`, `optional<SortSpec<size_t>> sort`, `uint16_t limit{20}`, `TypedCursor<D> cursor`, `uint32_t offset{0}`. Holds **no** keys. This is what you fill (by hand or via the builder). `sortBy<D, Name, Dir = Asc>()`, `sortAsc<D, Name>()` and `sortDesc<D, Name>()` (`GeneratedTraits.h`, `consteval`) build the `sort` value by name; an unknown name is a compile error.
 - **`ListQuery<Descriptor>`** — the sealed, immutable form. `ListQuery() = delete`; constructible **only** via `seal()` (friend) or `Builder::build()`. Read-only accessors: `filters()`, `sort()`, `limit()`, `cursor()`, `offset()`, `params()`, plus the two canonical keys `groupKey()` and `cacheKey()`, each encoded on every call and returned as a `std::string`. It is the **sole** type `query()` / `queryJson()` / `queryBinary()` accept.
 
 ```cpp
@@ -581,19 +603,16 @@ ListQuery<Descriptor> seal(ListQueryParams<Descriptor> params);   // CanonicalEn
 
 `seal()` sorts and deduplicates every IN/NIN set in place — `filters()` returns them in that canonical form — then the type is immutable. The sealed query stores no key: `groupKey` (from `filters + sort`) and `cacheKey` (from `groupKey + limit + cursor + offset`) are encoded from its params where they are needed, so they always reflect its contents. An L1 lookup encodes the page key into a reused per-thread buffer: a hit allocates nothing.
 
-> **Two `ListQuery`s exist; this section is about `spec::ListQuery<Descriptor>`.** `list::ListQuery<FilterSet, SortFieldEnum>` (in `ListQuery.h`) is the lower-level cache-key struct the L1 `ListCache` consumes; `ListMixin::toCacheQuery` adapts the sealed `spec::ListQuery<D>` into it. Public callers use `spec::ListQuery<D>` (the `Repo::ListQuery` alias).
-
 ### TypedCursor — phantom-typed keyset cursor
 
-`TypedCursor<Descriptor>` (`TypedCursor.h`, aliased as `Repo::Cursor`) wraps the opaque byte-level `list::Cursor` and tags it with its owning descriptor, so a cursor minted for one list **cannot** be passed to another list's `query()`/builder — a compile error, not a runtime mis-decode against the wrong sort/key shape.
+`TypedCursor<Descriptor>` (`TypedCursor.h`, aliased as `Repo::Cursor`) is the keyset cursor of one list, tagged with its owning descriptor, so a cursor minted for one list **cannot** be passed to another list's `query()`/builder — a compile error, not a runtime mis-decode against the wrong sort/key shape.
 
 | Member | Returns | Semantics |
 |---|---|---|
 | `TypedCursor()` | — | Empty cursor = first page. |
 | `static decode(string_view token)` | `optional<TypedCursor>` | Decode a server-minted base64 token. `nullopt` on a malformed token (trust boundary): a character outside the base64 alphabet, or a decoded width other than `8 × (1 + N)` bytes. Empty token → empty (first-page) cursor. The **sole** runtime entry point — the type tag is conferred here. |
-| `encode()` | `std::string` | Standard base64 wire token, `=`-padded (passes straight through to `list::Cursor`). |
+| `encode()` | `std::string` | Standard base64 wire token, `=`-padded. |
 | `empty()` / `size()` | `bool` / `size_t` | Emptiness / byte length. |
-| `raw()` | `const list::Cursor&` | The opaque byte cursor, for the keyset SQL / cache-key machinery. |
 
 The wire token is standard base64 over exactly `8 × (1 + N)` bytes: `int64(sort_value)` followed by the `N` int64 primary-key components (one for a scalar key, N for a composite key) — the full keyset tiebreaker for the `ORDER BY` row-value comparison. The width is normative: `decode` rejects any other.
 
@@ -601,14 +620,14 @@ The wire token is standard base64 over exactly `8 × (1 + N)` bytes: `int64(sort
 
 <details><summary>Pagination cycle — mint and hand-back</summary>
 
-`query()` mints the next page's token into `ListResult`'s `next_cursor` when a full page is returned; the controller hands it back via `.after(Repo::Cursor::decode(token).value())`. The byte layout is built in `queryFromDb` and (de)serialized by `list::Cursor::encode`/`decode`.
+`query()` mints the next page's token into `ListResult`'s `next_cursor` when a full page is returned; the controller hands it back via `.after(Repo::Cursor::decode(token).value())`.
 </details>
 
 > **Intra-descriptor coherence stays a runtime concern by design.** The type tag guards cross-descriptor confusion only; whether a cursor matches the *current request's* sort cannot be a compile-time type (the sort varies per request, the token arrives off the wire).
 
 ### HTTP parsers
 
-Both take a parameter map (default `std::unordered_map<std::string, std::string>`, e.g. Drogon's `req->getParameters()`) and return a **sealed** `ListQuery<Descriptor>`. Recognized non-filter keys: `sort` (`field:dir`), `limit`, `after` (the cursor), `offset`, and `cursor` (reserved/ignored — the cursor is read only from `after`). Filter keys match `Filter::name`; IN/NIN values are comma-separated.
+Both take a parameter map (default `std::unordered_map<std::string, std::string>`, e.g. Drogon's `req->getParameters()`) and return a **sealed** `ListQuery<Descriptor>`. Recognized non-filter keys: `sort` (`field:dir`), `limit`, `after` (the cursor), `offset`, and `cursor` (reserved/ignored — the cursor is read only from `after`). Filter keys match `Filter::name`; IN/NIN values are comma-separated, sorted and deduplicated; a set holds at most `kMaxInListElements` (`HttpQueryParser.h`, `256`) distinct elements.
 
 ```cpp
 template<typename Descriptor, typename Map = std::unordered_map<std::string, std::string>>
@@ -630,6 +649,7 @@ std::expected<ListQuery<Descriptor>, QueryValidationError>
 | missing `limit` | `defaultLimit<D>()` | `defaultLimit<D>()` |
 | cursor + offset | offset ignored if cursor present | rejected → `ConflictingPagination` |
 | Unparsable filter value | filter inactive (set: element dropped) | rejected → `InvalidValue` |
+| Set above `kMaxInListElements` distinct elements | first 256 kept, in sorted order | rejected → `InvalidValue` |
 | Malformed cursor (alphabet or width) | dropped (first page) | rejected → `InvalidCursor` |
 
 `QueryValidationError` (`GeneratedTraits.h`): `{ Type type; std::string field; uint16_t limit; }` with `Type ∈ { InvalidFilter, InvalidSort, InvalidLimit, ConflictingPagination, InvalidValue, InvalidCursor }` and a `message()` formatter.
@@ -667,7 +687,6 @@ When the entity has a `ListDescriptor`, `Repo` exposes these aliases and types (
 | `QueryBuilder` | `list::spec::ListQueryBuilder<Descriptor>`. |
 | `Cursor` | `list::spec::TypedCursor<Descriptor>`. |
 | `ListResult` | `cache::CacheView<list::ListWrapper<E>>` (epoch-guarded, zero-copy). |
-| `ListTraits` | the `Traits` adapter (sort parsing, limit normalization, etc., for controllers). |
 
 `ListResult` wraps a `ListWrapper<E>`: `items` (`vector<E>`), `next_cursor` (base64 string), with on-demand `json()` / `binary()` (BEVE) and accessors `front()`/`back()` (`const Item*`, `nullptr` when empty), `size()` (`size_t`), `empty()` (`bool`), `cursor()` (`string_view`). `query()` returns `Immediate<ListResult>` (L1 hit is frameless); `queryJson`/`queryBinary` return serialized pages by value. See the Repository API for the query method signatures and constraints.
 
@@ -859,9 +878,21 @@ The awaitable family in `io/Task.h`. All repository reads/writes resolve to one 
 | `Task<T>` (`T` defaults to `void`) | Lazy, move-only coroutine; symmetric transfer (resumes its continuation on completion). Frames come from a thread-local `FramePool` (~3-5 ns alloc; frames >1 KB fall back to global `new`). | Two creation paths: a coroutine body (`co_return`/`co_await` → heap frame) or `Task<T>::fromValue(T)` (pre-resolved, **zero allocation**, `await_ready()==true`). `await_resume` rethrows a captured exception. |
 | `Task<void>` | Specialization. `Task<void>::ready()` is the pre-resolved (frameless) success. | `await_resume()` rethrows the stored exception if any, else returns. |
 | `Immediate<T>` | Zero-overhead awaitable wrapping `variant<T, Task<T>>` (no extra discriminant). | Sync/async branch on the hot path: `Immediate(T)` is a ready value (no `Task` allocated); `Immediate(Task<T>)` delegates. Ready case: `await_ready()==true`, single move out of the variant, no coroutine frame. `take_task()` extracts the inner `Task` (valid only when `!await_ready()`). |
-| `DetachedTask` | Eager, fire-and-forget coroutine (`initial_suspend`/`final_suspend` = `suspend_never`); self-destructs on completion. | Starts immediately on call. **Exceptions are swallowed** (logged if `RELAIS_LOG_ERROR`). For async work nobody awaits. |
+| `DetachedTask` | Eager, fire-and-forget coroutine (`initial_suspend`/`final_suspend` = `suspend_never`); self-destructs on completion. | Starts immediately on call. **Exceptions are swallowed** (reported to the [log callback](#logging)). For async work nobody awaits. |
 
 > **`co_await` unifies `Task` and `Immediate`.** Both expose `await_ready`/`await_suspend`/`await_resume`, and a pre-resolved `Task` (`fromValue`/`ready`) or a ready `Immediate` short-circuits with `await_ready()==true` — no suspend, no frame. Repository reads return `Immediate<...>` and writes `Task<...>`, whatever the preset.
+
+`whenAll` (`io/WhenAll.h`) awaits several tasks started together:
+
+| Overload | `co_await` yields |
+|---|---|
+| `whenAll(Task<Ts>... tasks)` | `std::tuple<Ts...>`, a `void` task as `std::monostate`; `void` when every task is `void`. |
+| `whenAll(std::span<Task<T>> tasks)` / `whenAll(std::vector<Task<T>> tasks)` | `std::vector<T>`, in input order; `void` for `T = void`. |
+
+- **semantics**: starts every task before awaiting any, on the calling loop thread, so their queries enter the same batch instead of one round trip each; completes when all have finished. It runs nothing in parallel: the tasks interleave on one thread.
+- **ownership**: `whenAll` takes the tasks over; the span overload leaves the span's tasks moved-from, never to be awaited.
+- **errors**: when tasks throw, the exception of the lowest-index one is rethrown and the results are discarded.
+- **lifetime**: returns the awaitable itself; `co_await` it in the same expression.
 
 ### Outcome
 
@@ -953,7 +984,7 @@ static void runAll(Io& io, Drive drive);   // testing/IoContextConformance.h
 
 ### PgProvider & PgResult / Row & errors
 
-`PgProvider` (`PgProvider.h`, root ns) is the type-erased service locator: it wraps `io::PgClient<Io>` behind `thread_local std::function`s so repositories don't name the concrete `IoContext`. **All query entry points are static methods of `PgProvider`** (not of `PgResult`/`Row`).
+`PgProvider` (`PgProvider.h`, root ns) is the type-erased service locator: `thread_local std::function`s bound to the loop's pool, so repositories don't name the concrete `IoContext`. **All query entry points are static methods of `PgProvider`** (not of `PgResult`/`Row`).
 
 | Method | Returns | Notes |
 |---|---|---|
@@ -963,8 +994,6 @@ static void runAll(Io& io, Drive drive);   // testing/IoContextConformance.h
 | `queryWrite(const char* sql, const PgParams&, batch::WriteMode mode = Idempotent)` | `Task<batch::PgWriteResult>` | Sole write entry point (write batch, ordering in [runtime.md › Write ordering](runtime.md#write-ordering)). Result carries RETURNING rows + `affectedRows()`; `coalesced=true` ⇒ an identical `Idempotent` write was already batched, no DB round-trip. `WriteMode::Exclusive` (relative SET, guarded write, claim, `now()`-dependent value) is never coalesced: it runs once per caller, still batched. |
 | `initialized()` | `bool` (noexcept) | Whether providers are bound on this thread. |
 | `reset()` | `void` (noexcept) | Clear this thread's providers (testing). |
-
-`entityQueryParams` / `entityQueryParamsMany` also exist (entity-read paths routed through `submitEntityRead*` for `pk = ANY` batching/fusion) — repositories use these, not application code.
 
 **Arguments** — `queryArgs` and `PgParams::make` accept a closed set of types, enforced by the `io::PgArg` concept. Nothing converts implicitly: what is sent is exactly what is written.
 
@@ -991,19 +1020,17 @@ static void init(
     int max_concurrent = 8);
 ```
 - `max_concurrent` (default `8`) is the loop's send budget, as `IoPoolConfig::max_concurrent_per_worker`.
-- Providers are `thread_local`: `init` on thread A binds nothing for thread B. Debug builds assert `io.isInLoopThread()` for adapters that expose it. `bindBatcher<Io>(batcher)` is the lower-level entry `IoPool` uses (one batcher per worker).
+- Providers are `thread_local`: `init` on thread A binds nothing for thread B. Debug builds assert `io.isInLoopThread()` for adapters that expose it.
 
 **`PgResult`** (`io/pg/PgResult.h`) — RAII wrapper over `PGresult`:
 
 | Member | Returns | Notes |
 |---|---|---|
-| `rows()` | `int` | Row count (honors slice views). |
+| `rows()` | `int` | Row count. |
 | `cols()` | `int` | Column count. |
 | `valid()` / `empty()` / `ok()` | `bool` | Has a result / zero rows / status is OK (TUPLES/COMMAND/SINGLE_TUPLE). |
 | `affectedRows()` | `int` | INSERT/UPDATE/DELETE count. |
-| `pipelineAborted()` | `bool` | Pipeline-aborted status. |
 | `operator[](int row)` | `Row` | Row proxy (no ownership). |
-| `sliceRow` / `sliceRows` (static) | `PgResult` | Zero-copy single-/multi-row views sharing the same `PGresult` (fans a fused ANY-batch to per-key waiters). |
 
 **`PgResult::Row`** — lightweight, non-owning proxy:
 
@@ -1043,6 +1070,19 @@ Any other `T` is a compile error.
 
 > Catch `PgError` to handle the whole layer; catch `PgNoRows` etc. for the specific case. There is no `error_code`-style enum — branch on type. The one category that carries semantics is `PgUncertainError`: a write that throws it *may* have committed (relais has already evicted the affected caches); a write that throws a plain `PgError` provably did not. See [runtime.md › Liveness & failure semantics](runtime.md#liveness--failure-semantics).
 
+### Logging
+
+relais writes nothing until the application installs a callback (`Log.h`, namespace `jcailloux::relais::log`). Install it at startup; it can be replaced or removed later, from any thread. Errors a repository absorbs (a failed write returning `nullopt`, a dropped detached task) are reported only there.
+
+```cpp
+enum class Level : uint8_t { Debug, Warn, Error };
+using Callback = void (*)(Level level, const char* msg, std::size_t len);
+
+void     setCallback(Callback cb) noexcept;   // nullptr: silence
+Callback getCallback() noexcept;
+```
+- **semantics**: the callback runs on the thread that logs, usually a loop thread, so it must be thread-safe. A thread that read the previous callback may still be running it after `setCallback` returns. `msg` holds `len` bytes and is valid only during the call.
+
 → Guides: [runtime.md](runtime.md), [foreign-event-loops.md](foreign-event-loops.md)
 
 ---
@@ -1073,3 +1113,34 @@ Any other `T` is a compile error.
 > Full reference, examples, and constraints: **[entities.md](entities.md)**.
 
 → Guide: [entities.md](entities.md)
+
+---
+
+## Stability
+
+relais follows [semantic versioning](https://semver.org): a release that breaks what this section covers raises the major version, one that only adds to it raises the minor version, and one that only fixes it raises the patch version. The [CHANGELOG](../CHANGELOG.md) records every change to it.
+
+**Covered:**
+
+- every name, signature and behaviour this file documents, and the header paths it gives for them;
+- the wire format of the keyset cursor token ([TypedCursor](#typedcursor--phantom-typed-keyset-cursor)): a token minted by one release decodes in every release of the same major version;
+- the `@relais` annotations, the generator's command line, `relais_generate_wrappers()`, and the generated names [entities.md](entities.md) documents (`{Class}Entity`, `{Class}Mapping`, `TraitsType::Field`, `FieldInfo<F>`);
+- the CMake options `RELAIS_GDSF_ENABLED` and `RELAIS_ENABLE_METRICS`, the environment variable `RELAIS_L1_MAX_MEMORY`, and the version macros below.
+
+**Not covered** — these may change in any release:
+
+- every namespace named `detail` (`cache::detail::CacheTier`, `io::detail::PgConnection`, `detail::LocalRepo`, …), although public headers declare them and this file names some of them to explain a behaviour;
+- a member of a documented type that this file does not list, or lists as internal;
+- the rest of a generated file: regenerate it with the generator of the release you build against;
+- the mechanisms the guides describe to explain a behaviour; [internals.md](internals.md) is written for contributors.
+
+**Version macros** (`Version.h`):
+
+```cpp
+#include <jcailloux/relais/Version.h>
+
+RELAIS_VERSION_MAJOR
+RELAIS_VERSION_MINOR
+RELAIS_VERSION_PATCH
+RELAIS_VERSION   // MAJOR * 10000 + MINOR * 100 + PATCH: #if RELAIS_VERSION >= 40000
+```

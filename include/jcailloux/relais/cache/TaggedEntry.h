@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <type_traits>
 
-namespace jcailloux::relais::cache {
+namespace jcailloux::relais::cache::detail {
 
 // =============================================================================
 // TaggedEntry — 8-byte tagged pointer encoding ghost data inline
@@ -104,6 +104,6 @@ struct TaggedEntry {
 static_assert(sizeof(TaggedEntry) == 8, "TaggedEntry must be 8 bytes");
 static_assert(std::is_trivially_copyable_v<TaggedEntry>, "TaggedEntry must be trivially copyable");
 
-}  // namespace jcailloux::relais::cache
+}  // namespace jcailloux::relais::cache::detail
 
 #endif  // JCX_RELAIS_CACHE_TAGGED_ENTRY_H

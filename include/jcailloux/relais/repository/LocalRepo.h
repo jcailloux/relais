@@ -29,7 +29,7 @@
 namespace relais_test { struct TestInternals; }
 #endif
 
-namespace jcailloux::relais {
+namespace jcailloux::relais::detail {
 
 /**
  * Repo with L1 RAM cache backed by CacheTier (ChunkMap + GDSF + ghosts).
@@ -60,8 +60,8 @@ class LocalRepo : public PgRepo<E, Name, Cfg, Key> {
 
     using Base = PgRepo<E, Name, Cfg, Key>;
 
-    using Metadata = cache::CacheMetadata<HasGDSF, HasTTL>;
-    using Tier = cache::CacheTier<Key, E, Metadata>;
+    using Metadata = cache::detail::CacheMetadata<HasGDSF, HasTTL>;
+    using Tier = cache::detail::CacheTier<Key, E, Metadata>;
 
     /// Read-fill recheck guard (one static slot array per Name/Key/SlotsLog2).
     using Recheck = RecheckGuard<Name, Key, Cfg.recheck_slots_log2>;
@@ -84,7 +84,7 @@ public:
     static constexpr auto l1Ttl() { return std::chrono::nanoseconds(kL1TtlNs); }
 
 #if RELAIS_ENABLE_METRICS
-    static inline cache::L1Counters l1_counters_{};
+    static inline cache::detail::L1Counters l1_counters_{};
 #endif
 
     // =========================================================================
@@ -377,7 +377,7 @@ public:
 
     /// Every copy (see PgRepo::invalidateEveryRow): a note with an empty
     /// predicate (see noteRowsChanged), O(1).
-    static void invalidateEveryRow(const std::shared_ptr<io::SettleTicket>& ticket) {
+    static void invalidateEveryRow(const std::shared_ptr<io::detail::SettleTicket>& ticket) {
         noteRowsChanged(ticket, {});
         Base::invalidateEveryRow(ticket);
     }
@@ -455,27 +455,27 @@ protected:
     /// No tick — the sweep counter is driven by fetch paths (DB misses),
     /// not by local cache mutations (update, insert via API).
     static typename Tier::Hit putInCache(const Key& key, const E& src,
-        uint32_t now_sec = runtime::CachedClock::now())
+        uint32_t now_sec = runtime::detail::CachedClock::now())
     {
         return tier().store(key, E(src), buildMetadata(now_sec));
     }
 
     /// Put entity in cache (move). Returns Hit.
     static typename Tier::Hit putInCache(const Key& key, E&& src,
-        uint32_t now_sec = runtime::CachedClock::now())
+        uint32_t now_sec = runtime::detail::CachedClock::now())
     {
         return tier().store(key, std::move(src), buildMetadata(now_sec));
     }
 
     /// Build metadata. Accepts pre-computed now_sec to avoid redundant
     /// CachedClock::now() calls.
-    static Metadata buildMetadata(uint32_t now_sec = runtime::CachedClock::now()) {
+    static Metadata buildMetadata(uint32_t now_sec = runtime::detail::CachedClock::now()) {
         if constexpr (HasGDSF) {
             uint32_t ttl_sec = 0;
             if constexpr (HasTTL) {
                 ttl_sec = now_sec + kTtlSec;
             }
-            return Metadata{cache::GDSFScoreData::kCountScale, ttl_sec};
+            return Metadata{cache::detail::GDSFScoreData::kCountScale, ttl_sec};
         } else if constexpr (HasTTL) {
             return Metadata{now_sec + kTtlSec};
         } else {
@@ -492,13 +492,13 @@ protected:
     /// stored before the seal are, and a pass over the cache evicts those left;
     /// found aborted, the note is dropped. Without a pending ticket, the note
     /// is settled at once.
-    static void noteRowsChanged(const std::shared_ptr<io::SettleTicket>& ticket,
+    static void noteRowsChanged(const std::shared_ptr<io::detail::SettleTicket>& ticket,
                                 typename Notes::Predicate pred) {
         auto& n = notes();
-        if (ticket && ticket->state == io::SettleTicket::State::Pending) {
+        if (ticket && ticket->state == io::detail::SettleTicket::State::Pending) {
             const uint64_t id = n.addPending(std::move(pred), &Recheck::bumpAll);
-            ticket->replays.emplace_back([id](io::WriteOutcome outcome) -> io::Task<void> {
-                if (outcome == io::WriteOutcome::Aborted) {
+            ticket->replays.emplace_back([id](io::detail::WriteOutcome outcome) -> io::Task<void> {
+                if (outcome == io::detail::WriteOutcome::Aborted) {
                     notes().discard(id);
                     co_return;
                 }
@@ -513,7 +513,7 @@ protected:
 
     /// Rows an uncertain write may have erased (see
     /// PgRepo::rowsMayHaveBeenErased): their copies kept, then evicted.
-    static io::Task<void> rowsMayHaveBeenErased(std::shared_ptr<io::SettleTicket> ticket,
+    static io::Task<void> rowsMayHaveBeenErased(std::shared_ptr<io::detail::SettleTicket> ticket,
                                                 std::span<const Key> keys,
                                                 std::vector<std::optional<E>>* before) {
         for (size_t i = 0; i < keys.size(); ++i)
@@ -531,7 +531,7 @@ protected:
     /// Rows an uncertain predicate write may have changed: a note on the
     /// entity tier (see noteRowsChanged), then the tiers below.
     template<typename... Updates>
-    static void rowsMayHaveChanged(const std::shared_ptr<io::SettleTicket>& ticket,
+    static void rowsMayHaveChanged(const std::shared_ptr<io::detail::SettleTicket>& ticket,
                                    const detail::RowPredicate<E>& rows,
                                    const Updates&... updates) {
         readColumnFacts();  // a read that failed is tried again
@@ -904,6 +904,6 @@ private:
 #endif
 };
 
-}  // namespace jcailloux::relais
+}  // namespace jcailloux::relais::detail
 
 #endif //JCX_RELAIS_LOCALREPO_H

@@ -154,8 +154,8 @@ Entity makeArticle(int64_t id, std::string category, int64_t author_id,
 // path. Both gained the NIN branch in this commit and must never disagree.
 template<typename Desc>
 bool l1Match(const Entity& e, const decl::Filters<Desc>& f) {
-    const bool viaFree = decl::matchesFilters<Desc>(e, f);
-    const bool viaTags = f.matchesFilters(decl::extractTags<Desc>(e));
+    const bool viaFree = decl::detail::matchesFilters<Desc>(e, f);
+    const bool viaTags = f.matchesFilters(decl::detail::extractTags<Desc>(e));
     CHECK(viaFree == viaTags);
     return viaFree;
 }
@@ -331,7 +331,7 @@ TEST_CASE("[DeclListNin] IN and NIN coexist on distinct columns", "[list][nin][u
 
 namespace {
 
-std::string paramStr(const jcailloux::relais::io::PgParam& p) {
+std::string paramStr(const jcailloux::relais::io::detail::PgParam& p) {
     return p.isNull() ? std::string("<null>")
                       : std::string(p.data(), static_cast<size_t>(p.length()));
 }
@@ -343,7 +343,7 @@ TEST_CASE("[DeclListNin] SQL: NIN emits != ALL with one array param",
     decl::Filters<DescNinString> f;
     f.get<"category">() = std::vector<std::string>{"science", "tech"};
 
-    auto wc = decl::buildWhereClause<DescNinString>(f);
+    auto wc = decl::detail::buildWhereClause<DescNinString>(f);
     CHECK(wc.sql == "\"category\" != ALL($1)");
     REQUIRE(wc.params.params.size() == 1);          // exactly one param — the array
     CHECK(paramStr(wc.params.params[0]) == "{science,tech}");
@@ -354,7 +354,7 @@ TEST_CASE("[DeclListNin] SQL: NIN int64 array literal", "[list][nin][unit][sql]"
     decl::Filters<DescNinInt64> f;
     f.get<"author_id">() = std::vector<int64_t>{1, 2, 3};
 
-    auto wc = decl::buildWhereClause<DescNinInt64>(f);
+    auto wc = decl::detail::buildWhereClause<DescNinInt64>(f);
     CHECK(wc.sql == "\"author_id\" != ALL($1)");
     REQUIRE(wc.params.params.size() == 1);
     CHECK(paramStr(wc.params.params[0]) == "{1,2,3}");
@@ -364,7 +364,7 @@ TEST_CASE("[DeclListNin] SQL: singleton NIN behaves like != x", "[list][nin][uni
     decl::Filters<DescNinString> f;
     f.get<"category">() = std::vector<std::string>{"tech"};
 
-    auto wc = decl::buildWhereClause<DescNinString>(f);
+    auto wc = decl::detail::buildWhereClause<DescNinString>(f);
     CHECK(wc.sql == "\"category\" != ALL($1)");      // != ALL('{tech}') ≡ != 'tech'
     CHECK(paramStr(wc.params.params[0]) == "{tech}");
 }
@@ -375,7 +375,7 @@ TEST_CASE("[DeclListNin] SQL: empty set yields != ALL('{}') (universe)",
     f.get<"category">() = std::vector<std::string>{};  // present-but-empty
     REQUIRE(f.get<"category">().has_value());
 
-    auto wc = decl::buildWhereClause<DescNinString>(f);
+    auto wc = decl::detail::buildWhereClause<DescNinString>(f);
     CHECK(wc.sql == "\"category\" != ALL($1)");
     REQUIRE(wc.params.params.size() == 1);
     CHECK(paramStr(wc.params.params[0]) == "{}");    // != ALL('{}') → TRUE → all rows
@@ -387,7 +387,7 @@ TEST_CASE("[DeclListNin] SQL: EQ + NIN + range $n numbering", "[list][nin][unit]
     f.get<"category">() = std::vector<std::string>{"news", "spam"};     // NIN category
     f.get<"view_count">() = int32_t{10};                                  // GE view_count
 
-    auto wc = decl::buildWhereClause<DescCombo>(f);
+    auto wc = decl::detail::buildWhereClause<DescCombo>(f);
     CHECK(wc.sql == "\"author_id\"=$1 AND \"category\" != ALL($2) AND \"view_count\">=$3");
     REQUIRE(wc.params.params.size() == 3);     // NIN contributes exactly one param
     CHECK(paramStr(wc.params.params[0]) == "42");
@@ -398,7 +398,7 @@ TEST_CASE("[DeclListNin] SQL: EQ + NIN + range $n numbering", "[list][nin][unit]
     SECTION("only NIN active — EQ/range skipped, NIN takes $1") {
         decl::Filters<DescCombo> g;
         g.get<"category">() = std::vector<std::string>{"spam"};
-        auto wc2 = decl::buildWhereClause<DescCombo>(g);
+        auto wc2 = decl::detail::buildWhereClause<DescCombo>(g);
         CHECK(wc2.sql == "\"category\" != ALL($1)");
         REQUIRE(wc2.params.params.size() == 1);
         CHECK(wc2.next_param == 2);
@@ -411,7 +411,7 @@ TEST_CASE("[DeclListNin] SQL: IN and NIN coexist — two array params, $n correc
     f.get<"author_id">() = std::vector<int64_t>{1, 2};                   // author_id IN {1,2}
     f.get<"category">() = std::vector<std::string>{"spam", "draft"};    // category NOT IN {spam,draft}
 
-    auto wc = decl::buildWhereClause<DescInNin>(f);
+    auto wc = decl::detail::buildWhereClause<DescInNin>(f);
     CHECK(wc.sql == "\"author_id\" = ANY($1) AND \"category\" != ALL($2)");
     REQUIRE(wc.params.params.size() == 2);     // each set op contributes one array param
     CHECK(paramStr(wc.params.params[0]) == "{1,2}");
@@ -470,6 +470,29 @@ TEST_CASE("[DeclListNin] parse: element count capped at 256", "[list][nin][unit]
     auto q = decl::parseListQuery<DescNinInt64>(Params{{"author_id", csv}});
     REQUIRE(q.filters().get<"author_id">().has_value());
     CHECK(q.filters().get<"author_id">()->size() == 256);
+}
+
+
+namespace {
+
+std::string intCsv(int count, int distinct) {
+    std::string csv;
+    for (int i = 0; i < count; ++i) {
+        if (i) csv += ',';
+        csv += std::to_string(i % distinct);
+    }
+    return csv;
+}
+
+}  // namespace
+
+TEST_CASE("[DeclListNin] parse: strict rejects a set above 256 distinct elements",
+          "[list][nin][unit][parse]") {
+    // Truncating a NOT IN set would return rows the caller excluded.
+    auto r = decl::parseListQueryStrict<DescNinInt64>(Params{{"author_id", intCsv(257, 257)}});
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().type == decl::QueryValidationError::Type::InvalidValue);
+    CHECK(r.error().field == "author_id");
 }
 
 TEST_CASE("[DeclListNin] parse: strict rejects undeclared, accepts well-formed NIN",
@@ -590,16 +613,16 @@ void crossTierNinProperty(const std::vector<Entity>& entities,
         for (size_t i = 0; i < sets.size(); ++i) {
             decl::Filters<DescNin> fn;
             std::get<0>(fn.values) = sets[i];
-            const bool ninL1 = decl::matchesFilters<DescNin>(e, fn);
+            const bool ninL1 = decl::detail::matchesFilters<DescNin>(e, fn);
 
-            auto wc = decl::buildWhereClause<DescNin>(fn);
+            auto wc = decl::detail::buildWhereClause<DescNin>(fn);
             const std::string arr = paramStr(wc.params.params[0]);
             const auto fld = getField(e);
             const bool ninL3 = sqlAllVerdict(fld, arr, cast);
 
             decl::Filters<DescIn> fi;
             std::get<0>(fi.values) = sets[i];
-            const bool inL1 = decl::matchesFilters<DescIn>(e, fi);
+            const bool inL1 = decl::detail::matchesFilters<DescIn>(e, fi);
 
             CAPTURE(e.id, i, arr, ninL1, ninL3, inL1, fld.has_value());
             CHECK(ninL1 == ninL3);          // cross-tier: L1 == L3 SQL

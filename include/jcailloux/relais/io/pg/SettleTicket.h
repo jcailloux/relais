@@ -21,6 +21,8 @@ enum class UncertainSettle : uint8_t {
     Off,        // no settling: the immediate eviction only
 };
 
+namespace detail {
+
 // Settling as configured on a connection; the pool fills it from PgPoolConfig.
 struct SettleConfig {
     UncertainSettle mode = UncertainSettle::Off;
@@ -68,6 +70,8 @@ struct SettleTicket {
     // stop the others.
     std::vector<std::function<Task<void>(WriteOutcome)>> replays;
 };
+
+}  // namespace detail
 
 } // namespace jcailloux::relais::io
 

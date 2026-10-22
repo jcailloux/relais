@@ -69,7 +69,8 @@ comma-separated list (`?authors=1,2,3`); the set is canonicalized
 (deduplicated, sorted) before use. Element types are `int64`, `int32`,
 `std::string`, `bool` and [mapped enums](#enum-fields); an enum stored as an
 integer is rejected at compile time. An empty or all-invalid set leaves the
-filter inactive. The set is bounded at 256 elements.
+filter inactive. The set is bounded at 256 distinct elements: the strict parser
+rejects a larger set, the tolerant one keeps the first 256 in sorted order.
 
 Boolean filter values — for `in`, scalar `eq` and `is_null` alike — accept the standard
 HTTP / HTML-form conventions, case-insensitively: `true/1/t/yes/y/on` and

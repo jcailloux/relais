@@ -44,6 +44,8 @@ struct GDSFConfig {
     long chunk_count = 8;                    // number of chunks for all ChunkMaps (uniform)
 };
 
+namespace detail {
+
 // =========================================================================
 // fast_log2_approx — IEEE 754 bit manipulation (~1-2ns, branchless)
 // =========================================================================
@@ -125,6 +127,8 @@ struct RepoRegistryEntry {
     const char* name;                 // compile-time repo name (for logging)
 };
 
+}  // namespace detail
+
 // =========================================================================
 // GDSFPolicy — global singleton managing GDSF eviction coordination
 // =========================================================================
@@ -176,7 +180,7 @@ public:
     /// Cost: 2 relaxed loads + add (~2ns). Only called on cache miss path.
     bool isOverBudget(uint64_t extra = 0) const {
         if (max_memory_ == 0) return false;
-        return runtime::CachedMemory::bytes()
+        return runtime::detail::CachedMemory::bytes()
              + admitted_since_tick_.load(std::memory_order_relaxed)
              + extra
              >= max_memory_;
@@ -231,7 +235,7 @@ public:
 
     /// Register a repo for global coordination (threshold, sweep).
     /// Called once per LocalRepo instantiation via std::call_once.
-    void enroll(RepoRegistryEntry entry) {
+    void enroll(detail::RepoRegistryEntry entry) {
         std::unique_lock lock(registry_mutex_);
         registry_.push_back(std::move(entry));
     }
@@ -315,7 +319,7 @@ public:
         {
             float threshold = 0.0f;
             if (max_memory_ > 0) {
-                auto heap = runtime::CachedMemory::bytes();
+                auto heap = runtime::detail::CachedMemory::bytes();
                 if (heap > max_memory_) {
                     threshold = histogram_.thresholdForBytes(heap - max_memory_);
                 }
@@ -337,7 +341,7 @@ public:
 
         // 6. Refresh heap + reset admitted counter so isOverBudget()
         //    immediately reflects the post-eviction state.
-        runtime::CachedMemory::tick();
+        runtime::detail::CachedMemory::tick();
         onHeapRefresh();
 
 #if RELAIS_ENABLE_METRICS
@@ -351,15 +355,15 @@ public:
     }
 
 #if RELAIS_ENABLE_METRICS
-    const SweepCounters& sweepCounters() const noexcept { return sweep_counters_; }
-    SweepCounters& sweepCounters() noexcept { return sweep_counters_; }
+    const detail::SweepCounters& sweepCounters() const noexcept { return sweep_counters_; }
+    detail::SweepCounters& sweepCounters() noexcept { return sweep_counters_; }
 #endif
 
 private:
     GDSFPolicy() : max_memory_(readMaxMemoryFromEnv()) {
         // Release-store the hook last: a background-thread reader that acquire-
         // loads it then sees this fully-constructed policy.
-        runtime::RuntimeThread::on_heap_refresh.store(
+        runtime::detail::RuntimeThread::on_heap_refresh.store(
             [] () noexcept { GDSFPolicy::instance().onHeapRefresh(); },
             std::memory_order_release);
     }
@@ -394,11 +398,11 @@ private:
 
     // Repo registry (reader-writer lock: enroll=write, threshold/sweep=read)
     mutable std::shared_mutex registry_mutex_;
-    std::vector<RepoRegistryEntry> registry_;
+    std::vector<detail::RepoRegistryEntry> registry_;
 
     // Histogram-based threshold
-    ScoreHistogram histogram_{};              // persistent, EMA-smoothed
-    ScoreHistogram building_histogram_{};     // temporary, rebuilt each sweep
+    detail::ScoreHistogram histogram_{};           // persistent, EMA-smoothed
+    detail::ScoreHistogram building_histogram_{};  // temporary, rebuilt each sweep
     std::atomic<float> cached_threshold_{0.0f};
 
     // Deterministic insertion counter (replaces probabilistic hash-based trigger)
@@ -421,7 +425,7 @@ private:
     std::atomic_flag sweep_flag_{};
 
 #if RELAIS_ENABLE_METRICS
-    SweepCounters sweep_counters_;
+    detail::SweepCounters sweep_counters_;
 #endif
 
 #ifdef RELAIS_BUILDING_TESTS
@@ -431,9 +435,9 @@ public:
     void resetForTesting() { reset(); }
 
     /// Expose histograms for testing.
-    ScoreHistogram& persistentHistogram() { return histogram_; }
-    const ScoreHistogram& persistentHistogram() const { return histogram_; }
-    ScoreHistogram& buildingHistogram() { return building_histogram_; }
+    detail::ScoreHistogram& persistentHistogram() { return histogram_; }
+    const detail::ScoreHistogram& persistentHistogram() const { return histogram_; }
+    detail::ScoreHistogram& buildingHistogram() { return building_histogram_; }
 #endif
 };
 

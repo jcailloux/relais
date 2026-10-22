@@ -61,7 +61,7 @@ struct PgPoolConfig {
 template<IoContext Io>
 class PgPool : public std::enable_shared_from_this<PgPool<Io>> {
 public:
-    using ConnectionType = PgConnection<Io>;
+    using ConnectionType = detail::PgConnection<Io>;
 
     // ConnectionGuard — RAII: returns connection to pool on destruction
 
@@ -203,7 +203,7 @@ private:
         , cfg_(cfg)
     {}
 
-    [[nodiscard]] SettleConfig settleConfig() const noexcept {
+    [[nodiscard]] detail::SettleConfig settleConfig() const noexcept {
         return {cfg_.uncertain_settle, cfg_.settle_delay, cfg_.client_check_interval};
     }
 
@@ -324,6 +324,8 @@ private:
     std::deque<Waiter*> waiters_;
 };
 
+namespace detail {
+
 // PgClient — high-level query interface using a PgPool
 
 template<IoContext Io>
@@ -367,6 +369,8 @@ public:
 private:
     std::shared_ptr<Pool> pool_;
 };
+
+}  // namespace detail
 
 } // namespace jcailloux::relais::io
 
