@@ -45,6 +45,14 @@
   SQL constants (`update_returning`, `update_returning_changes`,
   `delete_by_pk_returning`, `delete_with_partition_returning`). The generator
   now also rejects a filter parameter declared twice in one entity.
+- **The entity generator rejects every annotation it does not recognize**: an
+  unknown tag, a tag at the wrong level or a malformed one is an error, where it
+  was ignored or read as something else. Tags run to the end of the comment:
+  move a note on a member before `@relais`
+  (`// assigned by the caller — @relais primary_key`).
+- **`@relais table=` is required**: the table is no longer derived from the
+  class name. `model=` and `raw_json` are removed; a `glz::raw_json` member is
+  stored verbatim because of its type.
 - **Writes in one batch keep their submission order only on the same row.**
   Concurrent writes now commit on several connections at once: two writes on
   different rows issued without a `co_await` between them (a parent row and its
@@ -77,6 +85,9 @@
   `max_concurrent = 6` the split gains nothing and concurrent writes are slower
   than in 3.2.1, where they could take the whole budget: raise it for
   write-heavy loads.
+- **A failed entity generation writes nothing.** It reports every error as
+  `path:line:col: error: …`, then exits with status 1; the output directory
+  stays as it was. See `docs/entities.md › When generation fails`.
 
 ### Removed
 
@@ -149,6 +160,13 @@
 - **List reads prepared a new statement per `limit`/`offset`** on every
   connection, without bound, and identical list reads in flight were never
   merged.
+- **The entity generator misread ordinary C++ without an error.** A brace in a
+  comment or a string literal, a brace-initialized member (`int64_t id{0};`), a
+  `{` on its own line or a comment between the annotation and the struct could
+  drop members, merge two structs or misname the entity; members of nested types
+  were read as fields. Members are now read from the struct body only.
+- **Two entities with the same class name overwrote each other's generated
+  header.** This is now a generation error naming both.
 
 ## [3.2.1] - 2026-09-27
 

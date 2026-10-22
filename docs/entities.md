@@ -40,6 +40,17 @@ the member line.
 struct User { ... };
 ```
 
+Tags are separated by spaces and run to the end of the comment. On a member, a
+note goes **before** `@relais`:
+
+```cpp
+int64_t id = 0;   // assigned by the caller — @relais primary_key
+```
+
+Above the struct, the comment must begin with `@relais`:
+`// users — @relais table=users` is not an annotation. A note goes on its own
+comment line, above the `// @relais` lines.
+
 ## 2. Run the generator
 
 ```bash
@@ -74,6 +85,37 @@ entities/
 └── generated/
     └── UserEntity.h     →  #include "../User.h"
 ```
+
+### When generation fails
+
+The generator never guesses: an annotation it cannot read is an error, reported
+in the compiler format at the faulty tag. With `tabel=users` above `User` and
+`colum=mail` on `email`:
+
+```
+entities/User.h:1:12: error: unknown struct tag 'tabel=users'; did you mean 'table='?
+entities/User.h:5:43: error: unknown field tag 'colum=mail'; did you mean 'column='?
+2 errors, no file written
+```
+
+A run reports the errors of every header, then exits with status 1 **without
+writing any file**: the output directory stays as it was. It rejects:
+
+- an unknown tag, or a tag at the wrong level (`table=` on a member, `sortable`
+  above the struct);
+- an entity without `table=`;
+- a `key=` tag without a value (`column=`);
+- a malformed `filterable` or `sortable` (more than three segments, a parameter
+  that is not an identifier, an unknown operator or direction), `enum=` pair or
+  `limits=` value;
+- an `is_null` filter on a member that is not a `std::optional`, or a filter
+  parameter declared twice;
+- an `@relais enum` field whose enum has no `glz::meta` with `glz::enumerate` in
+  the source header;
+- an annotated struct whose body never closes, or that is only declared
+  (`struct User;`);
+- two entities that would write the same `{ClassName}Entity.h`;
+- a `--sources` path that does not exist or cannot be read.
 
 ## 3. Use the generated type — mind the namespace
 

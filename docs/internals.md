@@ -1207,7 +1207,7 @@ computed relative path).
 | Annotation | Type C++ | `fromRow` | `toInsertParams` |
 |-----------|----------|-----------|------------------|
 | `timestamp` | `std::string` | `row.get<std::string>(col)` | Direct string parameter |
-| `nullable` | `std::optional<T>` | `row.getOpt<T>(col)` | Optional parameter in PgParams |
+| — | `std::optional<T>` | `row.getOpt<T>(col)` | Optional parameter in PgParams |
 | — | `glz::raw_json` | `e.field.str = row.get<std::string>(col)` | `e.field.str` as parameter |
 | `json_field` | Struct / `vector<T>` | `glz::read_json(e.field, row_str)` | `glz::write_json(e.field, json)` |
 | `enum=...` | `enum class` | generated `if (s == "db_val") e.field = Enum::val;` chain | generated `switch` pushing the `db_val` string literals |
