@@ -27,6 +27,33 @@ from typing import Optional
 
 
 # =============================================================================
+# Diagnostics
+# =============================================================================
+
+@dataclass
+class Diagnostic:
+    """A message about a source header, in the compiler format."""
+    path: Path
+    line: int  # 1-based; 0 when the message is about the whole file
+    col: int   # 1-based
+    message: str
+    severity: str = "error"
+
+    def __str__(self) -> str:
+        where = f"{self.path}:{self.line}:{self.col}" if self.line else str(self.path)
+        return f"{where}: {self.severity}: {self.message}"
+
+
+class GenerationError(Exception):
+    """An error at a line and column of the header being processed."""
+
+    def __init__(self, line: int, col: int, message: str):
+        super().__init__(message)
+        self.line = line
+        self.col = col
+
+
+# =============================================================================
 # Data structures
 # =============================================================================
 
@@ -41,6 +68,7 @@ class DataMember:
     enum_pairs: list[tuple[str, str]] = field(default_factory=list)
     filter_configs: list[FilterConfig] = field(default_factory=list)
     sort_configs: list[SortConfig] = field(default_factory=list)
+    enum_pos: tuple[int, int] = (0, 0)  # line and column of its enum tag
 
     @property
     def col_name(self) -> str:
@@ -73,6 +101,7 @@ class EnumMapping:
     field_name: str
     pairs: list[tuple[str, str]]  # [(db_value, enum_value), ...]
     cpp_type: str = ""  # C++ type name (e.g., "Priority")
+    pos: tuple[int, int] = (0, 0)  # line and column of the tag declaring it
 
 
 @dataclass
@@ -131,6 +160,11 @@ class ParsedEntity:
     annotation: EntityAnnotation
     members: list[DataMember]
     source_file: Path
+    pos: tuple[int, int] = (0, 0)  # line and column of the struct name
+
+    @property
+    def fqn(self) -> str:
+        return f"{self.namespace}::{self.class_name}" if self.namespace else self.class_name
 
 
 # =============================================================================
@@ -138,10 +172,16 @@ class ParsedEntity:
 # =============================================================================
 
 class StructParser:
-    """Parse C++ headers for @relais annotations and struct data members."""
+    """Parse C++ headers for @relais annotations and struct data members.
 
-    # Regex: @relais or @relais_list annotations in comments
-    ANNOTATION_RE = re.compile(r'//\s*@relais(?:_list)?\s+(.*)')
+    Errors are collected in `errors`, never raised: an entity with an error is
+    left out of the result, and parsing goes on with the next one.
+    """
+
+    # Regex: a line holding only a @relais or @relais_list annotation comment
+    ANNOTATION_RE = re.compile(r'\s*//\s*@relais(_list)?\s+(.*)')
+    # Regex: one annotation tag
+    TOKEN_RE = re.compile(r'\S+')
     # Regex: class/struct Name [: public ...] {
     CLASS_RE = re.compile(r'(?:class|struct)\s+(\w+)')
     # Regex: data member, on the code view — type name [= init | {init}];
@@ -154,7 +194,6 @@ class StructParser:
     ACCESS_RE = re.compile(r'^\s*(public|protected|private)\s*:')
     # Regex: the @relais tags of a member, in its trailing line comment
     MEMBER_TAGS_RE = re.compile(r'//.*?@relais\b(.*)')
-    NOT_DEFINED = "declared but not defined here; @relais annotates the struct definition"
     # Regex: namespace ... {
     NAMESPACE_RE = re.compile(r'namespace\s+([\w:]+)\s*\{')
     # Raw string literal prefixes: the identifier right before the opening quote
@@ -166,10 +205,11 @@ class StructParser:
         the state carried to the next line.
 
         `state` is the terminator still awaited from a previous line: "" in
-        code, "*/" in a block comment, ')delim"' in a raw string. A block
-        comment becomes a space; a literal keeps its quotes and loses its
-        contents. Braces and declarations are read from this view only: the
-        raw line still carries the @relais tags and the member's initializer.
+        code, "*/" in a block comment, ')delim"' in a raw string. Comments and
+        literal contents become spaces, a literal keeps its quotes, and a
+        trailing line comment is dropped: every column of the code is the
+        line's. Braces and declarations are read from this view only: the raw
+        line still carries the @relais tags.
         """
         out = []
         i, n = 0, len(line)
@@ -178,14 +218,16 @@ class StructParser:
                 end = line.find(state, i)
                 if end < 0:
                     break
-                i = end + len(state)
+                stop = end + len(state)  # blanked; a raw string keeps its closing quote
+                out.append(" " * (stop - i - 1) + (" " if state == "*/" else '"'))
+                i = stop
                 state = ""
                 continue
             ch = line[i]
             if line.startswith("//", i):
                 break
             if line.startswith("/*", i):
-                out.append(" ")
+                out.append("  ")
                 state = "*/"
                 i += 2
             elif ch in "\"'":
@@ -194,13 +236,15 @@ class StructParser:
                     out.append(ch)
                     i += 1
                     continue
-                out.append(ch + ch)
                 open_paren = line.find("(", i + 1)
                 if ch == '"' and prefix in StructParser.RAW_PREFIXES and open_paren >= 0:
+                    out.append(ch + " " * (open_paren - i))
                     state = ")" + line[i + 1:open_paren] + '"'
                     i = open_paren + 1
                 else:
-                    i = StructParser._literal_end(line, i)
+                    end = StructParser._literal_end(line, i)
+                    out.append(ch + " " * (end - i - 2) + ch)
+                    i = end
             else:
                 out.append(ch)
                 i += 1
@@ -237,12 +281,20 @@ class StructParser:
             codes.append(code)
         return codes
 
+    def __init__(self):
+        self.errors: list[Diagnostic] = []
+        self._path: Optional[Path] = None
+
+    def _error(self, line: int, col: int, message: str):
+        self.errors.append(Diagnostic(self._path, line, col, message))
+
     def parse_file(self, filepath: Path) -> list[ParsedEntity]:
         """Parse a header file and return all annotated entities."""
+        self._path = filepath
         try:
             content = filepath.read_text()
         except OSError as e:
-            print(f"Error: cannot read {filepath}: {e}", file=sys.stderr)
+            self.errors.append(Diagnostic(filepath, 0, 0, f"cannot read: {e.strerror}"))
             return []
 
         entities = []
@@ -252,14 +304,17 @@ class StructParser:
         codes = self._code_lines(lines)
         i = 0
         while i < len(lines):
-            # Look for @relais annotation block
+            # Look for @relais annotation block: (is_list, line, [(column, tag)])
             annotations = []
-            annotation_start_line = i + 1  # 1-based for error messages
-            while i < len(lines) and self.ANNOTATION_RE.match(lines[i].strip()):
-                m = self.ANNOTATION_RE.match(lines[i].strip())
+            while i < len(lines):
+                m = self.ANNOTATION_RE.match(lines[i])
+                if not m:
+                    break
                 annotations.append((
-                    '@relais_list' in lines[i],
-                    m.group(1).strip()
+                    m.group(1) is not None,
+                    i + 1,
+                    [(m.start(2) + t.start() + 1, t.group())
+                     for t in self.TOKEN_RE.finditer(m.group(2))],
                 ))
                 i += 1
 
@@ -282,6 +337,7 @@ class StructParser:
                 continue
 
             class_name = class_match.group(1)
+            errors_before = len(self.errors)
 
             try:
                 # Parse annotation key=value pairs
@@ -302,39 +358,36 @@ class StructParser:
                 # Apply inline member annotations to the EntityAnnotation
                 self._apply_member_annotations(annot, members)
 
-                entities.append(ParsedEntity(
-                    class_name=class_name,
-                    namespace=ns,
-                    annotation=annot,
-                    members=members,
-                    source_file=filepath,
-                ))
-            except Exception as e:
-                print(f"Error: {filepath}:{annotation_start_line}: "
-                      f"failed to parse entity '{class_name}': {e}",
-                      file=sys.stderr)
-                sys.exit(1)
+                if len(self.errors) == errors_before:
+                    entities.append(ParsedEntity(
+                        class_name=class_name,
+                        namespace=ns,
+                        annotation=annot,
+                        members=members,
+                        source_file=filepath,
+                        pos=(i + 1, class_match.start(1) + 1),
+                    ))
+            except GenerationError as e:
+                self._error(e.line, e.col, str(e))
 
             i += 1
 
         return entities
 
-    def _parse_annotations(self, annotations: list[tuple[bool, str]]) -> EntityAnnotation:
+    def _parse_annotations(self, annotations: list[tuple[bool, int, list[tuple[int, str]]]]
+                           ) -> EntityAnnotation:
         """Parse annotation key=value pairs."""
         annot = EntityAnnotation()
 
-        for is_list, text in annotations:
-            # Split by whitespace, preserving key=value pairs
-            tokens = self._tokenize_annotation(text)
-
+        for is_list, line, tokens in annotations:
             if is_list:
-                for token in tokens:
+                for col, token in tokens:
                     if token.startswith("limits="):
-                        annot.limits = self._parse_limits(token[7:])
+                        annot.limits = self._parse_limits(token[7:], line, col + 7)
                     elif token.startswith("entity="):
                         annot.entity_fqn = token[7:]
             else:
-                for token in tokens:
+                for col, token in tokens:
                     if token.startswith("table="):
                         annot.table = token[6:]
                     elif token.startswith("model="):
@@ -344,50 +397,31 @@ class StructParser:
 
         return annot
 
-    def _parse_limits(self, spec: str) -> list[int]:
-        """Parse, validate, sort and dedup a `limits=` annotation value.
+    def _parse_limits(self, spec: str, line: int, col: int) -> list[int]:
+        """Parse, validate, sort and dedup a `limits=` annotation value, which
+        starts at `col` of `line`.
 
         Each value must be an integer in [1, 65535] (uint16_t domain).
         Returns the ascending, deduplicated list — a precondition of the
         round-up semantics in normalizeLimit.
         """
-        raw = [tok for tok in spec.split(",") if tok.strip() != ""]
+        raw = list(re.finditer(r'[^,]+', spec))
         if not raw:
-            print(f"error: empty limits= annotation", file=sys.stderr)
-            sys.exit(1)
+            self._error(line, col, "empty limits= annotation")
         values: set[int] = set()
         for tok in raw:
-            tok = tok.strip()
             try:
-                v = int(tok)
+                v = int(tok.group())
             except ValueError:
-                print(f"error: invalid limits= value '{tok}' (not an integer)",
-                      file=sys.stderr)
-                sys.exit(1)
+                self._error(line, col + tok.start(),
+                            f"invalid limits= value '{tok.group()}' (not an integer)")
+                continue
             if v < 1 or v > 65535:
-                print(f"error: limits= value {v} out of range [1, 65535]",
-                      file=sys.stderr)
-                sys.exit(1)
+                self._error(line, col + tok.start(),
+                            f"limits= value {v} out of range [1, 65535]")
+                continue
             values.add(v)
         return sorted(values)
-
-    def _tokenize_annotation(self, text: str) -> list[str]:
-        """Split annotation text by spaces, but keep enum=... together."""
-        tokens = []
-        current = ""
-        for ch in text:
-            if ch == ' ' and current and '=' not in current:
-                if current:
-                    tokens.append(current)
-                current = ""
-            elif ch == ' ' and current:
-                tokens.append(current)
-                current = ""
-            else:
-                current += ch
-        if current:
-            tokens.append(current)
-        return tokens
 
     def _parse_enum_mapping(self, text: str) -> EnumMapping:
         """Parse enum=field:val1:Enum1,val2:Enum2"""
@@ -418,22 +452,11 @@ class StructParser:
             if 'json_field' in m.tags:
                 annot.json_fields.append(m.name)
             if m.enum_pairs:
-                annot.enums.append(EnumMapping(m.name, m.enum_pairs, m.inner_type))
+                annot.enums.append(EnumMapping(m.name, m.enum_pairs, m.inner_type, m.enum_pos))
             elif 'auto_enum' in m.tags:
-                annot.enums.append(EnumMapping(m.name, [], m.inner_type))
-            for fc in m.filter_configs:
-                if fc.op == "is_null" and not m.is_optional:
-                    raise ValueError(
-                        f"field '{m.name}': filterable:...:is_null requires a "
-                        f"std::optional member")
-                if any(f.param == fc.param for f in annot.filters):
-                    raise ValueError(
-                        f"field '{m.name}': filter parameter '{fc.param}' is "
-                        f"declared twice; name one of them "
-                        f"(filterable:<param>:<op>)")
-                annot.filters.append(fc)
-            for sc in m.sort_configs:
-                annot.sorts.append(sc)
+                annot.enums.append(EnumMapping(m.name, [], m.inner_type, m.enum_pos))
+            annot.filters.extend(m.filter_configs)
+            annot.sorts.extend(m.sort_configs)
 
     @staticmethod
     def _parse_filterable_tag(field_name: str, tag: str) -> FilterConfig:
@@ -518,9 +541,13 @@ class StructParser:
         """
         members = []
         decl = self.CLASS_RE.search(codes[class_line_idx])
+        name_pos = (class_line_idx + 1, decl.start(1) + 1)
+        not_defined = (f"'{decl.group(1)}' is declared but not defined here; "
+                       f"@relais annotates the struct definition")
         in_public = decl.group(0).startswith("struct")
         depth = 0
         opened = False
+        filter_params: set[str] = set()
 
         for i in range(class_line_idx, len(lines)):
             code = codes[i]
@@ -534,7 +561,7 @@ class StructParser:
                     if depth == 0:
                         return members  # the body's closing brace
                 elif ch == ';' and not opened:
-                    raise ValueError(self.NOT_DEFINED)
+                    raise GenerationError(*name_pos, not_defined)
             if start != 1:
                 continue  # before the body, or inside a nested scope
 
@@ -547,42 +574,51 @@ class StructParser:
 
             m = self.MEMBER_RE.match(code)
             if m:
-                cpp_type = m.group(1).strip()
-                name = m.group(2)
                 init = m.group(3) or ""
-                default = init[1:].strip() if init.startswith("=") else init
-                tags = set()
-                db_column = ""
-                enum_pairs = []
-                flt_configs = []
-                srt_configs = []
+                member = DataMember(m.group(2), m.group(1).strip(),
+                                    init[1:].strip() if init.startswith("=") else init)
                 tag_match = self.MEMBER_TAGS_RE.search(lines[i])
                 if tag_match:
-                    for tag in tag_match.group(1).split():
-                        if tag.startswith('enum='):
-                            for pair in tag[5:].split(','):
-                                parts = pair.split(':')
-                                if len(parts) == 2:
-                                    enum_pairs.append((parts[0], parts[1]))
-                        elif tag == 'enum':
-                            tags.add('auto_enum')
-                        elif tag.startswith('column='):
-                            db_column = tag[7:]
-                        elif tag.startswith('filterable'):
-                            flt_configs.append(
-                                self._parse_filterable_tag(name, tag))
-                        elif tag.startswith('sortable'):
-                            srt_configs.append(
-                                self._parse_sortable_tag(name, tag))
-                        else:
-                            tags.add(tag)
-                members.append(DataMember(
-                    name, cpp_type, default, db_column, tags, enum_pairs,
-                    flt_configs, srt_configs))
+                    self._parse_member_tags(member, i + 1, tag_match, filter_params)
+                members.append(member)
 
         if opened:
-            raise ValueError("unbalanced braces: the struct body is never closed")
-        raise ValueError(self.NOT_DEFINED)
+            raise GenerationError(*name_pos, f"the body of '{decl.group(1)}' is never "
+                                             f"closed (unbalanced braces)")
+        raise GenerationError(*name_pos, not_defined)
+
+    def _parse_member_tags(self, m: DataMember, line: int, tags: re.Match,
+                           filter_params: set[str]):
+        """Apply to `m` the tags of its line's @relais comment, matched by
+        MEMBER_TAGS_RE. `filter_params` holds the filter parameters of the
+        members before it."""
+        for t in self.TOKEN_RE.finditer(tags.group(1)):
+            tag, col = t.group(), tags.start(1) + t.start() + 1
+            if tag.startswith('enum='):
+                for pair in tag[5:].split(','):
+                    parts = pair.split(':')
+                    if len(parts) == 2:
+                        m.enum_pairs.append((parts[0], parts[1]))
+                m.enum_pos = (line, col)
+            elif tag == 'enum':
+                m.tags.add('auto_enum')
+                m.enum_pos = (line, col)
+            elif tag.startswith('column='):
+                m.db_column = tag[7:]
+            elif tag.startswith('filterable'):
+                fc = self._parse_filterable_tag(m.name, tag)
+                if fc.op == "is_null" and not m.is_optional:
+                    self._error(line, col, f"is_null requires a std::optional member; "
+                                           f"'{m.name}' is {m.cpp_type}")
+                elif fc.param in filter_params:
+                    self._error(line, col, f"filter parameter '{fc.param}' is declared "
+                                           f"twice; name one of them (filterable:<param>:<op>)")
+                filter_params.add(fc.param)
+                m.filter_configs.append(fc)
+            elif tag.startswith('sortable'):
+                m.sort_configs.append(self._parse_sortable_tag(m.name, tag))
+            else:
+                m.tags.add(tag)
 
 
 # =============================================================================
@@ -1667,7 +1703,8 @@ class MappingGenerator:
                 enum.pairs = pairs
             else:
                 enum_fqn = self._qualify_type(entity, enum.cpp_type)
-                raise ValueError(
+                raise GenerationError(
+                    *enum.pos,
                     f"@relais enum on field '{enum.field_name}': "
                     f"no glz::meta<{enum_fqn}> with glz::enumerate() found in "
                     f"{entity.source_file.name}. "
@@ -1894,26 +1931,27 @@ def main():
 
     output_dir = Path(args.output_dir)
     struct_parser = StructParser()
+    errors = struct_parser.errors  # every error of the run, in source order
 
     # Collect files to process (sources can be a mix of files and directories)
-    files: list[Path] = []
+    files: dict[Path, Path] = {}  # resolved path -> path as given
     for src in args.sources:
         p = Path(src)
         if p.is_dir():
             for f in p.rglob("*.h"):
                 if "generated" in str(f) or "Wrapper" in f.name:
                     continue
-                files.append(f)
+                files.setdefault(f.resolve(), f)
         elif p.is_file():
-            files.append(p)
+            files.setdefault(p.resolve(), p)
         else:
-            print(f"Error: {src} is not a file or directory", file=sys.stderr)
-            sys.exit(1)
+            errors.append(Diagnostic(p, 0, 0, "not a file or directory"))
 
+    # Generate everything in memory: a run with an error writes nothing
     generator = MappingGenerator()
-    generated_count = 0
-
-    for filepath in files:
+    owners: dict[Path, ParsedEntity] = {}  # output path -> first entity generating it
+    outputs: dict[Path, str] = {}
+    for filepath in sorted(files.values()):
         entities = struct_parser.parse_file(filepath)
         for entity in entities:
             # Validate: warn if @relais annotation lacks table=
@@ -1924,14 +1962,33 @@ def main():
             filename = f"{entity.class_name}Entity.h"
             output_path = output_dir / filename
 
-            print(f"  -> {entity.class_name}")
-            code = generator.generate(entity, output_path)
+            first = owners.setdefault(output_path, entity)
+            if first is not entity:
+                errors.append(Diagnostic(
+                    filepath, *entity.pos,
+                    f"'{entity.fqn}' generates {filename}, as does '{first.fqn}'"))
+                errors.append(Diagnostic(
+                    first.source_file, *first.pos,
+                    f"'{first.fqn}' is declared here", "note"))
+                continue
+            try:
+                outputs[output_path] = generator.generate(entity, output_path)
+            except GenerationError as e:
+                errors.append(Diagnostic(filepath, e.line, e.col, str(e)))
 
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            output_path.write_text(code)
-            generated_count += 1
+    if errors:
+        for d in errors:
+            print(d, file=sys.stderr)
+        count = sum(d.severity == "error" for d in errors)
+        print(f"{count} error{'s' if count > 1 else ''}, no file written", file=sys.stderr)
+        sys.exit(1)
 
-    print(f"Generated {generated_count} entity mappings")
+    for output_path, code in outputs.items():
+        print(f"  -> {owners[output_path].class_name}")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(code)
+
+    print(f"Generated {len(outputs)} entity mappings")
 
 
 if __name__ == "__main__":
