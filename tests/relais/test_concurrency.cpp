@@ -1376,7 +1376,7 @@ TEST_CASE("Concurrency - entity notes vs concurrent reads, fills, seals and drai
 //  15. Concurrent upsert on a shared assigned-PK key
 //
 //  Upsert composes the update-model primitives on the shared static caches:
-//  a pre-image discriminant, then L1 onMutation+bumpGeneration+storeAndView of
+//  a pre-image discriminant, then L1 onMutation+storeThrough of
 //  the committed RETURNING row. N threads upsert the SAME key — the first resolves to INSERT, the rest to in-place UPDATE, each
 //  racing the others' store-through and generation bump on that one slot. Worker
 //  threads assert only robustness (the `parallel` error counter); correctness is
@@ -1533,10 +1533,12 @@ public:
 
     /// `block` runs in a transaction on another connection and makes A wait in
     /// the server; `unblock` ends that transaction. `committed` tells, through
-    /// the probe, that A has committed. A runs on loop 0, B on loop 1.
-    template<typename Committed>
+    /// the probe, that A has committed. A runs on loop 0, B on loop 1. `b` is
+    /// a task, or makes one once A has committed (to write a key A's commit
+    /// assigned).
+    template<typename Committed, typename B>
     void outOfOrder(const std::string& block, const std::string& unblock,
-             io::Task<void> a, Committed committed, io::Task<void> b) {
+             io::Task<void> a, Committed committed, B b) {
         locker_.query("BEGIN");
         locker_.query(block);
         auto done_a = start(0, std::move(a));
@@ -1544,7 +1546,8 @@ public:
         holdLoop(0);
         locker_.query(unblock);
         REQUIRE(eventually(committed));
-        start(1, std::move(b)).get();
+        if constexpr (std::is_invocable_v<B&>) start(1, b()).get();
+        else start(1, std::move(b)).get();
         hold_->release();
         done_a.get();
     }
@@ -1621,6 +1624,10 @@ io::Task<void> writeThroughUpdate(int64_t id, int32_t value) {
 io::Task<void> patchValue(int64_t id, int32_t value) {
     using jcailloux::relais::entity::set;
     (void)co_await L1TestItemRepo::patch(id, set<TestItemEntity::Field::value>(value));
+}
+
+io::Task<void> insertItem(std::string name, int32_t value) {
+    (void)co_await L1TestItemRepo::insert(makeTestItem(name, value));
 }
 
 io::Task<void> eraseItem(int64_t id) {
@@ -1739,6 +1746,26 @@ TEST_CASE("Concurrency - store-through handled out of commit order",
         REQUIRE(akeyPayload(probe, key) == "2");
         auto cached = TestInternals::getFromCache<L1TestAssignedKeyRepo>(key);
         CHECK((!cached || cached->payload == 2));
+    }
+
+    SECTION("insert with a database-assigned key, then patch") {
+        // A waits for a table lock; B names the key the database gave A. The
+        // parser takes the table's lock too: the insert is prepared on loop 0's
+        // connection first, so that only its execution waits.
+        w.runOn(0, insertItem("prepare", 0));
+        int64_t id = 0;
+        auto a_committed = [&] {
+            auto r = probe.query("SELECT id FROM relais_test_items WHERE name = 'ooo-db-key'");
+            if (r.empty()) return false;
+            id = std::stoll(r.get(0));
+            return true;
+        };
+        w.outOfOrder("LOCK TABLE relais_test_items IN SHARE MODE", "COMMIT",
+                     insertItem("ooo-db-key", 1), a_committed, [&] { return patchValue(id, 2); });
+
+        REQUIRE(itemValue(probe, id) == "2");
+        auto cached = TestInternals::getFromCache<L1TestItemRepo>(id);
+        CHECK((!cached || cached->value == 2));
     }
 }
 

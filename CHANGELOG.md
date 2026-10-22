@@ -130,7 +130,8 @@
 - **Two event loops writing the same row could leave L1 with the older row**,
   or with a deleted one, until `l1_ttl`, after `patch`, `upsert`, `insert` with a
   caller-assigned key or `update` with `PopulateImmediately`. L1 now keeps the
-  last committed row, or nothing.
+  last committed row, or nothing. An `insert` with a database-assigned key no
+  longer caches its row: the first read fetches it.
 - **List reads prepared a new statement per `limit`/`offset`** on every
   connection, without bound, and identical list reads in flight were never
   merged.

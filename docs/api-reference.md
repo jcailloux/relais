@@ -83,7 +83,7 @@ Available only when `!Cfg.read_only`. Each write flows down the full chain: data
 
 | Method | Returns | Constraints | Notes |
 |---|---|---|---|
-| `insert(const E& e)` | `Task<CacheView<E>>` | `MutableEntity<E> && !Cfg.read_only` | Empty view on error. Populates L1; notifies lists. |
+| `insert(const E& e)` | `Task<CacheView<E>>` | `MutableEntity<E> && !Cfg.read_only` | Empty view on error. Populates L1 when the caller assigns the key; with a database-assigned key the row is returned uncached and the first read fetches it. Notifies lists. |
 | `update(const Key&, const E&)` | `Task<std::optional<size_t>>` | `MutableEntity<E> && HasFullUpdate<E> && !Cfg.read_only` | Rows affected (`0` = not found), `nullopt` = DB error. Strategy via `Cfg.update_strategy`: `InvalidateAndLazyReload` (evict) vs optimistic write-through. With lists or cross-invalidation the statement also returns the prior and committed rows, so both versions are invalidated without a pre-read. |
 | `updateJson(const Key&, std::string_view)` | `Task<std::optional<size_t>>` | `MutableEntity<E> && HasFullUpdate<E> && !Cfg.read_only` | Parses JSON → `update`. `nullopt` on parse failure or DB error. |
 | `updateBinary(const Key&, std::span<const uint8_t>)` | `Task<std::optional<size_t>>` | `… && HasBinarySerialization<E> && !Cfg.read_only` | Parses BEVE → `update`. `nullopt` on parse failure or DB error. |
@@ -254,7 +254,7 @@ Neither `std::chrono::duration` (private members) nor a raw string literal is a 
 <details>
 <summary><code>recheck_slots_log2</code> — the read-fill recheck guard</summary>
 
-The read-fill recheck closes the race where a read misses, fetches from the DB, and is about to store a value that an interleaving write has already invalidated. A sharded generation counter is snapshotted at miss and re-compared at fill; if the generation moved, the fill is rejected (pessimistic miss, **never stale**). A write that stores its committed row (`patch`, `upsert`, `insert`, `update` with `PopulateImmediately`) is gated the same way: if the generation moved since the write was sent, the key is evicted instead of stored. Writes in flight together on one key therefore leave it evicted, and the next read fetches it. The table is sized in slots rather than per-key, so memory is bounded by accepting hash collisions (a collision only costs an extra pessimistic miss). It scales with **write concurrency** (`write_rate × round-trip`), **not** with the number of keys — raise `recheck_slots_log2` for write-heavy repositories; the default `12` (4096 slots, ~32 KB/repo) suits typical workloads.
+The read-fill recheck closes the race where a read misses, fetches from the DB, and is about to store a value that an interleaving write has already invalidated. A sharded generation counter is snapshotted at miss and re-compared at fill; if the generation moved, the fill is rejected (pessimistic miss, **never stale**). A write that stores its committed row (`patch`, `upsert`, `insert` with a caller-assigned key, `update` with `PopulateImmediately`) is gated the same way: if the generation moved since the write was sent, the key is evicted instead of stored. Writes in flight together on one key therefore leave it evicted, and the next read fetches it. The table is sized in slots rather than per-key, so memory is bounded by accepting hash collisions (a collision only costs an extra pessimistic miss). It scales with **write concurrency** (`write_rate × round-trip`), **not** with the number of keys — raise `recheck_slots_log2` for write-heavy repositories; the default `12` (4096 slots, ~32 KB/repo) suits typical workloads.
 </details>
 
 ### Fluent modifiers
@@ -785,7 +785,7 @@ The building blocks live in `EntityConcepts.h` / `SerializationTraits.h`; the up
 | `ReadableEntity<E>` | `Readable<E>` | **PgRepo** (DB-only read). |
 | `CacheableEntity<E>` | `ReadableEntity<E> && Serializable<E>` | **LocalRepo** (read + cache store). |
 | `MutableEntity<E>` | `ReadableEntity<E> && Writable<E>` | `insert()` / `update()` (read + DB write). |
-| `CreatableEntity<E, Key>` | `MutableEntity<E> && Keyed<E, Key>` | `insert()` with cache population (write + key). |
+| `CreatableEntity<E, Key>` | `MutableEntity<E> && Keyed<E, Key>` | `insert()` (write + key). |
 | `HasFullUpdate<E>` | `E::toUpdateParams(e)` well-formed | Gates every full-row `update()` path; absent for all-PK junctions where no column is updatable. |
 | `UpsertableEntity<E, Key>` | `CreatableEntity<E, Key> && HasFullUpdate<E>` | One arm of the `upsert()` gate: creatable **and** full-row-updatable. |
 | `HasUpsertSql<E>` | `E::MappingType::SQL::upsert → const char*` | The other arm: the generator emitted `ON CONFLICT` SQL — true only for an **assigned-PK** entity with ≥1 non-PK column. Together they gate `upsert()`. |
