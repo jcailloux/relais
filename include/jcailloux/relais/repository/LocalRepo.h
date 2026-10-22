@@ -105,7 +105,7 @@ public:
     }
 
     /// Batched multi-id read. Probes L1 for every (deduplicated) id under a
-    /// single batch EpochGuard, then issues one ANY (L3) over the L1 misses.
+    /// single batch EpochGuard, then issues one ANY query over the L1 misses.
     /// Returns a guarded MultiView<E>:
     /// view[i] maps to ids[i] (nullptr = absent in every tier), L1 hits are
     /// zero-copy slot pointers kept alive by the batch guard.
@@ -827,7 +827,7 @@ private:
         co_return std::vector<uint8_t>{};
     }
 
-    /// Miss path for findMany: fetch the L1 misses from L3 (one ANY),
+    /// Miss path for findMany: fetch the L1 misses from the database (one ANY),
     /// force-insert each into L1 — same as the single-find
     /// fetch path in the non-GDSF build — and point the view at the fresh slots.
     /// The batch guard is held across the await so both the pre-await L1 hits

@@ -1745,7 +1745,7 @@ TEST_CASE("Benchmark - predicate erase / invalidate (where)", "[benchmark][where
 //  15. Detached cleanup — caller throughput / time-to-return
 //
 //  eraseMany/eraseWhere split the batch cleanup into a CRITICAL pass (awaited:
-//  L3 DELETE + L1 evict + L1 list bump) and a DEFERRED pass (fired
+//  DELETE + L1 evict + L1 list bump) and a DEFERRED pass (fired
 //  fire-and-forget: cross-target invalidations). The caller returns after the
 //  critical pass; the deferred work drains in the background.
 //

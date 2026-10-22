@@ -30,7 +30,7 @@ using namespace relais_test;
 // ---------------------------------------------------------------------------
 // PgRepo::findManyRaw via WHERE pk = ANY($1)
 // findManyRaw is internal (like findRaw); reached through TestInternals on
-// Uncached* repos (no L1 — exercises the pure L3 ANY path).
+// Uncached* repos (no L1 — exercises the pure database ANY path).
 // ---------------------------------------------------------------------------
 
 namespace {
@@ -183,7 +183,7 @@ TEST_CASE("findManyRaw partition key: cross-partition ANY", "[findmany][partitio
 // ---------------------------------------------------------------------------
 // LocalRepo::findMany : public guarded MultiView<E>
 // L1-bearing repos (Local). Hot path = zero-copy under one batch guard;
-// miss path = ANY (L3) through the lower tier, force-insert L1.
+// miss path = ANY query through the lower tier, force-insert L1.
 // findMany is public (inherited up the chain) — called directly on the repo.
 // ---------------------------------------------------------------------------
 
@@ -196,7 +196,7 @@ TEMPLATE_TEST_CASE("findMany simple key: cold miss then zero-copy hot path",
     auto u2 = insertTestUser("fm4_b", "fm4b@x", 2);
     auto u3 = insertTestUser("fm4_c", "fm4c@x", 3);
 
-    SECTION("all cold → fetched from L3, request order with holes") {
+    SECTION("all cold → fetched from the database, request order with holes") {
         std::vector<int64_t> ids = {u3, -1, u1, -2, u2};
         auto v = findManySync<Repo, int64_t>(ids);
         REQUIRE(v.size() == 5);
@@ -278,7 +278,7 @@ TEMPLATE_TEST_CASE("findMany warming: miss populates L1 (same slot on re-probe)"
     auto u1 = insertTestUser("warm4", "warm4@x", 9);
 
     std::vector<int64_t> ids = {u1};
-    auto v = findManySync<Repo, int64_t>(ids);   // miss → L3 → store L1
+    auto v = findManySync<Repo, int64_t>(ids);   // miss → PG → store L1
     REQUIRE(v[0]);
 
     auto slot = TestInternals::getFromCache<Repo>(u1);

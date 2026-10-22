@@ -892,7 +892,7 @@ TEST_CASE("Concurrency - findMany overlapping reads",
 //
 //  Readers batch-read a pool while writers update entities in it.  Mid-flight
 //  reads may transiently miss (the shared-transaction pg connection serialises
-//  interleaved L3 queries — the existing read+write test documents the same
+//  interleaved database queries — the existing read+write test documents the same
 //  transient nullptr), so the invariant is robustness, not per-op values: the
 //  pinned pointers stay dereferenceable (UAF bait for TSan/ASan) and a settled
 //  batch read after the storm is complete.
@@ -1026,10 +1026,10 @@ TEST_CASE("Concurrency - findMany guard survives invalidation",
 // -----------------------------------------------------------------------------
 //  invalidateMany (batch bumpGeneration) vs concurrent L1 fills
 //
-//  A reader re-fills L1 from L3 for the whole pool while a second thread runs
+//  A reader re-fills L1 from the database for the whole pool while a second thread runs
 //  invalidateMany over the same pool: each batched bump races an in-flight fill
 //  of the (now stale) entry. The bump must win — a stale fill must never resurrect
-//  past the invalidation. invalidate evicts caches only (rows stay in L3), so the
+//  past the invalidation. invalidate evicts caches only (rows stay in the database), so the
 //  settled read fills every slot; a survivor would mean a fill outran its bump.
 // -----------------------------------------------------------------------------
 
@@ -1038,7 +1038,7 @@ static void runInvalidateManyVsFills(const std::vector<int64_t>& pool) {
     parallel(NUM_THREADS, [&](int t) {
         for (int j = 0; j < OPS_PER_THREAD; ++j) {
             if (t % 2 == 0) {
-                // Reader — re-fill L1 from L3 for every pooled id, racing the bump.
+                // Reader — re-fill L1 from the database for every pooled id, racing the bump.
                 for (auto id : pool) sync(Repo::find(id));
             } else {
                 // Batch invalidator — one bumpGeneration per key, in one cascade.
@@ -1047,7 +1047,7 @@ static void runInvalidateManyVsFills(const std::vector<int64_t>& pool) {
         }
     });
 
-    // Quiescent: invalidate never deletes → every row resolves from L3.
+    // Quiescent: invalidate never deletes → every row resolves from the database.
     auto view = findManyView<Repo>(pool);
     int missing = 0;
     for (size_t i = 0; i < view.size(); ++i) if (!view[i]) ++missing;
@@ -1080,7 +1080,7 @@ TEST_CASE("Concurrency - invalidateMany vs concurrent fills",
 //  mono-erase the last 60% — the middle 20% is double-deleted from both paths
 //  concurrently. A double DELETE … RETURNING yields zero rows the second time;
 //  the eviction must stay idempotent (no crash, no ghost hit). After quiescence
-//  every targeted id is gone from L1 and L3 (no L1 phantom over a deleted row).
+//  every targeted id is gone from L1 and PostgreSQL (no L1 phantom over a deleted row).
 // -----------------------------------------------------------------------------
 
 template<typename Repo>
@@ -1125,7 +1125,7 @@ TEST_CASE("Concurrency - eraseMany vs mono erase overlapping keys",
 //  Erase vs concurrent find: no deleted row resurrected in L1
 //
 //  Reader threads hammer find() on the very keys an eraser thread is deleting.
-//  A find() whose L3 fetch straddles the delete would write the entity back
+//  A find() whose database fetch straddles the delete would write the entity back
 //  into L1 AFTER the eraser evicted it, and nothing re-evicts it: the deleted
 //  row would survive quiescence. The read-fill recheck closes this window — the
 //  reader snapshots the recheck slot at fetch-start and skips the store when a
@@ -1391,7 +1391,7 @@ TEST_CASE("Concurrency - entity notes vs concurrent reads, fills, seals and drai
 //
 // #############################################################################
 
-// Ground-truth read straight from L3 (no cache), same table as the cached repos.
+// Ground-truth read straight from the database (no cache), same table as the cached repos.
 static std::optional<int64_t> dbAkeyPayload(int64_t key) {
     auto v = sync(UncachedTestAssignedKeyRepo::find(key));
     return v ? std::optional<int64_t>(v->payload) : std::nullopt;
@@ -1409,7 +1409,7 @@ static void runConcurrentUpsertSameKey(int64_t key) {
     REQUIRE(sync(Repo::find(key)) != nullptr);
 
     // Deterministic settle: a single-threaded upsert supersedes the storm's
-    // residue in both the cached tier and L3 — they must agree.
+    // residue in both the cached tier and the database — they must agree.
     constexpr int64_t SENTINEL = 987654;
     sync(Repo::upsert(makeTestAssignedKey(key, SENTINEL)));
 

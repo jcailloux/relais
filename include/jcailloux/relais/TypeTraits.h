@@ -16,6 +16,10 @@ template<typename T> struct is_optional : std::false_type {};
 template<typename U> struct is_optional<std::optional<U>> : std::true_type {};
 template<typename T> inline constexpr bool is_optional_v = is_optional<T>::value;
 
+template<typename T> struct unwrap_optional { using type = T; };
+template<typename U> struct unwrap_optional<std::optional<U>> { using type = U; };
+template<typename T> using unwrap_optional_t = typename unwrap_optional<T>::type;
+
 template<typename T> struct is_std_vector : std::false_type {};
 template<typename U, typename A> struct is_std_vector<std::vector<U, A>> : std::true_type {};
 template<typename T> inline constexpr bool is_std_vector_v = is_std_vector<T>::value;

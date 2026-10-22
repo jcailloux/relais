@@ -347,12 +347,12 @@ TEST_CASE("coherence: a read against a killed backend throws PgError, not empty"
     // Clean server-side disconnect of exactly the relais backend.
     env.probe.terminateBackends(std::string("application_name = '") + kAppName + "'");
 
-    // No false 404: the read surfaces the L3 error rather than reporting absent.
+    // No false 404: the read surfaces the database error rather than reporting absent.
     REQUIRE_THROWS_AS(driveBounded(env.io, CohItemL1::find(id)), io::PgError);
 }
 
 // =============================================================================
-// countWhere — a read: L3 errors surface, identical counts in flight coalesce.
+// countWhere — a read: database errors surface, identical counts in flight coalesce.
 // =============================================================================
 
 static void seedCounts(CohEnv& env) {

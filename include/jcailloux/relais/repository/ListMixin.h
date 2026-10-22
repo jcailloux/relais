@@ -671,7 +671,7 @@ protected:
     }
 
     /// Best-effort pre-read of the current entity, used by the top mixin to feed
-    /// precise list/cross invalidation. The read path no longer swallows L3
+    /// precise list/cross invalidation. The read path no longer swallows DB
     /// errors, so this pre-read can throw; a failure is treated as "old unknown"
     /// and the caller proceeds with the write + precautionary invalidation rather
     /// than aborting on a preliminary read failure (preserves write liveness —
@@ -879,7 +879,7 @@ protected:
                 if constexpr (ST::column() == column) {
                     rows.moved_sorts |= uint64_t{1} << Ss;
                     if constexpr (entity::detail::assigns_value_v<U>) {
-                        using W = list::spec::detail::unwrap_optional_t<typename ST::value_type>;
+                        using W = relais::detail::unwrap_optional_t<typename ST::value_type>;
                         if (auto v = setAs<W>(update.value)) {
                             const int64_t x = list::spec::detail::toInt64ForCursor(*v);
                             rows.sorts[Ss] = {x, x};

@@ -275,7 +275,7 @@ bool userExists(int64_t id) {
 
 // Oracle — eraseMany(setA) must reach the SAME observable state as a mono
 // erase loop over a symmetric setB: identical affected count, every id gone
-// from find() AND from L3. The mono path is the trusted reference.
+// from find() AND from the database. The mono path is the trusted reference.
 template<typename Repo>
 void eraseManyMatchesMonoLoop() {
     int64_t a1 = insertTestUser("om_a1", "om_a1@x", 1);
@@ -300,13 +300,13 @@ void eraseManyMatchesMonoLoop() {
     REQUIRE(*n == m);  // batch count == mono-loop count
     for (int64_t id : {a1, a2, a3, b1, b2, b3}) {
         REQUIRE_FALSE(sync(Repo::find(id)));  // gone from every tier
-        REQUIRE_FALSE(userExists(id));        // gone from L3
+        REQUIRE_FALSE(userExists(id));        // gone from the database
     }
 }
 
 // Oracle — invalidateMany(setA) ≡ a mono invalidate loop over setB: both evict
 // the cached copy (a stale DB mutation becomes visible on the next read) while
-// leaving the L3 rows intact. Distinct per-id balances detect a stale survivor.
+// leaving the rows intact. Distinct per-id balances detect a stale survivor.
 template<typename Repo>
 void invalidateManyMatchesMonoLoop() {
     int64_t a1 = insertTestUser("im_a1", "im_a1@x", 10);
@@ -325,7 +325,7 @@ void invalidateManyMatchesMonoLoop() {
     sync(Repo::invalidateMany(std::span<const int64_t>(A)));
     for (int64_t id : {b1, b2}) sync(Repo::invalidate(id));
 
-    // Both paths now refetch fresh from L3, and the rows are still present.
+    // Both paths now refetch fresh from the database, and the rows are still present.
     auto fresh = [](int64_t id) {
         auto v = sync(Repo::find(id));
         REQUIRE(v);
@@ -344,14 +344,14 @@ void invalidateManyMatchesMonoLoop() {
 // The erase/invalidate distinction (the public contract split)
 // ---------------------------------------------------------------------------
 
-TEST_CASE("eraseMany removes from L3; invalidateMany evicts cache but keeps L3",
+TEST_CASE("eraseMany removes from the database; invalidateMany evicts cache but keeps the rows",
           "[public][many][integration][db]") {
     TransactionGuard tx;
     int64_t u1 = insertTestUser("d_u1", "d_u1@x", 10);
     int64_t u2 = insertTestUser("d_u2", "d_u2@x", 20);
     std::vector<int64_t> ids = {u1, u2};
 
-    SECTION("invalidateMany: evicted then repopulated from L3, rows intact") {
+    SECTION("invalidateMany: evicted then repopulated from the database, rows intact") {
         sync(L1TestUserRepo::find(u1));  // warm L1
         sync(L1TestUserRepo::find(u2));
         updateTestUserBalance(u1, 111);         // mutate under the cache
@@ -366,11 +366,11 @@ TEST_CASE("eraseMany removes from L3; invalidateMany evicts cache but keeps L3",
         REQUIRE(a->balance == 111);
         REQUIRE(b);
         REQUIRE(b->balance == 222);
-        REQUIRE(userExists(u1));  // still in L3
+        REQUIRE(userExists(u1));  // still in the database
         REQUIRE(userExists(u2));
     }
 
-    SECTION("eraseMany: gone from every tier and from L3") {
+    SECTION("eraseMany: gone from every tier and from the database") {
         sync(L1TestUserRepo::find(u1));
         sync(L1TestUserRepo::find(u2));
 
@@ -530,13 +530,13 @@ static_assert(jcailloux::relais::HasListDescriptor<TestArticleEntity>,
 
 namespace {
 
-// L1 Article repo (L1+L3 + own lists) for the where oracle.
+// L1 Article repo (L1 + own lists) for the where oracle.
 using WhereArticleRepo = jcailloux::relais::Repo<
     TestArticleEntity, "test:article:where:l1", cfg::Local>;
 
 using ArticlePred = jcailloux::relais::FilterSet<TestArticleEntity>;
 
-// The predicate's reference id set, resolved straight from L3.
+// The predicate's reference id set, resolved straight from the database.
 std::vector<int64_t> articleIdsByAuthor(int64_t author) {
     auto r = execQueryArgs(
         "SELECT id FROM relais_test_articles WHERE author_id = $1 ORDER BY id",
@@ -559,9 +559,9 @@ int64_t articleCountByAuthor(int64_t author) {
 
 }  // namespace
 
-// Selectivity: the predicate deletes exactly its matched rows from L3,
+// Selectivity: the predicate deletes exactly its matched rows from the database,
 // returns their count, leaves the rest. Designated-init names the param.
-TEST_CASE("eraseWhere deletes exactly the predicate's rows from L3",
+TEST_CASE("eraseWhere deletes exactly the predicate's rows from the database",
           "[public][where][integration][db]") {
     TransactionGuard tx;
     auto author = insertTestUser("ew_a", "ew_a@x", 0);
@@ -603,10 +603,10 @@ TEST_CASE("eraseWhere ≡ eraseMany over the resolved id set",
     REQUIRE(articleCount() == 0);  // both authors' rows gone
 }
 
-// invalidateWhere evicts the cache for the matched rows but leaves L3
+// invalidateWhere evicts the cache for the matched rows but leaves the database
 // intact (the rows still exist → a later find refetches fresh). Proven by the
-// staleness trick: warm, mutate L3 directly, invalidate, observe the fresh value.
-TEST_CASE("invalidateWhere evicts cache by predicate, keeps L3",
+// staleness trick: warm, mutate the table directly, invalidate, observe the fresh value.
+TEST_CASE("invalidateWhere evicts cache by predicate, keeps the rows",
           "[public][where][integration][db]") {
     TransactionGuard tx;
     auto author = insertTestUser("iw_a", "iw_a@x", 0);
@@ -616,7 +616,7 @@ TEST_CASE("invalidateWhere evicts cache by predicate, keeps L3",
     sync(WhereArticleRepo::find(id1));  // warm L1
     sync(WhereArticleRepo::find(id2));
 
-    updateTestArticle(id1, "T1", 111);  // mutate L3 behind the cache
+    updateTestArticle(id1, "T1", 111);  // mutate the row behind the cache
     updateTestArticle(id2, "T2", 222);
 
     sync(WhereArticleRepo::invalidateWhere({.author_id = author}));
@@ -627,11 +627,11 @@ TEST_CASE("invalidateWhere evicts cache by predicate, keeps L3",
     REQUIRE(v2);
     REQUIRE((*v1).view_count == 111);  // refetched fresh, not the stale 10
     REQUIRE((*v2).view_count == 222);
-    REQUIRE(articleCountByAuthor(author) == 2);  // still in L3
+    REQUIRE(articleCountByAuthor(author) == 2);  // still in the database
 }
 
 // Oracle: invalidateWhere(P) ≡ invalidateMany(SELECT pk WHERE P). Both
-// leave L3 intact and evict the matched set; symmetric authors must agree.
+// leave the rows intact and evict the matched set; symmetric authors must agree.
 TEST_CASE("invalidateWhere ≡ invalidateMany over the resolved id set",
           "[public][where][oracle][integration][db]") {
     TransactionGuard tx;

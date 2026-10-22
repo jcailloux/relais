@@ -78,8 +78,8 @@ void appendFilterSet(Out& out, const Filters<Descriptor>& filters) {
             const auto& filter_value = std::get<Is>(filters.values);
             if constexpr (FilterType::is_set_op) {
                 // Set op (IN/NIN): [presence][count:u32][elem×count]. Encoding is
-                // byte-identical for both — only the match verdict differs (L1/L3),
-                // never the key.
+                // byte-identical for both — only the match verdict differs, never
+                // the key.
                 out.push_back(filter_value.has_value() ? 1 : 0);
                 if (filter_value) {
                     // Pin the element type: iterating std::vector<bool> yields a
