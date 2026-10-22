@@ -1,6 +1,7 @@
 #ifndef JCX_RELAIS_LIST_MIXIN_H
 #define JCX_RELAIS_LIST_MIXIN_H
 
+#include <cassert>
 #include <mutex>
 #include <utility>
 
@@ -301,7 +302,8 @@ public:
 
     /// Descriptor-tagged keyset cursor — decode a server-minted token with
     /// Cursor::decode(token), pass it to queryBuilder().after(). A cursor from
-    /// another repo's descriptor is rejected at compile time.
+    /// another repo's descriptor is rejected at compile time; a token of the
+    /// wrong width, at decode (nullopt).
     using Cursor = list::spec::TypedCursor<Descriptor>;
 
     /// Open a fluent builder: the primary, name-checked construction path for a
@@ -1058,10 +1060,12 @@ protected:
         };
 
         // Cursor keyset condition (page 2+ with cursor). The tiebreaker is
-        // the full primary key — a PostgreSQL row-value comparison.
+        // the full primary key — a PostgreSQL row-value comparison. The width
+        // is checked by Cursor::decode, the only source of a non-empty cursor.
         const auto& cursor_data = query.cursor().raw().data;
-        if (!cursor_data.empty()
-            && cursor_data.size() >= sizeof(int64_t) * (1 + kKeyN)) {
+        assert(cursor_data.empty()
+            || cursor_data.size() == sizeof(int64_t) * (1 + kKeyN));
+        if (!cursor_data.empty()) {
             int64_t cursor_sort_value = 0;
             std::memcpy(&cursor_sort_value, cursor_data.data(),
                         sizeof(cursor_sort_value));

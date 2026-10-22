@@ -201,6 +201,10 @@ cursor) and a non-zero `offset` (`ConflictingPagination`); the tolerant parser
 gives the cursor precedence and silently ignores `offset`. The active cursor
 param is `after` — `cursor` is reserved but ignored.
 
+An `after` token that [`Cursor::decode`](#keyset-cursor) rejects is an
+`InvalidCursor` error for the strict parser, reported before a pagination
+conflict; the tolerant parser serves the first page.
+
 A hand-written descriptor with no `allowedLimits` member falls back to the grid
 `{10,25,50,100}`, and to a default page size of `20` (the
 `ListQueryParams::limit{20}` default; `ListQuery` itself is not
@@ -298,8 +302,8 @@ auto q2 = ld::seal<Desc>(std::move(p2));
 ### Keyset cursor
 
 The keyset cursor is descriptor-tagged: `Repo::Cursor` is
-`list::spec::TypedCursor<Descriptor>`. The wire token is unchanged — a page's
-`view->cursor()` is still a `std::string_view` over the base64 token — set
+`list::spec::TypedCursor<Descriptor>`. A page's `view->cursor()` is a
+`std::string_view` over the base64 token, set
 **only when the page is full** (`items.size() >= limit`); a short final page leaves it empty, which is
 how you detect end-of-pagination. You decode the token you previously emitted and
 pass the result to `.after()`:
@@ -314,6 +318,13 @@ auto next = AuditLogRepo::queryBuilder()
     .after(*cursor)
     .build();
 ```
+
+`decode()` returns `nullopt` for a token outside the base64 alphabet, or one
+that does not decode to exactly the cursor's width: the sort value and every
+primary-key component, `int64_t` each (16 bytes for a single-column key, 8 more
+per extra column). A truncated or extended token is an error, never page 1. The
+token is standard base64, so `+`, `/` and `=` are percent-encoded when it goes
+into a URL.
 
 `decode()` is the **only** way to obtain a cursor from a token (the raw
 constructor is private). The tag makes one kind of mistake a compile error:

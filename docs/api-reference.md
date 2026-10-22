@@ -590,12 +590,12 @@ ListQuery<Descriptor> seal(ListQueryParams<Descriptor> params);   // CanonicalEn
 | Member | Returns | Semantics |
 |---|---|---|
 | `TypedCursor()` | — | Empty cursor = first page. |
-| `static decode(string_view token)` | `optional<TypedCursor>` | Decode a server-minted base64 token. `nullopt` on a malformed token (trust boundary); empty token → empty (first-page) cursor. The **sole** runtime entry point — the type tag is conferred here. |
-| `encode()` | `std::string` | Base64 wire token (passes straight through to `list::Cursor`). |
+| `static decode(string_view token)` | `optional<TypedCursor>` | Decode a server-minted base64 token. `nullopt` on a malformed token (trust boundary): a character outside the base64 alphabet, or a decoded width other than `8 × (1 + N)` bytes. Empty token → empty (first-page) cursor. The **sole** runtime entry point — the type tag is conferred here. |
+| `encode()` | `std::string` | Standard base64 wire token, `=`-padded (passes straight through to `list::Cursor`). |
 | `empty()` / `size()` | `bool` / `size_t` | Emptiness / byte length. |
 | `raw()` | `const list::Cursor&` | The opaque byte cursor, for the keyset SQL / cache-key machinery. |
 
-The wire token is plain base64 over the cursor bytes: `int64(sort_value)` followed by the `N` int64 primary-key components (one for a scalar key, N for a composite key) — the full keyset tiebreaker for the `ORDER BY` row-value comparison.
+The wire token is standard base64 over exactly `8 × (1 + N)` bytes: `int64(sort_value)` followed by the `N` int64 primary-key components (one for a scalar key, N for a composite key) — the full keyset tiebreaker for the `ORDER BY` row-value comparison. The width is normative: `decode` rejects any other.
 
 > **Primary keys must be integral.** Keyset pagination seeks from a fixed-width, totally-ordered tiebreaker, so every key component is encoded as `int64_t` here — inherent to cursor pagination, not a relais-specific limit. A non-integral primary key is therefore a **compile error** (`"list keyset pagination requires an integer primary key"`): an entity with a string PK (`uuid`, `slug`) cannot carry a `@relais_list` — use a `bigserial` surrogate key. This mirrors the integral-or-enum constraint on sort fields (see [Sort directions](#sort-directions)).
 
@@ -630,13 +630,13 @@ std::expected<ListQuery<Descriptor>, QueryValidationError>
 | missing `limit` | `defaultLimit<D>()` | `defaultLimit<D>()` |
 | cursor + offset | offset ignored if cursor present | rejected → `ConflictingPagination` |
 | Unparsable filter value | filter inactive (set: element dropped) | rejected → `InvalidValue` |
-| Malformed cursor | dropped (first page) | dropped (no validation, decode-only) |
+| Malformed cursor (alphabet or width) | dropped (first page) | rejected → `InvalidCursor` |
 
-`QueryValidationError` (`GeneratedTraits.h`): `{ Type type; std::string field; uint16_t limit; }` with `Type ∈ { InvalidFilter, InvalidSort, InvalidLimit, ConflictingPagination, InvalidValue }` and a `message()` formatter.
+`QueryValidationError` (`GeneratedTraits.h`): `{ Type type; std::string field; uint16_t limit; }` with `Type ∈ { InvalidFilter, InvalidSort, InvalidLimit, ConflictingPagination, InvalidValue, InvalidCursor }` and a `message()` formatter.
 
 Descriptor-side limit helpers (`GeneratedTraits.h`): `normalizeLimit<D>(requested)` (round up to grid), `defaultLimit<D>()` (declared default or `20`), `isLimitAllowed<D>(limit)` (exact grid membership), `kDefaultLimits = {10, 25, 50, 100}` fallback.
 
-> **Strict cursor is decode-only.** Even `parseListQueryStrict` does not *validate* the cursor contents (it only rejects a cursor+offset conflict); a structurally valid token that targets the wrong sort is a runtime concern, consistent with `TypedCursor`'s design.
+> **The strict parser checks the cursor's format, not its provenance.** It rejects a token `decode` rejects (`InvalidCursor`, reported before `ConflictingPagination`); a well-formed token that targets the wrong sort is a runtime concern, consistent with `TypedCursor`'s design.
 
 ### FilterSet — predicate aggregate for the where-variants
 

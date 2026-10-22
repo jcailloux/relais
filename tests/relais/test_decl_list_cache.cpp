@@ -165,9 +165,9 @@ TEST_CASE("[decl-builder] cursor changes the page key, not the group", "[decl][b
         .build();
 
     // Two distinct server-minted tokens, decoded through the descriptor-tagged
-    // boundary ("AQ" = 0x01, "Ag" = 0x02).
-    auto c1 = TestArticleListRepo::Cursor::decode("AQ").value();
-    auto c2 = TestArticleListRepo::Cursor::decode("Ag").value();
+    // boundary: sort value 1 then 2, id 1, int64 little-endian each.
+    auto c1 = TestArticleListRepo::Cursor::decode("AQAAAAAAAAABAAAAAAAAAA==").value();
+    auto c2 = TestArticleListRepo::Cursor::decode("AgAAAAAAAAABAAAAAAAAAA==").value();
 
     auto page1 = TestArticleListRepo::queryBuilder()
         .filter<"category">(std::string("tech"))

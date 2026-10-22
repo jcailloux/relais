@@ -57,6 +57,11 @@ struct Row {
     static std::optional<Row> fromRow(const jcailloux::relais::io::PgResult::Row&) {
         return std::nullopt;
     }
+
+    // The key sets the cursor width: sort value + id, 16 bytes.
+    struct MappingType {
+        static int64_t key(const Row& r) { return r.id; }
+    };
 };
 
 // Every scalar width and signedness, raw enums, an optional member, a string.
@@ -227,11 +232,11 @@ TEST_CASE("[ListKeyGolden] pagination: cursor, offset, cursor over offset",
     base.limit = 10;
 
     auto cursor = base;
-    cursor.cursor = cursorOf<ScalarDesc>("AAECAwQFBgcICQoL");
+    cursor.cursor = cursorOf<ScalarDesc>("AAECAwQFBgcICQoLDA0ODw==");
     checkParams(cursor,
         "00000000010700000000000000000000000000000001010000000000000000",
         "000000000107000000000000000000000000000000010100000000000000000a"
-        "000c000000000102030405060708090a0b");
+        "0010000000000102030405060708090a0b0c0d0e0f");
 
     auto offset = base;
     offset.offset = 40;
@@ -245,7 +250,7 @@ TEST_CASE("[ListKeyGolden] pagination: cursor, offset, cursor over offset",
     checkParams(both,
         "00000000010700000000000000000000000000000001010000000000000000",
         "000000000107000000000000000000000000000000010100000000000000000a"
-        "000c000000000102030405060708090a0b");
+        "0010000000000102030405060708090a0b0c0d0e0f");
 }
 
 TEST_CASE("[ListKeyGolden] set filters: unsorted, duplicates, bool", "[list][golden][unit]") {
