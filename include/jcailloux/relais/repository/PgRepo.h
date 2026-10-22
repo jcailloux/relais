@@ -1432,16 +1432,17 @@ protected:
     /// Update returning full outcome (affected + coalesced flag), and both
     /// row versions when WithBefore: the UPDATE then locks the row in a CTE and
     /// RETURNs it before and after, so the list and cross-invalidation cascades
-    /// get the exact pre-image without reading the row first.
+    /// get the exact pre-image without reading the row first. WithAfter alone
+    /// RETURNs the committed row only, for a write-through cache.
     /// `uncertain_before`: see eraseOutcome.
-    template<bool WithBefore = false>
+    template<bool WithBefore = false, bool WithAfter = WithBefore>
     static io::Task<UpdateOutcome> updateOutcome(
         const Key& id, const E& entity,
         [[maybe_unused]] std::optional<E>* uncertain_before = nullptr)
         requires MutableEntity<E> && HasFullUpdate<E> && (!Cfg.read_only)
     {
-        constexpr const char* kSql = WithBefore
-            ? Mapping::SQL::update_returning_changes : Mapping::SQL::update;
+        constexpr const char* kSql = WithBefore ? Mapping::SQL::update_returning_changes
+            : WithAfter ? Mapping::SQL::update_returning : Mapping::SQL::update;
         try {
             auto keyParams = io::PgParams::fromKey(id);
             io::PgParams fieldParams = E::toUpdateParams(entity);
@@ -1464,6 +1465,8 @@ protected:
                         outcome.after = std::move(change->after);
                     }
                 }
+            } else if constexpr (WithAfter) {
+                if (!result.empty()) outcome.after = E::fromRow(result[0]);
             }
             co_return outcome;
 

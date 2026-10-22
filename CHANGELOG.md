@@ -42,9 +42,9 @@
   `fromRows` set it to the page size. Use `size()` for the page and
   `countWhere` for a total.
 - **Generated entity headers must be regenerated**: the repositories use new
-  SQL constants (`update_returning_changes`, `delete_by_pk_returning`,
-  `delete_with_partition_returning`). The generator now also rejects a filter
-  parameter declared twice in one entity.
+  SQL constants (`update_returning`, `update_returning_changes`,
+  `delete_by_pk_returning`, `delete_with_partition_returning`). The generator
+  now also rejects a filter parameter declared twice in one entity.
 - **Writes in one batch keep their submission order only on the same row.**
   Concurrent writes now commit on several connections at once: two writes on
   different rows issued without a `co_await` between them (a parent row and its
@@ -124,6 +124,9 @@
   row had changed elsewhere, and `update` took its new value from the caller's
   entity rather than the committed row (triggers, defaults). Both now come from
   the write itself, which also removes the read that preceded it.
+- **`update` with `PopulateImmediately` cached the caller's entity**, not the
+  row the database committed (triggers, rounding, `db_managed` columns), until
+  `l1_ttl`. It now caches the committed row.
 - **List reads prepared a new statement per `limit`/`offset`** on every
   connection, without bound, and identical list reads in flight were never
   merged.
