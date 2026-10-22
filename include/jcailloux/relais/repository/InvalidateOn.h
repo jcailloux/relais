@@ -6,6 +6,7 @@
 #include <span>
 #include <utility>
 #include <vector>
+#include "jcailloux/relais/TypeTraits.h"
 #include "jcailloux/relais/io/Task.h"
 #include "jcailloux/relais/io/WhenAll.h"
 #include "jcailloux/relais/repository/ConditionalWrite.h"
@@ -42,14 +43,14 @@ template<typename T> using awaited_t = typename awaited<std::decay_t<T>>::type;
 
 /// Every row of the target repo (see PgRepo::invalidateEveryRow).
 template<typename Target>
-void everyTargetRow(const std::shared_ptr<io::SettleTicket>& ticket) {
+void everyTargetRow(const std::shared_ptr<io::detail::SettleTicket>& ticket) {
     if constexpr (requires { Target::invalidateEveryRow(ticket); })
         Target::invalidateEveryRow(ticket);
 }
 
 /// Every page of the target list repo.
 template<typename ListRepo>
-void everyListPage(const std::shared_ptr<io::SettleTicket>& ticket) {
+void everyListPage(const std::shared_ptr<io::detail::SettleTicket>& ticket) {
     if constexpr (requires { ListRepo::notifyEveryRow(ticket); }) {
         ListRepo::notifyEveryRow(ticket);
     } else if constexpr (requires { ListRepo::invalidateAllListGroups(); }) {
@@ -185,17 +186,17 @@ struct Invalidate {
     // the target key from. True: every target was invalidated.
 
     template<typename E, typename K>
-    static bool invalidateUnknownRow(const std::shared_ptr<io::SettleTicket>& ticket, const K&) {
+    static bool invalidateUnknownRow(const std::shared_ptr<io::detail::SettleTicket>& ticket, const K&) {
         return invalidateEvery(ticket);
     }
 
     template<typename E, typename... Updates>
-    static bool invalidateUnknownRows(const std::shared_ptr<io::SettleTicket>& ticket,
+    static bool invalidateUnknownRows(const std::shared_ptr<io::detail::SettleTicket>& ticket,
                                       const detail::RowPredicate<E>&, const Updates&...) {
         return invalidateEvery(ticket);
     }
 
-    static bool invalidateEvery(const std::shared_ptr<io::SettleTicket>& ticket) {
+    static bool invalidateEvery(const std::shared_ptr<io::detail::SettleTicket>& ticket) {
         detail::everyTargetRow<Cache>(ticket);
         return true;
     }
@@ -315,7 +316,7 @@ struct InvalidateList {
     // do; any other gets every page. True: every page was invalidated.
 
     template<typename E, typename K>
-    static bool invalidateUnknownRow(const std::shared_ptr<io::SettleTicket>& ticket, const K& key) {
+    static bool invalidateUnknownRow(const std::shared_ptr<io::detail::SettleTicket>& ticket, const K& key) {
         if constexpr (requires { ListCache::notifyRowLeft(ticket, key); }) {
             ListCache::notifyRowLeft(ticket, key);
             return false;
@@ -325,7 +326,7 @@ struct InvalidateList {
     }
 
     template<typename E, typename... Updates>
-    static bool invalidateUnknownRows(const std::shared_ptr<io::SettleTicket>& ticket,
+    static bool invalidateUnknownRows(const std::shared_ptr<io::detail::SettleTicket>& ticket,
                                       const detail::RowPredicate<E>& rows,
                                       const Updates&... updates) {
         if constexpr (requires { ListCache::notifyRowsChanged(ticket, rows, updates...); }) {
@@ -336,7 +337,7 @@ struct InvalidateList {
         }
     }
 
-    static bool invalidateEvery(const std::shared_ptr<io::SettleTicket>& ticket) {
+    static bool invalidateEvery(const std::shared_ptr<io::detail::SettleTicket>& ticket) {
         detail::everyListPage<ListCache>(ticket);
         return true;
     }
@@ -422,17 +423,17 @@ struct InvalidateVia {
     // the target key from. True: every target was invalidated.
 
     template<typename E, typename K>
-    static bool invalidateUnknownRow(const std::shared_ptr<io::SettleTicket>& ticket, const K&) {
+    static bool invalidateUnknownRow(const std::shared_ptr<io::detail::SettleTicket>& ticket, const K&) {
         return invalidateEvery(ticket);
     }
 
     template<typename E, typename... Updates>
-    static bool invalidateUnknownRows(const std::shared_ptr<io::SettleTicket>& ticket,
+    static bool invalidateUnknownRows(const std::shared_ptr<io::detail::SettleTicket>& ticket,
                                       const detail::RowPredicate<E>&, const Updates&...) {
         return invalidateEvery(ticket);
     }
 
-    static bool invalidateEvery(const std::shared_ptr<io::SettleTicket>& ticket) {
+    static bool invalidateEvery(const std::shared_ptr<io::detail::SettleTicket>& ticket) {
         detail::everyTargetRow<TargetCache>(ticket);
         return true;
     }
@@ -469,11 +470,6 @@ private:
 // =============================================================================
 // InvalidateListVia - Selective list cache invalidation through enriched resolver
 // =============================================================================
-
-namespace detail {
-    template<typename T> struct is_optional : std::false_type {};
-    template<typename T> struct is_optional<std::optional<T>> : std::true_type {};
-}
 
 /// Typed invalidation target for list cache cross-invalidation.
 template<typename GroupKey>
@@ -540,17 +536,17 @@ struct InvalidateListVia {
     // the targets from. True: every page was invalidated.
 
     template<typename E, typename K>
-    static bool invalidateUnknownRow(const std::shared_ptr<io::SettleTicket>& ticket, const K&) {
+    static bool invalidateUnknownRow(const std::shared_ptr<io::detail::SettleTicket>& ticket, const K&) {
         return invalidateEvery(ticket);
     }
 
     template<typename E, typename... Updates>
-    static bool invalidateUnknownRows(const std::shared_ptr<io::SettleTicket>& ticket,
+    static bool invalidateUnknownRows(const std::shared_ptr<io::detail::SettleTicket>& ticket,
                                       const detail::RowPredicate<E>&, const Updates&...) {
         return invalidateEvery(ticket);
     }
 
-    static bool invalidateEvery(const std::shared_ptr<io::SettleTicket>& ticket) {
+    static bool invalidateEvery(const std::shared_ptr<io::detail::SettleTicket>& ticket) {
         detail::everyListPage<ListRepo>(ticket);
         return true;
     }
@@ -570,7 +566,7 @@ private:
     static io::Task<void> invalidateResolved(Resolved resolved) {
         using ResolvedType = std::decay_t<Resolved>;
 
-        if constexpr (detail::is_optional<ResolvedType>::value) {
+        if constexpr (detail::is_optional_v<ResolvedType>) {
             if (!resolved) {
                 co_await ListRepo::invalidateAllListGroups();
                 co_return;
@@ -630,20 +626,20 @@ struct InvalidateOn {
     /// Uncertain write of the row `key`, its version before the write
     /// unknown. True if a dependency fell back on every target.
     template<typename E, typename K>
-    static bool invalidateUnknownRow(const std::shared_ptr<io::SettleTicket>& ticket, const K& key) {
+    static bool invalidateUnknownRow(const std::shared_ptr<io::detail::SettleTicket>& ticket, const K& key) {
         return (... | Dependencies::template invalidateUnknownRow<E>(ticket, key));
     }
 
     /// Uncertain predicate write of rows `rows` may hold for, setting `updates`.
     template<typename E, typename... Updates>
-    static bool invalidateUnknownRows(const std::shared_ptr<io::SettleTicket>& ticket,
+    static bool invalidateUnknownRows(const std::shared_ptr<io::detail::SettleTicket>& ticket,
                                       const detail::RowPredicate<E>& rows,
                                       const Updates&... updates) {
         return (... | Dependencies::template invalidateUnknownRows<E>(ticket, rows, updates...));
     }
 
     /// Any source row may have changed: every target.
-    static bool invalidateEvery(const std::shared_ptr<io::SettleTicket>& ticket) {
+    static bool invalidateEvery(const std::shared_ptr<io::detail::SettleTicket>& ticket) {
         return (... | Dependencies::invalidateEvery(ticket));
     }
 };
@@ -671,18 +667,20 @@ struct InvalidateOn<> {
     }
 
     template<typename E, typename K>
-    static bool invalidateUnknownRow(const std::shared_ptr<io::SettleTicket>&, const K&) {
+    static bool invalidateUnknownRow(const std::shared_ptr<io::detail::SettleTicket>&, const K&) {
         return false;
     }
 
     template<typename E, typename... Updates>
-    static bool invalidateUnknownRows(const std::shared_ptr<io::SettleTicket>&,
+    static bool invalidateUnknownRows(const std::shared_ptr<io::detail::SettleTicket>&,
                                       const detail::RowPredicate<E>&, const Updates&...) {
         return false;
     }
 
-    static bool invalidateEvery(const std::shared_ptr<io::SettleTicket>&) { return false; }
+    static bool invalidateEvery(const std::shared_ptr<io::detail::SettleTicket>&) { return false; }
 };
+
+namespace detail {
 
 // =============================================================================
 // propagateInvalidations - Helper functions for use in repositories
@@ -720,6 +718,8 @@ template<typename E, typename InvalidatesType>
 io::Task<void> propagateUpdateMany(std::span<const Change<E>> changes) {
     co_await InvalidatesType::template propagateUpdateMany<E>(changes);
 }
+
+}  // namespace detail
 
 // =============================================================================
 // Concept to detect if a type has Invalidates defined

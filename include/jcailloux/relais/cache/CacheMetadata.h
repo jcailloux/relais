@@ -5,7 +5,7 @@
 #include <atomic>
 #include <cstdint>
 
-namespace jcailloux::relais::cache {
+namespace jcailloux::relais::cache::detail {
 
 // =============================================================================
 // GDSFScoreData — shared base for GDSF-enabled metadata variants
@@ -83,7 +83,7 @@ struct GDSFScoreData {
 // =============================================================================
 //
 // Selected at compile time in LocalRepo via:
-//   using Metadata = cache::CacheMetadata<HasGDSF, HasTTL>;
+//   using Metadata = cache::detail::CacheMetadata<HasGDSF, HasTTL>;
 //
 // Sizes (TTL compressed to uint32_t seconds):
 //   <false, false>  0 bytes (EBO via [[no_unique_address]] in ChunkMap)
@@ -165,6 +165,6 @@ struct CacheMetadata<true, true> : GDSFScoreData {
     }
 };
 
-}  // namespace jcailloux::relais::cache
+}  // namespace jcailloux::relais::cache::detail
 
 #endif  // JCX_RELAIS_CACHE_METADATA_H

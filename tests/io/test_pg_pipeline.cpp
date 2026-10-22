@@ -9,6 +9,7 @@
 #include <jcailloux/relais/io/Task.h>
 
 using namespace jcailloux::relais::io;
+using namespace jcailloux::relais::io::detail;
 using Io = test::EpollIoContext;
 
 static constexpr const char* CONNINFO = relais_test::kConnInfo;

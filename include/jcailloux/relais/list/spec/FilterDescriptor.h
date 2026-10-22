@@ -106,16 +106,12 @@ void appendColumnSql(std::string& sql, std::string_view column) {
     if constexpr (Ranked) sql += Converter::codec::rankCases();
 }
 
-}  // namespace detail
-
 template<typename T>
-inline constexpr bool is_via_v = detail::is_via<T>::value;
+inline constexpr bool is_via_v = is_via<T>::value;
 
 // =============================================================================
 // Type traits helpers
 // =============================================================================
-
-namespace detail {
 
 /// Check if T is std::optional<U>
 template<typename T>
@@ -242,7 +238,7 @@ template<typename E>
 template<typename E>
 inline constexpr size_t keyComponentCount = [] {
     using K = std::remove_cvref_t<decltype(E::MappingType::key(std::declval<const E&>()))>;
-    if constexpr (jcailloux::relais::is_tuple_v<K>) {
+    if constexpr (jcailloux::relais::detail::is_tuple_v<K>) {
         return std::tuple_size_v<K>;
     } else {
         return size_t{1};
@@ -253,7 +249,7 @@ inline constexpr size_t keyComponentCount = [] {
 template<typename E>
 void extractKeyComponents(const E& entity, int64_t* out) noexcept {
     auto k = E::MappingType::key(entity);
-    if constexpr (jcailloux::relais::is_tuple_v<decltype(k)>) {
+    if constexpr (jcailloux::relais::detail::is_tuple_v<decltype(k)>) {
         std::apply([&](auto const&... xs) {
             static_assert((std::is_integral_v<std::remove_cvref_t<decltype(xs)>> && ...),
                 "list keyset pagination requires integer primary-key components");
@@ -355,9 +351,9 @@ struct Filter {
     // --- Set-op guard-rails: the SQL array must hold what the column stores. A
     // bare enum would bind its integer against a text column, and AsString has
     // no array form; only Via<Codec> converts every element. ---
-    static_assert(!(is_set_op && std::is_enum_v<element_type> && !is_via_v<Converter>),
+    static_assert(!(is_set_op && std::is_enum_v<element_type> && !detail::is_via_v<Converter>),
         "IN/NOT IN filter: an enum element type requires a Via<Codec> converter");
-    static_assert(!(is_set_op && !std::is_same_v<Converter, NoConvert> && !is_via_v<Converter>),
+    static_assert(!(is_set_op && !std::is_same_v<Converter, NoConvert> && !detail::is_via_v<Converter>),
         "IN/NOT IN filter: value converter (e.g. AsString) not supported");
 
     static_assert(detail::via_codec_matches<Converter, element_type>,

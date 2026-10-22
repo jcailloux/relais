@@ -180,7 +180,7 @@ T driveBounded(Io& io, io::Immediate<T> imm, std::chrono::milliseconds budget = 
 struct CohEnv {
     Io io;
     std::shared_ptr<io::PgPool<Io>> pool;
-    std::shared_ptr<io::batch::BatchScheduler<Io>> batcher;
+    std::shared_ptr<io::batch::detail::BatchScheduler<Io>> batcher;
     io::test::PgProbe probe;
     int pg_fd = -1;
     std::chrono::milliseconds q_timeout_;
@@ -209,7 +209,7 @@ struct CohEnv {
         // Build the batcher directly (not PgProvider::init) so the cases can read
         // its counters and shut it down. Bound on the test thread, which
         // driveBounded already stamped as the loop thread.
-        batcher = std::make_shared<io::batch::BatchScheduler<Io>>(io, pool, 8);
+        batcher = std::make_shared<io::batch::detail::BatchScheduler<Io>>(io, pool, 8);
         PgProvider::bindBatcher<Io>(batcher);
     }
 
@@ -393,7 +393,7 @@ TEST_CASE("coherence: identical countWhere in flight share one statement",
     seedCounts(env);
     // Past bootstrap, the first read goes direct: identical reads share its
     // result, different ones join a batch.
-    for (int i = 0; i < io::batch::TimingEstimator::kBootstrapThreshold + 2; ++i)
+    for (int i = 0; i < io::batch::detail::TimingEstimator::kBootstrapThreshold + 2; ++i)
         driveBounded(env.io, CohCount::countWhere({}));
 
     SECTION("same predicate: one statement for all three") {
@@ -519,7 +519,7 @@ TEST_CASE("list SQL: identical list reads in flight share one statement",
     seedArticles(env, 30);
     // Past bootstrap, the first read goes direct: identical reads share its
     // result, different ones join a batch.
-    for (int i = 0; i < io::batch::TimingEstimator::kBootstrapThreshold + 2; ++i)
+    for (int i = 0; i < io::batch::detail::TimingEstimator::kBootstrapThreshold + 2; ++i)
         driveBounded(env.io, CohArticlePg::query(articlePage(5, 5)));
 
     SECTION("same page: one statement for all three") {
@@ -1165,7 +1165,7 @@ RowLock lockItem(int64_t id) {
 
 // Runs a write expected to fail uncertainly; returns the ticket it carries.
 template<typename Op>
-std::shared_ptr<io::SettleTicket> uncertainTicket(CohEnv& env, Op op) {
+std::shared_ptr<io::detail::SettleTicket> uncertainTicket(CohEnv& env, Op op) {
     try {
         (void)driveBounded(env.io, std::move(op));
     } catch (const io::PgUncertainError& e) {
@@ -1175,7 +1175,7 @@ std::shared_ptr<io::SettleTicket> uncertainTicket(CohEnv& env, Op op) {
     return nullptr;
 }
 
-bool backendAlive(CohEnv& env, const io::BackendId& b) {
+bool backendAlive(CohEnv& env, const io::detail::BackendId& b) {
     auto r = env.probe.query(
         "SELECT count(*) FROM pg_stat_activity WHERE pid = " + std::to_string(b.pid)
         + " AND backend_start = '" + b.backend_start + "'::timestamptz"
@@ -1192,13 +1192,13 @@ TEST_CASE("settle ticket: an uncertain write names the backend that ran it",
     resetItems(env);
     auto id = env.seedItem("settle-name", 1);
 
-    std::shared_ptr<io::SettleTicket> ticket;
+    std::shared_ptr<io::detail::SettleTicket> ticket;
     {
         auto lock = lockItem(id);
         ticket = uncertainTicket(env, CohItemL1::update(id, item(id, "settle-name", 2)));
         REQUIRE(ticket);
         CHECK(ticket->mode == io::UncertainSettle::Terminate);
-        CHECK(ticket->state == io::SettleTicket::State::Pending);
+        CHECK(ticket->state == io::detail::SettleTicket::State::Pending);
         // The backend still runs the write, blocked on the lock: the ticket
         // names it by pid and start time.
         CHECK(backendAlive(env, ticket->backend));
@@ -1215,7 +1215,7 @@ TEST_CASE("settle ticket: a connection lost after sending carries a ticket",
 
     bool done = false;
     bool lost = false;
-    std::shared_ptr<io::SettleTicket> ticket;
+    std::shared_ptr<io::detail::SettleTicket> ticket;
     auto op = [&]() -> io::Task<void> {
         try {
             (void)co_await CohItemL1::update(id, item(id, "settle-lost", 2));
@@ -1270,7 +1270,7 @@ TEST_CASE("settle ticket: every caller of a failed batch shares one ticket",
 
     static constexpr const char* kSql =
         "UPDATE relais_test_items SET value = $1 WHERE id = $2";
-    std::array<std::shared_ptr<io::SettleTicket>, 3> tickets;
+    std::array<std::shared_ptr<io::detail::SettleTicket>, 3> tickets;
     std::array<bool, 3> uncertain{};
     auto write = [&](int slot, int64_t id, int32_t value) -> io::Task<void> {
         try {
@@ -1311,7 +1311,7 @@ struct WaveWrite {
     bool uncertain = false;
     bool coalesced = false;
     int64_t affected = -1;
-    std::shared_ptr<io::SettleTicket> ticket;
+    std::shared_ptr<io::detail::SettleTicket> ticket;
 };
 
 // Sends one write alone, then `writes` (row, value) batched behind it into one
@@ -1460,7 +1460,7 @@ TEST_CASE("settle ticket: the mode decides what the ticket names",
 
 namespace {
 
-using Queue = io::SettleQueue<Io>;
+using Queue = io::detail::SettleQueue<Io>;
 
 template<typename Pred>
 bool pumpUntil(CohEnv& env, Pred pred, std::chrono::milliseconds budget) {
@@ -1478,16 +1478,16 @@ bool settledAll(CohEnv& env) {
 
 // The settle connection carries the pool's application_name: count only the
 // backend named by the ticket.
-io::BackendId backendOf(io::test::PgProbe& probe) {
+io::detail::BackendId backendOf(io::test::PgProbe& probe) {
     auto r = probe.query(
         "SELECT pid, backend_start::text FROM pg_stat_activity WHERE pid = pg_backend_pid()");
     return {static_cast<int32_t>(std::stol(r.get(0, 0))), r.get(0, 1)};
 }
 
-std::shared_ptr<io::SettleTicket> ticketFor(io::UncertainSettle mode, io::BackendId b,
+std::shared_ptr<io::detail::SettleTicket> ticketFor(io::UncertainSettle mode, io::detail::BackendId b,
                                             std::chrono::milliseconds delay = 0ms) {
-    return std::make_shared<io::SettleTicket>(
-        io::SettleTicket{.mode = mode, .backend = std::move(b), .delay = delay});
+    return std::make_shared<io::detail::SettleTicket>(
+        io::detail::SettleTicket{.mode = mode, .backend = std::move(b), .delay = delay});
 }
 
 // Captures the log lines of one level while alive.
@@ -1516,7 +1516,7 @@ struct FaultReset {
 
 // Holds the row, makes the update of it fail uncertainly, and returns its ticket;
 // the queue is paused so that the case decides when settling starts.
-std::shared_ptr<io::SettleTicket> blockedUpdate(CohEnv& env, int64_t id, int32_t value) {
+std::shared_ptr<io::detail::SettleTicket> blockedUpdate(CohEnv& env, int64_t id, int32_t value) {
     queueOf(env).pause();
     auto t = uncertainTicket(env, CohItemL1::update(id, item(id, "settle", value)));
     REQUIRE(t);
@@ -1538,7 +1538,7 @@ TEST_CASE("settle queue: Terminate ends the backend, the write never commits",
 
     queueOf(env).resume();
     REQUIRE(pumpUntil(env, [&] { return settledAll(env); }, 7s));
-    CHECK(t->state == io::SettleTicket::State::Settled);
+    CHECK(t->state == io::detail::SettleTicket::State::Settled);
     CHECK(queueOf(env).settled() == 1);
     CHECK(queueOf(env).statements() == 1);
     CHECK_FALSE(backendAlive(env, t->backend));
@@ -1552,16 +1552,16 @@ TEST_CASE("settle queue: a ticket runs its replays once, in order, past a failin
     CohEnv env(300ms);
     std::vector<int> ran;
     auto t = ticketFor(io::UncertainSettle::Delay, {}, 50ms);
-    t->replays.push_back([&ran](io::WriteOutcome) -> io::Task<void> {
+    t->replays.push_back([&ran](io::detail::WriteOutcome) -> io::Task<void> {
         ran.push_back(1);
         co_return;
     });
-    t->replays.push_back([&ran](io::WriteOutcome) -> io::Task<void> {
+    t->replays.push_back([&ran](io::detail::WriteOutcome) -> io::Task<void> {
         ran.push_back(2);
         throw std::runtime_error("replay failure");
         co_return;
     });
-    t->replays.push_back([&ran](io::WriteOutcome) -> io::Task<void> {
+    t->replays.push_back([&ran](io::detail::WriteOutcome) -> io::Task<void> {
         ran.push_back(3);
         co_return;
     });
@@ -1573,7 +1573,7 @@ TEST_CASE("settle queue: a ticket runs its replays once, in order, past a failin
     pumpUntil(env, [] { return false; }, 100ms);
 
     CHECK(ran == std::vector<int>{1, 2, 3});
-    CHECK(t->state == io::SettleTicket::State::Settled);
+    CHECK(t->state == io::detail::SettleTicket::State::Settled);
     CHECK(t->replays.empty());
     CHECK(queueOf(env).settled() == 1);
     CHECK(queueOf(env).statements() == 0);
@@ -1596,13 +1596,13 @@ TEST_CASE("settle queue: tickets of one backend are settled by one statement",
 
     queueOf(env).resume();
     REQUIRE(pumpUntil(env, [&] { return settledAll(env); }, 7s));
-    CHECK(t->state == io::SettleTicket::State::Settled);
-    CHECK(twin->state == io::SettleTicket::State::Settled);
+    CHECK(t->state == io::detail::SettleTicket::State::Settled);
+    CHECK(twin->state == io::detail::SettleTicket::State::Settled);
     CHECK(queueOf(env).settled() == 2);
     CHECK(queueOf(env).statements() == 1);
     // Either ticket may be the transaction seen running.
-    CHECK(t->outcome == io::WriteOutcome::Unknown);
-    CHECK(twin->outcome == io::WriteOutcome::Unknown);
+    CHECK(t->outcome == io::detail::WriteOutcome::Unknown);
+    CHECK(twin->outcome == io::detail::WriteOutcome::Unknown);
 }
 
 TEST_CASE("settle queue: start time guards against a reused pid",
@@ -1615,7 +1615,7 @@ TEST_CASE("settle queue: start time guards against a reused pid",
 
     queueOf(env).enqueue(t);
     REQUIRE(pumpUntil(env, [&] { return settledAll(env); }, 3s));
-    CHECK(t->state == io::SettleTicket::State::Settled);
+    CHECK(t->state == io::detail::SettleTicket::State::Settled);
     // The backend with that pid but another start time is left alone.
     CHECK(other.query("SELECT 1").get(0, 0) == "1");
 }
@@ -1623,8 +1623,8 @@ TEST_CASE("settle queue: start time guards against a reused pid",
 TEST_CASE("settle queue: a backend already gone is settled",
           "[coherence][settle][integration]") {
     CohEnv env(300ms);
-    std::shared_ptr<io::SettleTicket> t;
-    io::BackendId b;
+    std::shared_ptr<io::detail::SettleTicket> t;
+    io::detail::BackendId b;
     {
         io::test::PgProbe gone{probeConnInfo()};
         b = backendOf(gone);
@@ -1637,9 +1637,9 @@ TEST_CASE("settle queue: a backend already gone is settled",
     t = ticketFor(io::UncertainSettle::Terminate, b);
     queueOf(env).enqueue(t);
     REQUIRE(pumpUntil(env, [&] { return settledAll(env); }, 3s));
-    CHECK(t->state == io::SettleTicket::State::Settled);
+    CHECK(t->state == io::detail::SettleTicket::State::Settled);
     CHECK(queueOf(env).statements() == 1);
-    CHECK(t->outcome == io::WriteOutcome::Unknown);
+    CHECK(t->outcome == io::detail::WriteOutcome::Unknown);
 }
 
 TEST_CASE("settle queue: Await waits for the backend to end on its own",
@@ -1659,7 +1659,7 @@ TEST_CASE("settle queue: Await waits for the backend to end on its own",
     // Unblocked, the write commits, then its backend finds the client gone.
     lock.reset();
     REQUIRE(pumpUntil(env, [&] { return settledAll(env); }, 5s));
-    CHECK(t->state == io::SettleTicket::State::Settled);
+    CHECK(t->state == io::detail::SettleTicket::State::Settled);
     CHECK_FALSE(backendAlive(env, t->backend));
     CHECK(probeValue(env, id) == "2");
 }
@@ -1679,9 +1679,9 @@ TEST_CASE("settle queue: Delay settles after the delay, without a statement",
 
     REQUIRE(pumpUntil(env, [&] { return settledAll(env); }, 2s));
     CHECK(std::chrono::steady_clock::now() - sent >= 300ms + 400ms);
-    CHECK(t->state == io::SettleTicket::State::Settled);
+    CHECK(t->state == io::detail::SettleTicket::State::Settled);
     CHECK(queueOf(env).statements() == 0);
-    CHECK(t->outcome == io::WriteOutcome::Unknown);
+    CHECK(t->outcome == io::detail::WriteOutcome::Unknown);
 }
 
 TEST_CASE("settle queue: PostgreSQL unreachable, settling is retried with a growing wait",
@@ -1723,8 +1723,8 @@ TEST_CASE("settle queue: a refused termination falls back to statement_timeout",
         CHECK(queueOf(env).pending() == 1);
         REQUIRE(pumpUntil(env, [&] { return settledAll(env); }, 3s));
         CHECK(std::chrono::steady_clock::now() - start >= 1700ms);
-        CHECK(t->state == io::SettleTicket::State::Settled);
-        CHECK(t->outcome == io::WriteOutcome::Unknown);
+        CHECK(t->state == io::detail::SettleTicket::State::Settled);
+        CHECK(t->outcome == io::detail::WriteOutcome::Unknown);
         CHECK(queueOf(env).abandoned() == 0);
         CHECK(LogCapture::count(log::Level::Error, "statement_timeout instead") == 1);
     }
@@ -1735,12 +1735,12 @@ TEST_CASE("settle queue: a refused termination falls back to statement_timeout",
         auto id = env.seedItem("settle", 1);
         auto lock = lockItem(id);
         auto t = blockedUpdate(env, id, 2);
-        t->replays.push_back([](io::WriteOutcome) -> io::Task<void> { co_return; });
+        t->replays.push_back([](io::detail::WriteOutcome) -> io::Task<void> { co_return; });
 
         Queue::fault = {.kind = Queue::Fault::Kind::Refused, .count = 1};
         queueOf(env).resume();
         REQUIRE(pumpUntil(env, [&] { return settledAll(env); }, 3s));
-        CHECK(t->state == io::SettleTicket::State::Pending);
+        CHECK(t->state == io::detail::SettleTicket::State::Pending);
         CHECK(t->replays.empty());
         CHECK(queueOf(env).abandoned() == 1);
         CHECK(queueOf(env).settled() == 0);
@@ -1758,7 +1758,7 @@ TEST_CASE("settle queue: settles while the pool's only connection is blocked",
     queueOf(env).pause();
 
     auto starter = [](io::Task<void> t) -> Starter { co_await std::move(t); };
-    auto update = [&](int32_t value, bool& done, std::shared_ptr<io::SettleTicket>* out)
+    auto update = [&](int32_t value, bool& done, std::shared_ptr<io::detail::SettleTicket>* out)
             -> io::Task<void> {
         try {
             (void)co_await CohItemL1::update(id, item(id, "settle", value));
@@ -1770,7 +1770,7 @@ TEST_CASE("settle queue: settles while the pool's only connection is blocked",
 
     // A: sent, blocked on the lock, then its connection is lost.
     bool a_done = false;
-    std::shared_ptr<io::SettleTicket> t;
+    std::shared_ptr<io::detail::SettleTicket> t;
     auto a = starter(update(2, a_done, &t));
     pumpUntil(env, [] { return false; }, 150ms);
     REQUIRE(::shutdown(env.pg_fd, SHUT_RD) == 0);
@@ -1809,7 +1809,7 @@ TEST_CASE("settle queue: Delay without a delay takes statement_timeout",
         auto lock = lockItem(id);
         auto t = uncertainTicket(env, CohItemL1::update(id, item(id, "settle", 2)));
         REQUIRE(t);
-        CHECK(t->delay == 700ms + io::kSettleMargin);
+        CHECK(t->delay == 700ms + io::detail::kSettleMargin);
     }
     SECTION("no statement_timeout: warned at startup") {
         LogCapture logs;
@@ -1854,16 +1854,16 @@ struct TableLock {
 };
 
 // Settles `t` once resumed; returns the outcome its replays received.
-std::optional<io::WriteOutcome> settleSeen(CohEnv& env,
-                                           const std::shared_ptr<io::SettleTicket>& t) {
-    auto seen = std::make_shared<std::optional<io::WriteOutcome>>();
-    t->replays.push_back([seen](io::WriteOutcome o) -> io::Task<void> {
+std::optional<io::detail::WriteOutcome> settleSeen(CohEnv& env,
+                                           const std::shared_ptr<io::detail::SettleTicket>& t) {
+    auto seen = std::make_shared<std::optional<io::detail::WriteOutcome>>();
+    t->replays.push_back([seen](io::detail::WriteOutcome o) -> io::Task<void> {
         *seen = o;
         co_return;
     });
     queueOf(env).resume();
     REQUIRE(pumpUntil(env, [&] { return settledAll(env); }, 7s));
-    REQUIRE(t->state == io::SettleTicket::State::Settled);
+    REQUIRE(t->state == io::detail::SettleTicket::State::Settled);
     return *seen;
 }
 
@@ -1879,9 +1879,9 @@ TEST_CASE("settle outcome: a write terminated while it waits for a row lock was 
     auto t = blockedUpdate(env, id, 2);
 
     // The write took a transaction id before waiting for the row: it is known.
-    CHECK(settleSeen(env, t) == io::WriteOutcome::Aborted);
-    CHECK(t->outcome == io::WriteOutcome::Aborted);
-    CHECK(queueOf(env).settledAs(io::WriteOutcome::Aborted) == 1);
+    CHECK(settleSeen(env, t) == io::detail::WriteOutcome::Aborted);
+    CHECK(t->outcome == io::detail::WriteOutcome::Aborted);
+    CHECK(queueOf(env).settledAs(io::detail::WriteOutcome::Aborted) == 1);
     CHECK_FALSE(backendAlive(env, t->backend));
     lock.reset();
     CHECK(probeValue(env, id) == "1");
@@ -1902,7 +1902,7 @@ TEST_CASE("settle outcome: a write that reads the row it replaces has its id whi
     queueOf(env).pause();
     auto t = uncertainTicket(env, CohArticleL1::update(id, articleIn(id, "coh-so-pre-b")));
     REQUIRE(t);
-    CHECK(settleSeen(env, t) == io::WriteOutcome::Aborted);
+    CHECK(settleSeen(env, t) == io::detail::WriteOutcome::Aborted);
     lock.reset();
     CHECK(articleCategory(env, id) == "coh-so-pre-a");
     resetArticleCaches<CohArticleL1>(env);
@@ -1923,8 +1923,8 @@ TEST_CASE("settle outcome: under Await, a write that commits once unblocked was 
     queueOf(env).pause();
     lock.reset();
 
-    CHECK(settleSeen(env, t) == io::WriteOutcome::Committed);
-    CHECK(queueOf(env).settledAs(io::WriteOutcome::Committed) == 1);
+    CHECK(settleSeen(env, t) == io::detail::WriteOutcome::Committed);
+    CHECK(queueOf(env).settledAs(io::detail::WriteOutcome::Committed) == 1);
     CHECK(probeValue(env, id) == "2");
 }
 
@@ -1939,8 +1939,8 @@ TEST_CASE("settle outcome: a write terminated while it waits for a table lock is
 
     // No change made yet, no transaction id: the write may have taken one and
     // committed between the read and the termination.
-    CHECK(settleSeen(env, t) == io::WriteOutcome::Unknown);
-    CHECK(queueOf(env).settledAs(io::WriteOutcome::Unknown) == 1);
+    CHECK(settleSeen(env, t) == io::detail::WriteOutcome::Unknown);
+    CHECK(queueOf(env).settledAs(io::detail::WriteOutcome::Unknown) == 1);
     CHECK_FALSE(backendAlive(env, t->backend));
     lock.reset();
     CHECK(probeValue(env, id) == "1");
@@ -1958,7 +1958,7 @@ TEST_CASE("settle outcome: a write behind another unresolved one is unknown",
     // seen running may be either one, and the first may have committed.
     t->unresolved = 2;
 
-    CHECK(settleSeen(env, t) == io::WriteOutcome::Unknown);
+    CHECK(settleSeen(env, t) == io::detail::WriteOutcome::Unknown);
     CHECK_FALSE(backendAlive(env, t->backend));
     lock.reset();
     CHECK(probeValue(env, id) == "1");
@@ -1974,7 +1974,7 @@ namespace {
 
 // The pool connection's value of the setting, and where it comes from.
 std::pair<std::string, std::string> clientCheckOf(CohEnv& env) {
-    auto r = driveBounded(env.io, io::PgClient<Io>(env.pool).query(
+    auto r = driveBounded(env.io, io::detail::PgClient<Io>(env.pool).query(
         "SELECT setting, source FROM pg_settings "
         "WHERE name = 'client_connection_check_interval'"));
     REQUIRE(r.rows() == 1);
@@ -2035,7 +2035,7 @@ namespace {
 // the old row once the first eviction is done), releases the lock, then lets
 // the queue settle. Under Await the write commits as the lock goes.
 template<typename Op, typename Refill>
-std::shared_ptr<io::SettleTicket> settleAfterRefill(CohEnv& env, std::optional<RowLock>& lock,
+std::shared_ptr<io::detail::SettleTicket> settleAfterRefill(CohEnv& env, std::optional<RowLock>& lock,
                                                    Op op, Refill refill) {
     queueOf(env).pause();
     auto t = uncertainTicket(env, std::move(op));
@@ -2089,7 +2089,7 @@ TEST_CASE("precaution: an eviction runs at once and again only on a pending tick
     }
     SECTION("settled: run once, not registered") {
         auto t = ticketFor(io::UncertainSettle::Delay, {}, 1s);
-        t->state = io::SettleTicket::State::Settled;
+        t->state = io::detail::SettleTicket::State::Settled;
         detail::precautionSync(t, evict);
         CHECK(runs == 1);
         CHECK(t->replays.empty());
@@ -2126,7 +2126,7 @@ TEST_CASE("replay: Terminate settles before the commit, the cache matches Postgr
     CHECK(cachedValue(env, id) == 1);
     queueOf(env).resume();
     REQUIRE(pumpUntil(env, [&] { return settledAll(env); }, 7s));
-    REQUIRE(t->outcome == io::WriteOutcome::Aborted);
+    REQUIRE(t->outcome == io::detail::WriteOutcome::Aborted);
     CHECK(inL1Item(id));  // aborted: the copy read meanwhile is right, kept
     lock.reset();
     CHECK(probeValue(env, id) == "1");
@@ -2270,7 +2270,7 @@ TEST_CASE("replay: writes of one pipeline share one ticket and replay every evic
     queueOf(env).pause();
     std::optional<RowLock> lock;
     lock.emplace("relais_test_items", "id=" + std::to_string(locked));
-    std::array<std::shared_ptr<io::SettleTicket>, 3> tickets;
+    std::array<std::shared_ptr<io::detail::SettleTicket>, 3> tickets;
     auto write = [&](int slot, int64_t id, int32_t value) -> io::Task<void> {
         try {
             (void)co_await CohItemL1::update(id, item(id, "replay", value));
@@ -2304,9 +2304,9 @@ TEST_CASE("replay: writes of one pipeline share one ticket and replay every evic
 TEST_CASE("replay: writes of a pipeline whose end was read succeed and replay nothing",
           "[coherence][settle][replay][integration]") {
     // Writes on distinct rows in one pipeline, whatever the rows.
-    io::batch::BatchScheduler<Io>::write_fanout_override = 1;
+    io::batch::detail::BatchScheduler<Io>::write_fanout_override = 1;
     struct Reset {
-        ~Reset() { io::batch::BatchScheduler<Io>::write_fanout_override = 0; }
+        ~Reset() { io::batch::detail::BatchScheduler<Io>::write_fanout_override = 0; }
     } reset;
     CohEnv env(300ms);
     resetItems(env);
@@ -2324,7 +2324,7 @@ TEST_CASE("replay: writes of a pipeline whose end was read succeed and replay no
     std::optional<RowLock> lock;
     lock.emplace("relais_test_items", "id=" + std::to_string(locked));
     std::array<bool, 3> failed{};
-    std::shared_ptr<io::SettleTicket> ticket;
+    std::shared_ptr<io::detail::SettleTicket> ticket;
     auto write = [&](int slot, int64_t id, int32_t value) -> io::Task<void> {
         try {
             (void)co_await CohItemL1::update(id, item(id, "through", value));
@@ -2708,13 +2708,13 @@ void probeSet(CohEnv& env, int64_t id, int32_t v) {
                     + " WHERE id=" + std::to_string(id));
 }
 
-std::shared_ptr<io::SettleTicket> pendingTicket() {
+std::shared_ptr<io::detail::SettleTicket> pendingTicket() {
     return ticketFor(io::UncertainSettle::Delay, {}, 1s);
 }
 
 // Settle `t` as the queue does, without a backend: its replays run at once.
-void settleByHand(CohEnv& env, const std::shared_ptr<io::SettleTicket>& t) {
-    t->state = io::SettleTicket::State::Settled;
+void settleByHand(CohEnv& env, const std::shared_ptr<io::detail::SettleTicket>& t) {
+    t->state = io::detail::SettleTicket::State::Settled;
     auto replays = std::move(t->replays);
     t->replays.clear();
     for (auto& r : replays) driveBounded(env.io, r(t->outcome));
@@ -3502,10 +3502,10 @@ TEST_CASE("cross: an uncertain eraseMany of rows nobody holds reaches every targ
 namespace {
 
 // Lets the paused queue settle `t`, and requires the write found aborted.
-void settleAborted(CohEnv& env, const std::shared_ptr<io::SettleTicket>& t) {
+void settleAborted(CohEnv& env, const std::shared_ptr<io::detail::SettleTicket>& t) {
     queueOf(env).resume();
     REQUIRE(pumpUntil(env, [&] { return settledAll(env); }, 7s));
-    REQUIRE(t->outcome == io::WriteOutcome::Aborted);
+    REQUIRE(t->outcome == io::detail::WriteOutcome::Aborted);
 }
 
 }  // namespace

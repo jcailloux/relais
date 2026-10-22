@@ -6,7 +6,7 @@
 #include <optional>
 #include <string_view>
 
-namespace jcailloux::relais::list::spec::parse {
+namespace jcailloux::relais::list::spec::detail::parse {
 
 /// Fast int64_t parsing using std::from_chars
 [[nodiscard]] inline int64_t toInt64(std::string_view str) noexcept {
@@ -55,6 +55,6 @@ inline constexpr size_t MAX_STRING_LEN = 256;
     return str.size() <= MAX_STRING_LEN;
 }
 
-}  // namespace jcailloux::relais::list::spec::parse
+}  // namespace jcailloux::relais::list::spec::detail::parse
 
 #endif  // JCX_RELAIS_LIST_SPEC_PARSE_UTILS_H

@@ -19,6 +19,7 @@
 #include <vector>
 
 using namespace jcailloux::relais::io;
+using namespace jcailloux::relais::io::detail;
 using namespace jcailloux::relais::io::test;
 using jcailloux::relais::detail::parseNumber;
 

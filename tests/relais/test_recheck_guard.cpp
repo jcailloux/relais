@@ -19,7 +19,7 @@
 
 #include "jcailloux/relais/repository/RecheckGuard.h"
 
-using jcailloux::relais::RecheckGuard;
+using jcailloux::relais::detail::RecheckGuard;
 
 namespace {
 

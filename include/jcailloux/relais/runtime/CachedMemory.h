@@ -24,7 +24,7 @@ __attribute__((weak)) int mallctl(const char*, void*, size_t*, void*, size_t);
     #include <malloc.h>
 #endif
 
-namespace jcailloux::relais::runtime {
+namespace jcailloux::relais::runtime::detail {
 
 /// CachedMemory — background-refreshed live process memory for hot paths.
 ///
@@ -109,6 +109,6 @@ private:
     alignas(64) static inline std::atomic<uint64_t> bytes_{0};
 };
 
-}  // namespace jcailloux::relais::runtime
+}  // namespace jcailloux::relais::runtime::detail
 
 #endif  // JCX_RELAIS_RUNTIME_CACHED_MEMORY_H

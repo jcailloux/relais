@@ -44,8 +44,8 @@ extern "C" const char* __tsan_default_suppressions() {
 }
 #endif
 
-using jcailloux::relais::cache::ChunkMap;
-using jcailloux::relais::cache::TaggedEntry;
+using jcailloux::relais::cache::detail::ChunkMap;
+using jcailloux::relais::cache::detail::TaggedEntry;
 
 namespace {
 

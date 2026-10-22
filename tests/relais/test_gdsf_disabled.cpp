@@ -68,14 +68,14 @@ TEST_CASE("GDSF disabled - zero overhead when not enabled",
     }
 
     SECTION("monostate metadata when no TTL and no GDSF") {
-        using Metadata = jcailloux::relais::cache::CacheMetadata<false, false>;
+        using Metadata = jcailloux::relais::cache::detail::CacheMetadata<false, false>;
         static_assert(std::is_empty_v<Metadata>,
             "CacheMetadata<false, false> should be empty (0 bytes via EBO)");
         SUCCEED();
     }
 
     SECTION("TTL-only metadata when TTL configured but no GDSF") {
-        using Metadata = jcailloux::relais::cache::CacheMetadata<false, true>;
+        using Metadata = jcailloux::relais::cache::detail::CacheMetadata<false, true>;
         static_assert(sizeof(Metadata) == sizeof(uint32_t),
             "CacheMetadata<false, true> should be 4 bytes (TTL only)");
 

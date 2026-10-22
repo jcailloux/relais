@@ -98,7 +98,7 @@ std::vector<Case> cases() {
 }
 
 bool pgVerdict(int64_t id, const Filters& f) {
-    auto where = decl::buildWhereClause<GenDesc>(f);
+    auto where = decl::detail::buildWhereClause<GenDesc>(f);
     const auto sql = "SELECT count(*) FROM relais_test_nullable_list WHERE id = "
                    + std::to_string(id) + " AND " + where.sql;
     return sync(relais_test::detail::testPg()->queryParams(sql.c_str(), where.params))[0].get<int64_t>(0) == 1;
@@ -119,8 +119,8 @@ TEST_CASE("[ListNullMatch] L1 and PostgreSQL agree on NULL and non-NULL rows",
             for (const auto& c : all) {
                 const auto& f = c.filters;
                 const bool pg = pgVerdict(id, f);
-                const bool viaFree = decl::matchesFilters<GenDesc>(row, f);
-                const bool viaTags = f.matchesFilters(decl::extractTags<GenDesc>(row));
+                const bool viaFree = decl::detail::matchesFilters<GenDesc>(row, f);
+                const bool viaTags = f.matchesFilters(decl::detail::extractTags<GenDesc>(row));
                 CAPTURE(c.name, rank.has_value(), label.has_value());
                 CHECK(viaFree == pg);
                 CHECK(viaTags == pg);
@@ -137,10 +137,10 @@ TEST_CASE("[ListNullMatch] NOT IN an empty set holds a NULL row, a non-empty one
     Filters some;
     some.get<"rank_nin">() = std::vector<int32_t>{5};
 
-    CHECK(decl::matchesFilters<GenDesc>(nullRow, empty));
-    CHECK(empty.matchesFilters(decl::extractTags<GenDesc>(nullRow)));
-    CHECK_FALSE(decl::matchesFilters<GenDesc>(nullRow, some));
-    CHECK_FALSE(some.matchesFilters(decl::extractTags<GenDesc>(nullRow)));
+    CHECK(decl::detail::matchesFilters<GenDesc>(nullRow, empty));
+    CHECK(empty.matchesFilters(decl::detail::extractTags<GenDesc>(nullRow)));
+    CHECK_FALSE(decl::detail::matchesFilters<GenDesc>(nullRow, some));
+    CHECK_FALSE(some.matchesFilters(decl::detail::extractTags<GenDesc>(nullRow)));
 }
 
 // =============================================================================

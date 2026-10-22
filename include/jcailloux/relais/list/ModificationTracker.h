@@ -13,7 +13,7 @@
 namespace relais_test { struct TestInternals; }
 #endif
 
-namespace jcailloux::relais::list {
+namespace jcailloux::relais::list::detail {
 
 // =============================================================================
 // EntityModification - Represents a modification to an entity
@@ -58,10 +58,8 @@ struct EntityModification {
     }
 };
 
-namespace detail {
-    /// Default range-payload — an entity-only tracker carries no predicate ranges.
-    struct NoRangePayload {};
-}
+/// Default range-payload — an entity-only tracker carries no predicate ranges.
+struct NoRangePayload {};
 
 // =============================================================================
 // ModificationTracker - Bitmap-based tracker for list cache invalidation
@@ -78,24 +76,24 @@ namespace detail {
 //
 
 template<typename E, size_t TotalSegments,
-         typename RangePayload = detail::NoRangePayload,
+         typename RangePayload = NoRangePayload,
          typename RowLeft = int64_t>
 class ModificationTracker {
 public:
     using Modification = EntityModification<E>;
 
     /// Entity modifications.
-    using ModificationLane = cache::PendingLane<Modification, TotalSegments>;
+    using ModificationLane = cache::detail::PendingLane<Modification, TotalSegments>;
     /// Ranges of rows (predicate writes): one entry stands in for an unbounded
     /// set of rows located by what they hold, instead of N entity
     /// modifications.
-    using RangeLane = cache::PendingLane<RangePayload, TotalSegments>;
+    using RangeLane = cache::detail::PendingLane<RangePayload, TotalSegments>;
     /// Rows that left the pages holding them, at a position nobody knows (the
     /// write that moved them was uncertain). An entry touches exactly the
     /// pages that hold one of its rows (the owner says which). Counted:
     /// readers skip it while it is empty, which it is unless an uncertain
     /// write happened.
-    using RowLeftLane = cache::PendingLane<RowLeft, TotalSegments, true>;
+    using RowLeftLane = cache::detail::PendingLane<RowLeft, TotalSegments, true>;
 
     using BitmapType = typename ModificationLane::BitmapType;
 
@@ -321,6 +319,6 @@ public:
 #endif
 };
 
-}  // namespace jcailloux::relais::list
+}  // namespace jcailloux::relais::list::detail
 
 #endif  // JCX_RELAIS_LIST_MODIFICATIONTRACKER_H

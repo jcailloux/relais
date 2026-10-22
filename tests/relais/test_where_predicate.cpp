@@ -40,7 +40,7 @@
 namespace decl = jcailloux::relais::list::spec;
 using namespace relais_test;
 using ArticleEntity = entity::generated::TestArticleEntity;
-using jcailloux::relais::list::SortBounds;
+using jcailloux::relais::list::detail::SortBounds;
 using jcailloux::relais::list::SortDirection;
 
 // ===========================================================================
@@ -157,22 +157,22 @@ TEST_CASE("predicateGroupCompatible prunes EQ-incompatible groups, wildcards sta
     SECTION("same EQ value → compatible") {
         decl::Filters<DescEq> pred;
         pred.get<"author_id">() = int64_t{42};
-        CHECK(decl::predicateGroupCompatible<DescEq>(pred, group));
+        CHECK(decl::detail::predicateGroupCompatible<DescEq>(pred, group));
     }
     SECTION("different EQ value → pruned") {
         decl::Filters<DescEq> pred;
         pred.get<"author_id">() = int64_t{7};
-        CHECK_FALSE(decl::predicateGroupCompatible<DescEq>(pred, group));
+        CHECK_FALSE(decl::detail::predicateGroupCompatible<DescEq>(pred, group));
     }
     SECTION("absent predicate constraint is a wildcard → compatible") {
         decl::Filters<DescEq> pred;     // nothing set
-        CHECK(decl::predicateGroupCompatible<DescEq>(pred, group));
+        CHECK(decl::detail::predicateGroupCompatible<DescEq>(pred, group));
     }
     SECTION("absent group constraint is a wildcard → compatible") {
         decl::Filters<DescEq> pred;
         pred.get<"author_id">() = int64_t{7};
         decl::Filters<DescEq> open;     // group filters nothing
-        CHECK(decl::predicateGroupCompatible<DescEq>(pred, open));
+        CHECK(decl::detail::predicateGroupCompatible<DescEq>(pred, open));
     }
     SECTION("a single incompatible filter prunes the group") {
         decl::Filters<DescEq> pred;
@@ -181,7 +181,7 @@ TEST_CASE("predicateGroupCompatible prunes EQ-incompatible groups, wildcards sta
         decl::Filters<DescEq> g2;
         g2.get<"author_id">() = int64_t{42};
         g2.get<"category">() = std::string("news");           // category differs → prune
-        CHECK_FALSE(decl::predicateGroupCompatible<DescEq>(pred, g2));
+        CHECK_FALSE(decl::detail::predicateGroupCompatible<DescEq>(pred, g2));
     }
 }
 
@@ -191,13 +191,13 @@ TEST_CASE("predicateGroupCompatible prunes IN-disjoint groups only",
         decl::Filters<DescIn> pred, group;
         pred.get<"category">() = std::vector<std::string>{"a", "b"};
         group.get<"category">() = std::vector<std::string>{"b", "c"};
-        CHECK(decl::predicateGroupCompatible<DescIn>(pred, group));
+        CHECK(decl::detail::predicateGroupCompatible<DescIn>(pred, group));
     }
     SECTION("disjoint sets → pruned") {
         decl::Filters<DescIn> pred, group;
         pred.get<"category">() = std::vector<std::string>{"a"};
         group.get<"category">() = std::vector<std::string>{"c"};
-        CHECK_FALSE(decl::predicateGroupCompatible<DescIn>(pred, group));
+        CHECK_FALSE(decl::detail::predicateGroupCompatible<DescIn>(pred, group));
     }
 }
 
@@ -210,7 +210,7 @@ TEST_CASE("predicateSortRange narrows the aligned sort dimension", "[where][unit
     pred.get<"views_min">() = int32_t{50};   // view_count >= 50 (GE)
 
     // Sort dim 0 == view_count == the filtered column → lower-bounded at 50.
-    auto r = decl::predicateSortRange<DescAligned>(pred, 0);
+    auto r = decl::detail::predicateSortRange<DescAligned>(pred, 0);
     CHECK(r.lo == 50);
     CHECK(r.hi == std::numeric_limits<int64_t>::max());
 }
@@ -221,7 +221,7 @@ TEST_CASE("predicateSortRange leaves an unconstrained dimension full", "[where][
     decl::Filters<DescEq> pred;
     pred.get<"author_id">() = int64_t{42};
 
-    auto r = decl::predicateSortRange<DescEq>(pred, 0);  // sort dim 0 == id
+    auto r = decl::detail::predicateSortRange<DescEq>(pred, 0);  // sort dim 0 == id
     CHECK(r.lo == std::numeric_limits<int64_t>::min());
     CHECK(r.hi == std::numeric_limits<int64_t>::max());
 }

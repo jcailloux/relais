@@ -16,6 +16,7 @@
 
 using namespace jcailloux::relais::io;
 using namespace jcailloux::relais::io::batch;
+using namespace jcailloux::relais::io::batch::detail;
 using Io = test::EpollIoContext;
 
 static constexpr const char* CONNINFO = relais_test::kConnInfo;

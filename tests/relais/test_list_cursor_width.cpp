@@ -43,7 +43,7 @@ using Params = std::unordered_map<std::string, std::string>;
 
 /// Base64 token of `width` bytes, each byte distinct so tokens differ by width.
 std::string tokenOfWidth(std::size_t width) {
-    jcailloux::relais::list::Cursor c;
+    jcailloux::relais::list::detail::Cursor c;
     for (std::size_t i = 0; i < width; ++i) c.data.push_back(static_cast<std::byte>(i + 1));
     return c.encode();
 }
@@ -58,7 +58,7 @@ const std::string kTruncated = kScalarToken.substr(0, kScalarToken.size() - 4);
 // --- Encode ----------------------------------------------------------------
 
 TEST_CASE("cursor encode is standard padded base64", "[list][cursor]") {
-    using jcailloux::relais::list::Cursor;
+    using jcailloux::relais::list::detail::Cursor;
     auto bytes = [](std::initializer_list<int> v) {
         Cursor c;
         for (int b : v) c.data.push_back(static_cast<std::byte>(b));

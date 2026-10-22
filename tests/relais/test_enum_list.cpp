@@ -55,7 +55,7 @@ decl::ListQueryParams<D> ticketParams(std::optional<TicketState> state,
 }
 
 std::string groupKeyOf(const Params& q) {
-    return decl::groupKey<Desc>(q.filters, q.sort);
+    return decl::detail::groupKey<Desc>(q.filters, q.sort);
 }
 
 TestTicketEntity makeTicket(TicketState state, int32_t weight = 0, int64_t queue = 0) {
@@ -91,13 +91,13 @@ TEST_CASE("[EnumList] distinct enum filter values give distinct page keys",
 
 TEST_CASE("[EnumList] equality and set filters bind the codec's strings",
           "[list][enum][unit]") {
-    using jcailloux::relais::io::PgParam;
+    using jcailloux::relais::io::detail::PgParam;
     Params q;
 
     SECTION("EQ and NE") {
         q.filters.get<"state">() = TicketState::Closed;
         q.filters.get<"state_ne">() = TicketState::Open;
-        auto w = decl::buildWhereClause<Desc>(q.filters);
+        auto w = decl::detail::buildWhereClause<Desc>(q.filters);
         CHECK(w.sql == "\"state\"=$1 AND \"state\"!=$2");
         REQUIRE(w.params.params.size() == 2);
         CHECK(w.params.params[0] == PgParam::text("closed"));
@@ -107,7 +107,7 @@ TEST_CASE("[EnumList] equality and set filters bind the codec's strings",
     SECTION("IN and NIN: one array of strings each") {
         q.filters.get<"state_in">() = std::vector{TicketState::Closed, TicketState::Open};
         q.filters.get<"state_nin">() = std::vector{TicketState::Archived};
-        auto w = decl::buildWhereClause<Desc>(q.filters);
+        auto w = decl::detail::buildWhereClause<Desc>(q.filters);
         CHECK(w.sql == "\"state\" = ANY($1) AND \"state\" != ALL($2)");
         REQUIRE(w.params.params.size() == 2);
         CHECK(w.params.params[0] == PgParam::text("{closed,open}"));
@@ -116,7 +116,7 @@ TEST_CASE("[EnumList] equality and set filters bind the codec's strings",
 
     SECTION("an ordering operator compares the rank with the underlying value") {
         q.filters.get<"state_min">() = TicketState::Closed;
-        auto w = decl::buildWhereClause<Desc>(q.filters);
+        auto w = decl::detail::buildWhereClause<Desc>(q.filters);
         CHECK(w.sql == "CASE \"state\" WHEN 'open' THEN 5 WHEN 'blocked' THEN 20 "
                        "WHEN 'closed' THEN 10 WHEN 'archived' THEN 0 END>=$1");
         REQUIRE(w.params.params.size() == 1);
@@ -128,7 +128,7 @@ namespace {
 
 enum class Quoted : int16_t { Neg = -300, Zero = 0, Big = 32000 };
 
-struct QuotedCodec : jcailloux::relais::entity::MappedEnumCodec<QuotedCodec, Quoted> {
+struct QuotedCodec : jcailloux::relais::entity::detail::MappedEnumCodec<QuotedCodec, Quoted> {
     static constexpr std::array<std::pair<enum_type, std::string_view>, 3>
         pairs{{{enum_type::Neg, "it's"}, {enum_type::Zero, ""}, {enum_type::Big, "''"}}};
 };
@@ -203,7 +203,7 @@ TEST_CASE("[EnumList] HTTP parsing reads the codec's strings",
 namespace {
 
 bool matches(const Params& q, const TestTicketEntity& e) {
-    return decl::matchesFilters<Desc>(e, q.filters);
+    return decl::detail::matchesFilters<Desc>(e, q.filters);
 }
 
 }  // namespace

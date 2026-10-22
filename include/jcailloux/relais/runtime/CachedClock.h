@@ -5,7 +5,7 @@
 #include <chrono>
 #include <cstdint>
 
-namespace jcailloux::relais::runtime {
+namespace jcailloux::relais::runtime::detail {
 
 /// CachedClock — background-refreshed steady_clock for hot paths.
 ///
@@ -40,6 +40,6 @@ private:
     alignas(64) static inline std::atomic<uint32_t> sec_{currentSec()};
 };
 
-}  // namespace jcailloux::relais::runtime
+}  // namespace jcailloux::relais::runtime::detail
 
 #endif  // JCX_RELAIS_RUNTIME_CACHED_CLOCK_H

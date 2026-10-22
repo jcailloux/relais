@@ -24,29 +24,29 @@ namespace jcailloux::relais::detail {
 // (key, copies): its replay runs after the caller's frame is gone.
 
 template<typename Fn>
-io::Task<void> runOwned(Fn evict, io::WriteOutcome outcome) {
-    if (outcome == io::WriteOutcome::Aborted) co_return;
+io::Task<void> runOwned(Fn evict, io::detail::WriteOutcome outcome) {
+    if (outcome == io::detail::WriteOutcome::Aborted) co_return;
     co_await evict();
 }
 
 template<typename Fn>
-void registerReplay(const std::shared_ptr<io::SettleTicket>& ticket, const Fn& replay) {
-    if (ticket && ticket->state == io::SettleTicket::State::Pending)
+void registerReplay(const std::shared_ptr<io::detail::SettleTicket>& ticket, const Fn& replay) {
+    if (ticket && ticket->state == io::detail::SettleTicket::State::Pending)
         ticket->replays.emplace_back(
-            [replay](io::WriteOutcome outcome) { return runOwned(replay, outcome); });
+            [replay](io::detail::WriteOutcome outcome) { return runOwned(replay, outcome); });
 }
 
 // Asynchronous eviction: `evict` returns io::Task<void>. Await it after the
 // handler (co_await is illegal in a catch).
 template<typename Fn>
-io::Task<void> precaution(std::shared_ptr<io::SettleTicket> ticket, Fn evict) {
+io::Task<void> precaution(std::shared_ptr<io::detail::SettleTicket> ticket, Fn evict) {
     registerReplay(ticket, evict);
     co_await evict();
 }
 
 // Synchronous eviction (cannot suspend): usable inside the handler.
 template<typename Fn>
-void precautionSync(const std::shared_ptr<io::SettleTicket>& ticket, Fn evict) {
+void precautionSync(const std::shared_ptr<io::detail::SettleTicket>& ticket, Fn evict) {
     registerReplay(ticket, [evict]() -> io::Task<void> { evict(); co_return; });
     evict();
 }
@@ -56,11 +56,11 @@ void precautionSync(const std::shared_ptr<io::SettleTicket>& ticket, Fn evict) {
 // settled, it runs when the returned task is awaited (after the handler); without
 // a ticket (settling Off), never.
 template<typename Fn>
-io::Task<void> onSettled(std::shared_ptr<io::SettleTicket> ticket, Fn fn) {
+io::Task<void> onSettled(std::shared_ptr<io::detail::SettleTicket> ticket, Fn fn) {
     if (!ticket) co_return;
-    if (ticket->state == io::SettleTicket::State::Pending) {
+    if (ticket->state == io::detail::SettleTicket::State::Pending) {
         ticket->replays.emplace_back(
-            [fn](io::WriteOutcome outcome) { return runOwned(fn, outcome); });
+            [fn](io::detail::WriteOutcome outcome) { return runOwned(fn, outcome); });
         co_return;
     }
     co_await runOwned(std::move(fn), ticket->outcome);

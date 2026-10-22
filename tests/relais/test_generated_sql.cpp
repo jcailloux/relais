@@ -318,7 +318,7 @@ TEST_CASE("delete_where - $n survives buildWhereClause -> assembly",
     decl::Filters<ArticleDesc> f;
     f.template get<"is_published">() = true;  // is_published EQ -> "is_published"=$1
 
-    auto wc = decl::buildWhereClause<ArticleDesc>(f);
+    auto wc = decl::detail::buildWhereClause<ArticleDesc>(f);
     REQUIRE(wc.sql.find("$1") != std::string::npos);
     REQUIRE(wc.params.params.size() == 1);
 
@@ -371,8 +371,8 @@ TEST_CASE("mapped enum codec - one mapping per field", "[generator][enum]") {
         const auto upd = Mapping::toUpdateParams(t);
         REQUIRE(ins.params.size() == 4);
         REQUIRE(upd.params.size() == 4);
-        CHECK(ins.params[1] == jcailloux::relais::io::PgParam::text("closed"));
-        CHECK(upd.params[1] == jcailloux::relais::io::PgParam::text("closed"));
+        CHECK(ins.params[1] == jcailloux::relais::io::detail::PgParam::text("closed"));
+        CHECK(upd.params[1] == jcailloux::relais::io::detail::PgParam::text("closed"));
     }
 }
 
@@ -383,7 +383,7 @@ TEST_CASE("mapped enum codec - one mapping per field", "[generator][enum]") {
 TEST_CASE("count_where - form and $n numbering", "[generator][sql][where][count]") {
     constexpr auto kTable = entity::generated::TestFilterOnlyMapping::table_name;
     auto count = [&](const decl::Filters<FilterOnlyDesc>& f) {
-        auto wc = decl::buildWhereClause<FilterOnlyDesc>(f);
+        auto wc = decl::detail::buildWhereClause<FilterOnlyDesc>(f);
         return std::pair{detail::buildCountWhereSql(kTable, wc.sql), wc.params.params.size()};
     };
     const std::string head = "SELECT count(*) FROM relais_test_filter_only";

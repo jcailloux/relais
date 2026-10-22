@@ -14,6 +14,8 @@
 
 namespace jcailloux::relais::cache {
 
+namespace detail {
+
 /// Striped atomic counter — 8 cache-line-aligned slots to minimize contention.
 /// Total footprint: ~512 bytes per counter.
 ///
@@ -85,6 +87,8 @@ struct L1Counters {
     StripedCounter hits;
     StripedCounter misses;
 };
+
+}  // namespace detail
 
 /// Immutable snapshot of all cache metrics for a Repo instantiation.
 struct MetricsSnapshot {

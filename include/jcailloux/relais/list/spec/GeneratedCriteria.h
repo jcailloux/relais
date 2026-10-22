@@ -13,7 +13,7 @@
 #include "ListDescriptor.h"
 #include "GeneratedFilters.h"
 
-namespace jcailloux::relais::list::spec {
+namespace jcailloux::relais::list::spec::detail {
 
 // =============================================================================
 // Convert Op enum to SQL operator string
@@ -35,7 +35,6 @@ namespace jcailloux::relais::list::spec {
 // Value conversion for DB queries
 // =============================================================================
 
-namespace detail {
 
 /// Convert filter value for DB query and add to params
 template<typename FilterType, typename T>
@@ -45,13 +44,13 @@ void addParamForDb(io::PgParams& params, const T& value) {
         // Equality compares the stored text; an ordering operator binds the
         // underlying value.
         if constexpr (FilterType::op == Op::EQ || FilterType::op == Op::NE) {
-            params.params.push_back(io::PgParam::text(Converter::codec::toDb(value)));
+            params.params.push_back(io::detail::PgParam::text(Converter::codec::toDb(value)));
         } else {
             params.push(static_cast<int64_t>(std::to_underlying(value)));
         }
     } else if constexpr (std::is_same_v<Converter, AsString>) {
         using std::to_string;
-        params.params.push_back(io::PgParam::text(toString(value)));
+        params.params.push_back(io::detail::PgParam::text(toString(value)));
     } else if constexpr (std::is_enum_v<T>) {
         params.push(static_cast<int64_t>(std::to_underlying(value)));
     } else {
@@ -83,7 +82,6 @@ inline constexpr bool compares_rank = is_via_v<typename FilterType::converter>
     && FilterType::op != Op::EQ && FilterType::op != Op::NE && !FilterType::is_set_op
     && !FilterType::is_null_op;
 
-}  // namespace detail
 
 // =============================================================================
 // Build SQL WHERE clause from Filters
@@ -144,6 +142,6 @@ template<typename Descriptor>
     return result;
 }
 
-}  // namespace jcailloux::relais::list::spec
+}  // namespace jcailloux::relais::list::spec::detail
 
 #endif  // JCX_RELAIS_LIST_SPEC_GENERATEDCRITERIA_H

@@ -6,7 +6,7 @@
 #include <type_traits>
 #include <vector>
 
-namespace jcailloux::relais {
+namespace jcailloux::relais::detail {
 
 template<typename T> struct is_tuple : std::false_type {};
 template<typename... Ts> struct is_tuple<std::tuple<Ts...>> : std::true_type {};
@@ -20,6 +20,6 @@ template<typename T> struct is_std_vector : std::false_type {};
 template<typename U, typename A> struct is_std_vector<std::vector<U, A>> : std::true_type {};
 template<typename T> inline constexpr bool is_std_vector_v = is_std_vector<T>::value;
 
-}  // namespace jcailloux::relais
+}  // namespace jcailloux::relais::detail
 
 #endif  // JCX_RELAIS_TYPE_TRAITS_H

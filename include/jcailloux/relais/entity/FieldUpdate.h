@@ -81,6 +81,8 @@ auto nowPlus(std::chrono::duration<Rep, Period> offset) {
         std::chrono::duration_cast<std::chrono::microseconds>(offset).count()};
 }
 
+namespace detail {
+
 // =============================================================================
 // SetOp — how an update assigns its column
 // =============================================================================
@@ -151,8 +153,6 @@ std::string fieldColumnName(const FieldNowPlus<F>&) {
     return std::string(Traits::template FieldInfo<F>::column_name);
 }
 
-namespace detail {
-
 /// True when V is the C++ enum a column maps to database strings.
 template<typename Info, typename V>
 inline constexpr bool is_mapped_enum_v = false;
@@ -174,8 +174,6 @@ auto columnValue(const V& value) {
     }
 }
 
-}  // namespace detail
-
 /// Extract properly-typed value for SQL binding from a FieldUpdate.
 template<typename Traits, auto F, typename V>
 auto fieldValue(const FieldUpdate<F, V>& update) {
@@ -189,8 +187,6 @@ std::nullptr_t fieldValue(const FieldSetNull<F>&) {
         "setNull<F>() can only be used on nullable fields");
     return nullptr;
 }
-
-namespace detail {
 
 /// Relative arithmetic needs a plain numeric column: NULL + n stays NULL, and a
 /// timestamp or a bool has no meaningful + n.
@@ -206,8 +202,6 @@ auto relativeValue(const V& value) {
         "increment/decrement take a numeric value");
     return static_cast<T>(value);
 }
-
-}  // namespace detail
 
 template<typename Traits, auto F, typename V>
 auto fieldValue(const FieldIncrement<F, V>& update) {
@@ -225,6 +219,8 @@ int64_t fieldValue(const FieldNowPlus<F>& update) {
         "nowPlus<F>() can only be used on timestamp fields");
     return update.microseconds;
 }
+
+}  // namespace detail
 
 }  // namespace jcailloux::relais::entity
 

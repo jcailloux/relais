@@ -361,6 +361,11 @@ if(RELAIS_BUILD_TESTS)
         target_compile_options(test_relais_chunk_map PRIVATE
             -fsanitize=thread -fno-omit-frame-pointer)
         target_link_options(test_relais_chunk_map PRIVATE -fsanitize=thread)
+        # Log callback swapped while plain threads log: TSan validates the
+        # callback slot.
+        target_compile_options(test_relais_dbprovider_log PRIVATE
+            -fsanitize=thread -fno-omit-frame-pointer)
+        target_link_options(test_relais_dbprovider_log PRIVATE -fsanitize=thread)
         # NB: the cache-coherence suite is single-loop (one event-loop thread), so
         # its concurrency-relevant surface — the shared static L1 under concurrent
         # find/update/erase, and the coroutine resume chains — is TSan-validated by

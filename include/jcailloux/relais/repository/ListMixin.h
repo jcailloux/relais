@@ -53,8 +53,6 @@ inline void trimListKeyScratch(std::string& key) noexcept {
     if (key.capacity() > kMaxRetained) std::string().swap(key);
 }
 
-}  // namespace detail
-
 /**
  * Optional mixin layer for declarative list caching.
  *
@@ -91,14 +89,14 @@ class ListMixin : public Base {
     static constexpr bool kHasL1 =
         Base::config.cache_level == config::CacheLevel::L1;
 
-    static constexpr bool kInsertKeyKnown = relais::kInsertKeyKnown<Entity>;
+    static constexpr bool kInsertKeyKnown = relais::detail::kInsertKeyKnown<Entity>;
 
     // =========================================================================
     // Type aliases from list infrastructure
     // =========================================================================
 
     using DescriptorFilters = list::spec::Filters<Descriptor>;
-    using DescriptorSortSpec = list::spec::SortSpec<Descriptor>;
+    using DescriptorSortSpec = list::spec::detail::SortSpec<Descriptor>;
 
     // =========================================================================
     // Traits adapter — bridges Descriptor helpers to ListCache interface
@@ -107,50 +105,50 @@ class ListMixin : public Base {
     struct Traits {
         using Filters = DescriptorFilters;
         using SortField = size_t;
-        using FilterTags = list::spec::FilterTags<Descriptor>;
+        using FilterTags = list::spec::detail::FilterTags<Descriptor>;
 
         static bool matchesFilters(const Entity& e, const Filters& f) {
-            return list::spec::matchesFilters<Descriptor>(e, f);
+            return list::spec::detail::matchesFilters<Descriptor>(e, f);
         }
 
         static int compare(const Entity& a, const Entity& b,
                           SortField field_index, list::SortDirection dir) {
-            return list::spec::compare<Descriptor>(a, b, {field_index, dir});
+            return list::spec::detail::compare<Descriptor>(a, b, {field_index, dir});
         }
 
-        static list::Cursor extractCursor(const Entity& e,
+        static list::detail::Cursor extractCursor(const Entity& e,
                                                   const list::SortSpec<size_t>& sort) {
-            return list::spec::extractCursor<Descriptor>(
+            return list::spec::detail::extractCursor<Descriptor>(
                 e, {sort.field, sort.direction});
         }
 
         static bool isBeforeOrAtCursor(const Entity& e,
-                                       const list::Cursor& cursor,
+                                       const list::detail::Cursor& cursor,
                                        const list::SortSpec<size_t>& sort) {
-            return list::spec::isBeforeOrAtCursor<Descriptor>(
+            return list::spec::detail::isBeforeOrAtCursor<Descriptor>(
                 e, cursor, {sort.field, sort.direction});
         }
 
         static FilterTags extractTags(const Entity& e) {
-            return list::spec::extractTags<Descriptor>(e);
+            return list::spec::detail::extractTags<Descriptor>(e);
         }
 
         static int64_t extractSortValue(const Entity& e, size_t field_index) {
-            return list::spec::extractSortValue<Descriptor>(e, field_index);
+            return list::spec::detail::extractSortValue<Descriptor>(e, field_index);
         }
 
         static constexpr list::SortSpec<size_t> defaultSort() {
-            auto ds = list::spec::defaultSort<Descriptor>();
+            auto ds = list::spec::detail::defaultSort<Descriptor>();
             return {ds.field_index, ds.direction};
         }
 
         // Ranges of rows (predicate writes) — see GeneratedTraits. Enable
         // ListCache's range consumption.
-        using RowsRange = list::spec::RowsRange<Descriptor>;
+        using RowsRange = list::spec::detail::RowsRange<Descriptor>;
 
-        static std::optional<list::spec::SortRange> rowsSortRange(
+        static std::optional<list::spec::detail::SortRange> rowsSortRange(
             const RowsRange& rows, const Filters& group, size_t field_index) {
-            return list::spec::rowsSortRange<Descriptor>(rows, group, field_index);
+            return list::spec::detail::rowsSortRange<Descriptor>(rows, group, field_index);
         }
 
         static std::optional<size_t> parseSortField(std::string_view field) {
@@ -158,7 +156,7 @@ class ListMixin : public Base {
         }
 
         static std::string_view sortFieldName(size_t field_index) {
-            return list::spec::sortFieldName<Descriptor>(field_index);
+            return list::spec::detail::sortFieldName<Descriptor>(field_index);
         }
 
         // Bucketed page sizes for cache key normalization. Sourced from the
@@ -168,7 +166,7 @@ class ListMixin : public Base {
         // declared a `limits=` annotation, else the shared kDefaultLimits
         // fallback. Arbitrary length — no fixed-size-4 assumption.
         static constexpr auto limitSteps = [] {
-            if constexpr (list::spec::HasAllowedLimits<Descriptor>) {
+            if constexpr (list::spec::detail::HasAllowedLimits<Descriptor>) {
                 return Descriptor::allowedLimits;
             } else {
                 return list::spec::kDefaultLimits;
@@ -188,9 +186,9 @@ class ListMixin : public Base {
     static constexpr bool HasGDSF = cache::GDSFPolicy::enabled;
 
     using ListWrapperType = list::ListWrapper<Entity>;
-    using ListCacheType = list::ListCache<Entity, Base::config.l1_chunk_count_log2, Key, Traits, HasGDSF>;
+    using ListCacheType = list::detail::ListCache<Entity, Base::config.l1_chunk_count_log2, Key, Traits, HasGDSF>;
 
-    static list::ListCacheConfig listCacheConfig() {
+    static list::detail::ListCacheConfig listCacheConfig() {
         return {
             .default_ttl_sec = static_cast<uint32_t>(
                 std::chrono::duration_cast<std::chrono::seconds>(
@@ -241,7 +239,7 @@ class ListMixin : public Base {
     // Query types
     // =========================================================================
 
-    using CacheQuery = list::ListQuery<DescriptorFilters, size_t>;
+    using CacheQuery = list::detail::ListQuery<DescriptorFilters, size_t>;
 
     static CacheQuery toCacheQuery(const auto& q, std::string page_key) {
         CacheQuery cq;
@@ -263,21 +261,21 @@ class ListMixin : public Base {
     static cache::CacheView<ListWrapperType> findInL1(
             const list::spec::ListQuery<Descriptor>& q) {
         auto& key = detail::listKeyScratch();
-        list::spec::appendPageKey<Descriptor>(key, q);
+        list::spec::detail::appendPageKey<Descriptor>(key, q);
         auto cached = listCache().getByKey(key);
         detail::trimListKeyScratch(key);
         return cached;
     }
 
-    /// Convert spec::defaultSort → list::SortSpec<size_t>
+    /// Convert spec::detail::defaultSort → list::SortSpec<size_t>
     static list::SortSpec<size_t> defaultSortAsListSpec() {
-        auto ds = list::spec::defaultSort<Descriptor>();
+        auto ds = list::spec::detail::defaultSort<Descriptor>();
         return {ds.field_index, ds.direction};
     }
 
 public:
 #if RELAIS_ENABLE_METRICS
-    static inline cache::L1Counters list_l1_counters_{};
+    static inline cache::detail::L1Counters list_l1_counters_{};
 #endif
 
     using typename Base::EntityType;
@@ -317,7 +315,7 @@ public:
     /// List result type — returned by query() (epoch-guarded, zero-copy)
     using ListResult = cache::CacheView<ListWrapperType>;
 
-    /// Traits type — exposed for controllers (sort parsing, limit normalization, etc.)
+    /// Traits adapter of the list cache; internal, outside the documented API.
     using ListTraits = Traits;
 
     // =========================================================================
@@ -391,7 +389,7 @@ public:
     {
         cache::CacheView<Entity> result;
         std::exception_ptr uncertain;
-        std::shared_ptr<io::SettleTicket> ticket;
+        std::shared_ptr<io::detail::SettleTicket> ticket;
         try {
             result = co_await Base::insert(entity);
         } catch (const io::PgUncertainError& e) {
@@ -458,7 +456,7 @@ public:
         static_assert(WithBefore, "this cascade reads the row before the write");
         typename Base::PatchedRow row;
         std::exception_ptr uncertain;
-        std::shared_ptr<io::SettleTicket> ticket;
+        std::shared_ptr<io::detail::SettleTicket> ticket;
         try {
             row = co_await Base::template patchRow<true>(
                 id, uncertain_before, std::forward<Updates>(updates)...);
@@ -488,7 +486,7 @@ public:
         static_assert(WithBefore, "this cascade reads the row before the write");
         std::optional<typename Base::PatchedRow> row;
         std::exception_ptr uncertain;
-        std::shared_ptr<io::SettleTicket> ticket;
+        std::shared_ptr<io::detail::SettleTicket> ticket;
         try {
             row = co_await Base::template patchIfRow<true>(
                 id, uncertain_before, guard, std::forward<Updates>(updates)...);
@@ -584,7 +582,7 @@ public:
     // runs now and again once settled.
 
     /// The row `key` left every page holding it.
-    static void notifyRowLeft(const std::shared_ptr<io::SettleTicket>& ticket, const Key& key) {
+    static void notifyRowLeft(const std::shared_ptr<io::detail::SettleTicket>& ticket, const Key& key) {
         if constexpr (kHasL1) detail::precautionSync(ticket, [key] { listCache().onRowLeft(key); });
     }
 
@@ -592,7 +590,7 @@ public:
     /// page, if empty) and, for the values `updates` set, may enter the
     /// pages of the groups that filter on, or sort by, a column they set.
     template<typename... Updates>
-    static void notifyRowsChanged(const std::shared_ptr<io::SettleTicket>& ticket,
+    static void notifyRowsChanged(const std::shared_ptr<io::detail::SettleTicket>& ticket,
                                   const detail::RowPredicate<Entity>& rows,
                                   const Updates&... updates) {
         if constexpr (kHasL1) {
@@ -614,7 +612,7 @@ public:
     }
 
     /// Any row may have changed: every page.
-    static void notifyEveryRow(const std::shared_ptr<io::SettleTicket>& ticket) {
+    static void notifyEveryRow(const std::shared_ptr<io::detail::SettleTicket>& ticket) {
         notifyRowsChanged(ticket, {});
     }
 
@@ -701,7 +699,7 @@ protected:
         static_assert(WithBefore, "this cascade reads the row before the write");
         typename Base::UpdateOutcome outcome;
         std::exception_ptr uncertain;
-        std::shared_ptr<io::SettleTicket> ticket;
+        std::shared_ptr<io::detail::SettleTicket> ticket;
         try {
             outcome = co_await Base::template updateOutcome<true>(id, entity, uncertain_before);
         } catch (const io::PgUncertainError& e) {
@@ -740,7 +738,7 @@ protected:
         static_assert(WithBefore, "this cascade reads the row before the write");
         typename Base::EraseOutcome outcome;
         std::exception_ptr uncertain;
-        std::shared_ptr<io::SettleTicket> ticket;
+        std::shared_ptr<io::detail::SettleTicket> ticket;
         try {
             outcome = co_await Base::template eraseOutcome<true>(id, hint, uncertain_before);
         } catch (const io::PgUncertainError& e) {
@@ -788,7 +786,7 @@ protected:
     /// then, `estimate` (the input, when it is a whole row) stands for where it
     /// may enter. Once settled, the row read again enters the pages of its
     /// position as committed (realignOnSettled).
-    static io::Task<void> realignUncertain(std::shared_ptr<io::SettleTicket> ticket, Key id,
+    static io::Task<void> realignUncertain(std::shared_ptr<io::detail::SettleTicket> ticket, Key id,
                                            std::optional<Entity> estimate) {
         detail::precautionSync(ticket, [id] { listCache().onRowLeft(id); });
         if (estimate) listCache().onEntityCreated(*estimate);
@@ -799,7 +797,7 @@ protected:
     /// PgRepo::rowsMayHaveBeenErased): the tiers below, then, for the keys
     /// they kept no copy of, the copies the pages hold (see keepPageCopy);
     /// then the rows leave every page holding one of them, in one entry.
-    static io::Task<void> rowsMayHaveBeenErased(std::shared_ptr<io::SettleTicket> ticket,
+    static io::Task<void> rowsMayHaveBeenErased(std::shared_ptr<io::detail::SettleTicket> ticket,
                                                 std::span<const Key> keys,
                                                 std::vector<std::optional<Entity>>* before) {
         co_await Base::rowsMayHaveBeenErased(ticket, keys, before);
@@ -818,7 +816,7 @@ protected:
     /// pages read before the write is settled are checked like the others),
     /// then the tiers below.
     template<typename... Updates>
-    static void rowsMayHaveChanged(const std::shared_ptr<io::SettleTicket>& ticket,
+    static void rowsMayHaveChanged(const std::shared_ptr<io::detail::SettleTicket>& ticket,
                                    const detail::RowPredicate<Entity>& rows,
                                    const Updates&... updates) {
         notifyRowsChanged(ticket, rows, updates...);
@@ -848,7 +846,7 @@ protected:
 
     template<typename U>
     static void moveRows(typename Traits::RowsRange& rows, const U& update) {
-        constexpr auto F = entity::update_field_v<U>;
+        constexpr auto F = entity::detail::update_field_v<U>;
         constexpr std::string_view column = detail::match::bareColumn(
             Entity::TraitsType::template FieldInfo<F>::column_name);
         constexpr bool sets_null = std::is_same_v<U, entity::FieldSetNull<F>>;
@@ -861,8 +859,8 @@ protected:
                     auto& value = std::get<Is>(rows.predicate.values);
                     if constexpr (FT::is_null_op) {
                         if constexpr (sets_null) value = true;
-                        else if constexpr (entity::assigns_value_v<U>) value = false;
-                    } else if constexpr (entity::assigns_value_v<U>) {
+                        else if constexpr (entity::detail::assigns_value_v<U>) value = false;
+                    } else if constexpr (entity::detail::assigns_value_v<U>) {
                         using T = typename FT::element_type;
                         if (auto v = setAs<T>(update.value)) {
                             if constexpr (FT::op == list::spec::Op::IN)
@@ -880,7 +878,7 @@ protected:
                 using ST = list::spec::sort_at<Descriptor, Ss>;
                 if constexpr (ST::column() == column) {
                     rows.moved_sorts |= uint64_t{1} << Ss;
-                    if constexpr (entity::assigns_value_v<U>) {
+                    if constexpr (entity::detail::assigns_value_v<U>) {
                         using W = list::spec::detail::unwrap_optional_t<typename ST::value_type>;
                         if (auto v = setAs<W>(update.value)) {
                             const int64_t x = list::spec::detail::toInt64ForCursor(*v);
@@ -915,7 +913,7 @@ protected:
     {
         cache::CacheView<Entity> result;
         std::exception_ptr uncertain;
-        std::shared_ptr<io::SettleTicket> ticket;
+        std::shared_ptr<io::detail::SettleTicket> ticket;
         try {
             result = co_await Base::upsert(entity);
         } catch (const io::PgUncertainError& e) {
@@ -974,7 +972,7 @@ protected:
 
         // 1. L1 check — epoch-guarded view, zero-copy
         if constexpr (kHasL1) {
-            list::spec::appendPageKey<Descriptor>(page_key, query);
+            list::spec::detail::appendPageKey<Descriptor>(page_key, query);
             if (auto cached = listCache().getByKey(page_key))
                 co_return std::move(cached);
         }
@@ -1006,11 +1004,11 @@ protected:
         }
 
         // Extract sort bounds from entities
-        list::SortBounds bounds;
+        list::detail::SortBounds bounds;
         if (!wrapper.items.empty()) {
-            bounds.first_value = list::spec::extractSortValue<Descriptor>(
+            bounds.first_value = list::spec::detail::extractSortValue<Descriptor>(
                 wrapper.items.front(), sort.field);
-            bounds.last_value = list::spec::extractSortValue<Descriptor>(
+            bounds.last_value = list::spec::detail::extractSortValue<Descriptor>(
                 wrapper.items.back(), sort.field);
             bounds.is_valid = true;
         }
@@ -1035,7 +1033,7 @@ protected:
     /// coalesce.
     static std::pair<const char*, io::PgParams> querySql(const ListQuery& query) {
         // Build WHERE clause from filters
-        auto where = list::spec::buildWhereClause<Descriptor>(query.filters());
+        auto where = list::spec::detail::buildWhereClause<Descriptor>(query.filters());
 
         // Parse sort
         auto sort = query.sort().value_or(defaultSortAsListSpec());
@@ -1078,7 +1076,7 @@ protected:
 
             if (!where.sql.empty()) where.sql += " AND ";
             where.sql += "(COALESCE(";
-            list::spec::appendSortExpression<Descriptor>(where.sql, sort.field);
+            list::spec::detail::appendSortExpression<Descriptor>(where.sql, sort.field);
             where.sql += ", 0)";
             appendKeyColumns(where.sql, nullptr);
             where.sql += ") ";
@@ -1091,9 +1089,9 @@ protected:
             }
             where.sql += ")";
 
-            where.params.params.push_back(io::PgParam::number(cursor_sort_value));
+            where.params.params.push_back(io::detail::PgParam::number(cursor_sort_value));
             for (size_t i = 0; i < kKeyN; ++i) {
-                where.params.params.push_back(io::PgParam::number(cursor_keys[i]));
+                where.params.params.push_back(io::detail::PgParam::number(cursor_keys[i]));
             }
         }
 
@@ -1107,20 +1105,20 @@ protected:
             sql += where.sql;
         }
         sql += " ORDER BY COALESCE(";
-        list::spec::appendSortExpression<Descriptor>(sql, sort.field);
+        list::spec::detail::appendSortExpression<Descriptor>(sql, sort.field);
         sql += ", 0) ";
         sql += is_desc ? "DESC" : "ASC";
         appendKeyColumns(sql, is_desc ? "DESC" : "ASC");
         sql += " LIMIT $";
         sql += std::to_string(where.next_param++);
-        where.params.params.push_back(io::PgParam::number(query.limit()));
+        where.params.params.push_back(io::detail::PgParam::number(query.limit()));
 
         // Offset pagination (mutually exclusive with cursor). No offset is
         // its own shape rather than OFFSET $n bound to 0.
         if (query.offset() > 0 && query.cursor().empty()) {
             sql += " OFFSET $";
             sql += std::to_string(where.next_param++);
-            where.params.params.push_back(io::PgParam::number(query.offset()));
+            where.params.params.push_back(io::detail::PgParam::number(query.offset()));
         }
 
         return {detail::internSql(std::move(sql)), std::move(where.params)};
@@ -1150,6 +1148,8 @@ protected:
         }
     }
 };
+
+}  // namespace detail
 
 }  // namespace jcailloux::relais
 

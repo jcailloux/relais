@@ -28,7 +28,7 @@
 namespace relais_test { struct TestInternals; }
 #endif
 
-namespace jcailloux::relais::cache {
+namespace jcailloux::relais::cache::detail {
 
 // =============================================================================
 // Feature detection concepts
@@ -117,7 +117,7 @@ public:
     // =========================================================================
 
     CacheTier() {
-        runtime::RuntimeThread::ensureStarted();
+        runtime::detail::RuntimeThread::ensureStarted();
     }
 
     ~CacheTier() = default;
@@ -147,7 +147,7 @@ public:
 
         // TTL check
         if constexpr (kHasTTL) {
-            if (ce->metadata.isExpired(runtime::CachedClock::now())) {
+            if (ce->metadata.isExpired(runtime::detail::CachedClock::now())) {
                 map_.remove_if(key, [ce](auto* e) { return e == ce; });
                 return {};
             }
@@ -341,7 +341,7 @@ public:
         } else {
             assert(map_.num_buckets() >= n_chunks);
             auto& policy = GDSFPolicy::instance();
-            CleanupContext ctx{runtime::CachedClock::now(),
+            CleanupContext ctx{runtime::detail::CachedClock::now(),
                                kHasGDSF ? policy.threshold() : 0.0f};
 
             std::vector<typename CleanupContext::GhostCandidate> candidates;
@@ -398,7 +398,7 @@ public:
             return 0;
         } else {
             auto& policy = GDSFPolicy::instance();
-            CleanupContext ctx{runtime::CachedClock::now(),
+            CleanupContext ctx{runtime::detail::CachedClock::now(),
                                kHasGDSF ? policy.threshold() : 0.0f};
 
             std::vector<typename CleanupContext::GhostCandidate> candidates;
@@ -593,12 +593,12 @@ private:
         struct Shard {
             std::mutex mu;
             std::unordered_map<Key, std::shared_ptr<InflightEntry>,
-                               detail::AutoHash<Key>> map;
+                               AutoHash<Key>> map;
         };
         std::array<Shard, kShards> shards;
 
         Shard& shard_for(const Key& k) {
-            return shards[detail::AutoHash<Key>{}(k)
+            return shards[AutoHash<Key>{}(k)
                           & static_cast<size_t>(kShards - 1)];
         }
 
@@ -853,6 +853,6 @@ private:
     }
 };
 
-}  // namespace jcailloux::relais::cache
+}  // namespace jcailloux::relais::cache::detail
 
 #endif  // JCX_RELAIS_CACHE_CACHETIER_H

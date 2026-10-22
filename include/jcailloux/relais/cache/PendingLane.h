@@ -9,16 +9,14 @@
 #include <type_traits>
 #include <vector>
 
-namespace jcailloux::relais::cache {
+namespace jcailloux::relais::cache::detail {
 
-namespace detail {
-    template<size_t N>
-    using SmallestUintFor = std::conditional_t<(N <= 8), uint8_t,
-                            std::conditional_t<(N <= 16), uint16_t,
-                            std::conditional_t<(N <= 32), uint32_t, uint64_t>>>;
+template<size_t N>
+using SmallestUintFor = std::conditional_t<(N <= 8), uint8_t,
+                        std::conditional_t<(N <= 16), uint16_t,
+                        std::conditional_t<(N <= 32), uint32_t, uint64_t>>>;
 
-    struct NoCount {};
-}
+struct NoCount {};
 
 // =============================================================================
 // PendingLane - Entries that every chunk of a cache must see once
@@ -42,7 +40,7 @@ public:
     static_assert(TotalSegments >= 2 && TotalSegments <= 64,
                   "TotalSegments must be between 2 and 64");
 
-    using BitmapType = detail::SmallestUintFor<TotalSegments>;
+    using BitmapType = SmallestUintFor<TotalSegments>;
 
     static constexpr BitmapType initial_bitmap_ =
         TotalSegments >= sizeof(BitmapType) * 8
@@ -59,7 +57,7 @@ public:
 private:
     std::vector<Entry> entries_;
     [[no_unique_address]]
-    std::conditional_t<Counted, std::atomic<uint32_t>, detail::NoCount> count_{};
+    std::conditional_t<Counted, std::atomic<uint32_t>, NoCount> count_{};
 
     void publishCount() {
         if constexpr (Counted)
@@ -168,6 +166,6 @@ public:
     [[nodiscard]] static constexpr BitmapType initialBitmap() { return initial_bitmap_; }
 };
 
-}  // namespace jcailloux::relais::cache
+}  // namespace jcailloux::relais::cache::detail
 
 #endif  // JCX_RELAIS_CACHE_PENDINGLANE_H

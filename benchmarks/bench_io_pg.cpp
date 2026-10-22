@@ -49,6 +49,7 @@
 #include <vector>
 
 using namespace jcailloux::relais::io;
+using namespace jcailloux::relais::io::detail;
 using namespace jcailloux::relais::io::test;
 using namespace relais_bench;
 
