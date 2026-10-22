@@ -38,9 +38,7 @@ if [ -d "$TESTS_DIR/fixtures" ]; then
   if command -v python3 &> /dev/null; then
       python3 "$SCRIPT_PATH" \
           --sources "$FIXTURES_DIR" \
-          --output-dir "$GENERATED_DIR" || {
-          echo "  Warning: Entity generation failed"
-      }
+          --output-dir "$GENERATED_DIR"
       echo "  Done."
   else
       echo "  Warning: python3 not found, skipping entity generation"
