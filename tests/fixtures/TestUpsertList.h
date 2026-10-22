@@ -17,7 +17,7 @@ namespace relais_test {
 // @relais table=relais_test_upsert_list
 // @relais_list limits=50
 struct TestUpsertList {
-    int64_t id = 0;          // @relais primary_key   (assigned, NOT db_managed)
+    int64_t id = 0;          // assigned, NOT db_managed — @relais primary_key
     int64_t owner_id = 0;    // @relais filterable sortable:asc
     std::string label;
 };
