@@ -264,6 +264,118 @@ class BraceCounting(GeneratorCase):
         self.assertFalse(self.out.exists() and any(self.out.iterdir()))
 
 
+class BodyDepth(GeneratorCase):
+    """A data member is a declaration of the struct body itself (depth 1)."""
+
+    def names(self, body: str) -> list:
+        return [m.name for m in self.entity(body).members]
+
+    def test_opening_brace_on_its_own_line(self):
+        self.assertEqual(self.names("""
+            // @relais table=t
+            struct T
+            {
+                int64_t id = 0;  // @relais primary_key
+                std::string name;
+            };
+        """), ["id", "name"])
+
+    def test_brace_initialized_members(self):
+        self.assertEqual(self.names("""
+            // @relais table=t
+            struct T {
+                int64_t id{0};  // @relais primary_key
+                std::vector<int32_t> ranks{1, 2};
+                int32_t views{};
+            };
+        """), ["id", "ranks", "views"])
+
+    def test_initializers_with_parentheses(self):
+        self.assertEqual(self.names("""
+            // @relais table=t
+            struct T {
+                int64_t id = 0;  // @relais primary_key
+                std::string name = std::string("x");
+                std::string tpl = R"({"a": })";
+            };
+        """), ["id", "name", "tpl"])
+
+    def test_function_bodies_hold_no_member(self):
+        self.assertEqual(self.names("""
+            // @relais table=t
+            struct T {
+                int64_t id = 0;  // @relais primary_key
+                int32_t views = 0;
+                int32_t twice() const {
+                    int32_t tmp = views * 2;
+                    return tmp;
+                }
+            };
+        """), ["id", "views"])
+
+    def test_nested_type_members_stay_in_the_nested_type(self):
+        self.assertEqual(self.names("""
+            // @relais table=t
+            struct T {
+                int64_t id = 0;  // @relais primary_key
+                struct Inner {
+                    int32_t hidden = 0;
+                };
+                Inner inner;
+            };
+        """), ["id", "inner"])
+
+    def test_struct_opened_after_other_code_on_its_line(self):
+        self.assertEqual(self.names("""
+            // @relais table=t
+            namespace app { struct T {
+                int64_t id = 0;  // @relais primary_key
+                std::string name;
+            }; }
+        """), ["id", "name"])
+
+    def test_access_specifier_followed_by_a_comment(self):
+        self.assertEqual(self.names("""
+            // @relais table=t
+            class T {
+                int32_t secret_ = 0;
+            public:  // columns
+                int64_t id = 0;  // @relais primary_key
+            private:  // cache
+                int32_t hits_ = 0;
+            };
+        """), ["id"])
+
+    def test_declarations_that_are_not_data_members(self):
+        self.assertEqual(self.names("""
+            // @relais table=t
+            struct T {
+                static constexpr int32_t kMax = 5;
+                inline static int32_t instances = 0;
+                using Id = int64_t;
+                typedef int64_t Key;
+                friend class Codec;
+                struct Forward;
+                enum class Kind { A, B };
+                template <typename X> using List = std::vector<X>;
+                int64_t id = 0;  // @relais primary_key
+            };
+        """), ["id"])
+
+    def test_an_annotated_declaration_without_definition_is_rejected(self):
+        self.header("Fwd.h", """
+            // @relais table=t
+            struct T;
+
+            struct Other {
+                int64_t id = 0;
+            };
+        """)
+        r = self.run_generator()
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("not defined", r.stderr)
+
+
 class EntityAnnotations(GeneratorCase):
 
     def test_table_and_namespace(self):
