@@ -257,6 +257,10 @@ Cache contamination across executables means specific suites should be run
 directly, e.g. `./.build/dev/test_relais_decl_list_full`. See
 [tests/README.md](tests/README.md).
 
+## Use of generative AI
+
+Relais is developed with an AI coding assistant, Claude Code (Anthropic). The assistant drafts code, tests, documentation and measurements. The author sets the design, decides each change, reviews it before committing it, and is responsible for the result.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
