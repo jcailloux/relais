@@ -29,9 +29,8 @@ namespace jcailloux::relais::io::test {
 // so dropping the Read bit via updateWatch suppresses delivery of already-
 // buffered bytes, and restoring it re-signals them on the next loop turn. We
 // track the mask relais last asked for per fd and re-apply it with Read masked
-// off while a hold is active, so a relais-driven updateWatch *during* a hold
-// (e.g. a watch re-register, or ConnectAwaiter flipping IN/OUT) cannot
-// accidentally lift it.
+// off while a hold is active, so an addWatch or updateWatch issued during a
+// hold cannot accidentally lift it.
 //
 // Loop-thread affinity matches EpollIoContext: the watch/hold methods touch the
 // fixture's own maps and must run on the loop thread; post()/postDelayed()/

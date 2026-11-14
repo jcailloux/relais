@@ -1,17 +1,19 @@
 // Liveness / timeout suite for the I/O layer.
 //
 // Every test here drives a fault into the loop — a withheld read, a blackholed
-// connect, an injected RST, a poisoned pool slot — and asserts the worker stays
-// live: a bounded timeout fires, the poisoned resource is reclaimed, no slot or
-// waiter leaks, and nothing double-resumes or dangles. Run it under ASan
-// (.build/asan) and TSan (.build/tsan); the bugs these guard against are exactly
-// the kind those sanitizers catch.
+// connect, a socket replaced mid-handshake, an injected RST, a poisoned pool
+// slot — and asserts the worker stays live: a bounded timeout fires, the
+// poisoned resource is reclaimed, no slot or waiter leaks, and nothing
+// double-resumes or dangles. Run it under ASan (.build/asan) and TSan
+// (.build/tsan); the bugs these guard against are exactly the kind those
+// sanitizers catch.
 //
 // Fault injection lives entirely in tests/fixtures (ControllableIoContext,
-// PgProbe) plus the in-test SilentTcpServer — nothing in include/ knows it is
-// under test.
+// PgProbe) plus the in-test SilentTcpServer and TlsDropServer — nothing in
+// include/ knows it is under test.
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 
 #include <jcailloux/relais/io/pg/PgConnection.h>
 #include <jcailloux/relais/io/pg/PgPool.h>
@@ -28,15 +30,20 @@
 #include <arpa/inet.h>
 #include <dirent.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <chrono>
 #include <coroutine>
+#include <cstdint>
 #include <exception>
 #include <memory>
 #include <optional>
 #include <string>
+#include <thread>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -88,6 +95,120 @@ struct SilentTcpServer {
     std::string conninfo() const {
         return "host=127.0.0.1 port=" + std::to_string(port_) +
                " dbname=relais_test user=relais_test password=x";
+    }
+};
+
+// A fake PG server that makes libpq replace its socket inside one PQconnectPoll
+// call. The first connection accepts TLS ('S' to the SSLRequest), then drops as
+// the ClientHello arrives; under sslmode=prefer libpq retries in plaintext on a
+// new socket. The second connection answers the StartupMessage with a FATAL
+// ErrorResponse. A client that follows the new socket fails fast with kError; one
+// still watching the old socket waits for acquire_timeout. One thread, blocking
+// I/O bounded by poll, two connections served once.
+struct TlsDropServer {
+    static constexpr const char* kError = "fake: plaintext reached";
+
+    std::atomic<bool> saw_ssl_request{false};
+    std::atomic<bool> saw_plain_startup{false};
+
+    TlsDropServer() {
+        fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        REQUIRE(fd >= 0);
+        int one = 1;
+        ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = 0;  // ephemeral
+        REQUIRE(::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
+        REQUIRE(::listen(fd, 4) == 0);
+        socklen_t len = sizeof(addr);
+        REQUIRE(::getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len) == 0);
+        port_ = ntohs(addr.sin_port);
+        thread_ = std::thread([this] { serve(); });
+    }
+    ~TlsDropServer() {
+        thread_.join();
+        ::close(fd);
+    }
+    TlsDropServer(const TlsDropServer&) = delete;
+    TlsDropServer& operator=(const TlsDropServer&) = delete;
+
+    std::string conninfo() const {
+        // gssencmode=disable: no GSSENCRequest ahead of the SSLRequest, even
+        // with a Kerberos credential cache around.
+        return "host=127.0.0.1 port=" + std::to_string(port_) +
+               " user=u dbname=d sslmode=prefer gssencmode=disable";
+    }
+
+private:
+    int fd = -1;
+    int port_ = 0;
+    std::thread thread_;
+
+    static bool readFull(int s, void* buf, size_t n) {
+        auto* p = static_cast<char*>(buf);
+        while (n > 0) {
+            pollfd pfd{s, POLLIN, 0};
+            if (::poll(&pfd, 1, 2000) <= 0) return false;
+            ssize_t r = ::read(s, p, n);
+            if (r <= 0) return false;
+            p += r;
+            n -= static_cast<size_t>(r);
+        }
+        return true;
+    }
+
+    int acceptOne() const {
+        pollfd pfd{fd, POLLIN, 0};
+        if (::poll(&pfd, 1, 3000) <= 0) return -1;
+        return ::accept4(fd, nullptr, nullptr, SOCK_CLOEXEC);
+    }
+
+    static uint32_t be32(const unsigned char* b) {
+        return (uint32_t{b[0]} << 24) | (uint32_t{b[1]} << 16) | (uint32_t{b[2]} << 8) | b[3];
+    }
+
+    void serve() {
+        // 1st connection: SSLRequest → 'S', wait for the ClientHello's record
+        // header, then drop it mid-handshake.
+        int c1 = acceptOne();
+        if (c1 < 0) return;
+        unsigned char req[8];
+        if (readFull(c1, req, sizeof(req)) && be32(req) == 8 && be32(req + 4) == 80877103u) {
+            saw_ssl_request = true;
+            [[maybe_unused]] ssize_t sent = ::write(c1, "S", 1);
+            unsigned char hello[5];
+            readFull(c1, hello, sizeof(hello));
+        }
+        ::close(c1);
+        if (!saw_ssl_request) return;  // libpq without TLS: no plaintext retry to serve
+
+        // 2nd connection: plaintext StartupMessage (protocol 3.x) → FATAL error.
+        int c2 = acceptOne();
+        if (c2 < 0) return;
+        unsigned char hdr[8];
+        if (readFull(c2, hdr, sizeof(hdr)) && be32(hdr) >= 8 && (be32(hdr + 4) >> 16) == 3) {
+            saw_plain_startup = true;
+            std::string rest(be32(hdr) - 8, '\0');
+            readFull(c2, rest.data(), rest.size());
+
+            const std::pair<char, const char*> fields[] = {
+                {'S', "FATAL"}, {'V', "FATAL"}, {'C', "28000"}, {'M', kError}};
+            std::string body;
+            for (auto [code, value] : fields) {
+                body += code;
+                body += value;
+                body += '\0';
+            }
+            body += '\0';
+            const uint32_t len = htonl(static_cast<uint32_t>(body.size() + 4));
+            std::string msg = "E";
+            msg.append(reinterpret_cast<const char*>(&len), sizeof(len));
+            msg += body;
+            [[maybe_unused]] ssize_t sent = ::write(c2, msg.data(), msg.size());
+        }
+        ::close(c2);
     }
 };
 
@@ -375,7 +496,7 @@ TEST_CASE("liveness: a blackholed connect (path b) trips PgPoolTimeout and recla
     auto elapsed = std::chrono::steady_clock::now() - t0;
 
     // Bounded near acquire_timeout: the single timer armed at the first watch
-    // registration survived the connect's WRITING→READING mask flips (the whole
+    // registration survived the connect's per-step re-watch (the whole
     // multi-step handshake stayed bounded).
     REQUIRE(elapsed < 2s);
     // Path (b): the timeout is on the connect, never on the queue — no waiter was
@@ -398,6 +519,47 @@ TEST_CASE("liveness: repeated connect failures never freeze the pool",
     // and the pool is never wedged at max with dead slots.
     REQUIRE(pool->totalConnections() == 0);
     REQUIRE(pool->waiterCount() == 0);
+}
+
+TEST_CASE("liveness: a connect follows the socket libpq replaces mid-handshake",
+          "[io][liveness][integration]") {
+    TlsDropServer srv;
+    Io io;
+    const std::string conninfo = srv.conninfo();
+
+    // Whatever the entry point, the connect ends with the server's error, long
+    // before acquire_timeout (3 s).
+    auto expectFollowed = [&](auto connect) {
+        const auto t0 = std::chrono::steady_clock::now();
+        std::string error;
+        try {
+            connect();
+            FAIL("connected to a server that only answers with an error");
+        } catch (const PgPoolTimeout&) {
+            FAIL("the connect waited for acquire_timeout on the socket libpq replaced");
+        } catch (const PgConnectionError& e) {
+            error = e.what();
+        }
+        const auto elapsed = std::chrono::steady_clock::now() - t0;
+
+        if (!srv.saw_ssl_request)
+            SKIP("libpq built without TLS: it never replaces its socket here");
+        CHECK(srv.saw_plain_startup);
+        CHECK_THAT(error, Catch::Matchers::ContainsSubstring(TlsDropServer::kError));
+        CHECK(elapsed < 1s);
+    };
+
+    SECTION("PgConnection::connect") {
+        expectFollowed([&] {
+            driveBounded(io, PgConnection<Io>::connect(io, conninfo.c_str(), 3s));
+        });
+    }
+    SECTION("PgPool::create, boot connection") {
+        expectFollowed([&] {
+            driveBounded(io, PgPool<Io>::create(io, conninfo,
+                {.min_connections = 1, .max_connections = 1, .acquire_timeout = 3s}));
+        });
+    }
 }
 
 // =============================================================================

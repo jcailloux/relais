@@ -563,6 +563,7 @@ private:
     struct ConnectAwaiter {
         PgConnection* self;
         std::chrono::nanoseconds timeout;  // acquire_timeout, 0 = unbounded
+        bool watch_failed = false;         // the socket could not be watched mid-handshake
 
         bool await_ready() const noexcept { return false; }
 
@@ -586,9 +587,9 @@ private:
                     return;
             }
 
-            // Arm the acquire_timeout ONCE here. pollConnect() flips the epoll mask
-            // via updateWatchEvents() (not registerWatch) across the multi-step
-            // handshake, so this single timer bounds the *entire* connect; it is
+            // Arm the acquire_timeout ONCE here. pollConnect() moves the watch onto
+            // the current socket after every handshake step without touching the
+            // timer, so this single timer bounds the *entire* connect; it is
             // cancelled only at the final removeCurrentWatch.
             self->registerWatch(events, [this](IoEvent) {
                 pollConnect();
@@ -600,6 +601,9 @@ private:
             // pool timeout, distinct from a server-refused connection.
             if (self->dead_)
                 throw PgPoolTimeout("connect handshake exceeded acquire_timeout");
+            if (watch_failed)
+                throw PgConnectionError(
+                    "async connect failed: could not watch the connection's socket");
             if (PQstatus(self->conn_) != CONNECTION_OK)
                 throw PgConnectionError(
                     std::string("async connect failed: ") + PQerrorMessage(self->conn_));
@@ -607,30 +611,33 @@ private:
 
     private:
         void pollConnect() {
-            auto poll = PQconnectPoll(self->conn_);
-
-            switch (poll) {
-                case PGRES_POLLING_READING:
-                    self->updateWatchEvents(IoEvent::Read);
-                    break;
-                case PGRES_POLLING_WRITING:
-                    self->updateWatchEvents(IoEvent::Write);
-                    break;
-                case PGRES_POLLING_OK:
-                case PGRES_POLLING_FAILED: {
-                    // Save before removeCurrentWatch destroys this lambda (and its captures)
-                    auto coro = self->current_cont_;
-                    self->removeCurrentWatch();
-                    coro.resume();
-                    break;
-                }
-                default: {
-                    auto coro = self->current_cont_;
-                    self->removeCurrentWatch();
-                    coro.resume();
-                    break;
-                }
+            switch (PQconnectPoll(self->conn_)) {
+                case PGRES_POLLING_READING: rewatch(IoEvent::Read);  break;
+                case PGRES_POLLING_WRITING: rewatch(IoEvent::Write); break;
+                default:                    finish();                break;  // OK, FAILED
             }
+        }
+
+        // PQconnectPoll may close the socket and open another one (sslmode=prefer
+        // falling back to plaintext, next host or address, target_session_attrs).
+        // The epoll registration dies with the old socket even when the new one
+        // reuses its number, so the current socket is watched afresh after every
+        // step. acquire_timeout keeps bounding the whole handshake.
+        void rewatch(IoEvent events) {
+            try {
+                self->rewatchSocket(events, [this](IoEvent) { pollConnect(); });
+            } catch (...) {
+                // Never let it escape into the event loop: fail this connect.
+                watch_failed = true;
+                finish();
+            }
+        }
+
+        void finish() {
+            // Save before removeCurrentWatch destroys the lambda we run in
+            auto coro = self->current_cont_;
+            self->removeCurrentWatch();  // also cancels acquire_timeout
+            coro.resume();
         }
     };
 
@@ -738,12 +745,16 @@ private:
         }
     }
 
-    void updateWatchEvents(IoEvent events) {
-        // Deliberately does NOT touch the timer: the connect handshake flips the
-        // mask here repeatedly, and acquire_timeout must bound the whole handshake,
-        // not restart per step.
-        if (watch_active_)
-            io_->updateWatch(watch_, events);
+    // Moves the I/O watch onto the connection's current socket, leaving the
+    // watch-bound timer armed: acquire_timeout must bound the whole handshake,
+    // not restart per step. If addWatch throws, no watch is left behind.
+    void rewatchSocket(IoEvent events, std::function<void(IoEvent)> cb) {
+        if (watch_active_) {
+            io_->removeWatch(watch_);
+            watch_active_ = false;
+        }
+        watch_ = io_->addWatch(socket(), events, std::move(cb));
+        watch_active_ = true;
     }
 
     void removeCurrentWatch() {
