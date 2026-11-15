@@ -1,8 +1,8 @@
 -- Test base table + aggregated VIEW for relais array-column mapping
 -- (int8[] -> std::vector<int64_t>, text[] -> std::vector<std::string>).
--- Mirrors the codiga member_role_set pattern: a junction collapsed per owner via
--- array_agg. INNER scan + GROUP BY → an owner with no rows is simply absent from the
--- view (find() miss → empty), and array_agg never yields {NULL}.
+-- A junction table collapsed per owner via array_agg. INNER scan + GROUP BY → an
+-- owner with no rows is simply absent from the view (find() miss → empty), and
+-- array_agg never yields {NULL}.
 
 CREATE TABLE IF NOT EXISTS relais_test_array_src (
     owner_id BIGINT NOT NULL,

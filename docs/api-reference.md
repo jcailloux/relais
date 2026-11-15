@@ -952,7 +952,7 @@ Required expressions (6), each result-constrained via `-> std::same_as<...>`:
 | `cancelTimer` | No-op if the timer already fired or is unknown. |
 </details>
 
-> **Changing this concept breaks foreign adapters.** A real consumer (codiga/api, co-locating relais on Drogon via a `TrantorIoContext`) satisfies `IoContext` and is validated by the harness — any signature change to the six expressions or two member types breaks every external adapter. Treat it as a stable ABI-like contract.
+> **Changing this concept breaks foreign adapters.** Adapters live outside relais (e.g. a `TrantorIoContext` co-locating relais on Drogon), satisfy `IoContext` and are validated by the harness — any signature change to the six expressions or two member types breaks every external adapter. Treat it as a stable ABI-like contract.
 
 <details>
 <summary>EpollIoContext: methods beyond the concept</summary>
