@@ -7,8 +7,8 @@
 namespace relais_test {
 
 // Read-only aggregated view: one row per owner carrying the set of related rows
-// collapsed into arrays (array_agg). Mirrors the codiga member_role_set pattern
-// (a member's role_ids as int8[]). Exercises the array-column mapping:
+// collapsed into arrays (array_agg): a junction table read from one side (e.g.
+// a member's role ids as int8[]). Exercises the array-column mapping:
 //   int8[] -> std::vector<int64_t>   (numeric, no quoting)
 //   text[] -> std::vector<std::string>  (quoting/escaping, commas inside elements)
 // Point-lookup find(owner_id) returns one entity; the array fields are parsed by
