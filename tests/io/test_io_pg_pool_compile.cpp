@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <type_traits>
 
 using namespace jcailloux::relais::io;
 using namespace jcailloux::relais::io::detail;
@@ -34,6 +35,13 @@ using TestConnection = PgConnection<TestIo>;
 using TestPool = PgPool<TestIo>;
 using TestClient = PgClient<TestIo>;
 using TestGuard = TestPool::ConnectionGuard;
+
+// A connection's I/O callbacks hold its address: it must never move. The guard
+// that lends it moves freely.
+static_assert(!std::is_move_constructible_v<TestConnection>);
+static_assert(!std::is_move_assignable_v<TestConnection>);
+static_assert(std::is_nothrow_move_constructible_v<TestGuard>);
+static_assert(std::is_nothrow_move_assignable_v<TestGuard>);
 
 TEST_CASE("PgPool and PgClient compile with mock IoContext", "[pg][pool]") {
     // Pure compilation test — no DB connection

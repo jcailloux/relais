@@ -85,16 +85,16 @@ TEST_CASE("Benchmark - PG raw SELECT", "[benchmark][pg][latency][select]")
         std::vector<BenchResult> results;
 
         results.push_back(co_await benchAsync("SELECT 1", [&]() -> Task<void> {
-            co_await conn.query("SELECT 1");
+            co_await conn->query("SELECT 1");
         }));
 
         results.push_back(co_await benchAsync("SELECT 1 (parameterized)", [&]() -> Task<void> {
             auto params = PgParams::make(1);
-            co_await conn.queryParams("SELECT $1::int", params);
+            co_await conn->queryParams("SELECT $1::int", params);
         }));
 
         results.push_back(co_await benchAsync("SELECT now()", [&]() -> Task<void> {
-            co_await conn.query("SELECT now()");
+            co_await conn->query("SELECT now()");
         }));
 
         co_return results;

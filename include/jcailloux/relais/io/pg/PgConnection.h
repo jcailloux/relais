@@ -27,17 +27,13 @@
 namespace jcailloux::relais::io::detail {
 
 // PgConnection — RAII async PostgreSQL connection using libpq + IoContext
+//
+// Neither copyable nor movable: its watch and timer callbacks hold `this`, so
+// a connection stays where connect() built it, on the heap, until destroyed.
 
 template<IoContext Io>
 class PgConnection {
 public:
-    PgConnection(Io& io, PGconn* conn,
-                 std::chrono::nanoseconds query_timeout = {}) noexcept
-        : io_(&io), conn_(conn), query_timeout_(query_timeout) {
-        assert(conn_);
-        PQsetnonblocking(conn_, 1);
-    }
-
     ~PgConnection() {
         if (conn_) {
             // Route teardown through removeCurrentWatch: it cancels any armed
@@ -47,60 +43,6 @@ public:
             removeCurrentWatch();
             PQfinish(conn_);
         }
-    }
-
-    // Move only
-    PgConnection(PgConnection&& o) noexcept
-        : io_(o.io_)
-        , conn_(std::exchange(o.conn_, nullptr))
-        , watch_(std::exchange(o.watch_, {}))
-        , watch_active_(std::exchange(o.watch_active_, false))
-        , prepared_(std::move(o.prepared_))
-        , pipeline_prepare_queued_(o.pipeline_prepare_queued_)
-        , pipeline_prepares_(std::move(o.pipeline_prepares_))
-        , pipeline_read_pos_(o.pipeline_read_pos_)
-        // dead_ + timer token + stored continuation must travel with the
-        // connection. release() takes ConnectionType *by value* → move-constructs;
-        // dropping dead_ here would resurrect a poisoned connection (connected() ==
-        // PQstatus==OK on a silent hang), and dropping the timer token would orphan it.
-        , dead_(o.dead_)
-        , current_cont_(std::exchange(o.current_cont_, {}))
-        , timer_(std::exchange(o.timer_, {}))
-        , timer_armed_(std::exchange(o.timer_armed_, false))
-        , query_timeout_(o.query_timeout_)
-        , settle_(o.settle_)
-        , backend_(std::move(o.backend_))
-    {
-        // Never move mid-wait: the watch callback (and timer) capture a raw `this`
-        // that move does not patch → UAF. watch_active_ catches the query_timeout=0
-        // case too (watch, no timer). Holds by run-to-completion; assert guards it.
-        assert(!watch_active_);
-    }
-
-    PgConnection& operator=(PgConnection&& o) noexcept {
-        if (this != &o) {
-            assert(!o.watch_active_);  // never move mid-wait (watch/timer → UAF)
-            if (conn_) {
-                removeCurrentWatch();  // cancel timer before PQfinish (timer → UAF)
-                PQfinish(conn_);
-            }
-            io_ = o.io_;
-            conn_ = std::exchange(o.conn_, nullptr);
-            watch_ = std::exchange(o.watch_, {});
-            watch_active_ = std::exchange(o.watch_active_, false);
-            prepared_ = std::move(o.prepared_);
-            pipeline_prepare_queued_ = o.pipeline_prepare_queued_;
-            pipeline_prepares_ = std::move(o.pipeline_prepares_);
-            pipeline_read_pos_ = o.pipeline_read_pos_;
-            dead_ = o.dead_;
-            current_cont_ = std::exchange(o.current_cont_, {});
-            timer_ = std::exchange(o.timer_, {});
-            timer_armed_ = std::exchange(o.timer_armed_, false);
-            query_timeout_ = o.query_timeout_;
-            settle_ = o.settle_;
-            backend_ = std::move(o.backend_);
-        }
-        return *this;
     }
 
     PgConnection(const PgConnection&) = delete;
@@ -131,30 +73,33 @@ public:
     // without a delay reads the server's statement_timeout, both here within
     // acquire_timeout; a given delay and Off add no round-trip. A non-zero
     // client_check_interval adds one, except under Delay.
-    static Task<PgConnection> connect(Io& io, const char* conninfo,
-                                      std::chrono::nanoseconds acquire_timeout = {},
-                                      std::chrono::nanoseconds query_timeout = {},
-                                      SettleConfig settle = {}) {
-        PGconn* conn = PQconnectStart(conninfo);
-        if (!conn)
+    static Task<std::unique_ptr<PgConnection>> connect(
+        Io& io, const char* conninfo,
+        std::chrono::nanoseconds acquire_timeout = {},
+        std::chrono::nanoseconds query_timeout = {},
+        SettleConfig settle = {})
+    {
+        // Allocated before libpq's connection, which it then owns: a failure
+        // below frees both.
+        std::unique_ptr<PgConnection> pgconn(new PgConnection(io, query_timeout));
+        pgconn->conn_ = PQconnectStart(conninfo);
+        if (!pgconn->conn_)
             throw PgConnectionError("PQconnectStart returned null");
 
-        if (PQstatus(conn) == CONNECTION_BAD) {
-            std::string err = PQerrorMessage(conn);
-            PQfinish(conn);
-            throw PgConnectionError("connect failed: " + err);
-        }
+        if (PQstatus(pgconn->conn_) == CONNECTION_BAD)
+            throw PgConnectionError(std::string("connect failed: ")
+                                    + PQerrorMessage(pgconn->conn_));
+        PQsetnonblocking(pgconn->conn_, 1);
 
-        PgConnection pgconn(io, conn, query_timeout);
-        co_await pgconn.awaitConnect(acquire_timeout);
-        pgconn.settle_ = settle;
+        co_await pgconn->awaitConnect(acquire_timeout);
+        pgconn->settle_ = settle;
         if (settle.mode == UncertainSettle::Terminate || settle.mode == UncertainSettle::Await)
-            co_await pgconn.readBackendId(acquire_timeout);
+            co_await pgconn->readBackendId(acquire_timeout);
         else if (settle.mode == UncertainSettle::Delay && settle.delay.count() <= 0)
-            co_await pgconn.readStatementTimeout(acquire_timeout);
+            co_await pgconn->readStatementTimeout(acquire_timeout);
         if (settle.mode != UncertainSettle::Delay && settle.client_check_interval.count() > 0)
-            co_await pgconn.setClientCheckInterval(settle.client_check_interval, acquire_timeout);
-        co_return std::move(pgconn);
+            co_await pgconn->setClientCheckInterval(settle.client_check_interval, acquire_timeout);
+        co_return pgconn;
     }
 
     /// The backend serving this connection, read at connect; unknown when the
@@ -365,6 +310,9 @@ public:
     }
 
 private:
+    PgConnection(Io& io, std::chrono::nanoseconds query_timeout) noexcept
+        : io_(io), query_timeout_(query_timeout) {}
+
     // Part of acquiring the connection, so bounded by acquire_timeout and failing
     // as an acquire does: the request changes nothing, its failure is never
     // uncertain. A server-side refusal leaves the backend unknown and the
@@ -580,10 +528,10 @@ private:
                     events = IoEvent::Write;
                     break;
                 case PGRES_POLLING_OK:
-                    self->io_->post([h] { h.resume(); });
+                    self->io_.post([h] { h.resume(); });
                     return;
                 default:
-                    self->io_->post([h] { h.resume(); });
+                    self->io_.post([h] { h.resume(); });
                     return;
             }
 
@@ -734,13 +682,13 @@ private:
         // would leak the predecessor's timer on every awaiter chaining (the pipeline
         // chains one per result read).
         removeCurrentWatch();
-        watch_ = io_->addWatch(socket(), events, std::move(cb));
+        watch_ = io_.addWatch(socket(), events, std::move(cb));
         watch_active_ = true;
         // Arm the watch-bound timeout AFTER the watch is posted. The invariant
         // becomes: timer armed ⟺ watch active ⟺ connection waiting on I/O.
         // 0 = unbounded (delegated to conninfo connect_timeout/statement_timeout).
         if (timeout.count() > 0) {
-            timer_ = io_->postDelayed(timeout, [this] { timeoutCurrentWait(); });
+            timer_ = io_.postDelayed(timeout, [this] { timeoutCurrentWait(); });
             timer_armed_ = true;
         }
     }
@@ -750,10 +698,10 @@ private:
     // not restart per step. If addWatch throws, no watch is left behind.
     void rewatchSocket(IoEvent events, std::function<void(IoEvent)> cb) {
         if (watch_active_) {
-            io_->removeWatch(watch_);
+            io_.removeWatch(watch_);
             watch_active_ = false;
         }
-        watch_ = io_->addWatch(socket(), events, std::move(cb));
+        watch_ = io_.addWatch(socket(), events, std::move(cb));
         watch_active_ = true;
     }
 
@@ -763,11 +711,11 @@ private:
         // the co-resident timeout. Single point that does both — no per-site
         // cancelTimer to forget.
         if (timer_armed_) {
-            io_->cancelTimer(timer_);
+            io_.cancelTimer(timer_);
             timer_armed_ = false;
         }
         if (watch_active_) {
-            io_->removeWatch(watch_);
+            io_.removeWatch(watch_);
             watch_active_ = false;
         }
     }
@@ -787,11 +735,11 @@ private:
         dead_ = true;
         if (current_cont_) {
             auto coro = current_cont_;
-            io_->post([coro] { coro.resume(); });
+            io_.post([coro] { coro.resume(); });
         }
     }
 
-    Io* io_;
+    Io& io_;
     PGconn* conn_ = nullptr;
     typename Io::WatchHandle watch_{};
     bool watch_active_ = false;

@@ -1,6 +1,7 @@
 #ifndef JCX_RELAIS_IO_PG_POOL_H
 #define JCX_RELAIS_IO_PG_POOL_H
 
+#include <algorithm>
 #include <cassert>
 #include <chrono>
 #include <coroutine>
@@ -8,7 +9,6 @@
 #include <deque>
 #include <functional>
 #include <memory>
-#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -63,32 +63,28 @@ class PgPool : public std::enable_shared_from_this<PgPool<Io>> {
 public:
     using ConnectionType = detail::PgConnection<Io>;
 
-    // ConnectionGuard — RAII: returns connection to pool on destruction
+    // ConnectionGuard — RAII: lends a connection of the pool, returns it on
+    // destruction. The connection itself never moves; the pool owns it.
 
     class ConnectionGuard {
     public:
         ConnectionGuard() noexcept = default;
 
-        ConnectionGuard(std::shared_ptr<PgPool> pool, ConnectionType conn) noexcept
-            : pool_(std::move(pool)), conn_(std::move(conn)) {}
+        ConnectionGuard(std::shared_ptr<PgPool> pool, ConnectionType* conn) noexcept
+            : pool_(std::move(pool)), conn_(conn) {}
 
         ~ConnectionGuard() {
-            if (pool_ && conn_)
-                pool_->release(std::move(*conn_));
+            if (conn_) pool_->release(conn_);
         }
 
         ConnectionGuard(ConnectionGuard&& o) noexcept
-            : pool_(std::move(o.pool_)), conn_(std::move(o.conn_))
-        {
-            o.conn_.reset();
-        }
+            : pool_(std::move(o.pool_)), conn_(std::exchange(o.conn_, nullptr)) {}
 
         ConnectionGuard& operator=(ConnectionGuard&& o) noexcept {
             if (this != &o) {
-                if (pool_ && conn_) pool_->release(std::move(*conn_));
+                if (conn_) pool_->release(conn_);
                 pool_ = std::move(o.pool_);
-                conn_ = std::move(o.conn_);
-                o.conn_.reset();
+                conn_ = std::exchange(o.conn_, nullptr);
             }
             return *this;
         }
@@ -100,7 +96,7 @@ public:
 
     private:
         std::shared_ptr<PgPool> pool_;
-        std::optional<ConnectionType> conn_;
+        ConnectionType* conn_ = nullptr;  // non-null ⟹ pool_ non-null
     };
 
     // Factory: create pool with initial connections.
@@ -129,12 +125,12 @@ public:
             auto conn = co_await ConnectionType::connect(
                 pool->io_, pool->conninfo_.c_str(),
                 cfg.acquire_timeout, cfg.query_timeout, pool->settleConfig());
-            pool->idle_.push_back(std::move(conn));
+            pool->idle_.push_back(pool->adopt(std::move(conn)));
             ++pool->total_;
         }
 
         if (cfg.uncertain_settle == UncertainSettle::Delay && !pool->idle_.empty()
-            && pool->idle_.front().settleDelay().count() == 0) {
+            && pool->idle_.front()->settleDelay().count() == 0) {
             RELAIS_LOG_WARN << "relais: uncertain_settle is Delay, but neither settle_delay "
                                "nor the server's statement_timeout bounds a write: "
                                "uncertain writes will not be settled";
@@ -147,9 +143,9 @@ public:
 
     Task<ConnectionGuard> acquire() {
         if (!idle_.empty()) {
-            auto conn = std::move(idle_.back());
+            auto* conn = idle_.back();
             idle_.pop_back();
-            co_return ConnectionGuard(this->shared_from_this(), std::move(conn));
+            co_return ConnectionGuard(this->shared_from_this(), conn);
         }
 
         if (total_ < cfg_.max_connections) {
@@ -172,8 +168,9 @@ public:
             auto conn = co_await ConnectionType::connect(
                 io_, conninfo_.c_str(), cfg_.acquire_timeout, cfg_.query_timeout,
                 settleConfig());
+            auto* adopted = adopt(std::move(conn));
             slot.committed = true;
-            co_return ConnectionGuard(this->shared_from_this(), std::move(conn));
+            co_return ConnectionGuard(this->shared_from_this(), adopted);
         }
 
         Waiter waiter{this};
@@ -207,14 +204,33 @@ private:
         return {cfg_.uncertain_settle, cfg_.settle_delay, cfg_.client_check_interval};
     }
 
-    void release(ConnectionType conn) {
+    // Takes ownership of a new connection, which stays at its address until
+    // destroy(). Returns that address.
+    ConnectionType* adopt(std::unique_ptr<ConnectionType> conn) {
+        conns_.push_back(std::move(conn));
+        return conns_.back().get();
+    }
+
+    // Linear in the pool size, off the hot path: only a dead connection is
+    // destroyed while the pool lives.
+    void destroy(ConnectionType* conn) noexcept {
+        auto it = std::find_if(conns_.begin(), conns_.end(),
+                               [conn](const auto& c) { return c.get() == conn; });
+        assert(it != conns_.end());
+        std::swap(*it, conns_.back());
+        conns_.pop_back();
+    }
+
+    void release(ConnectionType* conn) {
+        // A dead connection is dropped, never handed to a waiter.
+        if (!conn->connected()) {
+            --total_;
+            replenish();
+            destroy(conn);
+            return;
+        }
+
         if (!waiters_.empty()) {
-            // Validate connection before handing to a waiter
-            if (!conn.connected()) {
-                --total_;
-                replenish();
-                return;
-            }
             auto* waiter = waiters_.front();
             waiters_.pop_front();
             // Win the acquire_timeout race: cancel the waiter's timer
@@ -222,16 +238,12 @@ private:
             // expiry callback (onWaiterTimeout) cannot run. No-op if unarmed
             // (acquire_timeout == 0).
             if (waiter->armed_) io_.cancelTimer(waiter->timer_);
-            waiter->conn.emplace(std::move(conn));
+            waiter->conn = conn;
             io_.post([h = waiter->continuation] { h.resume(); });
             return;
         }
 
-        if (conn.connected()) {
-            idle_.push_back(std::move(conn));
-        } else {
-            --total_;
-        }
+        idle_.push_back(conn);
     }
 
     // A dead connection freed a slot while acquires wait: nothing else would
@@ -249,7 +261,7 @@ private:
             auto conn = co_await ConnectionType::connect(
                 self->io_, self->conninfo_.c_str(), self->cfg_.acquire_timeout,
                 self->cfg_.query_timeout, self->settleConfig());
-            self->release(std::move(conn));
+            self->release(self->adopt(std::move(conn)));
         } catch (...) {
             --self->total_;
         }
@@ -275,7 +287,7 @@ private:
 
     struct Waiter {
         PgPool* pool;
-        std::optional<ConnectionType> conn;
+        ConnectionType* conn = nullptr;  // handed over by release()
         std::coroutine_handle<> continuation;
         typename Io::TimerToken timer_{};
         bool armed_ = false;      // timer_ holds a live token
@@ -310,8 +322,8 @@ private:
         ConnectionGuard await_resume() {
             if (timed_out_)
                 throw PgPoolTimeout("queue wait exceeded acquire_timeout");
-            assert(conn.has_value());
-            return ConnectionGuard(pool->shared_from_this(), std::move(*conn));
+            assert(conn);
+            return ConnectionGuard(pool->shared_from_this(), conn);
         }
     };
 
@@ -320,7 +332,10 @@ private:
     PgPoolConfig cfg_;
     size_t total_ = 0;
 
-    std::vector<ConnectionType> idle_;
+    // Every connection the pool owns, idle or lent out. Its I/O callbacks hold
+    // its address, so the pool keeps it in a node of its own, never moved.
+    std::vector<std::unique_ptr<ConnectionType>> conns_;
+    std::vector<ConnectionType*> idle_;
     std::deque<Waiter*> waiters_;
 };
 

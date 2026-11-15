@@ -243,7 +243,7 @@ private:
     Worker run() {
         // Leave the handler of the failed write before any work.
         co_await Nap{this, Clock::duration{}};
-        std::optional<PgConnection<Io>> conn;
+        std::unique_ptr<PgConnection<Io>> conn;
         while (!jobs_.empty()) {
 #ifdef RELAIS_BUILDING_TESTS
             if (paused_) {
@@ -281,7 +281,7 @@ private:
 
     // One step on the job's backend. A connection failure, or a statement that
     // may not have run, is retried; a server refusal is reported.
-    Task<Step> attempt(Job& job, std::optional<PgConnection<Io>>& conn) {
+    Task<Step> attempt(Job& job, std::unique_ptr<PgConnection<Io>>& conn) {
         if (job.mode == UncertainSettle::Delay) co_return Step::Settled;
         try {
             co_await connect(conn);
@@ -317,7 +317,7 @@ private:
 
     // The server refuses to settle the backend: the write is still bounded by
     // the statement_timeout of the role, if any. The job then waits that long.
-    Task<Step> fallBack(Job& job, std::optional<PgConnection<Io>>& conn) {
+    Task<Step> fallBack(Job& job, std::unique_ptr<PgConnection<Io>>& conn) {
         int64_t ms = 0;
         try {
             PgResult r = co_await conn->query(kStatementTimeoutSql);
@@ -356,7 +356,7 @@ private:
     // The backend is gone, or its delay elapsed. With one ticket, itself the
     // backend's sole unresolved write, the transaction seen running was the
     // write's: the server tells whether it committed. Anything else is Unknown.
-    Task<WriteOutcome> readOutcome(const Job& job, std::optional<PgConnection<Io>>& conn) {
+    Task<WriteOutcome> readOutcome(const Job& job, std::unique_ptr<PgConnection<Io>>& conn) {
         if (job.mode == UncertainSettle::Delay || !job.xid || job.tickets.size() != 1
             || job.tickets.front()->unresolved != 1 || !conn || !conn->connected())
             co_return WriteOutcome::Unknown;
@@ -378,7 +378,7 @@ private:
     // runs at once. Then the replays start in registration order, together: one
     // that reads the database does not hold back the evictions registered after
     // it. A failure is logged without stopping the others.
-    Task<void> settle(std::optional<PgConnection<Io>>& conn) {
+    Task<void> settle(std::unique_ptr<PgConnection<Io>>& conn) {
         auto outcome = co_await readOutcome(*current_, conn);
         // A ticket joined while the status was read: the transaction may be its.
         if (current_->tickets.size() != 1) outcome = WriteOutcome::Unknown;
@@ -411,7 +411,7 @@ private:
         --replaying_;
     }
 
-    Task<void> connect(std::optional<PgConnection<Io>>& conn) {
+    Task<void> connect(std::unique_ptr<PgConnection<Io>>& conn) {
 #ifdef RELAIS_BUILDING_TESTS
         if (fault.count > 0 && fault.kind == Fault::Kind::Unreachable) {
             --fault.count;
@@ -426,8 +426,8 @@ private:
         // leaves them that time whatever the pool's query_timeout.
         const auto query_timeout = std::max<std::chrono::milliseconds>(
             cfg.query_timeout, kTerminateWait + std::chrono::seconds{5});
-        conn.emplace(co_await PgConnection<Io>::connect(
-            io_, pool_->conninfo().c_str(), cfg.acquire_timeout, query_timeout));
+        conn = co_await PgConnection<Io>::connect(
+            io_, pool_->conninfo().c_str(), cfg.acquire_timeout, query_timeout);
     }
 
     Io& io_;
