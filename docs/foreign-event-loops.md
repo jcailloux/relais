@@ -42,9 +42,9 @@ and enforced by the harness:
 
 | relais method | what it must do |
 |---|---|
-| `WatchHandle addWatch(int fd, IoEvent mask, cb)` | register `fd`; call `cb(events)` on the loop thread when ready, with matching `IoEvent` bits |
+| `WatchHandle addWatch(int fd, IoEvent mask, cb)` | register `fd`; call `cb(events)` on the loop thread when ready, with matching `IoEvent` bits. **A watch follows the open file, not the number**: after `fd` is closed, `removeWatch` then `addWatch` on a new fd that reuses the number must deliver the new file's events |
 | `void updateWatch(WatchHandle, IoEvent mask)` | change the active mask on that handle |
-| `void removeWatch(WatchHandle)` | stop all callbacks for that handle; **must be safe to call from inside that handle's own callback** — defer teardown of loop-owned state |
+| `void removeWatch(WatchHandle)` | stop all callbacks for that handle at once, **including for the rest of the event being dispatched**; **must be safe to call from inside that handle's own callback** — defer teardown of loop-owned state |
 | `void post(std::function<void()>)` | run once, on the loop thread, FIFO; thread-safe; **wake a blocked loop promptly** |
 | `TimerToken postDelayed(duration, cb)` | run `cb` once, on the loop thread, after the delay; return a cancellable token. Drives both the adaptive batch flush **and** the per-I/O-wait `query_timeout` — a timer that never fires means no liveness protection |
 | `void cancelTimer(TimerToken)` | cancel a pending `postDelayed`; no-op if already fired or unknown |

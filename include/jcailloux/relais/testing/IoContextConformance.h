@@ -13,6 +13,7 @@
 #include <vector>
 
 #include <sys/eventfd.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 // =============================================================================
@@ -22,8 +23,10 @@
 // The `IoContext` concept (io/IoContext.h) constrains only method *signatures*.
 // The semantic contract an adapter must honor — post() runs the callback once,
 // on the loop thread, and wakes a blocked loop; watches fire with the right
-// event mask on the loop thread; updateWatch/removeWatch take effect — cannot be
-// expressed by a concept. This harness encodes it as runnable checks.
+// event mask on the loop thread and follow the open file, not the fd number;
+// updateWatch takes effect, and removeWatch stops delivery at once, even for the
+// event being dispatched — cannot be expressed by a concept. This harness
+// encodes it as runnable checks.
 //
 // Who uses it:
 //   - relais CI runs it against EpollIoContext (test_io_context_conformance).
@@ -93,6 +96,18 @@ void pump(Io& io, Drive&& drive, int turns) {
     };
     io.post(step);
     drive(io, [&] { return remaining.load() <= 0; });
+}
+
+// Drives the loop until pred() holds or `timeout` elapses. A check whose event a
+// faulty adapter never delivers then fails instead of hanging; it relies on the
+// bounded wait `drive` already requires. Waiting for the event itself, rather
+// than for a number of turns, also holds on a loop that runs callbacks posted
+// from a callback within the same turn (trantor does), where pump() spans a
+// single turn.
+template<io::IoContext Io, typename Drive, typename Pred>
+void driveFor(Io& io, Drive&& drive, Pred&& pred, std::chrono::milliseconds timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    drive(io, [&] { return pred() || std::chrono::steady_clock::now() >= deadline; });
 }
 
 }  // namespace detail
@@ -237,6 +252,86 @@ struct IoContextConformance {
         efd.clear();
     }
 
+    // C12: a watch follows the open file, not the fd number. From a watch's own
+    // callback, close its fd and open a new one — the kernel hands back the
+    // lowest free number, so in practice the same one — then removeWatch the old
+    // handle and addWatch the new fd: the new file's events must reach the new
+    // watch. A PgConnection runs this exact sequence when libpq replaces its
+    // socket mid-connect (TLS or GSS fallback, next host or address). It fails an
+    // adapter that lets per-fd state outlive the close: a removal applied after
+    // the re-add, or an addWatch turned into a mask update on a registration the
+    // kernel already dropped, leaves the new socket unwatched until the connect
+    // times out.
+    template<io::IoContext Io, typename Drive>
+    static void checkRewatchReusedFd(Io& io, Drive drive) {
+        detail::EventFd a;
+        int b = -1;  // the replacement fd, closed below
+        int fired_old = 0, fired_new = 0;
+        typename Io::WatchHandle h_old{}, h_new{};
+        h_old = io.addWatch(a.fd, IoEvent::Read, [&](IoEvent) {
+            if (++fired_old > 1) return;
+            ::close(a.fd);
+            a.fd = -1;  // closed here, so ~EventFd must not close the number again
+            b = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+            io.removeWatch(h_old);
+            if (b < 0) return;  // reported as a setup failure below
+            uint64_t one = 1;
+            [[maybe_unused]] auto _ = ::write(b, &one, sizeof(one));
+            h_new = io.addWatch(b, IoEvent::Read, [&](IoEvent) {
+                ++fired_new;
+                io.removeWatch(h_new);
+            });
+        });
+        a.signal();
+        detail::driveFor(io, drive, [&] { return fired_new > 0; }, std::chrono::seconds(1));
+        detail::pump(io, drive, 3);  // a duplicate would surface here
+
+        if (b >= 0) {
+            if (fired_new == 0) io.removeWatch(h_new);
+            ::close(b);
+        }
+        detail::require(fired_old == 0 || b >= 0, "eventfd creation failed (harness setup)");
+        detail::require(fired_old == 1 && fired_new == 1,
+            "re-watch of a closed and reused fd number: the new fd's events must "
+            "reach the new watch exactly once, observed " + std::to_string(fired_new)
+            + " calls (old watch: " + std::to_string(fired_old) + ")");
+    }
+
+    // C13: removeWatch() stops delivery at once, including for the rest of the
+    // event being dispatched. A socket both readable and writable raises one
+    // event carrying both bits; a watch on Read|Write that removes itself from
+    // its callback must be called once. It fails an adapter that dispatches one
+    // event as several callbacks (read, then write) without re-checking the watch
+    // in between, as trantor's Channel does when an adapter sets its read and
+    // write callbacks separately. relais removes a watch and then resumes a
+    // coroutine from the same callback, so a second call runs against a
+    // coroutine that has moved on, or a frame already destroyed.
+    template<io::IoContext Io, typename Drive>
+    static void checkRemoveWatchWithinEvent(Io& io, Drive drive) {
+        int sv[2];
+        detail::require(
+            ::socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, sv) == 0,
+            "socketpair creation failed (harness setup)");
+        const char byte = 0;
+        [[maybe_unused]] auto _ = ::write(sv[1], &byte, 1);  // sv[0]: readable and writable
+
+        int calls = 0;
+        typename Io::WatchHandle h{};
+        h = io.addWatch(sv[0], IoEvent::Read | IoEvent::Write, [&](IoEvent) {
+            ++calls;
+            io.removeWatch(h);
+        });
+        detail::driveFor(io, drive, [&] { return calls > 0; }, std::chrono::seconds(1));
+        detail::pump(io, drive, 3);  // a refire on a later turn would surface here
+
+        if (calls == 0) io.removeWatch(h);
+        ::close(sv[0]);
+        ::close(sv[1]);
+        detail::require(calls == 1,
+            "removeWatch() within an event carrying several bits: no further call "
+            "may follow for that event, observed " + std::to_string(calls) + " calls");
+    }
+
     // -- cross-thread -------------------------------------------------------
 
     // C7: post() from another thread runs the callback ON the loop thread and
@@ -333,6 +428,8 @@ struct IoContextConformance {
 
     // -- aggregate ----------------------------------------------------------
 
+    // Checks are numbered in the order they were added; runAll groups them by
+    // subject and runs C1-C6, C10, C12, C13, C7-C9, C11.
     template<io::IoContext Io, typename Drive>
     static void runAll(Io& io, Drive drive) {
         checkPostExecutes(io, drive);
@@ -342,6 +439,8 @@ struct IoContextConformance {
         checkUpdateWatch(io, drive);
         checkRemoveWatch(io, drive);
         checkRemoveWatchReentrant(io, drive);
+        checkRewatchReusedFd(io, drive);
+        checkRemoveWatchWithinEvent(io, drive);
         checkCrossThreadPost(io, drive);
         checkPostDelayedFires(io, drive);
         checkCancelTimer(io, drive);
