@@ -1052,3 +1052,73 @@ TEST_CASE("liveness: an L1-only IoPool tears down with no fd leak",
     int fds_after = countOpenFds();
     REQUIRE(fds_after <= fds_before);
 }
+
+TEST_CASE("liveness: IoPool teardown waits for a request in flight",
+          "[io][iopool][integration][teardown]") {
+    // A request still running at stop() holds a connection of the pool: the
+    // teardown waits for its result, so that neither its frame nor the pool and
+    // its connections are left behind.
+    int fds_before = countOpenFds();
+    std::atomic<bool> started{false};
+    bool finished = false;  // written on the worker, read after the join
+    {
+        IoPoolConfig cfg;
+        cfg.num_workers = 1;
+        cfg.pg_conninfo = getConnInfo();
+        cfg.pin_to_cores = false;
+        cfg.pg_min_conns_per_worker = 1;
+        cfg.pg_max_conns_per_worker = 1;
+        auto pool = IoPool::create(cfg);
+
+        pool->workerIo(0).post([&] {
+            [](std::atomic<bool>& started, bool& finished) -> DetachedTask {
+                started = true;
+                (void)co_await jcailloux::relais::PgProvider::query("SELECT pg_sleep(0.3)");
+                finished = true;
+            }(started, finished);
+        });
+        while (!started) std::this_thread::yield();
+        pool->stop();
+    }
+    CHECK(finished);
+    CHECK(countOpenFds() <= fds_before);
+}
+
+TEST_CASE("liveness: IoPool teardown waits for relais's detached work",
+          "[io][iopool][integration][teardown]") {
+    // Work relais detaches on a loop and that holds no connection, such as
+    // draining the rows an uncertain write may have changed: the teardown runs
+    // it to its end too.
+    struct Sleep {
+        IoPool::Io& io;
+        std::chrono::milliseconds delay;
+        bool await_ready() const noexcept { return false; }
+        void await_suspend(std::coroutine_handle<> h) {
+            io.postDelayed(delay, [h] { h.resume(); });
+        }
+        void await_resume() const noexcept {}
+    };
+    std::atomic<bool> started{false};
+    bool finished = false;  // written on the worker, read after the join
+    {
+        IoPoolConfig cfg;
+        cfg.num_workers = 1;
+        cfg.pg_conninfo = getConnInfo();
+        cfg.pin_to_cores = false;
+        cfg.pg_min_conns_per_worker = 1;
+        cfg.pg_max_conns_per_worker = 1;
+        auto pool = IoPool::create(cfg);
+
+        auto& io = pool->workerIo(0);
+        io.post([&] {
+            [](IoPool::Io& io, std::atomic<bool>& started, bool& finished) -> TrackedTask {
+                started = true;
+                co_await Sleep{io, 300ms};
+                finished = true;
+            }(io, started, finished);
+        });
+        while (!started) std::this_thread::yield();
+        pool->stop();
+    }
+    CHECK(finished);
+}
