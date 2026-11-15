@@ -420,6 +420,25 @@ TEST_CASE("liveness: a poisoned connection is not handed back as idle",
     pump(io);
 }
 
+TEST_CASE("liveness: an idle connection the server closed is not lent",
+          "[io][liveness][integration]") {
+    Io io;
+    const std::string conninfo = std::string(getConnInfo())
+                               + " application_name=relais_liveness_idle_pool";
+    auto pool = driveBounded(io, PgPool<Io>::create(io, conninfo,
+        {.min_connections = 1, .max_connections = 1, .acquire_timeout = 2s,
+         .query_timeout = 2s}));
+
+    PgProbe probe(getConnInfo());
+    REQUIRE(probe.terminateBackends("application_name = 'relais_liveness_idle_pool'") == 1);
+    pump(io, 200ms);  // the idle connection reads the server's farewell
+
+    auto guard = driveBounded(io, pool->acquire());
+    CHECK(guard.conn().connected());
+    CHECK(driveBounded(io, guard.conn().query("SELECT 1")).ok());
+    CHECK(pool->totalConnections() == 1);
+}
+
 // =============================================================================
 // Pool-level: acquire timeout (queue wait) and connect-hang
 // =============================================================================
@@ -560,6 +579,124 @@ TEST_CASE("liveness: a connect follows the socket libpq replaces mid-handshake",
                 {.min_connections = 1, .max_connections = 1, .acquire_timeout = 3s}));
         });
     }
+}
+
+TEST_CASE("liveness: a connect changes its watches outside any event dispatch",
+          "[io][liveness][integration]") {
+    Io io;
+    const int fds_before = countOpenFds();
+
+    SECTION("a handshake that succeeds") {
+        auto conn = driveBounded(io, PgConnection<Io>::connect(io, getConnInfo(), 2s));
+        REQUIRE(conn->connected());
+    }
+    SECTION("a handshake libpq restarts on a new socket") {
+        TlsDropServer srv;
+        REQUIRE_THROWS_AS(
+            driveBounded(io, PgConnection<Io>::connect(io, srv.conninfo().c_str(), 3s)),
+            PgConnectionError);
+    }
+    SECTION("a handshake cut by acquire_timeout") {
+        SilentTcpServer silent;
+        REQUIRE_THROWS_AS(
+            driveBounded(io, PgConnection<Io>::connect(io, silent.conninfo().c_str(), 200ms)),
+            PgPoolTimeout);
+    }
+
+    pump(io, 50ms);  // runs the posted removal of the last watch
+    CHECK(io.watchChangesInDispatch() == 0);
+    CHECK(countOpenFds() <= fds_before);  // libpq's socket and every duplicate closed
+}
+
+TEST_CASE("liveness: requests keep the connection's one watch",
+          "[io][liveness][integration]") {
+    Io io;
+    auto pool = driveBounded(io, PgPool<Io>::create(io, getConnInfo(),
+        {.min_connections = 1, .max_connections = 1, .acquire_timeout = 2s,
+         .query_timeout = 2s}));
+    const auto added = io.addedWatches();
+
+    for (int i = 0; i < 3; ++i) {
+        auto guard = driveBounded(io, pool->acquire());
+        REQUIRE(driveBounded(io, guard.conn().query("SELECT 1")).ok());
+        REQUIRE(driveBounded(io, guard.conn().queryParams(
+            "SELECT $1::int", PgParams::make(int32_t{i}))).ok());
+    }
+    {
+        auto guard = driveBounded(io, pool->acquire());
+        auto& conn = guard.conn();
+        std::vector<PgPool<Io>::ConnectionType::PipelineResult> results;
+        driveBounded(io, [&]() -> Task<void> {
+            conn.enterPipelineMode();
+            for (int i = 0; i < 4; ++i) {
+                if (conn.ensurePreparedPipelined("SELECT $1::int + 1", 1)) conn.pipelineSync();
+                conn.sendPreparedPipelined("SELECT $1::int + 1", PgParams::make(int32_t{i}));
+                conn.pipelineSync();
+            }
+            co_await conn.flushPipeline();
+            co_await conn.readPipelineResults(4, results);
+            conn.exitPipelineMode();
+        }());
+        REQUIRE(results.size() == 4);
+    }
+
+    CHECK(io.addedWatches() == added);
+    CHECK(io.watchChangesInDispatch() == 0);
+}
+
+TEST_CASE("liveness: a pipeline flush reads what the server answers meanwhile",
+          "[io][liveness][integration]") {
+    Io io;
+    auto conn = driveBounded(io, PgConnection<Io>::connect(io, getConnInfo(), 2s, 5s));
+
+    // The first statement answers 32 MiB, more than both socket buffers hold;
+    // the server reads the 16 MiB of statements behind it only once that answer
+    // is out. Until the client reads it, the server blocks writing, stops
+    // reading, and the flush can never finish.
+    constexpr int kTail = 256;
+    const std::string payload(64 * 1024, 'x');
+    std::vector<PgConnection<Io>::PipelineResult> results;
+    driveBounded(io, [&]() -> Task<void> {
+        auto send = [&](const char* sql, const PgParams& params) {
+            if (conn->ensurePreparedPipelined(sql, params.count())) conn->pipelineSync();
+            conn->sendPreparedPipelined(sql, params);
+            conn->pipelineSync();
+        };
+        conn->enterPipelineMode();
+        send("SELECT repeat('x', $1::int)", PgParams::make(int32_t{32 << 20}));
+        for (int i = 0; i < kTail; ++i)
+            send("SELECT length($1::text)", PgParams::make(payload));
+        co_await conn->flushPipeline();
+        co_await conn->readPipelineResults(kTail + 1, results);
+        conn->exitPipelineMode();
+    }(), 30s);
+
+    REQUIRE(results.size() == kTail + 1);
+    for (const auto& r : results) REQUIRE(r.result.ok());
+}
+
+TEST_CASE("liveness: an idle connection the server closes is let go at once",
+          "[io][liveness][integration]") {
+    Io io;
+    const std::string conninfo = std::string(getConnInfo())
+                               + " application_name=relais_liveness_idle";
+    auto conn = driveBounded(io, PgConnection<Io>::connect(io, conninfo.c_str(), 2s, 2s));
+    REQUIRE(conn->connected());
+    PgProbe probe(getConnInfo());
+    const int fds_connected = countOpenFds();
+
+    REQUIRE(probe.terminateBackends("application_name = 'relais_liveness_idle'") == 1);
+
+    const auto deadline = std::chrono::steady_clock::now() + 3s;
+    while (conn->connected() && std::chrono::steady_clock::now() < deadline)
+        io.runOnce(10);
+    REQUIRE_FALSE(conn->connected());
+    pump(io, 50ms);
+
+    // Neither libpq's socket nor its duplicate lingers half-closed.
+    CHECK(conn->socket() == -1);
+    CHECK(countOpenFds() == fds_connected - 2);
+    CHECK(io.watchChangesInDispatch() == 0);
 }
 
 // =============================================================================
@@ -804,6 +941,37 @@ TEST_CASE("liveness: ordered teardown drains an in-flight detached fire, no leak
 
     if (s.handle) s.handle.destroy();
     pump(io);  // a leaked fire frame / stray timer would surface here under ASan
+}
+
+TEST_CASE("liveness: a request destroyed mid-wait poisons its connection",
+          "[io][liveness][integration][teardown]") {
+    Io io;
+    auto pool = driveBounded(io, PgPool<Io>::create(io, getConnInfo(),
+        {.min_connections = 1, .max_connections = 1, .acquire_timeout = 2s,
+         .query_timeout = 2s}));
+
+    // Suspended on its result, withheld; then its frame is destroyed.
+    int fd = -1;
+    auto op = [&]() -> Task<void> {
+        auto guard = co_await pool->acquire();
+        fd = guard.conn().socket();
+        io.holdReads(fd);
+        co_await guard.conn().query("SELECT 1");
+    };
+    auto starter = [](Task<void> t) -> Starter { co_await std::move(t); };
+    auto s = starter(op());
+    pump(io, 100ms);
+    REQUIRE(fd >= 0);
+    s.handle.destroy();
+
+    // The result still on its way answers nobody: the connection is dropped.
+    CHECK(pool->totalConnections() == 0);
+    CHECK(pool->idleCount() == 0);
+    io.releaseReads(fd);
+    pump(io);
+
+    auto guard = driveBounded(io, pool->acquire());
+    CHECK(driveBounded(io, guard.conn().query("SELECT 1")).ok());
 }
 
 TEST_CASE("liveness: fail-fast startup reclaims an in-flight connect, no fd leak",

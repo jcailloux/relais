@@ -81,16 +81,17 @@ namespace detail {
 // gives the handle to its owner. That ownership is what lets fail-fast teardown
 // reclaim a boot that is still suspended on a connect which never completed
 // (a dependency blackholed at boot, past startup_timeout): destroying the frame
-// runs its in-frame connection destructors — PgConnection cancels the
-// watch-bound timer, removes the watch, and PQfinishes the fd — so
-// neither the coroutine frame nor its socket fd leaks. With a self-destroying
+// runs its in-frame connection destructors — PgConnection cancels its timer,
+// posts the removal of its watch, and PQfinishes libpq's socket; the loop closes
+// relais's duplicate when it runs or destroys that task — so neither the
+// coroutine frame nor its socket fd leaks. With a self-destroying
 // DetachedTask the suspended frame and its fd would be abandoned, leaking one fd
 // per failed startup; a service that retries create() in a loop would exhaust
 // them.
 //
 // Destroy-only contract: the owner destroys the frame ONLY after the worker
 // thread is joined (nothing is mid-resume) and BEFORE the worker's IoContext is
-// torn down (removeWatch still reaches a live loop). The frame is never resumed
+// torn down (the posted removal still reaches a live loop). The frame is never resumed
 // after the thread stops, so a boot suspended inside the startup lambda never
 // dereferences the (by then destroyed) lambda closure — destruction only runs
 // the frame's local destructors.
