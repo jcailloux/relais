@@ -221,20 +221,24 @@ public:
     // Ordered teardown
     // =========================================================================
 
-    /// True when no detached work remains in flight: no fire*Batch is running, no
-    /// batch is still accumulating (its departure timer would otherwise leave
-    /// entries unfired). Ordered teardown pumps the loop until this holds (or a
-    /// grace deadline elapses). In-flight fires are not cancelled: each is
-    /// bounded by the per-operation query/acquire timeouts (a hung fire times
-    /// out, unwinds in error, and self-destroys). Loop-thread only — no
-    /// synchronization, since every mutation runs on the one loop.
+    /// True when nothing relais started on this loop is still running: no
+    /// coroutine relais detached on this thread (batch fires, background reads
+    /// and drains), no batch still accumulating (its departure timer would
+    /// otherwise leave entries unfired), and no connection of the pool lent,
+    /// connecting or awaited (a request in flight holds one, whoever awaits it).
+    /// Ordered teardown pumps the loop until this holds (or a grace deadline
+    /// elapses). Nothing is cancelled: each request is bounded by the
+    /// per-operation query/acquire timeouts (a hung one times out, unwinds in
+    /// error, and its frame ends). Loop-thread only — no synchronization, since
+    /// every mutation runs on the one loop.
     [[nodiscard]] bool quiescentForTeardown() const noexcept {
-        return detached_inflight_ == 0
+        return io::detail::TrackedTask::inFlight() == 0
             && pg_read_batch_.entries.empty()
-            && pg_write_batch_.entries.empty();
+            && pg_write_batch_.entries.empty()
+            && (!pg_pool_ || pg_pool_->quiescent());
     }
 
-    /// Diagnostic: in-flight detached fire coroutines (loop-thread only).
+    /// Diagnostic: this scheduler's batch fires in flight (loop-thread only).
     [[nodiscard]] size_t inflightDetached() const noexcept { return detached_inflight_; }
 
     /// The queue settling this loop's uncertain writes (for testing/diagnostics).
@@ -827,13 +831,11 @@ private:
         return used;
     }
 
-    // RAII counter for in-flight detached fire coroutines. One is constructed at
+    // RAII counter for this scheduler's fires in flight. One is constructed at
     // the top of each fire*Batch, right after its self-anchor — so it is destroyed
     // *before* the anchor releases the scheduler, keeping detached_inflight_ (a
-    // scheduler member) valid through the decrement. Ordered teardown pumps the
-    // loop until the count is zero, with each fire bounded by the per-operation
-    // query/acquire timeouts. The dtor runs on every exit, including frame
-    // destruction, so the count never sticks.
+    // scheduler member) valid through the decrement. The dtor runs on every
+    // exit, including frame destruction, so the count never sticks.
     struct InflightGuard {
         size_t& counter;
         explicit InflightGuard(size_t& c) noexcept : counter(c) { ++counter; }
@@ -853,7 +855,7 @@ private:
     // PG Read batch execution
     // =========================================================================
 
-    DetachedTask firePgReadBatch(std::vector<PgReadEntry*> entries) {
+    io::detail::TrackedTask firePgReadBatch(std::vector<PgReadEntry*> entries) {
         // Anchor the scheduler for the whole fire. The resume loop below runs
         // continuations that can unwind to the last external owner of this
         // scheduler (a provider/test teardown), and the drain-or-chain after it
@@ -862,14 +864,13 @@ private:
         // frame end, after the final `this` access, so a chained fire (which takes
         // its own anchor) carries the lifetime forward.
         auto self = this->shared_from_this();
-        // Count this fire as in-flight detached work for the life of the frame so
-        // ordered teardown pumps the loop until it drains (declared after `self`
-        // → destroyed first → the decrement lands while `self` still holds the
-        // scheduler alive).
+        // Count this fire among the scheduler's for the life of the frame
+        // (declared after `self` → destroyed first → the decrement lands while
+        // `self` still holds the scheduler alive).
         InflightGuard inflight{detached_inflight_};
         // Both acquisitions run *inside* the try. pg_pool_->acquire()
         // throws PgPoolTimeout on acquire_timeout; this coroutine is a
-        // DetachedTask whose unhandled_exception() has an empty body, so an
+        // TrackedTask whose unhandled_exception() has an empty body, so an
         // escaped throw is silently swallowed and would strand every batched
         // waiter + coalesced follower forever. The catch stamps the exception on
         // all of them; the resume loop below then completes them with that error
@@ -1077,18 +1078,18 @@ private:
     // PG Write batch execution
     // =========================================================================
 
-    DetachedTask firePgWriteBatch(std::vector<PgWriteEntry*> entries) {
+    io::detail::TrackedTask firePgWriteBatch(std::vector<PgWriteEntry*> entries) {
         // Keep the scheduler alive across the resume loop + drain-or-chain (see
         // firePgReadBatch): a resumed continuation may drop the last external
         // owner, and the chain below still touches `this`.
         auto self = this->shared_from_this();
-        // In-flight detached accounting for ordered teardown (see firePgReadBatch).
+        // Counted among the scheduler's fires (see firePgReadBatch).
         InflightGuard inflight{detached_inflight_};
         // `entries` is one group of a batch (firePgWriteBatchNow), in seq order.
 
         // Acquire inside the try (see firePgReadBatch). An escaped
         // PgPoolTimeout from pg_pool_->acquire() would be swallowed by the
-        // DetachedTask and strand every batched waiter + follower forever.
+        // TrackedTask and strand every batched waiter + follower forever.
         std::optional<typename ConcurrencyGate::Permit> permit;
         std::optional<typename PgPool<Io>::ConnectionGuard> guard;
         // Filled as the pipeline is read: a failure leaves the writes whose
@@ -1394,10 +1395,10 @@ private:
     // one row from two connections. Loop-thread only, like the latches.
     size_t pg_write_units_ = 0;
 
-    // In-flight detached fire coroutines (firePgReadBatch, firePgWriteBatch). Plain size_t: it
-    // is mutated only on the loop thread (an eager fire start ++ via InflightGuard,
-    // its frame teardown --), and read only on that same thread by
-    // quiescentForTeardown during ordered teardown — no synchronization needed.
+    // This scheduler's fires in flight (firePgReadBatch, firePgWriteBatch), a
+    // diagnostic. Plain size_t: it is mutated only on the loop thread (an eager
+    // fire start ++ via InflightGuard, its frame end --) and read on that
+    // same thread — no synchronization needed.
     size_t detached_inflight_ = 0;
 
     // PG read statements sent (one per direct read, one per batch segment).

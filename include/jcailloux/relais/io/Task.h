@@ -1,7 +1,9 @@
 #ifndef JCX_RELAIS_IO_TASK_H
 #define JCX_RELAIS_IO_TASK_H
 
+#include <cassert>
 #include <coroutine>
+#include <cstddef>
 #include <exception>
 #include <optional>
 #include <type_traits>
@@ -331,6 +333,44 @@ struct DetachedTask {
         void unhandled_exception() noexcept {}
     };
 };
+
+namespace detail {
+
+// TrackedTask — a DetachedTask that its thread counts until its frame ends.
+//
+// Every coroutine relais detaches on a loop is a TrackedTask, so that the
+// ordered teardown of that loop runs it until none is left, instead of
+// abandoning a frame and what it holds (see BatchScheduler::quiescentForTeardown).
+// A TrackedTask starts and ends on one thread: relais never moves one to
+// another loop.
+
+struct TrackedTask {
+    struct promise_type {
+        promise_type() noexcept { ++in_flight; }
+        ~promise_type() {
+            assert(counter == &in_flight && "a TrackedTask ended on another thread");
+            --in_flight;
+        }
+        promise_type(const promise_type&) = delete;
+        promise_type& operator=(const promise_type&) = delete;
+
+        TrackedTask get_return_object() noexcept { return {}; }
+        std::suspend_never initial_suspend() noexcept { return {}; }
+        std::suspend_never final_suspend() noexcept { return {}; }
+        void return_void() noexcept {}
+        void unhandled_exception() noexcept {}
+
+#ifndef NDEBUG
+        std::size_t* counter = &in_flight;  // this thread's counter
+#endif
+        static inline thread_local std::size_t in_flight = 0;
+    };
+
+    /// TrackedTasks started on the calling thread that have not ended yet.
+    [[nodiscard]] static std::size_t inFlight() noexcept { return promise_type::in_flight; }
+};
+
+} // namespace detail
 
 } // namespace jcailloux::relais::io
 

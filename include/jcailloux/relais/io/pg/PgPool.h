@@ -189,6 +189,12 @@ public:
     [[nodiscard]] size_t idleCount() const noexcept { return idle_.size(); }
     [[nodiscard]] size_t waiterCount() const noexcept { return waiters_.size(); }
 
+    /// No connection lent or connecting, no acquire waiting: no request is in
+    /// flight on the pool, whoever awaits it. Loop-thread only, like the above.
+    [[nodiscard]] bool quiescent() const noexcept {
+        return idle_.size() == total_ && waiters_.empty();
+    }
+
     [[nodiscard]] const std::string& conninfo() const noexcept { return conninfo_; }
     [[nodiscard]] const PgPoolConfig& config() const noexcept { return cfg_; }
 
@@ -260,7 +266,7 @@ private:
         connectReplacement(this->shared_from_this());
     }
 
-    static DetachedTask connectReplacement(std::shared_ptr<PgPool> self) {
+    static detail::TrackedTask connectReplacement(std::shared_ptr<PgPool> self) {
         try {
             auto conn = co_await ConnectionType::connect(
                 self->io_, self->conninfo_.c_str(), self->cfg_.acquire_timeout,

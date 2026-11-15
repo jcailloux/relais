@@ -605,7 +605,7 @@ private:
     static inline int column_facts_faults = 0;
 #endif
 
-    static io::DetachedTask readColumnFactsTask(detail::ColumnFacts& facts) {
+    static io::detail::TrackedTask readColumnFactsTask(detail::ColumnFacts& facts) {
         try {
 #ifdef RELAIS_BUILDING_TESTS
             if (column_facts_faults > 0) {
@@ -668,7 +668,7 @@ private:
 
     /// Evict, chunk by chunk, the copies the settled notes touch, handing the
     /// loop back between two chunks; ascending order (see RowNotes).
-    static io::DetachedTask drainNotes() {
+    static io::detail::TrackedTask drainNotes() {
         auto& n = notes();
         constexpr long kChunks = static_cast<long>(Notes::kChunks);
         try {

@@ -168,15 +168,14 @@ public:
         std::condition_variable ready_cv;
 
         // Drain window for ordered teardown (phase 2 in each worker). Sized to let
-        // a single fire blocked on a bounded query/acquire time out and
-        // self-destruct, so the common case — a handful of in-flight fires —
-        // drains with no leak. It is NOT a hard ceiling on total drain time: fires
-        // queued behind a saturated pool against a blackholed server time out
-        // serially (~ceil(N/conns) x query_timeout), and a 0 (unbounded) timeout
-        // never times out at all. Past this window the pump gives up and the
-        // still-suspended frame(s) are abandoned — a bounded, best-effort residual,
-        // far better than before ordered teardown (which abandoned every in-flight
-        // fire unconditionally), and no finite grace can cover the serial cascade.
+        // a single request blocked on a bounded query/acquire time out and end, so
+        // the common case — a handful of requests in flight — drains with no
+        // leak. It is NOT a hard ceiling on total drain time: requests queued
+        // behind a saturated pool against a blackholed server time out serially
+        // (~ceil(N/conns) x query_timeout), and a 0 (unbounded) timeout never
+        // times out at all. Past this window the pump gives up and the
+        // still-suspended frame(s) are abandoned — a bounded, best-effort
+        // residual: no finite grace can cover the serial cascade.
         // Captured BY VALUE into each worker: a temporary config argument must not
         // be read at teardown, long after create() has returned.
         const auto teardown_grace =
@@ -251,17 +250,19 @@ public:
                 // Phase 1: serve until stop is requested.
                 w.io->runUntil([&stop] { return stop.stop_requested(); });
 
-                // Phase 2: ordered teardown. A detached fire still suspended on a
-                // blackholed server would otherwise leak its frame and, via its
-                // in-frame ConnectionGuard, the pool. Pump the loop until every
-                // detached fire has completed (each is bounded by the
-                // per-operation query/acquire timeouts: a hung fire times out,
-                // unwinds in error, and self-destroys) or the grace window
-                // elapses (the fallback when a timeout is 0 or the serial drain
-                // outruns the window — the residual frame is then abandoned,
-                // bounded best-effort; see teardown_grace). The join in stop()
-                // blocks on this, so teardown waits for the drain rather than
-                // tearing the loop out from under it.
+                // Phase 2: ordered teardown. A frame left suspended on the loop
+                // would leak, and with it the connection it holds and, through
+                // that, the pool. Pump the loop until nothing relais started on
+                // it is still running (quiescentForTeardown: its detached
+                // coroutines, the batches, every request in flight on the pool,
+                // whoever awaits it), each bounded by the per-operation
+                // query/acquire timeouts (a hung request times out, unwinds in
+                // error, and its frame ends), or until the grace window elapses
+                // (the fallback when a timeout is 0 or the serial drain outruns
+                // the window — the residual frame is then abandoned, bounded
+                // best-effort; see teardown_grace). The join in stop() blocks on
+                // this, so teardown waits for the drain rather than tearing the
+                // loop out from under it.
                 auto drain_deadline = Io::Clock::now() + teardown_grace;
                 w.io->runUntil([&w, drain_deadline] {
                     return (!w.batcher || w.batcher->quiescentForTeardown())

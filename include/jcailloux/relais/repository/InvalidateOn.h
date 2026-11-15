@@ -56,7 +56,7 @@ void everyListPage(const std::shared_ptr<io::detail::SettleTicket>& ticket) {
     } else if constexpr (requires { ListRepo::invalidateAllListGroups(); }) {
         auto every = []() -> io::Task<void> { co_await ListRepo::invalidateAllListGroups(); };
         registerReplay(ticket, every);
-        [](auto fn) -> io::DetachedTask { co_await fn(); }(every);
+        [](auto fn) -> io::detail::TrackedTask { co_await fn(); }(every);
     }
 }
 

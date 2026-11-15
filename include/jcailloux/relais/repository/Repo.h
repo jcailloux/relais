@@ -583,13 +583,13 @@ private:
     // bounded by the targets' l1_ttl).
     // ----------------------------------------------------------------------
 
-    static io::DetachedTask fireInvalidateManyDeferred(std::vector<E> entities) {
+    static io::detail::TrackedTask fireInvalidateManyDeferred(std::vector<E> entities) {
         try {
             co_await Base::invalidateManyDeferred(std::span<const E>(entities));
         } catch (...) {}
     }
 
-    static io::DetachedTask fireInvalidateManyUpdatedDeferred(std::vector<Change<E>> changes) {
+    static io::detail::TrackedTask fireInvalidateManyUpdatedDeferred(std::vector<Change<E>> changes) {
         try {
             co_await Base::invalidateManyUpdatedDeferred(
                 std::span<const Change<E>>(changes));
