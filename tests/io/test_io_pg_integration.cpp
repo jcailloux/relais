@@ -38,7 +38,7 @@ static const char* getConnInfo() {
 TEST_CASE("PgConnection async connect", "[pg][integration]") {
     EpollIoContext io;
     auto conn = runTask(io, PgConnection<EpollIoContext>::connect(io, getConnInfo()));
-    REQUIRE(conn.connected());
+    REQUIRE(conn->connected());
 }
 
 TEST_CASE("PgConnection simple query", "[pg][integration]") {
@@ -46,7 +46,7 @@ TEST_CASE("PgConnection simple query", "[pg][integration]") {
 
     auto result = runTask(io, [](EpollIoContext& io) -> Task<PgResult> {
         auto conn = co_await PgConnection<EpollIoContext>::connect(io, getConnInfo());
-        co_return co_await conn.query("SELECT 1 AS num, 'hello' AS greeting");
+        co_return co_await conn->query("SELECT 1 AS num, 'hello' AS greeting");
     }(io));
 
     REQUIRE(result.ok());
@@ -61,7 +61,7 @@ TEST_CASE("PgConnection parameterized query", "[pg][integration]") {
     auto result = runTask(io, [](EpollIoContext& io) -> Task<PgResult> {
         auto conn = co_await PgConnection<EpollIoContext>::connect(io, getConnInfo());
         auto params = PgParams::make(42, "world");
-        co_return co_await conn.queryParams(
+        co_return co_await conn->queryParams(
             "SELECT $1::int AS num, $2::text AS txt", params);
     }(io));
 
@@ -89,16 +89,16 @@ TEST_CASE("PgConnection floating-point params round-trip bit for bit", "[pg][int
         Read out;
         for (double d : doubles) {
             auto params = PgParams::make(d);
-            auto r = co_await conn.queryParams("SELECT $1::float8", params);
+            auto r = co_await conn->queryParams("SELECT $1::float8", params);
             out.doubles.push_back(r[0].get<double>(0));
         }
         for (float f : floats) {
             auto params = PgParams::make(f);
-            auto r = co_await conn.queryParams("SELECT $1::float4", params);
+            auto r = co_await conn->queryParams("SELECT $1::float4", params);
             out.floats.push_back(r[0].get<std::string>(0));
         }
         auto params = PgParams::make(doubles, std::numeric_limits<double>::quiet_NaN());
-        auto r = co_await conn.queryParams("SELECT $1::float8[], $2::float8", params);
+        auto r = co_await conn->queryParams("SELECT $1::float8[], $2::float8", params);
         out.array = r[0].get<std::vector<double>>(0);
         out.nan = r[0].get<double>(1);
         co_return out;
@@ -127,7 +127,7 @@ TEST_CASE("PgResult reads numeric columns strictly", "[pg][integration]") {
 
     auto r = runTask(io, [](EpollIoContext& io) -> Task<PgResult> {
         auto conn = co_await PgConnection<EpollIoContext>::connect(io, getConnInfo());
-        co_return co_await conn.query(
+        co_return co_await conn->query(
             "SELECT 0.1::real, '{0.1,1.5,-0}'::real[], 32767::int2,"
             " 18446744073709551615::numeric, 12.5::numeric, 3000000000::int8,"
             " '1.5x'::text, '{1,2.5}'::numeric[], 'Infinity'::float8");
@@ -172,7 +172,7 @@ TEST_CASE("PgConnection CRUD operations", "[pg][integration]") {
     // Diagnostic: verify connection target
     auto diag = runTask(io, [](EpollIoContext& io) -> Task<PgResult> {
         auto conn = co_await PgConnection<EpollIoContext>::connect(io, getConnInfo());
-        co_return co_await conn.query(
+        co_return co_await conn->query(
             "SELECT current_database(), current_user, current_schema(), "
             "EXISTS(SELECT 1 FROM pg_tables WHERE schemaname='public' AND tablename='relais_test_items')");
     }(io));
@@ -186,14 +186,14 @@ TEST_CASE("PgConnection CRUD operations", "[pg][integration]") {
     // Clean table
     runTask(io, [](EpollIoContext& io) -> Task<void> {
         auto conn = co_await PgConnection<EpollIoContext>::connect(io, getConnInfo());
-        co_await conn.query("DELETE FROM relais_test_items");
+        co_await conn->query("DELETE FROM relais_test_items");
     }(io));
 
     SECTION("INSERT and SELECT") {
         auto result = runTask(io, [](EpollIoContext& io) -> Task<PgResult> {
             auto conn = co_await PgConnection<EpollIoContext>::connect(io, getConnInfo());
             auto params = PgParams::make("test_item", 42, true);
-            co_return co_await conn.queryParams(
+            co_return co_await conn->queryParams(
                 "INSERT INTO relais_test_items (name, value, is_active) "
                 "VALUES ($1, $2, $3) RETURNING id, name, value, is_active",
                 params);
@@ -211,7 +211,7 @@ TEST_CASE("PgConnection CRUD operations", "[pg][integration]") {
         auto select = runTask(io, [id](EpollIoContext& io) -> Task<PgResult> {
             auto conn = co_await PgConnection<EpollIoContext>::connect(io, getConnInfo());
             auto params = PgParams::make(id);
-            co_return co_await conn.queryParams(
+            co_return co_await conn->queryParams(
                 "SELECT id, name, value, is_active FROM relais_test_items WHERE id = $1",
                 params);
         }(io));
@@ -226,7 +226,7 @@ TEST_CASE("PgConnection CRUD operations", "[pg][integration]") {
         auto insert = runTask(io, [](EpollIoContext& io) -> Task<PgResult> {
             auto conn = co_await PgConnection<EpollIoContext>::connect(io, getConnInfo());
             auto params = PgParams::make("to_update", 1, true);
-            co_return co_await conn.queryParams(
+            co_return co_await conn->queryParams(
                 "INSERT INTO relais_test_items (name, value, is_active) "
                 "VALUES ($1, $2, $3) RETURNING id",
                 params);
@@ -237,7 +237,7 @@ TEST_CASE("PgConnection CRUD operations", "[pg][integration]") {
         auto affected = runTask(io, [id](EpollIoContext& io) -> Task<int> {
             auto conn = co_await PgConnection<EpollIoContext>::connect(io, getConnInfo());
             auto params = PgParams::make("updated", false, id);
-            co_return co_await conn.execute(
+            co_return co_await conn->execute(
                 "UPDATE relais_test_items SET name = $1, is_active = $2 WHERE id = $3",
                 params);
         }(io));
@@ -250,7 +250,7 @@ TEST_CASE("PgConnection CRUD operations", "[pg][integration]") {
         auto insert = runTask(io, [](EpollIoContext& io) -> Task<PgResult> {
             auto conn = co_await PgConnection<EpollIoContext>::connect(io, getConnInfo());
             auto params = PgParams::make("to_delete", 0, true);
-            co_return co_await conn.queryParams(
+            co_return co_await conn->queryParams(
                 "INSERT INTO relais_test_items (name, value, is_active) "
                 "VALUES ($1, $2, $3) RETURNING id",
                 params);
@@ -261,7 +261,7 @@ TEST_CASE("PgConnection CRUD operations", "[pg][integration]") {
         auto affected = runTask(io, [id](EpollIoContext& io) -> Task<int> {
             auto conn = co_await PgConnection<EpollIoContext>::connect(io, getConnInfo());
             auto params = PgParams::make(id);
-            co_return co_await conn.execute(
+            co_return co_await conn->execute(
                 "DELETE FROM relais_test_items WHERE id = $1", params);
         }(io));
 
@@ -272,7 +272,7 @@ TEST_CASE("PgConnection CRUD operations", "[pg][integration]") {
         auto result = runTask(io, [](EpollIoContext& io) -> Task<PgResult> {
             auto conn = co_await PgConnection<EpollIoContext>::connect(io, getConnInfo());
             auto params = PgParams::make("null_desc", 0, true, nullptr);
-            co_return co_await conn.queryParams(
+            co_return co_await conn->queryParams(
                 "INSERT INTO relais_test_items (name, value, is_active, description) "
                 "VALUES ($1, $2, $3, $4) RETURNING id, description",
                 params);
@@ -295,7 +295,7 @@ TEST_CASE("PgConnection query error throws PgError", "[pg][integration]") {
     REQUIRE_THROWS_AS(
         runTask(io, [](EpollIoContext& io) -> Task<PgResult> {
             auto conn = co_await PgConnection<EpollIoContext>::connect(io, getConnInfo());
-            co_return co_await conn.query("SELECT * FROM nonexistent_table_xyz");
+            co_return co_await conn->query("SELECT * FROM nonexistent_table_xyz");
         }(io)),
         PgError
     );
@@ -306,7 +306,7 @@ TEST_CASE("PgConnection bad conninfo throws PgConnectionError", "[pg][integratio
 
     // Use an invalid dbname on a valid host for fast failure
     REQUIRE_THROWS_AS(
-        runTask(io, [](EpollIoContext& io) -> Task<PgConnection<EpollIoContext>> {
+        runTask(io, [](EpollIoContext& io) -> Task<std::unique_ptr<PgConnection<EpollIoContext>>> {
             co_return co_await PgConnection<EpollIoContext>::connect(
                 io, "host=localhost port=5432 dbname=nonexistent_db_xyz_relais "
                     "user=nonexistent_user_xyz connect_timeout=2");

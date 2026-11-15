@@ -1558,7 +1558,7 @@ public:
 
     LockSession() {
         conn_ = sync([]() -> io::Task<std::shared_ptr<Conn>> {
-            co_return std::make_shared<Conn>(
+            co_return std::shared_ptr<Conn>(
                 co_await Conn::connect(relais_test::detail::testIo(), getConnInfo()));
         }());
     }

@@ -317,17 +317,17 @@ TEST_CASE("liveness: a withheld read trips query_timeout (PgQueryTimeout)",
           "[io][liveness][integration]") {
     Io io;
     auto conn = driveBounded(io, PgConnection<Io>::connect(io, getConnInfo(), 2s, 200ms));
-    REQUIRE(conn.connected());
+    REQUIRE(conn->connected());
 
     // Hold the read side before the query: the send proceeds (write-ready is not
     // masked), the response is withheld, the query_timeout fires.
-    io.holdReads(conn.socket());
+    io.holdReads(conn->socket());
     REQUIRE_THROWS_AS(
-        driveBounded(io, conn.query("SELECT 1")),
+        driveBounded(io, conn->query("SELECT 1")),
         PgQueryTimeout);
 
     // The connection is poisoned, not silently reusable.
-    REQUIRE_FALSE(conn.connected());
+    REQUIRE_FALSE(conn->connected());
 }
 
 TEST_CASE("liveness: a late result after teardown is dropped, not re-injected",
@@ -336,9 +336,9 @@ TEST_CASE("liveness: a late result after teardown is dropped, not re-injected",
     int fd = -1;
     {
         auto conn = driveBounded(io, PgConnection<Io>::connect(io, getConnInfo(), 2s, 150ms));
-        fd = conn.socket();
+        fd = conn->socket();
         io.holdReads(fd);
-        REQUIRE_THROWS_AS(driveBounded(io, conn.query("SELECT 1")), PgQueryTimeout);
+        REQUIRE_THROWS_AS(driveBounded(io, conn->query("SELECT 1")), PgQueryTimeout);
         // conn destroyed here: ~PgConnection removeCurrentWatch + PQfinish(fd).
     }
     // The buffered result is now "released" — but the watch is gone and the fd is
@@ -573,7 +573,7 @@ TEST_CASE("liveness: a mid-query RST resolves in error without a stray timer",
     std::string conninfo = std::string(getConnInfo()) +
                            " application_name=relais_liveness_rst";
     auto conn = driveBounded(io, PgConnection<Io>::connect(io, conninfo.c_str(), 2s, 5s));
-    REQUIRE(conn.connected());
+    REQUIRE(conn->connected());
 
     PgProbe probe(getConnInfo());
 
@@ -590,7 +590,7 @@ TEST_CASE("liveness: a mid-query RST resolves in error without a stray timer",
             killed = true;
         });
         try {
-            co_await conn.query("SELECT pg_sleep(2)");
+            co_await conn->query("SELECT pg_sleep(2)");
         } catch (const PgError&) {
             // A terminated backend sends a FATAL result, so this is a deterministic
             // "query failed" — distinct from a raw socket drop, which surfaces as
@@ -619,11 +619,11 @@ TEST_CASE("liveness: a fast multi-result pipeline re-arms with no spurious timeo
     auto conn = driveBounded(io, PgConnection<Io>::connect(io, getConnInfo(), 2s, 500ms));
 
     for (int i = 0; i < 5; ++i) {
-        auto r = driveBounded(io, conn.query("SELECT generate_series(1, 50)"));
+        auto r = driveBounded(io, conn->query("SELECT generate_series(1, 50)"));
         REQUIRE(r.ok());
         REQUIRE(r.rows() == 50);
     }
-    REQUIRE(conn.connected());
+    REQUIRE(conn->connected());
     REQUIRE(io.pendingTimerCount() == 0);  // no timer leaked across re-arms
 }
 
