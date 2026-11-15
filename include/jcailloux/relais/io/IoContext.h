@@ -43,14 +43,21 @@ constexpr IoEvent& operator|=(IoEvent& a, IoEvent b) noexcept {
 //
 //   - addWatch(fd, mask, cb): cb runs ON THE LOOP THREAD whenever fd is ready
 //     for an event in `mask`, with the matching IoEvent bits set. Returns a
-//     handle for later update/remove.
+//     handle for later update/remove. A watch follows the open file, not the
+//     number: once fd is closed, removeWatch(old handle) then addWatch on a new
+//     fd — even one that reuses the number — must deliver the new file's
+//     events. relais does this from a watch callback when libpq replaces its
+//     socket mid-connect.
 //   - updateWatch(handle, mask): changes the active mask on that handle.
-//   - removeWatch(handle): no further callbacks for that handle. MUST be safe to
-//     call FROM INSIDE that handle's own callback — relais self-removes a watch
-//     from its I/O callback when a connection's interest changes (e.g. EOF). The
-//     loop resumes after the callback returns, so the adapter must not destroy
-//     loop-owned watch state (nor the callback it is mid-invocation through)
-//     synchronously here; defer teardown until the event is fully processed.
+//   - removeWatch(handle): no further callbacks for that handle, including for
+//     the event being dispatched when it is called: an adapter that splits one
+//     event into several callbacks (read, then write) must stop after the one
+//     that removed the watch. MUST be safe to call FROM INSIDE that handle's
+//     own callback — relais self-removes a watch from its I/O callback when a
+//     connection's interest changes (e.g. EOF). The loop resumes after the
+//     callback returns, so the adapter must not destroy loop-owned watch state
+//     (nor the callback it is mid-invocation through) synchronously here; defer
+//     teardown until the event is fully processed.
 //   - post(cb): runs cb exactly once, on the loop thread, FIFO with other posts;
 //     thread-safe AND wakes a blocked loop promptly when called from another
 //     thread. The loop's wait must be bounded so posts cannot stall.
