@@ -400,12 +400,12 @@ struct IoContextConformance {
     }
 
     // C11: arm+cancel at scale. Arming many timers then cancelling them all must
-    // leave none firing — and, on a conforming adapter, must not accumulate state
-    // (a cancel removes the timer, it does not tombstone it until its deadline).
-    // This encodes the complexity expectation in the IoContext contract: relais
-    // arms+cancels a timer per in-flight I/O wait, so an adapter that defers
-    // cancellation to maturity would grow O(timeout) state at QPS. A later
-    // uncancelled fence proves the subsystem is still live after the churn.
+    // leave none firing. A conforming adapter must also not accumulate state (a
+    // cancel removes the timer, it does not tombstone it until its deadline):
+    // relais arms+cancels a timer per in-flight I/O wait, so an adapter that
+    // defers cancellation to maturity grows O(timeout) state at QPS. This check
+    // only sees firing, not retained state. A later uncancelled fence proves the
+    // subsystem is still live after the churn.
     template<io::IoContext Io, typename Drive>
     static void checkTimerArmCancelAtScale(Io& io, Drive drive) {
         constexpr int N = 2000;

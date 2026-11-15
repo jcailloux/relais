@@ -75,9 +75,11 @@ constexpr IoEvent& operator|=(IoEvent& a, IoEvent b) noexcept {
 // no syscall per call, and cancel must *remove* the timer, not tombstone it
 // until its deadline. relais arms+cancels a timer per in-flight I/O wait, so
 // per-op allocation or O(timeout) tombstone growth is a correctness-relevant
-// cost at QPS, not a micro-optimization. Asio, Trantor and the bundled
-// EpollIoContext all satisfy this; IoContextConformance exercises arm+cancel at
-// scale.
+// cost at QPS, not a micro-optimization. Asio and the bundled EpollIoContext
+// satisfy this; trantor's timers do not (invalidateTimer leaves a cancelled
+// timer queued until its deadline), so a trantor adapter keeps its own queue.
+// IoContextConformance exercises arm+cancel at scale but cannot see what an
+// adapter retains.
 //
 // These rules are encoded as runnable checks in
 // testing/IoContextConformance.h — instantiate the harness against any adapter

@@ -59,36 +59,48 @@ and enforced by the harness:
 #include <jcailloux/relais/io/IoContext.h>
 #include <trantor/net/EventLoop.h>
 #include <trantor/net/Channel.h>
+#include <sys/epoll.h>
+#include <sys/timerfd.h>
+#include <unistd.h>
 #include <chrono>
+#include <cstdint>
+#include <functional>
+#include <map>
 #include <memory>
+#include <memory_resource>
+#include <mutex>
 #include <unordered_map>
 
 namespace relais = jcailloux::relais;
 
 class TrantorIoContext {
 public:
-    using WatchHandle = int;                 // the fd doubles as the handle
-    using TimerToken  = trantor::TimerId;     // trantor's own timer id
+    using IoEvent     = relais::io::IoEvent;
+    using WatchHandle = int;             // the fd doubles as the handle
+    using TimerToken  = std::uint64_t;
 
-    explicit TrantorIoContext(trantor::EventLoop* loop) : loop_(loop) {}
+    explicit TrantorIoContext(trantor::EventLoop* loop)
+        : loop_(loop),
+          timer_fd_(::timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC)) {
+        // A Channel registers on the loop thread; the adapter may be built on another.
+        loop_->runInLoop([this] {
+            addWatch(timer_fd_, IoEvent::Read, [this](IoEvent) { fireTimers(); });
+        });
+    }
 
-    WatchHandle addWatch(int fd, relais::io::IoEvent ev,
-                         std::function<void(relais::io::IoEvent)> cb) {
-        using relais::io::IoEvent;
+    WatchHandle addWatch(int fd, IoEvent ev, std::function<void(IoEvent)> cb) {
+        removeWatch(fd);  // a Channel already on fd goes through the deferred free
         auto ch = std::make_unique<trantor::Channel>(loop_, fd);
-        // trantor splits events by type; relais gets one mono-bit call per type
-        // (PgConnection tests each bit, so that is fine).
-        ch->setReadCallback ([cb] { cb(IoEvent::Read); });
-        ch->setWriteCallback([cb] { cb(IoEvent::Write); });
-        // EPOLLERR / EPOLLHUP → IoEvent::Error, like EpollIoContext does.
-        ch->setErrorCallback([cb] { cb(IoEvent::Error); });
-        ch->setCloseCallback([cb] { cb(IoEvent::Error); });
+        // One callback per epoll event, with the combined mask.
+        ch->setEventCallback([raw = ch.get(), cb = std::move(cb)] {
+            cb(fromEpoll(raw->revents()));
+        });
         applyMask(*ch, ev);
         channels_[fd] = std::move(ch);
         return fd;
     }
 
-    void updateWatch(WatchHandle fd, relais::io::IoEvent ev) {
+    void updateWatch(WatchHandle fd, IoEvent ev) {
         if (auto it = channels_.find(fd); it != channels_.end())
             applyMask(*it->second, ev);
     }
@@ -96,14 +108,9 @@ public:
     void removeWatch(WatchHandle fd) {
         if (auto it = channels_.find(fd); it != channels_.end()) {
             it->second->disableAll();
-            it->second->remove();   // detach from the poller (loop thread)
-            // removeWatch is often called FROM the Channel's own callback (relais
-            // drops its watch when I/O state changes, e.g. EOF — permitted by the
-            // concept). Destroying the Channel here is a use-after-free: trantor
-            // regains control in handleEventSafely() after the callback and still
-            // writes into it. Erase the map entry now (the fd is reusable again)
-            // but DEFER destruction to queueInLoop — it runs after this turn's
-            // events are processed, when nothing touches the Channel anymore.
+            it->second->remove();   // detached now: no further callback
+            // Freed after this turn's events: trantor still touches the Channel
+            // when the callback that called removeWatch returns.
             trantor::Channel* dying = it->second.release();
             channels_.erase(it);
             loop_->queueInLoop([dying] { delete dying; });
@@ -113,44 +120,117 @@ public:
     // queueInLoop is thread-safe and wakes the loop via its own eventfd.
     void post(std::function<void()> cb) { loop_->queueInLoop(std::move(cb)); }
 
-    // BatchScheduler flushes a batch on an adaptive deadline via these.
-    TimerToken postDelayed(std::chrono::nanoseconds delay,
-                           std::function<void()> cb) {
-        double seconds = std::chrono::duration<double>(delay).count();
-        return loop_->runAfter(seconds, std::move(cb));  // trantor: delay in seconds
+    // Thread-safe. The timers live here, not in trantor's timer queue.
+    TimerToken postDelayed(std::chrono::nanoseconds delay, std::function<void()> cb) {
+        const auto due = Clock::now() + delay;
+        std::lock_guard lock(timer_mutex_);
+        const TimerToken token = next_token_++;
+        by_token_.emplace(token, timers_.emplace(due, Timer{token, std::move(cb)}));
+        if (due < armed_) arm(due);  // a syscall only for a new earliest deadline
+        return token;
     }
 
-    void cancelTimer(TimerToken token) { loop_->invalidateTimer(token); }
+    void cancelTimer(TimerToken token) {
+        std::lock_guard lock(timer_mutex_);
+        if (auto it = by_token_.find(token); it != by_token_.end()) {
+            timers_.erase(it->second);
+            by_token_.erase(it);
+        }  // the timerfd keeps its deadline: one empty wakeup, then fireTimers re-arms
+    }
 
 private:
-    static void applyMask(trantor::Channel& ch, relais::io::IoEvent ev) {
+    using Clock = std::chrono::steady_clock;  // CLOCK_MONOTONIC on Linux
+    struct Timer { TimerToken token; std::function<void()> cb; };
+
+    // The mapping EpollIoContext uses.
+    static IoEvent fromEpoll(int revents) {
+        IoEvent e = IoEvent::None;
+        if (revents & (EPOLLIN | EPOLLPRI))  e |= IoEvent::Read;
+        if (revents & EPOLLOUT)              e |= IoEvent::Write;
+        if (revents & (EPOLLERR | EPOLLHUP)) e |= IoEvent::Error;
+        return e;
+    }
+
+    static void applyMask(trantor::Channel& ch, IoEvent ev) {
         using relais::io::hasEvent;
-        using relais::io::IoEvent;
-        hasEvent(ev, IoEvent::Read)  ? ch.enableReading()  : ch.disableReading();
-        hasEvent(ev, IoEvent::Write) ? ch.enableWriting()  : ch.disableWriting();
+        hasEvent(ev, IoEvent::Read)  ? ch.enableReading() : ch.disableReading();
+        hasEvent(ev, IoEvent::Write) ? ch.enableWriting() : ch.disableWriting();
+    }
+
+    void fireTimers() {
+        std::uint64_t expirations;
+        [[maybe_unused]] auto r = ::read(timer_fd_, &expirations, sizeof expirations);
+        const auto now = Clock::now();
+        for (;;) {
+            std::function<void()> cb;
+            {
+                std::lock_guard lock(timer_mutex_);
+                auto head = timers_.begin();
+                if (head == timers_.end() || head->first > now) {
+                    armed_ = Clock::time_point::max();
+                    if (head != timers_.end()) arm(head->first);
+                    return;
+                }
+                cb = std::move(head->second.cb);
+                by_token_.erase(head->second.token);
+                timers_.erase(head);  // under the lock: the pool is not thread-safe
+            }
+            cb();  // unlocked: it may arm or cancel timers
+        }
+    }
+
+    void arm(Clock::time_point due) {  // timer_mutex_ held
+        armed_ = due;
+        const auto ns = std::chrono::nanoseconds(due.time_since_epoch()).count();
+        const itimerspec its{{0, 0}, {ns / 1'000'000'000, ns % 1'000'000'000}};
+        ::timerfd_settime(timer_fd_, TFD_TIMER_ABSTIME, &its, nullptr);
     }
 
     trantor::EventLoop* loop_;
     std::unordered_map<int, std::unique_ptr<trantor::Channel>> channels_;
+
+    int timer_fd_;
+    std::mutex timer_mutex_;
+    std::pmr::unsynchronized_pool_resource pool_;  // recycles nodes: no allocation per arm
+    std::pmr::multimap<Clock::time_point, Timer> timers_{&pool_};
+    std::pmr::unordered_map<TimerToken, decltype(timers_)::iterator> by_token_{&pool_};
+    Clock::time_point armed_ = Clock::time_point::max();  // the timerfd's deadline
+    TimerToken next_token_ = 1;
 };
 
 static_assert(relais::io::IoContext<TrantorIoContext>);
 ```
 
-> Pinned to a specific trantor API — **validate it with the harness** before
-> trusting it. The version above is the shape an adapter that passes `runAll`
-> converges to.
+> Checked with `runAll`, under ASan, against trantor 1.5.28 (Drogon 1.9.13).
+> trantor's API changes across versions: run the harness again when you upgrade.
 
-> **Self-removal is the trap.** relais calls `removeWatch(h)` from inside watch
-> `h`'s own callback (a connection drops its watch on EOF/error). The loop is
-> still mid-dispatch and resumes after the callback returns, so freeing the
-> watch's loop-owned state — the `trantor::Channel`, or even the `std::function`
-> you are invoking through — synchronously inside `removeWatch` is a
-> use-after-free. Defer the free past the current event: `queueInLoop(delete)`
-> for trantor; copy the callback onto the stack before invoking for a raw epoll
-> loop (see `EpollIoContext::runOnce`). The harness exercises this directly (C10),
-> so a synchronous-teardown adapter fails `runAll` under ASan instead of
-> corrupting memory in production.
+Three rules of the contract shape this sketch. Each is easy to break on
+trantor, and the harness checks each one.
+
+- **Self-removal.** relais calls `removeWatch(h)` from inside watch `h`'s own
+  callback (a connection drops its watch on EOF or error). The loop resumes
+  after that callback returns, so freeing the watch's loop-owned state — the
+  `trantor::Channel`, or the `std::function` being invoked — inside
+  `removeWatch` is a use-after-free. Defer the free past the current event:
+  `queueInLoop(delete)` here; on a raw epoll loop, copy the callback onto the
+  stack before invoking it (see `EpollIoContext::runOnce`). Defer only the free,
+  not the removal: from that same callback, relais may watch a new socket that
+  reuses the fd number (libpq replaces its socket while connecting), and a
+  pending removal would tear the new watch down. C10 catches a synchronous
+  free under ASan; C12 catches a deferred removal.
+- **One event, one callback.** With separate read, write, error and close
+  callbacks, trantor calls them back to back for one epoll event without
+  re-checking the watch, and one event often carries several bits (readable and
+  writable; error and readable when the server drops the connection). If the
+  first callback removes the watch and resumes a coroutine that frees its
+  awaiter, the next one runs on freed memory. Hence a single `setEventCallback`
+  with the combined mask. C13 checks that nothing follows a `removeWatch`.
+- **Cancel removes the timer.** relais arms a timer per I/O wait and cancels it
+  when the wait completes. trantor's `invalidateTimer` leaves the cancelled
+  timer queued until its deadline — about 200 bytes held for `query_timeout`
+  (30 s by default), so 6 MB per 1 000 waits/s — and does nothing while the
+  loop is stopped. Hence the adapter's own queue behind one timerfd. C9 and C11
+  check that a cancelled timer never fires; no check sees what it retains.
 
 ## Verify it
 
@@ -244,13 +324,14 @@ database's `max_connections`. (relais ships `io::IoPool` as a reference N-loop
 runtime for its own `EpollIoContext`; external routers follow the same
 init-per-loop-thread contract shown above.)
 
-> **Wire your timeouts here.** `PgPoolConfig` also carries `acquire_timeout` and
-> `query_timeout` — a foreign adapter gets the liveness backstop **only if you
-> pass them**, exactly as `IoPool` does for its own loops. They are armed via your
-> `postDelayed`/`cancelTimer`, so a correct timer subsystem (conformance
-> C8/C9/C11) is the prerequisite. Its `uncertain_settle`, `settle_delay` and
-> `client_check_interval` default to a direct connection; behind a transaction
-> pooler, set them as
+> **Wire your timeouts here.** `PgPoolConfig` also carries `acquire_timeout`
+> (default 5 s) and `query_timeout` (default 30 s), the liveness backstop of
+> every wait. They are armed via your `postDelayed`/`cancelTimer`, so a correct
+> timer subsystem (conformance C8/C9/C11) is the prerequisite. On trantor they
+> also end a wait on a lost watch: `EpollPoller::update` ignores every
+> `epoll_ctl` failure, so a watch it could not register never fires and reports
+> nothing. `uncertain_settle`, `settle_delay` and `client_check_interval`
+> default to a direct connection; behind a transaction pooler, set them as
 > [runtime.md › Settling an uncertain write](runtime.md#settling-an-uncertain-write)
 > says. See
 > [runtime.md › Liveness & failure semantics](runtime.md#liveness--failure-semantics).
