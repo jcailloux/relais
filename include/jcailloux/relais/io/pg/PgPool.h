@@ -142,10 +142,14 @@ public:
     // Acquire a connection (may suspend if pool exhausted)
 
     Task<ConnectionGuard> acquire() {
-        if (!idle_.empty()) {
+        while (!idle_.empty()) {
             auto* conn = idle_.back();
             idle_.pop_back();
-            co_return ConnectionGuard(this->shared_from_this(), conn);
+            if (conn->connected())
+                co_return ConnectionGuard(this->shared_from_this(), conn);
+            // The server closed it while idle; its socket is already let go.
+            --total_;
+            destroy(conn);
         }
 
         if (total_ < cfg_.max_connections) {

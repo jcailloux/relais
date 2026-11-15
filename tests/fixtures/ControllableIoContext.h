@@ -16,9 +16,9 @@ namespace jcailloux::relais::io::test {
 
 // ControllableIoContext — a fault-injecting wrapper over the bundled
 // EpollIoContext for the liveness/timeout suite. It is a *faithful* IoContext
-// (passes IoContextConformance): every concept method forwards verbatim to the
-// inner loop, so the wrapper is a drop-in for EpollIoContext anywhere a test
-// drives the loop.
+// (passes IoContextConformance): every concept method forwards to the inner
+// loop, its callbacks wrapped only to be counted, so the wrapper is a drop-in
+// for EpollIoContext anywhere a test drives the loop.
 //
 // On top of that it can withhold read-readiness from a single fd while leaving
 // timers and every other fd untouched — the exact shape of "the result arrived
@@ -31,6 +31,10 @@ namespace jcailloux::relais::io::test {
 // track the mask relais last asked for per fd and re-apply it with Read masked
 // off while a hold is active, so an addWatch or updateWatch issued during a
 // hold cannot accidentally lift it.
+//
+// It also counts the watches added or removed inside an event dispatch, that
+// is while a watch or timer callback runs: relais makes these changes from
+// posted tasks only, so an adapter may free a watch synchronously.
 //
 // Loop-thread affinity matches EpollIoContext: the watch/hold methods touch the
 // fixture's own maps and must run on the loop thread; post()/postDelayed()/
@@ -48,15 +52,22 @@ public:
     ControllableIoContext(const ControllableIoContext&) = delete;
     ControllableIoContext& operator=(const ControllableIoContext&) = delete;
 
-    // -- IoContext concept surface (verbatim forwarding) --------------------
+    // -- IoContext concept surface (forwarding) ------------------------------
 
     WatchHandle addWatch(int fd, IoEvent events, std::function<void(IoEvent)> cb) {
+        noteWatchChange();
+        ++added_watches_;
         requested_[fd] = events;
         last_added_fd_ = fd;
-        return inner_.addWatch(fd, effective(fd, events), std::move(cb));
+        return inner_.addWatch(fd, effective(fd, events),
+            [this, cb = std::move(cb)](IoEvent ev) {
+                Dispatch d{*this};
+                cb(ev);
+            });
     }
 
     void removeWatch(WatchHandle handle) {
+        noteWatchChange();
         // Clear the fixture's per-fd state so a recycled fd starts clean.
         requested_.erase(handle);
         held_.erase(handle);
@@ -73,7 +84,10 @@ public:
     template<typename Rep, typename Period>
     TimerToken postDelayed(std::chrono::duration<Rep, Period> delay,
                            std::function<void()> cb) {
-        return inner_.postDelayed(delay, std::move(cb));
+        return inner_.postDelayed(delay, [this, cb = std::move(cb)] {
+            Dispatch d{*this};
+            cb();
+        });
     }
 
     void cancelTimer(TimerToken token) { inner_.cancelTimer(token); }
@@ -96,6 +110,14 @@ public:
     }
 
     [[nodiscard]] bool isHeld(int fd) const { return held_.contains(fd); }
+
+    // Every addWatch so far.
+    [[nodiscard]] std::size_t addedWatches() const noexcept { return added_watches_; }
+
+    // Watches added or removed while a watch or timer callback ran.
+    [[nodiscard]] std::size_t watchChangesInDispatch() const noexcept {
+        return changes_in_dispatch_;
+    }
 
     // The fd of the most recent addWatch — the connection a pool/client just
     // established. Stable for that connection's lifetime, so a test reads it
@@ -122,6 +144,18 @@ public:
     [[nodiscard]] Inner& inner() noexcept { return inner_; }
 
 private:
+    struct Dispatch {
+        ControllableIoContext& io;
+        explicit Dispatch(ControllableIoContext& c) noexcept : io(c) { ++io.dispatch_depth_; }
+        ~Dispatch() { --io.dispatch_depth_; }
+        Dispatch(const Dispatch&) = delete;
+        Dispatch& operator=(const Dispatch&) = delete;
+    };
+
+    void noteWatchChange() noexcept {
+        if (dispatch_depth_ > 0) ++changes_in_dispatch_;
+    }
+
     // The mask actually pushed to epoll: what relais asked for, minus Read while
     // the fd is held.
     [[nodiscard]] IoEvent effective(int fd, IoEvent requested) const {
@@ -140,6 +174,9 @@ private:
     std::unordered_map<int, IoEvent> requested_;  // last mask relais asked for, per fd
     std::unordered_set<int> held_;                // fds with reads currently withheld
     int last_added_fd_ = -1;                      // fd of the most recent addWatch
+    int dispatch_depth_ = 0;                      // watch or timer callbacks running
+    std::size_t changes_in_dispatch_ = 0;         // addWatch/removeWatch among them
+    std::size_t added_watches_ = 0;
 };
 
 static_assert(IoContext<ControllableIoContext>,
