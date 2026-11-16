@@ -378,6 +378,50 @@ if(RELAIS_BUILD_TESTS)
     endif()
 
     # -------------------------------------------------------------------------
+    # Integrations: each library is fetched for its tests only, at a pinned
+    # version. Off by default, since each needs its own system dependencies.
+    # -------------------------------------------------------------------------
+    option(RELAIS_TEST_DROGON
+        "Test the trantor and Drogon integrations (fetches Drogon; needs jsoncpp, uuid, zlib)" OFF)
+    if(RELAIS_TEST_DROGON)
+        # Drogon's library alone: no tools, examples, ORM or tests of its own.
+        function(relais_fetch_drogon)
+            set(CMAKE_POLICY_DEFAULT_CMP0077 NEW)  # trantor's options honour these
+            set(CMAKE_CXX_STANDARD 23)  # Drogon builds with the standard of the tests
+            set(BUILD_CTL OFF)
+            set(BUILD_EXAMPLES OFF)
+            set(BUILD_ORM OFF)
+            set(BUILD_BROTLI OFF)
+            set(BUILD_YAML_CONFIG OFF)
+            set(BUILD_C-ARES OFF)
+            set(BUILD_TESTING OFF)
+            set(BUILD_SHARED_LIBS OFF)
+            FetchContent_Declare(drogon
+                GIT_REPOSITORY https://github.com/drogonframework/drogon.git
+                GIT_TAG        v1.9.13
+                GIT_SHALLOW    TRUE)
+            FetchContent_MakeAvailable(drogon)
+        endfunction()
+        relais_fetch_drogon()
+
+        relais_add_test(test_trantor        tests/integration/test_trantor.cpp      LABELS "integration;trantor" RESOURCE_LOCK)
+        relais_add_test(test_trantor_loops  tests/io/test_io_adversarial_loops.cpp  DEFINITIONS RELAIS_TEST_TRANTOR_LOOP LABELS "io;integration;adversarial;trantor" RESOURCE_LOCK)
+        relais_add_test(test_drogon         tests/integration/test_drogon.cpp       LABELS "integration;drogon" RESOURCE_LOCK)
+        target_link_libraries(test_trantor PRIVATE trantor)
+        target_link_libraries(test_trantor_loops PRIVATE trantor)
+        target_link_libraries(test_drogon PRIVATE drogon)
+
+        if(RELAIS_ENABLE_TSAN)
+            # trantor's own queues and loops instrumented too, or TSan cannot
+            # see their synchronization.
+            foreach(target trantor drogon test_trantor test_trantor_loops test_drogon)
+                target_compile_options(${target} PRIVATE -fsanitize=thread -fno-omit-frame-pointer)
+                target_link_options(${target} PRIVATE -fsanitize=thread)
+            endforeach()
+        endif()
+    endif()
+
+    # -------------------------------------------------------------------------
     # Combined targets
     # -------------------------------------------------------------------------
     add_custom_target(test_relais_integration

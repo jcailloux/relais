@@ -75,6 +75,12 @@ struct InlinePostIoContext : ForwardingIoContext {
     }
 };
 
+// Runs a callback in place on whatever thread posts it: from another thread,
+// it never reaches the loop thread.
+struct PostInPlaceIoContext : ForwardingIoContext {
+    void post(std::function<void()> cb) { cb(); }
+};
+
 // Only what the contract asks for: no cancelTimer, and a postDelayed that
 // returns nothing.
 struct MinimalIoContext {
@@ -148,6 +154,11 @@ TEST_CASE("IoContext conformance: the checks reject the adapter defects they tar
         InlinePostIoContext io;
         REQUIRE_NOTHROW(IoContextConformance::checkPostFromCallback(io, drive_inner));
         REQUIRE_THROWS_AS(IoContextConformance::checkPostFromWatchDeferred(io, drive_inner),
+                          ConformanceError);
+    }
+    SECTION("a post from another thread run on that thread") {
+        PostInPlaceIoContext io;
+        REQUIRE_THROWS_AS(IoContextConformance::checkCrossThreadPost(io, drive_inner),
                           ConformanceError);
     }
     SECTION("an event split into several callbacks meets the contract") {
