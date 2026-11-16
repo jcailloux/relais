@@ -225,6 +225,7 @@ private:
             });
             return;
         }
+        const bool drained = !scheduler_ || scheduler_->quiescentForTeardown();
         // Destroying a suspended boot ends its connect here, on the loop.
         if (auto frame = std::exchange(boot_frame_, {})) frame.destroy();
         if (scheduler_) {
@@ -233,6 +234,12 @@ private:
         }
         if (attachedHere() == this) attachedHere() = nullptr;
         pool_.reset();
+        // Nothing of relais runs on the loop any more, and the timers it armed
+        // that are still pending do nothing; what the drain abandoned may
+        // still need its own.
+        if constexpr (requires(Io& i) { i.detached(); }) {
+            if (drained) io_.detached();
+        }
         {
             std::lock_guard lock(m_);
             release_ = Release::Done;
@@ -276,6 +283,16 @@ private:
     std::shared_ptr<Scheduler> scheduler_;
     Clock::time_point drain_until_;
 };
+
+// attach() waits for the loop: on the loop's own thread, it never would.
+template<io::IoContext Io>
+void refuseLoopThread(Io& io) {
+    if constexpr (requires(Io& i) { { i.isInLoopThread() } -> std::convertible_to<bool>; }) {
+        if (io.isInLoopThread())
+            throw AttachError("relais::attach() called on the loop's own thread: it waits for "
+                              "that loop, so call it from another thread");
+    }
+}
 
 // Takes relais off every loop at once, each waiting there for its requests in
 // flight. On a loop's own thread, starts that loop's teardown without waiting
@@ -381,11 +398,7 @@ private:
 /// returned Attachment takes relais off the loop; `io` must outlive it.
 template<io::IoContext Io>
 [[nodiscard]] Attachment<Io> attach(Io& io, std::string conninfo, AttachConfig cfg = {}) {
-    if constexpr (requires(Io& i) { { i.isInLoopThread() } -> std::convertible_to<bool>; }) {
-        if (io.isInLoopThread())
-            throw AttachError("relais::attach() called on the loop's own thread: it waits for "
-                              "that loop, so call it from another thread");
-    }
+    detail::refuseLoopThread(io);
     Io* const loops[] = {&io};
     auto bound = detail::bindAll<Io>(loops, conninfo, cfg);  // no deadline: never empty
     return Attachment<Io>(std::move(bound->front()));

@@ -421,6 +421,42 @@ if(RELAIS_BUILD_TESTS)
         endif()
     endif()
 
+    option(RELAIS_TEST_ASIO "Test the asio integration (fetches standalone asio)" OFF)
+    option(RELAIS_TEST_BOOST_ASIO "Test the Boost.Asio integration (needs Boost)" OFF)
+    if(RELAIS_TEST_ASIO)
+        FetchContent_Declare(asio
+            GIT_REPOSITORY https://github.com/chriskohlhoff/asio.git
+            GIT_TAG        asio-1-38-2
+            GIT_SHALLOW    TRUE)
+        FetchContent_MakeAvailable(asio)  # headers only, no CMake project
+        add_library(relais_test_asio INTERFACE)
+        target_include_directories(relais_test_asio SYSTEM INTERFACE ${asio_SOURCE_DIR}/include)
+        target_compile_definitions(relais_test_asio INTERFACE ASIO_STANDALONE ASIO_NO_DEPRECATED)
+
+        relais_add_test(test_asio        tests/integration/test_asio.cpp        LABELS "integration;asio" RESOURCE_LOCK)
+        relais_add_test(test_asio_loops  tests/io/test_io_adversarial_loops.cpp DEFINITIONS RELAIS_TEST_ASIO_LOOP LABELS "io;integration;adversarial;asio" RESOURCE_LOCK)
+        target_link_libraries(test_asio PRIVATE relais_test_asio)
+        target_link_libraries(test_asio_loops PRIVATE relais_test_asio)
+        list(APPEND RELAIS_ASIO_TESTS test_asio test_asio_loops)
+    endif()
+    if(RELAIS_TEST_BOOST_ASIO)
+        find_package(Boost 1.74 CONFIG REQUIRED)
+        relais_add_test(test_boost_asio        tests/integration/test_asio.cpp        DEFINITIONS RELAIS_TEST_BOOST_ASIO LABELS "integration;asio" RESOURCE_LOCK)
+        relais_add_test(test_boost_asio_loops  tests/io/test_io_adversarial_loops.cpp DEFINITIONS RELAIS_TEST_BOOST_ASIO RELAIS_TEST_ASIO_LOOP LABELS "io;integration;adversarial;asio" RESOURCE_LOCK)
+        foreach(target test_boost_asio test_boost_asio_loops)
+            target_link_libraries(${target} PRIVATE Boost::headers)
+            target_compile_definitions(${target} PRIVATE BOOST_ASIO_NO_DEPRECATED)
+        endforeach()
+        list(APPEND RELAIS_ASIO_TESTS test_boost_asio test_boost_asio_loops)
+    endif()
+    if(RELAIS_ENABLE_TSAN)
+        # asio is all headers: its queues are instrumented with the tests.
+        foreach(target ${RELAIS_ASIO_TESTS})
+            target_compile_options(${target} PRIVATE -fsanitize=thread -fno-omit-frame-pointer)
+            target_link_options(${target} PRIVATE -fsanitize=thread)
+        endforeach()
+    endif()
+
     # -------------------------------------------------------------------------
     # Combined targets
     # -------------------------------------------------------------------------

@@ -67,6 +67,14 @@ constexpr IoEvent& operator|=(IoEvent& a, IoEvent b) noexcept {
 //     wakes the loop if it is waiting.
 //   - postDelayed(delay, cb): run cb once on the loop thread, `delay` from now
 //     or later. What it returns is ignored.
+//
+// Optional:
+//   - isInLoopThread(): true on the loop thread. attach() then refuses that
+//     thread, which it would wait on forever.
+//   - detached(): called on the loop thread once relais has left the loop
+//     (detach) and nothing of it is still running there: the postDelayed
+//     callbacks still pending would do nothing, and the adapter may drop them,
+//     for a loop that runs until it has no work left.
 template<typename T>
 concept IoContext = requires(
     T& ctx,

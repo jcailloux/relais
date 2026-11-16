@@ -5,6 +5,7 @@
 
 #include <chrono>
 #include <functional>
+#include <memory>
 #include <utility>
 
 // Validates that the bundled EpollIoContext honors the full IoContext semantic
@@ -75,6 +76,19 @@ struct InlinePostIoContext : ForwardingIoContext {
     }
 };
 
+// Reports a watch once, then never again: an adapter over one-shot waits
+// (asio's async_wait) that does not wait again after the callback.
+struct OneShotWatchIoContext : ForwardingIoContext {
+    WatchHandle addWatch(int fd, IoEvent events, std::function<void(IoEvent)> cb) {
+        auto handle = std::make_shared<WatchHandle>();
+        *handle = inner.addWatch(fd, events, [this, handle, cb = std::move(cb)](IoEvent ev) {
+            inner.updateWatch(*handle, IoEvent::None);
+            cb(ev);
+        });
+        return *handle;
+    }
+};
+
 // Runs a callback in place on whatever thread posts it: from another thread,
 // it never reaches the loop thread.
 struct PostInPlaceIoContext : ForwardingIoContext {
@@ -123,6 +137,11 @@ TEST_CASE("IoContext conformance: watch fires on readable fd", "[io][conformance
     REQUIRE_NOTHROW(IoContextConformance::checkWatchReadable(io, drive));
 }
 
+TEST_CASE("IoContext conformance: a watch keeps reporting after its callback", "[io][conformance]") {
+    EpollIoContext io;
+    REQUIRE_NOTHROW(IoContextConformance::checkWatchPersists(io, drive));
+}
+
 TEST_CASE("IoContext conformance: updateWatch changes the mask", "[io][conformance]") {
     EpollIoContext io;
     REQUIRE_NOTHROW(IoContextConformance::checkUpdateWatch(io, drive));
@@ -154,6 +173,12 @@ TEST_CASE("IoContext conformance: the checks reject the adapter defects they tar
         InlinePostIoContext io;
         REQUIRE_NOTHROW(IoContextConformance::checkPostFromCallback(io, drive_inner));
         REQUIRE_THROWS_AS(IoContextConformance::checkPostFromWatchDeferred(io, drive_inner),
+                          ConformanceError);
+    }
+    SECTION("a watch that reports once") {
+        OneShotWatchIoContext io;
+        REQUIRE_NOTHROW(IoContextConformance::checkWatchReadable(io, drive_inner));
+        REQUIRE_THROWS_AS(IoContextConformance::checkWatchPersists(io, drive_inner),
                           ConformanceError);
     }
     SECTION("a post from another thread run on that thread") {

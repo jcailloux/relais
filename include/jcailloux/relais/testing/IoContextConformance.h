@@ -27,6 +27,8 @@
 // updateWatch takes effect; removeWatch stops delivery at once and leaves a
 // later watch of the same fd number alone; postDelayed fires once — cannot be
 // expressed by a concept. This harness encodes it as runnable checks.
+// A watch lasts until its removeWatch: an adapter over one-shot waits (asio's
+// async_wait) waits again after each callback.
 //
 // runAll checks that contract, nothing more. The deprecated checks (C9, C10,
 // C11, C13) test properties relais relied on before and no longer needs:
@@ -210,6 +212,30 @@ struct IoContextConformance {
 
         io.removeWatch(h);
         efd.clear();
+    }
+
+    // C15: a watch lasts until its removeWatch: each time its fd turns readable
+    // again, once drained by the callback, the watch reports it again. An
+    // adapter over one-shot waits (asio's async_wait) must wait again after
+    // each callback.
+    template<io::IoContext Io, typename Drive>
+    static void checkWatchPersists(Io& io, Drive drive) {
+        detail::EventFd efd;
+        int reported = 0;
+        auto h = io.addWatch(efd.fd, IoEvent::Read, [&](IoEvent ev) {
+            if (!hasEvent(ev, IoEvent::Read | IoEvent::Error)) return;
+            efd.clear();  // relais reads what is there, then waits again
+            ++reported;
+        });
+        for (int round = 1; round <= 3; ++round) {
+            efd.signal();
+            detail::driveFor(io, drive, [&] { return reported >= round; },
+                             std::chrono::seconds(1));
+            detail::require(reported >= round,
+                "a watch must keep reporting: its fd turned readable again after its callback, "
+                "and the watch stayed silent (round " + std::to_string(round) + ")");
+        }
+        io.removeWatch(h);
     }
 
     // C5: updateWatch changes the active mask on the SAME handle (no re-add).
@@ -465,8 +491,8 @@ struct IoContextConformance {
     // -- aggregate ----------------------------------------------------------
 
     // Checks are numbered in the order they were added; runAll groups them by
-    // subject and runs C1-C3, C14, C4-C6, C12, C7, C8: the contract relais
-    // relies on.
+    // subject and runs C1-C3, C14, C4, C15, C5, C6, C12, C7, C8: the contract
+    // relais relies on.
     template<io::IoContext Io, typename Drive>
     static void runAll(Io& io, Drive drive) {
         checkPostExecutes(io, drive);
@@ -474,6 +500,7 @@ struct IoContextConformance {
         checkPostFromCallback(io, drive);
         checkPostFromWatchDeferred(io, drive);
         checkWatchReadable(io, drive);
+        checkWatchPersists(io, drive);
         checkUpdateWatch(io, drive);
         checkRemoveWatch(io, drive);
         checkRewatchReusedFd(io, drive);

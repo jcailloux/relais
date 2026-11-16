@@ -34,6 +34,8 @@ jobs:
           sudo apt-get install -y gcc-14 g++-14 cmake libpq-dev postgresql-client python3
           # Drogon, fetched for the integration tests only
           sudo apt-get install -y libjsoncpp-dev uuid-dev zlib1g-dev libssl-dev
+          # Boost.Asio, for its integration tests (standalone asio is fetched)
+          sudo apt-get install -y libboost-dev
 
       - name: Run database migrations
         env:
@@ -59,6 +61,8 @@ jobs:
           -DRELAIS_BUILD_BENCHMARKS=OFF
           -DRELAIS_BUILD_EXAMPLES=ON
           -DRELAIS_TEST_DROGON=ON
+          -DRELAIS_TEST_ASIO=ON
+          -DRELAIS_TEST_BOOST_ASIO=ON
 
       - name: Build
         run: cmake --build build -j$(nproc)
