@@ -74,7 +74,6 @@ namespace detail {
 template<IoContext Io>
 class BatchScheduler : public std::enable_shared_from_this<BatchScheduler<Io>> {
     using Clock = std::chrono::steady_clock;
-    using TimerToken = typename Io::TimerToken;
 
 public:
     BatchScheduler(Io& io,
@@ -324,8 +323,6 @@ private:
     struct PgReadBatch {
         std::vector<PgReadEntry*> entries;
         double cost_ns = 0;
-        TimerToken timer{0};
-        bool timer_active = false;
     };
 
     struct PgWriteBatch {
@@ -688,16 +685,20 @@ private:
     // Timer scheduling
     // =========================================================================
 
+    // The departure timer is never cancelled: a batch that leaves before it
+    // (size, cost, or the leader's answer) lets it fire for nothing. Its stamp
+    // keeps it off the batches formed after, and it holds the scheduler weakly,
+    // since it may outlive it.
     void schedulePgReadDeparture() {
         auto delay_ns = static_cast<int64_t>(estimator_.pg_network_time_ns);
         if (delay_ns <= 0) delay_ns = 100'000; // 100us minimum
         auto delay = std::chrono::nanoseconds(delay_ns);
 
-        pg_read_batch_.timer = io_.postDelayed(delay, [this] {
-            pg_read_batch_.timer_active = false;
-            firePgReadBatchNow();
+        const auto departure = ++pg_read_departures_;
+        io_.postDelayed(delay, [self = this->weak_from_this(), departure] {
+            if (auto s = self.lock(); s && s->pg_read_departures_ == departure)
+                s->firePgReadBatchNow();
         });
-        pg_read_batch_.timer_active = true;
     }
 
     // =========================================================================
@@ -706,12 +707,6 @@ private:
 
     void firePgReadBatchNow() {
         if (pg_read_batch_.entries.empty()) return;
-
-        // Cancel timer if still active
-        if (pg_read_batch_.timer_active) {
-            io_.cancelTimer(pg_read_batch_.timer);
-            pg_read_batch_.timer_active = false;
-        }
 
         // Move batch out and reset
         auto entries = std::move(pg_read_batch_.entries);
@@ -1365,6 +1360,8 @@ private:
     // Current accumulating batches (one of each at a time)
     PgReadBatch pg_read_batch_;
     PgWriteBatch pg_write_batch_;
+    // Read batches formed so far: stamps each one's departure timer.
+    uint64_t pg_read_departures_ = 0;
 
     // Nagle inflight latches — true while a direct send is in-flight, so
     // subsequent queries accumulate into the batch instead of each paying its

@@ -1684,6 +1684,47 @@ TEST_CASE("settle queue: Delay settles after the delay, without a statement",
     CHECK(t->outcome == io::detail::WriteOutcome::Unknown);
 }
 
+TEST_CASE("settle queue: tickets enqueued during a long wait arm no timer",
+          "[coherence][settle][integration]") {
+    LogCapture logs;  // the tickets are abandoned with the queue
+    CohEnv env(300ms);
+    auto& q = queueOf(env);
+    const auto armed = env.io.armedTimers();
+    const auto cancelled = env.io.cancelledTimers();
+
+    // Each Delay ticket is a job of its own: every enqueue wakes the queue,
+    // which waits again for the end of the first ticket.
+    for (int i = 0; i < 20; ++i) {
+        q.enqueue(ticketFor(io::UncertainSettle::Delay, {}, 10s));
+        pumpUntil(env, [] { return false; }, 5ms);
+    }
+    CHECK(q.pending() == 20);
+    CHECK(env.io.armedTimers() - armed == 1);  // for the end of the first ticket
+    CHECK(env.io.cancelledTimers() == cancelled);
+}
+
+TEST_CASE("settle queue: a shorter delay enqueued during a long wait settles on time",
+          "[coherence][settle][integration]") {
+    LogCapture logs;  // the long ticket is abandoned with the queue
+    CohEnv env(300ms);
+    auto& q = queueOf(env);
+    const auto cancelled = env.io.cancelledTimers();
+    auto later = ticketFor(io::UncertainSettle::Delay, {}, 10s);
+    q.enqueue(later);
+    pumpUntil(env, [] { return false; }, 50ms);
+
+    const auto start = std::chrono::steady_clock::now();
+    auto sooner = ticketFor(io::UncertainSettle::Delay, {}, 200ms);
+    q.enqueue(sooner);
+    REQUIRE(pumpUntil(env, [&] { return q.settled() == 1; }, 2s));
+    const auto waited = std::chrono::steady_clock::now() - start;
+    CHECK(sooner->state == io::detail::SettleTicket::State::Settled);
+    CHECK(later->state != io::detail::SettleTicket::State::Settled);
+    CHECK(waited >= 200ms);
+    CHECK(waited < 1s);
+    CHECK(env.io.cancelledTimers() == cancelled);
+}
+
 TEST_CASE("settle queue: PostgreSQL unreachable, settling is retried with a growing wait",
           "[coherence][settle][integration]") {
     FaultReset reset;

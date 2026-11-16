@@ -81,7 +81,7 @@ namespace detail {
 // gives the handle to its owner. That ownership is what lets fail-fast teardown
 // reclaim a boot that is still suspended on a connect which never completed
 // (a dependency blackholed at boot, past startup_timeout): destroying the frame
-// runs its in-frame connection destructors — PgConnection cancels its timer,
+// runs its in-frame connection destructors — PgConnection disarms its deadline,
 // posts the removal of its watch, and PQfinishes libpq's socket; the loop closes
 // relais's duplicate when it runs or destroys that task — so neither the
 // coroutine frame nor its socket fd leaks. With a self-destroying
