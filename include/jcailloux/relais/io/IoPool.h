@@ -4,6 +4,7 @@
 #include <chrono>
 #include <exception>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -117,50 +118,33 @@ public:
                      .client_check_interval = config.client_check_interval},
             .max_concurrent = config.max_concurrent_per_worker};
         const auto deadline = std::chrono::steady_clock::now() + config.startup_timeout;
-        for (auto& w : pool->workers_)
-            w.binding = relais::detail::LoopBinding<Io>::start(*w.io, config.pg_conninfo, attach_cfg);
-
-        std::exception_ptr error;
-        for (auto& w : pool->workers_) {
-            try {
-                w.binding->awaitCheck();
-            } catch (...) {
-                if (!error) error = std::current_exception();
-            }
-        }
-        bool timed_out = false;
-        if (!error) {
-            for (auto& w : pool->workers_) w.binding->startBoot();
-            for (auto& w : pool->workers_) {
-                try {
-                    // acquire_timeout bounds each connect; startup_timeout
-                    // bounds them all, a connect with no bound included.
-                    if (!w.binding->awaitBoot(deadline)) timed_out = true;
-                } catch (...) {
-                    if (!error) error = std::current_exception();
-                }
-            }
-        }
-
-        // Fail fast: the teardown ends a boot still connecting, on its loop.
-        if (timed_out || error) {
+        std::vector<Io*> loops;
+        for (auto& w : pool->workers_) loops.push_back(w.io.get());
+        // acquire_timeout bounds each connect; startup_timeout bounds them all,
+        // a connect with no bound included. A failure has already taken relais
+        // off every loop; stop() then ends the threads.
+        std::optional<std::vector<std::shared_ptr<relais::detail::LoopBinding<Io>>>> bound;
+        try {
+            bound = relais::detail::bindAll<Io>(loops, config.pg_conninfo, attach_cfg, deadline);
+        } catch (...) {
             pool->stop();
-            if (timed_out) throw IoPoolStartupError("IoPool startup exceeded startup_timeout");
-            std::rethrow_exception(error);
+            throw;
         }
+        if (!bound) {
+            pool->stop();
+            throw IoPoolStartupError("IoPool startup exceeded startup_timeout");
+        }
+        for (std::size_t i = 0; i < bound->size(); ++i)
+            pool->workers_[i].binding = std::move((*bound)[i]);
         return pool;
     }
 
     /// Stop all workers: relais leaves every loop at once, each waiting for the
     /// requests in flight on it, then the loops stop.
     void stop() {
-        for (auto& w : workers_) {
-            if (w.binding) w.binding->beginRelease();
-        }
-        for (auto& w : workers_) {
-            if (w.binding) (void)w.binding->awaitRelease();
-            w.binding.reset();
-        }
+        std::vector<std::shared_ptr<relais::detail::LoopBinding<Io>>> bindings;
+        for (auto& w : workers_) bindings.push_back(std::move(w.binding));
+        relais::detail::releaseAll<Io>(bindings);
         for (auto& w : workers_) {
             if (w.thread.joinable()) {
                 w.thread.request_stop();

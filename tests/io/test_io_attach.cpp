@@ -157,7 +157,7 @@ struct SilentTimers : Forwarding {
 };
 
 // What attach() reports on a loop of that kind; the check's descriptors are
-// closed once the loop has run what the failure posted.
+// closed once the loop has run what the failure posted or armed.
 template<typename Loop>
 std::string rejection() {
     LoopThread<Loop> t;
@@ -169,6 +169,10 @@ std::string rejection() {
         what = e.what();
     }
     t.settle();
+    for (int i = 0; i < 100 && countOpenFds() != fds; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        t.settle();
+    }
     CHECK(countOpenFds() == fds);
     return what;
 }

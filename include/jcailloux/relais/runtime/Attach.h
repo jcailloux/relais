@@ -10,6 +10,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -276,6 +277,59 @@ private:
     Clock::time_point drain_until_;
 };
 
+// Takes relais off every loop at once, each waiting there for its requests in
+// flight. On a loop's own thread, starts that loop's teardown without waiting
+// for it.
+template<io::IoContext Io>
+void releaseAll(std::span<const std::shared_ptr<LoopBinding<Io>>> bindings) noexcept {
+    for (const auto& binding : bindings) {
+        if (binding) binding->beginRelease();
+    }
+    for (const auto& binding : bindings) {
+        if (binding && !binding->onLoopThread()) (void)binding->awaitRelease();
+    }
+}
+
+// Binds relais to every loop at once, from another thread than theirs: all are
+// checked, then all boot, each boot bounded by `deadline` when given. A loop
+// that fails the check fails them all before any boot. Once they boot, an error
+// or the deadline takes relais off every loop: the error is rethrown, the
+// deadline gives nullopt.
+template<io::IoContext Io>
+[[nodiscard]] std::optional<std::vector<std::shared_ptr<LoopBinding<Io>>>>
+bindAll(std::span<Io* const> loops, const std::string& conninfo, const AttachConfig& cfg,
+        std::optional<std::chrono::steady_clock::time_point> deadline = std::nullopt) {
+    std::vector<std::shared_ptr<LoopBinding<Io>>> bindings;
+    bindings.reserve(loops.size());
+    for (Io* io : loops) bindings.push_back(LoopBinding<Io>::start(*io, conninfo, cfg));
+
+    std::exception_ptr error;
+    for (const auto& binding : bindings) {
+        try {
+            binding->awaitCheck();
+        } catch (...) {
+            if (!error) error = std::current_exception();
+        }
+    }
+    if (error) std::rethrow_exception(error);
+
+    for (const auto& binding : bindings) binding->startBoot();
+    bool timed_out = false;
+    for (const auto& binding : bindings) {
+        try {
+            if (!binding->awaitBoot(deadline)) timed_out = true;
+        } catch (...) {
+            if (!error) error = std::current_exception();
+        }
+    }
+    if (timed_out || error) {
+        releaseAll<Io>(bindings);  // ends, on its loop, a boot still connecting
+        if (timed_out) return std::nullopt;
+        std::rethrow_exception(error);
+    }
+    return bindings;
+}
+
 }  // namespace detail
 
 // Attachment — relais bound to a loop by attach(). Destroying it, or detach(),
@@ -332,11 +386,9 @@ template<io::IoContext Io>
             throw AttachError("relais::attach() called on the loop's own thread: it waits for "
                               "that loop, so call it from another thread");
     }
-    auto binding = detail::LoopBinding<Io>::start(io, std::move(conninfo), cfg);
-    binding->awaitCheck();
-    binding->startBoot();
-    binding->awaitBoot();
-    return Attachment<Io>(std::move(binding));
+    Io* const loops[] = {&io};
+    auto bound = detail::bindAll<Io>(loops, conninfo, cfg);  // no deadline: never empty
+    return Attachment<Io>(std::move(bound->front()));
 }
 
 }  // namespace jcailloux::relais

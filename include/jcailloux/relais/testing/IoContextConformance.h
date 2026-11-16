@@ -41,8 +41,10 @@
 //
 // What the author must supply, besides the IoContext instance:
 //   - `drive(io, pred)` — pump the loop ON THE CALLING THREAD until pred()
-//     returns true. The loop's internal wait MUST be bounded (return to re-check
-//     pred periodically) so the cross-thread check cannot hang. For
+//     returns true. Every check calls it from the thread that called the
+//     check, so a loop bound to one thread (trantor) is driven where it lives.
+//     The loop's internal wait MUST be bounded (return to re-check pred
+//     periodically) so the cross-thread check cannot hang. For
 //     EpollIoContext: `[](auto& io, auto p){ io.runUntil(p); }`.
 //
 // Usage:
@@ -378,35 +380,29 @@ struct IoContextConformance {
 
     // C7: post() from another thread runs the callback ON the loop thread and
     // promptly wakes a blocked loop. This is the property cross-loop bridges
-    // (and most hand-rolled adapters) get wrong.
+    // (and most hand-rolled adapters) get wrong. The loop runs on the calling
+    // thread, as in every check; the post comes from a thread of its own while
+    // the loop waits.
     template<io::IoContext Io, typename Drive>
     static void checkCrossThreadPost(Io& io, Drive drive) {
-        std::atomic<bool> stop{false};
         std::atomic<bool> fired{false};
         std::atomic<bool> on_loop_thread{false};
+        const auto loop_id = std::this_thread::get_id();
 
-        std::thread loop([&] { drive(io, [&] { return stop.load(); }); });
-
-        auto loop_id = loop.get_id();
-        io.post([&, loop_id] {
-            on_loop_thread = (std::this_thread::get_id() == loop_id);
-            fired = true;
+        std::thread poster([&] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));  // the loop waits by then
+            io.post([&] {
+                on_loop_thread = (std::this_thread::get_id() == loop_id);
+                fired = true;
+            });
         });
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        drive(io, [&] { return fired.load() || std::chrono::steady_clock::now() >= deadline; });
+        poster.join();
 
-        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-        while (!fired.load() && std::chrono::steady_clock::now() < deadline)
-            std::this_thread::yield();
-
-        bool ok_fired = fired.load();
-        bool ok_thread = on_loop_thread.load();
-
-        stop = true;
-        io.post([] {});  // wake the loop so it observes `stop`
-        loop.join();
-
-        detail::require(ok_fired,
+        detail::require(fired.load(),
             "post() from another thread: callback never ran (loop not woken?)");
-        detail::require(ok_thread,
+        detail::require(on_loop_thread.load(),
             "post() from another thread: callback must run on the loop thread");
     }
 

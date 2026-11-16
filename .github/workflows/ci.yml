@@ -32,6 +32,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-14 g++-14 cmake libpq-dev postgresql-client python3
+          # Drogon, fetched for the integration tests only
+          sudo apt-get install -y libjsoncpp-dev uuid-dev zlib1g-dev libssl-dev
 
       - name: Run database migrations
         env:
@@ -56,6 +58,7 @@ jobs:
           -DRELAIS_BUILD_TESTS=ON
           -DRELAIS_BUILD_BENCHMARKS=OFF
           -DRELAIS_BUILD_EXAMPLES=ON
+          -DRELAIS_TEST_DROGON=ON
 
       - name: Build
         run: cmake --build build -j$(nproc)

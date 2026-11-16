@@ -10,6 +10,9 @@
 // breach its side of the contract, and leave no watch behind. Under ASan, a
 // watch freed inside its own dispatch and then called again (the next bit of a
 // split event) is also a use-after-free.
+//
+// Built with RELAIS_TEST_TRANTOR_LOOP, the same cases run on trantor instead,
+// through the shipped TrantorIoContext (test_trantor_loops).
 
 #include <catch2/catch_template_test_macros.hpp>
 #include <catch2/catch_test_macros.hpp>
@@ -27,6 +30,9 @@
 #include <fixtures/LivenessHarness.h>
 #include <fixtures/PgProbe.h>
 #include <fixtures/TestConnInfo.h>
+#ifdef RELAIS_TEST_TRANTOR_LOOP
+#include <fixtures/TrantorTestLoop.h>
+#endif
 
 #include <chrono>
 #include <cstdint>
@@ -52,7 +58,11 @@ using Adversarial = AdversarialIoContext<kAll>;
 static_assert(IoContext<Plain> && IoContext<Adversarial>,
               "an adapter without cancelTimer satisfies the concept");
 
+#ifdef RELAIS_TEST_TRANTOR_LOOP
+#define ADVERSARIAL_LOOPS TrantorTestLoop
+#else
 #define ADVERSARIAL_LOOPS Plain, Split, Spurious, Coarse, Adversarial
+#endif
 
 namespace {
 

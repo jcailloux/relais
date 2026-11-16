@@ -36,8 +36,8 @@ namespace jcailloux::relais::io::detail {
 // Each step is bounded by one deadline, kTimeout from the start: a step still
 // awaited then fails, naming what the loop did not do. The check never adds or
 // removes a watch inside an event dispatch, and lets go of its socket pairs on
-// the loop even when it fails, through a posted task; a loop that never runs
-// that task keeps them.
+// the loop even when it fails, through a posted task (a timer, when post() runs
+// in place); a loop that never runs that task keeps them.
 template<IoContext Io>
 class LoopSelfCheck : public std::enable_shared_from_this<LoopSelfCheck<Io>> {
     using Clock = std::chrono::steady_clock;
@@ -128,6 +128,10 @@ private:
             if (!hasEvent(ev, IoEvent::Read | IoEvent::Error) || !drain(a_)) return;
             in_callback_ = true;
             io_.post([self = this->shared_from_this()] { self->postedFromCallback(); });
+            if (finished()) {  // it ran in place and failed: the watch is left alone
+                in_callback_ = false;
+                return;
+            }
             advance(Step::Writable);
             io_.updateWatch(*handle_, IoEvent::Read | IoEvent::Write);
             in_callback_ = false;
@@ -146,9 +150,12 @@ private:
 
     void postedFromCallback() {
         if (finished()) return;
+        // A posted letGo would run in place too, and remove the watch inside its
+        // own callback: a timer lets go of it once the callback has returned.
         if (in_callback_)
             return fail("a callback posted from a watch callback ran before that callback "
-                        "returned: post() must queue it, never run it in place");
+                        "returned: post() must queue it, never run it in place",
+                        LetGo::AfterDelay);
         posted_ran_ = true;
     }
 
@@ -194,7 +201,9 @@ private:
         closeAll();
     }
 
-    void fail(std::string what) {
+    enum class LetGo { Posted, AfterDelay };
+
+    void fail(std::string what, LetGo how = LetGo::Posted) {
         {
             std::lock_guard lock(m_);
             if (done_) return;
@@ -202,7 +211,12 @@ private:
             failure_ = std::move(what);
             cv_.notify_all();
         }
-        io_.post([self = this->shared_from_this()] { self->letGo(); });
+        auto let_go = [self = this->shared_from_this()] { self->letGo(); };
+        if (how == LetGo::Posted) {
+            io_.post(std::move(let_go));
+        } else {
+            io_.postDelayed(std::chrono::milliseconds(1), std::move(let_go));
+        }
     }
 
     bool watch(int id) {

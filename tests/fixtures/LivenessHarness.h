@@ -321,6 +321,61 @@ void pump(Loop& io, std::chrono::milliseconds window = std::chrono::milliseconds
 template<typename> struct TaskValue;
 template<typename T> struct TaskValue<Task<T>> { using type = T; };
 
+// Runs task to its end, then settles done with what it gave.
+template<typename T>
+DetachedTask settleWith(std::shared_ptr<std::promise<T>> done, Task<T> task) {
+    try {
+        if constexpr (std::is_void_v<T>) {
+            co_await std::move(task);
+            done->set_value();
+        } else {
+            done->set_value(co_await std::move(task));
+        }
+    } catch (...) {
+        done->set_exception(std::current_exception());
+    }
+}
+
+// Runs f on the thread of a loop another thread runs; returns what it returns.
+template<typename Io, typename F>
+auto callOn(Io& io, F f) -> std::invoke_result_t<F&> {
+    using R = std::invoke_result_t<F&>;
+    auto done = std::make_shared<std::promise<R>>();
+    auto result = done->get_future();
+    io.post([done, f = std::move(f)]() mutable {
+        try {
+            if constexpr (std::is_void_v<R>) {
+                f();
+                done->set_value();
+            } else {
+                done->set_value(f());
+            }
+        } catch (...) {
+            done->set_exception(std::current_exception());
+        }
+    });
+    REQUIRE(result.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+    return result.get();
+}
+
+// Runs the task make() returns, both on the thread of a loop another thread
+// runs; returns its value.
+template<typename Io, typename MakeTask>
+auto runOn(Io& io, MakeTask make) -> typename TaskValue<std::invoke_result_t<MakeTask&>>::type {
+    using T = typename TaskValue<std::invoke_result_t<MakeTask&>>::type;
+    auto done = std::make_shared<std::promise<T>>();
+    auto result = done->get_future();
+    io.post([done, make = std::move(make)]() mutable {
+        try {
+            settleWith(done, make());
+        } catch (...) {
+            done->set_exception(std::current_exception());
+        }
+    });
+    REQUIRE(result.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+    return result.get();
+}
+
 // A loop built and run on a thread of its own, as a framework runs its loops:
 // what relais::attach() binds relais to, from another thread.
 template<typename Loop>
@@ -345,40 +400,13 @@ public:
     // Runs f on the loop thread; returns what it returns.
     template<typename F>
     auto call(F f) -> std::invoke_result_t<F&> {
-        using R = std::invoke_result_t<F&>;
-        auto done = std::make_shared<std::promise<R>>();
-        auto result = done->get_future();
-        loop_->post([done, f = std::move(f)]() mutable {
-            try {
-                if constexpr (std::is_void_v<R>) {
-                    f();
-                    done->set_value();
-                } else {
-                    done->set_value(f());
-                }
-            } catch (...) {
-                done->set_exception(std::current_exception());
-            }
-        });
-        REQUIRE(result.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
-        return result.get();
+        return callOn(*loop_, std::move(f));
     }
 
     // Runs the task make() returns, both on the loop thread; returns its value.
     template<typename MakeTask>
     auto run(MakeTask make) -> typename TaskValue<std::invoke_result_t<MakeTask&>>::type {
-        using T = typename TaskValue<std::invoke_result_t<MakeTask&>>::type;
-        auto done = std::make_shared<std::promise<T>>();
-        auto result = done->get_future();
-        loop_->post([done, make = std::move(make)]() mutable {
-            try {
-                drive(done, make());
-            } catch (...) {
-                done->set_exception(std::current_exception());
-            }
-        });
-        REQUIRE(result.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
-        return result.get();
+        return runOn(*loop_, std::move(make));
     }
 
     // What the loop has queued so far has run.
@@ -392,20 +420,6 @@ public:
     }
 
 private:
-    template<typename T>
-    static DetachedTask drive(std::shared_ptr<std::promise<T>> done, Task<T> task) {
-        try {
-            if constexpr (std::is_void_v<T>) {
-                co_await std::move(task);
-                done->set_value();
-            } else {
-                done->set_value(co_await std::move(task));
-            }
-        } catch (...) {
-            done->set_exception(std::current_exception());
-        }
-    }
-
     std::promise<Loop*> built_;
     Loop* loop_ = nullptr;
     std::jthread thread_;
