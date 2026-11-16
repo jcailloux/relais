@@ -750,9 +750,8 @@ TEST_CASE("liveness: a mid-query RST resolves in error without a stray timer",
 TEST_CASE("liveness: a fast multi-result pipeline re-arms with no spurious timeout",
           "[io][liveness][integration]") {
     Io io;
-    // Short query_timeout, but each round-trip is fast → every re-registered
-    // watch cancels its predecessor's timer; zero spurious PgQueryTimeout and no
-    // timer accumulation.
+    // Short query_timeout, but each round-trip is fast → every wait disarms its
+    // deadline in time; zero spurious PgQueryTimeout and no timer accumulation.
     auto conn = driveBounded(io, PgConnection<Io>::connect(io, getConnInfo(), 2s, 500ms));
 
     for (int i = 0; i < 5; ++i) {
@@ -761,7 +760,53 @@ TEST_CASE("liveness: a fast multi-result pipeline re-arms with no spurious timeo
         REQUIRE(r.rows() == 50);
     }
     REQUIRE(conn->connected());
-    REQUIRE(io.pendingTimerCount() == 0);  // no timer leaked across re-arms
+    // At most the timer of each of the connection's two queues.
+    REQUIRE(io.pendingTimerCount() <= 2);
+    REQUIRE(io.cancelledTimers() == 0);
+}
+
+TEST_CASE("liveness: a pool's requests arm no loop timer",
+          "[io][liveness][integration]") {
+    Io io;
+    auto pool = driveBounded(io, PgPool<Io>::create(io, getConnInfo(),
+        {.min_connections = 1, .max_connections = 1, .acquire_timeout = 5s,
+         .query_timeout = 30s}));
+    const auto armed_at_start = io.armedTimers();  // the handshake's acquire_timeout
+
+    // Four requests at a time on one connection: three queue on acquire.
+    constexpr int kRequests = 40;
+    int done = 0;
+    auto request = [&]() -> DetachedTask {
+        auto guard = co_await pool->acquire();
+        if ((co_await guard.conn().query("SELECT 1")).ok()) ++done;
+    };
+    for (int round = 0; round < kRequests / 4; ++round) {
+        const int target = done + 4;
+        for (int i = 0; i < 4; ++i) request();
+        const auto end = std::chrono::steady_clock::now() + 5s;
+        while (done < target && std::chrono::steady_clock::now() < end) io.runOnce(10);
+    }
+
+    REQUIRE(done == kRequests);
+    // The query_timeout queue's first timer, nothing per request or per waiter.
+    CHECK(io.armedTimers() - armed_at_start <= 1);
+    CHECK(io.cancelledTimers() == 0);
+    CHECK(pool->waiterCount() == 0);
+}
+
+TEST_CASE("liveness: query_timeout counts from each wait, not from the pool's timer",
+          "[io][liveness][integration]") {
+    Io io;
+    auto conn = driveBounded(io, PgConnection<Io>::connect(io, getConnInfo(), 2s, 300ms));
+    // Arms the query_timeout queue's timer, 300 ms from now.
+    REQUIRE(driveBounded(io, conn->query("SELECT 1")).ok());
+    pump(io, 200ms);
+
+    const auto t0 = std::chrono::steady_clock::now();
+    REQUIRE_THROWS_AS(driveBounded(io, conn->query("SELECT pg_sleep(2)")), PgQueryTimeout);
+    const auto waited = std::chrono::steady_clock::now() - t0;
+    CHECK(waited >= 300ms);  // not when the timer armed by the first query fired
+    CHECK(waited < 1500ms);
 }
 
 TEST_CASE("liveness: a batched fire that cannot acquire a connection fails its waiters",

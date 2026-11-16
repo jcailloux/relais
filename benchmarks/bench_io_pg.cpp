@@ -9,9 +9,10 @@
  *                    Exposes real pool/pipeline utilization. Without these,
  *                    the latency benchmarks would mislead readers into
  *                    treating 1/RTT as the system's max throughput.
- *   - [timer]      : per-operation deadline arm/cancel cost in isolation, plus
- *                    its zero-syscall / bounded-memory invariants. The
- *                    [timeout] cases re-measure the same overhead end to end.
+ *   - [timer]      : per-operation deadline arm/disarm cost in isolation, and
+ *                    the loop timer's arm/cancel, with their zero-syscall /
+ *                    bounded-memory invariants. The [timeout] cases re-measure
+ *                    the deadline's overhead end to end.
  *   - [number-text]: numeric parameter / column text conversion in isolation.
  *
  * Run with:
@@ -30,6 +31,7 @@
 
 #include "BenchEngine.h"
 
+#include <jcailloux/relais/io/DeadlineQueue.h>
 #include <jcailloux/relais/io/pg/PgPool.h>
 #include <jcailloux/relais/io/pg/PgConnection.h>
 #include <jcailloux/relais/io/pg/PgResult.h>
@@ -478,12 +480,14 @@ TEST_CASE("Benchmark - PG throughput SELECT by PK", "[benchmark][pg][throughput]
 // =============================================================================
 // TIMEOUT / TIMER — per-operation deadline overhead and timer-subsystem health
 //
-// Every timed operation arms a postDelayed on registerWatch and cancels it on
-// removeCurrentWatch when the result wins the race (the overwhelmingly common
-// case). query_timeout=0 arms nothing. These cases quantify the cost of the
-// armed-but-never-fired path and assert its two structural invariants:
-//   - loop-local arm issues no pipe wakeup (zero syscall),
-//   - cancel removes the node outright (no tombstone, bounded memory).
+// Every timed I/O wait arms a deadline in its pool's queue and disarms it when
+// the result wins the race (the overwhelmingly common case): a link and an
+// unlink, no call on the loop. The queue's single loop timer is armed once and
+// never cancelled. query_timeout=0 arms nothing. These cases quantify the cost
+// of the armed-but-never-fired path and assert its structural invariants:
+//   - a deadline arms no loop timer,
+//   - loop-local arm of a loop timer issues no pipe wakeup (zero syscall),
+//   - cancel removes the loop timer outright (no tombstone, bounded memory).
 // =============================================================================
 // #############################################################################
 
@@ -491,8 +495,9 @@ TEST_CASE("Benchmark - PG throughput SELECT by PK", "[benchmark][pg][throughput]
 //  TIMER: isolated arm + cancel cost (no DB)
 //
 //  The end-to-end cases below drown this in the μs-scale round-trip; here it is
-//  measured directly. Steady state runs against a warmed pmr node pool, so the
-//  figure is the real per-op cost a timed query pays, with no malloc.
+//  measured directly: a deadline's arm + disarm, what a timed I/O wait pays, and
+//  a loop timer's arm + cancel, what a batch's flush timer pays. Steady state
+//  runs against a warmed pmr node pool, with no malloc.
 // -----------------------------------------------------------------------------
 
 TEST_CASE("Benchmark - timer arm+cancel (loop-local)", "[benchmark][io][timer]")
@@ -532,15 +537,37 @@ TEST_CASE("Benchmark - timer arm+cancel (loop-local)", "[benchmark][io][timer]")
     for (auto t : tokens) io.cancelTimer(t);
     size_t pending_drained = io.pendingTimerCount();
 
+    // A deadline in a queue, as a timed I/O wait arms and disarms it. The first
+    // arm arms the queue's loop timer; none after it does.
+    auto queue = DeadlineQueue<Io>::make(io, kNever);
+    struct Op { Deadline deadline{this, [](void*) {}}; } op;
+    queue->arm(op.deadline);
+    op.deadline.disarm();
+    const size_t loop_timers = io.pendingTimerCount();
+    auto d0 = Clock::now();
+    for (int i = 0; i < kIters; ++i) {
+        queue->arm(op.deadline);
+        op.deadline.disarm();
+    }
+    double deadline_ns =
+        std::chrono::duration<double, std::nano>(Clock::now() - d0).count() / kIters;
+    const size_t loop_timers_after = io.pendingTimerCount();
+
     // Deterministic structural invariants gate; the ns figure only reports.
     CHECK(wake_delta == 0);          // loop-local arm issues no pipe write
     CHECK(pending_after == 0);       // every armed timer cancelled
     CHECK(peak_pending == kLive);    // all live deadlines tracked, none coalesced
     CHECK(pending_drained == 0);     // cancel-all leaves no residue
+    CHECK(loop_timers == 1);         // the queue's one timer
+    CHECK(loop_timers_after == loop_timers);  // a deadline arms no loop timer
 
     csv("timer arm+cancel", "avg_us", arm_cancel_ns / 1000.0);
+    csv("deadline arm+disarm", "avg_us", deadline_ns / 1000.0);
     std::ostringstream out;
-    out << "\n  timer arm+cancel (loop-local, deadline never fires)\n"
+    out << "\n  deadline arm+disarm (a timed I/O wait, deadline never reached)\n"
+        << "    per-op:        " << fmtDuration(deadline_ns / 1000.0) << "\n"
+        << "    loop timers:   " << loop_timers_after << "  (the queue's one, armed once)\n"
+        << "\n  timer arm+cancel (loop-local, deadline never fires)\n"
         << "    per-op:        " << fmtDuration(arm_cancel_ns / 1000.0) << "\n"
         << "    pipe wakeups:  " << wake_delta << "  (loop-local arm → 0 syscall)\n"
         << "    peak pending:  " << peak_pending << " timers held at once\n"
@@ -552,8 +579,9 @@ TEST_CASE("Benchmark - timer arm+cancel (loop-local)", "[benchmark][io][timer]")
 // -----------------------------------------------------------------------------
 //  LATENCY: same query, query_timeout off vs armed-never-fired
 //
-//  p50/p99 side by side. The delta is the per-round-trip arm+cancel — expected
-//  to sit inside the round-trip noise (no syscall, no measurable regression).
+//  p50/p99 side by side. The delta is the per-round-trip deadline arm+disarm —
+//  expected to sit inside the round-trip noise (no syscall, no measurable
+//  regression).
 // -----------------------------------------------------------------------------
 
 TEST_CASE("Benchmark - PG pool query: timeout off vs on", "[benchmark][pg][latency][timeout]")
@@ -591,14 +619,15 @@ TEST_CASE("Benchmark - PG pool query: timeout off vs on", "[benchmark][pg][laten
 //  THROUGHPUT: concurrent in-flight load, query_timeout off vs on
 //
 //  Single loop, kConc queries in flight at once — the pipeline saturates and
-//  deadlines arm/cancel back to back. Reports throughput delta plus two health
+//  deadlines arm/disarm back to back. Reports throughput delta plus two health
 //  metrics. The wakeup rate is non-zero in BOTH configs: it comes from the pool
 //  granting a queued waiter (io_.post resumes it, an unconditional pipe write) —
 //  the loop is oversubscribed (kConc > pool max) on purpose, to force pipelining.
 //  What matters here is that query_timeout=on matches the off baseline: the
 //  deadline arming is loop-local and adds no parasitic wakeup of its own. The
 //  absolute zero-syscall property of arming is proven in the [timer] case.
-//  peak pending = the memory bound: one timer per in-flight deadline, no more.
+//  peak pending = the loop timers held at once: one per deadline queue, however
+//  many deadlines are in flight.
 // -----------------------------------------------------------------------------
 
 TEST_CASE("Benchmark - PG throughput: timeout off vs on", "[benchmark][pg][throughput][timeout]")
