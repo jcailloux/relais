@@ -13,6 +13,7 @@
 #include <utility>
 #include <vector>
 
+#include "jcailloux/relais/io/DeadlineQueue.h"
 #include "jcailloux/relais/io/Task.h"
 #include "jcailloux/relais/io/IoContext.h"
 #include "jcailloux/relais/io/pg/PgConnection.h"
@@ -57,6 +58,10 @@ struct PgPoolConfig {
 };
 
 // PgPool — bounded connection pool with coroutine wait queue
+//
+// acquire_timeout and query_timeout bound operations through two deadline
+// queues the pool's connections share (DeadlineQueue): one loop timer each for
+// the whole pool, none armed or cancelled per request.
 
 template<IoContext Io>
 class PgPool : public std::enable_shared_from_this<PgPool<Io>> {
@@ -119,12 +124,7 @@ public:
             new PgPool(io, std::move(conninfo), cfg));
 
         for (size_t i = 0; i < cfg.min_connections; ++i) {
-            // ms → ns is an exact widening (implicit). acquire_timeout bounds the
-            // handshake; query_timeout is stored on the connection for its later
-            // query I/O waits.
-            auto conn = co_await ConnectionType::connect(
-                pool->io_, pool->conninfo_.c_str(),
-                cfg.acquire_timeout, cfg.query_timeout, pool->settleConfig());
+            auto conn = co_await pool->connectOne();
             pool->idle_.push_back(pool->adopt(std::move(conn)));
             ++pool->total_;
         }
@@ -169,9 +169,7 @@ public:
             // acquire_timeout bounds this connect: a hanging handshake
             // (DNS, SYN blackhole) throws PgPoolTimeout, the SlotGuard unwinds
             // ++total_, and acquire() propagates instead of freezing.
-            auto conn = co_await ConnectionType::connect(
-                io_, conninfo_.c_str(), cfg_.acquire_timeout, cfg_.query_timeout,
-                settleConfig());
+            auto conn = co_await connectOne();
             auto* adopted = adopt(std::move(conn));
             slot.committed = true;
             co_return ConnectionGuard(this->shared_from_this(), adopted);
@@ -204,14 +202,24 @@ private:
     // it must be visible before that declaration.
     struct Waiter;
 
+    using Deadlines = detail::DeadlineQueue<Io>;
+
     PgPool(Io& io, std::string conninfo, PgPoolConfig cfg)
         : io_(io)
         , conninfo_(std::move(conninfo))
         , cfg_(cfg)
+        , acquire_deadlines_(Deadlines::make(io, cfg.acquire_timeout))
+        , query_deadlines_(Deadlines::make(io, cfg.query_timeout))
     {}
 
     [[nodiscard]] detail::SettleConfig settleConfig() const noexcept {
         return {cfg_.uncertain_settle, cfg_.settle_delay, cfg_.client_check_interval};
+    }
+
+    // A new connection, bounded by the pool's queues.
+    Task<std::unique_ptr<ConnectionType>> connectOne() {
+        return ConnectionType::connect(io_, conninfo_.c_str(), acquire_deadlines_,
+                                       query_deadlines_, settleConfig());
     }
 
     // Takes ownership of a new connection, which stays at its address until
@@ -243,11 +251,10 @@ private:
         if (!waiters_.empty()) {
             auto* waiter = waiters_.front();
             waiters_.pop_front();
-            // Win the acquire_timeout race: cancel the waiter's timer
-            // before posting its resume. Single loop thread, so once cancelled the
-            // expiry callback (onWaiterTimeout) cannot run. No-op if unarmed
-            // (acquire_timeout == 0).
-            if (waiter->armed_) io_.cancelTimer(waiter->timer_);
+            // Win the acquire_timeout race: disarm the waiter's deadline before
+            // posting its resume. Single loop thread, so once disarmed its expiry
+            // (onWaiterTimeout) cannot run. No-op if unarmed (acquire_timeout == 0).
+            waiter->deadline.disarm();
             waiter->conn = conn;
             io_.post([h = waiter->continuation] { h.resume(); });
             return;
@@ -268,9 +275,7 @@ private:
 
     static detail::TrackedTask connectReplacement(std::shared_ptr<PgPool> self) {
         try {
-            auto conn = co_await ConnectionType::connect(
-                self->io_, self->conninfo_.c_str(), self->cfg_.acquire_timeout,
-                self->cfg_.query_timeout, self->settleConfig());
+            auto conn = co_await self->connectOne();
             self->release(self->adopt(std::move(conn)));
         } catch (...) {
             --self->total_;
@@ -279,9 +284,9 @@ private:
 
     // acquire_timeout expiry for a queued Waiter. Single loop thread, so
     // this and release() cannot interleave: whichever runs first removes the
-    // waiter — release pops it and cancels this timer; this erases it from the
+    // waiter — release pops it and disarms its deadline; this erases it from the
     // queue — and the other finds nothing to do. The resume is posted, never run
-    // inline, to keep the unwind out of fireExpiredTimers.
+    // inline, to keep the unwind out of the timer's dispatch.
     void onWaiterTimeout(Waiter* w) {
         for (auto it = waiters_.begin(); it != waiters_.end(); ++it) {
             if (*it == w) {
@@ -291,42 +296,35 @@ private:
                 return;
             }
         }
-        // Not found: release() already served this waiter and cancelled the
-        // timer — this callback should not even run; defensive no-op.
+        // Not found: release() already served this waiter and disarmed its
+        // deadline — this should not even run; defensive no-op.
     }
 
     struct Waiter {
         PgPool* pool;
         ConnectionType* conn = nullptr;  // handed over by release()
-        std::coroutine_handle<> continuation;
-        typename Io::TimerToken timer_{};
-        bool armed_ = false;      // timer_ holds a live token
+        std::coroutine_handle<> continuation{};
         bool timed_out_ = false;  // acquire_timeout fired before a connection arrived
+        // Bounds the queue wait by acquire_timeout. It lives in the suspended
+        // acquire() frame, which is never destroyed while queued here — the same
+        // invariant the waiters_-stored `continuation` relies on — and disarms
+        // itself with the frame.
+        detail::Deadline deadline{this, &Waiter::expire};
+
+        static void expire(void* w) {
+            auto* self = static_cast<Waiter*>(w);
+            self->pool->onWaiterTimeout(self);
+        }
 
         bool await_ready() const noexcept { return false; }
 
-        // noexcept preserved: under OOM both postDelayed and waiters_.push_back may
-        // throw bad_alloc, which terminates — the same fatal-allocation contract as
-        // the original push_back-only body, and it avoids any half-armed/half-queued
-        // intermediate state.
+        // noexcept preserved: under OOM both waiters_.push_back and the queue's
+        // first timer may throw bad_alloc, which terminates, rather than leave a
+        // half-armed, half-queued waiter.
         void await_suspend(std::coroutine_handle<> h) noexcept {
             continuation = h;
             pool->waiters_.push_back(this);
-            // Bound the queue wait by acquire_timeout. 0 = unbounded.
-            // The timer callback captures the raw `self`; it stays valid because a
-            // queued acquire() frame is never destroyed while suspended here — the
-            // same invariant the waiters_-stored `continuation` already relies on.
-            // The frame is torn down only after a posted resume, which both
-            // release() (timer cancelled) and onWaiterTimeout() (timer consumed)
-            // emit strictly before the timer could dangle. A future cancellable
-            // acquire() caller would have to disarm on cancellation.
-            auto to = pool->cfg_.acquire_timeout;
-            if (to.count() > 0) {
-                timer_ = pool->io_.postDelayed(
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(to),
-                    [pool = pool, self = this] { pool->onWaiterTimeout(self); });
-                armed_ = true;
-            }
+            if (auto* q = pool->acquire_deadlines_.get()) q->arm(deadline);  // 0 = unbounded
         }
 
         ConnectionGuard await_resume() {
@@ -341,6 +339,11 @@ private:
     std::string conninfo_;
     PgPoolConfig cfg_;
     size_t total_ = 0;
+
+    // acquire_timeout bounds queued acquires and connect handshakes;
+    // query_timeout, every I/O wait of the pool's connections. Null = unbounded.
+    std::shared_ptr<Deadlines> acquire_deadlines_;
+    std::shared_ptr<Deadlines> query_deadlines_;
 
     // Every connection the pool owns, idle or lent out. Its I/O callbacks hold
     // its address, so the pool keeps it in a node of its own, never moved.

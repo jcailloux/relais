@@ -216,6 +216,10 @@ public:
         return wakeups_.load(std::memory_order_relaxed);
     }
 
+    /// Diagnostic: timerfd_settime calls so far. A loop turn whose earliest
+    /// timer did not move earlier costs none. Loop-thread only.
+    [[nodiscard]] uint64_t timerfdArms() const noexcept { return timerfd_arms_; }
+
     /// Diagnostic: timers currently in flight (excludes cancelled ones, which are
     /// removed outright rather than tombstoned). Used to assert no accumulation.
     [[nodiscard]] size_t pendingTimerCount() const {
@@ -258,9 +262,10 @@ public:
             }
 
             if (fd == timer_fd_) {
-                // Drain the timerfd
+                // Drain the timerfd: it expired, so it is no longer armed.
                 uint64_t expirations;
                 [[maybe_unused]] auto _ = ::read(timer_fd_, &expirations, sizeof(expirations));
+                timerfd_at_ = Clock::time_point::max();
                 fireExpiredTimers();
                 continue;
             }
@@ -347,18 +352,19 @@ private:
     }
 
     void fireExpiredTimers() {
-        auto now = Clock::now();
-
         // Move matured timers out under lock, then fire them unlocked (a
         // callback may re-enter postDelayed/cancelTimer). fire_scratch_ is a
         // reused member: loop-thread only, capacity retained → no per-fire alloc.
         fire_scratch_.clear();
         {
             std::lock_guard lock(post_mutex_);
-            for (auto it = timers_.begin(); it != timers_.end() && it->first <= now; ) {
-                by_token_.erase(it->second.token);
-                fire_scratch_.push_back(std::move(it->second));
-                it = timers_.erase(it);
+            if (!timers_.empty()) {
+                const auto now = Clock::now();
+                for (auto it = timers_.begin(); it != timers_.end() && it->first <= now; ) {
+                    by_token_.erase(it->second.token);
+                    fire_scratch_.push_back(std::move(it->second));
+                    it = timers_.erase(it);
+                }
             }
         }
 
@@ -369,24 +375,30 @@ private:
         rearmTimerfd();
     }
 
+    // Arms the timerfd only when the earliest timer is earlier than what it is
+    // armed for, so a loop turn costs no syscall for timers that did not change.
+    // A timer cancelled or fired ahead of the timerfd leaves it armed: it
+    // expires for nothing, and that expiry re-arms it for the earliest timer
+    // left, if any. One wakeup then, instead of a syscall on every turn.
     void rearmTimerfd() {
-        std::lock_guard lock(post_mutex_);
-        struct itimerspec its{};
-
-        if (!timers_.empty()) {
-            auto deadline = timers_.begin()->first;
-            auto now = Clock::now();
-            if (deadline <= now) {
-                // Fire ASAP
-                its.it_value.tv_nsec = 1;
-            } else {
-                auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - now);
-                its.it_value.tv_sec = ns.count() / 1'000'000'000;
-                its.it_value.tv_nsec = ns.count() % 1'000'000'000;
-            }
+        Clock::time_point earliest = Clock::time_point::max();
+        {
+            std::lock_guard lock(post_mutex_);
+            if (!timers_.empty()) earliest = timers_.begin()->first;
         }
-        // its = {{0,0},{0,0}} disarms the timer if queue is empty
-        timerfd_settime(timer_fd_, 0, &its, nullptr);
+        if (earliest >= timerfd_at_) return;
+
+        struct itimerspec its{};
+        const auto now = Clock::now();
+        if (earliest <= now) {
+            its.it_value.tv_nsec = 1;  // fire ASAP
+        } else {
+            const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(earliest - now);
+            its.it_value.tv_sec = ns.count() / 1'000'000'000;
+            its.it_value.tv_nsec = ns.count() % 1'000'000'000;
+        }
+        ++timerfd_arms_;
+        if (timerfd_settime(timer_fd_, 0, &its, nullptr) == 0) timerfd_at_ = earliest;
     }
 
     int computeTimeout() const {
@@ -420,6 +432,9 @@ private:
     std::pmr::unordered_map<TimerToken,
         std::pmr::multimap<Clock::time_point, TimerEntry>::iterator> by_token_{&timer_pool_};
     std::vector<TimerEntry> fire_scratch_;  // reused by fireExpiredTimers (loop-thread)
+    // When the timerfd expires; max() while disarmed or expired (loop-thread).
+    Clock::time_point timerfd_at_ = Clock::time_point::max();
+    uint64_t timerfd_arms_ = 0;  // loop-thread only
 
     std::atomic<uint64_t> next_timer_token_{1};
     std::atomic<uint64_t> wakeups_{0};

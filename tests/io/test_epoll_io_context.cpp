@@ -157,3 +157,60 @@ TEST_CASE("EpollIoContext: thread-safe post with multiple threads", "[io][epoll]
     io.runUntil([&] { return count.load() >= N; });
     REQUIRE(count.load() == N);
 }
+
+TEST_CASE("EpollIoContext: a loop turn whose timers did not move earlier rearms nothing",
+          "[io][epoll]") {
+    EpollIoContext io;
+    io.runOnce(0);
+    REQUIRE(io.timerfdArms() == 0);  // nothing to arm
+
+    io.postDelayed(std::chrono::seconds(60), [] {});
+    io.runOnce(0);
+    REQUIRE(io.timerfdArms() == 1);
+
+    for (int i = 0; i < 100; ++i) {
+        io.post([] {});
+        io.runOnce(0);
+    }
+    CHECK(io.timerfdArms() == 1);
+
+    // A later timer leaves the expiry where it is; an earlier one moves it.
+    io.postDelayed(std::chrono::seconds(120), [] {});
+    io.runOnce(0);
+    CHECK(io.timerfdArms() == 1);
+    io.postDelayed(std::chrono::seconds(30), [] {});
+    io.runOnce(0);
+    CHECK(io.timerfdArms() == 2);
+}
+
+TEST_CASE("EpollIoContext: an earlier timer fires on time while a later one is armed",
+          "[io][epoll]") {
+    EpollIoContext io;
+    io.postDelayed(std::chrono::seconds(10), [] {});
+    io.runOnce(0);
+
+    bool fired = false;
+    const auto t0 = std::chrono::steady_clock::now();
+    io.postDelayed(std::chrono::milliseconds(5), [&] { fired = true; });
+    io.runUntil([&] { return fired; });
+
+    // Well before the loop's own 100 ms wait would have run it.
+    CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(60));
+}
+
+TEST_CASE("EpollIoContext: a cancelled earliest timer lets the next one fire on time",
+          "[io][epoll]") {
+    EpollIoContext io;
+    bool cancelled_fired = false, fired = false;
+    const auto t0 = std::chrono::steady_clock::now();
+    auto first = io.postDelayed(std::chrono::milliseconds(20), [&] { cancelled_fired = true; });
+    io.postDelayed(std::chrono::milliseconds(40), [&] { fired = true; });
+    io.runOnce(0);  // the timerfd is armed for the first
+    io.cancelTimer(first);
+
+    io.runUntil([&] { return fired; });
+    CHECK_FALSE(cancelled_fired);
+    CHECK(std::chrono::steady_clock::now() - t0 >= std::chrono::milliseconds(40));
+    // Armed for the first, then, from its expiry for nothing, for the second.
+    CHECK(io.timerfdArms() == 2);
+}

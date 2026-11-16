@@ -19,6 +19,7 @@
 #include <unistd.h>
 
 #include "jcailloux/relais/Log.h"
+#include "jcailloux/relais/io/DeadlineQueue.h"
 #include "jcailloux/relais/io/Task.h"
 #include "jcailloux/relais/io/IoContext.h"
 #include "jcailloux/relais/io/pg/PgError.h"
@@ -35,14 +36,21 @@ namespace jcailloux::relais::io::detail {
 // Watches are added and removed from posted tasks, never inside an event
 // dispatch.
 //
-// Neither copyable nor movable: its watch and timer callbacks hold its address,
-// so a connection stays where connect() built it, on the heap, until destroyed.
+// Its handshake and its I/O waits are bounded by a deadline in a queue
+// (DeadlineQueue), one loop timer serving every connection that shares the
+// queue: a request arms no timer of the loop.
+//
+// Neither copyable nor movable: its watch callback and its deadline hold its
+// address, so a connection stays where connect() built it, on the heap, until
+// destroyed.
 
 template<IoContext Io>
 class PgConnection {
 public:
+    using Deadlines = DeadlineQueue<Io>;
+
     ~PgConnection() {
-        disarmTimer();  // its callback holds `this`
+        deadline_.disarm();
         // A request that loses its connection may destroy it inside an event
         // dispatch: the watch is retired, its removal posted.
         retireSocketWatch();
@@ -69,10 +77,10 @@ public:
 
     // Async connect (static factory)
 
-    // acquire_timeout bounds the connect handshake; query_timeout is stored on the
-    // connection as the default bound for subsequent I/O waits. Both default to
-    // 0 = unbounded (server/conninfo-delegated), which keeps direct callers
-    // (tests/benches) compiling unchanged.
+    // acquire_timeout bounds the connect handshake and the setup queries below;
+    // query_timeout bounds each later I/O wait. Both default to 0 = unbounded
+    // (server/conninfo-delegated). The connection gets queues of its own; a
+    // pool's connections share the pool's, through the overload below.
     //
     // `settle` decides what a write failing uncertainly on this connection must
     // wait for (settleTicket()). Terminate and Await name the backend, and Delay
@@ -85,9 +93,22 @@ public:
         std::chrono::nanoseconds query_timeout = {},
         SettleConfig settle = {})
     {
+        return connect(io, conninfo, Deadlines::make(io, acquire_timeout),
+                       Deadlines::make(io, query_timeout), settle);
+    }
+
+    // The same, bounded by the given queues (null = unbounded): the durations
+    // are theirs, and their timers serve every connection that shares them.
+    static Task<std::unique_ptr<PgConnection>> connect(
+        Io& io, const char* conninfo,
+        std::shared_ptr<Deadlines> acquire_deadlines,
+        std::shared_ptr<Deadlines> query_deadlines,
+        SettleConfig settle = {})
+    {
         // Allocated before libpq's connection, which it then owns: a failure
         // below frees both.
-        std::unique_ptr<PgConnection> pgconn(new PgConnection(io, query_timeout));
+        std::unique_ptr<PgConnection> pgconn(new PgConnection(
+            io, std::move(acquire_deadlines), std::move(query_deadlines)));
         pgconn->conn_ = PQconnectStart(conninfo);
         if (!pgconn->conn_)
             throw PgConnectionError("PQconnectStart returned null");
@@ -97,14 +118,14 @@ public:
                                     + PQerrorMessage(pgconn->conn_));
         PQsetnonblocking(pgconn->conn_, 1);
 
-        co_await pgconn->awaitConnect(acquire_timeout);
+        co_await pgconn->awaitConnect();
         pgconn->settle_ = settle;
         if (settle.mode == UncertainSettle::Terminate || settle.mode == UncertainSettle::Await)
-            co_await pgconn->readBackendId(acquire_timeout);
+            co_await pgconn->readBackendId();
         else if (settle.mode == UncertainSettle::Delay && settle.delay.count() <= 0)
-            co_await pgconn->readStatementTimeout(acquire_timeout);
+            co_await pgconn->readStatementTimeout();
         if (settle.mode != UncertainSettle::Delay && settle.client_check_interval.count() > 0)
-            co_await pgconn->setClientCheckInterval(settle.client_check_interval, acquire_timeout);
+            co_await pgconn->setClientCheckInterval(settle.client_check_interval);
         co_return pgconn;
     }
 
@@ -316,20 +337,23 @@ public:
     }
 
 private:
-    PgConnection(Io& io, std::chrono::nanoseconds query_timeout)
+    PgConnection(Io& io, std::shared_ptr<Deadlines> acquire_deadlines,
+                 std::shared_ptr<Deadlines> query_deadlines)
         : io_(io)
         , socket_watch_(std::make_shared<SocketWatch>(this, io))
-        , query_timeout_(query_timeout) {}
+        , acquire_deadlines_(std::move(acquire_deadlines))
+        , query_deadlines_(std::move(query_deadlines))
+        , wait_deadlines_(query_deadlines_.get()) {}
 
     // Part of acquiring the connection, so bounded by acquire_timeout and failing
     // as an acquire does: the request changes nothing, its failure is never
     // uncertain. A server-side refusal leaves the backend unknown and the
     // connection usable.
-    Task<void> readBackendId(std::chrono::nanoseconds acquire_timeout) {
+    Task<void> readBackendId() {
         static constexpr const char* kSql =
             "SELECT pid, backend_start::text FROM pg_stat_activity "
             "WHERE pid = pg_backend_pid()";
-        std::optional<PgResult> r = co_await settleQuery(kSql, acquire_timeout,
+        std::optional<PgResult> r = co_await settleQuery(kSql,
             "cannot name the backend of a connection, its uncertain writes will not be settled");
         if (r && r->rows() == 1) {
             backend_.pid = (*r)[0].get<int32_t>(0);
@@ -339,10 +363,10 @@ private:
 
     // Delay without a configured delay: the server's statement_timeout bounds
     // a write. Read in milliseconds; 0 (no bound) leaves nothing to settle.
-    Task<void> readStatementTimeout(std::chrono::nanoseconds acquire_timeout) {
+    Task<void> readStatementTimeout() {
         static constexpr const char* kSql =
             "SELECT setting::bigint FROM pg_settings WHERE name = 'statement_timeout'";
-        std::optional<PgResult> r = co_await settleQuery(kSql, acquire_timeout,
+        std::optional<PgResult> r = co_await settleQuery(kSql,
             "cannot read statement_timeout, uncertain writes will not be settled");
         if (r && r->rows() == 1) {
             const auto ms = (*r)[0].get<int64_t>(0);
@@ -352,20 +376,18 @@ private:
 
     // Refused by a server before 14 (unknown parameter) or not on Linux: the
     // statement then runs to its end after the client left, as before.
-    Task<void> setClientCheckInterval(std::chrono::milliseconds interval,
-                                      std::chrono::nanoseconds acquire_timeout) {
+    Task<void> setClientCheckInterval(std::chrono::milliseconds interval) {
         const std::string sql = "SET client_connection_check_interval = "
             + std::to_string(interval.count());
-        (void)co_await settleQuery(sql.c_str(), acquire_timeout,
+        (void)co_await settleQuery(sql.c_str(),
             "client_connection_check_interval not set", log::Level::Debug);
     }
 
-    // Runs a settle setup query, nullopt when the server refuses it.
-    Task<std::optional<PgResult>> settleQuery(const char* sql,
-                                              std::chrono::nanoseconds acquire_timeout,
-                                              const char* refused,
+    // Runs a settle setup query, bounded by acquire_timeout; nullopt when the
+    // server refuses it.
+    Task<std::optional<PgResult>> settleQuery(const char* sql, const char* refused,
                                               log::Level level = log::Level::Warn) {
-        const auto query_timeout = std::exchange(query_timeout_, acquire_timeout);
+        auto* const query_deadlines = std::exchange(wait_deadlines_, acquire_deadlines_.get());
         std::optional<PgResult> r;
         try {
             r = co_await query(sql);
@@ -376,7 +398,7 @@ private:
         } catch (const PgError& e) {
             log::LogStream(level) << "relais: " << refused << ": " << e.what();
         }
-        query_timeout_ = query_timeout;
+        wait_deadlines_ = query_deadlines;
         co_return r;
     }
 
@@ -531,23 +553,17 @@ private:
     // dispatch: a step removes the previous watch and adds the next one.
     struct ConnectAwaiter {
         PgConnection* self;
-        std::chrono::nanoseconds timeout;  // acquire_timeout, 0 = unbounded
-        bool watch_failed = false;         // the socket could not be watched mid-handshake
-        bool step_posted = false;          // a step is pending: further events add none
+        bool watch_failed = false;  // the socket could not be watched mid-handshake
+        bool step_posted = false;   // a step is pending: further events add none
 
         bool await_ready() const noexcept { return false; }
 
         void await_suspend(std::coroutine_handle<> h) {
+            // acquire_timeout bounds the whole handshake: armed once here,
+            // disarmed when the handshake ends.
+            if (auto* q = self->acquire_deadlines_.get()) q->arm(self->deadline_);
             self->current_cont_ = h;
             self->connect_ = this;
-            // acquire_timeout bounds the whole handshake: armed once here,
-            // cancelled when the handshake ends.
-            if (timeout.count() > 0) {
-                self->timer_ = self->io_.postDelayed(timeout, [s = self] {
-                    s->timeoutCurrentWait();
-                });
-                self->timer_armed_ = true;
-            }
             self->postConnectStep();
         }
 
@@ -565,9 +581,7 @@ private:
         }
     };
 
-    ConnectAwaiter awaitConnect(std::chrono::nanoseconds acquire_timeout = {}) {
-        return ConnectAwaiter{this, acquire_timeout};
-    }
+    ConnectAwaiter awaitConnect() { return ConnectAwaiter{this}; }
 
     // Any number of events before the step runs post it once.
     void postConnectStep() {
@@ -608,7 +622,7 @@ private:
     // From a posted task: the connect resumes outside any event dispatch.
     void endConnect() {
         connect_ = nullptr;
-        disarmTimer();  // acquire_timeout
+        deadline_.disarm();  // acquire_timeout
         std::exchange(current_cont_, {}).resume();
     }
 
@@ -708,20 +722,17 @@ private:
             w.lost = true;
             return false;
         }
+        // No queue = unbounded (delegated to conninfo connect_timeout/statement_timeout).
+        if (wait_deadlines_) wait_deadlines_->arm(deadline_);
         current_cont_ = h;
         wait_ = &w;
         if (w.want == Want::Flush) setWatchMask(IoEvent::Read | IoEvent::Write);
-        // 0 = unbounded (delegated to conninfo connect_timeout/statement_timeout).
-        if (query_timeout_.count() > 0) {
-            timer_ = io_.postDelayed(query_timeout_, [this] { timeoutCurrentWait(); });
-            timer_armed_ = true;
-        }
         return true;
     }
 
     void endWait() {
         wait_ = nullptr;
-        disarmTimer();
+        deadline_.disarm();
         setWatchMask(IoEvent::Read);
     }
 
@@ -732,7 +743,7 @@ private:
         if (wait_ != &w) return;
         wait_ = nullptr;
         current_cont_ = {};
-        disarmTimer();
+        deadline_.disarm();
         dead_ = true;
         retireSocketWatch();
     }
@@ -760,12 +771,6 @@ private:
         if (!socket_watch_ || socket_watch_->fd < 0 || watch_mask_ == mask) return;
         io_.updateWatch(socket_watch_->handle, mask);
         watch_mask_ = mask;
-    }
-
-    void disarmTimer() {
-        if (!timer_armed_) return;
-        io_.cancelTimer(timer_);
-        timer_armed_ = false;
     }
 
     // Auto-prepare: first call PREPAREs the statement, subsequent calls reuse it
@@ -815,12 +820,15 @@ private:
         return ResultAwaiter{this};
     }
 
-    // The wait's timer expired: the connection is poisoned (dead_) and no
+    // The wait's deadline expired: the connection is poisoned (dead_) and no
     // longer watched, and the coroutine resumes from a posted task, never
     // inside the timer's dispatch. Its awaiter sees dead_ and throws
     // (PgQueryTimeout for a request, PgPoolTimeout for the handshake).
+    static void expireWait(void* self) {
+        static_cast<PgConnection*>(self)->timeoutCurrentWait();
+    }
+
     void timeoutCurrentWait() {
-        timer_armed_ = false;  // it just fired
         dead_ = true;
         connect_ = nullptr;    // a step already posted finds the handshake over
         wait_ = nullptr;
@@ -866,12 +874,15 @@ private:
     // Timeout machinery. current_cont_ is the single in-flight continuation
     // per connection (the pipeline chains co_awaits sequentially), set by the
     // handshake and every wait so timeoutCurrentWait can resume it without
-    // knowing which awaiter is parked.
+    // knowing which awaiter is parked. One deadline serves them all, armed in
+    // acquire_deadlines_ for the handshake and its setup queries, in
+    // query_deadlines_ afterwards; a null queue bounds nothing.
     bool dead_ = false;
     std::coroutine_handle<> current_cont_{};
-    typename Io::TimerToken timer_{};
-    bool timer_armed_ = false;
-    std::chrono::nanoseconds query_timeout_{};  // default bound for query I/O waits
+    std::shared_ptr<Deadlines> acquire_deadlines_;
+    std::shared_ptr<Deadlines> query_deadlines_;
+    Deadlines* wait_deadlines_ = nullptr;  // what bounds the next I/O wait
+    Deadline deadline_{this, &PgConnection::expireWait};
 
     SettleConfig settle_{};
     BackendId backend_{};

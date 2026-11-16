@@ -4,6 +4,7 @@
 #include <jcailloux/relais/io/EpollIoContext.h>
 #include <jcailloux/relais/io/IoContext.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -38,7 +39,8 @@ namespace jcailloux::relais::io::test {
 //
 // Loop-thread affinity matches EpollIoContext: the watch/hold methods touch the
 // fixture's own maps and must run on the loop thread; post()/postDelayed()/
-// cancelTimer() forward to the (thread-safe) inner loop and add no shared state.
+// cancelTimer() forward to the (thread-safe) inner loop, the timer ones counted
+// atomically.
 //
 // Test-only — lives entirely in tests/fixtures, nothing here is in include/.
 class ControllableIoContext {
@@ -84,13 +86,17 @@ public:
     template<typename Rep, typename Period>
     TimerToken postDelayed(std::chrono::duration<Rep, Period> delay,
                            std::function<void()> cb) {
+        armed_timers_.fetch_add(1, std::memory_order_relaxed);
         return inner_.postDelayed(delay, [this, cb = std::move(cb)] {
             Dispatch d{*this};
             cb();
         });
     }
 
-    void cancelTimer(TimerToken token) { inner_.cancelTimer(token); }
+    void cancelTimer(TimerToken token) {
+        cancelled_timers_.fetch_add(1, std::memory_order_relaxed);
+        inner_.cancelTimer(token);
+    }
 
     // -- fault injection ----------------------------------------------------
 
@@ -113,6 +119,14 @@ public:
 
     // Every addWatch so far.
     [[nodiscard]] std::size_t addedWatches() const noexcept { return added_watches_; }
+
+    // Every postDelayed and cancelTimer so far.
+    [[nodiscard]] std::size_t armedTimers() const noexcept {
+        return armed_timers_.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::size_t cancelledTimers() const noexcept {
+        return cancelled_timers_.load(std::memory_order_relaxed);
+    }
 
     // Watches added or removed while a watch or timer callback ran.
     [[nodiscard]] std::size_t watchChangesInDispatch() const noexcept {
@@ -140,6 +154,7 @@ public:
     // is one write(pipe). Forwarded from production rather than duplicated.
     [[nodiscard]] uint64_t loopWakeups() const noexcept { return inner_.loopWakeups(); }
     [[nodiscard]] std::size_t pendingTimerCount() const { return inner_.pendingTimerCount(); }
+    [[nodiscard]] uint64_t timerfdArms() const noexcept { return inner_.timerfdArms(); }
 
     [[nodiscard]] Inner& inner() noexcept { return inner_; }
 
@@ -177,6 +192,8 @@ private:
     int dispatch_depth_ = 0;                      // watch or timer callbacks running
     std::size_t changes_in_dispatch_ = 0;         // addWatch/removeWatch among them
     std::size_t added_watches_ = 0;
+    std::atomic<std::size_t> armed_timers_{0};
+    std::atomic<std::size_t> cancelled_timers_{0};
 };
 
 static_assert(IoContext<ControllableIoContext>,
