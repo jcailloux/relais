@@ -59,12 +59,10 @@ public:
         if (const auto n = pending())
             RELAIS_LOG_WARN << "relais: " << n << " uncertain write(s) abandoned unsettled "
                                "at shutdown";
-        // A posted wake-up may still be queued: it finds no waiter.
+        // A timer or a posted resume still queued finds no waiter.
         alarm_->waiting = {};
-        ++alarm_->seq;
-        if (alarm_armed_) io_.cancelTimer(alarm_token_);
         // Destroying a suspended worker runs its connection's destructor, which
-        // drops the watch and the timer before closing the socket.
+        // drops the watch and the deadline before closing the socket.
         if (worker_) worker_.destroy();
     }
 
@@ -194,41 +192,63 @@ private:
         std::coroutine_handle<promise_type> handle;
     };
 
-    // The worker's sleep. Timer and wake-up both go through a shared alarm with
-    // a sequence number: a superseded or late timer finds another number and does
-    // nothing, and the resume is posted, never run inside the timer dispatch.
+    // The worker's sleep. The alarm, shared with the loop's timers and tasks,
+    // holds when the sleeping worker resumes: a timer or a posted resume acts
+    // only once that time has come, so one left over from an earlier sleep does
+    // nothing. Nothing is cancelled. A sleep arms a timer only when none pending
+    // fires by its end, and a wake-up posts instead of arming one: a burst of
+    // tickets during a long sleep leaves no timer behind. The resume is always
+    // posted, never run inside a timer dispatch.
     struct Alarm {
         std::coroutine_handle<> waiting{};
-        uint64_t seq = 0;
+        Clock::time_point wake_at{};                            // when `waiting` resumes
+        Clock::time_point timer_at = Clock::time_point::max();  // earliest timer pending
     };
 
     struct Nap {
         SettleQueue* q;
-        Clock::duration d;
+        Clock::time_point until;
         bool await_ready() const noexcept { return false; }
-        void await_suspend(std::coroutine_handle<> h) {
-            q->alarm_->waiting = h;
-            q->arm(d);
-        }
-        void await_resume() noexcept { q->alarm_armed_ = false; }
+        void await_suspend(std::coroutine_handle<> h) { q->sleep(h, until); }
+        void await_resume() const noexcept {}
     };
 
-    void arm(Clock::duration d) {
-        if (alarm_armed_) io_.cancelTimer(alarm_token_);
-        const auto seq = ++alarm_->seq;
-        alarm_token_ = io_.postDelayed(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(std::max(d, Clock::duration{})),
-            [a = alarm_, seq, io = &io_] {
-                io->post([a, seq] {
-                    if (a->seq != seq || !a->waiting) return;
-                    std::exchange(a->waiting, {}).resume();
-                });
-            });
-        alarm_armed_ = true;
+    // Throws only when the loop cannot take the post or the timer; the worker is
+    // then not left waiting.
+    void sleep(std::coroutine_handle<> h, Clock::time_point until) {
+        if (until <= Clock::now()) postResume(io_, alarm_);
+        else if (until < alarm_->timer_at) armAlarm(io_, alarm_, until);
+        alarm_->wake_at = until;
+        alarm_->waiting = h;
     }
 
+    // Resumes the sleeping worker on a later turn of the loop.
     void wake() {
-        if (alarm_->waiting) arm(Clock::duration{});
+        if (!alarm_->waiting || alarm_->wake_at == Clock::time_point::min()) return;
+        postResume(io_, alarm_);
+        alarm_->wake_at = Clock::time_point::min();
+    }
+
+    static void postResume(Io& io, const std::shared_ptr<Alarm>& a) {
+        io.post([a] {
+            if (!a->waiting || Clock::now() < a->wake_at) return;
+            std::exchange(a->waiting, {}).resume();
+        });
+    }
+
+    static void armAlarm(Io& io, const std::shared_ptr<Alarm>& a, Clock::time_point at) {
+        const auto delay = std::max(at - Clock::now(), Clock::duration::zero());
+        io.postDelayed(std::chrono::duration_cast<std::chrono::nanoseconds>(delay),
+            [a, at, io = &io] { onAlarm(*io, a, at); });
+        a->timer_at = at;
+    }
+
+    // A timer fired: the earliest pending, or one an earlier timer superseded.
+    static void onAlarm(Io& io, const std::shared_ptr<Alarm>& a, Clock::time_point at) {
+        if (a->timer_at == at) a->timer_at = Clock::time_point::max();
+        if (!a->waiting) return;
+        if (Clock::now() >= a->wake_at) postResume(io, a);
+        else if (a->wake_at < a->timer_at) armAlarm(io, a, a->wake_at);
     }
 
     void kick() {
@@ -242,20 +262,19 @@ private:
 
     Worker run() {
         // Leave the handler of the failed write before any work.
-        co_await Nap{this, Clock::duration{}};
+        co_await Nap{this, Clock::now()};
         std::unique_ptr<PgConnection<Io>> conn;
         while (!jobs_.empty()) {
 #ifdef RELAIS_BUILDING_TESTS
             if (paused_) {
-                co_await Nap{this, std::chrono::hours{1}};
+                co_await Nap{this, Clock::now() + std::chrono::hours{1}};
                 continue;
             }
 #endif
             auto due = std::min_element(jobs_.begin(), jobs_.end(),
                 [](const Job& a, const Job& b) { return a.next < b.next; });
-            const auto now = Clock::now();
-            if (due->next > now) {
-                co_await Nap{this, due->next - now};
+            if (due->next > Clock::now()) {
+                co_await Nap{this, due->next};
                 continue;
             }
             current_ = std::move(*due);
@@ -438,8 +457,6 @@ private:
 
     std::coroutine_handle<typename Worker::promise_type> worker_{};
     std::shared_ptr<Alarm> alarm_ = std::make_shared<Alarm>();
-    typename Io::TimerToken alarm_token_{};
-    bool alarm_armed_ = false;
 
     bool refusal_logged_ = false;
     uint64_t settled_ = 0;

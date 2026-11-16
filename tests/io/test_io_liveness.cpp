@@ -854,6 +854,66 @@ TEST_CASE("liveness: a withheld pipeline read times out via the pipeline awaiter
     REQUIRE_THROWS_AS(driveBounded(io, runner(), 3s), PgQueryTimeout);
 }
 
+namespace relais_bench {
+// Befriended by BatchScheduler: lets a case set how long a read batch waits.
+struct BatchBenchAccessor {
+    static void setNetworkTime(BatchScheduler<Io>& b, std::chrono::nanoseconds t) {
+        b.estimator_.pg_network_time_ns = static_cast<double>(t.count());
+    }
+};
+}  // namespace relais_bench
+
+TEST_CASE("liveness: a read batch that leaves early lets its departure timer fire for nothing",
+          "[io][liveness][integration]") {
+    using Clock = std::chrono::steady_clock;
+    Io io;
+    auto pool = driveBounded(io, PgPool<Io>::create(io, getConnInfo(),
+        {.min_connections = 2, .max_connections = 2}));
+    auto batcher = std::make_shared<BatchScheduler<Io>>(io, pool, 8);
+    // Past bootstrap, a read sent while another is in flight joins a batch.
+    for (int i = 0; i < 6; ++i)
+        REQUIRE(driveBounded(io, batcher->submitQueryRead("SELECT 1", PgParams{})).ok());
+    // A batch leaves 400 ms after it forms, or with its leader's answer.
+    relais_bench::BatchBenchAccessor::setNetworkTime(*batcher, 400ms);
+    const auto cancelled_at_start = io.cancelledTimers();
+
+    Clock::time_point follower_done{};
+    auto follower = [&](const char* sql) -> Task<PgResult> {
+        auto r = co_await batcher->submitQueryRead(sql, PgParams{});
+        follower_done = Clock::now();
+        co_return r;
+    };
+    auto pair = [&](const char* leader_sql, const char* follower_sql) -> Task<void> {
+        auto [lead, follow] = co_await whenAll(
+            batcher->submitQueryRead(leader_sql, PgParams{}), follower(follower_sql));
+        REQUIRE(lead.ok());
+        REQUIRE(follow.ok());
+    };
+
+    // A fast leader: its batch leaves with its answer, its timer stays pending.
+    const auto t0 = Clock::now();
+    driveBounded(io, pair("SELECT 1", "SELECT 2"), 3s);
+    REQUIRE(follower_done - t0 < 200ms);
+
+    // A slow leader: the next batch waits for its own departure; the first
+    // batch's timer, which fires meanwhile, does not send it.
+    pump(io, std::chrono::duration_cast<std::chrono::milliseconds>(t0 + 200ms - Clock::now()));
+    const auto t1 = Clock::now();
+    driveBounded(io, pair("SELECT 1 FROM pg_sleep(0.8)", "SELECT 3"), 3s);
+    CHECK(follower_done - t1 >= 350ms);
+
+    // A batch leaves early again, then the scheduler goes: its timer fires on
+    // nothing.
+    driveBounded(io, pair("SELECT 1", "SELECT 2"), 3s);
+    std::weak_ptr<BatchScheduler<Io>> weak = batcher;
+    batcher.reset();
+    REQUIRE(weak.expired());
+    weak.reset();  // or the scheduler's memory outlives it, out of ASan's sight
+    pump(io, 500ms);
+
+    CHECK(io.cancelledTimers() == cancelled_at_start);
+}
+
 // =============================================================================
 // Teardown safety
 // =============================================================================
