@@ -22,11 +22,15 @@
 //
 // The `IoContext` concept (io/IoContext.h) constrains only method *signatures*.
 // The semantic contract an adapter must honor — post() runs the callback once,
-// on the loop thread, and wakes a blocked loop; watches fire with the right
-// event mask on the loop thread and follow the open file, not the fd number;
-// updateWatch takes effect, and removeWatch stops delivery at once, even for the
-// event being dispatched — cannot be expressed by a concept. This harness
-// encodes it as runnable checks.
+// on the loop thread, in order, after the callback that posted it, and wakes a
+// blocked loop; watches fire with the right event mask on the loop thread;
+// updateWatch takes effect; removeWatch stops delivery at once and leaves a
+// later watch of the same fd number alone; postDelayed fires once — cannot be
+// expressed by a concept. This harness encodes it as runnable checks.
+//
+// runAll checks that contract, nothing more. The deprecated checks (C9, C10,
+// C11, C13) test properties relais relied on before and no longer needs:
+// cancelling a timer, removing a watch from within its own callback.
 //
 // Who uses it:
 //   - relais CI runs it against EpollIoContext (test_io_context_conformance).
@@ -57,6 +61,11 @@ struct ConformanceError : std::runtime_error {
 };
 
 namespace detail {
+
+template<typename Io>
+concept CancelsTimers = requires(Io& io, typename Io::TimerToken token) {
+    io.cancelTimer(token);
+};
 
 inline void require(bool cond, const std::string& what) {
     if (!cond) throw ConformanceError(what);
@@ -146,6 +155,36 @@ struct IoContextConformance {
         detail::require(inner, "post(): re-posting from within a callback must be honored");
     }
 
+    // C14: a callback posted from a watch callback runs once that callback has
+    // returned. relais posts from its watch callbacks the work that adds or
+    // removes watches (a connect's next step, a lost connection's removal): run
+    // in place, that work would change watches inside the event dispatch. It
+    // fails an adapter whose post() runs the callback at once when called on the
+    // loop thread, as trantor's runInLoop does.
+    template<io::IoContext Io, typename Drive>
+    static void checkPostFromWatchDeferred(Io& io, Drive drive) {
+        detail::EventFd efd;
+        bool in_callback = false, ran = false, ran_inside = false;
+        int calls = 0;
+        auto h = io.addWatch(efd.fd, IoEvent::Read, [&](IoEvent) {
+            if (calls++ > 0) return;
+            efd.clear();
+            in_callback = true;
+            io.post([&] {
+                ran_inside = in_callback;
+                ran = true;
+            });
+            in_callback = false;
+        });
+        efd.signal();
+        detail::driveFor(io, drive, [&] { return ran; }, std::chrono::seconds(1));
+        io.removeWatch(h);
+        detail::require(ran, "post() from a watch callback: the callback never ran");
+        detail::require(!ran_inside,
+            "post() from a watch callback: the callback must not run before the "
+            "watch callback returns");
+    }
+
     // -- watches ------------------------------------------------------------
 
     // C4: addWatch(Read) fires when the fd becomes readable, with the Read bit set.
@@ -216,17 +255,13 @@ struct IoContextConformance {
     }
 
     // C10: removeWatch() called FROM INSIDE the watch's own callback must be
-    // safe (no use-after-free) and stop further delivery. This is not a corner
-    // case: relais self-removes a watch from its I/O callback whenever the
-    // connection's interest changes (e.g. EOF / error on a PgConnection), so the
-    // loop regains control AFTER the callback returns and must not touch any
-    // per-watch state the callback just tore down. An adapter that destroys
-    // loop-owned watch state — or invokes the callback through storage it then
-    // frees — synchronously inside removeWatch corrupts memory here. The fix is
-    // to defer teardown: invoke through a copy/stable reference, and free the
-    // watch's resources after the current event has been fully processed (e.g.
-    // trantor: queueInLoop(delete), epoll: copy the callback out before calling).
+    // safe (no use-after-free) and stop further delivery. The loop regains
+    // control after the callback returns and must not touch any per-watch state
+    // the callback just tore down: an adapter that frees the watch, or the
+    // callback it is calling through, synchronously inside removeWatch corrupts
+    // memory here.
     template<io::IoContext Io, typename Drive>
+    [[deprecated("relais no longer removes a watch from its callback; not run by runAll")]]
     static void checkRemoveWatchReentrant(Io& io, Drive drive) {
         detail::EventFd efd;
         int fired = 0;
@@ -252,49 +287,57 @@ struct IoContextConformance {
         efd.clear();
     }
 
-    // C12: a watch follows the open file, not the fd number. From a watch's own
-    // callback, close its fd and open a new one — the kernel hands back the
-    // lowest free number, so in practice the same one — then removeWatch the old
-    // handle and addWatch the new fd: the new file's events must reach the new
-    // watch. A PgConnection runs this exact sequence when libpq replaces its
-    // socket mid-connect (TLS or GSS fallback, next host or address). It fails an
-    // adapter that lets per-fd state outlive the close: a removal applied after
-    // the re-add, or an addWatch turned into a mask update on a registration the
-    // kernel already dropped, leaves the new socket unwatched until the connect
-    // times out.
+    // C12: a removed watch does not outlive its removeWatch. From a posted task,
+    // remove a watch, close its fd and open a new one — the kernel hands back
+    // the lowest free number, so in practice the same one — then watch the new
+    // fd: when it becomes ready, a few turns later, its events must reach the
+    // new watch. Each step of a PgConnection's handshake runs this sequence on a
+    // duplicate of libpq's socket. It fails an adapter that defers the removal:
+    // applied after the re-add, it drops the new watch, and the connect waits
+    // for acquire_timeout.
     template<io::IoContext Io, typename Drive>
     static void checkRewatchReusedFd(Io& io, Drive drive) {
         detail::EventFd a;
         int b = -1;  // the replacement fd, closed below
-        int fired_old = 0, fired_new = 0;
+        int fired_old = 0, fired_new = 0, fired_old_at_swap = -1;
         typename Io::WatchHandle h_old{}, h_new{};
         h_old = io.addWatch(a.fd, IoEvent::Read, [&](IoEvent) {
-            if (++fired_old > 1) return;
+            ++fired_old;
+            a.clear();
+        });
+        a.signal();
+        detail::driveFor(io, drive, [&] { return fired_old > 0; }, std::chrono::seconds(1));
+
+        io.post([&] {
+            io.removeWatch(h_old);
+            fired_old_at_swap = fired_old;
             ::close(a.fd);
             a.fd = -1;  // closed here, so ~EventFd must not close the number again
             b = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-            io.removeWatch(h_old);
             if (b < 0) return;  // reported as a setup failure below
-            uint64_t one = 1;
-            [[maybe_unused]] auto _ = ::write(b, &one, sizeof(one));
             h_new = io.addWatch(b, IoEvent::Read, [&](IoEvent) {
                 ++fired_new;
-                io.removeWatch(h_new);
+                uint64_t v;
+                [[maybe_unused]] auto r = ::read(b, &v, sizeof(v));
             });
         });
-        a.signal();
-        detail::driveFor(io, drive, [&] { return fired_new > 0; }, std::chrono::seconds(1));
-        detail::pump(io, drive, 3);  // a duplicate would surface here
+        detail::pump(io, drive, 3);  // a removal applied late lands here
 
         if (b >= 0) {
-            if (fired_new == 0) io.removeWatch(h_new);
+            uint64_t one = 1;
+            [[maybe_unused]] auto _ = ::write(b, &one, sizeof(one));
+            detail::driveFor(io, drive, [&] { return fired_new > 0; }, std::chrono::seconds(1));
+            io.removeWatch(h_new);
             ::close(b);
         }
-        detail::require(fired_old == 0 || b >= 0, "eventfd creation failed (harness setup)");
-        detail::require(fired_old == 1 && fired_new == 1,
-            "re-watch of a closed and reused fd number: the new fd's events must "
-            "reach the new watch exactly once, observed " + std::to_string(fired_new)
-            + " calls (old watch: " + std::to_string(fired_old) + ")");
+        detail::require(fired_old_at_swap < 0 || b >= 0, "eventfd creation failed (harness setup)");
+        detail::require(fired_old > 0, "addWatch(Read): the first watch never fired");
+        detail::require(fired_new > 0,
+            "re-watch of a removed watch's fd number: the new fd's events must reach "
+            "the new watch");
+        detail::require(fired_old == fired_old_at_swap,
+            "removeWatch(): the old watch was called after its removal, "
+            + std::to_string(fired_old - fired_old_at_swap) + " times");
     }
 
     // C13: removeWatch() stops delivery at once, including for the rest of the
@@ -303,10 +346,9 @@ struct IoContextConformance {
     // its callback must be called once. It fails an adapter that dispatches one
     // event as several callbacks (read, then write) without re-checking the watch
     // in between, as trantor's Channel does when an adapter sets its read and
-    // write callbacks separately. relais removes a watch and then resumes a
-    // coroutine from the same callback, so a second call runs against a
-    // coroutine that has moved on, or a frame already destroyed.
+    // write callbacks separately.
     template<io::IoContext Io, typename Drive>
+    [[deprecated("relais no longer removes a watch from its callback; not run by runAll")]]
     static void checkRemoveWatchWithinEvent(Io& io, Drive drive) {
         int sv[2];
         detail::require(
@@ -387,7 +429,8 @@ struct IoContextConformance {
     // timer bounds the wait: once it fires, the cancelled timer's earlier
     // deadline has passed, so any firing means cancel failed.
     template<io::IoContext Io, typename Drive>
-    static void checkCancelTimer(Io& io, Drive drive) {
+    [[deprecated("relais no longer cancels timers; not run by runAll")]]
+    static void checkCancelTimer(Io& io, Drive drive) requires detail::CancelsTimers<Io> {
         int cancelled = 0;
         bool fence = false;
         auto token = io.postDelayed(std::chrono::milliseconds(1), [&] { ++cancelled; });
@@ -400,14 +443,11 @@ struct IoContextConformance {
     }
 
     // C11: arm+cancel at scale. Arming many timers then cancelling them all must
-    // leave none firing. A conforming adapter must also not accumulate state (a
-    // cancel removes the timer, it does not tombstone it until its deadline):
-    // relais arms+cancels a timer per in-flight I/O wait, so an adapter that
-    // defers cancellation to maturity grows O(timeout) state at QPS. This check
-    // only sees firing, not retained state. A later uncancelled fence proves the
-    // subsystem is still live after the churn.
+    // leave none firing. A later uncancelled fence proves the subsystem is still
+    // live after the churn. Only firing is seen, not what the adapter retains.
     template<io::IoContext Io, typename Drive>
-    static void checkTimerArmCancelAtScale(Io& io, Drive drive) {
+    [[deprecated("relais no longer cancels timers; not run by runAll")]]
+    static void checkTimerArmCancelAtScale(Io& io, Drive drive) requires detail::CancelsTimers<Io> {
         constexpr int N = 2000;
         int fired = 0;
         std::vector<typename Io::TimerToken> tokens;
@@ -429,22 +469,20 @@ struct IoContextConformance {
     // -- aggregate ----------------------------------------------------------
 
     // Checks are numbered in the order they were added; runAll groups them by
-    // subject and runs C1-C6, C10, C12, C13, C7-C9, C11.
+    // subject and runs C1-C3, C14, C4-C6, C12, C7, C8: the contract relais
+    // relies on.
     template<io::IoContext Io, typename Drive>
     static void runAll(Io& io, Drive drive) {
         checkPostExecutes(io, drive);
         checkPostOrdering(io, drive);
         checkPostFromCallback(io, drive);
+        checkPostFromWatchDeferred(io, drive);
         checkWatchReadable(io, drive);
         checkUpdateWatch(io, drive);
         checkRemoveWatch(io, drive);
-        checkRemoveWatchReentrant(io, drive);
         checkRewatchReusedFd(io, drive);
-        checkRemoveWatchWithinEvent(io, drive);
         checkCrossThreadPost(io, drive);
         checkPostDelayedFires(io, drive);
-        checkCancelTimer(io, drive);
-        checkTimerArmCancelAtScale(io, drive);
     }
 };
 

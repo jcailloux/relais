@@ -53,6 +53,19 @@ struct MockIoContext {
 static_assert(jcailloux::relais::io::IoContext<MockIoContext>,
     "MockIoContext must satisfy IoContext concept");
 
+// relais cancels no timer: an adapter without cancelTimer, whose postDelayed
+// returns nothing, satisfies the concept too.
+struct NoCancelIoContext {
+    using WatchHandle = int;
+    WatchHandle addWatch(int, IoEvent, std::function<void(IoEvent)>) { return 0; }
+    void removeWatch(WatchHandle) {}
+    void updateWatch(WatchHandle, IoEvent) {}
+    void post(std::function<void()>) {}
+    void postDelayed(std::chrono::nanoseconds, std::function<void()>) {}
+};
+static_assert(jcailloux::relais::io::IoContext<NoCancelIoContext>,
+    "the concept must not require cancelTimer or a timer token");
+
 // =============================================================================
 // IoEvent bitmask tests
 // =============================================================================
