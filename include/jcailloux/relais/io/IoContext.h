@@ -33,57 +33,40 @@ constexpr IoEvent& operator|=(IoEvent& a, IoEvent b) noexcept {
     return (set & flag) != IoEvent::None;
 }
 
-// IoContext — the event-loop extension point relais binds I/O onto.
+// IoContext — the event loop relais runs its I/O on.
 //
-// EpollIoContext is the bundled model, but PgPool and the awaiter
-// machinery are generic over this concept: any epoll-family loop (e.g. a
-// trantor::EventLoop shim to run relais inline on Drogon's threads) can satisfy
-// it. The concept fixes only the signatures below; the *semantic* contract an
-// adapter must honor is:
+// EpollIoContext is the bundled one. Any loop that offers fd watches, posted
+// callbacks and one-shot timers can be adapted to it: trantor (Channel,
+// queueInLoop, runAfter), libuv (uv_poll, uv_async, uv_timer), asio
+// (async_wait, post, steady_timer). The concept fixes the signatures; the
+// contract below fixes their meaning, and testing/IoContextConformance.h checks
+// it (runAll).
 //
-//   - addWatch(fd, mask, cb): cb runs ON THE LOOP THREAD whenever fd is ready
-//     for an event in `mask`, with the matching IoEvent bits set. Returns a
-//     handle for later update/remove. A watch follows the open file, not the
-//     number: once fd is closed, removeWatch(old handle) then addWatch on a new
-//     fd — even one that reuses the number — must deliver the new file's
-//     events. relais does this from a watch callback when libpq replaces its
-//     socket mid-connect.
-//   - updateWatch(handle, mask): changes the active mask on that handle.
-//   - removeWatch(handle): no further callbacks for that handle, including for
-//     the event being dispatched when it is called: an adapter that splits one
-//     event into several callbacks (read, then write) must stop after the one
-//     that removed the watch. MUST be safe to call FROM INSIDE that handle's
-//     own callback — relais self-removes a watch from its I/O callback when a
-//     connection's interest changes (e.g. EOF). The loop resumes after the
-//     callback returns, so the adapter must not destroy loop-owned watch state
-//     (nor the callback it is mid-invocation through) synchronously here; defer
-//     teardown until the event is fully processed.
-//   - post(cb): runs cb exactly once, on the loop thread, FIFO with other posts;
-//     thread-safe AND wakes a blocked loop promptly when called from another
-//     thread. The loop's wait must be bounded so posts cannot stall.
-//   - postDelayed(delay, cb): runs cb once on the loop thread after `delay`;
-//     returns a TimerToken. Thread-safe. (Used by BatchScheduler to flush a
-//     batch after an adaptive deadline, and per in-flight I/O wait for the
-//     query/acquire timeout.)
-//   - cancelTimer(token): cancels a pending postDelayed; no-op if it already
-//     fired or the token is unknown. (Used to cancel the flush timer when a
-//     batch departs early because it filled up, and the timeout timer when a
-//     wait completes in time.)
+// What relais guarantees the adapter:
+//   - every call but post() comes from the loop thread;
+//   - addWatch and removeWatch are never called inside an event dispatch (a
+//     watch or timer callback): relais makes them from tasks it posts;
+//   - a watched fd stays open, on the same file, until its removeWatch;
+//   - postDelayed is rare: once per batch of reads at most, never per request;
+//   - no timer is ever cancelled.
 //
-// Complexity expectation (not a signature, but part of the contract): arm
-// (postDelayed) and cancel (cancelTimer) must be cheap from the loop thread —
-// no syscall per call, and cancel must *remove* the timer, not tombstone it
-// until its deadline. relais arms+cancels a timer per in-flight I/O wait, so
-// per-op allocation or O(timeout) tombstone growth is a correctness-relevant
-// cost at QPS, not a micro-optimization. Asio and the bundled EpollIoContext
-// satisfy this; trantor's timers do not (invalidateTimer leaves a cancelled
-// timer queued until its deadline), so a trantor adapter keeps its own queue.
-// IoContextConformance exercises arm+cancel at scale but cannot see what an
-// adapter retains.
-//
-// These rules are encoded as runnable checks in
-// testing/IoContextConformance.h — instantiate the harness against any adapter
-// to verify it before wiring relais pools onto it.
+// What the adapter must do:
+//   - addWatch(fd, mask, cb): call cb on the loop thread, with the IoEvent bits
+//     of what is ready among `mask`, for as long as the watch lasts; may throw
+//     if the fd cannot be watched. One event split into several calls (Read,
+//     then Write) and calls for nothing are tolerated: relais reads what is
+//     there and waits again. A failed fd may be reported as Error, which relais
+//     takes as Read.
+//   - updateWatch(handle, mask): watch for `mask` from then on. relais may call
+//     it from a watch callback, that watch's own included.
+//   - removeWatch(handle): no call for that handle once it returns; the watch,
+//     its callback included, may be freed right away. A later addWatch of the
+//     same fd number is a new watch, which the old one must not affect.
+//   - post(cb): run cb once on the loop thread, in posting order, never before
+//     the callback that posted it has returned; callable from any thread, and
+//     wakes the loop if it is waiting.
+//   - postDelayed(delay, cb): run cb once on the loop thread, `delay` from now
+//     or later. What it returns is ignored.
 template<typename T>
 concept IoContext = requires(
     T& ctx,
@@ -92,15 +75,13 @@ concept IoContext = requires(
     std::function<void(IoEvent)> io_cb,
     std::function<void()> cb,
     typename T::WatchHandle handle,
-    typename T::TimerToken token,
     std::chrono::nanoseconds delay
 ) {
     { ctx.addWatch(fd, events, std::move(io_cb)) } -> std::same_as<typename T::WatchHandle>;
     { ctx.removeWatch(handle) } -> std::same_as<void>;
     { ctx.updateWatch(handle, events) } -> std::same_as<void>;
     { ctx.post(std::move(cb)) } -> std::same_as<void>;
-    { ctx.postDelayed(delay, std::move(cb)) } -> std::same_as<typename T::TimerToken>;
-    { ctx.cancelTimer(token) } -> std::same_as<void>;
+    ctx.postDelayed(delay, std::move(cb));
 };
 
 } // namespace jcailloux::relais::io

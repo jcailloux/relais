@@ -16,6 +16,7 @@
 
 #include <fcntl.h>
 #include <libpq-fe.h>
+#include <poll.h>
 #include <unistd.h>
 
 #include "jcailloux/relais/Log.h"
@@ -555,6 +556,8 @@ private:
         PgConnection* self;
         bool watch_failed = false;  // the socket could not be watched mid-handshake
         bool step_posted = false;   // a step is pending: further events add none
+        // What libpq waits for before its next step; Write before the first.
+        IoEvent want = IoEvent::Write;
 
         bool await_ready() const noexcept { return false; }
 
@@ -595,28 +598,43 @@ private:
     // PQconnectPoll may close the socket and open another one (sslmode=prefer
     // falling back to plaintext, next host or address, target_session_attrs),
     // even under the same number: every step watches a duplicate of the socket
-    // it returns on.
+    // it returns on. A step woken before the socket is ready keeps watching it.
     void connectStep() {
         auto* step = connect_;
         if (!step) return;  // acquire_timeout ended the handshake
         step->step_posted = false;
-        unwatchSocket();
 
-        IoEvent events = IoEvent::Read;
         bool done = false;
-        switch (PQconnectPoll(conn_)) {
-            case PGRES_POLLING_READING: break;
-            case PGRES_POLLING_WRITING: events = IoEvent::Write; break;
-            case PGRES_POLLING_OK:      done = true; break;  // the watch the connection keeps
-            default: endConnect(); return;  // FAILED
+        if (socketReady(step->want)) {
+            unwatchSocket();
+            switch (PQconnectPoll(conn_)) {
+                case PGRES_POLLING_READING: step->want = IoEvent::Read; break;
+                case PGRES_POLLING_WRITING: step->want = IoEvent::Write; break;
+                case PGRES_POLLING_OK:  // the watch the connection keeps
+                    step->want = IoEvent::Read;
+                    done = true;
+                    break;
+                default: endConnect(); return;  // FAILED
+            }
         }
-        try {
-            watchSocket(events);
-        } catch (...) {
-            step->watch_failed = true;
-            done = true;
+        if (socket_watch_->fd < 0) {
+            try {
+                watchSocket(step->want);
+            } catch (...) {
+                step->watch_failed = true;
+                done = true;
+            }
         }
         if (done) endConnect();
+    }
+
+    // libpq takes the readiness it asked for as given: polled before a TCP
+    // connect completes, it takes the connect for made and fails sending its
+    // first packet. Ready also when the socket failed or poll() cannot tell:
+    // libpq then reports what happened.
+    bool socketReady(IoEvent want) const noexcept {
+        pollfd p{PQsocket(conn_), static_cast<short>(want == IoEvent::Write ? POLLOUT : POLLIN), 0};
+        return p.fd < 0 || ::poll(&p, 1, 0) != 0;
     }
 
     // From a posted task: the connect resumes outside any event dispatch.
