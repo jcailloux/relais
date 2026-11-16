@@ -17,8 +17,6 @@
 #include "jcailloux/relais/io/pg/PgParams.h"
 #include "jcailloux/relais/io/batch/BatchScheduler.h"
 
-namespace jcailloux::relais::io { class IoPool; }
-
 namespace jcailloux::relais {
 
 // =============================================================================
@@ -31,10 +29,11 @@ namespace jcailloux::relais {
 // The overhead of std::function indirection (one pointer-chase per call) is
 // negligible compared to the network I/O latency of database operations.
 //
-// Initialization (in application startup):
-//   auto pool = co_await PgPool<MyIo>::create(io, conninfo,
-//                  {.min_connections = 4, .max_connections = 16});
-//   PgProvider::init(io, pool);   // on the loop thread it serves
+// Initialization, once per loop, from another thread than the loop's:
+//   auto relais_on_loop = relais::attach(io, conninfo,
+//                             {.pool = {.min_connections = 4, .max_connections = 16}});
+// (runtime/Attach.h); io::IoPool does it for each of its loops. PgProvider::init
+// binds the calling loop thread to a pool created there.
 //
 // Usage in repositories:
 //   auto result = co_await PgProvider::queryParams(sql, params);
@@ -53,7 +52,7 @@ public:
     /// Execute a simple SQL query (no parameters).
     /// @note sql must remain valid until the co_await completes.
     static io::Task<io::PgResult> query(const char* sql) {
-        if (!pg_query_) throw std::logic_error("PgProvider::query() called before init() on this thread (providers are thread_local — init() must run on each loop thread)");
+        if (!pg_query_) notAttached("query");
         return pg_query_(sql);
     }
 
@@ -62,7 +61,7 @@ public:
     static io::Task<io::PgResult> queryParams(
         const char* sql, const io::PgParams& params)
     {
-        if (!pg_query_params_) throw std::logic_error("PgProvider::queryParams() called before init() on this thread (providers are thread_local — init() must run on each loop thread)");
+        if (!pg_query_params_) notAttached("queryParams");
         return pg_query_params_(sql, params);
     }
 
@@ -73,7 +72,7 @@ public:
         const char* batch_sql, const char* single_sql,
         const io::PgParams& params)
     {
-        if (!pg_entity_query_) throw std::logic_error("PgProvider::entityQueryParams() called before init() on this thread (providers are thread_local — init() must run on each loop thread)");
+        if (!pg_entity_query_) notAttached("entityQueryParams");
         return pg_entity_query_(batch_sql, single_sql, params);
     }
 
@@ -85,7 +84,7 @@ public:
         const char* batch_sql, const char* single_sql,
         std::vector<io::PgParams> keys)
     {
-        if (!pg_entity_query_many_) throw std::logic_error("PgProvider::entityQueryParamsMany() called before init() on this thread (providers are thread_local — init() must run on each loop thread)");
+        if (!pg_entity_query_many_) notAttached("entityQueryParamsMany");
         return pg_entity_query_many_(batch_sql, single_sql, std::move(keys));
     }
 
@@ -112,7 +111,7 @@ public:
         const char* sql, const io::PgParams& params,
         const io::batch::WriteMode mode, const io::batch::detail::WriteAffinity affinity)
     {
-        if (!pg_write_) throw std::logic_error("PgProvider::queryWrite() called before init() on this thread (providers are thread_local — init() must run on each loop thread)");
+        if (!pg_write_) notAttached("queryWrite");
         return pg_write_(sql, params, mode, affinity);
     }
 
@@ -176,7 +175,7 @@ public:
     }
 
     /// Bind the calling thread's providers to an already-built BatchScheduler.
-    /// Used by init() and by IoPool (which builds one batcher per worker). MUST
+    /// Used by init() and by attach(), which builds one per loop. MUST
     /// run on the loop thread that owns `batcher`. The thread_local function
     /// objects co-own `batcher` via shared_ptr — it lives until reset() or the
     /// thread exits.
@@ -225,7 +224,7 @@ public:
     }
 
     // =========================================================================
-    // Type-erased function storage (accessible to IoPool for registration)
+    // Type-erased function storage
     // =========================================================================
 
     using PgQueryFn = std::function<io::Task<io::PgResult>(const char*)>;
@@ -251,8 +250,13 @@ public:
     static inline thread_local PgWriteFn pg_write_;
     static inline thread_local PostFn post_;
 
-    // IoPool needs to set these directly
-    friend class io::IoPool;
+private:
+    [[noreturn]] static void notAttached(const char* entry) {
+        throw std::logic_error(std::string("PgProvider::") + entry
+            + "() called on a thread relais is not attached to (relais binds each loop "
+              "thread on its own): run it on a loop of an io::IoPool, or on a loop that "
+              "relais::attach() bound");
+    }
 };
 
 }  // namespace jcailloux::relais
