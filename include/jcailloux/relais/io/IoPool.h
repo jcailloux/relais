@@ -1,29 +1,20 @@
 #ifndef JCX_RELAIS_IO_POOL_H
 #define JCX_RELAIS_IO_POOL_H
 
-#include <algorithm>
-#include <atomic>
 #include <chrono>
-#include <condition_variable>
-#include <coroutine>
-#include <cstdint>
 #include <exception>
 #include <memory>
-#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
-#include <utility>
 #include <vector>
 
 #include <pthread.h>
 #include <sched.h>
 
 #include "jcailloux/relais/io/EpollIoContext.h"
-#include "jcailloux/relais/io/Task.h"
 #include "jcailloux/relais/io/pg/PgPool.h"
-#include "jcailloux/relais/io/batch/BatchScheduler.h"
-#include "jcailloux/relais/PgProvider.h"
+#include "jcailloux/relais/runtime/Attach.h"
 
 namespace jcailloux::relais::io {
 
@@ -72,73 +63,13 @@ struct IoPoolConfig {
     int first_core = 1;  // Avoid core 0 (OS/IRQ)
 };
 
-namespace detail {
-
-// BootTask — an eager, owned coroutine for per-worker startup.
-//
-// Unlike DetachedTask (which self-destroys at final_suspend and hands back no
-// handle), BootTask starts immediately, parks its frame at final_suspend, and
-// gives the handle to its owner. That ownership is what lets fail-fast teardown
-// reclaim a boot that is still suspended on a connect which never completed
-// (a dependency blackholed at boot, past startup_timeout): destroying the frame
-// runs its in-frame connection destructors — PgConnection disarms its deadline,
-// posts the removal of its watch, and PQfinishes libpq's socket; the loop closes
-// relais's duplicate when it runs or destroys that task — so neither the
-// coroutine frame nor its socket fd leaks. With a self-destroying
-// DetachedTask the suspended frame and its fd would be abandoned, leaking one fd
-// per failed startup; a service that retries create() in a loop would exhaust
-// them.
-//
-// Destroy-only contract: the owner destroys the frame ONLY after the worker
-// thread is joined (nothing is mid-resume) and BEFORE the worker's IoContext is
-// torn down (the posted removal still reaches a live loop). The frame is never resumed
-// after the thread stops, so a boot suspended inside the startup lambda never
-// dereferences the (by then destroyed) lambda closure — destruction only runs
-// the frame's local destructors.
-struct BootTask {
-    struct promise_type {
-        BootTask get_return_object() noexcept {
-            return BootTask{
-                std::coroutine_handle<promise_type>::from_promise(*this)};
-        }
-        std::suspend_never initial_suspend() noexcept { return {}; }
-        std::suspend_always final_suspend() noexcept { return {}; }
-        void return_void() noexcept {}
-        void unhandled_exception() noexcept {}  // boot body try/catches; unreached
-    };
-
-    std::coroutine_handle<promise_type> handle{};
-
-    BootTask() noexcept = default;
-    explicit BootTask(std::coroutine_handle<promise_type> h) noexcept : handle(h) {}
-    BootTask(BootTask&& o) noexcept : handle(std::exchange(o.handle, {})) {}
-    BootTask& operator=(BootTask&& o) noexcept {
-        if (this != &o) {
-            if (handle) handle.destroy();
-            handle = std::exchange(o.handle, {});
-        }
-        return *this;
-    }
-    BootTask(const BootTask&) = delete;
-    BootTask& operator=(const BootTask&) = delete;
-    ~BootTask() { if (handle) handle.destroy(); }
-};
-
-}  // namespace detail
-
 // IoPool — N event loops pinned on N cores, each with its own resources.
 //
-// Each worker owns:
-// - An EpollIoContext (event loop)
-// - A PgPool (PostgreSQL connection pool)
-// - A BatchScheduler (adaptive batching)
-// - A std::jthread (the actual OS thread)
-//
-// Each worker binds PgProvider's thread_local providers to its OWN
-// BatchScheduler, on its own thread, during create(). A coroutine running on a
-// worker thus routes to that worker's resources with no cross-thread hop
-// (shared-nothing). This is the same per-loop-thread init() contract any
-// external router (e.g. a Drogon/trantor adapter) uses.
+// Each worker owns an EpollIoContext run by its own std::jthread, to which
+// create() binds relais as attach() does: the loop is checked, a PgPool and a
+// BatchScheduler are created on it, and the worker thread's providers are bound
+// to them. A coroutine running on a worker thus routes to that worker's
+// resources with no cross-thread hop (shared-nothing).
 
 class IoPool {
 public:
@@ -160,158 +91,81 @@ public:
         pool->config_ = config;
         pool->workers_.resize(config.num_workers);
 
-        // Startup barrier: every worker reports exactly once — on success AND on
-        // failure — so the main thread can never deadlock waiting on a worker
-        // whose initialization threw.
-        std::atomic<int> done_count{0};
-        std::mutex ready_mutex;
-        std::condition_variable ready_cv;
-
-        // Drain window for ordered teardown (phase 2 in each worker). Sized to let
-        // a single request blocked on a bounded query/acquire time out and end, so
-        // the common case — a handful of requests in flight — drains with no
-        // leak. It is NOT a hard ceiling on total drain time: requests queued
-        // behind a saturated pool against a blackholed server time out serially
-        // (~ceil(N/conns) x query_timeout), and a 0 (unbounded) timeout never
-        // times out at all. Past this window the pump gives up and the
-        // still-suspended frame(s) are abandoned — a bounded, best-effort
-        // residual: no finite grace can cover the serial cascade.
-        // Captured BY VALUE into each worker: a temporary config argument must not
-        // be read at teardown, long after create() has returned.
-        const auto teardown_grace =
-            std::max(config.acquire_timeout, config.query_timeout)
-            + std::chrono::milliseconds(500);
-
         for (int i = 0; i < config.num_workers; ++i) {
             auto& w = pool->workers_[i];
             w.io = std::make_unique<Io>();
-            w.worker_id = i;
-
-            w.thread = std::jthread([&w, &config, &done_count,
-                                     &ready_mutex, &ready_cv, i, teardown_grace]
-                                    (std::stop_token stop) {
-                // Pin to core
-                if (config.pin_to_cores) {
-                    int core = config.first_core + i;
+            w.thread = std::jthread([io = w.io.get(), pin = config.pin_to_cores,
+                                     core = config.first_core + i](std::stop_token stop) {
+                if (pin) {
                     cpu_set_t cpuset;
                     CPU_ZERO(&cpuset);
                     CPU_SET(core, &cpuset);
                     pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
                 }
-
-                // Initialize resources on the event loop
-                auto initTask = [&]() -> detail::BootTask {
-                    try {
-                        // PG pool — acquire_timeout bounds the warm-up connect.
-                        w.pg_pool = co_await PgPool<Io>::create(
-                            *w.io, config.pg_conninfo,
-                            {.min_connections = config.pg_min_conns_per_worker,
-                             .max_connections = config.pg_max_conns_per_worker,
-                             .acquire_timeout = config.acquire_timeout,
-                             .query_timeout = config.query_timeout,
-                             .uncertain_settle = config.uncertain_settle,
-                             .settle_delay = config.settle_delay,
-                             .client_check_interval = config.client_check_interval});
-
-                        // Batch scheduler — owned per worker (shared so the
-                        // thread_local providers can co-own it).
-                        w.batcher = std::make_shared<batch::detail::BatchScheduler<Io>>(
-                            *w.io, w.pg_pool, config.max_concurrent_per_worker);
-
-                        // Bind THIS worker thread's providers to its own batcher.
-                        PgProvider::bindBatcher<Io>(w.batcher);
-                    } catch (...) {
-                        // Capture the failure: a bare DetachedTask would swallow
-                        // it silently. The main thread rethrows it after the
-                        // barrier (fail-fast).
-                        w.init_error = std::current_exception();
-                    }
-
-                    // Report done on BOTH paths — failure still advances the
-                    // barrier, so create() wakes and surfaces the error instead
-                    // of hanging. Increment AND notify under the lock: the woken
-                    // main thread re-checks the predicate by re-acquiring this
-                    // mutex, so it can neither miss the wakeup nor return and
-                    // destroy ready_cv while this notify is still in flight (a
-                    // one-shot startup barrier — the extra contention is moot).
-                    {
-                        std::lock_guard lock(ready_mutex);
-                        done_count.fetch_add(1, std::memory_order_release);
-                        ready_cv.notify_one();
-                    }
-                };
-
-                // Own the boot frame: on fail-fast, ~Worker destroys a frame
-                // still suspended on a blackholed connect instead of leaking it
-                // (frame + socket fd). Eager start runs the body to its first
-                // suspend before returning.
-                w.init_task = initTask();
-
-                // Phase 1: serve until stop is requested.
-                w.io->runUntil([&stop] { return stop.stop_requested(); });
-
-                // Phase 2: ordered teardown. A frame left suspended on the loop
-                // would leak, and with it the connection it holds and, through
-                // that, the pool. Pump the loop until nothing relais started on
-                // it is still running (quiescentForTeardown: its detached
-                // coroutines, the batches, every request in flight on the pool,
-                // whoever awaits it), each bounded by the per-operation
-                // query/acquire timeouts (a hung request times out, unwinds in
-                // error, and its frame ends), or until the grace window elapses
-                // (the fallback when a timeout is 0 or the serial drain outruns
-                // the window — the residual frame is then abandoned, bounded
-                // best-effort; see teardown_grace). The join in stop() blocks on
-                // this, so teardown waits for the drain rather than tearing the
-                // loop out from under it.
-                auto drain_deadline = Io::Clock::now() + teardown_grace;
-                w.io->runUntil([&w, drain_deadline] {
-                    return (!w.batcher || w.batcher->quiescentForTeardown())
-                           || Io::Clock::now() >= drain_deadline;
-                });
+                io->runUntil([&stop] { return stop.stop_requested(); });
             });
         }
 
-        // Wait for every worker to report, bounded by startup_timeout so a
-        // worker stuck in a connect that never returns (e.g. a blackholed
-        // PostgreSQL at boot when acquire_timeout is unset) cannot freeze
-        // startup forever.
-        bool all_done;
-        {
-            std::unique_lock lock(ready_mutex);
-            all_done = ready_cv.wait_for(lock, config.startup_timeout, [&] {
-                return done_count.load(std::memory_order_acquire) == config.num_workers;
-            });
-        }
+        // Every worker at once: checked, then booted, each wait bounded.
+        const AttachConfig attach_cfg{
+            .pool = {.min_connections = config.pg_min_conns_per_worker,
+                     .max_connections = config.pg_max_conns_per_worker,
+                     .acquire_timeout = config.acquire_timeout,
+                     .query_timeout = config.query_timeout,
+                     .uncertain_settle = config.uncertain_settle,
+                     .settle_delay = config.settle_delay,
+                     .client_check_interval = config.client_check_interval},
+            .max_concurrent = config.max_concurrent_per_worker};
+        const auto deadline = std::chrono::steady_clock::now() + config.startup_timeout;
+        for (auto& w : pool->workers_)
+            w.binding = relais::detail::LoopBinding<Io>::start(*w.io, config.pg_conninfo, attach_cfg);
 
-        // Fail-fast on a stuck worker: join the workers (stop()) BEFORE
-        // unwinding, while the barrier's mutex/cv are still alive — a worker
-        // finishing its connect a hair after the timeout would otherwise touch a
-        // destroyed primitive (these locals are torn down before `pool`).
-        if (!all_done) {
-            pool->stop();
-            throw IoPoolStartupError("IoPool startup exceeded startup_timeout");
-        }
-        // Every worker reported; surface the first init failure. All workers are
-        // now in their event loop (past the barrier), so unwinding `pool` to join
-        // them via ~IoPool is safe.
+        std::exception_ptr error;
         for (auto& w : pool->workers_) {
-            if (w.init_error)
-                std::rethrow_exception(w.init_error);
+            try {
+                w.binding->awaitCheck();
+            } catch (...) {
+                if (!error) error = std::current_exception();
+            }
+        }
+        bool timed_out = false;
+        if (!error) {
+            for (auto& w : pool->workers_) w.binding->startBoot();
+            for (auto& w : pool->workers_) {
+                try {
+                    // acquire_timeout bounds each connect; startup_timeout
+                    // bounds them all, a connect with no bound included.
+                    if (!w.binding->awaitBoot(deadline)) timed_out = true;
+                } catch (...) {
+                    if (!error) error = std::current_exception();
+                }
+            }
         }
 
+        // Fail fast: the teardown ends a boot still connecting, on its loop.
+        if (timed_out || error) {
+            pool->stop();
+            if (timed_out) throw IoPoolStartupError("IoPool startup exceeded startup_timeout");
+            std::rethrow_exception(error);
+        }
         return pool;
     }
 
-    /// Stop all workers.
+    /// Stop all workers: relais leaves every loop at once, each waiting for the
+    /// requests in flight on it, then the loops stop.
     void stop() {
         for (auto& w : workers_) {
-            if (w.io) w.io->stop();
+            if (w.binding) w.binding->beginRelease();
         }
-        // Request stop on every worker first, then join — so the per-worker
-        // ordered-teardown drains (phase 2) overlap instead of serializing into
-        // N x teardown_grace.
         for (auto& w : workers_) {
-            if (w.thread.joinable()) w.thread.request_stop();
+            if (w.binding) (void)w.binding->awaitRelease();
+            w.binding.reset();
+        }
+        for (auto& w : workers_) {
+            if (w.thread.joinable()) {
+                w.thread.request_stop();
+                w.io->stop();  // wakes the loop to see it
+            }
         }
         for (auto& w : workers_) {
             if (w.thread.joinable()) w.thread.join();
@@ -329,16 +183,8 @@ public:
 private:
     struct Worker {
         std::unique_ptr<Io> io;
-        // Owns the startup coroutine frame. Declared right after `io` so member
-        // destruction (reverse order) reclaims it BEFORE `io`: a boot still
-        // suspended on a connect at fail-fast is destroyed while its loop is
-        // alive, so its connection dtors' removeWatch lands on a live IoContext.
-        detail::BootTask init_task;
-        std::shared_ptr<PgPool<Io>> pg_pool;
-        std::shared_ptr<batch::detail::BatchScheduler<Io>> batcher;
+        std::shared_ptr<relais::detail::LoopBinding<Io>> binding;
         std::jthread thread;
-        std::exception_ptr init_error;  // set if this worker's init threw
-        int worker_id = 0;
     };
 
     IoPoolConfig config_;

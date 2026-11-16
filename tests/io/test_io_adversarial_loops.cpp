@@ -2,7 +2,8 @@
 //
 // Each case drives PostgreSQL through relais — a connect, a socket libpq
 // replaces mid-handshake, requests, a pool, pipelines, batches, timeouts, a
-// connection the server closes — on an AdversarialIoContext, once per
+// connection the server closes, attach() and its startup check — on an
+// AdversarialIoContext, once per
 // adversity: none, events split into one callback per bit, calls for nothing,
 // coarse timers, then all of them. Every variant frees a watch synchronously and has
 // no cancelTimer. relais must give the same answers as on EpollIoContext, never
@@ -19,6 +20,8 @@
 #include <jcailloux/relais/io/pg/PgPool.h>
 #include <jcailloux/relais/io/batch/BatchScheduler.h>
 #include <jcailloux/relais/io/WhenAll.h>
+#include <jcailloux/relais/PgProvider.h>
+#include <jcailloux/relais/runtime/Attach.h>
 
 #include <fixtures/AdversarialIoContext.h>
 #include <fixtures/LivenessHarness.h>
@@ -348,4 +351,21 @@ TEMPLATE_TEST_CASE("adversarial loop: the server ends a request mid-wait",
         CHECK_FALSE(conn->connected());
     }
     requireContractKept(io);
+}
+
+TEMPLATE_TEST_CASE("adversarial loop: attach checks the loop, binds it, and detach lets go",
+                   "[io][adversarial][integration]", ADVERSARIAL_LOOPS) {
+    LoopThread<TestType> t;  // the adapter belongs to the thread that runs it
+    {
+        auto relais = jcailloux::relais::attach(t.loop(), conninfo(),
+            {.pool = {.min_connections = 2, .max_connections = 2}});
+        const auto value = t.run([]() -> Task<std::string> {
+            auto result = co_await jcailloux::relais::PgProvider::query("SELECT 6 * 7");
+            co_return std::string(result[0].rawValue(0));
+        });
+        CHECK(value == "42");
+    }
+    t.settle();  // the connections' posted removals
+    CHECK(t.call([&] { return t.loop().breaches(); }) == 0);
+    CHECK(t.call([&] { return t.loop().liveWatches(); }) == 0);
 }

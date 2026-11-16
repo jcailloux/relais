@@ -2,8 +2,9 @@
 #define JCX_RELAIS_TEST_LIVENESS_HARNESS_H
 
 // What the suites that drive PostgreSQL through a fault share: fake servers
-// that stall or reshape a connect, a descriptor count, and drivers that bound
-// every wait, over any loop. Catch2 test translation units only (REQUIRE).
+// that stall or reshape a connect, a descriptor count, drivers that bound
+// every wait, over any loop, and a loop run on a thread of its own. Catch2 test
+// translation units only (REQUIRE).
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -21,8 +22,11 @@
 #include <coroutine>
 #include <cstdint>
 #include <exception>
+#include <future>
+#include <memory>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <variant>
 
@@ -313,6 +317,99 @@ void pump(Loop& io, std::chrono::milliseconds window = std::chrono::milliseconds
     while (std::chrono::steady_clock::now() < deadline)
         io.runOnce(10);
 }
+
+template<typename> struct TaskValue;
+template<typename T> struct TaskValue<Task<T>> { using type = T; };
+
+// A loop built and run on a thread of its own, as a framework runs its loops:
+// what relais::attach() binds relais to, from another thread.
+template<typename Loop>
+class LoopThread {
+public:
+    LoopThread() {
+        auto built = built_.get_future();
+        thread_ = std::jthread([this](std::stop_token stop) {
+            Loop loop;  // built on the thread that drives it
+            built_.set_value(&loop);
+            while (!stop.stop_requested()) loop.runOnce(5);
+        });
+        loop_ = built.get();
+    }
+    ~LoopThread() { stop(); }
+
+    LoopThread(const LoopThread&) = delete;
+    LoopThread& operator=(const LoopThread&) = delete;
+
+    Loop& loop() noexcept { return *loop_; }
+
+    // Runs f on the loop thread; returns what it returns.
+    template<typename F>
+    auto call(F f) -> std::invoke_result_t<F&> {
+        using R = std::invoke_result_t<F&>;
+        auto done = std::make_shared<std::promise<R>>();
+        auto result = done->get_future();
+        loop_->post([done, f = std::move(f)]() mutable {
+            try {
+                if constexpr (std::is_void_v<R>) {
+                    f();
+                    done->set_value();
+                } else {
+                    done->set_value(f());
+                }
+            } catch (...) {
+                done->set_exception(std::current_exception());
+            }
+        });
+        REQUIRE(result.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+        return result.get();
+    }
+
+    // Runs the task make() returns, both on the loop thread; returns its value.
+    template<typename MakeTask>
+    auto run(MakeTask make) -> typename TaskValue<std::invoke_result_t<MakeTask&>>::type {
+        using T = typename TaskValue<std::invoke_result_t<MakeTask&>>::type;
+        auto done = std::make_shared<std::promise<T>>();
+        auto result = done->get_future();
+        loop_->post([done, make = std::move(make)]() mutable {
+            try {
+                drive(done, make());
+            } catch (...) {
+                done->set_exception(std::current_exception());
+            }
+        });
+        REQUIRE(result.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+        return result.get();
+    }
+
+    // What the loop has queued so far has run.
+    void settle() { call([] {}); }
+
+    void stop() {
+        if (thread_.joinable()) {
+            thread_.request_stop();
+            thread_.join();
+        }
+    }
+
+private:
+    template<typename T>
+    static DetachedTask drive(std::shared_ptr<std::promise<T>> done, Task<T> task) {
+        try {
+            if constexpr (std::is_void_v<T>) {
+                co_await std::move(task);
+                done->set_value();
+            } else {
+                done->set_value(co_await std::move(task));
+            }
+        } catch (...) {
+            done->set_exception(std::current_exception());
+        }
+    }
+
+    std::promise<Loop*> built_;
+    Loop* loop_ = nullptr;
+    std::jthread thread_;
+};
 
 }  // namespace jcailloux::relais::io::test
 
