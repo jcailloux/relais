@@ -103,7 +103,19 @@ struct FramePool {
     }
 };
 
-struct PromiseBase {
+// Allocates the frame of a coroutine whose promise derives from it from the
+// thread's FramePool.
+struct PooledFrame {
+    static void* operator new(size_t size) {
+        return FramePool::instance().alloc(size);
+    }
+
+    static void operator delete(void* ptr, size_t size) noexcept {
+        FramePool::instance().dealloc(ptr, size);
+    }
+};
+
+struct PromiseBase : PooledFrame {
     std::coroutine_handle<> continuation_ = std::noop_coroutine();
 
     struct FinalAwaiter {
@@ -120,15 +132,6 @@ struct PromiseBase {
 
     [[nodiscard]] std::suspend_always initial_suspend() noexcept { return {}; }
     [[nodiscard]] FinalAwaiter final_suspend() noexcept { return {}; }
-
-    // Coroutine frame allocation: thread-local pool (~3-5ns) with fallback.
-    static void* operator new(size_t size) {
-        return FramePool::instance().alloc(size);
-    }
-
-    static void operator delete(void* ptr, size_t size) noexcept {
-        FramePool::instance().dealloc(ptr, size);
-    }
 };
 
 } // namespace detail
