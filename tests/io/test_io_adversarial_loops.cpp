@@ -14,7 +14,9 @@
 // Built with RELAIS_TEST_TRANTOR_LOOP, the same cases run on trantor instead,
 // through the shipped TrantorIoContext (test_trantor_loops); with
 // RELAIS_TEST_ASIO_LOOP, on an asio io_context through the shipped adapter
-// (test_asio_loops, and test_boost_asio_loops on Boost.Asio).
+// (test_asio_loops, and test_boost_asio_loops on Boost.Asio); with
+// RELAIS_TEST_LIBUV_LOOP, on a libuv loop through the shipped LibuvIoContext
+// (test_libuv_loops).
 
 #include <catch2/catch_template_test_macros.hpp>
 #include <catch2/catch_test_macros.hpp>
@@ -37,6 +39,9 @@
 #endif
 #ifdef RELAIS_TEST_ASIO_LOOP
 #include <fixtures/AsioTestLoop.h>
+#endif
+#ifdef RELAIS_TEST_LIBUV_LOOP
+#include <fixtures/LibuvTestLoop.h>
 #endif
 
 #include <chrono>
@@ -67,6 +72,8 @@ static_assert(IoContext<Plain> && IoContext<Adversarial>,
 #define ADVERSARIAL_LOOPS TrantorTestLoop
 #elif defined(RELAIS_TEST_ASIO_LOOP)
 #define ADVERSARIAL_LOOPS AsioTestLoop
+#elif defined(RELAIS_TEST_LIBUV_LOOP)
+#define ADVERSARIAL_LOOPS LibuvTestLoop
 #else
 #define ADVERSARIAL_LOOPS Plain, Split, Spurious, Coarse, Adversarial
 #endif

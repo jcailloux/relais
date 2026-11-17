@@ -457,6 +457,40 @@ if(RELAIS_BUILD_TESTS)
         endforeach()
     endif()
 
+    option(RELAIS_TEST_LIBUV "Test the libuv integration (fetches libuv)" OFF)
+    if(RELAIS_TEST_LIBUV)
+        # libuv's static library alone: no shared library, tests or tidy targets.
+        function(relais_fetch_libuv)
+            set(CMAKE_POLICY_DEFAULT_CMP0077 NEW)  # libuv's options honour these
+            set(LIBUV_BUILD_SHARED OFF)
+            set(LIBUV_BUILD_TESTS OFF)
+            set(LIBUV_BUILD_BENCH OFF)
+            set(ENABLE_CLANG_TIDY OFF)
+            set(BUILD_TESTING OFF)
+            FetchContent_Declare(libuv
+                GIT_REPOSITORY https://github.com/libuv/libuv.git
+                GIT_TAG        v1.53.0
+                GIT_SHALLOW    TRUE)
+            FetchContent_MakeAvailable(libuv)
+        endfunction()
+        relais_fetch_libuv()
+
+        relais_add_test(test_libuv        tests/integration/test_libuv.cpp       LABELS "integration;libuv" RESOURCE_LOCK)
+        relais_add_test(test_libuv_loops  tests/io/test_io_adversarial_loops.cpp DEFINITIONS RELAIS_TEST_LIBUV_LOOP LABELS "io;integration;adversarial;libuv" RESOURCE_LOCK)
+        target_link_libraries(test_libuv PRIVATE uv_a)
+        target_link_libraries(test_libuv_loops PRIVATE uv_a)
+
+        if(RELAIS_ENABLE_TSAN)
+            # libuv's queues and async handles instrumented too, or TSan cannot
+            # see their synchronization.
+            target_compile_options(uv_a PRIVATE -fsanitize=thread -fno-omit-frame-pointer)
+            foreach(target test_libuv test_libuv_loops)
+                target_compile_options(${target} PRIVATE -fsanitize=thread -fno-omit-frame-pointer)
+                target_link_options(${target} PRIVATE -fsanitize=thread)
+            endforeach()
+        endif()
+    endif()
+
     # -------------------------------------------------------------------------
     # Combined targets
     # -------------------------------------------------------------------------

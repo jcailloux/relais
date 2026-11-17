@@ -63,6 +63,7 @@ jobs:
           -DRELAIS_TEST_DROGON=ON
           -DRELAIS_TEST_ASIO=ON
           -DRELAIS_TEST_BOOST_ASIO=ON
+          -DRELAIS_TEST_LIBUV=ON
 
       - name: Build
         run: cmake --build build -j$(nproc)
