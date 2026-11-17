@@ -1,10 +1,10 @@
 // relais on libuv, through the shipped LibuvIoContext: the adapter meets the
 // IoContext contract, fires no timer before its delay however late the loop's
-// clock, reports a socket error once, and leaves the loop nothing to close once
-// destroyed; attach() binds relais to loops that a thread runs with uv_run, and
-// leaves a loop nothing to do once detached, so that uv_run returns. The
-// PostgreSQL scenarios of the adversarial loops run on libuv in
-// test_libuv_loops.
+// clock, reports a socket error once, runs posted callbacks without allocating,
+// and leaves the loop nothing to close once destroyed; attach() binds relais to
+// loops that a thread runs with uv_run, and leaves a loop nothing to do once
+// detached, so that uv_run returns. The PostgreSQL scenarios of the
+// adversarial loops run on libuv in test_libuv_loops.
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
@@ -16,6 +16,7 @@
 #include <jcailloux/relais/runtime/Attach.h>
 #include <jcailloux/relais/testing/IoContextConformance.h>
 
+#include <fixtures/AllocationCounter.h>
 #include <fixtures/LibuvTestLoop.h>
 #include <fixtures/LivenessHarness.h>
 #include <fixtures/TestConnInfo.h>
@@ -427,6 +428,37 @@ TEST_CASE("libuv: a socket error is reported once, and updateWatch watches again
     d.close();
     ::close(client);
     ::close(listener);
+}
+
+// Posted callbacks run from a buffer that keeps its capacity from one turn to
+// the next, up to a thousand callbacks: a steady loop allocates nothing to run
+// them, and a burst's buffer is freed once run.
+TEST_CASE("libuv: posted callbacks run without allocating, and a burst leaves no memory held",
+          "[libuv]") {
+    DrivenLoop d;
+    int ran = 0;
+    auto postAndRun = [&](int n) {
+        const int target = ran + n;
+        for (int i = 0; i < n; ++i) d.io->post([&ran] { ++ran; });
+        return d.turnUntil([&] { return ran == target; });
+    };
+    REQUIRE(postAndRun(8));
+    REQUIRE(postAndRun(8));
+
+    SECTION("a steady loop") {
+        const auto before = relais_test::threadAllocations().count;
+        bool ok = true;
+        for (int i = 0; i < 100; ++i) ok = postAndRun(8) && ok;
+        const auto allocated = relais_test::threadAllocations().count - before;
+        REQUIRE(ok);
+        CHECK(allocated == 0);
+    }
+    SECTION("a burst") {
+        const auto before = relais_test::threadAllocations().live_bytes;
+        REQUIRE(postAndRun(100'000));
+        const auto held = relais_test::threadAllocations().live_bytes - before;
+        CHECK(held <= static_cast<std::int64_t>(2 * 1024 * sizeof(std::function<void()>)));
+    }
 }
 
 TEST_CASE("libuv: what the adapter leaves pending dies with it, and the loop closes",
