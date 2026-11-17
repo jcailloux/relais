@@ -10,8 +10,13 @@
 //
 // relais binds to the thread that runs the io_context, where repository calls
 // then run: one thread per io_context. With several io_contexts, one per
-// thread, attach relais to each.
+// thread, attach relais to each. A coroutine of Boost.Asio, or any completion
+// token, awaits a repository call through relais::async (Boost 1.82 or later):
+//
+//   auto item = co_await jcailloux::relais::async(ItemRepo::find(id),
+//                                                 boost::asio::use_awaitable);
 
+#include <exception>
 #include <string>
 #include <utility>
 
@@ -19,6 +24,19 @@
 #include <boost/asio/post.hpp>
 #include <boost/asio/posix/stream_descriptor.hpp>
 #include <boost/asio/steady_timer.hpp>
+#include <boost/asio/version.hpp>
+
+#if BOOST_ASIO_VERSION >= 102700
+#include <boost/asio/append.hpp>
+#include <boost/asio/associated_cancellation_slot.hpp>
+#include <boost/asio/associated_immediate_executor.hpp>
+#include <boost/asio/async_result.hpp>
+#include <boost/asio/cancellation_type.hpp>
+#include <boost/asio/dispatch.hpp>
+#include <boost/asio/error.hpp>
+#include <boost/asio/executor_work_guard.hpp>
+#include <boost/system/system_error.hpp>
+#endif
 
 #include "jcailloux/relais/integration/detail/basic_asio.h"
 
@@ -33,15 +51,58 @@ struct BoostAsio {
     using timer = ::boost::asio::steady_timer;
     using error_code = ::boost::system::error_code;
 
-    template<typename F>
-    static void post(io_context& ctx, F&& f) {
-        ::boost::asio::post(ctx, std::forward<F>(f));
+    // To an io_context or an executor.
+    template<typename Target, typename F>
+    static void post(Target&& target, F&& f) {
+        ::boost::asio::post(std::forward<Target>(target), std::forward<F>(f));
     }
 
     template<typename Service>
     static Service& use_service(io_context& ctx) {
         return ::boost::asio::use_service<Service>(ctx);
     }
+
+#if BOOST_ASIO_VERSION >= 102700
+    // What relais::async needs besides.
+    using cancellation_type = ::boost::asio::cancellation_type;
+
+    template<typename Signature, typename Token, typename Initiation, typename... Args>
+    static auto async_initiate(Initiation&& initiation, Token& token, Args&&... args) {
+        return ::boost::asio::async_initiate<Token, Signature>(
+            std::forward<Initiation>(initiation), token, std::forward<Args>(args)...);
+    }
+
+    template<typename Handler, typename... Values>
+    static auto append(Handler&& handler, Values&&... values) {
+        return ::boost::asio::append(std::forward<Handler>(handler),
+                                     std::forward<Values>(values)...);
+    }
+
+    template<typename Executor, typename Token>
+    static void dispatch(const Executor& ex, Token&& token) {
+        ::boost::asio::dispatch(ex, std::forward<Token>(token));
+    }
+
+    template<typename Handler, typename Executor>
+    static auto immediate_executor(const Handler& handler, const Executor& ex) noexcept {
+        return ::boost::asio::get_associated_immediate_executor(handler, ex);
+    }
+
+    template<typename Handler>
+    static auto cancellation_slot(const Handler& handler) noexcept {
+        return ::boost::asio::get_associated_cancellation_slot(handler);
+    }
+
+    template<typename Handler, typename Executor>
+    static auto work_guard(const Handler& handler, const Executor& ex) {
+        return ::boost::asio::make_work_guard(handler, ex);
+    }
+
+    static std::exception_ptr aborted() {
+        return std::make_exception_ptr(
+            ::boost::system::system_error(::boost::asio::error::operation_aborted));
+    }
+#endif
 };
 
 }  // namespace detail
@@ -65,6 +126,26 @@ namespace jcailloux::relais {
 attach(::boost::asio::io_context& ctx, std::string conninfo, AttachConfig cfg = {}) {
     return detail::attachAsio<io::detail::BoostAsio>(ctx, std::move(conninfo), cfg);
 }
+
+#if BOOST_ASIO_VERSION >= 102700
+
+/// relais::async of integration/asio.h, on Boost.Asio. With both headers in one
+/// translation unit, every call to it is ambiguous: call it where one is.
+template<typename T,
+         ::boost::asio::completion_token_for<detail::AsyncSignature<T>> Token =
+             ::boost::asio::default_completion_token_t<::boost::asio::io_context::executor_type>>
+auto async(io::Task<T> task, Token&& token = Token()) {
+    return detail::asyncOn<io::detail::BoostAsio, Token>(std::move(task), token);
+}
+
+template<typename T,
+         ::boost::asio::completion_token_for<detail::AsyncSignature<T>> Token =
+             ::boost::asio::default_completion_token_t<::boost::asio::io_context::executor_type>>
+auto async(io::Immediate<T> call, Token&& token = Token()) {
+    return detail::asyncOn<io::detail::BoostAsio, Token>(std::move(call), token);
+}
+
+#endif
 
 }  // namespace jcailloux::relais
 

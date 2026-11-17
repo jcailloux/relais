@@ -8,18 +8,23 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <coroutine>
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <utility>
 
 #include "jcailloux/relais/Log.h"
 #include "jcailloux/relais/io/IoContext.h"
+#include "jcailloux/relais/io/Task.h"
 #include "jcailloux/relais/runtime/Attach.h"
 
 namespace jcailloux::relais::io {
@@ -359,6 +364,260 @@ attachAsio(typename Net::io_context& ctx, std::string conninfo, AttachConfig cfg
     if (probe.refusal) throw AttachError("relais cannot run on this io_context: " + *probe.refusal);
     io.pinThread(probe.thread);
     return relais::attach<Io>(io, std::move(conninfo), cfg);
+}
+
+// ---------------------------------------------------------------------------
+// relais::async — a relais Task or Immediate as an asio asynchronous
+// operation, which integration/asio.h and integration/boost_asio.h declare.
+
+// What a relais awaitable yields: Task<T> and Immediate<T> yield T.
+template<typename Pending>
+using AwaitedOf = decltype(std::declval<Pending&>().await_resume());
+
+// The completion signature of relais::async, as co_spawn's: the exception the
+// operation ended with, if any, then its value.
+template<typename T>
+struct AsyncSignatureOf {
+    using type = void(std::exception_ptr, T);
+};
+
+template<>
+struct AsyncSignatureOf<void> {
+    using type = void(std::exception_ptr);
+};
+
+template<typename T>
+using AsyncSignature = typename AsyncSignatureOf<T>::type;
+
+// What an operation completes with: on an exception, a value-initialized T.
+template<typename T>
+struct AsyncResult {
+    std::exception_ptr error;
+    T value{};
+};
+
+template<>
+struct AsyncResult<void> {
+    std::exception_ptr error;
+};
+
+// Awaits `pending` into a result, never throwing.
+template<typename Pending>
+auto settle(Pending& pending) -> AsyncResult<AwaitedOf<Pending>> {
+    using T = AwaitedOf<Pending>;
+    AsyncResult<T> result;
+    try {
+        if constexpr (std::is_void_v<T>) {
+            pending.await_resume();
+        } else {
+            result.value = pending.await_resume();
+        }
+    } catch (...) {
+        result.error = std::current_exception();
+    }
+    return result;
+}
+
+// `handler`, bound to the arguments `result` completes it with.
+template<typename Net, typename Handler, typename T>
+auto bindResult(Handler&& handler, AsyncResult<T>&& result) {
+    if constexpr (std::is_void_v<T>) {
+        return Net::append(std::forward<Handler>(handler), std::move(result.error));
+    } else {
+        return Net::append(std::forward<Handler>(handler), std::move(result.error),
+                           std::move(result.value));
+    }
+}
+
+// Completes `handler` with `result` during the initiating function, as asio's
+// operations do: through the handler's immediate executor, by default a post
+// to the loop.
+template<typename Net, typename Handler, typename T>
+void completeImmediately(Handler&& handler, const typename Net::io_context::executor_type& io_ex,
+                         AsyncResult<T>&& result) {
+    auto immediate = Net::immediate_executor(handler, io_ex);  // before the handler moves
+    Net::dispatch(immediate, bindResult<Net>(std::forward<Handler>(handler), std::move(result)));
+}
+
+// The handler side of an operation that did not complete at once: it holds
+// the handler, keeps its executor's work outstanding, and answers a
+// cancellation. Lives in the operation's driver, on the loop thread.
+//
+// A cancellation abandons the operation: the handler completes at once with
+// operation_aborted, the request runs on and its result is dropped, relais's
+// cache staying valid. Honoured for the terminal and partial types: the
+// request may still have its effects, so not for the total type.
+template<typename Net, typename Handler, typename T>
+class AsyncOperation {
+    using IoExecutor = typename Net::io_context::executor_type;
+    using CancellationType = typename Net::cancellation_type;
+    using WorkGuard = decltype(Net::work_guard(std::declval<Handler&>(), std::declval<IoExecutor&>()));
+    using Slot = decltype(Net::cancellation_slot(std::declval<Handler&>()));
+
+public:
+    AsyncOperation(Handler handler, const IoExecutor& io_ex)
+        : handler_(std::move(handler)),
+          io_ex_(io_ex),
+          work_(Net::work_guard(handler_, io_ex_)),
+          slot_(Net::cancellation_slot(handler_)) {
+        if (slot_.is_connected()) slot_.template emplace<Cancellation>(this);
+    }
+
+    AsyncOperation(const AsyncOperation&) = delete;
+    AsyncOperation& operator=(const AsyncOperation&) = delete;
+
+    // Completes the handler with `result`, unless the operation was abandoned:
+    // through the handler's immediate executor while the initiating function
+    // runs, else as asio completes an operation of the loop (in place, from
+    // the loop thread, when the handler runs on the loop).
+    void complete(bool immediately, AsyncResult<T>&& result) {
+        if (abandoned_) return;
+        if (slot_.is_connected()) slot_.clear();
+        if (immediately) {
+            completeImmediately<Net>(std::move(handler_), io_ex_, std::move(result));
+        } else {
+            Net::dispatch(io_ex_, bindResult<Net>(std::move(handler_), std::move(result)));
+        }
+    }
+
+private:
+    // Sits in the handler's cancellation slot until the operation completes.
+    class Cancellation {
+    public:
+        explicit Cancellation(AsyncOperation* op) noexcept : op_(op) {}
+
+        void operator()(CancellationType type) {
+            constexpr auto honoured = CancellationType::terminal | CancellationType::partial;
+            if (op_ != nullptr && (type & honoured) != CancellationType::none)
+                std::exchange(op_, nullptr)->abandon();
+        }
+
+    private:
+        AsyncOperation* op_;  // null once it abandoned the operation
+    };
+
+    // Posted, as asio's own operations do: never inside the emitter's call.
+    void abandon() {
+        abandoned_ = true;
+        AsyncResult<T> aborted{Net::aborted()};
+        Net::post(io_ex_, bindResult<Net>(std::move(handler_), std::move(aborted)));
+        work_.reset();
+    }
+
+    Handler handler_;
+    IoExecutor io_ex_;
+    WorkGuard work_;
+    Slot slot_;
+    bool abandoned_ = false;
+};
+
+// The coroutine that awaits a relais awaitable for an operation, frame from
+// the thread's FramePool. It starts within the initiating function and runs
+// until the awaitable first suspends; it ends once it has completed the
+// handler, or with the request if the operation was abandoned.
+struct AsyncDriver {
+    struct promise_type : io::detail::PooledFrame {
+        // The initiating function's, while it runs the driver: set once the
+        // driver ends there.
+        bool* ended_initiating = nullptr;
+
+        AsyncDriver get_return_object() noexcept {
+            return {std::coroutine_handle<promise_type>::from_promise(*this)};
+        }
+        std::suspend_always initial_suspend() noexcept { return {}; }
+        std::suspend_never final_suspend() noexcept { return {}; }
+        void return_void() noexcept {}
+        // Only an allocation failure gets here, installing the cancellation
+        // handler or completing: the handler would never complete, and
+        // whoever awaits it would hang.
+        void unhandled_exception() noexcept { std::terminate(); }
+    };
+
+    // True if the driver ends while the initiating function runs: it ends
+    // right after. Never suspends.
+    struct EndingInitiation {
+        bool initiating = false;
+
+        bool await_ready() const noexcept { return false; }
+        bool await_suspend(std::coroutine_handle<promise_type> h) noexcept {
+            if (bool* ended = std::exchange(h.promise().ended_initiating, nullptr)) {
+                *ended = true;
+                initiating = true;
+            }
+            return false;
+        }
+        bool await_resume() const noexcept { return initiating; }
+    };
+
+    // From the initiating function.
+    void start() && {
+        bool ended = false;
+        handle.promise().ended_initiating = &ended;
+        handle.resume();
+        if (!ended) handle.promise().ended_initiating = nullptr;
+    }
+
+    std::coroutine_handle<promise_type> handle;
+};
+
+template<typename Net, typename Handler, typename Pending>
+AsyncDriver driveAsync(Pending pending, Handler handler,
+                       typename Net::io_context::executor_type io_ex) {
+    using T = AwaitedOf<Pending>;
+    AsyncOperation<Net, Handler, T> op(std::move(handler), io_ex);
+    AsyncResult<T> result;
+    try {
+        if constexpr (std::is_void_v<T>) {
+            co_await pending;
+        } else {
+            result.value = co_await pending;
+        }
+    } catch (...) {
+        result.error = std::current_exception();
+    }
+    op.complete(co_await AsyncDriver::EndingInitiation{}, std::move(result));
+}
+
+// The initiation of relais::async. Runs the awaitable where it is initiated:
+// on the loop thread, where relais::async is called.
+template<typename Net>
+class AsyncInitiation {
+public:
+    using executor_type = typename Net::io_context::executor_type;
+
+    explicit AsyncInitiation(const executor_type& io_ex) noexcept : io_ex_(io_ex) {}
+
+    [[nodiscard]] executor_type get_executor() const noexcept { return io_ex_; }
+
+    template<typename Handler, typename Pending>
+    void operator()(Handler&& handler, Pending pending) const {
+        if (pending.await_ready()) {  // done already, as a hit in relais's cache
+            completeImmediately<Net>(std::forward<Handler>(handler), io_ex_, settle(pending));
+            return;
+        }
+        driveAsync<Net, std::decay_t<Handler>>(std::move(pending), std::forward<Handler>(handler),
+                                               io_ex_)
+            .start();
+    }
+
+private:
+    executor_type io_ex_;
+};
+
+template<typename Net, typename Token, typename Pending>
+auto asyncOn(Pending pending, Token& token) {
+    using T = AwaitedOf<Pending>;
+    static_assert(std::is_void_v<T> || std::is_default_constructible_v<T>,
+                  "relais::async completes with (std::exception_ptr, T), as asio::co_spawn: "
+                  "T must be default-constructible");
+    auto* loop = attachedLoop<io::BasicAsioIoContext<Net>>();
+    if (loop == nullptr) {
+        throw std::logic_error(
+            "relais::async() called on a thread relais is not attached to: call it on the "
+            "thread that runs an io_context relais::attach() bound");
+    }
+    return Net::template async_initiate<AsyncSignature<T>, Token>(
+        AsyncInitiation<Net>(loop->context().get_executor()), token, std::move(pending));
 }
 
 }  // namespace jcailloux::relais::detail

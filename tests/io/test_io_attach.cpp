@@ -156,6 +156,22 @@ struct SilentTimers : Forwarding {
     void postDelayed(std::chrono::nanoseconds, std::function<void()>) {}
 };
 
+// Once `late` is set, runs each posted callback 10 ms after its turn comes: a
+// thread waiting on the loop wakes long before the next callback has run.
+struct LatePosts : Forwarding {
+    void post(std::function<void()> cb) {
+        if (!late) {
+            inner.post(std::move(cb));
+            return;
+        }
+        inner.post([cb = std::move(cb)] {
+            std::this_thread::sleep_for(10ms);
+            cb();
+        });
+    }
+    std::atomic<bool> late{false};
+};
+
 // What attach() reports on a loop of that kind; the check's descriptors are
 // closed once the loop has run what the failure posted or armed.
 template<typename Loop>
@@ -211,6 +227,19 @@ TEST_CASE("attach: detach waits for a request in flight", "[io][attach][integrat
     }
     CHECK(finished);
     CHECK_FALSE(t.call(bound));
+}
+
+TEST_CASE("attach: once detach returns, nothing relais opened is left, even on a slow loop",
+          "[io][attach][integration]") {
+    LoopThread<LatePosts> t;
+    const int fds = countOpenFds();
+    auto relais = attach(t.loop(), conninfo(), kSmall);
+    CHECK(t.run([] { return firstValue("SELECT 40 + 2"); }) == "42");
+    t.loop().late = true;
+    relais.detach();
+    // The loop may stop here: the teardown ran what it posted, the removal of
+    // each connection's watch and the closing of its descriptor among them.
+    CHECK(countOpenFds() == fds);
 }
 
 TEST_CASE("attach: detach on the loop's own thread starts the teardown and returns",

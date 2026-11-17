@@ -47,6 +47,14 @@ inline const void*& attachedHere() noexcept {
     return binding;
 }
 
+// The loop relais is attached to on this thread, if it is an Io: set once
+// relais is ready there, until its teardown.
+template<io::IoContext Io>
+Io*& attachedLoop() noexcept {
+    thread_local Io* loop = nullptr;
+    return loop;
+}
+
 // LoopBinding — relais bound to one loop: the check of the loop, then the pool
 // and the scheduler created on it, the loop thread's providers bound to them,
 // and the ordered teardown. Each phase is posted onto the loop and awaited from
@@ -190,6 +198,7 @@ private:
             PgProvider::bindBatcher<Io>(scheduler);
             self->pool_ = std::move(pool);
             self->scheduler_ = std::move(scheduler);
+            attachedLoop<Io>() = &self->io_;
         } catch (...) {
             if (attachedHere() == self.get()) attachedHere() = nullptr;
             error = std::current_exception();
@@ -232,8 +241,19 @@ private:
             PgProvider::reset();
             scheduler_.reset();
         }
-        if (attachedHere() == this) attachedHere() = nullptr;
+        if (attachedHere() == this) {
+            attachedHere() = nullptr;
+            attachedLoop<Io>() = nullptr;
+        }
         pool_.reset();
+        // Destroying the pool posts the removal of its connections' watches:
+        // the teardown ends after them, in posting order, so that a loop
+        // stopped as soon as detach() returns keeps nothing of relais.
+        io_.post([self = this->shared_from_this(), drained] { self->finish(drained); });
+    }
+
+    // Loop thread, once what the teardown posted has run.
+    void finish(bool drained) {
         // Nothing of relais runs on the loop any more, and the timers it armed
         // that are still pending do nothing; what the drain abandoned may
         // still need its own.
@@ -379,7 +399,8 @@ public:
     /// Takes relais off the loop, which must still be running: waits there for
     /// the requests in flight (each bounded by its timeouts), unbinds the loop
     /// thread, and closes the pool. Blocks until done, except on the loop's own
-    /// thread, where it only starts it; idempotent.
+    /// thread, where it only starts it; once done, the loop may stop at once.
+    /// Idempotent.
     void detach() noexcept {
         if (auto binding = std::move(binding_)) {
             binding->beginRelease();
