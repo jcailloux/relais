@@ -2,12 +2,12 @@
 #define JCX_RELAIS_IO_EPOLL_IO_CONTEXT_H
 
 #include <jcailloux/relais/io/IoContext.h>
+#include <jcailloux/relais/io/detail/DrainBuffer.h>
 
 #include <atomic>
 #include <cassert>
 #include <cstdint>
 #include <cstring>
-#include <deque>
 #include <functional>
 #include <map>
 #include <memory_resource>
@@ -340,34 +340,35 @@ private:
     };
 
     void drainPosted() {
-        std::deque<std::function<void()>> local;
+        detail::DrainBuffer<std::function<void()>>::Use use(posted_);
+        auto& posted = use.items();
         {
             std::lock_guard lock(post_mutex_);
-            local.swap(post_queue_);
+            posted.swap(post_queue_);
         }
-        for (auto& cb : local) {
+        for (auto& cb : posted) {
             cb();
         }
     }
 
+    // Matured timers leave the queue under the lock and fire outside it: a
+    // callback may arm or cancel another.
     void fireExpiredTimers() {
-        // Move matured timers out under lock, then fire them unlocked (a
-        // callback may re-enter postDelayed/cancelTimer). fire_scratch_ is a
-        // reused member: loop-thread only, capacity retained → no per-fire alloc.
-        fire_scratch_.clear();
+        detail::DrainBuffer<TimerEntry>::Use use(fired_);
+        auto& fired = use.items();
         {
             std::lock_guard lock(post_mutex_);
             if (!timers_.empty()) {
                 const auto now = Clock::now();
                 for (auto it = timers_.begin(); it != timers_.end() && it->first <= now; ) {
                     by_token_.erase(it->second.token);
-                    fire_scratch_.push_back(std::move(it->second));
+                    fired.push_back(std::move(it->second));
                     it = timers_.erase(it);
                 }
             }
         }
 
-        for (auto& entry : fire_scratch_) {
+        for (auto& entry : fired) {
             entry.callback();
         }
 
@@ -419,7 +420,10 @@ private:
     uint32_t watch_gen_seq_ = 0;  // loop-thread only (addWatch)
 
     mutable std::mutex post_mutex_;
-    std::deque<std::function<void()>> post_queue_;
+    std::vector<std::function<void()>> post_queue_;
+    // post_queue_ and posted_ swap buffers on each drain, so that both keep
+    // their capacity: a turn allocates nothing.
+    detail::DrainBuffer<std::function<void()>> posted_;
 
     // Timer subsystem: deadline-ordered multimap + token→iterator index, both
     // backed by a pooled resource. arm = emplace (O(log n)), cancel = erase via
@@ -430,7 +434,7 @@ private:
     std::pmr::multimap<Clock::time_point, TimerEntry> timers_{&timer_pool_};
     std::pmr::unordered_map<TimerToken,
         std::pmr::multimap<Clock::time_point, TimerEntry>::iterator> by_token_{&timer_pool_};
-    std::vector<TimerEntry> fire_scratch_;  // reused by fireExpiredTimers (loop-thread)
+    detail::DrainBuffer<TimerEntry> fired_;
     // When the timerfd expires; max() while disarmed or expired (loop-thread).
     Clock::time_point timerfd_at_ = Clock::time_point::max();
     uint64_t timerfd_arms_ = 0;  // loop-thread only

@@ -2,11 +2,44 @@
 
 #include <jcailloux/relais/io/EpollIoContext.h>
 
+#include <fixtures/AllocationCounter.h>
+
 #include <atomic>
 #include <chrono>
+#include <cstdint>
+#include <functional>
+#include <stdexcept>
+#include <string>
 #include <thread>
+#include <vector>
 
 using namespace jcailloux::relais::io;
+using namespace std::chrono_literals;
+
+namespace {
+
+// What a hundred turns allocate, each running a posted callback and a timer,
+// and a hundred more with nothing to run, once two such turns have run.
+std::uint64_t allocationsOfWarmTurns(EpollIoContext& io) {
+    int ran = 0;
+    auto turn = [&] {
+        io.post([&ran] { ++ran; });
+        io.postDelayed(0ns, [&ran] { ++ran; });
+        io.runOnce(0);
+    };
+    turn();
+    turn();
+    const auto before = relais_test::threadAllocations().count;
+    for (int i = 0; i < 100; ++i) {
+        io.runOnce(0);
+        turn();
+    }
+    const auto allocated = relais_test::threadAllocations().count - before;
+    REQUIRE(ran == 2 * 102);
+    return allocated;
+}
+
+}  // namespace
 
 TEST_CASE("EpollIoContext: post() from same thread", "[io][epoll]") {
     EpollIoContext io;
@@ -213,4 +246,88 @@ TEST_CASE("EpollIoContext: a cancelled earliest timer lets the next one fire on 
     CHECK(std::chrono::steady_clock::now() - t0 >= std::chrono::milliseconds(40));
     // Armed for the first, then, from its expiry for nothing, for the second.
     CHECK(io.timerfdArms() == 2);
+}
+
+TEST_CASE("EpollIoContext: a loop turn allocates nothing", "[io][epoll]") {
+    EpollIoContext io;
+    CHECK(allocationsOfWarmTurns(io) == 0);
+
+    // Callbacks posted from another thread: the loop's thread runs them
+    // without allocating either.
+    std::atomic<int> ran{0};
+    auto postFromAnotherThread = [&] {
+        std::thread([&] {
+            for (int i = 0; i < 8; ++i) io.post([&ran] { ran.fetch_add(1); });
+        }).join();
+    };
+    postFromAnotherThread();
+    io.runUntil([&] { return ran.load() == 8; });
+    postFromAnotherThread();
+    const auto before = relais_test::threadAllocations().count;
+    io.runUntil([&] { return ran.load() == 16; });
+    CHECK(relais_test::threadAllocations().count == before);
+}
+
+// A posted callback may run the loop itself: that turn runs what was posted
+// since, then the rest of the outer batch runs, each callback once.
+TEST_CASE("EpollIoContext: a posted callback that runs the loop", "[io][epoll]") {
+    EpollIoContext io;
+    std::string ran;
+    io.post([&] {
+        ran += 'A';
+        io.post([&] { ran += 'D'; });
+        io.runOnce(0);
+    });
+    io.post([&] { ran += 'B'; });
+    io.post([&] { ran += 'C'; });
+    io.runOnce(0);
+    io.runOnce(0);
+    CHECK(ran == "ADBC");
+    CHECK(allocationsOfWarmTurns(io) == 0);
+}
+
+// A timer callback may run the loop itself: that turn fires the timers due
+// since, then the rest of the outer batch fires, each timer once.
+TEST_CASE("EpollIoContext: a timer callback that runs the loop", "[io][epoll]") {
+    EpollIoContext io;
+    std::vector<std::string> fired;
+    // Its captures outgrow std::function's inline buffer: a timer destroyed
+    // before it fires is a use after free, which ASan reports.
+    const std::string second(64, '2');
+    io.postDelayed(0ns, [&] {
+        fired.emplace_back("first");
+        io.postDelayed(0ns, [&] { fired.emplace_back("set by the first"); });
+        io.runOnce(0);
+        fired.emplace_back("first, after its turn");
+    });
+    io.postDelayed(0ns, [&fired, second] { fired.push_back(second); });
+    io.runOnce(0);
+    io.runOnce(0);
+    CHECK(fired == std::vector<std::string>{"first", "set by the first", "first, after its turn", second});
+    CHECK(allocationsOfWarmTurns(io) == 0);
+}
+
+// A callback that throws leaves runOnce; the loop stays whole: what is posted
+// and armed next runs, and a turn again allocates nothing.
+TEST_CASE("EpollIoContext: a callback that throws leaves the loop whole", "[io][epoll]") {
+    EpollIoContext io;
+    io.post([] { throw std::runtime_error("posted"); });
+    CHECK_THROWS_AS(io.runOnce(0), std::runtime_error);
+    io.postDelayed(0ns, [] { throw std::runtime_error("timer"); });
+    CHECK_THROWS_AS(io.runOnce(0), std::runtime_error);
+    CHECK(allocationsOfWarmTurns(io) == 0);
+}
+
+// The buffer that runs posted callbacks keeps its capacity from one turn to
+// the next, up to a thousand callbacks: a burst's is freed once run.
+TEST_CASE("EpollIoContext: a burst of posted callbacks leaves no memory held", "[io][epoll]") {
+    EpollIoContext io;
+    io.runOnce(0);
+    const auto before = relais_test::threadAllocations().live_bytes;
+    int ran = 0;
+    for (int i = 0; i < 100'000; ++i) io.post([&ran] { ++ran; });
+    io.runOnce(0);
+    REQUIRE(ran == 100'000);
+    const auto held = relais_test::threadAllocations().live_bytes - before;
+    CHECK(held <= static_cast<std::int64_t>(2 * 1024 * sizeof(std::function<void()>)));
 }

@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "jcailloux/relais/io/IoContext.h"
+#include "jcailloux/relais/io/detail/DrainBuffer.h"
 
 namespace jcailloux::relais::io {
 
@@ -151,7 +152,9 @@ private:
         uv_async_t async;
         std::mutex m;
         std::vector<std::function<void()>> queued;   // guarded by m
-        std::vector<std::function<void()>> running;  // loop thread
+        // Swaps buffers with queued on each run, so that both keep their
+        // capacity; loop thread.
+        detail::DrainBuffer<std::function<void()>> running;
         std::atomic<std::thread::id> thread{};       // the last to run them
         bool orphaned = false;                       // the adapter is gone; loop thread
     };
@@ -202,17 +205,18 @@ private:
     static void runPosted(uv_async_t* async) noexcept {
         auto& posted = *static_cast<Posted*>(async->data);
         posted.thread.store(std::this_thread::get_id(), std::memory_order_relaxed);
+        detail::DrainBuffer<std::function<void()>>::Use use(posted.running);
+        auto& running = use.items();
         {
             std::lock_guard lock(posted.m);
-            posted.running.swap(posted.queued);
+            running.swap(posted.queued);
         }
         // What these post goes to `queued`, and to the next turn. One of them
         // may destroy the adapter: the rest then never run.
-        for (auto& cb : posted.running) {
+        for (auto& cb : running) {
             if (posted.orphaned) break;
             cb();
         }
-        posted.running.clear();  // both vectors keep their capacity
     }
 
     static int watchFor(Watch& watch, IoEvent mask) noexcept {
