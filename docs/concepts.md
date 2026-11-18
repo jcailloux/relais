@@ -142,16 +142,15 @@ The runtime model is shared-nothing:
   └───────┘         └───────┘         └───────┘
 ```
 
-The one rule that follows from this: **a repository call must run on a loop
-thread, and the providers must be bound on that thread.** The bundled `IoPool`
-does this for you — it spins up N loops and binds each one's providers during
-construction. If you bring your own event loop (a web framework already owns the
-threads your requests run on), you bind the providers once per loop yourself and
-relais runs inline on it via an `IoContext` adapter.
+The one rule that follows from this: **a repository call runs on a loop thread
+relais is attached to.** relais binds each loop's thread itself when it attaches
+to the loop: to the loops your application already runs (Drogon, trantor, asio
+and libuv have an integration, any other loop drives relais through one
+descriptor), or to those of the bundled `IoPool`, which runs loops of its own.
 
-> Stand up the runtime and the binding rule → [runtime.md](runtime.md).
-> Co-locating relais on a foreign loop → [foreign-event-loops.md](foreign-event-loops.md).
-> `IoPool`, `Task`, and the `IoContext` concept →
+> Where relais runs and the threading rule → [runtime.md](runtime.md).
+> Attaching relais to your event loop → [foreign-event-loops.md](foreign-event-loops.md).
+> `attach`, `IoPool`, `Task`, and the `IoContext` concept →
 > [api-reference.md › Runtime and I/O](api-reference.md#runtime-and-io).
 
 ---
@@ -215,12 +214,11 @@ Speed in relais comes from four independent choices, in order of impact.
    a request never hops threads, so throughput scales ~linearly with cores at
    unchanged latency. This is the `IoPool` default and reaches the L1-hit latency
    above on its own — see [§4](#4--the-shared-nothing-runtime).
-4. **Co-location on a foreign loop *(optional)*.** Relevant only when a web
-   framework (Drogon/asio/libuv) already owns the loops your requests run on:
-   bridging each call to a separate `IoPool` then costs a ~3 µs thread hop, even
-   on an L1 hit. Running relais inline on those existing loops removes it, via a
-   small [`IoContext` adapter](foreign-event-loops.md). If relais drives your
-   runtime, you don't need this.
+4. **Running on your application's loop.** When your application already runs
+   event loops (a web framework, asio, libuv…), relais
+   [attaches to them](foreign-event-loops.md): a call runs inline on its
+   handler's thread, where bridging it to a separate `IoPool` would cost a
+   thread hop (~3 µs), even on an L1 hit.
 
 ---
 

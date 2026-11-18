@@ -29,14 +29,13 @@ namespace jcailloux::relais {
 //     blocks, the loop keeps spinning;
 //   - on completion, `on_done` is invoked with the outcome, ON the loop thread.
 //
-// Primary use is the cross-thread bootstrap of co-located pools: from the main
-// thread, drive a lazy `PgPool::create()` to completion on the loop and signal a
-// std::promise to build a blocking wait. For per-request cache reads you should
-// co_await inline on the loop instead — no spawnOn, no hop.
+// Use it to hand relais work to a loop from a thread outside it, from main to an
+// IoPool worker, say; on the loop itself, co_await inline instead — no spawnOn,
+// no hop. A std::promise set by on_done turns it into a blocking wait:
 //
-//   relais::spawnOn(io, PgPool<Io>::create(io, conninfo),
-//       [&ready](relais::Outcome<PoolPtr> r) {
-//           if (r) ready.set_value(*r); else ready.set_exception(r.error());
+//   relais::spawnOn(pool->workerIo(0), countUsers(),
+//       [&done](relais::Outcome<int64_t> r) {
+//           if (r) done.set_value(*r); else done.set_exception(r.error());
 //       });
 //
 // Cost: exactly one coroutine-frame allocation (the driver). `task` and

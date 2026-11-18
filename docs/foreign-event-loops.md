@@ -1,355 +1,356 @@
-# Writing an `IoContext` adapter (running relais on a foreign event loop)
+# Running relais on your event loop
 
-relais is generic over the [`IoContext`](../include/jcailloux/relais/io/IoContext.h)
-concept. `EpollIoContext` is the bundled implementation, but `PgPool<Io>`
-and the coroutine awaiter machinery accept **any** type that
-satisfies the concept. This lets you run relais **inline on another framework's
-event loop** instead of bridging across threads.
+relais runs its I/O on event loops: each loop has its own connection pool, and a
+repository call is served by the loop whose thread makes it. When your
+application already runs an event loop, attach relais to it: handlers then call
+relais directly, on their own thread. An L1 hit is a lookup in memory, and a miss
+sends its query from that same thread: no thread hop, no lock.
 
-> **Most users don't need this.** The built-in `IoPool` runtime already delivers
-> the shared-nothing N-loop model and ~50 ns L1 hits. Write an adapter only when a
-> web framework already owns the loops your requests run on, and the per-request
-> bridge to `IoPool` (~3 µs) is a measured cost worth removing. Read
-> [runtime.md](runtime.md) first.
+| Your application runs | Attach relais with | See |
+|---|---|---|
+| Drogon | `attachDrogon(conninfo)`, before `run()` | [Drogon](#drogon) |
+| a trantor `EventLoop` | `attach(io, conninfo)`, `io` a `TrantorIoContext` | [trantor](#trantor) |
+| an asio or Boost.Asio `io_context` | `attach(ctx, conninfo)` | [asio and Boost.Asio](#asio-and-boostasio) |
+| a libuv loop | `attach(io, conninfo)`, `io` a `LibuvIoContext` | [libuv](#libuv) |
+| another loop: GLib, Qt, libevent, your own | `attachHere(conninfo)`, and one descriptor to watch | [Any other loop](#any-other-loop-one-descriptor) |
+| no event loop | `io::IoPool`, which runs loops of its own | [runtime.md › IoPool](runtime.md#no-event-loop-iopool) |
 
-## Why you'd want this
+Each integration is one header of `jcailloux/relais/integration/`. Including it
+needs the library it integrates; relais itself depends on none of them. A loop
+with no integration can also get an adapter of its own:
+[Writing an adapter](#writing-an-adapter).
 
-If your HTTP framework already runs one epoll loop per core (Drogon/trantor,
-asio, libuv, seastar…), construct the relais pools **on those same loops**:
+## One pool per loop thread
 
-- an **L1 cache hit** is then a pure in-process `ChunkMap` lookup (~50 ns, zero
-  thread hops, zero syscalls — L1 is a process-global sharded cache, not per-loop
-  state);
-- only real **misses** do async I/O, inline on the same thread.
+These rules hold on every loop:
 
-Bridging from the framework's threads to dedicated relais loops instead costs a
-hop + two syscalls per request, even on an L1 hit. Co-locate unless you can't fit
-one DB pool per front-end loop within your connection budget.
+- **relais binds the thread that runs the loop.** Repository calls run there:
+  from the loop's callbacks, handlers and coroutines. On a thread relais is not
+  attached to, a call that needs PostgreSQL throws `std::logic_error`.
+- **One thread per loop.** relais's state for a loop belongs to one thread, so a
+  loop that several threads run cannot host it. With several threads, run one
+  loop per thread and attach relais to each: each loop gets its own pool, and a
+  request stays on its loop end to end.
+- **Connections add up.** Each loop opens up to `max_connections`: keep their
+  total under the server's `max_connections`.
+- **`AttachConfig` sets up each loop**: `.pool` is its pool's `PgPoolConfig`
+  (connections, timeouts, settling), `.max_concurrent` the sends it keeps in
+  flight (default 8). Fields and defaults are in
+  [api-reference.md › Attaching relais to a loop](api-reference.md#attaching-relais-to-a-loop);
+  what the timeouts bound, in
+  [runtime.md › Liveness & failure semantics](runtime.md#liveness--failure-semantics).
 
-## Ownership
-
-The adapter depends on **both** relais and your framework, so it is glue and
-belongs in **your** code (or a small separate integration target), not in relais
-core — relais must not take a dependency on a specific web framework, and it
-cannot track that framework's API across versions. relais's responsibility ends
-at the concept and the conformance harness below.
-
-## The contract
-
-Satisfy six methods (plus the `WatchHandle` and `TimerToken` member types). The
-semantic rules (the part a concept can't express) are documented on the concept
-and enforced by the harness:
-
-| relais method | what it must do |
-|---|---|
-| `WatchHandle addWatch(int fd, IoEvent mask, cb)` | register `fd`; call `cb(events)` on the loop thread when ready, with matching `IoEvent` bits. **A watch follows the open file, not the number**: after `fd` is closed, `removeWatch` then `addWatch` on a new fd that reuses the number must deliver the new file's events |
-| `void updateWatch(WatchHandle, IoEvent mask)` | change the active mask on that handle |
-| `void removeWatch(WatchHandle)` | stop all callbacks for that handle at once, **including for the rest of the event being dispatched**; **must be safe to call from inside that handle's own callback** — defer teardown of loop-owned state |
-| `void post(std::function<void()>)` | run once, on the loop thread, FIFO; thread-safe; **wake a blocked loop promptly** |
-| `TimerToken postDelayed(duration, cb)` | run `cb` once, on the loop thread, after the delay; return a cancellable token. Drives both the adaptive batch flush **and** the per-I/O-wait `query_timeout` — a timer that never fires means no liveness protection |
-| `void cancelTimer(TimerToken)` | cancel a pending `postDelayed`; no-op if already fired or unknown |
-
-> The exact concept signatures and member types, plus the
-> `IoContextConformance::runAll` and `spawnOn` signatures, are in
-> [api-reference.md › Runtime and I/O](api-reference.md#runtime-and-io).
-
-## Sketch: trantor (Drogon)
+## Drogon
 
 ```cpp
-#include <jcailloux/relais/io/IoContext.h>
-#include <trantor/net/EventLoop.h>
-#include <trantor/net/Channel.h>
-#include <sys/epoll.h>
-#include <sys/timerfd.h>
-#include <unistd.h>
-#include <chrono>
-#include <cstdint>
-#include <functional>
-#include <map>
-#include <memory>
-#include <memory_resource>
-#include <mutex>
-#include <unordered_map>
+#include <jcailloux/relais/integration/drogon.h>
 
-namespace relais = jcailloux::relais;
-
-class TrantorIoContext {
-public:
-    using IoEvent     = relais::io::IoEvent;
-    using WatchHandle = int;             // the fd doubles as the handle
-    using TimerToken  = std::uint64_t;
-
-    explicit TrantorIoContext(trantor::EventLoop* loop)
-        : loop_(loop),
-          timer_fd_(::timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC)) {
-        // A Channel registers on the loop thread; the adapter may be built on another.
-        loop_->runInLoop([this] {
-            addWatch(timer_fd_, IoEvent::Read, [this](IoEvent) { fireTimers(); });
-        });
-    }
-
-    WatchHandle addWatch(int fd, IoEvent ev, std::function<void(IoEvent)> cb) {
-        removeWatch(fd);  // a Channel already on fd goes through the deferred free
-        auto ch = std::make_unique<trantor::Channel>(loop_, fd);
-        // One callback per epoll event, with the combined mask.
-        ch->setEventCallback([raw = ch.get(), cb = std::move(cb)] {
-            cb(fromEpoll(raw->revents()));
-        });
-        applyMask(*ch, ev);
-        channels_[fd] = std::move(ch);
-        return fd;
-    }
-
-    void updateWatch(WatchHandle fd, IoEvent ev) {
-        if (auto it = channels_.find(fd); it != channels_.end())
-            applyMask(*it->second, ev);
-    }
-
-    void removeWatch(WatchHandle fd) {
-        if (auto it = channels_.find(fd); it != channels_.end()) {
-            it->second->disableAll();
-            it->second->remove();   // detached now: no further callback
-            // Freed after this turn's events: trantor still touches the Channel
-            // when the callback that called removeWatch returns.
-            trantor::Channel* dying = it->second.release();
-            channels_.erase(it);
-            loop_->queueInLoop([dying] { delete dying; });
-        }
-    }
-
-    // queueInLoop is thread-safe and wakes the loop via its own eventfd.
-    void post(std::function<void()> cb) { loop_->queueInLoop(std::move(cb)); }
-
-    // Thread-safe. The timers live here, not in trantor's timer queue.
-    TimerToken postDelayed(std::chrono::nanoseconds delay, std::function<void()> cb) {
-        const auto due = Clock::now() + delay;
-        std::lock_guard lock(timer_mutex_);
-        const TimerToken token = next_token_++;
-        by_token_.emplace(token, timers_.emplace(due, Timer{token, std::move(cb)}));
-        if (due < armed_) arm(due);  // a syscall only for a new earliest deadline
-        return token;
-    }
-
-    void cancelTimer(TimerToken token) {
-        std::lock_guard lock(timer_mutex_);
-        if (auto it = by_token_.find(token); it != by_token_.end()) {
-            timers_.erase(it->second);
-            by_token_.erase(it);
-        }  // the timerfd keeps its deadline: one empty wakeup, then fireTimers re-arms
-    }
-
-private:
-    using Clock = std::chrono::steady_clock;  // CLOCK_MONOTONIC on Linux
-    struct Timer { TimerToken token; std::function<void()> cb; };
-
-    // The mapping EpollIoContext uses.
-    static IoEvent fromEpoll(int revents) {
-        IoEvent e = IoEvent::None;
-        if (revents & (EPOLLIN | EPOLLPRI))  e |= IoEvent::Read;
-        if (revents & EPOLLOUT)              e |= IoEvent::Write;
-        if (revents & (EPOLLERR | EPOLLHUP)) e |= IoEvent::Error;
-        return e;
-    }
-
-    static void applyMask(trantor::Channel& ch, IoEvent ev) {
-        using relais::io::hasEvent;
-        hasEvent(ev, IoEvent::Read)  ? ch.enableReading() : ch.disableReading();
-        hasEvent(ev, IoEvent::Write) ? ch.enableWriting() : ch.disableWriting();
-    }
-
-    void fireTimers() {
-        std::uint64_t expirations;
-        [[maybe_unused]] auto r = ::read(timer_fd_, &expirations, sizeof expirations);
-        const auto now = Clock::now();
-        for (;;) {
-            std::function<void()> cb;
-            {
-                std::lock_guard lock(timer_mutex_);
-                auto head = timers_.begin();
-                if (head == timers_.end() || head->first > now) {
-                    armed_ = Clock::time_point::max();
-                    if (head != timers_.end()) arm(head->first);
-                    return;
-                }
-                cb = std::move(head->second.cb);
-                by_token_.erase(head->second.token);
-                timers_.erase(head);  // under the lock: the pool is not thread-safe
-            }
-            cb();  // unlocked: it may arm or cancel timers
-        }
-    }
-
-    void arm(Clock::time_point due) {  // timer_mutex_ held
-        armed_ = due;
-        const auto ns = std::chrono::nanoseconds(due.time_since_epoch()).count();
-        const itimerspec its{{0, 0}, {ns / 1'000'000'000, ns % 1'000'000'000}};
-        ::timerfd_settime(timer_fd_, TFD_TIMER_ABSTIME, &its, nullptr);
-    }
-
-    trantor::EventLoop* loop_;
-    std::unordered_map<int, std::unique_ptr<trantor::Channel>> channels_;
-
-    int timer_fd_;
-    std::mutex timer_mutex_;
-    std::pmr::unsynchronized_pool_resource pool_;  // recycles nodes: no allocation per arm
-    std::pmr::multimap<Clock::time_point, Timer> timers_{&pool_};
-    std::pmr::unordered_map<TimerToken, decltype(timers_)::iterator> by_token_{&pool_};
-    Clock::time_point armed_ = Clock::time_point::max();  // the timerfd's deadline
-    TimerToken next_token_ = 1;
-};
-
-static_assert(relais::io::IoContext<TrantorIoContext>);
+int main() {
+    jcailloux::relais::attachDrogon("host=localhost dbname=app user=app",
+                                    {.pool = {.max_connections = 8}});
+    drogon::app().addListener("0.0.0.0", 8080).setThreadNum(4).run();
+}
 ```
 
-> Checked with `runAll`, under ASan, against trantor 1.5.28 (Drogon 1.9.13).
-> trantor's API changes across versions: run the harness again when you upgrade.
+relais binds each of Drogon's IO loops, where handlers run, once Drogon has
+started them and before it serves a request. A coroutine handler awaits relais
+directly:
 
-Three rules of the contract shape this sketch. Each is easy to break on
-trantor, and the harness checks each one.
+```cpp
+drogon::app().registerHandler("/users/{1}",
+    [](drogon::HttpRequestPtr, int64_t id) -> drogon::Task<drogon::HttpResponsePtr> {
+        auto user = co_await UserRepo::find(id);
+        auto resp = drogon::HttpResponse::newHttpResponse();
+        if (!user) resp->setStatusCode(drogon::k404NotFound);
+        else resp->setBody(user->username);
+        co_return resp;
+    });
+```
 
-- **Self-removal.** relais calls `removeWatch(h)` from inside watch `h`'s own
-  callback (a connection drops its watch on EOF or error). The loop resumes
-  after that callback returns, so freeing the watch's loop-owned state — the
-  `trantor::Channel`, or the `std::function` being invoked — inside
-  `removeWatch` is a use-after-free. Defer the free past the current event:
-  `queueInLoop(delete)` here; on a raw epoll loop, copy the callback onto the
-  stack before invoking it (see `EpollIoContext::runOnce`). Defer only the free,
-  not the removal: from that same callback, relais may watch a new socket that
-  reuses the fd number (libpq replaces its socket while connecting), and a
-  pending removal would tear the new watch down. C10 catches a synchronous
-  free under ASan; C12 catches a deferred removal.
-- **One event, one callback.** With separate read, write, error and close
-  callbacks, trantor calls them back to back for one epoll event without
-  re-checking the watch, and one event often carries several bits (readable and
-  writable; error and readable when the server drops the connection). If the
-  first callback removes the watch and resumes a coroutine that frees its
-  awaiter, the next one runs on freed memory. Hence a single `setEventCallback`
-  with the combined mask. C13 checks that nothing follows a `removeWatch`.
-- **Cancel removes the timer.** relais arms a timer per I/O wait and cancels it
-  when the wait completes. trantor's `invalidateTimer` leaves the cancelled
-  timer queued until its deadline — about 200 bytes held for `query_timeout`
-  (30 s by default), so 6 MB per 1 000 waits/s — and does nothing while the
-  loop is stopped. Hence the adapter's own queue behind one timerfd. C9 and C11
-  check that a cancelled timer never fires; no check sees what it retains.
+- Call `attachDrogon` once, before `run()`: it throws `AttachError` otherwise.
+- If a loop cannot be bound (it fails relais's check, or PostgreSQL does not
+  answer within `acquire_timeout`), Drogon quits without serving, and `run()`
+  throws that error.
+- When Drogon quits, relais leaves each loop before it stops, once the requests
+  in flight on it have ended.
+- Drogon's main loop, where beginning advices and `app().getLoop()` timers run,
+  is not bound: a relais call there throws `std::logic_error`.
 
-## Verify it
+Tested with Drogon 1.9.13.
 
-The harness needs one author-supplied primitive: `drive(io, pred)`, which pumps
-the loop **on the calling thread** until `pred()` is true, re-checking `pred`
-between iterations. trantor has no native "run once", so you synthesize it:
+## Attaching to a loop: `attach` and `attachHere`
+
+On trantor, asio, libuv and an adapter of your own, two calls bind relais to one
+loop:
+
+```cpp
+// From another thread, while the loop runs: returns once relais is ready.
+auto relais = jcailloux::relais::attach(io, conninfo, cfg);
+
+// On the loop's own thread, from one of its callbacks or before it starts there:
+// returns at once.
+auto relais = jcailloux::relais::attachHere(io, conninfo, cfg, on_ready);
+```
+
+**`attach`** checks the loop in a few milliseconds (posts from another thread, a
+watch, a timer, used as relais uses them), creates the pool on it, opens
+`min_connections`, and binds the loop's thread. It waits for the loop throughout,
+so the loop must be running, on another thread. It throws `AttachError` if the
+loop fails the check (the message says what the loop did not do), if it is called
+on the loop's own thread, or if relais is attached to that loop already. If the
+pool cannot connect, it throws the connection's error: `io::PgConnectionError`,
+or `io::PgPoolTimeout` after `acquire_timeout`.
+
+**`attachHere`** binds the calling thread at once and returns: a repository call
+made from then on waits for the pool's first connection. On the loop's first
+turn, relais checks that the loop runs on this thread (another thread ends the
+process: relais's state belongs to the thread that attached it), checks the loop
+as `attach` does, within `acquire_timeout` (1 s at least), then connects the
+pool. `on_ready(std::exception_ptr)` then runs once, on the loop's thread: with
+a null pointer once the pool has `min_connections`, or with what failed. A
+failure is also logged, and every PostgreSQL call on that thread fails with it,
+the calls waiting and the later ones, until `detach()`. `on_ready` must not
+throw, and never runs once `detach()` has begun. `attachHere` throws
+`AttachError` if relais is attached to this thread already.
+
+`attach` suits startup code that can wait for relais, before the server accepts
+requests; `attachHere` suits code that runs on the loop's thread, or must not
+block.
+
+Both return an `Attachment`:
+
+- `ready()` tells whether the pool has its first connections (always, once
+  `attach` has returned); `error()` gives what `attachHere` could not start
+  with.
+- `detach()`, or the destructor, takes relais off the loop, which must still be
+  running: relais waits there for the requests in flight (each bounded by its
+  timeouts), unbinds the thread and closes the pool. From another thread,
+  `detach()` returns once done, and the loop may then stop at once. On the
+  loop's thread, it starts the teardown and returns at once: the loop must go on
+  running until the teardown ends. On asio and libuv, `run()` returns once it
+  has, if nothing else is pending.
+- `io` must outlive the `Attachment`.
+
+## trantor
+
+```cpp
+#include <trantor/net/EventLoopThread.h>
+#include <jcailloux/relais/integration/trantor.h>
+
+trantor::EventLoopThread thread;
+thread.run();
+jcailloux::relais::io::TrantorIoContext io(thread.getLoop());
+auto relais = jcailloux::relais::attach(io, conninfo);
+```
+
+`io::TrantorIoContext` adapts a `trantor::EventLoop`, which must outlive it. On
+the loop's thread, call `attachHere(io, conninfo)` instead. trantor has no
+coroutine type of its own: a callback of the loop starts relais's work as a
+coroutine, an [`io::DetachedTask`](api-reference.md#task--immediate--detachedtask)
+for one whose result nobody awaits.
+
+Tested with trantor 1.5.28.
+
+## asio and Boost.Asio
+
+```cpp
+#include <asio.hpp>
+#include <jcailloux/relais/integration/asio.h>   // boost_asio.h for Boost.Asio
+
+asio::io_context ctx;
+auto work = asio::make_work_guard(ctx);           // keeps run() from returning first
+std::thread runner([&] { ctx.run(); });
+auto relais = jcailloux::relais::attach(ctx, conninfo);
+```
+
+On the thread that runs the `io_context`, before `run()` or from a handler, call
+`attachHere(ctx, conninfo)` instead. There is no adapter to build: relais keeps
+one in the `io_context`, which must outlive the `Attachment`.
+
+- **One thread per `io_context`.** `attach` refuses an `io_context` that several
+  threads run (`AttachError`, before connecting). A thread that starts running
+  it later, and runs one of relais's callbacks, ends the process. With several
+  threads, run one `io_context` per thread and attach relais to each.
+- After `detach()`, `run()` returns once nothing else is pending.
+- asio re-arms a descriptor after each wake-up (one `epoll_ctl`): a request
+  costs 5 system calls here, against 4 on the other loops.
+
+### Awaiting relais from an asio coroutine: `relais::async`
+
+An asio coroutine awaits asio operations only. `relais::async` runs a relais
+call as one, completing with `(std::exception_ptr, T)` as `co_spawn` does,
+through any completion token:
+
+```cpp
+asio::awaitable<void> show(int64_t id) {
+    auto user = co_await jcailloux::relais::async(UserRepo::find(id), asio::use_awaitable);
+    if (user) std::cout << user->username << '\n';
+}
+```
+
+- Call it on the thread of an `io_context` relais is attached to:
+  `std::logic_error` otherwise. The call starts at once.
+- Any token works: `use_awaitable` (an exception is rethrown), `deferred` (the
+  default from asio 1.29), `as_tuple`, a callback taking
+  `(std::exception_ptr, T)`, `use_future`. The handler runs on its associated
+  executor, by default the `io_context`.
+- What the call refers to must outlive the operation, as an asio buffer does:
+  the key passed to `find`, the SQL text and parameters of a `PgProvider` query.
+  Awaited at once, as above, it does.
+- A cancelled operation (`terminal` or `partial`, e.g. `||` against a timer)
+  completes at once with `operation_aborted`. The request runs on, and its
+  result is dropped; relais's cache stays valid.
+- Each `relais::async` costs what an asio operation does: about 240 ns for a
+  cache hit, which completes through a post to the `io_context`. A handler that
+  makes several calls does better to group them in one relais `io::Task`, passed
+  once to `relais::async`: each hit inside it costs about 2 ns.
+
+```cpp
+jcailloux::relais::io::Task<std::pair<std::string, std::string>> names(int64_t a, int64_t b) {
+    auto first = co_await UserRepo::find(a);
+    auto second = co_await UserRepo::find(b);
+    co_return std::pair{first ? first->username : "", second ? second->username : ""};
+}
+
+auto [first, second] = co_await jcailloux::relais::async(names(a, b), asio::use_awaitable);
+```
+
+`relais::async` needs asio 1.27 or later (Boost 1.82 or later). With both
+`asio.h` and `boost_asio.h` in one translation unit, every call to it is
+ambiguous: call it from translation units that include only one.
+
+Tested with asio 1.38.2 and Boost 1.83.
+
+## libuv
+
+```cpp
+#include <jcailloux/relais/integration/libuv.h>
+
+// On the loop's thread, before uv_run or from one of its callbacks:
+jcailloux::relais::io::LibuvIoContext io(loop);
+auto relais = jcailloux::relais::attachHere(io, conninfo);
+```
+
+From another thread, while the loop runs, call `attach(io, conninfo)` instead.
+libuv lets only the loop's thread touch the loop, which sets the adapter's
+lifecycle:
+
+- Build and destroy the adapter on the loop's thread, or while no thread runs
+  the loop.
+- Destroy it after `detach()`, and before closing the loop's handles
+  (`uv_walk`). It closes its own handles then, which libuv frees on its next
+  turn: run the loop once more before `uv_loop_close`.
+- relais's handles keep the loop running while relais has connections, as any
+  handle does. Before that, and for `attach` to find the loop running, something
+  of the application's must keep it running: a listening socket, a timer.
+
+Tested with libuv 1.53.0.
+
+## Any other loop: one descriptor
+
+Any loop that can watch a file descriptor can host relais (Linux):
+
+```cpp
+#include <jcailloux/relais/integration/fd.h>
+
+auto relais = jcailloux::relais::attachHere(conninfo);   // on the loop's thread
+// watch relais.fd() for reading, and call relais.poll() whenever it is readable
+```
+
+relais then runs a loop of its own (an `io::EpollIoContext`), which yours drives
+through `fd()`: the descriptor is readable while relais has work, and `poll()`
+does what is ready, without waiting, and returns. Watch it level-triggered:
+`poll()` leaves `fd()` readable while work remains, and your loop calls it
+again. With GLib:
+
+```cpp
+auto relais = jcailloux::relais::attachHere(conninfo);
+const guint watch = g_unix_fd_add(relais.fd(), G_IO_IN, [](int, GIOCondition, gpointer r) -> gboolean {
+    static_cast<jcailloux::relais::FdAttachment*>(r)->poll();
+    return G_SOURCE_CONTINUE;
+}, &relais);
+
+g_main_loop_run(loop);
+
+g_source_remove(watch);  // stop watching fd() before detach() closes it
+relais.detach();
+```
+
+On other loops, the watch is:
+
+| Loop | Watch `relais.fd()` with |
+|---|---|
+| Qt | `QSocketNotifier` of type `Read`, its `activated` signal connected to `poll()` |
+| libevent | an event of `EV_READ \| EV_PERSIST` whose callback calls `poll()` |
+| epoll | `EPOLLIN`, without `EPOLLET` |
+| `poll(2)` | `POLLIN` |
+
+`attachHere(conninfo, cfg, on_ready)` binds the calling thread as
+[`attachHere(io, …)`](#attaching-to-a-loop-attach-and-attachhere) does, and
+returns an `FdAttachment`. relais checks nothing of your loop: it runs its own.
+
+- Everything but `ready()` and `error()` runs on the thread that called
+  `attachHere`: `poll()` and `detach()` throw `std::logic_error` elsewhere, and
+  the destructor ends the process. Repository calls run on that thread too, and
+  `on_ready` runs from `poll()`.
+- `detach()` runs relais's loop until the requests in flight end, then closes
+  the pool and `fd()`: stop watching `fd()` before it, and before destruction.
+  It throws `std::logic_error` when called from inside `poll()`.
+- A request costs what it costs on relais's own loop, plus your loop's wait on
+  `fd()`: one system call more. A `poll()` with nothing to do costs about
+  140 ns, and a cache hit needs none.
+
+The GLib example runs in relais's CI (`tests/integration/test_glib.cpp`).
+
+## Writing an adapter
+
+An adapter makes a loop satisfy the `io::IoContext` concept
+(`io/IoContext.h`): watches on file descriptors, callbacks posted to the loop,
+one-shot timers. The integrations above are adapters, a hundred to three hundred
+lines each (`integration/trantor.h`, `integration/libuv.h`): models for one of
+your own. Compared with the descriptor, an adapter saves a system call per
+request.
+
+```cpp
+struct MyIoContext {
+    using WatchHandle = /* a copyable handle */;
+
+    WatchHandle addWatch(int fd, jcailloux::relais::io::IoEvent mask,
+                         std::function<void(jcailloux::relais::io::IoEvent)> cb);
+    void updateWatch(WatchHandle watch, jcailloux::relais::io::IoEvent mask);
+    void removeWatch(WatchHandle watch);
+    void post(std::function<void()> cb);
+    void postDelayed(std::chrono::nanoseconds delay, std::function<void()> cb);
+};
+static_assert(jcailloux::relais::io::IoContext<MyIoContext>);
+```
+
+The contract of each method, what relais guarantees the adapter in return, and
+three optional members are in
+[api-reference.md › The `IoContext` concept](api-reference.md#the-iocontext-concept).
+What an adapter most often gets wrong:
+
+- `post()` queues the callback, and never runs it in place, even on the loop's
+  thread: trantor's `runInLoop` runs it in place, its `queueInLoop` queues it.
+- A watch lasts until its `removeWatch`: over one-shot waits, as asio's
+  `async_wait`, wait again after each callback.
+- `removeWatch` takes effect when it returns: a later watch on the same
+  descriptor number receives that file's events, and nothing of the old watch.
+
+The conformance harness checks the contract. `drive(io, pred)` runs the loop on
+the calling thread until `pred()` holds, one bounded turn at a time; each check
+runs it from the thread that calls `runAll`, and `runAll` throws
+`testing::ConformanceError` naming the rule an adapter breaks:
 
 ```cpp
 #include <jcailloux/relais/testing/IoContextConformance.h>
 
-trantor::EventLoop loop;            // binds to the constructing thread
-TrantorIoContext io(&loop);
-
-auto drive = [&loop](TrantorIoContext&, auto pred) {
-    // C7 (cross-thread post) calls drive() from ANOTHER thread; a trantor loop
-    // is pinned to its constructing thread, so re-bind it or assertInLoopThread
-    // (compiled out in Release → segfault) fires.
-    if (!loop.isInLoopThread()) loop.moveToCurrentThread();
-    while (!pred()) {
-        loop.queueInLoop([&loop] { loop.quit(); });
-        loop.loop();  // process ~one iteration, then quit
-    }
-};
-
-jcailloux::relais::testing::IoContextConformance::runAll(io, drive);
+jcailloux::relais::testing::IoContextConformance::runAll(io, [](MyIoContext& ctx, auto pred) {
+    while (!pred()) ctx.runOneTurn(std::chrono::milliseconds(10));  // your loop's bounded turn
+});
 ```
 
-Two non-obvious pitfalls the harness will catch if you get them wrong:
-
-- **EventLoop is thread-bound.** It belongs to the thread that constructed it.
-  The cross-thread check (C7) drives from a different thread, so `drive` must
-  re-bind with `moveToCurrentThread()`. In Release the assert is compiled out and
-  you get a silent segfault instead of a clear failure.
-- **One iteration per `pred` check, not episodic polling.** A level-triggered
-  watch on an un-drained eventfd refires every loop turn. If `drive` runs many
-  turns between `pred` checks, the watch fires hundreds of times and the
-  `fired == 1` checks (C1, C6) fail. The `queueInLoop(quit)` trick caps it to one
-  turn per check.
-
-Once `runAll` passes, construct `PgPool<TrantorIoContext>` on each loop and
-`co_await` relais `Task`s directly inside your coroutine handlers — no thread hop.
-
-## Bootstrapping the pools (and scaling to N loops)
-
-`PgProvider`'s providers are **`thread_local`**: each loop thread binds its OWN
-pool/batcher by calling `PgProvider::init(io, pool)` **on that loop thread**. A
-Task co_awaited on loop K then routes to loop K's pool — shared-nothing, no
-cross-thread hop. Mono-loop is N=1; for N loops you run this once per loop and
-throughput scales ~linearly.
-
-There is one unavoidable cross-thread moment per loop: `PgPool::create()` is a
-*lazy* coroutine that does its connection I/O **on the loop thread**, but you
-kick it off at startup from another thread (the loop is already running and you
-must not block it). [`spawnOn`](../include/jcailloux/relais/runtime/Spawn.h)
-drives it on the loop, and its completion callback — which runs **on the loop
-thread** — is exactly where `init()` must bind the thread_local providers:
-
-```cpp
-#include <jcailloux/relais/runtime/Spawn.h>
-
-// Run this once per loop, each from a thread OTHER than that loop's (else you'd
-// block the loop on work posted to itself — deadlock). e.g. from Drogon's
-// registerBeginningAdvice over getIOLoop(0..N-1).
-void initRelaisOnLoop(trantor::EventLoop* loop, const char* conninfo,
-                      size_t min, size_t max) {
-    auto io = std::make_unique<TrantorIoContext>(loop);  // kept alive program-long
-    auto* io_ptr = io.get();
-    std::promise<std::shared_ptr<PgPool<TrantorIoContext>>> ready;
-    auto fut = ready.get_future();
-
-    relais::spawnOn(*io_ptr,
-        PgPool<TrantorIoContext>::create(*io_ptr, conninfo,
-            PgPoolConfig{.min_connections = min, .max_connections = max}),
-        [&ready, io_ptr](relais::Outcome<std::shared_ptr<PgPool<TrantorIoContext>>> r) {
-            // ON the loop thread: bind THIS loop's thread_local providers.
-            if (r) { relais::PgProvider::init(*io_ptr, *r); ready.set_value(*r); }
-            else   { ready.set_exception(r.error()); }
-        });
-
-    auto pool = fut.get();  // blocks until connected + bound (or throws)
-    // illustrative: you must keep io + pool alive program-long — store them
-    // somewhere (keepAlive is not a relais API).
-    keepAlive(std::move(io), pool);
-}
-```
-
-`spawnOn` is the *only* place it's needed in the co-located model: a one-time
-startup kick per loop. Per-request reads stay inline — no spawnOn, no hop. When
-sizing pools, remember total connections = N × per-loop max; keep it under the
-database's `max_connections`. (relais ships `io::IoPool` as a reference N-loop
-runtime for its own `EpollIoContext`; external routers follow the same
-init-per-loop-thread contract shown above.)
-
-> **Wire your timeouts here.** `PgPoolConfig` also carries `acquire_timeout`
-> (default 5 s) and `query_timeout` (default 30 s), the liveness backstop of
-> every wait. They are armed via your `postDelayed`/`cancelTimer`, so a correct
-> timer subsystem (conformance C8/C9/C11) is the prerequisite. On trantor they
-> also end a wait on a lost watch: `EpollPoller::update` ignores every
-> `epoll_ctl` failure, so a watch it could not register never fires and reports
-> nothing. `uncertain_settle`, `settle_delay` and `client_check_interval`
-> default to a direct connection; behind a transaction pooler, set them as
-> [runtime.md › Settling an uncertain write](runtime.md#settling-an-uncertain-write)
-> says. See
-> [runtime.md › Liveness & failure semantics](runtime.md#liveness--failure-semantics).
-
-Expose `isInLoopThread()` on your adapter and `PgProvider::init` will assert it
-runs on the loop thread — the same safety net `EpollIoContext` gets. The sketch
-above omits it, silently opting out of that check.
-
-## The background runtime thread (you don't wire it)
-
-When your framework drives the event loops, relais's cached clock and L1 memory
-budget are still ticked — by relais itself, not by anything you write.
-
-relais owns a single `RuntimeThread` — one `jthread`, a 100 ms tick that
-refreshes `CachedClock` and `CachedMemory`, and — only when GDSF eviction is
-compiled in — resets its admitted-bytes counter (`on_heap_refresh`). The first
-L1-caching `CacheTier` to come alive calls `RuntimeThread::ensureStarted()` in
-its constructor; it's idempotent (`std::call_once`), so it spins up exactly once
-per process regardless of how many loops or repos you have. It is **independent
-of your event loops** — co-located or not, single-loop or N-loop, the clocks and
-budget keep ticking. You don't start it, bind it, or tick it from your loop.
+On asio, for one, a turn is `ctx.run_one_for(10ms)`. Run the harness again when
+you upgrade relais or the loop's library. Once it passes, `attach(io, …)` and
+`attachHere(io, …)` bind relais to the loop as on the integrations above;
+`attach` also checks the loop at startup, and names what it did not do.

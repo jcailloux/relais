@@ -2,18 +2,15 @@
 
 Repository calls like `co_await UserRepo::find(123)` don't talk to PostgreSQL
 directly — they route through `PgProvider`, which dispatches to a per-loop
-`BatchScheduler` + connection pools running on an **event loop**. Before any repo
-call works you must stand up that runtime and bind it. This page covers how.
+`BatchScheduler` and connection pool running on an **event loop**. Before a repo
+call can reach PostgreSQL, relais must be attached to the loop it runs on. This
+page covers where relais runs, the threading rule, and how relais orders writes
+and handles failures.
 
 > **Prerequisite:** [concepts.md](concepts.md) for the mental model. Exact
-> signatures (`IoPool`/`IoPoolConfig`, `IoPool::create`, `PgProvider::init`,
-> the `Task`/`spawnOn`/`Outcome` family) live in
+> signatures (`attach`, `IoPool`/`IoPoolConfig`, `PgPoolConfig`, the
+> `Task`/`spawnOn`/`Outcome` family) live in
 > [api-reference.md › Runtime and I/O](api-reference.md#runtime-and-io).
-
-> This page covers the **I/O runtime** (loops, pools, binding). The separate
-> always-on background `RuntimeThread` (cached clock + L1 memory tick) starts
-> itself — you never wire it; see
-> [foreign-event-loops.md › The background runtime thread](foreign-event-loops.md#the-background-runtime-thread-you-dont-wire-it).
 
 ## The model in one picture
 
@@ -22,7 +19,7 @@ UserRepo::find(id)                     ← your code, on an event-loop thread
    └─ PgProvider::query/...            ← thread_local service locator
         └─ BatchScheduler              ← adaptive PG batching, per loop
              └─ PgPool                 ← connections owned by THIS loop
-                  └─ EpollIoContext / your adapter  ← the event loop
+                  └─ the event loop    ← your application's, or IoPool's
 ```
 
 `PgProvider`'s providers are **`thread_local`**: each event-loop thread binds its
@@ -32,23 +29,27 @@ throughput ~linearly with cores at unchanged per-request latency.
 
 ## The one rule
 
-> **Call `PgProvider::init(io, pool)` ON the event-loop thread it serves, once
-> per loop.** Repo calls must then run on that same loop thread.
+> **A repository call runs on a loop thread relais is attached to.**
 
-Providers are `thread_local`, so `init()` on thread A binds nothing for thread B.
-In debug builds a repo call on a thread that never ran `init()` trips an `assert`
-— `PgProvider::query() called before init() on this thread (providers are
-thread_local — init() must run on each loop thread)`. `init()` itself also asserts
-`isInLoopThread()` on adapters that expose it (relais's `EpollIoContext` does),
-catching an `init()` on the wrong thread.
+relais binds each loop's thread itself, when it attaches to the loop. On any other
+thread, a call that needs PostgreSQL throws `std::logic_error`, whose message says
+so.
 
-## Built-in standalone runtime: `IoPool`
+## Where relais runs
 
-`io::IoPool` is the reference shared-nothing runtime — N epoll loops, each pinned
-to a core with its own pools/batcher, each binding its own providers
-automatically, so you never call `init()` yourself. Reach for it when relais drives
-the process: a standalone service, a batch job, or background workers with no other
-framework owning your loops.
+- **Your application runs an event loop** (Drogon, trantor, asio, libuv, GLib,
+  Qt, …): attach relais to it, so that handlers call relais on their own thread.
+  Bridging each call to separate relais loops would instead cost a thread hop
+  (~3 µs) on every call, even an L1 hit. Drogon, trantor, asio and libuv have an
+  integration; any other loop drives relais through one descriptor. See
+  **[foreign-event-loops.md](foreign-event-loops.md)**.
+- **It runs none** (a standalone service, a batch job, background workers):
+  `io::IoPool` runs loops of its own, below.
+
+## No event loop: `IoPool`
+
+`io::IoPool` runs N epoll loops, each on its own thread pinned to a core, and
+attaches relais to each: every worker has its own pool and batcher.
 
 ```cpp
 #include <jcailloux/relais/io/IoPool.h>
@@ -70,44 +71,30 @@ pool->workerIo(0).post([] {
 });
 ```
 
-`create()` returns once every worker has connected and bound its providers. Repo
-calls only work **inside a coroutine running on a worker loop** (here, posted to
-`workerIo(0)`); calling them from an un-bound thread asserts/throws.
-`io::DetachedTask` is a fire-and-forget coroutine — you wrap the body in one
-because `post()` takes a plain callable, not an awaitable (see
-[api-reference.md › Runtime and I/O](api-reference.md#runtime-and-io)).
+`create()` returns once every worker has connected and bound its providers, and
+throws if one cannot (an unreachable database fails it within
+`acquire_timeout`). Repo calls then run **inside a coroutine on a worker loop**
+(here, posted to `workerIo(0)`). `io::DetachedTask` is a fire-and-forget
+coroutine: `post()` takes a plain callable, not an awaitable. `stop()`, or
+destroying the pool, takes relais off every worker, each once its requests in
+flight have ended.
 
 > The snippet sets the fields that matter most; the full `IoPoolConfig` field
 > list with defaults is in
-> [api-reference.md › Runtime and I/O](api-reference.md#runtime-and-io).
-
-## Co-locate on your framework's loops (Drogon, asio, libuv, …)
-
-When a web framework already owns the event loops your requests run on, that is
-where relais should run too — **inline on those loops**, not bridged to a separate
-`IoPool`. This is the path for a service built on an existing framework. Bridging
-each call to an `IoPool` thread would instead cost a hop (~3 µs, two syscalls) on
-every call, even an L1 hit; co-located, that same hit stays a pure in-process
-lookup (~50 ns, zero hops).
-
-If your framework runs one epoll loop per core, write a small `IoContext` adapter
-for its loop, verify it with the conformance harness, then `init()` per loop
-thread.
-
-See **[foreign-event-loops.md](foreign-event-loops.md)** for the full recipe
-(adapter sketch, the conformance harness, the per-loop bootstrap with `spawnOn`).
+> [api-reference.md › IoPool & IoPoolConfig](api-reference.md#iopool--iopoolconfig).
 
 ## Threading contract, summarized
 
-- One `IoContext` event loop per thread; build `PgPool` **on** that loop (its
-  connection I/O is async on the loop).
-- `PgProvider::init(io, pgPool)` **on each loop thread** — binds that thread's
-  `thread_local` providers. Mono-loop: once. N-loop: once per loop.
-- Repo calls (`find`/`insert`/`patch`/`erase`/…) run **on a bound loop thread**.
-- No state is shared between loops — a request stays on its loop end to end.
-- Bootstrapping from another thread (the loop is busy): drive the lazy
-  `PgPool::create()` onto the loop with `spawnOn` and block on a `std::promise`;
-  do the `init()` in its completion callback (which runs on the loop thread).
+- One event loop per thread, and relais attached to each loop it serves: by an
+  integration, `attach`/`attachHere`, or `IoPool`.
+- Repo calls (`find`/`insert`/`patch`/`erase`/…) run **on an attached loop
+  thread**.
+- No state is shared between loops — a request stays on its loop end to end. Each
+  loop opens its own connections: total = loops × per-loop maximum, to keep under
+  the database's `max_connections`.
+- The L1 cache, its clock and its memory budget are process-wide: a background
+  thread of relais's refreshes the clock and the budget every 100 ms. It starts
+  with the first repository that caches; nothing to start or wire.
 
 ## Write ordering
 
@@ -142,8 +129,9 @@ cache holding a value the database no longer agrees with. Two mechanisms cover t
 Every wait a repo call can block on is bounded by a client-side timer:
 
 - **`acquire_timeout`** (default 5 s) — acquiring a pooled connection, including the
-  warm-up connect at startup, so an unreachable database fails `create()` instead of
-  hanging forever.
+  connects at startup, so an unreachable database fails `attach` or
+  `IoPool::create()` (or reaches `attachHere`'s `on_ready`) instead of hanging
+  forever.
 - **`query_timeout`** (default 30 s) — each per-connection I/O wait.
 
 These are a **liveness backstop, not an SLA**: they bound a silently blackholed

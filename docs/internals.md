@@ -1093,9 +1093,12 @@ Each namespace keeps its implementation in a nested `detail` namespace, and a ne
 jcailloux::relais::                       # Repo, Entity<Struct, Mapping>, entity concepts,
                                           # Invalidate, InvalidateList, InvalidateVia,
                                           # InvalidateListVia, InvalidateOn, ListInvalidationTarget,
-                                          # Outcome, spawnOn, PgProvider
+                                          # Outcome, spawnOn, PgProvider, attach, attachHere,
+                                          # AttachConfig, AttachError, Attachment, attachDrogon,
+                                          # FdAttachment, async
 jcailloux::relais::detail::               # PgRepo, LocalRepo, ListMixin, InvalidationMixin,
-                                          # RecheckGuard, propagateCreate/Update/Delete, type traits
+                                          # RecheckGuard, propagateCreate/Update/Delete, type traits,
+                                          # LoopBinding
 jcailloux::relais::config::               # CacheConfig, CacheLevel, UpdateStrategy,
                                           # Duration, FixedString, presets
 jcailloux::relais::entity::               # set/setNull/increment/decrement/nowPlus, guards, ordering
@@ -1110,8 +1113,11 @@ jcailloux::relais::list::spec::           # Filter, Sort, ListQueryParams, ListQ
 jcailloux::relais::list::spec::detail::   # canonical encoding, WHERE builder, list traits, parsing
 jcailloux::relais::runtime::detail::      # CachedClock, CachedMemory, RuntimeThread
 jcailloux::relais::io::                   # Task, Immediate, whenAll, IoContext, EpollIoContext,
-                                          # IoPool, PgPool, PgResult, PgParams, Pg* errors
-jcailloux::relais::io::detail::           # PgConnection, PgClient, PgParam, SettleQueue, SettleTicket
+                                          # IoPool, PgPool, PgResult, PgParams, Pg* errors,
+                                          # TrantorIoContext, AsioIoContext, BoostAsioIoContext,
+                                          # LibuvIoContext
+jcailloux::relais::io::detail::           # PgConnection, PgClient, PgParam, SettleQueue, SettleTicket,
+                                          # DeadlineQueue, LoopSelfCheck
 jcailloux::relais::io::batch::            # WriteMode, PgWriteResult
 jcailloux::relais::io::batch::detail::    # BatchScheduler, TimingEstimator, WriteAffinity
 jcailloux::relais::log::                  # Level, setCallback
