@@ -366,6 +366,19 @@ attachAsio(typename Net::io_context& ctx, std::string conninfo, AttachConfig cfg
     return relais::attach<Io>(io, std::move(conninfo), cfg);
 }
 
+// Pinned to the thread of relais's first callback, which attachHere checks
+// against its own.
+template<typename Net>
+[[nodiscard]] Attachment<io::BasicAsioIoContext<Net>>
+attachAsioHere(typename Net::io_context& ctx, std::string conninfo, AttachConfig cfg,
+               std::function<void(std::exception_ptr)> on_ready) {
+    using Io = io::BasicAsioIoContext<Net>;
+    Io& io = Net::template use_service<AsioRelaisService<Net>>(ctx).io();
+    auto attachment = relais::attachHere<Io>(io, std::move(conninfo), cfg, std::move(on_ready));
+    io.pinThread({});  // a former attach's thread: relais's first callback pins its own
+    return attachment;
+}
+
 // ---------------------------------------------------------------------------
 // relais::async — a relais Task or Immediate as an asio asynchronous
 // operation, which integration/asio.h and integration/boost_asio.h declare.
@@ -614,7 +627,7 @@ auto asyncOn(Pending pending, Token& token) {
     if (loop == nullptr) {
         throw std::logic_error(
             "relais::async() called on a thread relais is not attached to: call it on the "
-            "thread that runs an io_context relais::attach() bound");
+            "thread that runs an io_context relais::attach() or relais::attachHere() bound");
     }
     return Net::template async_initiate<AsyncSignature<T>, Token>(
         AsyncInitiation<Net>(loop->context().get_executor()), token, std::move(pending));

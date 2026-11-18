@@ -7,6 +7,10 @@
 //   asio::io_context ctx;                      // run by one thread, elsewhere
 //   auto relais = jcailloux::relais::attach(ctx, conninfo);
 //
+// or, on the thread that runs it (from a handler, or before run()):
+//
+//   auto relais = jcailloux::relais::attachHere(ctx, conninfo);
+//
 // relais binds to the thread that runs the io_context, where repository calls
 // then run: one thread per io_context. With several io_contexts, one per
 // thread, attach relais to each. A coroutine of asio, or any completion token,
@@ -15,6 +19,7 @@
 //   auto item = co_await jcailloux::relais::async(ItemRepo::find(id), asio::use_awaitable);
 
 #include <exception>
+#include <functional>
 #include <string>
 #include <utility>
 
@@ -121,6 +126,19 @@ namespace jcailloux::relais {
 [[nodiscard]] inline Attachment<io::AsioIoContext>
 attach(::asio::io_context& ctx, std::string conninfo, AttachConfig cfg = {}) {
     return detail::attachAsio<io::detail::StandaloneAsio>(ctx, std::move(conninfo), cfg);
+}
+
+/// Binds relais to `ctx` on the calling thread, which runs it, as
+/// attachHere(io, …) binds it to a loop: from one of its handlers, or before
+/// run() starts there. Returns at once; see attachHere(io, …) for on_ready and
+/// what follows. relais's callbacks then run on this thread only: another
+/// thread that runs one of them ends the process. `ctx` must outlive the
+/// returned Attachment.
+[[nodiscard]] inline Attachment<io::AsioIoContext>
+attachHere(::asio::io_context& ctx, std::string conninfo, AttachConfig cfg = {},
+           std::function<void(std::exception_ptr)> on_ready = {}) {
+    return detail::attachAsioHere<io::detail::StandaloneAsio>(ctx, std::move(conninfo), cfg,
+                                                       std::move(on_ready));
 }
 
 #if ASIO_VERSION >= 102700

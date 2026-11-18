@@ -6,6 +6,7 @@
 //
 //   jcailloux::relais::io::TrantorIoContext io(loop);
 //   auto relais = jcailloux::relais::attach(io, conninfo);  // from another thread
+//   auto relais = jcailloux::relais::attachHere(io, conninfo);  // or, on its thread
 //
 // On Drogon, integration/drogon.h does this for every IO loop.
 

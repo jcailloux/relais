@@ -2,7 +2,8 @@
 // contract and never lets a second thread run relais's callbacks, and
 // attach(ctx, …) binds relais to an io_context that one thread runs, refuses
 // one that several threads run, and leaves the io_context no work once
-// detached, so that its run() returns. Built with RELAIS_TEST_BOOST_ASIO,
+// detached, so that its run() returns. attachHere(ctx, …) binds the thread
+// that runs it, and pins relais's callbacks there. Built with RELAIS_TEST_BOOST_ASIO,
 // the same cases run on Boost.Asio (test_boost_asio). The PostgreSQL scenarios
 // of the adversarial loops run on asio in test_asio_loops.
 
@@ -145,6 +146,37 @@ Task<int32_t> doubled(int32_t n) {
 
 Task<void> together(std::vector<Task<void>> tasks) {
     co_await whenAll(std::move(tasks));
+}
+
+// The hidden test case `name` of this executable, run in a child process: how
+// it ended, and what it printed.
+struct ChildEnd {
+    int status = 0;
+    std::string output;
+};
+
+ChildEnd runChild(const char* name) {
+    int out[2];
+    REQUIRE(::pipe(out) == 0);
+    posix_spawn_file_actions_t actions;
+    ::posix_spawn_file_actions_init(&actions);
+    ::posix_spawn_file_actions_adddup2(&actions, out[1], STDOUT_FILENO);
+    ::posix_spawn_file_actions_adddup2(&actions, out[1], STDERR_FILENO);
+    ::posix_spawn_file_actions_addclose(&actions, out[0]);
+    std::string exe = "test_asio";
+    std::string test = name;
+    char* argv[] = {exe.data(), test.data(), nullptr};
+    pid_t child = -1;
+    const int spawned = ::posix_spawn(&child, "/proc/self/exe", &actions, nullptr, argv, environ);
+    ::posix_spawn_file_actions_destroy(&actions);
+    ::close(out[1]);
+    REQUIRE(spawned == 0);
+    ChildEnd end;
+    char buf[512];
+    for (ssize_t n; (n = ::read(out[0], buf, sizeof buf)) > 0;) end.output.append(buf, static_cast<size_t>(n));
+    ::close(out[0]);
+    REQUIRE(::waitpid(child, &end.status, 0) == child);
+    return end;
 }
 
 std::string attachError(net::io_context& ctx) {
@@ -293,33 +325,112 @@ TEST_CASE("asio: a thread joins the io_context after attach", "[.][asio]") {
 
 TEST_CASE("asio: a thread that joins the io_context after attach ends the process",
           "[asio][attach]") {
-    int out[2];
-    REQUIRE(::pipe(out) == 0);
-    posix_spawn_file_actions_t actions;
-    ::posix_spawn_file_actions_init(&actions);
-    ::posix_spawn_file_actions_adddup2(&actions, out[1], STDOUT_FILENO);
-    ::posix_spawn_file_actions_adddup2(&actions, out[1], STDERR_FILENO);
-    ::posix_spawn_file_actions_addclose(&actions, out[0]);
-    char exe[] = "test_asio";
-    char name[] = "asio: a thread joins the io_context after attach";
-    char* argv[] = {exe, name, nullptr};
-    pid_t child = -1;
-    const int spawned = ::posix_spawn(&child, "/proc/self/exe", &actions, nullptr, argv, environ);
-    ::posix_spawn_file_actions_destroy(&actions);
-    ::close(out[1]);
-    REQUIRE(spawned == 0);
+    const auto end = runChild("asio: a thread joins the io_context after attach");
+    INFO(end.output);
+    CHECK(WIFSIGNALED(end.status));
+    CHECK(WTERMSIG(end.status) == SIGABRT);
+    CHECK_THAT(end.output, Catch::Matchers::ContainsSubstring("several threads run the io_context"));
+}
 
-    std::string output;
-    char buf[512];
-    for (ssize_t n; (n = ::read(out[0], buf, sizeof buf)) > 0;) output.append(buf, static_cast<size_t>(n));
-    ::close(out[0]);
-    int status = 0;
-    REQUIRE(::waitpid(child, &status, 0) == child);
+// Before run(), on the thread that then runs it: a request made at once is
+// served once run() starts, on_ready tells the pool is ready, and run()
+// returns once relais, detached on that thread, has left.
+TEST_CASE("asio: attachHere binds relais to the thread that runs the io_context",
+          "[asio][attach][here][integration]") {
+    net::io_context ctx;
+    { net::steady_timer first(ctx); }  // asio's own descriptors, before counting
+    const int fds = countOpenFds();
+    struct State {
+        std::optional<Attachment<AsioIo>> relais;
+        std::string value;
+        int ready_calls = 0;
+        std::exception_ptr ready_error;
+        std::thread::id ready_thread;
+        void detachOnceDone() {
+            if (!value.empty() && ready_calls > 0) relais->detach();  // only starts it
+        }
+    } state;
+    state.relais.emplace(jcailloux::relais::attachHere(
+        ctx, conninfo(), {.pool = {.min_connections = 1, .max_connections = 2}},
+        [&state](std::exception_ptr e) {
+            ++state.ready_calls;
+            state.ready_error = e;
+            state.ready_thread = std::this_thread::get_id();
+            state.detachOnceDone();
+        }));
+    CHECK(PgProvider::initialized());
+    [](State& s) -> DetachedTask {
+        try {
+            s.value = co_await sixTimesSeven();
+        } catch (const std::exception& e) {
+            s.value = e.what();
+        }
+        s.detachOnceDone();
+    }(state);
+    ctx.run_for(10s);
+    CHECK(ctx.stopped());  // out of work, not out of time
+    CHECK(state.value == "42");
+    CHECK(state.ready_calls == 1);
+    CHECK_FALSE(state.ready_error);
+    CHECK(state.ready_thread == std::this_thread::get_id());
+    CHECK_FALSE(PgProvider::initialized());
+    state.relais.reset();
+    CHECK(countOpenFds() == fds);
+}
 
-    INFO(output);
-    CHECK(WIFSIGNALED(status));
-    CHECK(WTERMSIG(status) == SIGABRT);
-    CHECK_THAT(output, Catch::Matchers::ContainsSubstring("several threads run the io_context"));
+// A former attach pinned relais to the thread that ran the io_context then:
+// attachHere pins the thread that runs it now.
+TEST_CASE("asio: attachHere after an attach from a thread that ran the io_context before",
+          "[asio][attach][here][integration]") {
+    net::io_context ctx;
+    {
+        auto work = net::make_work_guard(ctx);
+        std::jthread first([&ctx] { ctx.run(); });
+        auto relais = jcailloux::relais::attach(ctx, conninfo(),
+            {.pool = {.min_connections = 1, .max_connections = 1}});
+        relais.detach();
+        work.reset();
+        first.join();
+    }
+    ctx.restart();
+    std::string value;
+    auto relais = jcailloux::relais::attachHere(ctx, conninfo(),
+        {.pool = {.min_connections = 1, .max_connections = 1}});
+    [](std::string& out, Attachment<AsioIo>& r) -> DetachedTask {
+        try {
+            out = co_await sixTimesSeven();
+        } catch (const std::exception& e) {
+            out = e.what();
+        }
+        r.detach();
+    }(value, relais);
+    ctx.run_for(10s);
+    CHECK(ctx.stopped());
+    CHECK(value == "42");
+}
+
+// Run by the next case, in a process of its own: attachHere on this thread,
+// whose first turn pins relais here; then another thread alone runs the
+// io_context, and gets relais's next callback.
+TEST_CASE("asio: a second thread runs the io_context after attachHere", "[.][asio]") {
+    net::io_context ctx;
+    auto work = net::make_work_guard(ctx);
+    auto relais = jcailloux::relais::attachHere(ctx, conninfo(),
+        {.pool = {.min_connections = 1, .max_connections = 1}});
+    ctx.run_one();  // relais's first turn, on this thread
+    std::jthread second([&ctx] { ctx.run(); });
+    std::this_thread::sleep_for(3s);
+    std::fprintf(stderr, "the second thread ran relais's callback\n");
+    std::_Exit(3);
+}
+
+TEST_CASE("asio: after attachHere, a second thread that runs the io_context ends the process",
+          "[asio][attach][here]") {
+    const auto end = runChild("asio: a second thread runs the io_context after attachHere");
+    INFO(end.output);
+    CHECK(WIFSIGNALED(end.status));
+    CHECK(WTERMSIG(end.status) == SIGABRT);
+    CHECK_THAT(end.output, Catch::Matchers::ContainsSubstring("several threads run the io_context"));
 }
 
 TEST_CASE("asio: attach rejects a post() that runs in place", "[asio][attach]") {

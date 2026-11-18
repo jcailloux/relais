@@ -43,7 +43,9 @@ constexpr IoEvent& operator|=(IoEvent& a, IoEvent b) noexcept {
 // it (runAll).
 //
 // What relais guarantees the adapter:
-//   - every call but post() comes from the loop thread;
+//   - every call but post() comes from the loop thread: the one that runs the
+//     loop, or, after attachHere() before the loop starts, the one that will
+//     (postDelayed alone, until the loop's first turn);
 //   - addWatch and removeWatch are never called inside an event dispatch (a
 //     watch or timer callback): relais makes them from tasks it posts;
 //   - a watched fd stays open, on the same file, until its removeWatch;
@@ -71,6 +73,9 @@ constexpr IoEvent& operator|=(IoEvent& a, IoEvent b) noexcept {
 // Optional:
 //   - isInLoopThread(): true on the loop thread. attach() then refuses that
 //     thread, which it would wait on forever.
+//   - pinThread(std::thread::id): called by attachHere() on the loop's first
+//     turn, with the loop thread: relais's callbacks run there from then on,
+//     which the adapter may check.
 //   - detached(): called on the loop thread once relais has left the loop
 //     (detach) and nothing of it is still running there: the postDelayed
 //     callbacks still pending would do nothing, and the adapter may drop them,

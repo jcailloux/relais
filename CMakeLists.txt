@@ -499,6 +499,16 @@ if(RELAIS_BUILD_TESTS)
         endif()
     endif()
 
+    # A loop relais ships no adapter for, run through the descriptor of
+    # integration/fd.h: the example of the documentation.
+    option(RELAIS_TEST_GLIB "Test relais on a GLib main loop, through its descriptor (needs GLib)" OFF)
+    if(RELAIS_TEST_GLIB)
+        find_package(PkgConfig REQUIRED)
+        pkg_check_modules(RELAIS_GLIB REQUIRED IMPORTED_TARGET glib-2.0)
+        relais_add_test(test_glib tests/integration/test_glib.cpp LABELS "integration;glib;fd" RESOURCE_LOCK)
+        target_link_libraries(test_glib PRIVATE PkgConfig::RELAIS_GLIB)
+    endif()
+
     # -------------------------------------------------------------------------
     # Combined targets
     # -------------------------------------------------------------------------

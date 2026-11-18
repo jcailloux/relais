@@ -500,12 +500,18 @@ TEST_CASE("Benchmark - PG throughput SELECT by PK", "[benchmark][pg][throughput]
 //  runs against a warmed pmr node pool, with no malloc.
 // -----------------------------------------------------------------------------
 
+static void measureTimers(Io& io);
+
 TEST_CASE("Benchmark - timer arm+cancel (loop-local)", "[benchmark][io][timer]")
 {
     Io io;
-    io.runOnce(0);  // claim the loop thread so postDelayed takes the loop-local
-                    // (no-wakeup) arm path that a running event loop always uses
+    // Measured from inside a turn, where a running loop arms its timers: no
+    // pipe wakeup, and the timerfd re-armed once, at the end of the turn.
+    io.post([&io] { measureTimers(io); });
+    io.runOnce(0);
+}
 
+static void measureTimers(Io& io) {
     constexpr auto kNever = std::chrono::hours{1};  // deadline never reached
     constexpr int kWarm = 20'000;
     constexpr int kIters = 200'000;
