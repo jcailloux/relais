@@ -17,7 +17,7 @@ New to relais? Read [concepts.md](concepts.md) first for the mental model, then 
 3. [Invalidation descriptors](#invalidation-descriptors) — the four `Invalidate*` templates, resolver contracts, `InvalidationData`, `ListInvalidationTarget`, and wiring.
 4. [List and query API](#list-and-query-api) — `ListDescriptor`, filter operators, sort directions, the fluent builder, `ListQuery`/`ListQueryParams`/`TypedCursor`, HTTP parsers, and `FilterSet`.
 5. [Entity and concepts](#entity-and-concepts) — the `Entity<Struct, Mapping>` surface, partial-update factories, guards and ordering, and the full concept hierarchy (what each requires, what each enables).
-6. [Runtime and I/O](#runtime-and-io) — `IoPool`/`IoPoolConfig`, the `Task`/`Immediate`/`DetachedTask` family and `whenAll`, `Outcome`, `spawnOn`, the `IoContext` concept and its conformance harness, `PgProvider` with its result/error types, and the log callback.
+6. [Runtime and I/O](#runtime-and-io) — `attach`/`attachHere` and the `Attachment`, the integrations (Drogon, trantor, asio, libuv, one descriptor) and `relais::async`, `IoPool`/`IoPoolConfig`, the `Task`/`Immediate`/`DetachedTask` family and `whenAll`, `Outcome`, `spawnOn`, the `IoContext` concept and its conformance harness, `PgProvider` with its result/error types, and the log callback.
 7. [Annotations](#annotations) — index of `@relais` annotations (canonical home: [entities.md](entities.md)).
 8. [Stability](#stability) — what semantic versioning covers, what it does not, and the version macros.
 
@@ -823,21 +823,146 @@ The building blocks live in `EntityConcepts.h` / `SerializationTraits.h`; the up
 
 ## Runtime and I/O
 
-Repository calls don't reach PostgreSQL directly — they route through `PgProvider` (a `thread_local` service locator) to a per-loop `BatchScheduler` and connection pools running on an `IoContext` event loop. This section is the exhaustive reference for that runtime: the awaitable `Task`/`Immediate`/`DetachedTask` family, the `IoContext` extension point and its conformance harness, the `IoPool` reference runtime, the `spawnOn` cross-thread bridge, and `PgProvider` with its result/error types. Everything lives in `namespace jcailloux::relais::io` unless noted; `Outcome`/`spawnOn`/`PgProvider` are in root `jcailloux::relais`.
+Repository calls don't reach PostgreSQL directly — they route through `PgProvider` (a `thread_local` service locator) to a per-loop `BatchScheduler` and connection pool running on an event loop. This section is the exhaustive reference for that runtime: attaching relais to a loop and the shipped integrations, the `IoPool` runtime, the awaitable `Task`/`Immediate`/`DetachedTask` family, the `spawnOn` cross-thread bridge, the `IoContext` extension point and its conformance harness, and `PgProvider` with its result/error types. Everything lives in `namespace jcailloux::relais::io` unless noted; the attach family, `Outcome`, `spawnOn`, `relais::async` and `PgProvider` are in root `jcailloux::relais`. Guide: [foreign-event-loops.md](foreign-event-loops.md).
+
+### Attaching relais to a loop
+
+`runtime/Attach.h`, root namespace. Binds relais to the loop an `IoContext` runs: checks the loop, creates its pool and batch scheduler on it, and binds the loop thread's providers to them. The integrations and `IoPool` are built on it.
+
+```cpp
+template<io::IoContext Io>
+[[nodiscard]] Attachment<Io> attach(Io& io, std::string conninfo, AttachConfig cfg = {});
+
+template<io::IoContext Io>
+[[nodiscard]] Attachment<Io> attachHere(Io& io, std::string conninfo, AttachConfig cfg = {},
+                                        std::function<void(std::exception_ptr)> on_ready = {});
+```
+- **`attach`**: from another thread than the loop's, while the loop runs. Blocks until the loop has passed its check (a few milliseconds) and the pool has `min_connections`.
+  - **throws** `AttachError` if the loop fails the check (the message says what it did not do), if called on the loop's own thread (detected when `Io` has `isInLoopThread()`), or if relais is attached to that loop already; the pool's connection error otherwise (`io::PgConnectionError`, or `io::PgPoolTimeout` after `acquire_timeout`).
+- **`attachHere`**: on the loop's own thread, from one of its callbacks or before the loop starts there. Binds this thread and returns at once: a repository call made from then on waits for the pool's first connection.
+  - **on the loop's first turn**: relais checks the thread (another one ends the process), checks the loop as `attach` does, within `acquire_timeout` (1 s at least), then connects the pool.
+  - **`on_ready`**: runs once, on the loop thread, from a turn of its own: with a null pointer once the pool has `min_connections`, else with what failed (an `AttachError` naming what the loop did not do, or the connection's error). It must not throw, and never runs once `detach()` has begun.
+  - **on failure**: the error is logged, and every PostgreSQL call on this thread throws it, the calls waiting and the later ones, until `detach()`.
+  - **throws** `AttachError` if relais is attached to this thread already.
+- **lifetime**: `io` must outlive the returned `Attachment`.
+
+`AttachConfig`:
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `pool` | `io::PgPoolConfig` | `{}` | The loop's pool (below). |
+| `max_concurrent` | `int` | `8` | Sends in flight on the loop, as `IoPoolConfig::max_concurrent_per_worker`. |
+
+`PgPoolConfig` (`io/pg/PgPool.h`) — one loop's pool:
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `min_connections` | `size_t` | `2` | Connections opened before relais is ready. |
+| `max_connections` | `size_t` | `16` | Pool ceiling. |
+| `acquire_timeout` | `std::chrono::milliseconds` | `5000` | Bounds each connection acquire, including the connects at startup. |
+| `query_timeout` | `std::chrono::milliseconds` | `30000` | Bounds each per-connection I/O wait. A liveness backstop, not an SLA; `0` disables it (discouraged). See [runtime.md › Liveness & failure semantics](runtime.md#liveness--failure-semantics). |
+| `uncertain_settle` | `io::UncertainSettle` | `Terminate` | What settling an uncertain write waits for: `Terminate` (relais ends the backend that ran it), `Await` (that backend exits), `Delay` (`settle_delay`; behind a transaction pooler), `Off` (no settling). See [runtime.md › Settling](runtime.md#settling-an-uncertain-write). |
+| `settle_delay` | `std::chrono::milliseconds` | `0` | `Delay` only: must exceed the server's `statement_timeout`; `0` takes that timeout + 1 s, and settles nothing without one. |
+| `client_check_interval` | `std::chrono::milliseconds` | `1000` | Sent as the session's `client_connection_check_interval`: the server aborts a statement whose client is gone. Not sent under `Delay`; `0` sends nothing. |
+
+`AttachError` (`std::runtime_error`) — relais cannot be bound to a loop, as listed above; `on_ready` receives it for a loop that fails the check.
+
+`Attachment<Io>` — move-only. Destroying it, or move-assigning over it, detaches.
+
+| Member | Semantics |
+|---|---|
+| `bool ready() const` | The pool has its first connections: always once `attach` has returned; `false` once detached. Thread-safe. |
+| `std::exception_ptr error() const` | What `attachHere` could not start with; null otherwise, and once detached. Thread-safe. |
+| `std::shared_ptr<io::PgPool<Io>> pool() const` | The loop's pool; null once detached. |
+| `void detach() noexcept` | Takes relais off the loop, which must still be running: waits there for the requests in flight (each bounded by its timeouts), unbinds the loop thread, and closes the pool. From another thread, returns once done, and the loop may then stop at once; a loop that does not start the teardown within 1 s (stopped) keeps the pool open, with a warning logged. On the loop's thread, starts the teardown and returns at once: the loop must go on running until it ends. Idempotent. |
+
+### Integrations
+
+One header each in `integration/`. Including one needs the library it integrates; relais itself never depends on it. Guide: [foreign-event-loops.md](foreign-event-loops.md).
+
+| Header | Declares | Needs (tested with) |
+|---|---|---|
+| `integration/drogon.h` | `attachDrogon` | Drogon (1.9.13) |
+| `integration/trantor.h` | `io::TrantorIoContext` | trantor (1.5.28) |
+| `integration/asio.h` | `io::AsioIoContext`, `attach`/`attachHere` over `asio::io_context`, `async` | standalone asio (1.38.2); `async`: 1.27 or later |
+| `integration/boost_asio.h` | `io::BoostAsioIoContext`, the same over `boost::asio::io_context` | Boost (1.83); `async`: 1.82 or later |
+| `integration/libuv.h` | `io::LibuvIoContext` | libuv (1.53.0) |
+| `integration/fd.h` | `attachHere(conninfo, …)`, `FdAttachment` | Linux |
+
+**`attachDrogon`**
+
+```cpp
+void attachDrogon(std::string conninfo, AttachConfig cfg = {});   // root ns
+```
+- **semantics**: binds every IO loop of `drogon::app()` as `attach` does, each with its own pool, once Drogon has started them and before it serves a request. When Drogon quits, relais leaves each loop before it stops, once its requests in flight have ended. Drogon's main loop is not bound.
+- **constraints**: call it once, before `drogon::app().run()`: `AttachError` otherwise.
+- **errors**: a loop that cannot be bound makes Drogon quit without serving; `drogon::app().run()` then throws that error.
+
+**`io::TrantorIoContext`** — `explicit TrantorIoContext(trantor::EventLoop* loop)`: the `IoContext` of a trantor loop, which must outlive it; for `attach` and `attachHere`.
+
+**asio and Boost.Asio**
+
+```cpp
+[[nodiscard]] Attachment<io::AsioIoContext>
+attach(asio::io_context& ctx, std::string conninfo, AttachConfig cfg = {});
+
+[[nodiscard]] Attachment<io::AsioIoContext>
+attachHere(asio::io_context& ctx, std::string conninfo, AttachConfig cfg = {},
+           std::function<void(std::exception_ptr)> on_ready = {});
+```
+- **semantics**: as `attach(io, …)` and `attachHere(io, …)`, with the adapter kept in `ctx` (an asio service): nothing to build. `attach` runs while `ctx` runs (a work guard keeps `run()` from returning first), and also throws `AttachError` for an `io_context` that several threads run. relais's callbacks then run on the one thread that runs `ctx`: another thread that runs one ends the process.
+- **lifetime**: `ctx` must outlive the `Attachment`. After `detach()`, `run()` returns once nothing else is pending.
+- **Boost.Asio**: the same over `boost::asio::io_context`, returning `Attachment<io::BoostAsioIoContext>`.
+
+**`async`**
+
+```cpp
+template<typename T, asio::completion_token_for<Signature> Token = /* the io_context's default */>
+auto async(io::Task<T> task, Token&& token = Token());
+
+template<typename T, asio::completion_token_for<Signature> Token = /* the io_context's default */>
+auto async(io::Immediate<T> call, Token&& token = Token());
+```
+- **semantics**: runs a relais call as an asio asynchronous operation, through any completion token (`use_awaitable`, `deferred`, `as_tuple`, a callback, `use_future`). `Signature` is `void(std::exception_ptr, T)`, or `void(std::exception_ptr)` for `T = void`, as `co_spawn`'s; on an exception, the value is `T{}`. The default token is the `io_context` executor's (`deferred` from asio 1.29).
+- **constraints**: on the thread of an `io_context` relais is attached to: `std::logic_error` otherwise. The call starts at once.
+- **completion**: the handler runs on its associated executor, by default the `io_context`. A call ready at once (a cache hit) completes through the handler's immediate executor, by default a post to the `io_context`.
+- **lifetime**: what the call refers to (a key, a query's SQL text and parameters) must outlive the operation, as an asio buffer does.
+- **cancellation**: `terminal` or `partial` completes the operation at once with `operation_aborted`; the request runs on, its result is dropped, and relais's cache stays valid. `total` is not honoured: the request may still have its effects.
+- **versions**: asio 1.27 or later (Boost 1.82 or later). With both `asio.h` and `boost_asio.h` in one translation unit, every call to it is ambiguous.
+
+**`io::LibuvIoContext`** — `explicit LibuvIoContext(uv_loop_t* loop)`: the `IoContext` of a libuv loop, for `attach` and `attachHere`. Built and destroyed on the loop's thread, or while no thread runs the loop; destroyed after `detach()` and before the application closes the loop's handles (`uv_walk`); the loop then runs once more before `uv_loop_close`, freeing the adapter's handles. **throws** `std::system_error` if libuv cannot create its async handle.
+
+**`attachHere` and `FdAttachment`** (`integration/fd.h`, Linux)
+
+```cpp
+[[nodiscard]] FdAttachment attachHere(std::string conninfo, AttachConfig cfg = {},
+                                      std::function<void(std::exception_ptr)> on_ready = {});
+```
+- **semantics**: binds the calling thread, which runs another loop, to a loop of relais's own (an `io::EpollIoContext`) that the application's loop drives through one descriptor. As `attachHere(io, …)`, without the check of the loop; `on_ready` runs from `poll()`.
+- **throws** `AttachError` if relais is attached to this thread already.
+
+`FdAttachment` — move-only. Everything but `ready()` and `error()` runs on the thread that called `attachHere`.
+
+| Member | Semantics |
+|---|---|
+| `int fd() const noexcept` | The descriptor to watch for reading, level-triggered: readable while relais has work. `-1` once detached. |
+| `void poll()` | Runs what is ready, without waiting, and leaves `fd()` readable while work remains. **throws** `std::logic_error` on another thread. Does nothing once detached. |
+| `bool ready() const` / `std::exception_ptr error() const` | As on `Attachment`. Thread-safe. |
+| `std::shared_ptr<io::PgPool<io::EpollIoContext>> pool() const` | The pool; null once detached. |
+| `void detach()` | Runs relais's loop until the requests in flight end (each bounded by its timeouts), unbinds the thread, and closes the pool and `fd()`. Blocks until done; idempotent. Stop watching `fd()` first. **throws** `std::logic_error` on another thread, or inside `poll()`. |
+| destructor, move assignment | Detach as `detach()`; end the process on another thread, or inside `poll()`. |
 
 ### IoPool & IoPoolConfig
 
-`io::IoPool` is the reference shared-nothing runtime: N `EpollIoContext` loops, each pinned to a core, each owning its own `PgPool`/`BatchScheduler` and binding its own `thread_local` providers automatically (no manual `init()`).
+`io::IoPool` (`io/IoPool.h`) runs N `EpollIoContext` loops, each on its own thread pinned to a core, and attaches relais to each as `attach` does: every worker owns its own `PgPool` and `BatchScheduler`.
 
 ```cpp
 static std::unique_ptr<IoPool> create(const IoPoolConfig& config);   // io/IoPool.h
 ```
 - **returns**: `std::unique_ptr<IoPool>`, **synchronously** — `create` blocks the calling thread until every worker has connected and bound its providers. It is **not** a coroutine/`Task`. Call it from outside any event loop (e.g. `main`).
-- **throws**: `io::IoPoolStartupError` if a worker fails to report ready within `startup_timeout` (a dependency blackholed at boot); a worker whose own init throws rethrows that verbatim (e.g. an unreachable DB surfaces `PgPoolTimeout`). Either way `create()` fails fast instead of hanging.
-- **other members**: `void stop()` (idempotent; also runs in `~IoPool`), `int numWorkers() const noexcept`, `Io& workerIo(int idx) noexcept` (the worker's `EpollIoContext`, for posting work / testing). `using Io = EpollIoContext`.
-- **semantics**: each worker binds `PgProvider`'s `thread_local` providers to its own `BatchScheduler` on its own thread during `create()` — a coroutine running on a worker routes to that worker's resources with no cross-thread hop.
-
-> The bundled `PgPool<Io>::create` is a *coroutine* (a lazy `Task` doing connection I/O on the loop thread) — `IoPool::create` drives it internally. You only touch it directly in a bring-your-own-loop bootstrap (see `spawnOn`).
+- **throws**: `io::IoPoolStartupError` if a worker fails to report ready within `startup_timeout` (a dependency blackholed at boot); a worker whose own startup throws rethrows that verbatim (e.g. an unreachable DB surfaces `PgPoolTimeout`). Either way `create()` fails fast instead of hanging.
+- **other members**: `void stop()` (relais leaves every worker, each once its requests in flight have ended, then the loops stop; idempotent; also runs in `~IoPool`), `int numWorkers() const noexcept`, `Io& workerIo(int idx) noexcept` (the worker's `EpollIoContext`, for posting work / testing). `using Io = EpollIoContext`.
+- **semantics**: a coroutine running on a worker routes to that worker's resources with no cross-thread hop.
 
 `IoPoolConfig` — all fields, defaults from the header:
 
@@ -850,24 +975,12 @@ static std::unique_ptr<IoPool> create(const IoPoolConfig& config);   // io/IoPoo
 | `max_concurrent_per_worker` | `int` | `8` | Sends in flight per worker. Concurrent writes take at most half of the PG budget (up to 16 connections), leaving the rest to reads; PostgreSQL commits them together from 3 connections on, so a write-heavy worker gains from `6` or more. |
 | `pin_to_cores` | `bool` | `true` | Pin each worker thread to a CPU core. |
 | `first_core` | `int` | `1` | First core index for pinning (worker `i` → `first_core + i`); `1` avoids core 0 (OS/IRQ). |
-| `acquire_timeout` | `std::chrono::milliseconds` | `5000` | Bounds each connection acquire, including the startup warm-up connect — an unreachable DB fails `create()` instead of hanging. |
-| `query_timeout` | `std::chrono::milliseconds` | `30000` | Bounds each per-connection I/O wait. A liveness backstop, not an SLA; `0` disables it (discouraged). See [runtime.md › Liveness & failure semantics](runtime.md#liveness--failure-semantics). |
+| `acquire_timeout` | `std::chrono::milliseconds` | `5000` | As `PgPoolConfig::acquire_timeout`: an unreachable DB fails `create()` instead of hanging. |
+| `query_timeout` | `std::chrono::milliseconds` | `30000` | As `PgPoolConfig::query_timeout`. |
 | `startup_timeout` | `std::chrono::milliseconds` | `30000` | Bounds `create()`'s wait for all workers to report ready — a worker that hangs at boot (e.g. an unreachable dependency) makes `create()` throw `io::IoPoolStartupError` rather than block forever. |
-| `uncertain_settle` | `io::UncertainSettle` | `Terminate` | How an uncertain write is settled, as `PgPoolConfig::uncertain_settle`. |
+| `uncertain_settle` | `io::UncertainSettle` | `Terminate` | As `PgPoolConfig::uncertain_settle`. |
 | `settle_delay` | `std::chrono::milliseconds` | `0` | As `PgPoolConfig::settle_delay`. |
 | `client_check_interval` | `std::chrono::milliseconds` | `1000` | As `PgPoolConfig::client_check_interval`. |
-
-`PgPoolConfig` (`io/pg/PgPool.h`) — the per-loop pool, passed to `PgPool<Io>::create(io, conninfo, cfg)`:
-
-| Field | Type | Default | Meaning |
-|---|---|---|---|
-| `min_connections` | `size_t` | `2` | Connections opened at creation. |
-| `max_connections` | `size_t` | `16` | Pool ceiling. |
-| `acquire_timeout` | `std::chrono::milliseconds` | `5000` | As in `IoPoolConfig`. |
-| `query_timeout` | `std::chrono::milliseconds` | `30000` | As in `IoPoolConfig`. |
-| `uncertain_settle` | `io::UncertainSettle` | `Terminate` | What settling an uncertain write waits for: `Terminate` (relais ends the backend that ran it), `Await` (that backend exits), `Delay` (`settle_delay`; behind a transaction pooler), `Off` (no settling). See [runtime.md › Settling](runtime.md#settling-an-uncertain-write). |
-| `settle_delay` | `std::chrono::milliseconds` | `0` | `Delay` only: must exceed the server's `statement_timeout`; `0` takes that timeout + 1 s, and settles nothing without one. |
-| `client_check_interval` | `std::chrono::milliseconds` | `1000` | Sent as the session's `client_connection_check_interval`: the server aborts a statement whose client is gone. Not sent under `Delay`; `0` sends nothing. |
 
 ### Task / Immediate / DetachedTask
 
@@ -918,17 +1031,15 @@ A suspended driver coroutine is created holding `task` + `on_done`; `io.post()` 
 - **constraints**: `task` and `on_done` are *moved into* the driver frame, so `on_done` need **not** be copyable (move-only callbacks are fine). Cost: exactly one coroutine-frame allocation (the driver).
 - **on_done**: receives `Outcome<T>` (or `Outcome<void>`). If it throws, the exception is **swallowed** (fire-and-forget contract). The driver frame self-destructs after `on_done` returns.
 
-> Primary use is the one-time per-loop bootstrap: kick a lazy `PgPool::create()` onto a loop from the main thread and do `PgProvider::init` in `on_done`. Per-request reads should `co_await` inline on the loop instead — no `spawnOn`, no hop.
+> Use it to hand relais work to a loop from a thread outside it — from `main` to an `IoPool` worker, say. On the loop itself, `co_await` inline instead: no `spawnOn`, no hop.
 
 > **Teardown caveat:** if the posted resume never runs (the `IoContext` is destroyed with a non-empty queue), the suspended driver frame leaks — same fire-and-forget semantics as a dropped `post()`.
 
 ### The `IoContext` concept
 
-The event-loop extension point (`io/IoContext.h`). `PgPool<Io>`, `BatchScheduler<Io>`, the awaiter machinery, and `spawnOn` are all generic over it: any epoll-family loop (e.g. a trantor shim for Drogon) that satisfies it can host relais inline. The concept fixes **only the signatures below**; the semantic contract (callbacks on the loop thread, FIFO posts, cross-thread wakeups, reentrant `removeWatch`) is encoded in the conformance harness, not the concept.
+The event-loop extension point (`io/IoContext.h`): the loop relais runs its I/O on. `PgPool<Io>`, the batch scheduler, the awaiter machinery, `attach` and `spawnOn` are generic over it. Each integration is an adapter that satisfies it; [foreign-event-loops.md › Writing an adapter](foreign-event-loops.md#writing-an-adapter) covers writing one.
 
-Required member types (2): `T::WatchHandle`, `T::TimerToken`.
-
-Required expressions (6), each result-constrained via `-> std::same_as<...>`:
+Required member type: `T::WatchHandle`. Required expressions:
 
 | Expression | Result |
 |---|---|
@@ -936,28 +1047,42 @@ Required expressions (6), each result-constrained via `-> std::same_as<...>`:
 | `ctx.removeWatch(T::WatchHandle handle)` | `void` |
 | `ctx.updateWatch(T::WatchHandle handle, IoEvent events)` | `void` |
 | `ctx.post(std::function<void()> cb)` | `void` |
-| `ctx.postDelayed(std::chrono::nanoseconds delay, std::function<void()> cb)` | `T::TimerToken` |
-| `ctx.cancelTimer(T::TimerToken token)` | `void` |
+| `ctx.postDelayed(std::chrono::nanoseconds delay, std::function<void()> cb)` | any (ignored) |
 
-`IoEvent` is a `uint8_t`-backed flag enum (`None`/`Read`/`Write`/`Error`) with `operator|`/`operator&`/`operator|=` and `hasEvent(set, flag)`. Watch callbacks receive the matching bits set.
+`IoEvent` is a `uint8_t`-backed flag enum (`None`/`Read`/`Write`/`Error`) with `operator|`/`operator&`/`operator|=` and `hasEvent(set, flag)`.
 
-<details><summary>Semantic rules the concept can't express (enforced by the conformance harness)</summary>
+The concept fixes the signatures; the contract fixes their meaning, and the conformance harness checks it.
 
-| Method | Contract beyond the signature |
+**What relais guarantees the adapter:**
+
+- every call but `post()` comes from the loop thread: the one that runs the loop, or, after `attachHere` before the loop starts, the one that will (`postDelayed` alone, until the loop's first turn);
+- `addWatch` and `removeWatch` are never called inside an event dispatch (a watch or timer callback);
+- a watched fd stays open, on the same file, until its `removeWatch`;
+- `postDelayed` is rare: once per batch of reads at most, never per request;
+- no timer is ever cancelled.
+
+**What the adapter must do:**
+
+| Method | Contract |
 |---|---|
-| `addWatch` | `cb` runs on the loop thread when `fd` is ready for a masked event. |
-| `removeWatch` | Must be safe to call **from inside that handle's own callback** (relais self-removes a watch on EOF/error — defer teardown of loop-owned state past the current event). |
-| `post` | Runs once, FIFO, thread-safe, and **wakes a blocked loop promptly** even when posted cross-thread. |
-| `postDelayed` | Fires once after the delay. |
-| `cancelTimer` | No-op if the timer already fired or is unknown. |
-</details>
+| `addWatch` | Call `cb` on the loop thread, with the `IoEvent` bits of what is ready among `mask`, for as long as the watch lasts: an adapter over one-shot waits (asio's `async_wait`) waits again after each call. May throw if the fd cannot be watched. One event split into several calls, and calls for nothing, are tolerated. A failed fd may be reported as `Error`, which relais takes as `Read`. |
+| `updateWatch` | Watch for `mask` from then on. relais may call it from a watch callback, that watch's own included. |
+| `removeWatch` | No call for that handle once it returns; the watch, its callback included, may be freed at once. A later `addWatch` of the same fd number is a new watch, which the old one must not affect. |
+| `post` | Run `cb` once on the loop thread, in posting order, never before the callback that posted it has returned; callable from any thread, and wakes the loop if it is waiting. |
+| `postDelayed` | Run `cb` once on the loop thread, `delay` from now or later. |
 
-> **Changing this concept breaks foreign adapters.** Adapters live outside relais (e.g. a `TrantorIoContext` co-locating relais on Drogon), satisfy `IoContext` and are validated by the harness — any signature change to the six expressions or two member types breaks every external adapter. Treat it as a stable ABI-like contract.
+**Optional members**, used when present:
+
+| Member | Effect |
+|---|---|
+| `bool isInLoopThread()` | True on the loop thread: `attach` then refuses that thread, which it would wait on forever, and `PgProvider::init` asserts it in debug builds. |
+| `void pinThread(std::thread::id)` | Called by `attachHere` on the loop's first turn, with the loop thread: relais's callbacks run there from then on, which the adapter may check. |
+| `void detached()` | Called on the loop thread once relais has left the loop and nothing of it still runs there: the `postDelayed` callbacks still pending would do nothing, and the adapter may drop them, for a loop that runs until it has no work left. |
 
 <details>
 <summary>EpollIoContext: methods beyond the concept</summary>
 
-`EpollIoContext` (`io/EpollIoContext.h`; `using WatchHandle = int`, `using TimerToken = uint64_t`) is the bundled model. It satisfies `IoContext` and adds driving methods that are **not** part of the concept (a foreign adapter need not provide them — the harness's author-supplied `drive` substitutes):
+`EpollIoContext` (`io/EpollIoContext.h`, Linux; `using WatchHandle = int`) is relais's own loop, the one `IoPool` runs and `integration/fd.h` exposes. It satisfies `IoContext` and adds:
 
 | Method | Notes |
 |---|---|
@@ -965,7 +1090,10 @@ Required expressions (6), each result-constrained via `-> std::same_as<...>`:
 | `template<typename Pred> void runUntil(Pred&& pred)` | Run iterations until `pred()` is true. |
 | `void runOnce(int timeout_ms = 0)` | One loop iteration (drain posts, fire timers, `epoll_wait`). |
 | `void stop()` | Stop the loop; thread-safe (writes the wakeup pipe). |
-| `bool isInLoopThread() const noexcept` | True on the thread currently driving the loop. `PgProvider::init` asserts on it in debug when present. |
+| `bool isInLoopThread() const noexcept` | True on the thread currently driving the loop. |
+| `TimerToken postDelayed(…)`, `void cancelTimer(TimerToken)` | `postDelayed` returns a token (`using TimerToken = uint64_t`); `cancelTimer` cancels a pending timer, a no-op once fired or unknown. |
+| `int fd() const noexcept` | The epoll descriptor, readable while the loop has work: a callback posted, a timer due, a watched descriptor ready. |
+| `void poll()` | Runs what `fd()` reports, without waiting, and leaves `fd()` readable while work remains. Always from the same thread, which is then the loop thread. |
 
 </details>
 
@@ -975,12 +1103,13 @@ Required expressions (6), each result-constrained via `-> std::same_as<...>`:
 template<io::IoContext Io, typename Drive>
 static void runAll(Io& io, Drive drive);   // testing/IoContextConformance.h
 ```
-- **role**: an *executable contract* for the `IoContext` extension point — runnable checks for the semantics the concept can only describe. An adapter author instantiates `runAll` against their type to prove the shim is correct before wiring relais pools onto it; relais CI runs it against `EpollIoContext`.
-- **`drive`**: the one author-supplied primitive — `drive(io, pred)` pumps the loop **on the calling thread** until `pred()` returns true, re-checking `pred` between iterations (the loop's internal wait must be bounded). For `EpollIoContext`: `[](auto& c, auto pred){ c.runUntil(pred); }`.
-- **checks (C1-C13)**: post executes exactly once (C1) / FIFO order (C2) / re-post from a callback (C3); watch fires readable with the right mask (C4) / `updateWatch` remask (C5) / `removeWatch` stops delivery (C6) / **reentrant self-`removeWatch`** (C10, an ASan use-after-free trap) / **a watch follows the open file, not the fd number** — from a watch's callback, close its fd, open a new one under the same number, `removeWatch` the old handle and `addWatch` the new fd: the new file's events must arrive (C12, the sequence a connect runs when libpq replaces its socket) / **no callback after `removeWatch`, even within the same event** — a self-removing watch on `Read | Write` over a readable and writable socket is called once (C13, fails an adapter that splits one event into several callbacks); **cross-thread `post`** runs on the loop thread and wakes it (C7); `postDelayed` fires once (C8); `cancelTimer` cancels (C9); **arm-then-cancel at scale** — many timers armed then all cancelled must leave none firing (C11). No check sees retained state, yet `cancelTimer` must also *remove* the timer rather than tombstone it until its deadline: a timer is armed and cancelled on every I/O wait (`query_timeout`), so an adapter that defers cancellation accumulates them. (Checks are numbered in the order they were added; `runAll` groups them by subject and runs C1-C6, C10, C12, C13, C7-C9, C11.)
-- **framework-agnostic**: Catch-free — throws `ConformanceError` (a `std::runtime_error`) on failure, so it drops into any test framework.
+- **role**: the *executable contract* of `IoContext` — runnable checks for what the concept can only describe. An adapter author runs `runAll` against their type before attaching relais to it; relais's CI runs it against every shipped adapter.
+- **`drive`**: the one author-supplied primitive — `drive(io, pred)` runs the loop **on the calling thread** until `pred()` returns true, re-checking `pred` between turns; the loop's wait must be bounded (10 ms suits). Each check calls it from the thread that called the check. For `EpollIoContext`: `[](auto& c, auto pred){ c.runUntil(pred); }`; for asio: `while (!pred()) ctx.run_one_for(10ms);`.
+- **checks**: a posted callback runs once (C1), in order (C2); one posted from a callback runs on a later turn (C3), and one posted from a watch callback after that callback returns (C14); a watch reports a readable fd with `Read` (C4) and keeps reporting it each time it turns readable again (C15); `updateWatch` changes the mask of the same handle (C5); `removeWatch` stops delivery (C6), and a new watch on a reused fd number, from a posted task, receives that file's events (C12); a `post` from another thread runs on the loop thread and wakes it (C7); `postDelayed` fires once (C8). `runAll` runs them in that order.
+- **retired checks**: C9, C10, C11 and C13 test what relais no longer needs (cancelling timers, removing a watch from its own callback). They are `[[deprecated]]`, and `runAll` does not run them.
+- **framework-agnostic**: Catch-free — throws `ConformanceError` (a `std::runtime_error`) naming the broken rule, so it drops into any test framework.
 
-> Modifying the `IoContext` concept and not re-running `runAll` against every foreign adapter is how a co-located consumer silently breaks. The harness is the gate.
+> Run `runAll` again when you upgrade relais or the loop's library: the harness is what tells an adapter still holds.
 
 ### PgProvider & PgResult / Row & errors
 
@@ -1010,7 +1139,9 @@ static void runAll(Io& io, Drive drive);   // testing/IoContextConformance.h
 - **Floating point** is sent as the shortest text that reads back to the same value (`0.1` → `0.1`, `1e-7` → `1e-07`), independent of the C locale. NaN is sent as `NaN`, ±∞ as `Infinity`/`-Infinity`. Being text, the same value binds to a `real`, `double precision` or `numeric` column alike.
 - **An enum must say what it stands for**: its integer (`std::to_underlying(e)`) or its database text (a `std::string`). Binding it implicitly as an integer would hide a mismatch with a text or PostgreSQL `ENUM` column.
 
-**Initialization** (call once **per loop thread**, on that thread):
+On a thread relais is not attached to, every query entry point throws `std::logic_error`.
+
+**Binding by hand** — `attach` binds the providers, after checking the loop, and takes them down in order; prefer it.
 
 ```cpp
 template<typename Io>
@@ -1019,8 +1150,8 @@ static void init(
     std::shared_ptr<io::PgPool<Io>> pool,
     int max_concurrent = 8);
 ```
-- `max_concurrent` (default `8`) is the loop's send budget, as `IoPoolConfig::max_concurrent_per_worker`.
-- Providers are `thread_local`: `init` on thread A binds nothing for thread B. Debug builds assert `io.isInLoopThread()` for adapters that expose it.
+- `pool` comes from `io::PgPool<Io>::create(io, conninfo, cfg)`, a `Task` that connects on the loop. `max_concurrent` (default `8`) is the loop's send budget, as `IoPoolConfig::max_concurrent_per_worker`.
+- Call it on the loop thread whose pool it binds: providers are `thread_local`, so `init` on thread A binds nothing for thread B. Debug builds assert `io.isInLoopThread()` for adapters that expose it.
 
 **`PgResult`** (`io/pg/PgResult.h`) — RAII wrapper over `PGresult`:
 

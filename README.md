@@ -40,11 +40,11 @@ config and the entity's traits — you pay for exactly what you enable.
 - **Automatic SQL batching & pipelining.** Concurrent coroutines on one loop have
   their reads coalesced (`SELECT … WHERE id = ANY($1)`) and their writes pipelined
   into far fewer round-trips — no code to write, and a win even with caching off.
-- **Shared-nothing runtime, on your loop or ours.** Async I/O over epoll
-  coroutines; per-loop connection pools, no cross-thread hops on the hot path. The
-  event loop is an extension point (`IoContext`): the bundled `IoPool` is a
-  standalone runtime for when relais drives the process, and relais runs inline on
-  a framework loop (Drogon/asio/libuv) when one already owns your loops.
+- **Shared-nothing runtime, on your loop or ours.** Async I/O over coroutines;
+  per-loop connection pools, no cross-thread hops on the hot path. relais attaches
+  to the event loops your application already runs — Drogon, trantor, asio and
+  libuv through a shipped integration, any other loop through one file
+  descriptor — or runs loops of its own (`IoPool`).
 
 ## When relais fits
 
@@ -170,7 +170,9 @@ Key is auto-deduced from `Entity::key()` — the accessor relais exposes over yo
 ### 4 — Stand up the runtime, then call
 
 Repo calls run **on an event loop** and route through per-loop connection pools.
-The built-in `IoPool` stands one up when relais drives the process:
+If your application already runs one (Drogon, asio, libuv, GLib, Qt…), attach
+relais to it: see [docs/foreign-event-loops.md](docs/foreign-event-loops.md).
+Otherwise the built-in `IoPool` runs loops of its own:
 
 ```cpp
 #include <jcailloux/relais/io/IoPool.h>
@@ -197,8 +199,8 @@ io::Task<void> example() {
 }
 ```
 
-Calls must run **on a loop thread**. Full threading contract, N-loop scaling,
-and running relais on a foreign loop (Drogon/asio/…) are in
+Calls must run **on a loop thread** relais is attached to. The threading
+contract, N-loop scaling, write ordering and failure semantics are in
 **[docs/runtime.md](docs/runtime.md)**.
 
 ## Cache presets
@@ -225,9 +227,9 @@ Each file owns one subject and reads on its own. Pick by what you're trying to d
 | **Do** a task — decisions under concurrency | [docs/conditional-writes.md](docs/conditional-writes.md) | `patchIf`, `claim`, `patchWhere`: guarded and relative writes (optimistic locking, job queues, reservations). |
 | **Do** a task — invalidation | [docs/invalidation.md](docs/invalidation.md) | The four `Invalidate*` mechanisms, resolvers. |
 | **Do** a task — lists | [docs/lists.md](docs/lists.md) | `filterable`/`sortable`, paginated `query()`, cursors, `countWhere`. |
-| **Do** a task — runtime | [docs/runtime.md](docs/runtime.md) | `IoPool`, N-loop scaling, the threading rule. |
+| **Do** a task — runtime | [docs/runtime.md](docs/runtime.md) | Where relais runs, the threading rule, `IoPool`, write ordering, failure semantics. |
 | **Look up** a signature | [docs/api-reference.md](docs/api-reference.md) | The public API — every method, config field, descriptor, list/query type, runtime type, annotation index — and what semantic versioning covers. Every guide links here. |
-| **Integrate** on an existing loop | [docs/runtime.md](docs/runtime.md) → [docs/foreign-event-loops.md](docs/foreign-event-loops.md) | Co-locate relais on a framework loop (Drogon/asio/…) via an `IoContext` adapter — advanced, optional. |
+| **Integrate** with your event loop | [docs/foreign-event-loops.md](docs/foreign-event-loops.md) | Drogon, trantor, asio, libuv; any other loop through one descriptor; writing an adapter. |
 | **Dissect** the implementation | [docs/internals.md](docs/internals.md) | Mixin chain, layer selection, L1 tier, ListCache, ModificationTracker — for contributors. |
 | **Run** an example | [examples/](examples/README.md) | CI-compiled counterparts to the runtime snippets. |
 
@@ -239,7 +241,7 @@ Each file owns one subject and reads on its own. Pick by what you're trying to d
 
 **Performance** comes from four independent levers: the right cache preset,
 automatic SQL batching/pipelining (independent of the cache), the shared-nothing
-`IoPool` runtime, and optional co-location on a foreign loop. Full model and the
+runtime, and running on the loop your application already runs. Full model and the
 numbers: [concepts.md › Performance model](docs/concepts.md#performance-model).
 
 ## Testing

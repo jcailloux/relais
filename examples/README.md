@@ -1,7 +1,7 @@
 # Examples
 
 Runnable, CI-compiled counterparts to the snippets in
-[`docs/runtime-and-threading.md`](../docs/runtime-and-threading.md). Off by
+[`docs/runtime.md`](../docs/runtime.md). Off by
 default; enable with `-DRELAIS_BUILD_EXAMPLES=ON`.
 
 | Example | Needs DB? | Shows |

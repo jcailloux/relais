@@ -13,7 +13,6 @@
 #include <jcailloux/relais/integration/libuv.h>
 #include <jcailloux/relais/io/WhenAll.h>
 #include <jcailloux/relais/io/pg/PgParams.h>
-#include <jcailloux/relais/runtime/Attach.h>
 #include <jcailloux/relais/testing/IoContextConformance.h>
 
 #include <fixtures/AllocationCounter.h>

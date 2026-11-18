@@ -28,6 +28,7 @@
 
 #include "jcailloux/relais/io/IoContext.h"
 #include "jcailloux/relais/io/detail/DrainBuffer.h"
+#include "jcailloux/relais/runtime/Attach.h"
 
 namespace jcailloux::relais::io {
 

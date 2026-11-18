@@ -113,6 +113,24 @@ ctest -L integration --output-on-failure
 ./test_relais_base -s
 ```
 
+### Event-loop integrations
+
+The tests of the integrations (`include/jcailloux/relais/integration/`) are off by
+default. Each option builds the tests of one library, which it fetches or finds;
+CI turns them all on.
+
+| Option | Tests | Library |
+|---|---|---|
+| `RELAIS_TEST_DROGON` | `test_trantor`, `test_trantor_loops`, `test_drogon` | Drogon and trantor, fetched; needs jsoncpp, uuid, zlib and OpenSSL installed |
+| `RELAIS_TEST_ASIO` | `test_asio`, `test_asio_async`, `test_asio_loops` | standalone asio, fetched |
+| `RELAIS_TEST_BOOST_ASIO` | `test_boost_asio`, `test_boost_asio_loops`, and `test_boost_asio_async` from Boost 1.82 | Boost 1.74 or later, installed |
+| `RELAIS_TEST_LIBUV` | `test_libuv`, `test_libuv_loops` | libuv, fetched |
+| `RELAIS_TEST_GLIB` | `test_glib` (relais through one descriptor) | GLib 2 and pkg-config, installed |
+
+```bash
+cmake -B build -DRELAIS_BUILD_TESTS=ON -DRELAIS_TEST_ASIO=ON -DRELAIS_TEST_LIBUV=ON
+```
+
 ## Test Configurations
 
 Two repository configurations are tested:
