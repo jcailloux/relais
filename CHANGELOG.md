@@ -2,6 +2,92 @@
 
 ## [Unreleased]
 
+### Added
+
+- **relais runs on your application's event loop.** Handlers call repositories
+  on their own thread, without a hop between threads. One header per library,
+  in `integration/`, which needs only that library:
+  - **Drogon**: `attachDrogon(conninfo)`, before `drogon::app().run()`,
+    attaches relais to every IO loop;
+  - **trantor**: `attach(io, conninfo)` with an `io::TrantorIoContext`;
+  - **asio and Boost.Asio**: `attach(io_context, conninfo)`, for an
+    `io_context` that one thread runs;
+  - **libuv**: `attach(io, conninfo)` with an `io::LibuvIoContext`.
+
+  Tested with Drogon 1.9.13, trantor 1.5.28, asio 1.38.2, Boost 1.83 and
+  libuv 1.53.0. On these loops, a query costs what it costs on relais's own,
+  plus one system call on asio. See `docs/foreign-event-loops.md`.
+- **`attach(io, conninfo, cfg)` and `attachHere(io, conninfo, cfg, on_ready)`**
+  (`runtime/Attach.h`) attach relais to the loop of any `io::IoContext`: they
+  check that the loop does what relais needs, open its pool and bind its
+  thread. `attach` blocks, from another thread, until the pool has its first
+  connections; `attachHere`, on the loop's own thread, returns at once and
+  reports through `on_ready`. Destroying the returned `Attachment` detaches
+  relais once the queries in flight have ended. Binding by hand
+  (`PgPool<Io>::create`, then `PgProvider::init` on the loop thread) still
+  works.
+- **`relais::async(call, token)`** (`integration/asio.h`, `boost_asio.h`)
+  awaits a relais call from asio, on the thread of an `io_context` relais is
+  attached to, through any completion token:
+  `co_await relais::async(UserRepo::find(id), asio::use_awaitable)`. Its
+  signature is `(std::exception_ptr, T)`, as `co_spawn`'s. Cancelling it
+  (`terminal` or `partial`) completes it at once with `operation_aborted` and
+  leaves relais's cache valid. Needs asio 1.27 or Boost 1.82, or later.
+- **Any other loop drives relais through one descriptor** (`integration/fd.h`,
+  Linux): `attachHere(conninfo)` returns an `FdAttachment`, whose `fd()` the
+  loop watches for reading, calling `poll()` when it is readable. GLib, Qt,
+  libevent or `poll(2)` take a few lines each, and one more system call per
+  query than an adapter. `io::EpollIoContext` gains the `fd()` and `poll()`
+  this is built on.
+
+### Changed
+
+- **A query makes half the system calls.** On relais's own loop (`IoPool`), a
+  query sent alone makes 4 system calls instead of 8, and 11 allocations
+  instead of 17. Each PostgreSQL connection now holds two file descriptors:
+  relais watches a duplicate of libpq's socket.
+- **The `IoContext` contract changes for adapters.** relais no longer cancels
+  a timer or arms one per query, and adds or removes watches only from tasks
+  it posts: `TimerToken` and `cancelTimer` are no longer required, and what
+  `postDelayed` returns is ignored. An adapter written for 4.0 still compiles,
+  but must:
+  - report a watched fd each time it is ready, until `removeWatch`: relais
+    keeps one watch per connection for its whole life, so an adapter over
+    one-shot waits (asio's `async_wait`) waits again after each call;
+  - stop a watch by the time `removeWatch` returns: the deferred teardown that
+    the 4.0 contract advised can disturb a new watch of the same fd number;
+  - run a callback posted from a watch callback after that callback returns.
+
+  Run `testing::IoContextConformance::runAll` again: it checks these rules.
+  `checkCancelTimer`, `checkTimerArmCancelAtScale` and
+  `checkRemoveWatchReentrant` are deprecated, and `runAll` no longer runs
+  them. The optional members `pinThread` and `detached` let an adapter check
+  the thread relais runs on, and drop relais's pending timers once it has
+  left.
+
+### Fixed
+
+- **A connection waited until `acquire_timeout`, then failed, when libpq
+  replaced its socket during the handshake.** Under `sslmode=prefer`, libpq's
+  default, a failed TLS attempt is retried without TLS on a new socket: for
+  instance when the process cannot read `~/.postgresql` (systemd's
+  `ProtectHome`). relais now follows the new socket.
+- **An idle connection the server had closed was still handed out**, and the
+  query on it failed: after a server restart, an `idle_session_timeout`, or a
+  proxy closing idle connections. relais now drops it as soon as the server
+  closes it.
+- **A large pipelined batch could stall until `query_timeout`**, then fail,
+  when the server's results filled the receive buffer while relais was still
+  sending.
+- **A query whose coroutine was destroyed while it waited on PostgreSQL** left
+  its connection in the pool with a callback into the freed frame. The
+  connection is now closed.
+- **`IoPool::stop()`, and its destructor, abandoned the work in flight**: a
+  query, or work relais runs on its own, leaked with the worker's pool and
+  connections. They now wait for it, each query bounded by its timeouts.
+  `stop()` could also hang, when a worker went back to sleep before it saw the
+  stop request.
+
 ## [4.0.0] - 2026-10-22
 
 ### Added
