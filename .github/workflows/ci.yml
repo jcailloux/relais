@@ -36,6 +36,8 @@ jobs:
           sudo apt-get install -y libjsoncpp-dev uuid-dev zlib1g-dev libssl-dev
           # Boost.Asio, for its integration tests (standalone asio is fetched)
           sudo apt-get install -y libboost-dev
+          # GLib, a loop relais runs on through its descriptor
+          sudo apt-get install -y libglib2.0-dev pkg-config
 
       - name: Run database migrations
         env:
@@ -64,6 +66,7 @@ jobs:
           -DRELAIS_TEST_ASIO=ON
           -DRELAIS_TEST_BOOST_ASIO=ON
           -DRELAIS_TEST_LIBUV=ON
+          -DRELAIS_TEST_GLIB=ON
 
       - name: Build
         run: cmake --build build -j$(nproc)

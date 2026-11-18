@@ -363,6 +363,40 @@ TEST_CASE("libuv: uv_run returns once relais is detached", "[libuv][attach][inte
     }
 }
 
+// The loop's own thread, before it runs: what attachHere starts runs as this
+// thread drives the loop, and the teardown leaves no handle on it.
+TEST_CASE("libuv: attachHere binds relais to the loop's own thread", "[libuv][attach][here][integration]") {
+    DrivenLoop d;
+    std::string value;
+    int ready_calls = 0;
+    std::exception_ptr ready_error;
+    {
+        auto relais = jcailloux::relais::attachHere(
+            *d.io, conninfo(), {.pool = {.min_connections = 1, .max_connections = 2}},
+            [&](std::exception_ptr e) {
+                ++ready_calls;
+                ready_error = e;
+            });
+        CHECK(PgProvider::initialized());
+        [](std::string& out) -> DetachedTask {
+            try {
+                out = co_await sixTimesSeven();
+            } catch (const std::exception& e) {
+                out = e.what();
+            }
+        }(value);
+        REQUIRE(d.turnUntil([&] { return !value.empty() && ready_calls > 0; }, 10s));
+        CHECK(value == "42");
+        CHECK(ready_calls == 1);
+        CHECK_FALSE(ready_error);
+        relais.detach();  // this thread runs the loop: only starts the teardown
+        CHECK(d.turnUntil([] { return !PgProvider::initialized(); }, 5s));
+        const auto settled = Clock::now() + 100ms;
+        d.turnUntil([&] { return Clock::now() >= settled; }, 1s);  // what the teardown posted
+    }
+    d.close();  // ends the process if relais left a handle on the loop
+}
+
 TEST_CASE("libuv: postDelayed never fires before its delay, however late the loop's clock",
           "[libuv]") {
     // libuv times a timer from the loop's cached clock, which a busy turn

@@ -7,6 +7,7 @@
 #include <coroutine>
 #include <cstddef>
 #include <deque>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <string>
@@ -120,23 +121,59 @@ public:
         std::string conninfo,
         PgPoolConfig cfg = {}
     ) {
-        auto pool = std::shared_ptr<PgPool>(
-            new PgPool(io, std::move(conninfo), cfg));
+        auto pool = make(io, std::move(conninfo), cfg);
+        co_await pool->warmUp();
+        co_return pool;
+    }
 
-        for (size_t i = 0; i < cfg.min_connections; ++i) {
-            auto conn = co_await pool->connectOne();
-            pool->idle_.push_back(pool->adopt(std::move(conn)));
-            ++pool->total_;
+    // A pool that has no connection yet: acquire() waits until warmUp() hands
+    // it one. Touches nothing of the loop.
+    static std::shared_ptr<PgPool> make(Io& io, std::string conninfo, PgPoolConfig cfg = {}) {
+        return std::shared_ptr<PgPool>(new PgPool(io, std::move(conninfo), cfg));
+    }
+
+    // Connects min_connections, one after another, each handed to the oldest
+    // acquire() waiting, if any; then acquire() connects as needed, up to
+    // max_connections, and connections are opened for the acquires still
+    // waiting. On failure, throws, as failWarmUp() does. Once.
+    Task<void> warmUp() {
+        try {
+            for (size_t i = 0; i < cfg_.min_connections; ++i) {
+                auto conn = co_await connectOne();
+                auto* adopted = adopt(std::move(conn));
+                ++total_;
+                release(adopted);
+            }
+        } catch (...) {
+            failWarmUp(std::current_exception());
+            throw;
+        }
+        limit_ = cfg_.max_connections;
+        for (size_t queued = waiters_.size(); queued > 0 && total_ < limit_; --queued) {
+            ++total_;
+            connectReplacement(this->shared_from_this());
         }
 
-        if (cfg.uncertain_settle == UncertainSettle::Delay && !pool->idle_.empty()
-            && pool->idle_.front()->settleDelay().count() == 0) {
+        if (cfg_.uncertain_settle == UncertainSettle::Delay && !conns_.empty()
+            && conns_.front()->settleDelay().count() == 0) {
             RELAIS_LOG_WARN << "relais: uncertain_settle is Delay, but neither settle_delay "
                                "nor the server's statement_timeout bounds a write: "
                                "uncertain writes will not be settled";
         }
+    }
 
-        co_return pool;
+    // Ends a pool that is not warmed up: the acquires waiting throw `error`,
+    // and so does every acquire() that finds no connection idle from then on.
+    void failWarmUp(std::exception_ptr error) {
+        assert(error && limit_ == 0);
+        failure_ = std::move(error);
+        while (!waiters_.empty()) {
+            auto* waiter = waiters_.front();
+            waiters_.pop_front();
+            waiter->deadline.disarm();
+            waiter->error = failure_;
+            wake(waiter->continuation);
+        }
     }
 
     // Acquire a connection (may suspend if pool exhausted)
@@ -152,7 +189,7 @@ public:
             destroy(conn);
         }
 
-        if (total_ < cfg_.max_connections) {
+        if (total_ < limit_) {
             // ++total_ must be undone if connect throws. The
             // ConnectionGuard — the sole owner of the release → --total_ path — is
             // built only on success below, so a failed connect (a future
@@ -175,6 +212,7 @@ public:
             co_return ConnectionGuard(this->shared_from_this(), adopted);
         }
 
+        if (failure_) [[unlikely]] std::rethrow_exception(failure_);
         Waiter waiter{this};
         co_return co_await waiter;
     }
@@ -187,10 +225,11 @@ public:
     [[nodiscard]] size_t idleCount() const noexcept { return idle_.size(); }
     [[nodiscard]] size_t waiterCount() const noexcept { return waiters_.size(); }
 
-    /// No connection lent or connecting, no acquire waiting: no request is in
-    /// flight on the pool, whoever awaits it. Loop-thread only, like the above.
+    /// No connection lent or connecting, no acquire waiting or about to
+    /// resume: no request is in flight on the pool, whoever awaits it.
+    /// Loop-thread only, like the above.
     [[nodiscard]] bool quiescent() const noexcept {
-        return idle_.size() == total_ && waiters_.empty();
+        return idle_.size() == total_ && waiters_.empty() && waking_ == 0;
     }
 
     [[nodiscard]] const std::string& conninfo() const noexcept { return conninfo_; }
@@ -268,7 +307,7 @@ private:
     // for the slot and hand it over as a release does. A failed connect gives
     // the slot back; the waiters keep their acquire_timeout.
     void replenish() {
-        if (waiters_.empty() || total_ >= cfg_.max_connections) return;
+        if (waiters_.empty() || total_ >= limit_) return;
         ++total_;
         connectReplacement(this->shared_from_this());
     }
@@ -292,7 +331,7 @@ private:
             if (*it == w) {
                 waiters_.erase(it);  // linear — the wait queue is short
                 w->timed_out_ = true;
-                io_.post([h = w->continuation] { h.resume(); });
+                wake(w->continuation);
                 return;
             }
         }
@@ -300,11 +339,23 @@ private:
         // deadline — this should not even run; defensive no-op.
     }
 
+    // Resumes an acquire taken off the queue without a connection, on a turn
+    // of its own. Until it runs, the acquire is still in flight (quiescent()):
+    // a teardown must not destroy what it is about to unwind through.
+    void wake(std::coroutine_handle<> h) {
+        ++waking_;
+        io_.post([this, h] {
+            --waking_;
+            h.resume();
+        });
+    }
+
     struct Waiter {
         PgPool* pool;
         ConnectionType* conn = nullptr;  // handed over by release()
         std::coroutine_handle<> continuation{};
         bool timed_out_ = false;  // acquire_timeout fired before a connection arrived
+        std::exception_ptr error{};  // what failed the warm-up it waited for
         // Bounds the queue wait by acquire_timeout. It lives in the suspended
         // acquire() frame, which is never destroyed while queued here — the same
         // invariant the waiters_-stored `continuation` relies on — and disarms
@@ -330,6 +381,7 @@ private:
         ConnectionGuard await_resume() {
             if (timed_out_)
                 throw PgPoolTimeout("queue wait exceeded acquire_timeout");
+            if (error) std::rethrow_exception(error);
             assert(conn);
             return ConnectionGuard(pool->shared_from_this(), conn);
         }
@@ -339,6 +391,11 @@ private:
     std::string conninfo_;
     PgPoolConfig cfg_;
     size_t total_ = 0;
+    // Connections acquire() may open: none until warmUp() succeeds, so that
+    // every acquire waits for it; then max_connections.
+    size_t limit_ = 0;
+    std::exception_ptr failure_;  // what failed the warm-up, if it failed
+    size_t waking_ = 0;  // acquires taken off waiters_ whose resume is posted
 
     // acquire_timeout bounds queued acquires and connect handshakes;
     // query_timeout, every I/O wait of the pool's connections. Null = unbounded.

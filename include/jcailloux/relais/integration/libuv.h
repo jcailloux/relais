@@ -6,6 +6,7 @@
 //
 //   jcailloux::relais::io::LibuvIoContext io(loop);          // on the loop's thread
 //   auto relais = jcailloux::relais::attach(io, conninfo);   // from another thread
+//   auto relais = jcailloux::relais::attachHere(io, conninfo);  // or, on its thread
 //
 // relais binds to the thread that runs the loop, where repository calls then
 // run: one thread per loop, as libuv requires. With several loops, one per

@@ -4,6 +4,7 @@
 #include <cassert>
 #include <coroutine>
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <stdexcept>
@@ -32,8 +33,9 @@ namespace jcailloux::relais {
 // Initialization, once per loop, from another thread than the loop's:
 //   auto relais_on_loop = relais::attach(io, conninfo,
 //                             {.pool = {.min_connections = 4, .max_connections = 16}});
-// (runtime/Attach.h); io::IoPool does it for each of its loops. PgProvider::init
-// binds the calling loop thread to a pool created there.
+// (runtime/Attach.h), or relais::attachHere() on the loop's own thread, without
+// waiting; io::IoPool does it for each of its loops. PgProvider::init binds the
+// calling loop thread to a pool created there.
 //
 // Usage in repositories:
 //   auto result = co_await PgProvider::queryParams(sql, params);
@@ -213,6 +215,26 @@ public:
         post_ = [batcher](std::function<void()> cb) { batcher->post(std::move(cb)); };
     }
 
+    /// Make every PostgreSQL call on the calling thread throw `error`, for a
+    /// loop relais could not start on (attachHere()). post_ is kept: the loop
+    /// still runs.
+    static void bindFailure(std::exception_ptr error) {
+        pg_query_ = [error](const char*) -> io::Task<io::PgResult> {
+            std::rethrow_exception(error);
+        };
+        pg_query_params_ = [error](const char*, const io::PgParams&) -> io::Task<io::PgResult> {
+            std::rethrow_exception(error);
+        };
+        pg_entity_query_ = [error](const char*, const char*, const io::PgParams&)
+            -> io::Task<io::PgResult> { std::rethrow_exception(error); };
+        pg_entity_query_many_ = [error](const char*, const char*, std::vector<io::PgParams>)
+            -> io::Task<io::PgResult> { std::rethrow_exception(error); };
+        pg_write_ = [error](const char*, const io::PgParams&, io::batch::WriteMode,
+                            io::batch::detail::WriteAffinity) -> io::Task<io::batch::PgWriteResult> {
+            std::rethrow_exception(error);
+        };
+    }
+
     /// Reset all providers (for testing).
     static void reset() noexcept {
         pg_query_ = nullptr;
@@ -255,7 +277,7 @@ private:
         throw std::logic_error(std::string("PgProvider::") + entry
             + "() called on a thread relais is not attached to (relais binds each loop "
               "thread on its own): run it on a loop of an io::IoPool, or on a loop that "
-              "relais::attach() bound");
+              "relais::attach() or relais::attachHere() bound");
     }
 };
 

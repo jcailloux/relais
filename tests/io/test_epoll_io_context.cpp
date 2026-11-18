@@ -13,6 +13,9 @@
 #include <thread>
 #include <vector>
 
+#include <poll.h>
+#include <unistd.h>
+
 using namespace jcailloux::relais::io;
 using namespace std::chrono_literals;
 
@@ -330,4 +333,118 @@ TEST_CASE("EpollIoContext: a burst of posted callbacks leaves no memory held", "
     REQUIRE(ran == 100'000);
     const auto held = relais_test::threadAllocations().live_bytes - before;
     CHECK(held <= static_cast<std::int64_t>(2 * 1024 * sizeof(std::function<void()>)));
+}
+
+// -- driven through its descriptor, by another loop --------------------------
+
+namespace {
+
+// Whether fd turns readable within `timeout`.
+bool readable(int fd, std::chrono::milliseconds timeout = 0ms) {
+    pollfd pfd{fd, POLLIN, 0};
+    return ::poll(&pfd, 1, static_cast<int>(timeout.count())) == 1 && (pfd.revents & POLLIN);
+}
+
+// What another loop does: poll() each time fd() is readable, until it stays
+// quiet for `quiet`.
+int driveUntilQuiet(EpollIoContext& io, std::chrono::milliseconds quiet = 100ms) {
+    int polls = 0;
+    while (readable(io.fd(), quiet)) {
+        io.poll();
+        ++polls;
+    }
+    return polls;
+}
+
+}  // namespace
+
+TEST_CASE("EpollIoContext: a post from another thread makes fd() readable, and poll() runs it",
+          "[io][epoll][fd]") {
+    EpollIoContext io;
+    io.poll();  // this thread drives the loop
+    CHECK_FALSE(readable(io.fd()));
+    std::atomic<bool> ran{false};
+    std::thread([&] { io.post([&] { ran = true; }); }).join();
+    CHECK(readable(io.fd()));
+    io.poll();
+    CHECK(ran);
+    CHECK_FALSE(readable(io.fd()));
+}
+
+// Code of the other loop runs on this thread between two poll(): what it posts
+// or arms must show on fd(), which nothing else would make readable.
+TEST_CASE("EpollIoContext: a post on the loop thread between two turns makes fd() readable",
+          "[io][epoll][fd]") {
+    EpollIoContext io;
+    io.poll();
+    bool ran = false;
+    io.post([&] { ran = true; });
+    CHECK(readable(io.fd()));
+    io.poll();
+    CHECK(ran);
+    CHECK_FALSE(readable(io.fd()));
+}
+
+TEST_CASE("EpollIoContext: a timer armed on the loop thread between two turns makes fd() readable "
+          "when due", "[io][epoll][fd]") {
+    EpollIoContext io;
+    io.poll();
+    bool fired = false;
+    io.postDelayed(20ms, [&] { fired = true; });
+    CHECK_FALSE(readable(io.fd()));
+    CHECK(readable(io.fd(), 2000ms));
+    io.poll();
+    CHECK(fired);
+    CHECK_FALSE(readable(io.fd()));
+}
+
+// A callback run late in a turn posts again: nothing wakes the loop for it,
+// and only fd() can tell the other loop to call poll() once more.
+TEST_CASE("EpollIoContext: what a turn leaves queued keeps fd() readable", "[io][epoll][fd]") {
+    EpollIoContext io;
+    io.poll();
+    int left = 6;
+    std::function<void()> step = [&] {
+        if (--left > 0) io.post(step);
+    };
+    io.post(step);
+    driveUntilQuiet(io);
+    CHECK(left == 0);
+}
+
+// What a loop driven by run() saves: a post from inside a turn writes nothing
+// to the pipe, whoever drives the loop.
+TEST_CASE("EpollIoContext: a post from inside a turn issues no pipe wakeup", "[io][epoll][fd]") {
+    EpollIoContext io;
+    io.poll();
+    std::uint64_t before = 0, after = 0;
+    io.post([&] {
+        before = io.loopWakeups();
+        io.post([] {});
+        after = io.loopWakeups();
+    });
+    driveUntilQuiet(io);
+    CHECK(after == before);
+}
+
+TEST_CASE("EpollIoContext: a watched descriptor that stays readable keeps fd() readable",
+          "[io][epoll][fd]") {
+    EpollIoContext io;
+    int fds[2];
+    REQUIRE(::pipe(fds) == 0);
+    int calls = 0;
+    io.addWatch(fds[0], IoEvent::Read, [&](IoEvent) { ++calls; });  // never reads
+    io.poll();
+    CHECK_FALSE(readable(io.fd()));
+    char byte = 1;
+    REQUIRE(::write(fds[1], &byte, 1) == 1);
+    for (int i = 1; i <= 3; ++i) {
+        CHECK(readable(io.fd()));  // level-triggered: still there
+        io.poll();
+        CHECK(calls == i);
+    }
+    io.removeWatch(fds[0]);
+    CHECK_FALSE(readable(io.fd()));
+    ::close(fds[0]);
+    ::close(fds[1]);
 }

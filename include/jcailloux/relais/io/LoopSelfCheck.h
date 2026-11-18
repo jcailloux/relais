@@ -33,11 +33,16 @@ namespace jcailloux::relais::io::detail {
 //   - a removed watch is never called again (its socket turns readable, and a
 //     postDelayed callback closes the check a little later).
 //
-// Each step is bounded by one deadline, kTimeout from the start: a step still
-// awaited then fails, naming what the loop did not do. The check never adds or
-// removes a watch inside an event dispatch, and lets go of its socket pairs on
-// the loop even when it fails, through a posted task (a timer, when post() runs
-// in place); a loop that never runs that task keeps them.
+// Each step is bounded by one deadline, kTimeout from the start unless the
+// starting thread gives another: a step still awaited then fails, naming what
+// the loop did not do. The check never adds or removes a watch inside an event
+// dispatch, and lets go of its socket pairs on the loop even when it fails,
+// through a posted task (a timer, when post() runs in place); a loop that never
+// runs that task keeps them.
+//
+// The starting thread plays the part of a thread outside the loop: the one
+// attaching relais (attach), or one relais starts for the check, for a loop
+// whose own thread attaches relais (attachHere).
 template<IoContext Io>
 class LoopSelfCheck : public std::enable_shared_from_this<LoopSelfCheck<Io>> {
     using Clock = std::chrono::steady_clock;
@@ -49,14 +54,35 @@ public:
 
     LoopSelfCheck(Tag, Io& io) : io_(io) {}
 
-    // Starts the check on io's loop. Called from another thread than the loop's.
+    // Who starts the check, from another thread than the loop's.
+    enum class Starter {
+        Attaching,  // the thread attaching relais
+        Aside,      // a thread of relais's, for a loop whose own thread attaches it
+    };
+
+    // Starts the check on io's loop, bounded by kTimeout.
     static std::shared_ptr<LoopSelfCheck> start(Io& io) {
-        auto check = std::make_shared<LoopSelfCheck>(Tag{}, io);
-        check->caller_ = std::this_thread::get_id();
-        check->deadline_ = Clock::now() + kTimeout;
-        io.post([check] { check->firstPost(); });
-        io.post([check] { check->secondPost(); });
+        auto check = make(io, Starter::Attaching, kTimeout);
+        check->begin();
         return check;
+    }
+
+    // A check that begin() starts, on the starting thread, bounded by `timeout`.
+    static std::shared_ptr<LoopSelfCheck> make(Io& io, Starter starter,
+                                               std::chrono::milliseconds timeout) {
+        auto check = std::make_shared<LoopSelfCheck>(Tag{}, io);
+        check->starter_ = starter;
+        check->timeout_ = timeout;
+        return check;
+    }
+
+    // Starts the check, unless abandon() came first. Once, on the starting
+    // thread, which then waits for the check.
+    void begin() {
+        caller_ = std::this_thread::get_id();
+        deadline_ = Clock::now() + timeout_;
+        io_.post([self = this->shared_from_this()] { self->firstPost(); });
+        io_.post([self = this->shared_from_this()] { self->secondPost(); });
     }
 
     // Blocks until the check ends: nothing if the loop passed it, else what the
@@ -74,12 +100,30 @@ public:
         return failure_;
     }
 
+    // Ends the check at once, from the loop thread, outside an event dispatch:
+    // wait() returns `why`, and the check lets go of what it holds.
+    void abandon(std::string why) {
+        {
+            std::lock_guard lock(m_);
+            if (done_) return;  // what it held is let go already, or about to be
+            done_ = true;
+            failure_ = std::move(why);
+        }
+        cv_.notify_all();
+        letGo();
+    }
+
 private:
     enum class Step { Post, Readable, Writable, Rewatch, Quiet };
 
-    static const char* stalled(Step step) noexcept {
+    std::string stalled(Step step) const {
         switch (step) {
         case Step::Post:
+            if (starter_ == Starter::Aside) {
+                return "a callback posted from another thread did not run within "
+                       + std::to_string(timeout_.count())
+                       + " ms: the loop must keep running, and post() must wake it";
+            }
             return "a callback posted from another thread did not run within 1 s: the loop must "
                    "be running, on another thread than the one attaching relais, and post() "
                    "must wake it";
@@ -295,6 +339,8 @@ private:
 
     Io& io_;
     std::thread::id caller_;
+    Starter starter_ = Starter::Attaching;
+    std::chrono::milliseconds timeout_ = kTimeout;
     Clock::time_point deadline_;
 
     // Shared with the waiting thread.

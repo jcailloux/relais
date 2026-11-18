@@ -31,7 +31,11 @@ namespace jcailloux::relais::io {
 // Thread-safety model:
 // - post() and postDelayed() are safe to call from any thread
 // - All other methods must be called from the event loop thread
-// - The event loop wakes up via a pipe when post() is called from another thread
+// - The event loop wakes up via a pipe when post() is called from another
+//   thread, or from the loop thread between two turns
+//
+// Another loop can drive it through one descriptor: fd() turns readable when
+// there is work, and poll() does it without waiting.
 
 class EpollIoContext {
 public:
@@ -142,14 +146,13 @@ public:
             std::lock_guard lock(post_mutex_);
             post_queue_.push_back(std::move(cb));
         }
-        // Loop-local post needs no wakeup: a callback queued from the loop
-        // thread is drained within the current runOnce (its trailing
-        // drainPosted()) or, failing that, on the very next iteration —
-        // computeTimeout() returns 0 while post_queue_ is non-empty, so the loop
-        // never sleeps with work pending. The pipe write is only needed to
-        // interrupt a loop blocked in epoll_wait on another thread (cross-thread
-        // post). Mirrors the loop-local arm in postDelayed().
-        if (!isInLoopThread()) wakeLoop();
+        // A post from inside a turn needs no wakeup: the turn's trailing
+        // drainPosted() runs it, or else the next turn, which computeTimeout()
+        // or poll() keeps from waiting. Any other post writes the pipe: from
+        // another thread, it interrupts epoll_wait; from the loop thread
+        // between turns (a loop driven through fd()), it makes fd() readable.
+        // Mirrors postDelayed().
+        if (!isInLoopThread() || !in_turn_) wakeLoop();
     }
 
     /// Thread-safe: schedule a callback after a delay. Returns a token for cancellation.
@@ -162,12 +165,15 @@ public:
             auto it = timers_.emplace(deadline, TimerEntry{token, std::move(cb)});
             by_token_.emplace(token, it);
         }
-        // Loop-local arm needs no syscall: runOnce re-arms the timerfd via
-        // fireExpiredTimers()->rearmTimerfd() before its next epoll_wait, so a
-        // postDelayed issued on the loop thread is already accounted for. The
-        // pipe wakeup is only needed to interrupt a loop blocked in another
-        // thread (cross-thread arm).
-        if (!isInLoopThread()) wakeLoop();
+        // An arm from inside a turn costs no syscall here: the turn re-arms the
+        // timerfd (fireExpiredTimers()->rearmTimerfd()) before it ends. Between
+        // turns, the loop thread re-arms it now, so that fd() turns readable
+        // when the timer is due. Another thread wakes the loop, which re-arms it.
+        if (!isInLoopThread()) {
+            wakeLoop();
+        } else if (!in_turn_) {
+            rearmTimerfd();
+        }
         return token;
     }
 
@@ -227,9 +233,30 @@ public:
         return timers_.size();
     }
 
+    /// The epoll descriptor, readable while the loop has work: a callback
+    /// posted, a timer due, a watched descriptor ready. Another loop that
+    /// watches it for reading, level-triggered, calls poll() each time it is.
+    [[nodiscard]] int fd() const noexcept { return epoll_fd_; }
+
+    /// Runs what fd() reports, without waiting, and leaves fd() readable while
+    /// work remains. Always from the same thread, which is then the loop
+    /// thread.
+    void poll() {
+        runOnce(0);
+        // What the end of the turn queued, a turn of its own runs: fd() must
+        // say so.
+        bool pending;
+        {
+            std::lock_guard lock(post_mutex_);
+            pending = !post_queue_.empty();
+        }
+        if (pending) wakeLoop();
+    }
+
     /// Run one iteration of the event loop.
     void runOnce(int timeout_ms = 0) {
         loop_thread_.store(std::this_thread::get_id(), std::memory_order_relaxed);
+        TurnScope turn(in_turn_);
         drainPosted();
         fireExpiredTimers();
 
@@ -295,6 +322,21 @@ public:
     }
 
 private:
+    // Marks a turn, nested ones included (a callback that runs runOnce).
+    class TurnScope {
+    public:
+        explicit TurnScope(bool& in_turn) noexcept : in_turn_(in_turn), outer_(in_turn) {
+            in_turn_ = true;
+        }
+        ~TurnScope() { in_turn_ = outer_; }
+        TurnScope(const TurnScope&) = delete;
+        TurnScope& operator=(const TurnScope&) = delete;
+
+    private:
+        bool& in_turn_;
+        bool outer_;
+    };
+
     // epoll_data.u64 layout: high 32 bits = watch generation, low 32 = fd.
     static uint64_t packData(uint32_t gen, int fd) noexcept {
         return (static_cast<uint64_t>(gen) << 32) | static_cast<uint32_t>(fd);
@@ -443,6 +485,7 @@ private:
     std::atomic<uint64_t> wakeups_{0};
     std::atomic<bool> stopped_{false};
     std::atomic<std::thread::id> loop_thread_{};
+    bool in_turn_ = false;  // inside runOnce; loop thread only
 };
 
 static_assert(IoContext<EpollIoContext>);
