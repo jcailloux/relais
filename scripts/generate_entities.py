@@ -931,9 +931,9 @@ class MappingGenerator:
             lines.append("")
             lines.extend(self._generate_to_update_params(entity))
 
-        # dynamicSize (heap memory for strings/vectors)
+        # heapBytes (what the members own on the heap)
         lines.append("")
-        lines.extend(self._generate_dynamic_size(entity))
+        lines.extend(self._generate_heap_bytes(entity))
 
         # Glaze metadata template
         lines.append("")
@@ -1306,43 +1306,37 @@ class MappingGenerator:
     # Glaze metadata (variable template inside Mapping)
     # =========================================================================
 
-    def _generate_dynamic_size(self, entity: ParsedEntity) -> list[str]:
-        """Generate dynamicSize() — heap memory used by dynamic fields (strings, vectors, raw_json).
+    def _generate_heap_bytes(self, entity: ParsedEntity) -> list[str]:
+        """Generate heapBytes() — what the members own on the heap, for the L1 byte count.
 
-        Uses heapCapacity() for std::string to exclude SSO buffer (already in sizeof).
+        Every member is counted by jcailloux::relais::detail::heapBytes, json_field members
+        included, except fundamental types and enums, which own nothing. A
+        member whose type heapBytes has no rule for does not compile, so none
+        is silently counted as 0.
         """
         a = entity.annotation
-        hc = "jcailloux::relais::entity::detail::heapCapacity"
-        # Collect fields with dynamic heap allocations
-        dynamic_fields = []
+        counted = []
         for m in entity.members:
-            # json_field members are glaze-serialized (their heap is not tracked here,
-            # matching prior behavior) — skip before the generic std::vector<> branch,
-            # which is for native array columns (bytea, T[]) only.
-            if m.name in a.json_fields:
+            if m.inner_type in self._FUNDAMENTAL_TYPES:
                 continue
-            if m.cpp_type == "std::string":
-                dynamic_fields.append(f"{hc}(s.{m.name})")
-            elif m.cpp_type == "std::optional<std::string>":
-                dynamic_fields.append(f"(s.{m.name} ? {hc}(*s.{m.name}) : 0)")
-            elif m.cpp_type.startswith("std::vector<"):
-                elem = self._qualify_cpp_type(m.cpp_type[len("std::vector<"):-1].strip(), entity)
-                dynamic_fields.append(f"s.{m.name}.capacity() * sizeof({elem})")
-            elif m.is_optional and m.inner_type.startswith("std::vector<"):
-                elem = self._qualify_cpp_type(m.inner_type[len("std::vector<"):-1].strip(), entity)
-                dynamic_fields.append(f"(s.{m.name} ? s.{m.name}->capacity() * sizeof({elem}) : 0)")
-            elif m.is_raw_json:
-                dynamic_fields.append(f"{hc}(s.{m.name}.str)")
-
-        if not dynamic_fields:
-            return []
+            if self._find_enum_mapping(a, m.name):
+                continue
+            counted.append(f"d::heapBytes(s.{m.name})")
 
         struct_fqn = f"{entity.namespace}::{entity.class_name}" if entity.namespace else entity.class_name
+        if not counted:
+            return [
+                f"    static size_t heapBytes(const {struct_fqn}&) {{ return 0; }}",
+            ]
         lines = [
-            f"    static size_t dynamicSize(const {struct_fqn}& s) {{",
-            f"        return {' + '.join(dynamic_fields)};",
-            f"    }}",
+            f"    static size_t heapBytes(const {struct_fqn}& s) {{",
+            "        namespace d = jcailloux::relais::detail;",
+            f"        return {counted[0]}",
         ]
+        for c in counted[1:]:
+            lines.append(f"            + {c}")
+        lines[-1] += ";"
+        lines.append("    }")
         return lines
 
     def _generate_glaze_value(self, entity: ParsedEntity) -> list[str]:

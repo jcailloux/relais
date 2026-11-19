@@ -358,6 +358,14 @@ struct TestInternals {
         jcailloux::relais::cache::GDSFPolicy::instance().reset();
     }
 
+    /// Bytes recorded so far in the histogram the sweep is building.
+    static uint64_t buildingHistogramBytes() {
+        uint64_t total = 0;
+        for (auto b : jcailloux::relais::cache::GDSFPolicy::instance().building_histogram_.bytes)
+            total += b;
+        return total;
+    }
+
     /// Ticks counted toward the maintenance sweep since the last reset.
     static uint32_t sweepTicks() {
         return jcailloux::relais::cache::GDSFPolicy::instance()
@@ -403,7 +411,26 @@ struct TestInternals {
         return m;
     }
 
-    /// Compute the GDSF score for a cached entity (access_count x avg_cost / memoryUsage).
+    /// The L1 map of a repo's entities (its CacheEntry, entryBytes, constants).
+    template<typename Repo>
+    using EntityMap = typename std::remove_reference_t<decltype(Repo::tier())>::Map;
+
+    /// The L1 tier of a repo's entities.
+    template<typename Repo>
+    using EntityTier = std::remove_reference_t<decltype(Repo::tier())>;
+
+    /// Bytes counted for a cached entity's entry, as the sweep reads them
+    /// (stored in the header or recomputed). nullopt if not cached.
+    template<typename Repo, typename Key>
+    static std::optional<size_t> entityEntryBytes(const Key& key) {
+        auto result = Repo::cache().find(key);
+        auto* ce = result ? result.asReal() : nullptr;
+        if (!ce) return std::nullopt;
+        return ce->bytes();
+    }
+
+    /// Compute the GDSF score for a cached entity, as the sweep does
+    /// (access_count x avg_cost / bytes the entry costs).
     /// Returns nullopt if the entity is not in cache.
     template<typename Repo, typename Key>
     static std::optional<float> getEntityGDSFScore(const Key& key) {
@@ -414,11 +441,10 @@ struct TestInternals {
         if (!ce) return std::nullopt;
 
         auto& meta = ce->metadata;
-        auto& value = ce->value;
         if constexpr (requires { meta.access_count; }) {
+            using TierType = std::remove_reference_t<decltype(Repo::tier())>;
             float avg_cost = Repo::avgConstructionTime();
-            size_t mem = value.memoryUsage();
-            return meta.computeScore(avg_cost, mem);
+            return meta.computeScore(avg_cost, TierType::scoredBytes(ce->bytes()));
         } else {
             return 0.0f;
         }

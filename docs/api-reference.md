@@ -717,7 +717,7 @@ The public surface (namespace `jcailloux::relais`):
 | `fromJson()` | `static std::optional<Entity> fromJson(std::string_view)` | `nullopt` on empty/parse error. |
 | `binary()` | `std::vector<uint8_t> binary() const` | On-demand Glaze BEVE. Empty vector on write error. |
 | `fromBinary()` | `static std::optional<Entity> fromBinary(std::span<const uint8_t>)` | `nullopt` on empty/parse error. |
-| `memoryUsage()` | `size_t memoryUsage() const` | `sizeof(*this)` plus `Mapping::dynamicSize(*this)` when available. Feeds GDSF byte accounting. |
+| `memoryUsage()` | `size_t memoryUsage() const` | `sizeof(*this)` plus what the members own on the heap (`Mapping::heapBytes`), `json_field` members included. Feeds GDSF byte accounting. |
 | `Field` | `using Field = TraitsType::Field` | The field enum used as the NTTP `F` in partial updates. |
 | `MappingType` | `using MappingType = Mapping` | Exposed for concept detection (`HasListDescriptor`, `HasFilterSet`, `HasPartitionHint`). |
 | `TraitsType` | `using TraitsType = Mapping::TraitsType` | Field metadata (`FieldInfo<F>`). |

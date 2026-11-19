@@ -943,7 +943,7 @@ class Entity : public Struct {
     auto key() const { return Mapping::key(*this); }
     static std::optional<Entity> fromRow(const io::PgResult::Row&);   // -> Mapping
     static io::PgParams toInsertParams(const Entity&);                // -> Mapping
-    size_t memoryUsage() const;                  // struct + Mapping::dynamicSize
+    size_t memoryUsage() const;                  // struct + Mapping::heapBytes
 
     // On-demand serialization — allocates each call, returns BY VALUE:
     std::vector<uint8_t> binary() const;         // glz::write_beve
@@ -1098,11 +1098,11 @@ jcailloux::relais::                       # Repo, Entity<Struct, Mapping>, entit
                                           # FdAttachment, async
 jcailloux::relais::detail::               # PgRepo, LocalRepo, ListMixin, InvalidationMixin,
                                           # RecheckGuard, propagateCreate/Update/Delete, type traits,
-                                          # LoopBinding
+                                          # LoopBinding, heapBytes()
 jcailloux::relais::config::               # CacheConfig, CacheLevel, UpdateStrategy,
                                           # Duration, FixedString, presets
 jcailloux::relais::entity::               # set/setNull/increment/decrement/nowPlus, guards, ordering
-jcailloux::relais::entity::detail::       # heapCapacity(), MappedEnumCodec, patch SQL extractors
+jcailloux::relais::entity::detail::       # MappedEnumCodec, patch SQL extractors
 jcailloux::relais::cache::                # CacheView, MultiView, MetricsSnapshot, GDSFPolicy
 jcailloux::relais::cache::detail::        # CacheTier, ChunkMap, CacheMetadata, TaggedEntry,
                                           # PendingLane, ScoreHistogram, counters

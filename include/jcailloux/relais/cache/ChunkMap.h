@@ -5,7 +5,9 @@
 #include <atomic>
 #include <bit>
 #include <concepts>
+#include <cstdint>
 #include <cstring>
+#include <limits>
 #include <tuple>
 #include <type_traits>
 #include <variant>
@@ -16,6 +18,7 @@
 
 #include "jcailloux/relais/cache/GDSFPolicy.h"
 #include "jcailloux/relais/cache/TaggedEntry.h"
+#include "jcailloux/relais/HeapBytes.h"
 
 #ifdef RELAIS_BUILDING_TESTS
 namespace relais_test { struct TestInternals; }
@@ -29,6 +32,10 @@ namespace jcailloux::relais::cache::detail {
 
 template<typename T>
 concept Mergeable = requires(T& a, const T& b) { a.mergeFrom(b); };
+
+/// An entry's byte count, kept in its header when that costs no space.
+struct StoredBytes { uint32_t bytes = 0; };
+struct NoStoredBytes {};
 
 // =============================================================================
 // Fast hashing — splitmix64 for integers, wyhash for strings/bytes
@@ -126,7 +133,7 @@ struct AutoHash<std::tuple<Ts...>> {
 
 
 // =============================================================================
-// ChunkMap<K, V, Metadata, HasGhost> — lock-free hash map with epoch-based reclamation
+// ChunkMap<K, V, Metadata, HasGhost, CountsBytes> — lock-free hash map with epoch-based reclamation
 //
 // Wraps ParlayHash (lock-free concurrent hash map) with:
 // - epoch::memory_pool<CacheEntry> for safe deferred destruction
@@ -145,20 +152,89 @@ struct AutoHash<std::tuple<Ts...>> {
 
 template<typename K, typename V, typename Metadata = std::monostate,
          bool HasGhost = false,
+         bool CountsBytes = false,
          typename Hash = AutoHash<K>>
 class ChunkMap {
+    // The entry's layout with and without a stored byte count, to keep the
+    // count only where it fits in padding.
+    struct HeaderWithoutBytes { [[no_unique_address]] Metadata metadata; };
+    struct EntryWithoutBytes : HeaderWithoutBytes { V value; };
+    struct HeaderWithBytes {
+        [[no_unique_address]] Metadata metadata;
+        [[no_unique_address]] StoredBytes stored_bytes;
+    };
+    struct EntryWithBytes : HeaderWithBytes { V value; };
+
 public:
+    /// Whether entries are counted in bytes: set by a GDSF tier, the only
+    /// kind whose bytes the eviction budget reads.
+    static constexpr bool kCountsBytes = CountsBytes;
+
+    /// The byte count is stored in the header when that leaves the entry's
+    /// size unchanged, and recomputed from the value otherwise.
+    static constexpr bool kStoresBytes =
+        kCountsBytes && sizeof(EntryWithBytes) == sizeof(EntryWithoutBytes);
+
     // Base: metadata accessible without downcast
     struct EntryHeader {
         [[no_unique_address]] Metadata metadata;
+        [[no_unique_address]] std::conditional_t<kStoresBytes, StoredBytes, NoStoredBytes>
+            stored_bytes{};
     };
 
     // Real entry: inherits EntryHeader, adds value
     struct CacheEntry : EntryHeader {
         V value;
         CacheEntry(V v, Metadata m)
-            : EntryHeader{std::move(m)}, value(std::move(v)) {}
+            : EntryHeader{std::move(m)}, value(std::move(v)) {
+            if constexpr (kStoresBytes) {
+                this->stored_bytes.bytes = static_cast<uint32_t>(std::min<size_t>(
+                    entryBytes(value), std::numeric_limits<uint32_t>::max()));
+            }
+        }
+
+        /// The bytes this entry takes, entryBytes(value): read from the header
+        /// or recomputed. A cached value never changes (a write stores a new
+        /// entry), so both give the same count for the entry's whole life.
+        [[nodiscard]] size_t bytes() const {
+            if constexpr (kStoresBytes) return this->stored_bytes.bytes;
+            else return entryBytes(value);
+        }
     };
+
+    static_assert(sizeof(CacheEntry) == sizeof(EntryWithoutBytes),
+                  "a stored byte count must not make the entry bigger");
+
+private:
+    // What the epoch pool allocates for one entry: the entry, plus guard words
+    // around it when parlay checks its pool (EpochMemCheck, builds without NDEBUG).
+#ifdef EpochMemCheck
+    struct PooledEntry { long pad; std::atomic<long> head; CacheEntry entry; std::atomic<long> tail; };
+#else
+    struct PooledEntry { CacheEntry entry; };
+#endif
+
+public:
+    /// Bytes the pool allocates for one entry beyond its value, one malloc of
+    /// sizeof(PooledEntry) per entry:
+    ///   - the header: the metadata, and the stored byte count when it fits;
+    ///   - the padding that aligns the value after the header;
+    ///   - the pool's guard words, when parlay checks its pool.
+    static constexpr size_t kEntryOverhead = sizeof(PooledEntry) - sizeof(V);
+
+    /// Bytes a key takes in the table, beside its entry: parlay stores the key
+    /// and the entry's tagged pointer side by side in a bucket. Exact for a key
+    /// stored inline (K and TaggedEntry trivially copyable); a key parlay keeps
+    /// behind a pointer (std::string, std::tuple) also costs the node it points
+    /// to and the key's own heap, which this does not count.
+    static constexpr size_t kBucketSlotSize = sizeof(K) + sizeof(TaggedEntry);
+
+    /// The bytes an entry holding `v` takes: its pool block (overhead and
+    /// value) and what the value owns on the heap. Admission, score, eviction
+    /// histogram and stored count all use this one formula.
+    [[nodiscard]] static size_t entryBytes(const V& v) {
+        return kEntryOverhead + sizeof(V) + relais::detail::heapBytes(v);
+    }
 
     struct FindResult {
         TaggedEntry tagged{};

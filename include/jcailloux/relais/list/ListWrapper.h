@@ -13,6 +13,7 @@
 
 #include "jcailloux/relais/io/pg/PgResult.h"
 #include "jcailloux/relais/entity/Format.h"
+#include "jcailloux/relais/HeapBytes.h"
 
 namespace jcailloux::relais::list {
 
@@ -92,17 +93,12 @@ public:
     // Memory tracking
     // =========================================================================
 
-    /// Approximate heap memory used by this list (items + cursors).
+    /// The bytes this page holds: the object, the item array at its capacity,
+    /// what each item owns on the heap, and the cursor's heap.
     [[nodiscard]] size_t memoryUsage() const {
-        size_t size = sizeof(*this);
-        size += items.capacity() * sizeof(Item);
-        for (const auto& item : items) {
-            if constexpr (requires(const Item& i) { i.memoryUsage(); }) {
-                size += item.memoryUsage() - sizeof(Item);
-            }
-        }
-        size += next_cursor.capacity();
-        return size;
+        return sizeof(*this)
+            + relais::detail::heapBytes(items)
+            + relais::detail::heapBytes(next_cursor);
     }
 
     // =========================================================================

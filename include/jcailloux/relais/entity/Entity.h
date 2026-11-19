@@ -13,18 +13,7 @@
 #include "jcailloux/relais/io/pg/PgResult.h"
 #include "jcailloux/relais/io/pg/PgParams.h"
 #include "jcailloux/relais/entity/Format.h"
-
-namespace jcailloux::relais::entity::detail {
-
-/// Heap capacity of a std::string, excluding SSO buffer (already in sizeof).
-/// Portable: checks if data() points outside the string object.
-inline size_t heapCapacity(const std::string& s) {
-    const char* p = s.data();
-    const char* obj = reinterpret_cast<const char*>(&s);
-    return (p < obj || p >= obj + sizeof(std::string)) ? s.capacity() : 0;
-}
-
-}  // namespace jcailloux::relais::entity::detail
+#include "jcailloux/relais/HeapBytes.h"
 
 namespace jcailloux::relais {
 
@@ -100,13 +89,16 @@ public:
 
     using MappingType = Mapping;
 
-    /// Approximate heap memory used by this entity (struct + dynamic fields).
+    /// The bytes this entity holds: the object, plus what its members own on
+    /// the heap. Generated mappings count member by member; a hand-written one
+    /// without heapBytes is counted through glaze's reflection of the struct.
     [[nodiscard]] size_t memoryUsage() const {
-        size_t size = sizeof(*this);
-        if constexpr (requires(const Struct& s) { Mapping::dynamicSize(s); }) {
-            size += Mapping::dynamicSize(static_cast<const Struct&>(*this));
+        const auto& s = static_cast<const Struct&>(*this);
+        if constexpr (requires { Mapping::heapBytes(s); }) {
+            return sizeof(*this) + Mapping::heapBytes(s);
+        } else {
+            return sizeof(*this) + ::jcailloux::relais::detail::heapBytes(s);
         }
-        return size;
     }
 
     // =========================================================================

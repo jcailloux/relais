@@ -16,8 +16,9 @@
 namespace relais_test {
 
 struct Allocations {
-    std::uint64_t count = 0;      // allocations made so far
-    std::int64_t live_bytes = 0;  // allocated, less what this thread freed
+    std::uint64_t count = 0;            // allocations made so far
+    std::int64_t live_bytes = 0;        // allocated, less what this thread freed
+    std::uint64_t requested_bytes = 0;  // bytes asked for so far, before rounding
 };
 
 inline constinit thread_local Allocations tl_allocations{};
@@ -32,6 +33,7 @@ void* operator new(std::size_t size) {
     if (p == nullptr) throw std::bad_alloc();
     auto& counted = relais_test::tl_allocations;
     ++counted.count;
+    counted.requested_bytes += size;
     counted.live_bytes += static_cast<std::int64_t>(malloc_usable_size(p));
     return p;
 }

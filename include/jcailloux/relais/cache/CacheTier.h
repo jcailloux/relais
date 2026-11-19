@@ -1,6 +1,7 @@
 #ifndef JCX_RELAIS_CACHE_CACHETIER_H
 #define JCX_RELAIS_CACHE_CACHETIER_H
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <bit>
@@ -46,12 +47,6 @@ concept Expirable = requires(const M& m, uint32_t now_sec) {
     { m.isExpired(now_sec) } -> std::same_as<bool>;
 };
 
-/// Value that can report its memory usage.
-template<typename V>
-concept MemoryTrackable = requires(const V& v) {
-    { v.memoryUsage() } -> std::convertible_to<size_t>;
-};
-
 // =============================================================================
 // CacheTier<Key, Value, Metadata> — unified L1 cache with GDSF + ghosts
 // =============================================================================
@@ -69,7 +64,8 @@ concept MemoryTrackable = requires(const V& v) {
 // Feature detection:
 //   - GDSFAware<Metadata>      → ghost entries, admission control, GDSF scoring
 //   - Expirable<Metadata>      → TTL expiration checks
-//   - MemoryTrackable<Value>   → memory-aware GDSF scoring
+//
+// With GDSF, an entry is counted in bytes by Map::entryBytes (see ChunkMap).
 //
 
 template<typename Key, typename Value, typename Metadata>
@@ -80,24 +76,17 @@ public:
     static constexpr bool kHasTTL = Expirable<Metadata>;
     static constexpr bool kHasCleanup = kHasGDSF || kHasTTL;
 
-    using Map = ChunkMap<Key, Value, Metadata, kHasGhosts>;
+    using Map = ChunkMap<Key, Value, Metadata, kHasGhosts, /*CountsBytes=*/kHasGDSF>;
 
-    // --- Entry overhead constants ---
+    /// Bytes a key takes in the table, beside its entry (see ChunkMap).
+    static constexpr size_t kBucketSlotSize = Map::kBucketSlotSize;
 
-    template<typename T>
-    struct EpochWrapperMirror_ { T value; };
-
-    static constexpr size_t kEpochWrapperOverhead =
-        sizeof(EpochWrapperMirror_<typename Map::CacheEntry>)
-        - sizeof(typename Map::CacheEntry);
-
-    /// Overhead per live entry beyond the Value itself.
-    static constexpr size_t kEntryOverhead =
-        sizeof(typename Map::CacheEntry) - sizeof(Value) + kEpochWrapperOverhead;
-
-    /// Bucket slot size in the hash map (for score denominator).
-    static constexpr size_t kBucketSlotSize =
-        sizeof(Key) + sizeof(TaggedEntry);
+    /// The bytes an entry costs the cache, the denominator of its score: the
+    /// entry and its slot in the table. A value is weighed the same when it is
+    /// admitted, when it is swept, and when it waits as a ghost.
+    [[nodiscard]] static size_t scoredBytes(size_t entry_bytes) {
+        return entry_bytes + kBucketSlotSize;
+    }
 
     // =========================================================================
     // Hit — result of a cache lookup
@@ -360,7 +349,7 @@ public:
                             return ghostCleanupPred(key, te, ctx);
                         auto* ce = static_cast<typename Map::CacheEntry*>(
                             te.template asReal<typename Map::EntryHeader>());
-                        return realCleanupPred(key, ce->metadata, ce->value, ctx)
+                        return realCleanupPred(key, *ce, ctx)
                             || extra(key, ce->metadata, ce->value, chunk_id);
                     });
             } else {
@@ -368,7 +357,7 @@ public:
                     [this, &ctx, &extra, chunk_id](const Key& key, auto te) {
                         auto* ce = static_cast<typename Map::CacheEntry*>(
                             te.template asReal<typename Map::EntryHeader>());
-                        return realCleanupPred(key, ce->metadata, ce->value, ctx)
+                        return realCleanupPred(key, *ce, ctx)
                             || extra(key, ce->metadata, ce->value, chunk_id);
                     });
             }
@@ -419,7 +408,7 @@ public:
                                 return ghostCleanupPred(key, te, ctx);
                             auto* ce = static_cast<typename Map::CacheEntry*>(
                                 te.template asReal<typename Map::EntryHeader>());
-                            return realCleanupPred(key, ce->metadata, ce->value, ctx)
+                            return realCleanupPred(key, *ce, ctx)
                                 || extra(key, ce->metadata, ce->value, chunk_id);
                         });
                 }
@@ -428,7 +417,7 @@ public:
                     [this, &ctx, &extra](const Key& key, auto te) {
                         auto* ce = static_cast<typename Map::CacheEntry*>(
                             te.template asReal<typename Map::EntryHeader>());
-                        return realCleanupPred(key, ce->metadata, ce->value, ctx)
+                        return realCleanupPred(key, *ce, ctx)
                             || extra(key, ce->metadata, ce->value, long{-1});
                     });
             }
@@ -691,15 +680,8 @@ private:
 
             auto& policy = GDSFPolicy::instance();
 
-            // Compute estimated bytes (independent of ghost lookup)
-            size_t mem = 0;
-            if constexpr (MemoryTrackable<Value>) {
-                mem = opt->memoryUsage();
-            } else {
-                mem = sizeof(Value);
-            }
-            uint32_t est_bytes = static_cast<uint32_t>(
-                mem + kEntryOverhead + kBucketSlotSize);
+            // What the entry would cost (independent of ghost lookup)
+            uint32_t est_bytes = saturate32(scoredBytes(Map::entryBytes(*opt)));
             uint8_t est_flags = 0;
 
             // Lookup existing ghost — scoped to release EpochGuard before
@@ -779,13 +761,19 @@ private:
         }
     }
 
+    /// A byte count as a uint32_t, saturated.
+    static uint32_t saturate32(size_t n) {
+        return static_cast<uint32_t>(std::min<size_t>(n, UINT32_MAX));
+    }
+
     // =========================================================================
     // Cleanup predicates
     // =========================================================================
 
     /// Real entry cleanup: decay + score + histogram + TTL.
-    bool realCleanupPred(const Key& key, const Metadata& meta,
-                          const Value& value, CleanupContext& ctx) {
+    bool realCleanupPred(const Key& key, const typename Map::CacheEntry& entry,
+                          CleanupContext& ctx) {
+        const Metadata& meta = entry.metadata;
         if constexpr (kHasGDSF) {
             auto& gdsf = const_cast<Metadata&>(meta).gdsfData();
 
@@ -797,21 +785,14 @@ private:
                 std::memory_order_relaxed);
 
             // Score
-            size_t mem = 0;
-            if constexpr (MemoryTrackable<Value>) {
-                mem = value.memoryUsage();
-            } else {
-                mem = sizeof(Value);
-            }
+            size_t entry_bytes = entry.bytes();
+            size_t scored = scoredBytes(entry_bytes);
             float avg_cost = avg_cost_us_.load(std::memory_order_relaxed);
-            float score = gdsf.computeScore(avg_cost, mem + kBucketSlotSize);
+            float score = gdsf.computeScore(avg_cost, scored);
 
-            // Histogram — when ghost candidates are active, only count the
-            // freeable portion (real entry minus the bucket slot that stays).
-            size_t freeable = ctx.ghost_candidates
-                ? (mem - std::min(mem, kBucketSlotSize))
-                : mem;
-            GDSFPolicy::instance().recordEntry(score, freeable);
+            // Histogram: what evicting the entry frees. Its slot in the table
+            // stays, taken by a ghost or left in the bucket array.
+            GDSFPolicy::instance().recordEntry(score, entry_bytes);
 
             // TTL
             if constexpr (kHasTTL) {
@@ -822,7 +803,7 @@ private:
             if (score < ctx.threshold) {
                 if (ctx.ghost_candidates) {
                     ctx.ghost_candidates->push_back({key, old_count,
-                        static_cast<uint32_t>(mem), 0});
+                        saturate32(scored), 0});
                 }
                 return true;
             }

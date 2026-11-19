@@ -306,8 +306,8 @@ For each entity the generator produces, inside `entity::generated`:
   `fromRow`/`toInsertParams`/`key`, a `RowView` + `rowToJson`/`rowToBeve` for
   zero-copy serialization, `TraitsType` (the `Field` enum + `FieldInfo` for
   `patch`), a `{Field}Codec` per mapped enum field (the DB↔enum mapping,
-  used by rows, writes, filters and sorts), and — only when the entity has a heap field (string/vector/raw_json)
-  — `dynamicSize` for memory accounting.
+  used by rows, writes, filters and sorts), and `heapBytes`, what the
+  members own on the heap, for the L1 byte count.
 - **`{Class}Entity`** — the `Entity<Struct, Mapping>` alias (public API type).
 - **Assigned-PK entities (PK not `db_managed`, ≥1 non-PK column)** — `SQL::upsert`
   (`INSERT … ON CONFLICT (pk) DO UPDATE SET …=EXCLUDED.… RETURNING …`) and

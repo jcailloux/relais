@@ -298,6 +298,9 @@ if(RELAIS_BUILD_TESTS)
     relais_add_compile_fail_test(compile_fail_is_null_non_optional
         tests/compile_fail/is_null_non_optional.cpp
         "IS_NULL filter requires a std::optional member")
+    relais_add_compile_fail_test(compile_fail_heap_bytes_unsupported
+        tests/compile_fail/heap_bytes_unsupported.cpp
+        "heapBytes: no rule counts the heap this type owns")
     relais_add_generator_reject_test(generator_rejects_is_null_non_optional
         ${PROJECT_SOURCE_DIR}/tests/generator/is_null_non_optional
         "is_null requires a std::optional member")
@@ -334,6 +337,9 @@ if(RELAIS_BUILD_TESTS)
     relais_add_test(test_relais_conditional_writes tests/relais/test_conditional_writes.cpp DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;conditional" RESOURCE_LOCK)
     relais_add_test(test_relais_conditional_contention tests/relais/test_conditional_writes_contention.cpp DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;integration;db;conditional;concurrency" RESOURCE_LOCK)
     relais_add_test(test_relais_gdsf          tests/relais/test_gdsf.cpp                DEFINITIONS RELAIS_BUILDING_TESTS "RELAIS_GDSF_ENABLED=1" LABELS "relais;integration;db;gdsf"             RESOURCE_LOCK)
+    # Sees the entry pool's malloc calls: linked with --wrap=malloc.
+    relais_add_test(test_relais_entry_layout  tests/relais/test_entry_layout.cpp        LABELS "relais;gdsf")
+    target_link_options(test_relais_entry_layout PRIVATE -Wl,--wrap=malloc)
     if(NOT RELAIS_GDSF_ENABLED)
         relais_add_test(test_relais_gdsf_disabled tests/relais/test_gdsf_disabled.cpp       DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;gdsf")
     endif()
@@ -529,6 +535,7 @@ if(RELAIS_BUILD_TESTS)
             test_relais_upsert
             test_relais_gdsf
             test_relais_gdsf_disabled
+            test_relais_entry_layout
         COMMENT "Build all relais integration tests"
     )
 

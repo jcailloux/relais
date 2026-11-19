@@ -18,6 +18,7 @@
  * 16b. size() live count excludes ghosts
  *  17. Eviction selectivity    — hot/cold, score formula
  *  19. Cross-repo sweep coordination
+ *  20. Entry bytes             — exact size of an entry, stored or recomputed
  */
 
 #include <catch2/catch_test_macros.hpp>
@@ -25,9 +26,22 @@
 #include <cstdint>
 #include <vector>
 
+#include <array>
+#include <chrono>
+#include <map>
+#include <set>
+#include <string>
+#include <string_view>
+#include <tuple>
+#include <unordered_map>
+#include <unordered_set>
+#include <variant>
+
 #include "fixtures/test_helper.h"
 #include "fixtures/TestRepositories.h"
 #include "fixtures/RelaisTestAccessors.h"
+#include "fixtures/AllocationCounter.h"
+#include "fixtures/generated/TestOrderEntity.h"
 
 using namespace relais_test;
 using GDSFPolicy = jcailloux::relais::cache::GDSFPolicy;
@@ -955,4 +969,371 @@ TEST_CASE("GDSF - cross-repo sweep coordination",
 
     // Cleanup
     resetRepos<GDSFCoordRepo1, GDSFCoordRepo2>();
+}
+
+
+// #############################################################################
+//
+//  20. Entry bytes — what one L1 entry holds
+//
+// #############################################################################
+
+namespace {
+
+using jcailloux::relais::detail::heapBytes;
+using TestOrderEntity = ::entity::generated::TestOrderEntity;
+using TestArrayRwEntity = ::entity::generated::TestArrayRwEntity;
+using ItemPage = jcailloux::relais::list::ListWrapper<TestItemEntity>;
+
+// 40 characters: past libstdc++'s 15-character inline buffer, so on the heap
+// with capacity 40, and 41 bytes allocated (the terminator included).
+const std::string kLong(40, 'x');
+constexpr size_t kLongBytes = 41;
+
+relais_test::TestAddress makeAddress() {
+    relais_test::TestAddress a;
+    a.street = kLong;                  // 41
+    a.city = "Paris";                  // inline: 0
+    a.zip_code = "75001";              // inline: 0
+    a.geo.metadata.source = kLong;     // 41, two structs down
+    return a;
+}
+constexpr size_t kAddressBytes = 2 * kLongBytes;
+
+/// A struct glaze sees through an explicit glz::meta object.
+struct MetaListed { std::string label; int32_t rank = 0; std::vector<std::string> notes; };
+
+/// An entity whose mapping is written by hand, without heapBytes: its
+/// members are counted through glaze's reflection of the struct.
+struct Note { int64_t id = 0; std::string text; std::vector<std::string> tags; };
+struct NoteMapping {
+    static constexpr bool read_only = true;
+    struct TraitsType { enum class Field : uint8_t {}; };
+    template<typename E> static auto key(const E& e) noexcept { return e.id; }
+    template<typename E>
+    static std::optional<E> fromRow(const jcailloux::relais::io::PgResult::Row&) { return std::nullopt; }
+    template<typename E>
+    static jcailloux::relais::io::PgParams toInsertParams(const E&) { return {}; }
+    template<typename T>
+    static constexpr auto glaze_value = glz::object("id", &T::id, "text", &T::text, "tags", &T::tags);
+};
+using NoteEntity = jcailloux::relais::Entity<Note, NoteMapping>;
+
+template<typename Mapping, typename Struct>
+concept MappingCountsHeap = requires(const Struct& s) { Mapping::heapBytes(s); };
+
+/// The bytes a copy of `v` asks the allocator for: a copy allocates exactly
+/// its final storage, at the copy's own capacities.
+template<typename T>
+std::pair<size_t, size_t> allocatedAndCounted(const T& v) {
+    auto before = relais_test::threadAllocations().requested_bytes;
+    T copy = v;
+    auto asked = relais_test::threadAllocations().requested_bytes - before;
+    return {static_cast<size_t>(asked), heapBytes(copy)};
+}
+
+/// The bytes a value asks the allocator for while `make` builds it, with no
+/// free in between: unlike a copy, it keeps capacities beyond the size.
+template<typename Make>
+std::pair<size_t, size_t> builtAndCounted(Make make) {
+    auto before = relais_test::threadAllocations().requested_bytes;
+    auto v = make();
+    auto asked = relais_test::threadAllocations().requested_bytes - before;
+    return {static_cast<size_t>(asked), heapBytes(v)};
+}
+
+}  // namespace
+
+template<>
+struct glz::meta<MetaListed> {
+    using T = MetaListed;
+    static constexpr auto value = glz::object("label", &T::label, "rank", &T::rank, "notes", &T::notes);
+};
+
+TEST_CASE("Entry bytes - heapBytes counts every byte a value owns",
+          "[gdsf][entry-bytes]")
+{
+    SECTION("[entry-bytes] strings: inline when short, capacity + 1 on the heap") {
+        REQUIRE(kLong.capacity() == 40);
+        CHECK(heapBytes(std::string("short")) == 0);
+        CHECK(heapBytes(kLong) == kLongBytes);
+    }
+
+    SECTION("[entry-bytes] optional: what the value holds, nothing when empty") {
+        CHECK(heapBytes(std::optional<std::string>{}) == 0);
+        CHECK(heapBytes(std::optional<std::string>{"short"}) == 0);
+        CHECK(heapBytes(std::optional<std::string>{kLong}) == kLongBytes);
+    }
+
+    SECTION("[entry-bytes] text[]: the string array and each string's heap") {
+        TestArrayRwEntity e;
+        e.tag_ids = {1, 2, 3};             // 3 × 8
+        e.labels = {kLong, "ab"};          // 2 × sizeof(string) + 41 + 0
+        REQUIRE(e.tag_ids.capacity() == 3);
+        REQUIRE(e.labels.capacity() == 2);
+
+        size_t heap = 3 * sizeof(int64_t) + 2 * sizeof(std::string) + kLongBytes;
+        CHECK(e.memoryUsage() == sizeof(TestArrayRwEntity) + heap);
+    }
+
+    SECTION("[entry-bytes] json_field members: nested structs, vector<string>") {
+        TestOrderEntity o;
+        o.label = kLong;                                   // 41
+        o.metadata.str = std::string(20, '1');             // 21
+        o.created_at = "2026-11-18";                       // inline: 0
+        o.address = makeAddress();                         // 82
+        o.history = {makeAddress()};                       // 1 × sizeof + 82
+        o.quantities = {1, 2, 3};                          // 3 × 4
+        o.tags = {kLong, "x"};                             // 2 × sizeof + 41
+        REQUIRE(o.history.capacity() == 1);
+        REQUIRE(o.quantities.capacity() == 3);
+        REQUIRE(o.tags.capacity() == 2);
+
+        size_t heap = kLongBytes + 21
+            + kAddressBytes
+            + sizeof(relais_test::TestAddress) + kAddressBytes
+            + 3 * sizeof(int32_t)
+            + 2 * sizeof(std::string) + kLongBytes;
+        CHECK(o.memoryUsage() == sizeof(TestOrderEntity) + heap);
+    }
+
+    SECTION("[entry-bytes] list page: items at capacity, their heap, the cursor") {
+        auto makePage = [](const std::string& cursor) {
+            TestItemEntity item;
+            item.name = kLong;             // 41
+            item.description = "short";   // 0
+            ItemPage page;
+            page.items.reserve(2);
+            page.items.push_back(item);
+            page.items.push_back(item);
+            page.next_cursor = cursor;
+            return page;
+        };
+        size_t items = 2 * sizeof(TestItemEntity) + 2 * kLongBytes;
+
+        CHECK(makePage(kLong).memoryUsage() == sizeof(ItemPage) + items + kLongBytes);
+        CHECK(makePage("c1").memoryUsage() == sizeof(ItemPage) + items);  // inline cursor
+    }
+
+    SECTION("[entry-bytes] types with a trivial destructor own nothing") {
+        CHECK(heapBytes(std::string_view(kLong)) == 0);    // borrows, owns nothing
+        CHECK(heapBytes(std::chrono::system_clock::now()) == 0);
+        CHECK(heapBytes(std::array<int64_t, 4>{1, 2, 3, 4}) == 0);
+        CHECK(heapBytes(std::optional<int64_t>{7}) == 0);
+        CHECK(heapBytes(relais_test::Priority::High) == 0);
+    }
+
+    SECTION("[entry-bytes] a hand-written mapping is counted through reflection") {
+        STATIC_REQUIRE_FALSE(MappingCountsHeap<NoteMapping, Note>);
+        STATIC_REQUIRE(MappingCountsHeap<TestOrderEntity::MappingType, relais_test::TestOrder>);
+        NoteEntity n;
+        n.text = kLong;                    // 41
+        n.tags = {kLong, "x"};             // 2 × sizeof(string) + 41
+        CHECK(n.memoryUsage()
+              == sizeof(NoteEntity) + kLongBytes + 2 * sizeof(std::string) + kLongBytes);
+    }
+
+    SECTION("[entry-bytes] only a GDSF map counts, and stores only for free") {
+        using jcailloux::relais::cache::detail::ChunkMap;
+        using jcailloux::relais::cache::detail::CacheMetadata;
+        using Uncounted = ChunkMap<int64_t, TestItemEntity, CacheMetadata<true, false>, true, false>;
+        using Counted = ChunkMap<int64_t, TestItemEntity, CacheMetadata<true, false>, true, true>;
+        using CountedTtl = ChunkMap<int64_t, TestItemEntity, CacheMetadata<true, true>, true, true>;
+        STATIC_REQUIRE_FALSE(Uncounted::kStoresBytes);
+        STATIC_REQUIRE(Counted::kStoresBytes);
+        STATIC_REQUIRE_FALSE(CountedTtl::kStoresBytes);
+        // Storing the count never makes the entry bigger.
+        STATIC_REQUIRE(sizeof(Counted::CacheEntry) == sizeof(Uncounted::CacheEntry));
+    }
+}
+
+#if defined(__GLIBCXX__)
+TEST_CASE("Entry bytes - heapBytes matches what libstdc++ allocates",
+          "[gdsf][entry-bytes]")
+{
+    auto check = [](const auto& v) {
+        auto [asked, counted] = allocatedAndCounted(v);
+        CHECK(counted == asked);
+    };
+
+    SECTION("[entry-bytes] containers") {
+        check(std::vector<std::string>{kLong, "a", kLong});
+        check(std::vector<bool>(100, true));
+        check(std::map<std::string, std::string>{{kLong, kLong}, {"a", "b"}});
+        check(std::set<long double>{1.0L, 2.0L});              // 16-byte aligned nodes
+        check(std::unordered_map<std::string, int>{{kLong, 1}, {"k", 2}});  // hash kept
+        check(std::unordered_map<int, std::string>{{1, kLong}, {2, "k"}});  // hash not kept
+        check(std::unordered_set<std::string>{kLong, "a"});
+        check(std::multimap<int, std::string>{{1, kLong}, {1, kLong}});
+        std::unordered_map<int, int> reserved;
+        reserved.reserve(100);                                  // buckets, no node
+        check(reserved);
+        check(std::vector<std::vector<std::string>>{{kLong}, {}, {kLong, "a"}});
+    }
+
+    SECTION("[entry-bytes] capacity beyond size") {
+        // A copy allocates only the size: these are measured as built.
+        auto checkBuilt = [](auto make) {
+            auto [asked, counted] = builtAndCounted(make);
+            CHECK(counted == asked);
+        };
+        checkBuilt([] { std::string s; s.reserve(100); s = "abc"; return s; });
+        checkBuilt([] { std::vector<int32_t> v; v.reserve(10); v.push_back(1); return v; });
+        checkBuilt([] {
+            std::vector<std::string> v;
+            v.reserve(4);
+            v.emplace_back(kLong);
+            return v;
+        });
+        checkBuilt([] {
+            std::unordered_map<int, std::string> m;
+            m.reserve(50);
+            m.emplace(1, kLong);
+            return m;
+        });
+        checkBuilt([] {
+            TestOrderEntity o;
+            o.tags.reserve(8);
+            o.tags.emplace_back(kLong);
+            o.label.reserve(64);
+            return o;
+        });
+    }
+
+    SECTION("[entry-bytes] wrappers and aggregates") {
+        check(std::variant<int64_t, std::string>{kLong});
+        check(std::tuple<std::string, int32_t, std::string>{kLong, 1, kLong});
+        check(std::pair<std::string, std::string>{kLong, "a"});
+        check(std::array<std::string, 2>{kLong, "a"});
+        check(std::optional<std::vector<std::string>>{std::vector<std::string>{kLong}});
+        check(glz::raw_json{std::string(50, '1')});
+        check(MetaListed{kLong, 1, {kLong, "a"}});              // glz::meta object
+        check(makeAddress());                                   // reflected aggregate
+    }
+
+    SECTION("[entry-bytes] generated entity with json_field members") {
+        TestOrderEntity o;
+        o.label = kLong;
+        o.metadata.str = std::string(20, '1');
+        o.address = makeAddress();
+        o.history = {makeAddress(), makeAddress()};
+        o.quantities = {1, 2, 3};
+        o.tags = {kLong, "x"};
+        auto [asked, counted] = allocatedAndCounted(o);
+        CHECK(counted == asked);
+        CHECK(o.memoryUsage() == sizeof(TestOrderEntity) + asked);
+    }
+}
+#endif
+
+#if defined(__GLIBCXX__)
+TEST_CASE("Entry bytes - node formulas are libstdc++'s node types",
+          "[gdsf][entry-bytes]")
+{
+    namespace hb = jcailloux::relais::detail::heap_bytes;
+    using StrPair = std::pair<const std::string, std::string>;
+    using IntPair = std::pair<const int, int>;
+
+    // Tree nodes: four words of base, then the value at its alignment.
+    STATIC_REQUIRE(hb::kTreeNodeBytes<char> == sizeof(std::_Rb_tree_node<char>));
+    STATIC_REQUIRE(hb::kTreeNodeBytes<IntPair> == sizeof(std::_Rb_tree_node<IntPair>));
+    STATIC_REQUIRE(hb::kTreeNodeBytes<StrPair> == sizeof(std::_Rb_tree_node<StrPair>));
+    STATIC_REQUIRE(hb::kTreeNodeBytes<long double> == sizeof(std::_Rb_tree_node<long double>));
+
+    // Hash nodes: the next link, the value, the hash when it is kept.
+    STATIC_REQUIRE(hb::kHashNodeBytes<IntPair, false>
+                   == sizeof(std::__detail::_Hash_node<IntPair, false>));
+    STATIC_REQUIRE(hb::kHashNodeBytes<IntPair, true>
+                   == sizeof(std::__detail::_Hash_node<IntPair, true>));
+    STATIC_REQUIRE(hb::kHashNodeBytes<StrPair, true>
+                   == sizeof(std::__detail::_Hash_node<StrPair, true>));
+    STATIC_REQUIRE(hb::kHashNodeBytes<long double, false>
+                   == sizeof(std::__detail::_Hash_node<long double, false>));
+
+    // Which keys keep their hash: strings do (slow hash), integers do not.
+    STATIC_REQUIRE(hb::kCachesHash<std::string, std::hash<std::string>>);
+    STATIC_REQUIRE_FALSE(hb::kCachesHash<int, std::hash<int>>);
+}
+#endif
+
+TEST_CASE("Entry bytes - one count per entry, stored or recomputed",
+          "[integration][db][gdsf][entry-bytes]")
+{
+    TransactionGuard tx;
+
+    // GDSF alone leaves a free word in an 8-aligned entry's header: the count
+    // is stored there. GDSF + TTL fills the header: it is recomputed.
+    using StoredMap = TestInternals::EntityMap<GDSFNoTTLRepo>;
+    using RecomputedMap = TestInternals::EntityMap<GDSFItemRepo>;
+    STATIC_REQUIRE(StoredMap::kStoresBytes);
+    STATIC_REQUIRE_FALSE(RecomputedMap::kStoresBytes);
+    STATIC_REQUIRE(RecomputedMap::kCountsBytes);
+
+    SECTION("[entry-bytes] the stored count is the value's entryBytes") {
+        resetRepos<GDSFNoTTLRepo>();
+        auto id = insertTestItem(kLong, 1, kLong);
+        auto v = sync(GDSFNoTTLRepo::find(id));
+        REQUIRE(v);
+
+        auto bytes = TestInternals::entityEntryBytes<GDSFNoTTLRepo>(id);
+        REQUIRE(bytes.has_value());
+        CHECK(*bytes == StoredMap::entryBytes(*v));
+        CHECK(*bytes == StoredMap::kEntryOverhead + v->memoryUsage());
+        CHECK(v->memoryUsage() >= sizeof(TestItemEntity) + 2 * kLongBytes);
+        resetRepos<GDSFNoTTLRepo>();
+    }
+
+    SECTION("[entry-bytes] the recomputed count is the value's entryBytes") {
+        resetRepos<GDSFItemRepo>();
+        auto id = insertTestItem(kLong, 1, kLong);
+        auto v = sync(GDSFItemRepo::find(id));
+        REQUIRE(v);
+
+        auto bytes = TestInternals::entityEntryBytes<GDSFItemRepo>(id);
+        REQUIRE(bytes.has_value());
+        CHECK(*bytes == RecomputedMap::entryBytes(*v));
+        resetRepos<GDSFItemRepo>();
+    }
+
+    SECTION("[entry-bytes] the sweep weighs an entry with the same count") {
+        resetRepos<GDSFNoTTLRepo>();
+        auto id = insertTestItem(kLong, 1, kLong);
+        auto v = sync(GDSFNoTTLRepo::find(id));
+        REQUIRE(v);
+        size_t entry_bytes = StoredMap::entryBytes(*v);
+        using Tier = TestInternals::EntityTier<GDSFNoTTLRepo>;
+
+        // Kept: the histogram records what evicting the entry would free.
+        TestInternals::setThreshold(0.0f);
+        REQUIRE(TestInternals::buildingHistogramBytes() == 0);
+        GDSFNoTTLRepo::purge();
+        CHECK(TestInternals::buildingHistogramBytes() == entry_bytes);
+        REQUIRE(TestInternals::entityEntryBytes<GDSFNoTTLRepo>(id).has_value());
+
+        // Evicted: the ghost left behind weighs what admission weighed.
+        TestInternals::setThreshold(1e9f);
+        GDSFNoTTLRepo::purge();
+        auto ghost = TestInternals::getGhostData<GDSFNoTTLRepo>(id);
+        REQUIRE(ghost.has_value());
+        CHECK(ghost->estimated_bytes == Tier::scoredBytes(entry_bytes));
+        resetRepos<GDSFNoTTLRepo>();
+    }
+
+    SECTION("[entry-bytes] a ghost weighs what its entry would") {
+        resetRepos<GDSFGhostRepo>();
+        TestInternals::seedAvgConstructionTime<GDSFGhostRepo>(10.0f);
+        TestInternals::setThreshold(100.0f);  // every candidate is ghosted
+
+        auto id = insertTestItem(kLong, 1, kLong);
+        auto v = sync(GDSFGhostRepo::find(id));
+        REQUIRE(v);
+        auto ghost = TestInternals::getGhostData<GDSFGhostRepo>(id);
+        REQUIRE(ghost.has_value());
+
+        using Map = TestInternals::EntityMap<GDSFGhostRepo>;
+        using Tier = TestInternals::EntityTier<GDSFGhostRepo>;
+        CHECK(ghost->estimated_bytes == Tier::scoredBytes(Map::entryBytes(*v)));
+        CHECK(ghost->estimated_bytes == Map::entryBytes(*v) + Map::kBucketSlotSize);
+        resetRepos<GDSFGhostRepo>();
+    }
 }
