@@ -89,9 +89,10 @@ public:
 
     using MappingType = Mapping;
 
-    /// The bytes this entity holds: the object, plus what its members own on
-    /// the heap. Generated mappings count member by member; a hand-written one
-    /// without heapBytes is counted through glaze's reflection of the struct.
+    /// The bytes this entity holds: the object, plus the room its members'
+    /// heap blocks take at the allocator. Generated mappings count member by
+    /// member; a hand-written one without heapBytes is counted through glaze's
+    /// reflection of the struct.
     [[nodiscard]] size_t memoryUsage() const {
         const auto& s = static_cast<const Struct&>(*this);
         if constexpr (requires { Mapping::heapBytes(s); }) {

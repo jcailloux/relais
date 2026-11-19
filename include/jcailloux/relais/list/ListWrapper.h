@@ -93,8 +93,9 @@ public:
     // Memory tracking
     // =========================================================================
 
-    /// The bytes this page holds: the object, the item array at its capacity,
-    /// what each item owns on the heap, and the cursor's heap.
+    /// The bytes this page holds: the object, and the room the heap blocks take
+    /// at the allocator: the item array (at its capacity), each item's blocks,
+    /// and the cursor's.
     [[nodiscard]] size_t memoryUsage() const {
         return sizeof(*this)
             + relais::detail::heapBytes(items)

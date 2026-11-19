@@ -107,6 +107,9 @@ public:
 
     CacheTier() {
         runtime::detail::RuntimeThread::ensureStarted();
+        // The allocator's size classes are read before the first entry is
+        // weighed: no request pays for the read.
+        if constexpr (kHasGDSF) (void)relais::detail::BlockSizes::process();
     }
 
     ~CacheTier() = default;

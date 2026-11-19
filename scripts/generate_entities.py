@@ -931,7 +931,7 @@ class MappingGenerator:
             lines.append("")
             lines.extend(self._generate_to_update_params(entity))
 
-        # heapBytes (what the members own on the heap)
+        # heapBytes (the room the members' heap blocks take)
         lines.append("")
         lines.extend(self._generate_heap_bytes(entity))
 
@@ -1307,7 +1307,7 @@ class MappingGenerator:
     # =========================================================================
 
     def _generate_heap_bytes(self, entity: ParsedEntity) -> list[str]:
-        """Generate heapBytes() — what the members own on the heap, for the L1 byte count.
+        """Generate heapBytes() — the room the members' heap blocks take, for the L1 byte count.
 
         Every member is counted by jcailloux::relais::detail::heapBytes, json_field members
         included, except fundamental types and enums, which own nothing. A

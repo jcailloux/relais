@@ -429,6 +429,28 @@ struct TestInternals {
         return ce->bytes();
     }
 
+    /// The room a cached entity's entry takes, read now on its blocks.
+    /// nullopt if not cached.
+    template<typename Repo, typename Key>
+    static std::optional<size_t> entityHeldBytes(const Key& key) {
+        auto result = Repo::cache().find(key);
+        auto* ce = result ? result.asReal() : nullptr;
+        if (!ce) return std::nullopt;
+        return ce->heldBytes();
+    }
+
+    /// The room a cached entity's pool block takes, read on the block.
+    /// nullopt if not cached.
+    template<typename Repo, typename Key>
+    static std::optional<size_t> entityPoolBlockBytes(const Key& key) {
+        auto result = Repo::cache().find(key);
+        auto* ce = result ? result.asReal() : nullptr;
+        if (!ce) return std::nullopt;
+        using Map = EntityMap<Repo>;
+        using V = std::remove_cvref_t<decltype(ce->value)>;
+        return jcailloux::relais::detail::blockBytes(Map::kEntryOverhead + sizeof(V), ce->block());
+    }
+
     /// Compute the GDSF score for a cached entity, as the sweep does
     /// (access_count x avg_cost / bytes the entry costs).
     /// Returns nullopt if the entity is not in cache.

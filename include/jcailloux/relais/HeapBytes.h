@@ -20,22 +20,28 @@
 
 #include <glaze/glaze.hpp>
 
+#include "jcailloux/relais/BlockBytes.h"
+
 namespace jcailloux::relais::detail {
 
 // =============================================================================
-// heapBytes(v) — the bytes a value asks the allocator for, beyond sizeof(v)
+// heapBytes(v) — the room a value's heap blocks take, beyond sizeof(v)
 // =============================================================================
 //
-// Counted recursively, from the value alone, so the same value always gives
-// the same count. Each rule states what the standard library allocates; the
-// node sizes are libstdc++'s, the reference toolchain (with another standard
-// library they are estimates). The tests check every rule against what a copy
-// of the value really allocates, so a change in any of them shows up.
+// Counted recursively over the blocks the value holds. Each rule states which
+// blocks the standard library allocates for it, and of how many bytes; each
+// block weighs the room the allocator gives it, read on the block itself
+// (BlockBytes.h). The value's blocks never change while it is cached, so it
+// weighs the same for its whole life. The node layouts are libstdc++'s, the
+// reference toolchain: with another standard library, a node weighs the class
+// of an estimated size. The tests check every rule against the blocks a copy
+// of the value really holds, and the bytes each rule requests against a hand
+// count, so a change in any of them shows up.
 //   - a type with a trivial destructor frees nothing, so it owns nothing: 0
 //     (arithmetic types, enums, string_view, chrono types, PODs);
 //   - std::string: nothing while the characters fit in the object (short
-//     string optimization); on the heap, capacity() characters plus the
-//     terminating null, which the allocation includes;
+//     string optimization); on the heap, one block of capacity() characters
+//     plus the terminating null;
 //   - std::vector<T>: one array of exactly capacity() elements, plus what each
 //     element owns; std::vector<bool> packs bits in whole words, and capacity()
 //     counts those bits;
@@ -46,9 +52,10 @@ namespace jcailloux::relais::detail {
 //     aggregate, or a glz::meta object listing its data members);
 //   - a type with memoryUsage(), which reports sizeof plus its heap (entities,
 //     list pages): memoryUsage() - sizeof;
-//   - std::map, std::set (and multi): one allocated node per element;
-//   - std::unordered_map, std::unordered_set (and multi): one allocated node per
-//     element, plus the bucket array.
+//   - std::map, std::set (and multi): one node block per element;
+//   - std::unordered_map, std::unordered_set (and multi): one node block per
+//     element, plus the bucket array. The container keeps the array's address
+//     to itself: the array weighs the class of its request.
 // Any other type does not compile: a member is never silently counted as 0.
 
 template<typename T>
@@ -79,6 +86,42 @@ inline constexpr bool owns_nothing = std::is_trivially_destructible_v<T>;
 
 constexpr size_t roundUp(size_t n, size_t align) {
     return (n + align - 1) / align * align;
+}
+
+/// The block of a std::vector<bool>'s words: libstdc++'s iterator holds its
+/// address. Elsewhere unknown: the block weighs the class of its request.
+template<typename Alloc>
+const void* bitWords(const std::vector<bool, Alloc>& v) {
+#if defined(__GLIBCXX__)
+    return v.begin()._M_p;
+#else
+    (void)v;
+    return nullptr;
+#endif
+}
+
+/// The block of the node a container's iterator stands on: libstdc++'s tree
+/// and hash iterators hold the node's address, and the node's links come first
+/// in its block. Elsewhere unknown: the node weighs the class of its size.
+template<typename It>
+const void* nodeBlock(const It& it) {
+#if defined(__GLIBCXX__)
+    if constexpr (requires { it._M_node; }) return it._M_node;
+    else return it._M_cur;
+#else
+    (void)it;
+    return nullptr;
+#endif
+}
+
+/// The node blocks of a node container and what its elements own.
+template<size_t NodeBytes, typename Container>
+size_t nodesHeapBytes(const Container& c) {
+    size_t n = 0;
+    for (auto it = c.begin(); it != c.end(); ++it) {
+        n += blockBytes(NodeBytes, nodeBlock(it)) + heapBytes(*it);
+    }
+    return n;
 }
 
 /// A red-black tree node (std::_Rb_tree_node): its base holds the color, an
@@ -147,18 +190,21 @@ size_t heapBytes(const T& v) {
         return 0;
     } else if constexpr (is_spec<U, std::basic_string>) {
         // The characters are on the heap when they are not inside the object;
-        // the allocation holds capacity() characters and the terminating null.
+        // the block holds capacity() characters and the terminating null.
         const auto* p = reinterpret_cast<const char*>(v.data());
         const auto* obj = reinterpret_cast<const char*>(&v);
         bool on_heap = p < obj || p >= obj + sizeof(U);
-        return on_heap ? (v.capacity() + 1) * sizeof(typename U::value_type) : 0;
+        return on_heap ? blockBytes((v.capacity() + 1) * sizeof(typename U::value_type), p) : 0;
     } else if constexpr (is_spec<U, glz::basic_raw_json>) {
         return heapBytes(v.str);
     } else if constexpr (is_spec<U, std::vector>) {
+        // No array until the first element: capacity() is then 0.
+        if (v.capacity() == 0) return 0;
         if constexpr (std::is_same_v<typename U::value_type, bool>) {
-            return v.capacity() / CHAR_BIT;  // capacity() bits, in whole words
+            return blockBytes(v.capacity() / CHAR_BIT, bitWords(v));  // capacity() bits, in whole words
         } else {
-            return v.capacity() * sizeof(typename U::value_type) + elementsHeapBytes(v);
+            return blockBytes(v.capacity() * sizeof(typename U::value_type), v.data())
+                + elementsHeapBytes(v);
         }
     } else if constexpr (is_std_array<U>) {
         return elementsHeapBytes(v);
@@ -172,14 +218,14 @@ size_t heapBytes(const T& v) {
     } else if constexpr (is_spec<U, std::tuple>) {
         return std::apply([](const auto&... e) { return (size_t{0} + ... + heapBytes(e)); }, v);
     } else if constexpr (is_ordered_node_container<U>) {
-        return v.size() * kTreeNodeBytes<typename U::value_type> + elementsHeapBytes(v);
+        return nodesHeapBytes<kTreeNodeBytes<typename U::value_type>>(v);
     } else if constexpr (is_hashed_node_container<U>) {
         constexpr size_t node = kHashNodeBytes<typename U::value_type,
             kCachesHash<typename U::key_type, typename U::hasher>>;
         // The buckets are an array of bucket_count() pointers; a container with
         // a single bucket keeps it inside itself and allocates no array.
-        size_t buckets = v.bucket_count() > 1 ? v.bucket_count() * sizeof(void*) : 0;
-        return v.size() * node + buckets + elementsHeapBytes(v);
+        size_t buckets = v.bucket_count() > 1 ? blockBytes(v.bucket_count() * sizeof(void*)) : 0;
+        return buckets + nodesHeapBytes<node>(v);
     } else if constexpr (requires { { v.memoryUsage() } -> std::convertible_to<size_t>; }) {
         return v.memoryUsage() - sizeof(U);
     } else if constexpr (glz::glaze_object_t<U>) {

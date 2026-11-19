@@ -5,6 +5,7 @@
 #include <atomic>
 #include <bit>
 #include <concepts>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -182,23 +183,37 @@ public:
             stored_bytes{};
     };
 
-    // Real entry: inherits EntryHeader, adds value
+    // Real entry: inherits EntryHeader, adds value. Built only by the entry
+    // pool, inside its pool block (PooledEntry).
     struct CacheEntry : EntryHeader {
         V value;
         CacheEntry(V v, Metadata m)
             : EntryHeader{std::move(m)}, value(std::move(v)) {
             if constexpr (kStoresBytes) {
                 this->stored_bytes.bytes = static_cast<uint32_t>(std::min<size_t>(
-                    entryBytes(value), std::numeric_limits<uint32_t>::max()));
+                    heldBytes(), std::numeric_limits<uint32_t>::max()));
             }
         }
 
-        /// The bytes this entry takes, entryBytes(value): read from the header
-        /// or recomputed. A cached value never changes (a write stores a new
-        /// entry), so both give the same count for the entry's whole life.
+        /// The bytes this entry takes: read from the header, or recomputed by
+        /// heldBytes(). A cached value never changes (a write stores a new
+        /// entry), and a block keeps its size, so both give the same count for
+        /// the entry's whole life.
         [[nodiscard]] size_t bytes() const {
             if constexpr (kStoresBytes) return this->stored_bytes.bytes;
-            else return entryBytes(value);
+            else return heldBytes();
+        }
+
+        /// The room the entry's blocks take, read on them: its pool block, and
+        /// the blocks its value owns.
+        [[nodiscard]] size_t heldBytes() const {
+            return relais::detail::blockBytes(sizeof(PooledEntry), block())
+                + relais::detail::heapBytes(value);
+        }
+
+        /// The pool block that holds this entry.
+        [[nodiscard]] const void* block() const {
+            return reinterpret_cast<const char*>(this) - kEntryOffset;
         }
     };
 
@@ -214,8 +229,21 @@ private:
     struct PooledEntry { CacheEntry entry; };
 #endif
 
+    // Where the entry sits in its pool block: past the guard words, if any.
+    // CacheEntry has members in a base and in itself, so PooledEntry is not
+    // standard-layout, where offsetof is conditionally supported: GCC and Clang
+    // compute it, and warn.
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Winvalid-offsetof"
+#endif
+    static constexpr size_t kEntryOffset = offsetof(PooledEntry, entry);
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
+
 public:
-    /// Bytes the pool allocates for one entry beyond its value, one malloc of
+    /// Bytes the pool asks for one entry beyond its value, one malloc of
     /// sizeof(PooledEntry) per entry:
     ///   - the header: the metadata, and the stored byte count when it fits;
     ///   - the padding that aligns the value after the header;
@@ -229,11 +257,15 @@ public:
     /// to and the key's own heap, which this does not count.
     static constexpr size_t kBucketSlotSize = sizeof(K) + sizeof(TaggedEntry);
 
-    /// The bytes an entry holding `v` takes: its pool block (overhead and
-    /// value) and what the value owns on the heap. Admission, score, eviction
-    /// histogram and stored count all use this one formula.
+    /// The bytes an entry holding `v` would take, before it exists: the class
+    /// of its pool block (one malloc of sizeof(PooledEntry)), and the blocks
+    /// the value owns, which move into the entry with it. Admission and ghosts
+    /// weigh a value with it. The entry's own count, which the sweep, the score
+    /// and the eviction histogram read, is CacheEntry::bytes(): it reads the
+    /// pool block itself, which the allocator may have made larger than its
+    /// class.
     [[nodiscard]] static size_t entryBytes(const V& v) {
-        return kEntryOverhead + sizeof(V) + relais::detail::heapBytes(v);
+        return relais::detail::blockBytes(sizeof(PooledEntry)) + relais::detail::heapBytes(v);
     }
 
     struct FindResult {

@@ -18,7 +18,8 @@
  * 16b. size() live count excludes ghosts
  *  17. Eviction selectivity    — hot/cold, score formula
  *  19. Cross-repo sweep coordination
- *  20. Entry bytes             — exact size of an entry, stored or recomputed
+ *  20. Entry bytes             — the room an entry takes, stored or recomputed;
+ *                                 the room a block takes, read from the allocator
  */
 
 #include <catch2/catch_test_macros.hpp>
@@ -26,9 +27,12 @@
 #include <cstdint>
 #include <vector>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstring>
 #include <map>
+#include <memory>
 #include <set>
 #include <string>
 #include <string_view>
@@ -37,10 +41,15 @@
 #include <unordered_set>
 #include <variant>
 
+#include <dlfcn.h>
+#include <malloc.h>
+#include <unistd.h>
+
 #include "fixtures/test_helper.h"
 #include "fixtures/TestRepositories.h"
 #include "fixtures/RelaisTestAccessors.h"
 #include "fixtures/AllocationCounter.h"
+#include "fixtures/TestAllocator.h"
 #include "fixtures/generated/TestOrderEntity.h"
 
 using namespace relais_test;
@@ -980,13 +989,16 @@ TEST_CASE("GDSF - cross-repo sweep coordination",
 
 namespace {
 
+using jcailloux::relais::detail::AllocatorProbe;
+using jcailloux::relais::detail::BlockSizes;
+using jcailloux::relais::detail::blockBytes;
 using jcailloux::relais::detail::heapBytes;
 using TestOrderEntity = ::entity::generated::TestOrderEntity;
 using TestArrayRwEntity = ::entity::generated::TestArrayRwEntity;
 using ItemPage = jcailloux::relais::list::ListWrapper<TestItemEntity>;
 
 // 40 characters: past libstdc++'s 15-character inline buffer, so on the heap
-// with capacity 40, and 41 bytes allocated (the terminator included).
+// with capacity 40, in one block of 41 bytes (the terminator included).
 const std::string kLong(40, 'x');
 constexpr size_t kLongBytes = 41;
 
@@ -1022,24 +1034,141 @@ using NoteEntity = jcailloux::relais::Entity<Note, NoteMapping>;
 template<typename Mapping, typename Struct>
 concept MappingCountsHeap = requires(const Struct& s) { Mapping::heapBytes(s); };
 
-/// The bytes a copy of `v` asks the allocator for: a copy allocates exactly
-/// its final storage, at the copy's own capacities.
-template<typename T>
-std::pair<size_t, size_t> allocatedAndCounted(const T& v) {
-    auto before = relais_test::threadAllocations().requested_bytes;
-    T copy = v;
-    auto asked = relais_test::threadAllocations().requested_bytes - before;
-    return {static_cast<size_t>(asked), heapBytes(copy)};
+/// While alive, the calling thread weighs each block at the bytes it requests:
+/// the blocks each rule names, and their sizes, against a count by hand.
+class WeighRequests {
+public:
+    WeighRequests() { BlockSizes::setTestSizes(&sizes()); }
+    ~WeighRequests() { BlockSizes::setTestSizes(nullptr); }
+    WeighRequests(const WeighRequests&) = delete;
+    WeighRequests& operator=(const WeighRequests&) = delete;
+
+private:
+    static const BlockSizes& sizes() {
+        // An allocator whose blocks cannot be read: each weighs its request.
+        static const auto* blind = new BlockSizes(AllocatorProbe{nullptr, nullptr, nullptr});
+        return *blind;
+    }
+};
+
+/// The room the recorded blocks take: each one's usable size, as the allocator
+/// reports it, and the header in front of it, as the test knows it for this
+/// allocator (each is under 128 KiB, glibc's lowest mmap threshold: all on the
+/// heap). A bucket array, whose address its container keeps to itself, is
+/// weighed as heapBytes weighs it: the class of its request.
+size_t heldBy(const relais_test::RecordHeldBlocks& recorded, size_t bucket_array) {
+    size_t held = 0;
+    size_t bucket_arrays = 0;
+    for (const auto& b : recorded.blocks()) {
+        if (bucket_array != 0 && b.requested == bucket_array) {
+            held += blockBytes(b.requested);
+            ++bucket_arrays;
+        } else {
+            held += malloc_usable_size(b.block) + relais_test::heapBlockHeader();
+        }
+    }
+    CHECK(bucket_arrays == (bucket_array != 0 ? 1 : 0));
+    return held;
 }
 
-/// The bytes a value asks the allocator for while `make` builds it, with no
-/// free in between: unlike a copy, it keeps capacities beyond the size.
+/// The bytes a container's bucket array requests, 0 for none.
+template<typename T>
+size_t bucketArrayOf(const T& v) {
+    if constexpr (requires { v.bucket_count(); }) {
+        return v.bucket_count() > 1 ? v.bucket_count() * sizeof(void*) : 0;
+    } else {
+        return 0;
+    }
+}
+
+/// The room a copy of `v` holds, and what heapBytes counts for it: a copy
+/// allocates exactly its final storage, at the copy's own capacities.
+template<typename T>
+std::pair<size_t, size_t> heldAndCounted(const T& v) {
+    relais_test::RecordHeldBlocks recorded;
+    T copy = v;
+    recorded.stop();
+    return {heldBy(recorded, bucketArrayOf(copy)), heapBytes(copy)};
+}
+
+/// The same for the value `make` builds: unlike a copy, it keeps capacities
+/// beyond the size.
 template<typename Make>
 std::pair<size_t, size_t> builtAndCounted(Make make) {
-    auto before = relais_test::threadAllocations().requested_bytes;
+    relais_test::RecordHeldBlocks recorded;
     auto v = make();
-    auto asked = relais_test::threadAllocations().requested_bytes - before;
-    return {static_cast<size_t>(asked), heapBytes(v)};
+    recorded.stop();
+    return {heldBy(recorded, bucketArrayOf(v)), heapBytes(v)};
+}
+
+constexpr size_t roundUp(size_t n, size_t step) { return (n + step - 1) / step * step; }
+
+/// An allocator for BlockSizes to read: each block keeps its request in front
+/// of it, and Usable turns the request into the usable size reported.
+template<size_t (*Usable)(size_t)>
+struct FakeMalloc {
+    static constexpr size_t kFront = 16;
+    static void* allocate(size_t n) {
+        auto* p = static_cast<char*>(std::malloc(kFront + n));
+        std::memcpy(p, &n, sizeof n);
+        return p + kFront;
+    }
+    static void release(void* p) { std::free(static_cast<char*>(p) - kFront); }
+    static size_t usable(const void* p) {
+        size_t n;
+        std::memcpy(&n, static_cast<const char*>(p) - kFront, sizeof n);
+        return Usable(n);
+    }
+    static constexpr AllocatorProbe kProbe{&allocate, &release, &usable};
+};
+
+/// Classes of 16 bytes, metadata out of the block (jemalloc's small classes).
+size_t classesOf16(size_t n) { return roundUp(n, 16); }
+/// Classes of 12 bytes: some 8-byte slices hold two of them.
+size_t classesOf12(size_t n) { return roundUp(n, 12); }
+/// The request itself, as a sanitizer reports it.
+size_t requestedSize(size_t n) { return n; }
+/// Classes of 16, with every fourth block of a request served 16 bytes larger,
+/// as glibc serves one from a free block it does not split.
+size_t oneLarger(size_t n) {
+    static thread_local size_t served = 0;
+    return roundUp(n, 16) + (served++ % 4 == 0 ? 16 : 0);
+}
+/// glibc's: a chunk of max(32, ⌈n + 8⌉₁₆) bytes less its size word; from
+/// 128 KiB, a block mapped on its own, of whole pages less two words.
+size_t glibcLike(size_t n) {
+    if (n >= 128 * 1024) return roundUp(n + 16, 4096) - 16;
+    return std::max<size_t>(32, roundUp(n + 8, 16)) - 8;
+}
+
+/// Every request up to the table's limit weighs what `expected` says.
+template<typename Expected>
+void checkTable(const BlockSizes& sizes, Expected expected) {
+    size_t mismatches = 0, first = 0;
+    for (size_t n = 1; n <= BlockSizes::kTableLimit; ++n) {
+        if (sizes.bytes(n) != expected(n) && mismatches++ == 0) first = n;
+    }
+    size_t weighed = first ? sizes.bytes(first) : 0;
+    size_t wanted = first ? expected(first) : 0;
+    CAPTURE(first, weighed, wanted);
+    CHECK(mismatches == 0);
+}
+
+/// Gives each array twice what it asks for.
+template<typename T>
+struct GenerousAllocator {
+    using value_type = T;
+    GenerousAllocator() = default;
+    template<typename U>
+    GenerousAllocator(const GenerousAllocator<U>&) noexcept {}
+    T* allocate(size_t n) { return static_cast<T*>(std::malloc(2 * n * sizeof(T))); }
+    void deallocate(T* p, size_t) noexcept { std::free(p); }
+    bool operator==(const GenerousAllocator&) const = default;
+};
+
+thread_local std::string tl_logged;
+void captureLog(jcailloux::relais::log::Level, const char* msg, size_t len) {
+    tl_logged.assign(msg, len);
 }
 
 }  // namespace
@@ -1050,10 +1179,12 @@ struct glz::meta<MetaListed> {
     static constexpr auto value = glz::object("label", &T::label, "rank", &T::rank, "notes", &T::notes);
 };
 
-TEST_CASE("Entry bytes - heapBytes counts every byte a value owns",
+TEST_CASE("Entry bytes - heapBytes names every block a value owns, at its request",
           "[gdsf][entry-bytes]")
 {
-    SECTION("[entry-bytes] strings: inline when short, capacity + 1 on the heap") {
+    WeighRequests requests;
+
+    SECTION("[entry-bytes] strings: inline when short, one block of capacity + 1 on the heap") {
         REQUIRE(kLong.capacity() == 40);
         CHECK(heapBytes(std::string("short")) == 0);
         CHECK(heapBytes(kLong) == kLongBytes);
@@ -1067,8 +1198,8 @@ TEST_CASE("Entry bytes - heapBytes counts every byte a value owns",
 
     SECTION("[entry-bytes] text[]: the string array and each string's heap") {
         TestArrayRwEntity e;
-        e.tag_ids = {1, 2, 3};             // 3 × 8
-        e.labels = {kLong, "ab"};          // 2 × sizeof(string) + 41 + 0
+        e.tag_ids = {1, 2, 3};             // one block of 3 × 8
+        e.labels = {kLong, "ab"};          // one of 2 × sizeof(string), one of 41
         REQUIRE(e.tag_ids.capacity() == 3);
         REQUIRE(e.labels.capacity() == 2);
 
@@ -1080,11 +1211,11 @@ TEST_CASE("Entry bytes - heapBytes counts every byte a value owns",
         TestOrderEntity o;
         o.label = kLong;                                   // 41
         o.metadata.str = std::string(20, '1');             // 21
-        o.created_at = "2026-11-18";                       // inline: 0
-        o.address = makeAddress();                         // 82
-        o.history = {makeAddress()};                       // 1 × sizeof + 82
+        o.created_at = "2026-11-18";                       // inline: no block
+        o.address = makeAddress();                         // two of 41
+        o.history = {makeAddress()};                       // 1 × sizeof, two of 41
         o.quantities = {1, 2, 3};                          // 3 × 4
-        o.tags = {kLong, "x"};                             // 2 × sizeof + 41
+        o.tags = {kLong, "x"};                             // 2 × sizeof, 41
         REQUIRE(o.history.capacity() == 1);
         REQUIRE(o.quantities.capacity() == 3);
         REQUIRE(o.tags.capacity() == 2);
@@ -1101,7 +1232,7 @@ TEST_CASE("Entry bytes - heapBytes counts every byte a value owns",
         auto makePage = [](const std::string& cursor) {
             TestItemEntity item;
             item.name = kLong;             // 41
-            item.description = "short";   // 0
+            item.description = "short";   // inline: no block
             ItemPage page;
             page.items.reserve(2);
             page.items.push_back(item);
@@ -1128,9 +1259,9 @@ TEST_CASE("Entry bytes - heapBytes counts every byte a value owns",
         STATIC_REQUIRE(MappingCountsHeap<TestOrderEntity::MappingType, relais_test::TestOrder>);
         NoteEntity n;
         n.text = kLong;                    // 41
-        n.tags = {kLong, "x"};             // 2 × sizeof(string) + 41
-        CHECK(n.memoryUsage()
-              == sizeof(NoteEntity) + kLongBytes + 2 * sizeof(std::string) + kLongBytes);
+        n.tags = {kLong, "x"};             // 2 × sizeof(string), 41
+        CHECK(n.memoryUsage() == sizeof(NoteEntity)
+              + kLongBytes + 2 * sizeof(std::string) + kLongBytes);
     }
 
     SECTION("[entry-bytes] only a GDSF map counts, and stores only for free") {
@@ -1148,12 +1279,12 @@ TEST_CASE("Entry bytes - heapBytes counts every byte a value owns",
 }
 
 #if defined(__GLIBCXX__)
-TEST_CASE("Entry bytes - heapBytes matches what libstdc++ allocates",
+TEST_CASE("Entry bytes - heapBytes matches the blocks libstdc++ allocates",
           "[gdsf][entry-bytes]")
 {
     auto check = [](const auto& v) {
-        auto [asked, counted] = allocatedAndCounted(v);
-        CHECK(counted == asked);
+        auto [held, counted] = heldAndCounted(v);
+        CHECK(counted == held);
     };
 
     SECTION("[entry-bytes] containers") {
@@ -1174,8 +1305,8 @@ TEST_CASE("Entry bytes - heapBytes matches what libstdc++ allocates",
     SECTION("[entry-bytes] capacity beyond size") {
         // A copy allocates only the size: these are measured as built.
         auto checkBuilt = [](auto make) {
-            auto [asked, counted] = builtAndCounted(make);
-            CHECK(counted == asked);
+            auto [held, counted] = builtAndCounted(make);
+            CHECK(counted == held);
         };
         checkBuilt([] { std::string s; s.reserve(100); s = "abc"; return s; });
         checkBuilt([] { std::vector<int32_t> v; v.reserve(10); v.push_back(1); return v; });
@@ -1219,12 +1350,235 @@ TEST_CASE("Entry bytes - heapBytes matches what libstdc++ allocates",
         o.history = {makeAddress(), makeAddress()};
         o.quantities = {1, 2, 3};
         o.tags = {kLong, "x"};
-        auto [asked, counted] = allocatedAndCounted(o);
-        CHECK(counted == asked);
-        CHECK(o.memoryUsage() == sizeof(TestOrderEntity) + asked);
+        auto [held, counted] = heldAndCounted(o);
+        CHECK(counted == held);
+        CHECK(o.memoryUsage() == sizeof(TestOrderEntity) + held);
     }
 }
 #endif
+
+TEST_CASE("Block bytes - each block weighs the room the allocator gives it",
+          "[gdsf][block-bytes]")
+{
+    using relais_test::TestMalloc;
+    using relais_test::testMalloc;
+    using relais_test::heapBlockHeader;
+    using relais_test::mappedBlockHeader;
+
+    SECTION("[block-bytes] the malloc in use is the one the test's registration names") {
+        bool jemalloc = dlsym(RTLD_DEFAULT, "mallctl") != nullptr;
+        bool mimalloc = dlsym(RTLD_DEFAULT, "mi_version") != nullptr;
+        switch (testMalloc()) {
+            case TestMalloc::Glibc:     CHECK_FALSE(jemalloc); CHECK_FALSE(mimalloc); break;
+            case TestMalloc::Jemalloc:  CHECK(jemalloc);       CHECK_FALSE(mimalloc); break;
+            case TestMalloc::Mimalloc:  CHECK_FALSE(jemalloc); CHECK(mimalloc);       break;
+            case TestMalloc::Sanitizer: SUCCEED("the sanitizer's own malloc");        break;
+        }
+    }
+
+    SECTION("[block-bytes] the table holds each request's class: no block of it takes less") {
+        // A fresh block may be larger than its class under glibc (a free block
+        // 16 bytes larger, handed out whole); never under the others.
+        bool exact_classes = testMalloc() != TestMalloc::Glibc;
+        size_t smaller = 0, larger = 0;
+        for (size_t n = 1; n <= BlockSizes::kTableLimit; ++n) {
+            void* p = std::malloc(n);
+            size_t room = malloc_usable_size(p) + heapBlockHeader();
+            std::free(p);
+            if (blockBytes(n) > room) ++smaller;
+            if (exact_classes && blockBytes(n) < room) ++larger;
+        }
+        CHECK(smaller == 0);
+        CHECK(larger == 0);
+        CHECK(blockBytes(0) == 0);  // no block
+    }
+
+    SECTION("[block-bytes] each allocator's classes, as the test knows them") {
+        const auto& sizes = BlockSizes::process();
+        switch (testMalloc()) {
+            case TestMalloc::Glibc:
+                // A chunk of max(32, ⌈n + 8⌉₁₆) bytes: the request, the size
+                // word (8) in front of it, rounded to 16, never under 32.
+                CHECK(sizes.hasSizeWord());
+                CHECK(sizes.granularity() == 8);
+                checkTable(sizes, [](size_t n) { return std::max<size_t>(32, roundUp(n + 8, 16)); });
+                break;
+            case TestMalloc::Jemalloc:
+            case TestMalloc::Mimalloc:
+                // Classes on multiples of 8, the metadata out of the block.
+                CHECK_FALSE(sizes.hasSizeWord());
+                CHECK(sizes.granularity() == 8);
+                CHECK(sizes.bytes(1) == 8);
+                CHECK(sizes.bytes(9) == 16);
+                break;
+            case TestMalloc::Sanitizer:
+                // The request itself, read byte by byte.
+                CHECK_FALSE(sizes.hasSizeWord());
+                CHECK(sizes.granularity() == 1);
+                checkTable(sizes, requestedSize);
+                break;
+        }
+    }
+
+    SECTION("[block-bytes] a string's or a vector's block is read on itself, not weighed by its request") {
+        // An allocator that gives each array twice what it asks for: only a
+        // read of the block sees the difference.
+        std::vector<char, GenerousAllocator<char>> v;
+        v.reserve(5'000);
+        CHECK(heapBytes(v) == malloc_usable_size(v.data()) + heapBlockHeader());
+        CHECK(heapBytes(v) > blockBytes(5'000));
+
+        std::basic_string<char, std::char_traits<char>, GenerousAllocator<char>> str;
+        str.reserve(5'000);
+        CHECK(heapBytes(str) == malloc_usable_size(str.data()) + heapBlockHeader());
+        CHECK(heapBytes(str) > blockBytes(5'001));
+    }
+
+#if defined(__GLIBCXX__)
+    SECTION("[block-bytes] the blocks read are the value's own: nodes and bit words") {
+        namespace hb = jcailloux::relais::detail::heap_bytes;
+        auto onlyBlock = [](const relais_test::RecordHeldBlocks& recorded) {
+            REQUIRE(recorded.blocks().size() == 1);
+            return static_cast<const void*>(recorded.blocks()[0].block);
+        };
+        {
+            std::map<int64_t, int64_t> m;
+            relais_test::RecordHeldBlocks recorded;
+            m.emplace(1, 1);
+            recorded.stop();
+            CHECK(hb::nodeBlock(m.begin()) == onlyBlock(recorded));
+        }
+        {
+            std::unordered_set<int64_t> set;
+            set.reserve(1);                 // the bucket array first
+            relais_test::RecordHeldBlocks recorded;
+            set.insert(1);
+            recorded.stop();
+            CHECK(hb::nodeBlock(set.begin()) == onlyBlock(recorded));
+        }
+        {
+            relais_test::RecordHeldBlocks recorded;
+            std::vector<bool> bits(100, true);
+            recorded.stop();
+            CHECK(hb::bitWords(bits) == onlyBlock(recorded));
+        }
+    }
+#endif
+
+    SECTION("[block-bytes] past the table's limit, still on the heap") {
+        auto check = [](const auto& v) {
+            auto [held, counted] = heldAndCounted(v);
+            CHECK(counted == held);
+        };
+        check(std::string(20'000, 'x'));
+        check(std::vector<int64_t>(10'000, 1));
+        check(std::vector<bool>(200'000, true));
+        check(std::vector<TestItemEntity>(200));   // a list page's items
+        CHECK(blockBytes(20'000) == 20'000);       // without the block: its request
+    }
+
+    SECTION("[block-bytes] a block mapped on its own carries its own header") {
+        // Beyond glibc's highest mmap threshold (32 MiB on 64-bit), a block is
+        // always mapped on its own. Reserved, its pages are never touched.
+        std::string s;
+        s.reserve(size_t{256} << 20);
+        size_t usable = malloc_usable_size(s.data());
+        CHECK(heapBytes(s) == usable + mappedBlockHeader());
+        if (testMalloc() == TestMalloc::Glibc) {
+            // Whole pages, two words of which are the header.
+            CHECK(usable % 16 == 0);
+            CHECK((usable + 16) % static_cast<size_t>(sysconf(_SC_PAGESIZE)) == 0);
+        }
+    }
+
+    SECTION("[block-bytes] the table is read once, then frozen") {
+        const auto& sizes = BlockSizes::process();
+        CHECK(&sizes == &BlockSizes::process());
+        std::vector<size_t> before(BlockSizes::kTableLimit + 1);
+        for (size_t n = 1; n <= BlockSizes::kTableLimit; ++n) before[n] = sizes.bytes(n);
+
+        // Move the allocator's state: under glibc, freeing a mapped block
+        // raises the mmap threshold to its size.
+        std::free(std::malloc(size_t{1} << 20));
+        std::vector<void*> blocks;
+        for (size_t n = 1; n <= 1000; ++n) blocks.push_back(std::malloc(n * 16));
+        for (void* p : blocks) std::free(p);
+
+        checkTable(sizes, [&](size_t n) { return before[n]; });
+    }
+}
+
+TEST_CASE("Block bytes - reading an allocator", "[gdsf][block-bytes]")
+{
+    SECTION("[block-bytes] one class per 8-byte slice: a table by slice") {
+        using Fake = FakeMalloc<classesOf16>;
+        auto sizes = std::make_unique<BlockSizes>(Fake::kProbe);
+        CHECK(sizes->granularity() == 8);
+        CHECK_FALSE(sizes->hasSizeWord());  // 16, 32…: 0 modulo 16
+        checkTable(*sizes, classesOf16);
+
+        // A block at hand is read on itself, whatever the request says.
+        void* block = Fake::allocate(50);
+        CHECK(sizes->bytes(41, block) == 64);
+        CHECK(sizes->bytes(41) == 48);
+        Fake::release(block);
+        block = Fake::allocate(20'001);
+        CHECK(sizes->bytes(20'001, block) == 20'016);
+        CHECK(sizes->bytes(20'001) == 20'001);  // past the table, no block: the request
+        Fake::release(block);
+    }
+
+    SECTION("[block-bytes] a size word: one in front of a heap block, two of a mapped one") {
+        using Fake = FakeMalloc<glibcLike>;
+        auto sizes = std::make_unique<BlockSizes>(Fake::kProbe);
+        CHECK(sizes->granularity() == 8);
+        CHECK(sizes->hasSizeWord());
+        checkTable(*sizes, [](size_t n) { return std::max<size_t>(32, roundUp(n + 8, 16)); });
+
+        void* heap = Fake::allocate(20'001);
+        CHECK(sizes->bytes(20'001, heap) == 20'016);      // usable 20,008, one word
+        Fake::release(heap);
+        void* mapped = Fake::allocate(200'000);
+        CHECK(sizes->bytes(200'000, mapped) == 200'704);  // 49 pages: usable, two words
+        Fake::release(mapped);
+    }
+
+    SECTION("[block-bytes] a free block larger than the class: the class still read") {
+        // One block of each probe served 16 bytes larger: the least of the
+        // blocks allocated together is the class.
+        auto sizes = std::make_unique<BlockSizes>(FakeMalloc<oneLarger>::kProbe);
+        CHECK(sizes->granularity() == 8);
+        checkTable(*sizes, classesOf16);
+    }
+
+    SECTION("[block-bytes] slices that hold two classes: read byte by byte") {
+        auto by12 = std::make_unique<BlockSizes>(FakeMalloc<classesOf12>::kProbe);
+        CHECK(by12->granularity() == 1);
+        checkTable(*by12, classesOf12);
+
+        auto exact = std::make_unique<BlockSizes>(FakeMalloc<requestedSize>::kProbe);
+        CHECK(exact->granularity() == 1);
+        CHECK_FALSE(exact->hasSizeWord());
+        checkTable(*exact, requestedSize);
+    }
+
+    SECTION("[block-bytes] no usable size to read: each block at its request, and a message") {
+        namespace log = jcailloux::relais::log;
+        AllocatorProbe blind = FakeMalloc<classesOf16>::kProbe;
+        blind.usable = nullptr;
+        auto previous = log::getCallback();
+        log::setCallback(&captureLog);
+        tl_logged.clear();
+        auto sizes = std::make_unique<BlockSizes>(blind);
+        log::setCallback(previous);
+
+        CHECK(tl_logged.find("usable size") != std::string::npos);
+        checkTable(*sizes, requestedSize);
+        void* block = FakeMalloc<classesOf16>::allocate(50);
+        CHECK(sizes->bytes(41, block) == 41);
+        FakeMalloc<classesOf16>::release(block);
+    }
+}
 
 #if defined(__GLIBCXX__)
 TEST_CASE("Entry bytes - node formulas are libstdc++'s node types",
@@ -1269,29 +1623,34 @@ TEST_CASE("Entry bytes - one count per entry, stored or recomputed",
     STATIC_REQUIRE_FALSE(RecomputedMap::kStoresBytes);
     STATIC_REQUIRE(RecomputedMap::kCountsBytes);
 
-    SECTION("[entry-bytes] the stored count is the value's entryBytes") {
+    SECTION("[entry-bytes] the stored count is what the entry's blocks hold") {
         resetRepos<GDSFNoTTLRepo>();
         auto id = insertTestItem(kLong, 1, kLong);
         auto v = sync(GDSFNoTTLRepo::find(id));
         REQUIRE(v);
 
         auto bytes = TestInternals::entityEntryBytes<GDSFNoTTLRepo>(id);
+        auto pool_block = TestInternals::entityPoolBlockBytes<GDSFNoTTLRepo>(id);
         REQUIRE(bytes.has_value());
-        CHECK(*bytes == StoredMap::entryBytes(*v));
-        CHECK(*bytes == StoredMap::kEntryOverhead + v->memoryUsage());
+        REQUIRE(pool_block.has_value());
+        CHECK(*bytes == *TestInternals::entityHeldBytes<GDSFNoTTLRepo>(id));
+        CHECK(*bytes == *pool_block + heapBytes(*v));
         CHECK(v->memoryUsage() >= sizeof(TestItemEntity) + 2 * kLongBytes);
         resetRepos<GDSFNoTTLRepo>();
     }
 
-    SECTION("[entry-bytes] the recomputed count is the value's entryBytes") {
+    SECTION("[entry-bytes] the recomputed count is what the entry's blocks hold") {
         resetRepos<GDSFItemRepo>();
         auto id = insertTestItem(kLong, 1, kLong);
         auto v = sync(GDSFItemRepo::find(id));
         REQUIRE(v);
 
         auto bytes = TestInternals::entityEntryBytes<GDSFItemRepo>(id);
+        auto pool_block = TestInternals::entityPoolBlockBytes<GDSFItemRepo>(id);
         REQUIRE(bytes.has_value());
-        CHECK(*bytes == RecomputedMap::entryBytes(*v));
+        REQUIRE(pool_block.has_value());
+        CHECK(*bytes == *pool_block + heapBytes(*v));
+        CHECK(*bytes == *TestInternals::entityEntryBytes<GDSFItemRepo>(id));  // the same again
         resetRepos<GDSFItemRepo>();
     }
 
@@ -1300,7 +1659,7 @@ TEST_CASE("Entry bytes - one count per entry, stored or recomputed",
         auto id = insertTestItem(kLong, 1, kLong);
         auto v = sync(GDSFNoTTLRepo::find(id));
         REQUIRE(v);
-        size_t entry_bytes = StoredMap::entryBytes(*v);
+        size_t entry_bytes = *TestInternals::entityEntryBytes<GDSFNoTTLRepo>(id);
         using Tier = TestInternals::EntityTier<GDSFNoTTLRepo>;
 
         // Kept: the histogram records what evicting the entry would free.
@@ -1334,6 +1693,9 @@ TEST_CASE("Entry bytes - one count per entry, stored or recomputed",
         using Tier = TestInternals::EntityTier<GDSFGhostRepo>;
         CHECK(ghost->estimated_bytes == Tier::scoredBytes(Map::entryBytes(*v)));
         CHECK(ghost->estimated_bytes == Map::entryBytes(*v) + Map::kBucketSlotSize);
+        // Before the entry exists, its pool block weighs the class of its size.
+        CHECK(Map::entryBytes(*v)
+              == blockBytes(Map::kEntryOverhead + sizeof(TestItemEntity)) + heapBytes(*v));
         resetRepos<GDSFGhostRepo>();
     }
 }

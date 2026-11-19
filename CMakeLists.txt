@@ -340,6 +340,28 @@ if(RELAIS_BUILD_TESTS)
     # Sees the entry pool's malloc calls: linked with --wrap=malloc.
     relais_add_test(test_relais_entry_layout  tests/relais/test_entry_layout.cpp        LABELS "relais;gdsf")
     target_link_options(test_relais_entry_layout PRIVATE -Wl,--wrap=malloc)
+    # An entry's weight is read from the allocator in use: the tests that check
+    # it run again under jemalloc and mimalloc, preloaded, when installed. Not
+    # in a sanitizer build, whose runtime must be the first library loaded.
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT CMAKE_CXX_FLAGS MATCHES "-fsanitize")
+        foreach(allocator jemalloc mimalloc)
+            find_library(RELAIS_${allocator}_LIBRARY NAMES ${allocator})
+            if(RELAIS_${allocator}_LIBRARY)
+                set(preload "LD_PRELOAD=${RELAIS_${allocator}_LIBRARY};RELAIS_TEST_ALLOCATOR=${allocator}")
+                add_test(NAME test_relais_gdsf_${allocator}
+                         COMMAND test_relais_gdsf "[block-bytes],[entry-bytes]")
+                set_tests_properties(test_relais_gdsf_${allocator} PROPERTIES
+                    ENVIRONMENT "${preload}"
+                    LABELS "relais;integration;db;gdsf;allocator"
+                    RESOURCE_LOCK "db")
+                add_test(NAME test_relais_entry_layout_${allocator}
+                         COMMAND test_relais_entry_layout)
+                set_tests_properties(test_relais_entry_layout_${allocator} PROPERTIES
+                    ENVIRONMENT "${preload}"
+                    LABELS "relais;gdsf;allocator")
+            endif()
+        endforeach()
+    endif()
     if(NOT RELAIS_GDSF_ENABLED)
         relais_add_test(test_relais_gdsf_disabled tests/relais/test_gdsf_disabled.cpp       DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;gdsf")
     endif()
