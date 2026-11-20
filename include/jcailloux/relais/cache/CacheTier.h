@@ -174,9 +174,10 @@ public:
                     Map::get_hash(hk)};
     }
 
-    /// Count one addition of memory toward the maintenance sweep, which runs
-    /// one chunk every few hundred ticks: a store read from the database, or a
-    /// list modification tracked. A tier with nothing to sweep pays nothing.
+    /// Count one addition of memory toward the maintenance sweep, which the
+    /// maintenance thread runs on one chunk every few hundred ticks: a store
+    /// read from the database, or a list modification tracked. A tier with
+    /// nothing to sweep pays nothing.
     static void tickSweep() {
         if constexpr (kHasCleanup) GDSFPolicy::instance().tickInsertion();
     }
@@ -667,10 +668,9 @@ private:
             uint32_t est_bytes = saturate32(scoredBytes(key, Map::entryBytes(*opt)));
             uint8_t est_flags = 0;
 
-            // Lookup existing ghost — scoped to release EpochGuard before
-            // tickInsertion(), which may trigger sweep() → reclaim().
-            // Holding the guard during reclaim() prevents epoch advancement,
-            // so evicted entries stay allocated, and the L1 ledger counts them.
+            // Lookup existing ghost — scoped: the guard it holds keeps what
+            // a concurrent sweep retires allocated, and counted by the L1
+            // ledger, until it is released.
             uint32_t count;
             bool has_ghost;
             {
@@ -733,8 +733,6 @@ private:
             // Read-fill recheck (see GDSF branch).
             if (!gate()) co_return transientHit(std::move(*opt));
 
-            // Before the store: the sweep it may run reclaims more without a
-            // guard held (see the GDSF branch).
             tickSweep();
             auto meta = mb(*opt, 0.0f);
             auto r = map_.upsert(Map::make_key(key), std::move(*opt), std::move(meta));

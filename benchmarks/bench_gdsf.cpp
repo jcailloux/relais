@@ -152,7 +152,7 @@ SetupResult setupGDSFBench(size_t n_items, double pressure,
     // Pre-warm histogram: 16 sweeps (2 full rounds of 8 chunks).
     // Populates the persistent EMA histogram so that eviction uses
     // real score distributions, not exp2(23.25).
-    for (int i = 0; i < 16; ++i) GDSFPolicy::instance().sweep();
+    for (int i = 0; i < 16; ++i) GDSFPolicy::instance().sweepNow();
 
     // Measure the cache footprint on the ledger, then apply pressure.
     // pressure=0.9 → allow 90% of cache to stay, evict 10%.
@@ -191,14 +191,14 @@ void warmupAccess(const std::vector<int64_t>& ids, KeyGen&& gen, size_t ops = 10
     // Then restore the budget.
     auto saved_budget = GDSFPolicy::instance().maxMemory();
     GDSFPolicy::instance().configure({.max_memory = SIZE_MAX});
-    for (int i = 0; i < 16; ++i) GDSFPolicy::instance().sweep();
+    for (int i = 0; i < 16; ++i) GDSFPolicy::instance().sweepNow();
     GDSFPolicy::instance().configure({.max_memory = saved_budget});
 }
 
 /// Run multiple sweep rounds to converge on eviction threshold.
 void sweepRounds(int rounds = 8) {
     for (int i = 0; i < rounds; ++i)
-        GDSFPolicy::instance().sweep();
+        GDSFPolicy::instance().sweepNow();
 }
 
 /// Running statistics of the bytes the L1 holds, sampled during workload.

@@ -160,8 +160,7 @@ struct TestInternals {
     }
 
     /// Drain every chunk bit of the modification tracker for `Repo`.
-    /// Deterministic: bypasses the global GDSF sweep cursor and sweep_flag_
-    /// — does not interfere with background sweep threads.
+    /// Deterministic: bypasses the global GDSF sweep cursor and its exclusion.
     /// After this call, every modification with generation <= cutoff_gen is removed.
     template<typename Repo>
     static void drainAllModificationChunks(uint32_t cutoff_gen) {
@@ -396,16 +395,17 @@ struct TestInternals {
             * static_cast<size_t>(Policy::instance().chunkCount());
     }
 
-    /// Holds the sweep exclusion for its scope, as a sweep in progress does.
+    /// Holds the sweep exclusion for its scope, as a sweep in progress does:
+    /// taken as a forced pass takes it.
     struct HoldSweepExclusion {
-        HoldSweepExclusion() {
-            auto& flag = jcailloux::relais::cache::GDSFPolicy::instance().sweep_flag_;
-            while (flag.test_and_set(std::memory_order_acquire)) flag.wait(true);
-        }
-        ~HoldSweepExclusion() { jcailloux::relais::cache::GDSFPolicy::instance().releaseSweep(); }
-        HoldSweepExclusion(const HoldSweepExclusion&) = delete;
-        HoldSweepExclusion& operator=(const HoldSweepExclusion&) = delete;
+        std::unique_lock<std::mutex> exclusion =
+            jcailloux::relais::cache::GDSFPolicy::instance().lockForPass();
     };
+
+    /// Forced passes waiting for the sweep exclusion.
+    static uint32_t passesWaiting() {
+        return jcailloux::relais::cache::GDSFPolicy::instance().passes_waiting_.load();
+    }
 
     /// Reset per-repo GDSF state (avg_construction_time).
     template<typename Repo>

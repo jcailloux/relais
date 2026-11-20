@@ -350,6 +350,16 @@ if(RELAIS_BUILD_TESTS)
     # --wrap=malloc, --wrap=calloc and --wrap=free. No database.
     relais_add_test(test_relais_ledger        tests/relais/test_ledger.cpp              DEFINITIONS RELAIS_BUILDING_TESTS "RELAIS_GDSF_ENABLED=1" LABELS "relais;gdsf;ledger")
     target_link_options(test_relais_ledger PRIVATE -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=free)
+    # The maintenance thread, against a registry entry of the test. No database.
+    relais_add_test(test_relais_maintenance   tests/relais/test_maintenance.cpp         DEFINITIONS RELAIS_BUILDING_TESTS LABELS "relais;maintenance")
+    # Returns from main while the maintenance thread sweeps: its own main, no
+    # database, exit code 0 on success.
+    add_executable(test_relais_exit_during_sweep tests/relais/test_exit_during_sweep.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/LsanSuppressions.cpp)
+    target_include_directories(test_relais_exit_during_sweep PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_link_libraries(test_relais_exit_during_sweep PRIVATE jcailloux::relais)
+    add_test(NAME test_relais_exit_during_sweep COMMAND test_relais_exit_during_sweep)
+    set_tests_properties(test_relais_exit_during_sweep PROPERTIES LABELS "relais;maintenance")
     # An entry's weight is read from the allocator in use: the tests that check
     # it run again under jemalloc and mimalloc, preloaded, when installed. Not
     # in a sanitizer build, whose runtime must be the first library loaded.
@@ -420,6 +430,11 @@ if(RELAIS_BUILD_TESTS)
         target_compile_options(test_relais_gdsf PRIVATE
             -fsanitize=thread -fno-omit-frame-pointer)
         target_link_options(test_relais_gdsf PRIVATE -fsanitize=thread)
+        # The maintenance thread against the ticking and the passing threads:
+        # TSan validates what a served sweep publishes to a thread that waits.
+        target_compile_options(test_relais_maintenance PRIVATE
+            -fsanitize=thread -fno-omit-frame-pointer)
+        target_link_options(test_relais_maintenance PRIVATE -fsanitize=thread)
         # NB: the cache-coherence suite is single-loop (one event-loop thread), so
         # its concurrency-relevant surface — the shared static L1 under concurrent
         # find/update/erase, and the coroutine resume chains — is TSan-validated by
@@ -582,6 +597,8 @@ if(RELAIS_BUILD_TESTS)
             test_relais_gdsf_disabled
             test_relais_entry_layout
             test_relais_ledger
+            test_relais_maintenance
+            test_relais_exit_during_sweep
         COMMENT "Build all relais integration tests"
     )
 

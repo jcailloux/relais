@@ -647,9 +647,16 @@ void forcePurge() {
     Repo::purge();
 }
 
+/// Waits for the sweeps the maintenance thread was asked for, then runs one
+/// global sweep on the calling thread.
 template<typename Repo>
 void trySweep() {
-    jcailloux::relais::cache::GDSFPolicy::instance().sweep();
+    jcailloux::relais::cache::GDSFPolicy::instance().sweepNow();
+}
+
+/// Waits until the maintenance thread has served the sweeps requested so far.
+inline void awaitSweeps() {
+    jcailloux::relais::cache::GDSFPolicy::instance().awaitSweeps();
 }
 
 } // namespace relais_test

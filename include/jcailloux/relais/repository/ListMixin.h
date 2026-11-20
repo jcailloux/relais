@@ -213,6 +213,9 @@ class ListMixin : public Base {
                     .name = name.c_str()
                 });
             }
+            // At exit, before the list cache goes: the sweep in progress ends
+            // first, and no other starts.
+            ~Holder() { cache::GDSFPolicy::instance().stopMaintenance(); }
         };
         static Holder h;
         return h.instance;

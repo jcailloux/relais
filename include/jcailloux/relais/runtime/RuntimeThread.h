@@ -6,9 +6,24 @@
 #include <mutex>
 #include <thread>
 
+#if defined(__linux__)
+#include <pthread.h>
+#endif
+
 #include "jcailloux/relais/runtime/CachedClock.h"
 
 namespace jcailloux::relais::runtime::detail {
+
+/// Names the calling thread (15 characters at most), where the system lets a
+/// thread be named. A thread relais starts carries its own name, not the one
+/// of the thread that started it (an application's event loop).
+inline void nameThisThread(const char* name) noexcept {
+#if defined(__linux__)
+    (void)::pthread_setname_np(::pthread_self(), name);
+#else
+    (void)name;
+#endif
+}
 
 /// RuntimeThread — single background thread for periodic runtime tasks.
 ///
@@ -37,6 +52,7 @@ struct RuntimeThread {
     static void ensureStarted() {
         std::call_once(start_flag_, [] {
             thread_ = std::jthread{[](std::stop_token st) {
+                nameThisThread("relais-clock");
                 while (!st.stop_requested()) {
                     CachedClock::tick();
                     if (auto hook = on_tick.load(std::memory_order_acquire))

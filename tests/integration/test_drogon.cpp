@@ -18,7 +18,6 @@
 #include <jcailloux/relais/io/pg/PgError.h>
 #include <jcailloux/relais/io/pg/PgParams.h>
 #include <jcailloux/relais/repository/Repo.h>
-#include <jcailloux/relais/runtime/RuntimeThread.h>
 
 #include <fixtures/LivenessHarness.h>
 #include <fixtures/PgProbe.h>
@@ -185,7 +184,8 @@ private:
     std::thread thread_;
 };
 
-// The names of this process's threads.
+// The names of this process's threads, but relais's own ("relais-…"), which
+// start with the first repository and live as long as the process.
 std::multiset<std::string> threadNames() {
     std::multiset<std::string> names;
     DIR* d = ::opendir("/proc/self/task");
@@ -195,7 +195,7 @@ std::multiset<std::string> threadNames() {
         std::ifstream comm(std::string("/proc/self/task/") + entry->d_name + "/comm");
         std::string name;
         std::getline(comm, name);
-        names.insert(name);
+        if (!name.starts_with("relais-")) names.insert(name);
     }
     ::closedir(d);
     return names;
@@ -228,9 +228,6 @@ TEST_CASE("drogon: handlers reach PostgreSQL through relais on their IO loop and
 
     constexpr std::size_t kIoLoops = 3;
     const uint16_t port = freePort();
-    // relais's runtime thread, which the repository starts and the process
-    // keeps, is not Drogon's.
-    jcailloux::relais::runtime::detail::RuntimeThread::ensureStarted();
     const auto threads_before = threadNames();
     std::promise<std::string> main_loop_error;
     std::atomic<int> sleep_started{0}, sleep_answered{0}, sleep_failed{0};

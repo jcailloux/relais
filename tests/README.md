@@ -208,6 +208,12 @@ Tests for `warmup()` priming cache infrastructure including L1 entity cache and 
 | `[tracker-progressive]` | Progressive tracker reduction via `trySweep()` |
 | `[purge]` | `purge()` against concurrent sweeps, writes and reads: the cached page is the database's afterwards |
 
+### `test_relais_maintenance` (Maintenance thread, no database)
+
+The global sweep runs on relais's maintenance thread, never on the thread that ticks: a registry entry of the test records each sweep and can hold it. A cycle of ticks sweeps each chunk once, a backlog is served up to one cycle, a forced pass waiting for a sweep goes before the next one, and a sweep that throws is logged and dropped.
+
+`test_relais_exit_during_sweep` returns from `main` while a sweep is in progress: the sweep ends before the repositories' state is destroyed (exit code 0).
+
 ### `config/test_l1_config` (Configuration)
 
 Exhaustive tests for individual L1 cache configuration parameters: TTL, refresh, cleanup frequency, and write restriction.

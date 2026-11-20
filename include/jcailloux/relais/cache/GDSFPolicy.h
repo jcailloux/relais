@@ -9,9 +9,15 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <mutex>
 #include <shared_mutex>
+#include <stop_token>
+#include <thread>
 #include <vector>
+
+#include <utils/epoch.h>
+#include <utils/threads/thread_id_pool.h>
 
 #include "jcailloux/relais/cache/CacheMetadata.h"
 #include "jcailloux/relais/cache/L1Ledger.h"
@@ -141,6 +147,11 @@ struct RepoRegistryEntry {
 // Eviction strategy:
 //   1. Each repo sweeps 1 chunk (ghost decay, TTL expiration, score-based eviction)
 //   2. Building histogram merged into persistent histogram_ via EMA
+//
+// The global sweep runs on the maintenance thread, never on a thread that
+// serves requests: a tick asks for it and returns (see tickInsertion). One
+// sweep at a time for the whole process: sweep_mu_ excludes the maintenance
+// thread's sweeps and the forced passes.
 
 class GDSFPolicy {
 public:
@@ -161,7 +172,9 @@ public:
     }
 
     /// Configure the policy. Call once at startup before any repo access.
+    /// Excluded from the sweeps, which read it.
     void configure(const GDSFConfig& cfg) {
+        std::lock_guard exclusion(sweep_mu_);
         config_ = cfg;
         if (cfg.max_memory > 0) max_memory_ = cfg.max_memory;
     }
@@ -227,8 +240,9 @@ public:
     // Deterministic Cleanup Trigger
     // =====================================================================
 
-    /// Tick the global insertion counter. Fires a global sweep every
-    /// kCleanupMask+1 ticks. Three tick sources:
+    /// Tick the global insertion counter. Every kCleanupMask+1 ticks, asks the
+    /// maintenance thread for a global sweep and returns: the sweep never runs
+    /// on the ticking thread. Three tick sources:
     ///   - Real L1 insertion (under budget) — maintenance sweeps
     ///   - New ghost creation (over budget, first appearance) — tracking
     ///   - Qualified ghost re-access (over budget, score ≥ threshold) — eviction demand
@@ -236,7 +250,7 @@ public:
         if (kCleanupFrequencyLog2 > 0
                 && (insertion_counter_.fetch_add(1, std::memory_order_relaxed)
                     & kCleanupMask) == kCleanupMask) {
-            sweep();
+            requestSweep();
         }
     }
 
@@ -246,9 +260,35 @@ public:
 
     /// Register a repo for global coordination (threshold, sweep).
     /// Called once per LocalRepo instantiation via std::call_once.
+    /// The first enrollment starts the maintenance thread. The owner of an
+    /// entry calls stopMaintenance() before it destroys what its sweep
+    /// touches.
     void enroll(detail::RepoRegistryEntry entry) {
-        std::unique_lock lock(registry_mutex_);
-        registry_.push_back(std::move(entry));
+        {
+            std::unique_lock lock(registry_mutex_);
+            registry_.push_back(std::move(entry));
+        }
+        std::lock_guard lock(maintenance_mu_);
+        if (!maintenance_.joinable() && !maintenance_stopped_) startMaintenance();
+    }
+
+    /// Stops the maintenance thread and waits for the sweep in progress.
+    /// Called as the first enrolled tier is destroyed at exit: no sweep runs
+    /// once a tier, a tracker or the epoch goes. Final: no sweep is served
+    /// after it; the ticks keep counting. Idempotent.
+    void stopMaintenance() noexcept {
+        std::jthread thread;
+        {
+            std::lock_guard lock(maintenance_mu_);
+            maintenance_stopped_ = true;
+            thread = std::move(maintenance_);
+        }
+        if (!thread.joinable()) return;
+        thread.request_stop();
+        // Wakes the thread where it waits for a request.
+        requested_.fetch_add(1, std::memory_order_release);
+        requested_.notify_one();
+        thread.join();
     }
 
     size_t nbRepos() const {
@@ -276,13 +316,12 @@ public:
     }
 
     // =====================================================================
-    // Histogram Recording (during sweep, protected by sweep_flag_)
+    // Histogram Recording (during sweep, protected by sweep_mu_)
     // =====================================================================
 
     /// Record an entry into the building histogram during sweep.
     /// Called by cleanup predicates for ALL entries (evicted + kept).
-    /// Only called during a sweep or a forced pass, both serialized by
-    /// sweep_flag_.
+    /// Only called during a sweep or a forced pass, both under sweep_mu_.
     void recordEntry(float score, size_t entry_bytes) {
         building_histogram_.record(score, entry_bytes);
     }
@@ -291,11 +330,44 @@ public:
     // Global Sweep
     // =====================================================================
 
-    /// Global sweep: iterates all repos, sweeps one chunk per repo.
-    /// Abandons at once if a sweep or a forced pass is in progress.
-    void sweep() {
-        if (sweep_flag_.test_and_set(std::memory_order_acquire)) return;
+    /// Forced pass: `sweep_fn` (one repo's sweep) on every chunk, on the
+    /// calling thread, excluded from the global sweep. It removes what a sweep
+    /// removes, against the current threshold, ages the counts and the ghosts
+    /// as a sweep does, and records into the building histogram, which the
+    /// next global sweep resets before it records: the threshold does not
+    /// move. Waits for the sweep or pass in progress; the maintenance thread
+    /// lets it go before its next sweep. Returns the entries removed.
+    size_t sweepEveryChunk(size_t (*sweep_fn)(long chunk_id)) {
+        auto exclusion = lockForPass();
+        size_t removed = 0;
+        for (long chunk_id = 0; chunk_id < config_.chunk_count; ++chunk_id) {
+            removed += sweep_fn(chunk_id);
+        }
+        // As a sweep ends: what the pass freed is seen by isOverBudget() at once.
+        refreshHeldBytes();
+        return removed;
+    }
 
+#if RELAIS_ENABLE_METRICS
+    const detail::SweepCounters& sweepCounters() const noexcept { return sweep_counters_; }
+    detail::SweepCounters& sweepCounters() noexcept { return sweep_counters_; }
+#endif
+
+private:
+    GDSFPolicy() : max_memory_(readMaxMemoryFromEnv()) {
+        // Without GDSF nothing reads the held bytes: no hook.
+        // Release-store the hook last: a background-thread reader that acquire-
+        // loads it then sees this fully-constructed policy.
+        if constexpr (enabled) {
+            runtime::detail::RuntimeThread::on_tick.store(
+                [] () noexcept { GDSFPolicy::instance().refreshHeldBytes(); },
+                std::memory_order_release);
+        }
+    }
+
+    /// Global sweep: iterates all repos, sweeps one chunk per repo. The caller
+    /// holds sweep_mu_.
+    void sweepLocked() {
 #if RELAIS_ENABLE_METRICS
         auto sweep_t0 = std::chrono::steady_clock::now();
 #endif
@@ -364,58 +436,100 @@ public:
                 std::chrono::steady_clock::now() - sweep_t0).count());
         sweep_counters_.record(sweep_ns);
 #endif
-
-        releaseSweep();
     }
 
-    /// Forced pass: `sweep_fn` (one repo's sweep) on every chunk, excluded
-    /// from the global sweep. It removes what a sweep removes, against the
-    /// current threshold, ages the counts and the ghosts as a sweep does, and
-    /// records into the building histogram, which the next global sweep
-    /// resets before it records: the threshold does not move. Waits for the
-    /// sweep or pass in progress; a global sweep due meanwhile is abandoned.
-    /// Returns the entries removed.
-    size_t sweepEveryChunk(size_t (*sweep_fn)(long chunk_id)) {
-        while (sweep_flag_.test_and_set(std::memory_order_acquire)) {
-            sweep_flag_.wait(true, std::memory_order_relaxed);
-        }
-        // Released even if a chunk's sweep throws (an allocation): a flag
-        // left set would stop every later sweep.
-        struct Release {
-            GDSFPolicy& policy;
-            ~Release() { policy.releaseSweep(); }
-        } release{*this};
-
-        size_t removed = 0;
-        for (long chunk_id = 0; chunk_id < config_.chunk_count; ++chunk_id) {
-            removed += sweep_fn(chunk_id);
-        }
-        // As a sweep ends: what the pass freed is seen by isOverBudget() at once.
-        refreshHeldBytes();
-        return removed;
+    /// Asks the maintenance thread for one global sweep. The notify makes a
+    /// system call only when the thread sleeps: 1-2 µs, once every
+    /// kCleanupMask+1 ticks.
+    void requestSweep() noexcept {
+        // Release: the sweep that serves this request sees what the ticking
+        // thread wrote before it (the entry it stored, the modification it
+        // tracked).
+        requested_.fetch_add(1, std::memory_order_release);
+        requested_.notify_one();
     }
 
-#if RELAIS_ENABLE_METRICS
-    const detail::SweepCounters& sweepCounters() const noexcept { return sweep_counters_; }
-    detail::SweepCounters& sweepCounters() noexcept { return sweep_counters_; }
-#endif
+    /// Starts the maintenance thread, under maintenance_mu_, as the first tier
+    /// enrolls. The epoch and parlay's pool of thread ids are built first, on
+    /// this thread, while that tier is under construction: they outlive every
+    /// enrolled tier, and so the thread, stopped as the first one goes.
+    void startMaintenance() {
+        (void)epoch::internal::get_epoch();
+        (void)parlay::num_thread_ids();
+        maintenance_ = std::jthread([this](std::stop_token stop) { serveSweeps(stop); });
+    }
 
-private:
-    GDSFPolicy() : max_memory_(readMaxMemoryFromEnv()) {
-        // Without GDSF nothing reads the held bytes: no hook.
-        // Release-store the hook last: a background-thread reader that acquire-
-        // loads it then sees this fully-constructed policy.
-        if constexpr (enabled) {
-            runtime::detail::RuntimeThread::on_tick.store(
-                [] () noexcept { GDSFPolicy::instance().refreshHeldBytes(); },
-                std::memory_order_release);
+    /// The maintenance thread: one global sweep per request, until stopped.
+    /// More than a cycle behind (a sweep per chunk), it drops the oldest
+    /// requests: each chunk is still swept once per cycle of ticks, and the
+    /// delay never exceeds one cycle.
+    void serveSweeps(const std::stop_token& stop) {
+        runtime::detail::nameThisThread("relais-sweep");
+        // Holds parlay's pool of thread ids until the thread ends.
+        (void)parlay::my_thread_id();
+        for (;;) {
+            const uint32_t requested = requested_.load(std::memory_order_acquire);
+            if (stop.stop_requested()) return;
+            if (requested == served_.load(std::memory_order_relaxed)) {
+                requested_.wait(requested, std::memory_order_acquire);
+                continue;
+            }
+            yieldToPasses();
+            std::lock_guard exclusion(sweep_mu_);
+            uint32_t served = served_.load(std::memory_order_relaxed);
+            const uint32_t due = requested_.load(std::memory_order_acquire);
+            if (due == served) continue;  // a reset dropped them
+            const auto cycle = static_cast<uint32_t>(config_.chunk_count);
+            if (due - served > cycle) served = due - cycle;
+            try {
+                sweepLocked();
+            } catch (...) {
+                // A sweep that fails (an allocation) is dropped, and the next
+                // one starts over: the thread must not end.
+                logSweepFailure();
+            }
+            // Release: a thread that waits for this sweep sees its effects.
+            served_.store(served + 1, std::memory_order_release);
+            served_.notify_all();
         }
     }
 
-    /// Ends a sweep or a forced pass, and wakes a pass waiting for it.
-    void releaseSweep() noexcept {
-        sweep_flag_.clear(std::memory_order_release);
-        sweep_flag_.notify_all();
+    /// Takes sweep_mu_ for a forced pass. While a pass waits for it, the
+    /// maintenance thread does not start another sweep: the pass waits for
+    /// the sweep in progress at most.
+    [[nodiscard]] std::unique_lock<std::mutex> lockForPass() {
+        passes_waiting_.fetch_add(1);
+        // Once the lock is held (or its wait has thrown).
+        struct Arrived {
+            std::atomic<uint32_t>& waiting;
+            ~Arrived() {
+                waiting.fetch_sub(1);
+                waiting.notify_all();
+            }
+        } arrived{passes_waiting_};
+        return std::unique_lock(sweep_mu_);
+    }
+
+    /// Waits while a forced pass waits for sweep_mu_: a pass counts itself
+    /// before it waits for the lock, and goes before the next sweep.
+    void yieldToPasses() noexcept {
+        for (uint32_t waiting; (waiting = passes_waiting_.load()) != 0; ) {
+            passes_waiting_.wait(waiting);
+        }
+    }
+
+    /// Called in a catch handler, on the maintenance thread. Logging may
+    /// allocate: it never throws out of here.
+    static void logSweepFailure() noexcept {
+        try {
+            try {
+                throw;
+            } catch (const std::exception& e) {
+                RELAIS_LOG_ERROR << "relais: a maintenance sweep failed: " << e.what();
+            } catch (...) {
+                RELAIS_LOG_ERROR << "relais: a maintenance sweep failed";
+            }
+        } catch (...) {}
     }
 
     static size_t readMaxMemoryFromEnv() {
@@ -427,8 +541,10 @@ private:
         return 0;
     }
 
-    /// Reset all global state for test isolation.
+    /// Reset all global state for test isolation, between two sweeps. The
+    /// requests not served yet are dropped: none is pending after it.
     void reset() {
+        auto exclusion = lockForPass();
         cached_threshold_.store(0.0f, std::memory_order_relaxed);
         histogram_.reset();
         building_histogram_.reset();
@@ -440,6 +556,8 @@ private:
 #if RELAIS_ENABLE_METRICS
         sweep_counters_.reset();
 #endif
+        served_.store(requested_.load(std::memory_order_relaxed), std::memory_order_release);
+        served_.notify_all();
         // Registry and max_memory_ intentionally NOT cleared.
     }
 
@@ -461,7 +579,7 @@ private:
     // Global chunk cursor — all repos sweep the same chunk per sweep round.
     std::atomic<uint32_t> sweep_cursor_{0};
 
-    // Cycle interval tracking (protected by sweep_flag_, single writer)
+    // Cycle interval tracking (protected by sweep_mu_)
     static constexpr float kCycleAlpha = 0.2f;  // EMA α — half-life ≈ 3 cycles
     std::chrono::steady_clock::time_point last_cycle_tp_{};
     std::atomic<float> avg_cycle_interval_us_{0.0f};
@@ -472,10 +590,22 @@ private:
     std::atomic<uint64_t> held_bytes_{0};
     std::atomic<uint64_t> admitted_since_refresh_{0};
 
-    // Sweep serialization — lock-free, guaranteed on all platforms. Set by a
-    // global sweep (which abandons if it is set) and by a forced pass (which
-    // waits for it).
-    std::atomic_flag sweep_flag_{};
+    // One sweep at a time: held by the maintenance thread for each global
+    // sweep, and by each forced pass. Never taken on the request path.
+    std::mutex sweep_mu_;
+    // Forced passes waiting for sweep_mu_ (see lockForPass).
+    std::atomic<uint32_t> passes_waiting_{0};
+
+    // Global sweeps requested by the ticks, and served by the maintenance
+    // thread. served_ changes under sweep_mu_ only.
+    std::atomic<uint32_t> requested_{0};
+    std::atomic<uint32_t> served_{0};
+
+    // The maintenance thread. The policy is never destroyed: the thread is
+    // stopped by stopMaintenance() only.
+    std::mutex maintenance_mu_;
+    std::jthread maintenance_;
+    bool maintenance_stopped_ = false;
 
 #if RELAIS_ENABLE_METRICS
     detail::SweepCounters sweep_counters_;
@@ -486,6 +616,28 @@ private:
 public:
     /// Reset all global state for test isolation (test-only).
     void resetForTesting() { reset(); }
+
+    /// Waits until the maintenance thread has served the sweeps requested
+    /// before the call; at once if it does not run (test-only).
+    void awaitSweeps() {
+        const uint32_t due = requested_.load(std::memory_order_relaxed);
+        {
+            std::lock_guard lock(maintenance_mu_);
+            if (!maintenance_.joinable()) return;
+        }
+        for (uint32_t served;
+             static_cast<int32_t>(due - (served = served_.load(std::memory_order_acquire))) > 0; ) {
+            served_.wait(served, std::memory_order_acquire);
+        }
+    }
+
+    /// awaitSweeps(), then one global sweep on the calling thread, under the
+    /// exclusion (test-only).
+    void sweepNow() {
+        awaitSweeps();
+        auto exclusion = lockForPass();
+        sweepLocked();
+    }
 
     /// Expose histograms for testing.
     detail::ScoreHistogram& persistentHistogram() { return histogram_; }

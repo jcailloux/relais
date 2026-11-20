@@ -57,7 +57,7 @@ struct StripedCounter {
     }
 };
 
-/// Sweep duration counters — simple atomics (sweeps are serialized by sweep_flag_).
+/// Sweep duration counters — simple atomics (sweeps are serialized by sweep_mu_).
 struct SweepCounters {
     std::atomic<uint64_t> count{0};
     std::atomic<uint64_t> total_ns{0};

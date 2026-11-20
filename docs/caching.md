@@ -48,10 +48,11 @@ depends on **how relais was compiled**.
 truth, not a memory cap. The default `1h` is a safety net: invalidation covers
 writes through this process, but **not** out-of-band mutations (another instance, a
 migration, manual SQL) — see [Several instances](#several-instances). Expiry is
-**lazy** — an expired entry is dropped when it is next looked up (`find()` evicts on
-read); there is no background sweep in the default build, so a key written once and
-never read again lingers until touched. `with_l1_ttl(0s)` disables time expiry
-entirely.
+**lazy**: an expired entry is dropped when it is next looked up (`find()` evicts on
+read), or by the maintenance sweep, which a background thread of relais's runs over
+one chunk of the cache every few hundred entries read from the database. A key
+written once and never read again lingers until one of them reaches it.
+`with_l1_ttl(0s)` disables time expiry entirely.
 
 **2. Memory budget + GDSF (`RELAIS_L1_MAX_MEMORY`) — compile-time opt-in.**
 Size-aware GDSF eviction (score = frequency × cost ÷ entry size, evicts when over budget) and

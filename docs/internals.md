@@ -289,17 +289,24 @@ sliding-refresh knob on L1.
 ### Cleanup
 
 Cleanup is per-chunk, driven by `GDSFPolicy`'s global sweep (`enroll`'s
-`sweep_fn`), fired from `tickInsertion` on the fetch/admission path — **not** by
-the background `RuntimeThread`, which only refreshes the cached clock and, in a
-GDSF build, the bytes the L1 budget compares, and never sweeps L1. It is also
-not a global stop-the-world pass: the tier walks one chunk at a time, evicting
-expired entries (and, when GDSF is on, low-score entries against a byte target)
-so a sweep never holds a chunk locked longer than that chunk.
+`sweep_fn`). `tickInsertion` counts on the fetch/admission path; every 512 ticks
+it asks the **maintenance thread** for one sweep and returns: a sweep never runs
+on a thread that serves requests. The thread serves one sweep per request. More
+than a cycle behind (one sweep per chunk), it drops the oldest requests: each
+chunk is still swept once per cycle of ticks. It starts with the first enrolled
+tier; the first enrolled tier destroyed at exit stops it, after the sweep in
+progress. The other background thread, `RuntimeThread`, only refreshes the
+cached clock and, in a GDSF build, the bytes the L1 budget compares.
 
-`purge()` runs a forced pass: its repo's sweep on every chunk, excluded from the
-global sweep. It waits for the sweep in progress, and a global sweep due during
-the pass is skipped. It removes what a sweep removes, against the current
-threshold, and no more.
+A sweep is not a global stop-the-world pass: the tier walks one chunk at a
+time, evicting expired entries (and, when GDSF is on, low-score entries against
+a byte target), so a sweep never holds a chunk locked longer than that chunk.
+One sweep runs at a time for the whole process (`sweep_mu_`).
+
+`purge()` runs a forced pass on the calling thread: its repo's sweep on every
+chunk, under the same exclusion. It waits for the sweep in progress, and the
+maintenance thread lets it go before its next sweep. It removes what a sweep
+removes, against the current threshold, and no more.
 
 ## Cache Flow on Operations
 

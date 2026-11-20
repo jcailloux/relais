@@ -972,7 +972,7 @@ TEST_CASE("GDSF - cross-repo sweep coordination",
         }
 
         // Global sweep (sweeps 1 chunk per repo) + purge (covers all chunks)
-        policy.sweep();
+        policy.sweepNow();
         GDSFCoordRepo1::purge();
         GDSFCoordRepo2::purge();
 
@@ -1041,7 +1041,7 @@ TEST_CASE("GDSF - the budget bounds the bytes the L1 holds, not the process",
         std::memset(buffer.get(), 1, kBuffer);  // resident, not just reserved
         asm volatile("" : : "r"(buffer.get()) : "memory");  // kept, not elided
 
-        for (long i = 0; i < 2 * policy.chunkCount(); ++i) policy.sweep();
+        for (long i = 0; i < 2 * policy.chunkCount(); ++i) policy.sweepNow();
 
         CHECK_FALSE(policy.isOverBudget());
         CHECK(policy.threshold() == 0.0f);
@@ -1058,7 +1058,7 @@ TEST_CASE("GDSF - the budget bounds the bytes the L1 holds, not the process",
         // Room for half the entries: the same cache is now over budget.
         policy.configure({.max_memory = static_cast<size_t>(base + (held - base) / 2)});
 
-        policy.sweep();  // reads the ledger; an empty histogram evicts nothing
+        policy.sweepNow();  // reads the ledger; an empty histogram evicts nothing
         CHECK(policy.isOverBudget());
 
         // A miss over budget is ghosted, not admitted.
@@ -1067,13 +1067,13 @@ TEST_CASE("GDSF - the budget bounds the bytes the L1 holds, not the process",
         CHECK(TestInternals::isGhostEntry<GDSFItemRepo>(id));
 
         for (long i = 0; i < 4 * policy.chunkCount() && GDSFItemRepo::size() == kEntries; ++i)
-            policy.sweep();
+            policy.sweepNow();
         CHECK(GDSFItemRepo::size() < kEntries);
     }
 
     SECTION("[budget] the held bytes are read again every 100 ms, sweep or not") {
         policy.configure({.max_memory = static_cast<size_t>(base + (held - base) / 2)});
-        policy.sweep();  // reads the ledger; an empty histogram evicts nothing
+        policy.sweepNow();  // reads the ledger; an empty histogram evicts nothing
         REQUIRE(policy.isOverBudget());
 
         // The cache empties; no sweep runs: RuntimeThread reads it.
@@ -1090,7 +1090,7 @@ TEST_CASE("GDSF - the budget bounds the bytes the L1 holds, not the process",
         PauseTickHook pause;  // only the sweep reads them here
 
         // A histogram to place a threshold: one cycle under no pressure.
-        for (long i = 0; i < policy.chunkCount(); ++i) policy.sweep();
+        for (long i = 0; i < policy.chunkCount(); ++i) policy.sweepNow();
         REQUIRE(policy.threshold() == 0.0f);
         const int64_t before = L1Ledger::sum();
         REQUIRE(TestInternals::budgetHeldBytes() == static_cast<uint64_t>(before));
@@ -1105,7 +1105,7 @@ TEST_CASE("GDSF - the budget bounds the bytes the L1 holds, not the process",
 
         // Room for half of them: over budget only on what the sweep reads as it starts.
         policy.configure({.max_memory = static_cast<size_t>(before + (after - before) / 2)});
-        policy.sweep();
+        policy.sweepNow();
         CHECK(policy.threshold() > 0.0f);
         // What it evicted and freed is in what it reads as it ends.
         CHECK(TestInternals::budgetHeldBytes() == static_cast<uint64_t>(L1Ledger::sum()));
@@ -1143,7 +1143,7 @@ TEST_CASE("GDSF - purge is a forced pass, excluded from a concurrent sweep",
         std::atomic<bool> stop{false};
         std::thread sweeper([&] {
             while (!stop.load(std::memory_order_relaxed)) {
-                policy.sweep();
+                policy.sweepNow();
                 std::this_thread::sleep_for(std::chrono::microseconds{20});
             }
         });

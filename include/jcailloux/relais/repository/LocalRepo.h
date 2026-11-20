@@ -588,6 +588,11 @@ private:
                 // Release: publish only after the Tier is fully enrolled.
                 state_ptr_.store(&instance, std::memory_order_release);
             }
+            // At exit, before the state goes: the sweep in progress ends
+            // first, and no other starts.
+            ~Holder() {
+                if constexpr (Tier::kHasCleanup) cache::GDSFPolicy::instance().stopMaintenance();
+            }
         };
         static Holder h;
         // Redundant publish after the thread-safe static guard completes.

@@ -595,7 +595,7 @@ TEST_CASE("LocalRepo - FewChunks config",
         sync(FewChunksTestItemRepo::find(id));
 
         // Global sweep runs but removes nothing (entry not expired)
-        jcailloux::relais::cache::GDSFPolicy::instance().sweep();
+        jcailloux::relais::cache::GDSFPolicy::instance().sweepNow();
 
         // Non-expired entry survives
         auto result = sync(FewChunksTestItemRepo::find(id));
@@ -646,6 +646,7 @@ TEST_CASE("LocalRepo - stores from the database drive the maintenance sweep",
         auto view = sync(L1TestItemRepo::findMany(ids));
         REQUIRE(view.size() == cycle);
 
+        awaitSweeps();  // the maintenance thread sweeps the cycle
         CHECK(getCacheSize<ShortTTLTestItemRepo>() == 0);
     }
 

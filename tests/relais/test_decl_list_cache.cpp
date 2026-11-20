@@ -1077,6 +1077,7 @@ TEST_CASE("[DeclListRepo] The tracker drains as memory grows, without manual swe
                 static_cast<int32_t>(i)));
         }
         // Every chunk was swept after each write of the first cycle.
+        awaitSweeps();
         CHECK(TestInternals::pendingModificationCount<TestArticleListRepo>() <= cycle);
     }
 
@@ -1090,6 +1091,7 @@ TEST_CASE("[DeclListRepo] The tracker drains as memory grows, without manual swe
         auto view = sync(L1TestItemRepo::findMany(ids));
         REQUIRE(view.size() == cycle);
 
+        awaitSweeps();  // the maintenance thread sweeps the cycle
         CHECK(TestInternals::pendingModificationCount<TestArticleListRepo>() == 0);
     }
 
