@@ -14,8 +14,8 @@
 #include <vector>
 
 #include "jcailloux/relais/cache/CacheMetadata.h"
+#include "jcailloux/relais/cache/L1Ledger.h"
 #include "jcailloux/relais/cache/Metrics.h"
-#include "jcailloux/relais/runtime/CachedMemory.h"
 #include "jcailloux/relais/runtime/RuntimeThread.h"
 #include "jcailloux/relais/Log.h"
 
@@ -172,29 +172,40 @@ public:
     /// var at construction, overridable via configure(). Returns 0 if unset (no limit).
     size_t maxMemory() const { return max_memory_; }
 
-    /// True when estimated live heap (+ extra) would exceed the budget.
-    /// heap_cached + admitted_since_tick + extra ≥ budget.
-    /// CachedMemory is refreshed every ~100ms; admitted_since_tick_ bridges
-    /// the gap by tracking bytes admitted since the last refresh.
+    /// True when the bytes the L1 holds (+ extra) would exceed the budget:
+    /// held + admitted_since_refresh + extra ≥ budget. The held bytes are read
+    /// from the L1 ledger at each refresh (see refreshHeldBytes); what was
+    /// admitted since bridges the gap. Memory the L1 does not hold never
+    /// counts, whatever the allocator.
     /// Pass est_bytes as extra to pre-check that an admission won't overshoot.
     /// Cost: 2 relaxed loads + add (~2ns). Only called on cache miss path.
     bool isOverBudget(uint64_t extra = 0) const {
         if (max_memory_ == 0) return false;
-        return runtime::detail::CachedMemory::bytes()
-             + admitted_since_tick_.load(std::memory_order_relaxed)
+        return held_bytes_.load(std::memory_order_relaxed)
+             + admitted_since_refresh_.load(std::memory_order_relaxed)
              + extra
              >= max_memory_;
     }
 
     /// Record admitted bytes.  Called on real L1 insertion only (not ghosts).
     void recordAdmission(uint32_t est_bytes) {
-        admitted_since_tick_.fetch_add(est_bytes, std::memory_order_relaxed);
+        admitted_since_refresh_.fetch_add(est_bytes, std::memory_order_relaxed);
     }
 
-    /// Reset admitted counter after a fresh heap measurement.
-    /// Called by RuntimeThread (every ~100ms) and by sweep (step 6).
-    void onHeapRefresh() {
-        admitted_since_tick_.store(0, std::memory_order_relaxed);
+    /// Reads the bytes the L1 holds (L1Ledger::sum) into the value the budget
+    /// compares, and restarts the admissions it bridges: the sum holds them.
+    /// An admission under way meanwhile is seen at the next refresh at the
+    /// latest. Called by each sweep, before and after it evicts, and every
+    /// 100 ms by RuntimeThread. Cost: one cache line per thread.
+    void refreshHeldBytes() noexcept {
+        if constexpr (enabled) {
+            admitted_since_refresh_.store(0, std::memory_order_relaxed);
+            // A sum read while other threads allocate and free moves: near an
+            // empty cache it can read below zero for an instant.
+            const int64_t held = detail::L1Ledger::sum();
+            held_bytes_.store(held > 0 ? static_cast<uint64_t>(held) : 0,
+                              std::memory_order_relaxed);
+        }
     }
 
     /// Number of chunks (uniform across all ChunkMaps).
@@ -308,7 +319,9 @@ public:
             last_cycle_tp_ = now;
         }
 
-        // 3. Compute eviction threshold from heap pressure.
+        // 3. Compute eviction threshold from the bytes the L1 holds beyond
+        //    the budget. The histogram records what an eviction gives back to
+        //    the ledger (each entry's own count), so the two are in one unit.
         //    The histogram represents one average chunk (EMA-smoothed), so
         //    thresholdForBytes(overshoot) returns the score below which enough
         //    bytes exist to cover the full overshoot.  When overshoot exceeds
@@ -318,10 +331,11 @@ public:
         //    compensating for inter-sweep admissions.
         {
             float threshold = 0.0f;
-            if (max_memory_ > 0) {
-                auto heap = runtime::detail::CachedMemory::bytes();
-                if (heap > max_memory_) {
-                    threshold = histogram_.thresholdForBytes(heap - max_memory_);
+            if constexpr (enabled) {
+                refreshHeldBytes();
+                const uint64_t held = held_bytes_.load(std::memory_order_relaxed);
+                if (max_memory_ > 0 && held > max_memory_) {
+                    threshold = histogram_.thresholdForBytes(held - max_memory_);
                 }
             }
             cached_threshold_.store(threshold, std::memory_order_relaxed);
@@ -339,10 +353,9 @@ public:
         // 5. Merge building histogram into persistent (EMA)
         histogram_.mergeEMA(building_histogram_, config_.histogram_alpha);
 
-        // 6. Refresh heap + reset admitted counter so isOverBudget()
-        //    immediately reflects the post-eviction state.
-        runtime::detail::CachedMemory::tick();
-        onHeapRefresh();
+        // 6. Read the bytes the L1 holds once evicted entries are freed, so
+        //    isOverBudget() reflects them at once.
+        refreshHeldBytes();
 
 #if RELAIS_ENABLE_METRICS
         auto sweep_ns = static_cast<uint64_t>(
@@ -361,11 +374,14 @@ public:
 
 private:
     GDSFPolicy() : max_memory_(readMaxMemoryFromEnv()) {
+        // Without GDSF nothing reads the held bytes: no hook.
         // Release-store the hook last: a background-thread reader that acquire-
         // loads it then sees this fully-constructed policy.
-        runtime::detail::RuntimeThread::on_heap_refresh.store(
-            [] () noexcept { GDSFPolicy::instance().onHeapRefresh(); },
-            std::memory_order_release);
+        if constexpr (enabled) {
+            runtime::detail::RuntimeThread::on_tick.store(
+                [] () noexcept { GDSFPolicy::instance().refreshHeldBytes(); },
+                std::memory_order_release);
+        }
     }
 
     static size_t readMaxMemoryFromEnv() {
@@ -386,7 +402,7 @@ private:
         sweep_cursor_.store(0, std::memory_order_relaxed);
         last_cycle_tp_ = {};
         avg_cycle_interval_us_.store(0.0f, std::memory_order_relaxed);
-        admitted_since_tick_.store(0, std::memory_order_relaxed);
+        refreshHeldBytes();
 #if RELAIS_ENABLE_METRICS
         sweep_counters_.reset();
 #endif
@@ -416,10 +432,11 @@ private:
     std::chrono::steady_clock::time_point last_cycle_tp_{};
     std::atomic<float> avg_cycle_interval_us_{0.0f};
 
-    // Admitted bytes since last CachedMemory refresh.  Reset by onHeapRefresh()
-    // (called by RuntimeThread every ~100ms and by sweep after eviction).
-    // isOverBudget() uses heap + admitted ≥ budget to bridge measurement gaps.
-    std::atomic<uint64_t> admitted_since_tick_{0};
+    // The bytes the L1 holds, as the last refresh read them from the ledger,
+    // and the bytes admitted since (see refreshHeldBytes). isOverBudget()
+    // compares held + admitted to the budget.
+    std::atomic<uint64_t> held_bytes_{0};
+    std::atomic<uint64_t> admitted_since_refresh_{0};
 
     // Sweep serialization — lock-free, guaranteed on all platforms
     std::atomic_flag sweep_flag_{};

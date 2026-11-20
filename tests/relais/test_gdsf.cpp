@@ -18,6 +18,7 @@
  * 16b. size() live count excludes ghosts
  *  17. Eviction selectivity    — hot/cold, score formula
  *  19. Cross-repo sweep coordination
+ * 19b. Budget                  — bounds the bytes the L1 holds, not the process
  *  20. Entry bytes             — the room an entry takes, stored or recomputed;
  *                                 the room a block takes, read from the allocator
  */
@@ -36,6 +37,7 @@
 #include <set>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
@@ -52,6 +54,7 @@
 #include "fixtures/TestAllocator.h"
 #include "fixtures/generated/TestOrderEntity.h"
 #include <jcailloux/relais/WeighedFunction.h>
+#include <jcailloux/relais/cache/L1Ledger.h>
 
 using namespace relais_test;
 using GDSFPolicy = jcailloux::relais::cache::GDSFPolicy;
@@ -994,6 +997,122 @@ TEST_CASE("GDSF - cross-repo sweep coordination",
 
 // #############################################################################
 //
+//  19b. GDSF - the budget bounds the bytes the L1 holds
+//
+// #############################################################################
+
+TEST_CASE("GDSF - the budget bounds the bytes the L1 holds, not the process",
+          "[integration][db][gdsf][budget]")
+{
+    using L1Ledger = jcailloux::relais::cache::detail::L1Ledger;
+
+    TransactionGuard tx;
+    auto& policy = GDSFPolicy::instance();
+    resetAllTestRepos();
+    // Whatever a section configures, the next test case finds this TU's budget.
+    struct RestoreBudget {
+        ~RestoreBudget() { GDSFPolicy::instance().configure({.max_memory = kTestMaxMemory}); }
+    } restore;
+
+    constexpr size_t kEntries = 32;
+    const int64_t base = L1Ledger::sum();
+    for (size_t i = 0; i < kEntries; ++i) {
+        sync(GDSFItemRepo::find(insertTestItem("budget_" + std::to_string(i),
+                                               static_cast<int32_t>(i))));
+    }
+    REQUIRE(GDSFItemRepo::size() == kEntries);
+    const int64_t held = L1Ledger::sum();
+    REQUIRE(held > base);
+
+    SECTION("[budget] memory the L1 does not hold evicts nothing") {
+        // Room for what the L1 holds and 1 MiB more; the process holds far more.
+        policy.configure({.max_memory = static_cast<size_t>(held) + (size_t{1} << 20)});
+        constexpr size_t kBuffer = size_t{64} << 20;
+        auto buffer = std::make_unique<char[]>(kBuffer);
+        std::memset(buffer.get(), 1, kBuffer);  // resident, not just reserved
+        asm volatile("" : : "r"(buffer.get()) : "memory");  // kept, not elided
+
+        for (long i = 0; i < 2 * policy.chunkCount(); ++i) policy.sweep();
+
+        CHECK_FALSE(policy.isOverBudget());
+        CHECK(policy.threshold() == 0.0f);
+        CHECK(GDSFItemRepo::size() == kEntries);
+
+        // A miss is admitted, not ghosted.
+        auto id = insertTestItem("budget_admitted", 99);
+        sync(GDSFItemRepo::find(id));
+        CHECK_FALSE(TestInternals::isGhostEntry<GDSFItemRepo>(id));
+        CHECK(GDSFItemRepo::size() == kEntries + 1);
+    }
+
+    SECTION("[budget] the bytes the L1 holds beyond it are evicted") {
+        // Room for half the entries: the same cache is now over budget.
+        policy.configure({.max_memory = static_cast<size_t>(base + (held - base) / 2)});
+
+        policy.sweep();  // reads the ledger; an empty histogram evicts nothing
+        CHECK(policy.isOverBudget());
+
+        // A miss over budget is ghosted, not admitted.
+        auto id = insertTestItem("budget_ghosted", 99);
+        sync(GDSFItemRepo::find(id));
+        CHECK(TestInternals::isGhostEntry<GDSFItemRepo>(id));
+
+        for (long i = 0; i < 4 * policy.chunkCount() && GDSFItemRepo::size() == kEntries; ++i)
+            policy.sweep();
+        CHECK(GDSFItemRepo::size() < kEntries);
+    }
+
+    SECTION("[budget] the held bytes are read again every 100 ms, sweep or not") {
+        policy.configure({.max_memory = static_cast<size_t>(base + (held - base) / 2)});
+        policy.sweep();  // reads the ledger; an empty histogram evicts nothing
+        REQUIRE(policy.isOverBudget());
+
+        // The cache empties; no sweep runs: RuntimeThread reads it.
+        TestInternals::resetEntityCacheState<GDSFItemRepo>();
+        TestInternals::clearEntityCachePools<GDSFItemRepo>();
+        REQUIRE(L1Ledger::sum() < base + (held - base) / 2);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+        while (policy.isOverBudget() && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds{5});
+        CHECK_FALSE(policy.isOverBudget());
+    }
+
+    SECTION("[budget] a sweep reads the held bytes as it starts and as it ends") {
+        // Only the sweep reads them here.
+        using RuntimeThread = jcailloux::relais::runtime::detail::RuntimeThread;
+        struct PauseTickHook {
+            RuntimeThread::TickHook hook = RuntimeThread::on_tick.exchange(nullptr);
+            ~PauseTickHook() { RuntimeThread::on_tick.store(hook); }
+        } pause;
+
+        // A histogram to place a threshold: one cycle under no pressure.
+        for (long i = 0; i < policy.chunkCount(); ++i) policy.sweep();
+        REQUIRE(policy.threshold() == 0.0f);
+        const int64_t before = L1Ledger::sum();
+        REQUIRE(TestInternals::budgetHeldBytes() == static_cast<uint64_t>(before));
+
+        // More entries, which no refresh has read yet.
+        for (size_t i = 0; i < kEntries; ++i) {
+            sync(GDSFItemRepo::find(insertTestItem("budget_more_" + std::to_string(i),
+                                                   static_cast<int32_t>(i))));
+        }
+        const int64_t after = L1Ledger::sum();
+        REQUIRE(TestInternals::budgetHeldBytes() == static_cast<uint64_t>(before));
+
+        // Room for half of them: over budget only on what the sweep reads as it starts.
+        policy.configure({.max_memory = static_cast<size_t>(before + (after - before) / 2)});
+        policy.sweep();
+        CHECK(policy.threshold() > 0.0f);
+        // What it evicted and freed is in what it reads as it ends.
+        CHECK(TestInternals::budgetHeldBytes() == static_cast<uint64_t>(L1Ledger::sum()));
+    }
+
+    resetAllTestRepos();
+}
+
+
+// #############################################################################
+//
 //  20. Entry bytes — what one L1 entry holds
 //
 // #############################################################################
@@ -1388,9 +1507,10 @@ TEST_CASE("Entry bytes - heapBytes matches the blocks libstdc++ allocates",
         o.history = {makeAddress(), makeAddress()};
         o.quantities = {1, 2, 3};
         o.tags = {kLong, "x"};
+        // An entity is counted by its memoryUsage(), read on the copy whose
+        // blocks were recorded: the original's blocks may differ in room.
         auto [held, counted] = heldAndCounted(o);
         CHECK(counted == held);
-        CHECK(o.memoryUsage() == sizeof(TestOrderEntity) + held);
     }
 }
 #endif

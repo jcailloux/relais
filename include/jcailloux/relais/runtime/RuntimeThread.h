@@ -7,13 +7,13 @@
 #include <thread>
 
 #include "jcailloux/relais/runtime/CachedClock.h"
-#include "jcailloux/relais/runtime/CachedMemory.h"
 
 namespace jcailloux::relais::runtime::detail {
 
 /// RuntimeThread — single background thread for periodic runtime tasks.
 ///
-/// One jthread ticks every 100ms, calling each task directly.
+/// One jthread ticks every 100ms: it refreshes the cached clock, then runs the
+/// tick hook, if one is set. It never asks the allocator anything.
 /// New tasks: add a call in the loop body.
 struct RuntimeThread {
     /// Tick interval in microseconds (constexpr, usable for normalization).
@@ -21,17 +21,17 @@ struct RuntimeThread {
         static_cast<float>(std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::milliseconds{100}).count());
 
-    using HeapRefreshHook = void (*)() noexcept;
+    using TickHook = void (*)() noexcept;
 
-    /// Optional callback invoked after each CachedMemory::tick().
-    /// Set by GDSFPolicy to reset its admitted counter on heap refresh.
+    /// Optional task run on each tick, after the clock. Set by GDSFPolicy, in
+    /// a build with GDSF, to read the bytes the L1 holds for its budget.
     ///
     /// Atomic because it is written once by the GDSFPolicy singleton's
     /// constructor (which runs lazily, possibly after this thread has started)
     /// and read on every tick by the background thread. The release/acquire pair
     /// also publishes the GDSFPolicy state the hook touches: a reader that sees
     /// the non-null hook sees a fully-constructed policy.
-    static inline std::atomic<HeapRefreshHook> on_heap_refresh{nullptr};
+    static inline std::atomic<TickHook> on_tick{nullptr};
 
     /// Ensure the background thread is running (idempotent via call_once).
     static void ensureStarted() {
@@ -39,8 +39,7 @@ struct RuntimeThread {
             thread_ = std::jthread{[](std::stop_token st) {
                 while (!st.stop_requested()) {
                     CachedClock::tick();
-                    CachedMemory::tick();
-                    if (auto hook = on_heap_refresh.load(std::memory_order_acquire))
+                    if (auto hook = on_tick.load(std::memory_order_acquire))
                         hook();
                     std::this_thread::sleep_for(kInterval);
                 }

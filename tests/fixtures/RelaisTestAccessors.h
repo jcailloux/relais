@@ -532,6 +532,13 @@ struct TestInternals {
             t, std::memory_order_relaxed);
     }
 
+    /// The bytes the L1 holds as the GDSF budget compares them: what its last
+    /// refresh read on the ledger (test-only).
+    static uint64_t budgetHeldBytes() {
+        return jcailloux::relais::cache::GDSFPolicy::instance().held_bytes_.load(
+            std::memory_order_relaxed);
+    }
+
     /// Seed the average construction time for a repo (test-only).
     template<typename Repo>
     static void seedAvgConstructionTime(float us) {

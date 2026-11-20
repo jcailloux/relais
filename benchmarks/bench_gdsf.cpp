@@ -9,18 +9,17 @@
  *   - Pressure: 90% (low eviction), 50% (medium), 20% (high eviction)
  *   - Sizes:    uniform (~1KB each) or varied (alternating ~1KB / ~2KB)
  *
- * Working set: 10K items × ~1KB = ~10MB cache footprint (significant vs ~15-25MB RSS).
+ * Working set: 10K items × ~1KB = ~10MB cache footprint.
  *
- * Budget is self-calibrating: RSS is measured before and after cache insertion.
- * max_memory = RSS_baseline + actual_cache_footprint × pressure.
- * Each entry carries a ~1KB description so the cache footprint (~10MB for 10K items)
- * is significant relative to process RSS.
+ * Budget is self-calibrating on the bytes the L1 holds (its ledger), read
+ * before and after cache insertion:
+ * max_memory = ledger_baseline + cache_footprint × pressure.
  *
  * Design:
- *   1. Snapshot RSS baseline, insert N items into DB + L1 (all cached, access_count=1)
- *   2. Set budget = RSS_baseline + cache_headroom (pressure × estimated cache size)
+ *   1. Read the ledger baseline, insert N items into DB + L1 (all cached, access_count=1)
+ *   2. Set budget = ledger_baseline + cache_headroom (pressure × cache footprint)
  *   3. Warm up: run target distribution to build access counts (all L1 hits)
- *   4. Sweep rounds: threshold computed from RSS vs budget via histogram
+ *   4. Sweep rounds: threshold computed from the held bytes vs budget via histogram
  *   5. Measure: 100K fixed-ops L1-only lookups, count hits vs misses
  *
  * Run with:
@@ -42,14 +41,12 @@
 #include <numeric>
 #include <random>
 
-#include <jcailloux/relais/runtime/CachedMemory.h>
-#include <jcailloux/relais/runtime/RuntimeThread.h>
+#include <jcailloux/relais/cache/L1Ledger.h>
 
 using namespace relais_test;
 using namespace relais_bench;
 using GDSFPolicy = jcailloux::relais::cache::GDSFPolicy;
-using CachedMemory = jcailloux::relais::runtime::detail::CachedMemory;
-using RuntimeThread = jcailloux::relais::runtime::detail::RuntimeThread;
+using L1Ledger = jcailloux::relais::cache::detail::L1Ledger;
 
 static_assert(GDSFPolicy::enabled,
     "bench_gdsf.cpp must be compiled with RELAIS_GDSF_ENABLED=1");
@@ -119,11 +116,13 @@ struct SetupResult {
     std::vector<int64_t> ids;
 };
 
+/// The bytes the L1 holds, read on the ledger.
+uint64_t heldBytes() {
+    return static_cast<uint64_t>(std::max<int64_t>(L1Ledger::sum(), 0));
+}
+
 SetupResult setupGDSFBench(size_t n_items, double pressure,
                             bool varied_sizes = false) {
-    // Ensure RuntimeThread is running so CachedMemory is populated.
-    RuntimeThread::ensureStarted();
-
     // Reset everything (drain epoch pool before zeroing memory counters)
     TestInternals::resetCacheForGDSF<GDSFBenchRepo>();
 
@@ -131,12 +130,10 @@ SetupResult setupGDSFBench(size_t n_items, double pressure,
     // nuking chunks with an empty histogram.
     GDSFPolicy::instance().configure({.max_memory = SIZE_MAX});
 
-    // Snapshot RSS BEFORE inserting cache entries.
-    CachedMemory::tick();
-    auto rss_baseline = CachedMemory::bytes();
+    // What the L1 holds BEFORE inserting cache entries (its tables).
+    auto held_baseline = heldBytes();
 
-    // Each entry gets a ~1KB description so cache footprint is significant.
-    // With 10K items × ~1KB = ~10MB of cache, visible in RSS.
+    // Each entry gets a ~1KB description: 10K items × ~1KB = ~10MB of cache.
     std::string base_desc(1024, 'x');
 
     std::vector<int64_t> ids;
@@ -157,19 +154,18 @@ SetupResult setupGDSFBench(size_t n_items, double pressure,
     // real score distributions, not exp2(23.25).
     for (int i = 0; i < 16; ++i) GDSFPolicy::instance().sweep();
 
-    // Measure actual cache footprint in RSS, then apply pressure.
+    // Measure the cache footprint on the ledger, then apply pressure.
     // pressure=0.9 → allow 90% of cache to stay, evict 10%.
     // pressure=0.2 → allow 20% of cache to stay, evict 80%.
-    CachedMemory::tick();
-    auto rss_after = CachedMemory::bytes();
-    auto cache_footprint = (rss_after > rss_baseline)
-        ? rss_after - rss_baseline : 0ULL;
-    auto budget = rss_baseline
+    auto held_after = heldBytes();
+    auto cache_footprint = (held_after > held_baseline)
+        ? held_after - held_baseline : 0ULL;
+    auto budget = held_baseline
         + static_cast<uint64_t>(static_cast<double>(cache_footprint) * pressure);
     GDSFPolicy::instance().configure({.max_memory = static_cast<size_t>(budget)});
 
-    WARN("  [setup] heap_baseline=" << (rss_baseline / 1024) << " KB"
-         << "  heap_after=" << (rss_after / 1024) << " KB"
+    WARN("  [setup] held_baseline=" << (held_baseline / 1024) << " KB"
+         << "  held_after=" << (held_after / 1024) << " KB"
          << "  footprint=" << (cache_footprint / 1024) << " KB"
          << "  budget=" << (budget / 1024) << " KB");
 
@@ -192,7 +188,7 @@ void warmupAccess(const std::vector<int64_t>& ids, KeyGen&& gen, size_t ops = 10
 
     // Rebuild histogram to reflect post-warmup scores.
     // Temporarily disable budget so sweeps only record, not evict.
-    // Then re-anchor budget to current RSS + original cache headroom.
+    // Then restore the budget.
     auto saved_budget = GDSFPolicy::instance().maxMemory();
     GDSFPolicy::instance().configure({.max_memory = SIZE_MAX});
     for (int i = 0; i < 16; ++i) GDSFPolicy::instance().sweep();
@@ -205,8 +201,8 @@ void sweepRounds(int rounds = 8) {
         GDSFPolicy::instance().sweep();
 }
 
-/// Running statistics for heap sampling during workload.
-struct HeapStats {
+/// Running statistics of the bytes the L1 holds, sampled during workload.
+struct HeldStats {
     uint64_t min_kb = UINT64_MAX;
     uint64_t max_kb = 0;
     double sum_kb = 0.0;
@@ -214,7 +210,7 @@ struct HeapStats {
     size_t count = 0;
 
     void sample() {
-        auto kb = CachedMemory::bytes() / 1024;
+        auto kb = heldBytes() / 1024;
         if (kb < min_kb) min_kb = kb;
         if (kb > max_kb) max_kb = kb;
         sum_kb += static_cast<double>(kb);
@@ -236,7 +232,7 @@ struct AccessStats {
     int64_t misses = 0;
     int64_t cache_size = 0;
     Clock::duration elapsed{};
-    HeapStats heap{};
+    HeldStats held{};
 
     double hitRate() const {
         auto total = hits + misses;
@@ -252,7 +248,7 @@ struct AccessStats {
 
 /// Fixed-ops steady-state workload: misses fetch from DB and re-admit into L1,
 /// triggering GDSF sweeps. Measures the dynamic equilibrium hit rate.
-/// Samples heap every 1024 ops for min/max/avg/stddev statistics.
+/// Samples the held bytes every 1024 ops for min/max/avg/stddev statistics.
 template<typename KeyGen>
 AccessStats runWorkloadFixed(const std::vector<int64_t>& ids, KeyGen&& gen,
                              size_t num_ops) {
@@ -264,9 +260,9 @@ AccessStats runWorkloadFixed(const std::vector<int64_t>& ids, KeyGen&& gen,
     for (size_t i = 0; i < num_ops; ++i) {
         size_t idx = gen();
         doNotOptimize(sync(GDSFBenchRepo::find(ids[idx])));
-        if ((i & 1023) == 0) stats.heap.sample();
+        if ((i & 1023) == 0) stats.held.sample();
     }
-    stats.heap.sample();  // final sample
+    stats.held.sample();  // final sample
 
     auto m = GDSFBenchRepo::metrics();
     stats.hits = static_cast<int64_t>(m.l1_hits);
@@ -329,10 +325,10 @@ std::string formatAccessStats(const std::string& label, const AccessStats& s) {
         << "\n  L1 misses:    " << s.misses
         << "\n  hit rate:     " << std::fixed << std::setprecision(1) << s.hitRate() << "%"
         << "\n  cache size:   " << s.cache_size << " entries"
-        << "\n  heap:         " << "min=" << s.heap.min_kb
-            << " avg=" << std::fixed << std::setprecision(0) << s.heap.avg()
-            << " max=" << s.heap.max_kb
-            << " sd=" << std::setprecision(0) << s.heap.stddev() << " KB"
+        << "\n  held:         " << "min=" << s.held.min_kb
+            << " avg=" << std::fixed << std::setprecision(0) << s.held.avg()
+            << " max=" << s.held.max_kb
+            << " sd=" << std::setprecision(0) << s.held.stddev() << " KB"
         << "\n  max_memory:   " << (GDSFPolicy::instance().maxMemory() / 1024) << " KB"
         << "\n  throughput:   " << fmtOps(s.opsPerSec())
 #if RELAIS_ENABLE_METRICS
@@ -362,7 +358,7 @@ TEST_CASE("Benchmark - GDSF matrix", "[benchmark][gdsf]")
     auto pressure = GENERATE(0.90, 0.50, 0.20);
     auto varied = GENERATE(false, true);
 
-    // 1. Insert all items, measure actual RSS footprint, apply pressure.
+    // 1. Insert all items, measure the footprint on the ledger, apply pressure.
     //    pressure=0.9 → allow 90% of cache, pressure=0.2 → allow 20%.
     auto [ids] = setupGDSFBench(NUM_KEYS, pressure, varied);
 

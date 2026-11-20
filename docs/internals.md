@@ -290,11 +290,11 @@ sliding-refresh knob on L1.
 
 Cleanup is per-chunk, driven by `GDSFPolicy`'s global sweep (`enroll`'s
 `sweep_fn`), fired from `tickInsertion` on the fetch/admission path — **not** by
-the background `RuntimeThread`, which only refreshes the cached clock and memory
-readings and never sweeps L1. It is also not a global stop-the-world pass: the
-tier walks one chunk at a time, evicting expired entries (and, when GDSF is on,
-low-score entries against a byte target) so a sweep never holds a chunk locked
-longer than that chunk.
+the background `RuntimeThread`, which only refreshes the cached clock and, in a
+GDSF build, the bytes the L1 budget compares, and never sweeps L1. It is also
+not a global stop-the-world pass: the tier walks one chunk at a time, evicting
+expired entries (and, when GDSF is on, low-score entries against a byte target)
+so a sweep never holds a chunk locked longer than that chunk.
 
 ## Cache Flow on Operations
 
@@ -1113,7 +1113,7 @@ jcailloux::relais::list::detail::         # ListCache, ListCacheTraits, Modifica
 jcailloux::relais::list::spec::           # Filter, Sort, ListQueryParams, ListQuery, seal,
                                           # ListQueryBuilder, TypedCursor, HTTP parsers
 jcailloux::relais::list::spec::detail::   # canonical encoding, WHERE builder, list traits, parsing
-jcailloux::relais::runtime::detail::      # CachedClock, CachedMemory, RuntimeThread
+jcailloux::relais::runtime::detail::      # CachedClock, RuntimeThread
 jcailloux::relais::io::                   # Task, Immediate, whenAll, IoContext, EpollIoContext,
                                           # IoPool, PgPool, PgResult, PgParams, Pg* errors,
                                           # TrantorIoContext, AsioIoContext, BoostAsioIoContext,
