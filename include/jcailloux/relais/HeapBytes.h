@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <iterator>
 #include <map>
+#include <memory>
 #include <optional>
 #include <set>
 #include <string>
@@ -55,8 +56,12 @@ namespace jcailloux::relais::detail {
 //   - std::map, std::set (and multi): one node block per element;
 //   - std::unordered_map, std::unordered_set (and multi): one node block per
 //     element, plus the bucket array. The container keeps the array's address
-//     to itself: the array weighs the class of its request.
-// Any other type does not compile: a member is never silently counted as 0.
+//     to itself: the array weighs the class of its request;
+//   - std::unique_ptr<T> with its default deleter: the block `new T` made,
+//     sizeof(T) at the pointer, plus what T owns. A polymorphic T is refused:
+//     the object pointed to may be larger than T.
+// Any other type does not compile: a member is never silently counted as 0,
+// nor a container whose allocator already counts its blocks counted twice.
 
 template<typename T>
 size_t heapBytes(const T& v);
@@ -83,6 +88,11 @@ inline constexpr bool is_hashed_node_container =
 
 template<typename T>
 inline constexpr bool owns_nothing = std::is_trivially_destructible_v<T>;
+
+/// A container whose allocator reports each of its blocks as it allocates it
+/// (cache::detail::LedgerAllocator).
+template<typename T>
+concept counts_its_blocks = requires { T::allocator_type::kCountsItsBlocks; };
 
 constexpr size_t roundUp(size_t n, size_t align) {
     return (n + align - 1) / align * align;
@@ -188,6 +198,10 @@ size_t heapBytes(const T& v) {
 
     if constexpr (owns_nothing<U>) {
         return 0;
+    } else if constexpr (counts_its_blocks<U>) {
+        static_assert(unsupported<U>,
+            "heapBytes: this container's allocator counts its blocks already");
+        return 0;
     } else if constexpr (is_spec<U, std::basic_string>) {
         // The characters are on the heap when they are not inside the object;
         // the block holds capacity() characters and the terminating null.
@@ -213,6 +227,14 @@ size_t heapBytes(const T& v) {
     } else if constexpr (is_spec<U, std::variant>) {
         if (v.valueless_by_exception()) return 0;
         return std::visit([](const auto& alt) { return heapBytes(alt); }, v);
+    } else if constexpr (is_spec<U, std::unique_ptr>) {
+        using Pointee = typename U::element_type;
+        static_assert(std::is_same_v<typename U::deleter_type, std::default_delete<Pointee>>,
+            "heapBytes: a std::unique_ptr counts only the block its default deleter frees");
+        static_assert(!std::is_polymorphic_v<Pointee>,
+            "heapBytes: a std::unique_ptr to a polymorphic type may hold a larger object");
+        // One block of sizeof(Pointee), from `new Pointee`: the pointer is its start.
+        return v ? blockBytes(sizeof(Pointee), v.get()) + heapBytes(*v) : 0;
     } else if constexpr (is_spec<U, std::pair>) {
         return heapBytes(v.first) + heapBytes(v.second);
     } else if constexpr (is_spec<U, std::tuple>) {

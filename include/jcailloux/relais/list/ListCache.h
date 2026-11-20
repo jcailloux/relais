@@ -18,6 +18,7 @@
 #include "jcailloux/relais/cache/TaggedEntry.h"
 #include "jcailloux/relais/runtime/CachedClock.h"
 #include "jcailloux/relais/HeapBytes.h"
+#include "jcailloux/relais/WeighedFunction.h"
 
 #ifdef RELAIS_BUILDING_TESTS
 namespace relais_test { struct TestInternals; }
@@ -220,16 +221,26 @@ public:
     /// see onRowsRanged.
     using RowsRange = typename RowsRangeOf<Traits>::type;
 
+    /// Which rows: true for each row it may hold for.
+    using Rows = jcailloux::relais::detail::WeighedFunction<bool(const E&)>;
+
     /// Rows that left the pages holding them: the row `key` or, when `rows`
     /// is set, every row it may hold for (the write named no row).
     struct RowLeft {
         Key key{};
-        std::function<bool(const E&)> rows;
+        Rows rows;
     };
 
+private:
+    using CacheKey = std::string;
+    using MetadataImpl = ListCacheMetadataImpl<FilterSet, SortFieldEnum>;
+    using Tier = cache::detail::CacheTier<CacheKey, Result, MetadataImpl>;
+
+public:
     // The tracker carries ranges of rows and rows that left their pages as
-    // well as per-entity modifications.
-    using ModTracker = ModificationTracker<E, ChunkCount, RowsRange, RowLeft>;
+    // well as per-entity modifications; it counts what it holds as the pages'
+    // tier does.
+    using ModTracker = ModificationTracker<E, ChunkCount, RowsRange, RowLeft, Tier::kHasGDSF>;
     using BitmapType = typename ModTracker::BitmapType;
 
     /// Whether Traits locates ranges of rows (only ListMixin's adapter does).
@@ -240,10 +251,6 @@ public:
         };
 
 private:
-    using CacheKey = std::string;
-    using MetadataImpl = ListCacheMetadataImpl<FilterSet, SortFieldEnum>;
-    using Tier = cache::detail::CacheTier<CacheKey, Result, MetadataImpl>;
-
     /// Backward-compat alias for test accessors.
     using L1Cache = typename Tier::Map;
 
@@ -414,7 +421,7 @@ public:
     /// Record that every row `rows` may hold for left the pages holding it
     /// (an uncertain write named no row): those pages, and only those, are
     /// invalidated lazily.
-    void onRowsLeft(std::function<bool(const E&)> rows) {
+    void onRowsLeft(Rows rows) {
         modifications_.notifyRowLeft(RowLeft{.rows = std::move(rows)}, generation_);
         Tier::tickSweep();
     }

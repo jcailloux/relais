@@ -9,6 +9,9 @@
 #include <type_traits>
 #include <vector>
 
+#include "jcailloux/relais/cache/L1Ledger.h"
+#include "jcailloux/relais/HeapBytes.h"
+
 namespace jcailloux::relais::cache::detail {
 
 template<size_t N>
@@ -33,8 +36,14 @@ struct NoCount {};
 // erasures. Counted lanes publish their size in an atomic, so that readers
 // can skip them without the lock while they are empty.
 //
+// A lane that counts bytes reports to the L1 ledger what it holds: its array
+// and the arrays of indices a drain collects count their own blocks
+// (LedgerAllocator), and what a payload owns (heapBytes) is counted when the
+// payload comes in and when it goes. A payload does not change while in the
+// lane, or counts its own changes.
+//
 
-template<typename Payload, size_t TotalSegments, bool Counted = false>
+template<typename Payload, size_t TotalSegments, bool Counted = false, bool CountsBytes = false>
 class PendingLane {
 public:
     static_assert(TotalSegments >= 2 && TotalSegments <= 64,
@@ -54,8 +63,11 @@ public:
         mutable BitmapType pending_segments;
     };
 
+    /// Indices of entries, as a drain collects them.
+    using Indices = std::vector<size_t, LedgerAllocatorIf<CountsBytes, size_t>>;
+
 private:
-    std::vector<Entry> entries_;
+    std::vector<Entry, LedgerAllocatorIf<CountsBytes, Entry>> entries_;
     [[no_unique_address]]
     std::conditional_t<Counted, std::atomic<uint32_t>, NoCount> count_{};
 
@@ -64,7 +76,21 @@ private:
             count_.store(static_cast<uint32_t>(entries_.size()), std::memory_order_release);
     }
 
+    /// What `payload` owns, into the ledger (`sign` +1) or out of it (-1).
+    static void countPayload(const Payload& payload, int64_t sign) {
+        if constexpr (CountsBytes && !relais::detail::heap_bytes::owns_nothing<Payload>) {
+            L1Ledger::add(sign * static_cast<int64_t>(relais::detail::heapBytes(payload)));
+        }
+    }
+
 public:
+    PendingLane() = default;
+    ~PendingLane() {
+        for (const auto& e : entries_) countPayload(e.payload, -1);
+    }
+    PendingLane(const PendingLane&) = delete;
+    PendingLane& operator=(const PendingLane&) = delete;
+
     // ---- exclusive lock ----------------------------------------------------
 
     void reserve(size_t n) { entries_.reserve(n); }
@@ -75,14 +101,16 @@ public:
             .generation = gen,
             .pending_segments = initial_bitmap_
         });
+        countPayload(entries_.back().payload, +1);
         publishCount();
     }
 
     /// Erase the entries at `drained` (ascending indices from collectDrained).
-    void eraseDrained(const std::vector<size_t>& drained) {
+    void eraseDrained(const Indices& drained) {
         for (auto it = drained.rbegin(); it != drained.rend(); ++it) {
             size_t idx = *it;
             if (idx < entries_.size()) {
+                countPayload(entries_[idx].payload, -1);
                 if (idx != entries_.size() - 1) {
                     std::swap(entries_[idx], entries_.back());
                 }
@@ -95,12 +123,15 @@ public:
     /// Erase every entry with generation <= cutoff_gen.
     void drain(uint32_t cutoff_gen) {
         std::erase_if(entries_, [cutoff_gen](const Entry& e) {
-            return e.generation <= cutoff_gen;
+            if (e.generation > cutoff_gen) return false;
+            countPayload(e.payload, -1);
+            return true;
         });
         publishCount();
     }
 
     void clear() {
+        for (const auto& e : entries_) countPayload(e.payload, -1);
         entries_.clear();
         publishCount();
     }
@@ -110,6 +141,7 @@ public:
     std::optional<Payload> take(Match&& match) {
         for (size_t i = 0; i < entries_.size(); ++i) {
             if (!match(entries_[i].payload)) continue;
+            countPayload(entries_[i].payload, -1);  // it leaves with the caller
             std::optional<Payload> out{std::move(entries_[i].payload)};
             if (i != entries_.size() - 1) std::swap(entries_[i], entries_.back());
             entries_.pop_back();
@@ -123,8 +155,7 @@ public:
 
     /// Clear `chunk_bit` in every entry with generation <= cutoff_gen, and
     /// append to `drained` the indices of those left with no pending chunk.
-    void collectDrained(uint32_t cutoff_gen, BitmapType chunk_bit,
-                        std::vector<size_t>& drained) const {
+    void collectDrained(uint32_t cutoff_gen, BitmapType chunk_bit, Indices& drained) const {
         for (size_t i = 0; i < entries_.size(); ++i) {
             if (entries_[i].generation > cutoff_gen) continue;
             std::atomic_ref<BitmapType> bitmap(entries_[i].pending_segments);

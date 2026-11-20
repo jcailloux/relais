@@ -451,7 +451,8 @@ public:
         long start = chunk * chunk_size;
         long end = std::min(start + chunk_size, nb);
 
-        std::vector<K> to_remove;
+        // The keys to remove, copied out of the table: counted while held.
+        LedgerList<K, kCountsBytes> to_remove;
         {
             auto guard = epoch::EpochGuard::acquire();
             for (long i = start; i < end; ++i) {
@@ -487,7 +488,7 @@ public:
     template<typename Pred>
     size_t full_cleanup(Pred&& pred) {
         long nb = map_.num_buckets();
-        std::vector<K> to_remove;
+        LedgerList<K, kCountsBytes> to_remove;
         {
             auto guard = epoch::EpochGuard::acquire();
             for (long i = 0; i < nb; ++i) {

@@ -2738,11 +2738,15 @@ namespace {
 using TI = relais_test::TestInternals;
 using detail::RowMatch;
 
-auto nameIs(std::string name) {
-    return [name = std::move(name)](const TestItemEntity& e) {
+/// The rows named `name`: a named struct, as every predicate the L1 keeps.
+struct NameIs {
+    std::string name;
+    RowMatch operator()(const TestItemEntity& e) const {
         return e.name == name ? RowMatch::Maybe : RowMatch::No;
-    };
-}
+    }
+};
+
+NameIs nameIs(std::string name) { return NameIs{std::move(name)}; }
 
 void probeSet(CohEnv& env, int64_t id, int32_t v) {
     env.probe.query("UPDATE relais_test_items SET value=" + std::to_string(v)

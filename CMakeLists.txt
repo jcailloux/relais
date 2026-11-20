@@ -301,6 +301,12 @@ if(RELAIS_BUILD_TESTS)
     relais_add_compile_fail_test(compile_fail_heap_bytes_unsupported
         tests/compile_fail/heap_bytes_unsupported.cpp
         "heapBytes: no rule counts the heap this type owns")
+    relais_add_compile_fail_test(compile_fail_heap_bytes_counted_twice
+        tests/compile_fail/heap_bytes_counted_twice.cpp
+        "heapBytes: this container's allocator counts its blocks already")
+    relais_add_compile_fail_test(compile_fail_weighed_function_lambda
+        tests/compile_fail/weighed_function_lambda.cpp
+        "heapBytes: no rule counts the heap this type owns")
     relais_add_generator_reject_test(generator_rejects_is_null_non_optional
         ${PROJECT_SOURCE_DIR}/tests/generator/is_null_non_optional
         "is_null requires a std::optional member")

@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "jcailloux/relais/cache/ChunkMap.h"   // cache::detail::AutoHash
+#include "jcailloux/relais/cache/L1Ledger.h"
 #include "jcailloux/relais/cache/PendingLane.h"
 #include "jcailloux/relais/repository/RowMatch.h"
 
@@ -40,16 +41,21 @@ namespace jcailloux::relais::detail {
 //
 // No per-copy state: while no note exists, a hit pays one atomic load.
 //
+// CountsBytes: the notes report what they hold to the L1 ledger, as the cache
+// they serve does: the lane (see PendingLane) and each note's predicate, and
+// the exempt keys as they come and go (see LedgerSet).
+//
 // Chunks: a copy's chunk is the top ChunkCountLog2 bits of its bucket index,
 // as ChunkMap::cleanup_chunk splits the buckets in 1 << ChunkCountLog2. The
 // two agree while the table has at least that many buckets: it starts with
 // 64 or more and only grows, and ChunkCountLog2 is at most 6.
 //
 
-template<typename E, typename Key, uint8_t ChunkCountLog2>
+template<typename E, typename Key, uint8_t ChunkCountLog2, bool CountsBytes = false>
 class RowNotes {
 public:
     static constexpr size_t kChunks = size_t{1} << ChunkCountLog2;
+    static constexpr bool kCountsBytes = CountsBytes;
 
     /// Empty: every row.
     using Predicate = RowPredicate<E>;
@@ -60,7 +66,7 @@ private:
         Predicate pred;
         bool settled = false;
         // Written under the exclusive lock only.
-        mutable std::unordered_set<Key, cache::detail::AutoHash<Key>> exempt;
+        mutable cache::detail::LedgerSet<Key, cache::detail::AutoHash<Key>, CountsBytes> exempt;
 
         [[nodiscard]] bool mayMatch(const E& value) const {
             return !pred || pred(value) == RowMatch::Maybe;
@@ -70,7 +76,7 @@ private:
         }
     };
 
-    using Lane = cache::detail::PendingLane<Note, kChunks, true>;
+    using Lane = cache::detail::PendingLane<Note, kChunks, true, CountsBytes>;
 
 public:
     using BitmapType = typename Lane::BitmapType;
@@ -223,7 +229,7 @@ public:
 
     /// One exclusive section: settle() reorders the lane.
     void drainChunk(uint32_t cutoff_gen, size_t chunk) {
-        std::vector<size_t> drained;
+        typename Lane::Indices drained;
         std::unique_lock lock(mutex_);
         lane_.collectDrained(cutoff_gen, chunkBit(chunk), drained);
         lane_.eraseDrained(drained);

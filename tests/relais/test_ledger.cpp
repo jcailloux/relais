@@ -18,11 +18,18 @@
  * knows for the allocator in use (TestAllocator.h). The values hold no
  * bucket array: the L1 weighs one at the class of its request, the one block
  * it cannot read (test_gdsf covers that rule).
+ *
+ * What the L1 keeps beside its entries is checked the same way: a list
+ * tracker, the row notes, the key sets their predicates share, the values a
+ * tier serves without storing them, the fetches in flight (coroutines held
+ * at a gate, the test's own frames out of the record) and what a sweep
+ * collects in its chunk, read while it sweeps.
  */
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <array>
+#include <coroutine>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -42,6 +49,8 @@
 #include <jcailloux/relais/list/ListCache.h>
 #include <jcailloux/relais/list/ListWrapper.h>
 #include <jcailloux/relais/repository/RowMatch.h>
+#include <jcailloux/relais/repository/RowNotes.h>
+#include <jcailloux/relais/WeighedFunction.h>
 
 #include "fixtures/ProcessBlocks.h"
 #include "fixtures/RelaisTestAccessors.h"
@@ -326,6 +335,13 @@ void warmUp() {
     insertGhosts(makeKeys(2'000'000, 50, 50, 50, 50, 50));
     reclaimAll();
     emptyAll();
+    // The transient pools, set up on their first value.
+    {
+        auto item = tier<ItemTier>().transientHit(makeItem(1));
+        auto page = tier<PageTier>().transientHit(makePage(1));
+    }
+    tier<ItemTier>().transientPool().clear();
+    tier<PageTier>().transientPool().clear();
     (void)L1Ledger::sum();
 }
 
@@ -539,4 +555,447 @@ TEST_CASE("Ledger - threads that allocate and free each other's blocks", "[ledge
     }
     Change after = changeSince(base);
     CHECK(after.ledger == after.held);
+}
+
+// =============================================================================
+// What the L1 keeps beside its entries
+// =============================================================================
+
+namespace {
+
+using jcailloux::relais::detail::KeyRows;
+using jcailloux::relais::detail::KeySet;
+using jcailloux::relais::detail::MayHold;
+using jcailloux::relais::detail::RowMatch;
+using jcailloux::relais::detail::RowPredicate;
+using jcailloux::relais::detail::WeighedFunction;
+
+/// The rows named `name`, as an uncertain write may leave them.
+struct NamedRows {
+    std::string name;
+    RowMatch operator()(const TestItemEntity& e) const {
+        return e.name == name ? RowMatch::Maybe : RowMatch::No;
+    }
+};
+
+/// Rows located by what they hold: what a range of rows owns.
+struct RowsHolding {
+    std::optional<std::string> category;
+    std::vector<int64_t> ids;
+};
+
+/// Rows that left their pages: a key, or the rows a predicate may hold for.
+struct RowsLeft {
+    int64_t key{};
+    WeighedFunction<bool(const TestItemEntity&)> rows;
+};
+
+using Tracker = jcailloux::relais::list::detail::ModificationTracker<
+    TestItemEntity, 8, RowsHolding, RowsLeft, /*CountsBytes=*/true>;
+using Notes = jcailloux::relais::detail::RowNotes<TestItemEntity, std::string, 3, /*CountsBytes=*/true>;
+
+/// Checks the balance since `base`, and returns the change.
+Change balanced(const Reading& base, const char* phase) {
+    Change c = changeSince(base);
+    INFO(phase);
+    INFO("recorded blocks alive: " << ProcessBlocks::instance().count());
+    CHECK(c.ledger == c.held);
+    return c;
+}
+
+std::vector<TestItemEntity> makeItems(int64_t first, size_t n) {
+    std::vector<TestItemEntity> items;
+    for (size_t i = 0; i < n; ++i) items.push_back(makeItem(first + static_cast<int64_t>(i)));
+    return items;
+}
+
+}  // namespace
+
+TEST_CASE("Ledger - a list tracker counts what its lanes hold", "[ledger][beside][tracker]")
+{
+    warmUp();
+    const auto items = makeItems(0, 300);
+    std::atomic<uint32_t> generation{0};
+    std::optional<Tracker> tracker;  // its own storage is the test's
+    Reading base = readNow();
+
+    {
+        Recording recording;
+        tracker.emplace();  // reserves its modifications' array
+    }
+    CHECK(balanced(base, "constructed").held > 0);
+
+    auto notify = [&](size_t first, size_t n) {
+        for (size_t i = first; i < first + n; ++i) {
+            const auto& item = items[i];
+            (void)tracker->notifyCreated(item, generation);
+            (void)tracker->notifyUpdated(item, items[(i + 1) % items.size()], generation);
+            (void)tracker->notifyDeleted(item, generation);
+            const auto seed = static_cast<int64_t>(i);
+            RowsHolding range;
+            if (i % 2) range.category = text(i % 40, seed);
+            range.ids.assign(i % 7, seed);
+            (void)tracker->notifyRangeDeleted(std::move(range), generation);
+            (void)tracker->notifyRowLeft(RowsLeft{.key = seed}, generation);
+            (void)tracker->notifyRowLeft(
+                RowsLeft{.rows = MayHold<TestItemEntity>{NamedRows{text(i % 60, seed)}}}, generation);
+        }
+    };
+    auto drainAll = [&](uint32_t cutoff) {
+        for (uint8_t chunk = 0; chunk < 8; ++chunk) tracker->drainChunk(cutoff, chunk);
+    };
+
+    uint32_t first_cutoff = 0;
+    {
+        Recording recording;
+        notify(0, 150);
+        first_cutoff = tracker->cutoff(generation);
+        notify(150, 150);
+    }
+    balanced(base, "notified");
+
+    {
+        Recording recording;
+        for (uint8_t chunk = 0; chunk < 5; ++chunk) tracker->drainChunk(first_cutoff, chunk);
+    }
+    balanced(base, "partly drained: nothing seen by every chunk yet");
+
+    {
+        Recording recording;
+        for (uint8_t chunk = 5; chunk < 8; ++chunk) tracker->drainChunk(first_cutoff, chunk);
+    }
+    balanced(base, "the first half drained");
+    CHECK(tracker->size() == 3 * 150);
+
+    {
+        Recording recording;
+        drainAll(tracker->cutoff(generation));
+        notify(0, 40);
+        tracker->drain(tracker->cutoff(generation));  // as a purge drains
+    }
+    balanced(base, "drained");  // left: the lanes' arrays, at their capacity
+    CHECK(tracker->empty());
+
+    {
+        Recording recording;
+        // The arrays of indices a drain collects count their own blocks.
+        Tracker::ModificationLane::Indices indices;
+        indices.reserve(500);
+        Change c = changeSince(base);
+        CHECK(c.ledger == c.held);
+    }
+
+    {
+        Recording recording;
+        notify(0, 30);
+        tracker.reset();  // with what its lanes still hold
+    }
+    CHECK(balanced(base, "destroyed").held == 0);
+}
+
+TEST_CASE("Ledger - row notes count their predicates and the keys they exempt",
+          "[ledger][beside][notes]")
+{
+    warmUp();
+    const auto items = makeItems(100, 200);
+    std::vector<std::string> keys;  // a key in the object, or on the heap
+    for (size_t i = 0; i < items.size(); ++i) keys.push_back(text(i % 50, static_cast<int64_t>(i)));
+    std::vector<int64_t> ids;
+    for (int64_t i = 100; i < 160; ++i) ids.push_back(i);
+    std::optional<Notes> notes;
+    std::vector<uint64_t> pending;
+    pending.reserve(64);
+    const auto none = [] {};
+    const auto fresh = [] { return true; };
+    Reading base = readNow();
+
+    {
+        Recording recording;
+        notes.emplace();
+        for (int64_t i = 0; i < 20; ++i) {
+            pending.push_back(notes->addPending(NamedRows{text(static_cast<size_t>(i * 3), i)}, none));
+        }
+        notes->addSettled(KeyRows<TestItemEntity, int64_t>(ids), none);
+        notes->addSettled({}, none);  // every row
+        notes->addSettled(NamedRows{items[3].name}, none);
+    }
+    balanced(base, "noted");
+
+    {
+        Recording recording;
+        for (size_t i = 0; i < items.size(); ++i) notes->exemptStored(keys[i], items[i], fresh);
+    }
+    balanced(base, "copies exempted");
+
+    {
+        Recording recording;
+        for (size_t i = 0; i < pending.size(); i += 2) notes->settle(pending[i], none);
+        for (size_t i = 1; i < pending.size(); i += 2) notes->discard(pending[i]);
+        for (size_t i = 0; i < items.size(); i += 3) notes->exemptStored(keys[i], items[i], fresh);
+    }
+    balanced(base, "settled, discarded, exempted again");
+
+    {
+        Recording recording;
+        REQUIRE(notes->claimDrain());
+        do {
+            for (size_t chunk = 0; chunk < Notes::kChunks; ++chunk) {
+                notes->drainChunk(notes->cutoff(), chunk);
+            }
+        } while (notes->continueDraining());
+    }
+    balanced(base, "drained");  // left: the lane's array, at its capacity
+    CHECK(notes->size() == 0);
+
+    {
+        Recording recording;
+        notes.reset();
+    }
+    CHECK(balanced(base, "destroyed").held == 0);
+}
+
+TEST_CASE("Ledger - a key set its predicates share is counted once, while it lives",
+          "[ledger][beside][keys]")
+{
+    warmUp();
+    std::vector<std::string> names;
+    for (int64_t i = 0; i < 300; ++i) names.push_back(text(static_cast<size_t>(i % 60), i));
+    std::vector<int64_t> ids(500);
+    for (size_t i = 0; i < ids.size(); ++i) ids[i] = static_cast<int64_t>(i * 7);
+    std::shared_ptr<const KeySet<std::string, true>> set, set_copy;
+    RowPredicate<TestItemEntity> rows, rows_copy, rows_copy2;
+    Reading base = readNow();
+
+    // A predicate's own block is its holder's to count (a lane, a note): the
+    // test's here, so it is left out of the ledger. The set is counted once,
+    // by itself, however many share it.
+    auto predicates = [&] {
+        return static_cast<int64_t>(heapBytes(rows) + heapBytes(rows_copy) + heapBytes(rows_copy2));
+    };
+    auto check = [&](const char* phase) {
+        Change c = changeSince(base);
+        INFO(phase);
+        CHECK(c.ledger == c.held - predicates());
+        return c;
+    };
+
+    {
+        Recording recording;
+        set = KeySet<std::string, true>::share(names);
+        set_copy = set;
+    }
+    CHECK(check("a set shared").held > 0);
+
+    {
+        Recording recording;
+        rows = KeyRows<TestItemEntity, int64_t>(ids);
+        rows_copy = rows;      // a callable of its own, the same set
+        rows_copy2 = rows_copy;
+    }
+    CHECK(predicates() > 0);
+    check("predicates on a set");
+
+    {
+        Recording recording;
+        set.reset();
+        rows = {};
+        rows_copy = {};
+    }
+    check("released by some");
+
+    {
+        Recording recording;
+        set_copy.reset();
+        rows_copy2 = {};
+    }
+    CHECK(check("released by all").held == 0);
+}
+
+TEST_CASE("Ledger - a value served without being stored is counted until freed",
+          "[ledger][beside][transient]")
+{
+    warmUp();
+    std::array<ItemTier::Hit, 64> items;
+    std::array<PageTier::Hit, 24> pages;
+    Reading base = readNow();
+
+    {
+        Recording recording;
+        for (size_t i = 0; i < items.size(); ++i) {
+            items[i] = tier<ItemTier>().transientHit(makeItem(static_cast<int64_t>(i)));
+        }
+        for (size_t i = 0; i < pages.size(); ++i) {
+            pages[i] = tier<PageTier>().transientHit(makePage(static_cast<int64_t>(i) + 1));
+        }
+    }
+    CHECK(balanced(base, "served").held > 0);
+
+    {
+        Recording recording;
+        for (auto& hit : items) hit = {};
+        for (auto& hit : pages) hit = {};
+        tier<ItemTier>().transientPool().clear();
+        tier<PageTier>().transientPool().clear();
+    }
+    balanced(base, "freed");  // left: the retire lists' arrays
+}
+
+namespace {
+
+/// A coroutine that starts at once, its frame out of the record: the test's
+/// own, not the L1's.
+struct Driver {
+    struct promise_type {
+        static void* operator new(size_t n) { return __real_malloc(n); }
+        static void operator delete(void* p) noexcept { __real_free(p); }
+        Driver get_return_object() noexcept { return {}; }
+        std::suspend_never initial_suspend() noexcept { return {}; }
+        std::suspend_never final_suspend() noexcept { return {}; }
+        void return_void() noexcept {}
+        void unhandled_exception() noexcept { std::terminate(); }
+    };
+};
+
+/// Holds a fetch until released: the fetch stays in flight.
+struct Gate {
+    std::coroutine_handle<> waiting;
+    bool await_ready() const noexcept { return false; }
+    void await_suspend(std::coroutine_handle<> h) noexcept { waiting = h; }
+    void await_resume() const noexcept {}
+    void release() { std::exchange(waiting, {}).resume(); }
+};
+
+jcailloux::relais::io::Task<std::optional<TestItemEntity>> fetchItem(Gate* gate, int64_t i) {
+    co_await *gate;
+    co_return makeItem(i);
+}
+
+jcailloux::relais::io::Task<std::optional<Page>> fetchPage(Gate* gate, int64_t i) {
+    co_await *gate;
+    co_return makePage(i);
+}
+
+Driver findItem(int64_t key, Gate* gate, ItemTier::Hit* out) {
+    *out = co_await tier<ItemTier>().findOrFetch(
+        key, [gate, key] { return fetchItem(gate, key); },
+        [](const TestItemEntity&, float) { return CacheMetadata<true, false>{}; });
+}
+
+Driver findPage(const std::string* key, Gate* gate, PageTier::Hit* out) {
+    *out = co_await tier<PageTier>().findOrFetch(
+        *key, [gate, key] { return fetchPage(gate, seedOf(*key)); },
+        [key](const Page&, float) { return makePageMetadata(*key, 1); });
+}
+
+}  // namespace
+
+TEST_CASE("Ledger - a fetch in flight is counted while it lasts", "[ledger][beside][inflight]")
+{
+    warmUp();
+    constexpr size_t kReaders = 4;  // one fetches, the others wait for it
+    const std::string page_key = "page:" + std::string(60, 'f');
+    std::array<ItemTier::Hit, kReaders> items;
+    std::array<PageTier::Hit, kReaders> pages;
+    Gate item_gate, page_gate;
+
+    auto start = [&](int64_t item_key) {
+        for (auto& hit : items) findItem(item_key, &item_gate, &hit);
+        for (auto& hit : pages) findPage(&page_key, &page_gate, &hit);
+    };
+    auto finish = [&] {
+        item_gate.release();
+        page_gate.release();
+    };
+    auto release = [&] {
+        for (auto& hit : items) hit = {};
+        for (auto& hit : pages) hit = {};
+        emptyAll();
+    };
+
+    // Once before the reading: the coroutine frames come from a per-thread
+    // pool that keeps them for the next fetch.
+    {
+        Recording recording;
+        start(50'000'000);
+        finish();
+        release();
+    }
+    Reading base = readNow();
+
+    {
+        Recording recording;
+        start(50'000'001);
+    }
+    CHECK(balanced(base, "in flight").held > 0);
+
+    {
+        Recording recording;
+        finish();
+    }
+    balanced(base, "done");
+    for (const auto& hit : items) CHECK(hit);
+    for (const auto& hit : pages) CHECK(hit);
+
+    {
+        Recording recording;
+        release();
+    }
+    balanced(base, "released");
+}
+
+TEST_CASE("Ledger - what a sweep collects is counted while it sweeps", "[ledger][beside][sweep]")
+{
+    warmUp();
+    Keys k = makeKeys(60'000'000, 2000, 0, 0, 600, 0);
+    Keys ghosts = makeKeys(61'000'000, 300, 0, 0, 200, 0);
+    Reading base = readNow();
+
+    {
+        Recording recording;
+        storeAll(k, 0);
+        insertGhosts(ghosts);
+        // One key in two read: those score above the threshold and stay, the
+        // others go, as ghosts to insert once their chunk is swept.
+        for (size_t i = 0; i < k.items.size(); i += 2) {
+            for (int n = 0; n < 3; ++n) (void)tier<ItemTier>().find(k.items[i]);
+        }
+        for (size_t i = 0; i < k.pages.size(); i += 2) {
+            for (int n = 0; n < 3; ++n) (void)tier<PageTier>().find(k.pages[i]);
+        }
+    }
+    balanced(base, "filled");
+
+    tier<ItemTier>().recordCost(500.0f);
+    tier<PageTier>().recordCost(500.0f);
+    TestInternals::setThreshold(1e-6f);
+    size_t readings = 0;
+    size_t unbalanced = 0;
+    auto reading = [&](const auto&, auto&, auto&, long) {
+        Change c = changeSince(base);
+        ++readings;
+        if (c.ledger != c.held) ++unbalanced;
+        return false;
+    };
+    auto ghostCount = [] {
+        return tier<ItemTier>().map().totalEntries() - static_cast<long>(tier<ItemTier>().size());
+    };
+    const long ghosts_before = ghostCount();
+    {
+        Recording recording;
+        for (long chunk = 0; chunk < 4; ++chunk) {
+            (void)tier<ItemTier>().sweepChunk(chunk, 4, reading);
+            (void)tier<PageTier>().sweepChunk(chunk, 4, reading);
+        }
+    }
+    TestInternals::setThreshold(0.0f);
+    CHECK(readings > 0);
+    CHECK(unbalanced == 0);
+    CHECK(ghostCount() > ghosts_before);  // the ghosts collected, inserted
+    balanced(base, "swept");
+
+    {
+        Recording recording;
+        emptyAll();
+    }
+    balanced(base, "empty");
 }

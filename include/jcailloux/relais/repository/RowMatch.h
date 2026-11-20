@@ -5,7 +5,9 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -13,10 +15,13 @@
 #include <utility>
 #include <vector>
 
+#include "jcailloux/relais/cache/GDSFPolicy.h"
 #include "jcailloux/relais/entity/FieldGuard.h"
 #include "jcailloux/relais/entity/FieldUpdate.h"
 #include "jcailloux/relais/list/spec/GeneratedFilters.h"
+#include "jcailloux/relais/repository/KeyDedup.h"
 #include "jcailloux/relais/TypeTraits.h"
+#include "jcailloux/relais/WeighedFunction.h"
 
 namespace jcailloux::relais::detail {
 
@@ -24,9 +29,11 @@ namespace jcailloux::relais::detail {
 /// hold, Maybe otherwise.
 enum class RowMatch : uint8_t { No, Maybe };
 
-/// A predicate evaluated on cached copies; empty: every row.
+/// A predicate evaluated on cached copies; empty: every row. The L1 keeps it
+/// in its row notes and its list tracker, and weighs what it holds: its
+/// callable is a named struct (GuardRows, FilterRows, KeyRows), never a lambda.
 template<typename E>
-using RowPredicate = std::function<RowMatch(const E&)>;
+using RowPredicate = WeighedFunction<RowMatch(const E&)>;
 
 // =============================================================================
 // ColumnFacts - what the database says of a table's columns
@@ -391,19 +398,67 @@ template<typename Descriptor, typename E>
     }(std::make_index_sequence<list::spec::filter_count<Descriptor>>{});
 }
 
+// =============================================================================
+// The callables of a RowPredicate
+// =============================================================================
+//
+// Each owns what it uses, and its members say what it holds (heapBytes).
+// `facts` outlives them (a repo's static state): pointed to, not owned.
+
+/// The rows a typed guard may hold for.
+template<typename E, typename G>
+struct GuardRows {
+    G guard;
+    const ColumnFacts* facts = nullptr;
+
+    RowMatch operator()(const E& e) const { return guardMatch(e, guard, *facts); }
+};
+
+/// The rows declared filters may hold for.
+template<typename E, typename Descriptor>
+struct FilterRows {
+    list::spec::Filters<Descriptor> filters;
+    const ColumnFacts* facts = nullptr;
+
+    RowMatch operator()(const E& e) const { return filterMatch<Descriptor>(e, filters, *facts); }
+};
+
+/// The rows of a set of keys. Every copy shares the set, which reports what
+/// it holds to the L1 ledger for as long as it lives, when the L1 counts
+/// bytes (see KeySet): nothing is weighed here.
+template<typename E, typename Key>
+struct KeyRows {
+    using Keys = KeySet<Key, cache::GDSFPolicy::enabled>;
+
+    std::shared_ptr<const Keys> keys;
+
+    explicit KeyRows(std::span<const Key> rows) : keys(Keys::share(rows)) {}
+
+    RowMatch operator()(const E& e) const {
+        return keys->contains(Key(e.key())) ? RowMatch::Maybe : RowMatch::No;
+    }
+
+    [[nodiscard]] size_t memoryUsage() const noexcept { return sizeof(*this); }
+};
+
+/// The rows a predicate may hold for, as a list tracker tests them.
+template<typename E>
+struct MayHold {
+    RowPredicate<E> rows;
+
+    bool operator()(const E& e) const { return rows(e) == RowMatch::Maybe; }
+};
+
 /// The predicate of an uncertain write, as the cache tiers test their copies.
-/// It owns what it uses; `facts` outlives it (a repo's static state).
 template<typename E, typename G>
 [[nodiscard]] RowPredicate<E> guardPredicate(G guard, const ColumnFacts& facts) {
-    return [guard = std::move(guard), &facts](const E& e) { return guardMatch(e, guard, facts); };
+    return GuardRows<E, G>{std::move(guard), &facts};
 }
 
 template<typename E, typename Descriptor>
 [[nodiscard]] RowPredicate<E> filterPredicate(list::spec::Filters<Descriptor> filters,
                                               const ColumnFacts& facts) {
-    return [filters = std::move(filters), &facts](const E& e) {
-        return filterMatch<Descriptor>(e, filters, facts);
-    };
+    return FilterRows<E, Descriptor>{std::move(filters), &facts};
 }
 
 }  // namespace jcailloux::relais::detail

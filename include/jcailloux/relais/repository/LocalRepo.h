@@ -67,7 +67,7 @@ class LocalRepo : public PgRepo<E, Name, Cfg, Key> {
     using Recheck = RecheckGuard<Name, Key, Cfg.recheck_slots_log2>;
 
     /// Rows an uncertain write may have changed (see noteRowsChanged).
-    using Notes = detail::RowNotes<E, Key, Cfg.l1_chunk_count_log2>;
+    using Notes = detail::RowNotes<E, Key, Cfg.l1_chunk_count_log2, Tier::kHasGDSF>;
 
     /// TTL in seconds (compile-time, for metadata construction).
     static constexpr uint32_t kTtlSec = static_cast<uint32_t>(

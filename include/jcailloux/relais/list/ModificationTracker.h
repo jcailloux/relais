@@ -19,6 +19,8 @@ namespace jcailloux::relais::list::detail {
 // EntityModification - Represents a modification to an entity
 // =============================================================================
 
+/// What a tracker weighs of it (heapBytes, through its members): each copy's
+/// block and what the entity owns.
 template<typename E>
 struct EntityModification {
     using EntityPtr = std::unique_ptr<const E>;
@@ -74,26 +76,32 @@ struct NoRangePayload {};
 //
 // TotalSegments = number of chunks, known at compile time (from ChunkMap config).
 //
+// CountsBytes: the lanes report what they hold to the L1 ledger (see
+// PendingLane), as the cache they serve does.
+//
 
 template<typename E, size_t TotalSegments,
          typename RangePayload = NoRangePayload,
-         typename RowLeft = int64_t>
+         typename RowLeft = int64_t,
+         bool CountsBytes = false>
 class ModificationTracker {
 public:
     using Modification = EntityModification<E>;
+    static constexpr bool kCountsBytes = CountsBytes;
 
     /// Entity modifications.
-    using ModificationLane = cache::detail::PendingLane<Modification, TotalSegments>;
+    using ModificationLane =
+        cache::detail::PendingLane<Modification, TotalSegments, false, CountsBytes>;
     /// Ranges of rows (predicate writes): one entry stands in for an unbounded
     /// set of rows located by what they hold, instead of N entity
     /// modifications.
-    using RangeLane = cache::detail::PendingLane<RangePayload, TotalSegments>;
+    using RangeLane = cache::detail::PendingLane<RangePayload, TotalSegments, false, CountsBytes>;
     /// Rows that left the pages holding them, at a position nobody knows (the
     /// write that moved them was uncertain). An entry touches exactly the
     /// pages that hold one of its rows (the owner says which). Counted:
     /// readers skip it while it is empty, which it is unless an uncertain
     /// write happened.
-    using RowLeftLane = cache::detail::PendingLane<RowLeft, TotalSegments, true>;
+    using RowLeftLane = cache::detail::PendingLane<RowLeft, TotalSegments, true, CountsBytes>;
 
     using BitmapType = typename ModificationLane::BitmapType;
 
@@ -198,9 +206,9 @@ public:
     /// - Phase 2 (unique_lock): erase expired entries via swap-with-last.
     ///   Only taken when there are actual removals.
     void drainChunk(uint32_t cutoff_gen, uint8_t chunk_id) {
-        std::vector<size_t> to_erase;
-        std::vector<size_t> to_erase_ranges;
-        std::vector<size_t> to_erase_rows;
+        typename ModificationLane::Indices to_erase;
+        typename RangeLane::Indices to_erase_ranges;
+        typename RowLeftLane::Indices to_erase_rows;
         const BitmapType chunk_bit = BitmapType{1} << chunk_id;
 
         {

@@ -66,7 +66,11 @@ concept Expirable = requires(const M& m, uint32_t now_sec) {
 //   - Expirable<Metadata>      → TTL expiration checks
 //
 // With GDSF, an entry is counted in bytes (see EntryLayout), and every block
-// the L1 holds reported to the L1 ledger (see L1Ledger).
+// the L1 holds reported to the L1 ledger (see L1Ledger): the entries and the
+// table, and what the tier keeps beside them, which no score weighs: the
+// values it served without storing them (transientPool), the fetches in
+// flight (one shared state per key and its waiters), and the ghosts a sweep
+// collects in its chunk.
 //
 
 template<typename Key, typename Value, typename Metadata>
@@ -264,7 +268,7 @@ public:
                 throw;
             }
 
-            std::vector<std::coroutine_handle<>> to_resume;
+            typename InflightEntry::Waiters to_resume;
             {
                 std::lock_guard lk(entry->mu);
                 to_resume = std::move(entry->waiters);
@@ -299,14 +303,18 @@ public:
     // Cleanup
     // =========================================================================
 
-    /// Context passed to cleanup predicates.
+    /// Context passed to cleanup predicates. The ghosts to insert and to
+    /// decay once the chunk is done, each with a copy of its key, are counted
+    /// while held (see LedgerList).
     struct CleanupContext {
         uint32_t now_sec;
         float threshold;
         struct GhostCandidate { Key key; uint32_t count; uint32_t bytes; uint8_t flags; };
-        std::vector<GhostCandidate>* ghost_candidates = nullptr;
+        using GhostCandidates = LedgerList<GhostCandidate, kHasGDSF>;
+        GhostCandidates* ghost_candidates = nullptr;
         struct GhostDecay { Key key; uint32_t decayed_count; };
-        std::vector<GhostDecay>* ghost_decays = nullptr;
+        using GhostDecays = LedgerList<GhostDecay, kHasGDSF>;
+        GhostDecays* ghost_decays = nullptr;
     };
 
     struct SweepResult {
@@ -335,8 +343,8 @@ public:
             CleanupContext ctx{runtime::detail::CachedClock::now(),
                                kHasGDSF ? policy.threshold() : 0.0f};
 
-            std::vector<typename CleanupContext::GhostCandidate> candidates;
-            std::vector<typename CleanupContext::GhostDecay> ghost_decays;
+            typename CleanupContext::GhostCandidates candidates;
+            typename CleanupContext::GhostDecays ghost_decays;
             if constexpr (kHasGDSF) {
                 ctx.ghost_candidates = &candidates;
                 ctx.ghost_decays = &ghost_decays;
@@ -392,8 +400,8 @@ public:
             CleanupContext ctx{runtime::detail::CachedClock::now(),
                                kHasGDSF ? policy.threshold() : 0.0f};
 
-            std::vector<typename CleanupContext::GhostCandidate> candidates;
-            std::vector<typename CleanupContext::GhostDecay> ghost_decays;
+            typename CleanupContext::GhostCandidates candidates;
+            typename CleanupContext::GhostDecays ghost_decays;
             if constexpr (kHasGDSF) {
                 ctx.ghost_candidates = &candidates;
                 ctx.ghost_decays = &ghost_decays;
@@ -546,8 +554,17 @@ public:
     }
 
     /// Transient pool for values returned without caching (ghost REJECT path).
+    /// With GDSF, each value is counted from its construction to its release,
+    /// once no reader holds it: its pool block, read on it, and what it owns.
     epoch::memory_pool<Value>& transientPool() {
-        static auto* p = new epoch::memory_pool<Value>();
+        static auto* p = [] {
+            auto* pool = new epoch::memory_pool<Value>();
+            if constexpr (kHasGDSF) {
+                static constexpr epoch::pool_accounting<Value> kAccounting{&kL1Ledger, &weighTransient};
+                pool->set_accounting(&kAccounting);
+            }
+            return pool;
+        }();
         return *p;
     }
 
@@ -560,6 +577,11 @@ public:
 #endif
 
 private:
+    /// A value of the transient pool: its block, read on it, and what it owns.
+    static size_t weighTransient(const Value& v, const void* block, size_t block_size) {
+        return relais::detail::blockBytes(block_size, block) + relais::detail::heapBytes(v);
+    }
+
     Map map_;
     std::atomic<float> avg_cost_us_{0.0f};
     uint8_t chunk_bits_{0};
@@ -569,10 +591,20 @@ private:
     // Inflight dedup
     // =========================================================================
 
+    // With GDSF, a fetch in flight counts what it holds while it lasts: its
+    // map node, the shared state (allocate_shared: one block with its counts),
+    // the waiters' array, and what the key owns.
+    template<typename T>
+    using InflightAllocator = LedgerAllocatorIf<kHasGDSF, T>;
+    static constexpr bool kCountsInflightKeys =
+        kHasGDSF && !relais::detail::heap_bytes::owns_nothing<Key>;
+
     struct InflightEntry {
+        using Waiters = std::vector<std::coroutine_handle<>, InflightAllocator<std::coroutine_handle<>>>;
+
         std::mutex mu;
         std::atomic<bool> done{false};
-        std::vector<std::coroutine_handle<>> waiters;
+        Waiters waiters;
 
         enum class Outcome : uint8_t { pending, found, not_found, error };
         Outcome outcome = Outcome::pending;
@@ -581,10 +613,11 @@ private:
 
     struct ShardedInflightMap {
         static constexpr int kShards = 16;
+        using Slot = std::pair<const Key, std::shared_ptr<InflightEntry>>;
         struct Shard {
             std::mutex mu;
-            std::unordered_map<Key, std::shared_ptr<InflightEntry>,
-                               AutoHash<Key>> map;
+            std::unordered_map<Key, std::shared_ptr<InflightEntry>, AutoHash<Key>,
+                               std::equal_to<Key>, InflightAllocator<Slot>> map;
         };
         std::array<Shard, kShards> shards;
 
@@ -601,9 +634,13 @@ private:
         AcquireResult acquire(const Key& k) {
             auto& s = shard_for(k);
             std::lock_guard lk(s.mu);
-            auto& slot = s.map[k];
+            auto [it, inserted] = s.map.try_emplace(k);
+            if constexpr (kCountsInflightKeys) {
+                if (inserted) L1Ledger::add(keyHeap(it->first));
+            }
+            auto& slot = it->second;
             if (!slot) {
-                slot = std::make_shared<InflightEntry>();
+                slot = std::allocate_shared<InflightEntry>(InflightAllocator<InflightEntry>{});
                 return {slot, true};
             }
             return {slot, false};
@@ -612,7 +649,10 @@ private:
         void erase(const Key& k) {
             auto& s = shard_for(k);
             std::lock_guard lk(s.mu);
-            s.map.erase(k);
+            auto it = s.map.find(k);
+            if (it == s.map.end()) return;
+            if constexpr (kCountsInflightKeys) L1Ledger::add(-keyHeap(it->first));
+            s.map.erase(it);
         }
     };
 

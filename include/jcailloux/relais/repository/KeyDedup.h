@@ -3,6 +3,9 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <memory>
 #include <optional>
 #include <span>
 #include <type_traits>
@@ -33,15 +36,35 @@ template<typename K>
 }
 
 /// A set of keys, for membership tests: hashed when the key hashes, scanned
-/// otherwise (a composite key may only model equality).
-template<typename K>
+/// otherwise (a composite key may only model equality). Built once, then
+/// shared (share()). One that counts bytes reports to the L1 ledger what it
+/// holds, for as long as it lives, whoever holds it last: its blocks and the
+/// shared object count themselves (LedgerAllocator), what its keys own is
+/// counted when it is built and when it is destroyed.
+template<typename K, bool CountsBytes = false>
 class KeySet {
     static constexpr bool kHashed = std::is_invocable_v<cache::detail::AutoHash<K>, const K&>;
-    std::conditional_t<kHashed, std::unordered_set<K, cache::detail::AutoHash<K>>,
-                       std::vector<K>> keys_;
+    using Alloc = cache::detail::LedgerAllocatorIf<CountsBytes, K>;
+    std::conditional_t<kHashed,
+                       std::unordered_set<K, cache::detail::AutoHash<K>, std::equal_to<K>, Alloc>,
+                       std::vector<K, Alloc>> keys_;
+
+    void countKeys(int64_t sign) const {
+        if constexpr (CountsBytes && !heap_bytes::owns_nothing<K>) {
+            for (const auto& key : keys_) cache::detail::L1Ledger::add(sign * cache::detail::keyHeap(key));
+        }
+    }
 
 public:
-    explicit KeySet(std::span<const K> keys) : keys_(keys.begin(), keys.end()) {}
+    explicit KeySet(std::span<const K> keys) : keys_(keys.begin(), keys.end()) { countKeys(+1); }
+    ~KeySet() { countKeys(-1); }
+    KeySet(const KeySet&) = delete;
+    KeySet& operator=(const KeySet&) = delete;
+
+    /// A set every copy of a predicate shares.
+    [[nodiscard]] static std::shared_ptr<const KeySet> share(std::span<const K> keys) {
+        return std::allocate_shared<KeySet>(cache::detail::LedgerAllocatorIf<CountsBytes, KeySet>{}, keys);
+    }
 
     [[nodiscard]] bool contains(const K& key) const {
         if constexpr (kHashed) return keys_.contains(key);

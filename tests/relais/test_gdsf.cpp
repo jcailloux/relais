@@ -51,6 +51,7 @@
 #include "fixtures/AllocationCounter.h"
 #include "fixtures/TestAllocator.h"
 #include "fixtures/generated/TestOrderEntity.h"
+#include <jcailloux/relais/WeighedFunction.h>
 
 using namespace relais_test;
 using GDSFPolicy = jcailloux::relais::cache::GDSFPolicy;
@@ -474,6 +475,16 @@ TEST_CASE("GDSF - repo auto-registration",
 
         REQUIRE(GDSFPolicy::instance().nbRepos() == before + 2);
     }
+}
+
+
+TEST_CASE("GDSF - what a repo keeps beside its entries counts as its tier does",
+          "[gdsf][ledger]")
+{
+    // The row notes and the list tracker report what they hold to the L1
+    // ledger (test_ledger checks the counts) when their tier counts bytes.
+    STATIC_REQUIRE(TestInternals::rowNotesCountBytes<GDSFItemRepo>());
+    STATIC_REQUIRE(TestInternals::listTrackerCountsBytes<TestArticleListRepo>());
 }
 
 
@@ -1015,6 +1026,13 @@ constexpr size_t kAddressBytes = 2 * kLongBytes;
 /// A struct glaze sees through an explicit glz::meta object.
 struct MetaListed { std::string label; int32_t rank = 0; std::vector<std::string> notes; };
 
+/// A callable whose members say what it holds, as a WeighedFunction keeps one.
+struct HoldsHeap {
+    std::string name;
+    std::vector<int64_t> ids;
+    bool operator()(int64_t id) const { return std::ranges::find(ids, id) != ids.end(); }
+};
+
 /// An entity whose mapping is written by hand, without heapBytes: its
 /// members are counted through glaze's reflection of the struct.
 struct Note { int64_t id = 0; std::string text; std::vector<std::string> tags; };
@@ -1340,6 +1358,26 @@ TEST_CASE("Entry bytes - heapBytes matches the blocks libstdc++ allocates",
         check(glz::raw_json{std::string(50, '1')});
         check(MetaListed{kLong, 1, {kLong, "a"}});              // glz::meta object
         check(makeAddress());                                   // reflected aggregate
+    }
+
+    SECTION("[entry-bytes] std::unique_ptr: the block of the object, and what it owns") {
+        auto [held, counted] = builtAndCounted([] {
+            auto o = std::make_unique<TestOrderEntity>();
+            o->label = kLong;
+            o->tags = {kLong, "x"};
+            return o;
+        });
+        CHECK(counted == held);
+        CHECK(heapBytes(std::unique_ptr<TestOrderEntity>{}) == 0);
+    }
+
+    SECTION("[entry-bytes] WeighedFunction: the callable's block, and what it owns") {
+        using Fn = jcailloux::relais::detail::WeighedFunction<bool(int64_t)>;
+        auto make = [] { return Fn(HoldsHeap{kLong, {1, 2, 3}}); };
+        auto [held, counted] = builtAndCounted(make);
+        CHECK(counted == held);
+        check(make());  // a copy holds a callable of its own
+        CHECK(heapBytes(Fn{}) == 0);
     }
 
     SECTION("[entry-bytes] generated entity with json_field members") {

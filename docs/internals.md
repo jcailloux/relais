@@ -1098,7 +1098,8 @@ jcailloux::relais::                       # Repo, Entity<Struct, Mapping>, entit
                                           # FdAttachment, async
 jcailloux::relais::detail::               # PgRepo, LocalRepo, ListMixin, InvalidationMixin,
                                           # RecheckGuard, propagateCreate/Update/Delete, type traits,
-                                          # LoopBinding, heapBytes(), blockBytes()
+                                          # LoopBinding, heapBytes(), blockBytes(),
+                                          # WeighedFunction, RowNotes, KeySet
 jcailloux::relais::config::               # CacheConfig, CacheLevel, UpdateStrategy,
                                           # Duration, FixedString, presets
 jcailloux::relais::entity::               # set/setNull/increment/decrement/nowPlus, guards, ordering

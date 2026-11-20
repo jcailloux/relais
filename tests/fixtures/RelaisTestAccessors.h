@@ -42,6 +42,18 @@ struct TestInternals {
     template<typename Repo>
     static size_t rowNoteCount() { return Repo::notes().size(); }
 
+    /// Whether a repo's row notes report what they hold to the L1 ledger.
+    template<typename Repo>
+    static constexpr bool rowNotesCountBytes() {
+        return std::remove_reference_t<decltype(Repo::notes())>::kCountsBytes;
+    }
+
+    /// Whether a list repo's tracker reports what it holds to the L1 ledger.
+    template<typename Repo>
+    static constexpr bool listTrackerCountsBytes() {
+        return std::remove_reference_t<decltype(Repo::listCache())>::ModTracker::kCountsBytes;
+    }
+
     /// Whether a hit pays more than the note count's load.
     template<typename Repo>
     static bool rowNotesActive() { return Repo::notes().active(); }

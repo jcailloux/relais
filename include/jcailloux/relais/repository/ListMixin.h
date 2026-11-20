@@ -596,9 +596,7 @@ public:
         if constexpr (kHasL1) {
             if (rows) {
                 detail::precautionSync(ticket, [rows] {
-                    listCache().onRowsLeft([rows](const Entity& e) {
-                        return rows(e) == detail::RowMatch::Maybe;
-                    });
+                    listCache().onRowsLeft(detail::MayHold<Entity>{rows});
                 });
             } else {
                 detail::precautionSync(ticket, [] { listCache().onRowsRanged({}); });
@@ -804,9 +802,9 @@ protected:
         if constexpr (kHasL1) {
             for (size_t i = 0; i < keys.size(); ++i)
                 keepPageCopy(keys[i], before ? &(*before)[i] : nullptr);
-            auto rows = std::make_shared<const detail::KeySet<Key>>(keys);
+            detail::RowPredicate<Entity> rows = detail::KeyRows<Entity, Key>(keys);
             detail::precautionSync(ticket, [rows] {
-                listCache().onRowsLeft([rows](const Entity& e) { return rows->contains(Key(e.key())); });
+                listCache().onRowsLeft(detail::MayHold<Entity>{rows});
             });
         }
     }

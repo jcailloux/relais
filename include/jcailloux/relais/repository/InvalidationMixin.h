@@ -334,13 +334,10 @@ protected:
             else unknown.push_back(keys[i]);
         }
         if (!unknown.empty()) {
-            auto rows = std::make_shared<const detail::KeySet<Key>>(std::span<const Key>(unknown));
+            const detail::RowPredicate<Entity> rows =
+                detail::KeyRows<Entity, Key>(std::span<const Key>(unknown));
             everyTargetOf("eraseMany", [&] {
-                return InvList::template invalidateUnknownRows<Entity>(ticket,
-                    [rows](const Entity& e) {
-                        return rows->contains(Key(e.key())) ? detail::RowMatch::Maybe
-                                                            : detail::RowMatch::No;
-                    });
+                return InvList::template invalidateUnknownRows<Entity>(ticket, rows);
             });
         }
         if (!kept.empty()) {
