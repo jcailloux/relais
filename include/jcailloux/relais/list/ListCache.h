@@ -460,10 +460,13 @@ public:
     /// Per chunk, the cutoff is read under the tracker's lock, so every
     /// modification it covers is already tracked when the scan runs; with the
     /// fence, a page stored before a modification is notified is seen by the
-    /// sweep that drains it (see put()).
-    bool sweep(long chunk_id) {
+    /// sweep that drains it (see put()). The tracker's drain takes its indices
+    /// in one section and erases them in another: only the sweep exclusion
+    /// (a global sweep or a forced pass) calls it, so no other erase moves them
+    /// in between. Returns the pages removed.
+    size_t sweep(long chunk_id) {
         const long policy_chunks = cache::GDSFPolicy::instance().chunkCount();
-        bool removed_any = false;
+        size_t removed = 0;
         for (long chunk = chunk_id; chunk < static_cast<long>(ChunkCount);
              chunk += policy_chunks) {
             uint32_t cutoff_gen = modifications_.cutoff(generation_);
@@ -473,17 +476,8 @@ public:
             if (result.chunk_id >= 0) {
                 modifications_.drainChunk(cutoff_gen, static_cast<uint8_t>(chunk));
             }
-            removed_any = removed_any || result.removed_any;
+            removed += result.removed;
         }
-        return removed_any;
-    }
-
-    /// Sweep all chunks.
-    size_t purge() {
-        uint32_t cutoff_gen = modifications_.cutoff(generation_);
-        std::atomic_thread_fence(std::memory_order_seq_cst);
-        size_t removed = tier_.purgeAll(modificationPredFull());
-        modifications_.drain(cutoff_gen);
         return removed;
     }
 
@@ -502,7 +496,7 @@ public:
 
 private:
     // =========================================================================
-    // Modification extra predicates for CacheTier::sweepChunk/purgeAll
+    // Modification extra predicate for CacheTier::sweepChunk
     // =========================================================================
 
     /// Extra predicate for sweepChunk: uses bitmap skip optimization.
@@ -510,14 +504,6 @@ private:
         return [this](const CacheKey&, const MetadataImpl& meta,
                       const Result& value, long chunk_id) -> bool {
             return isAffectedByModificationsForChunk(meta, value, chunk_id);
-        };
-    }
-
-    /// Extra predicate for purgeAll: checks all modifications (no bitmap).
-    auto modificationPredFull() {
-        return [this](const CacheKey&, const MetadataImpl& meta,
-                      const Result& value, long /*chunk_id*/) -> bool {
-            return isAffectedByModifications(meta, value);
         };
     }
 

@@ -205,6 +205,8 @@ public:
     ///   they read via atomic_ref too.
     /// - Phase 2 (unique_lock): erase expired entries via swap-with-last.
     ///   Only taken when there are actual removals.
+    /// The indices of phase 1 are erased in phase 2: nothing else may erase
+    /// in between. Only the sweep exclusion calls this.
     void drainChunk(uint32_t cutoff_gen, uint8_t chunk_id) {
         typename ModificationLane::Indices to_erase;
         typename RangeLane::Indices to_erase_ranges;
@@ -224,15 +226,6 @@ public:
         modifications_.eraseDrained(to_erase);
         ranges_.eraseDrained(to_erase_ranges);
         rows_left_.eraseDrained(to_erase_rows);
-    }
-
-    /// Erase all entries with generation <= cutoff_gen in one pass.
-    /// Used by purge() after processing all chunks at once.
-    void drain(uint32_t cutoff_gen) {
-        std::unique_lock lock(mutex_);
-        modifications_.drain(cutoff_gen);
-        ranges_.drain(cutoff_gen);
-        rows_left_.drain(cutoff_gen);
     }
 
     // =========================================================================

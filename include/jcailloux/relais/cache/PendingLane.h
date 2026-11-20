@@ -120,16 +120,6 @@ public:
         publishCount();
     }
 
-    /// Erase every entry with generation <= cutoff_gen.
-    void drain(uint32_t cutoff_gen) {
-        std::erase_if(entries_, [cutoff_gen](const Entry& e) {
-            if (e.generation > cutoff_gen) return false;
-            countPayload(e.payload, -1);
-            return true;
-        });
-        publishCount();
-    }
-
     void clear() {
         for (const auto& e : entries_) countPayload(e.payload, -1);
         entries_.clear();

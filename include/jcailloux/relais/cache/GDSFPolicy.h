@@ -122,7 +122,7 @@ struct ScoreHistogram {
 // =========================================================================
 
 struct RepoRegistryEntry {
-    bool (*sweep_fn)(long chunk_id);  // cleanup given chunk, returns true if evicted something
+    size_t (*sweep_fn)(long chunk_id);  // sweeps the chunk, returns the entries it removed
     size_t (*size_fn)();              // current L1 cache size (entry count)
     const char* name;                 // compile-time repo name (for logging)
 };
@@ -281,7 +281,8 @@ public:
 
     /// Record an entry into the building histogram during sweep.
     /// Called by cleanup predicates for ALL entries (evicted + kept).
-    /// Only called during sweep which is serialized by sweep_flag_.
+    /// Only called during a sweep or a forced pass, both serialized by
+    /// sweep_flag_.
     void recordEntry(float score, size_t entry_bytes) {
         building_histogram_.record(score, entry_bytes);
     }
@@ -291,7 +292,7 @@ public:
     // =====================================================================
 
     /// Global sweep: iterates all repos, sweeps one chunk per repo.
-    /// Uses atomic_flag for instant abandon if a sweep is already in progress.
+    /// Abandons at once if a sweep or a forced pass is in progress.
     void sweep() {
         if (sweep_flag_.test_and_set(std::memory_order_acquire)) return;
 
@@ -364,7 +365,34 @@ public:
         sweep_counters_.record(sweep_ns);
 #endif
 
-        sweep_flag_.clear(std::memory_order_release);
+        releaseSweep();
+    }
+
+    /// Forced pass: `sweep_fn` (one repo's sweep) on every chunk, excluded
+    /// from the global sweep. It removes what a sweep removes, against the
+    /// current threshold, ages the counts and the ghosts as a sweep does, and
+    /// records into the building histogram, which the next global sweep
+    /// resets before it records: the threshold does not move. Waits for the
+    /// sweep or pass in progress; a global sweep due meanwhile is abandoned.
+    /// Returns the entries removed.
+    size_t sweepEveryChunk(size_t (*sweep_fn)(long chunk_id)) {
+        while (sweep_flag_.test_and_set(std::memory_order_acquire)) {
+            sweep_flag_.wait(true, std::memory_order_relaxed);
+        }
+        // Released even if a chunk's sweep throws (an allocation): a flag
+        // left set would stop every later sweep.
+        struct Release {
+            GDSFPolicy& policy;
+            ~Release() { policy.releaseSweep(); }
+        } release{*this};
+
+        size_t removed = 0;
+        for (long chunk_id = 0; chunk_id < config_.chunk_count; ++chunk_id) {
+            removed += sweep_fn(chunk_id);
+        }
+        // As a sweep ends: what the pass freed is seen by isOverBudget() at once.
+        refreshHeldBytes();
+        return removed;
     }
 
 #if RELAIS_ENABLE_METRICS
@@ -382,6 +410,12 @@ private:
                 [] () noexcept { GDSFPolicy::instance().refreshHeldBytes(); },
                 std::memory_order_release);
         }
+    }
+
+    /// Ends a sweep or a forced pass, and wakes a pass waiting for it.
+    void releaseSweep() noexcept {
+        sweep_flag_.clear(std::memory_order_release);
+        sweep_flag_.notify_all();
     }
 
     static size_t readMaxMemoryFromEnv() {
@@ -438,7 +472,9 @@ private:
     std::atomic<uint64_t> held_bytes_{0};
     std::atomic<uint64_t> admitted_since_refresh_{0};
 
-    // Sweep serialization — lock-free, guaranteed on all platforms
+    // Sweep serialization — lock-free, guaranteed on all platforms. Set by a
+    // global sweep (which abandons if it is set) and by a forced pass (which
+    // waits for it).
     std::atomic_flag sweep_flag_{};
 
 #if RELAIS_ENABLE_METRICS

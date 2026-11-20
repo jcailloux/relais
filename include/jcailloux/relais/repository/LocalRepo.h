@@ -414,13 +414,20 @@ public:
     // =========================================================================
 
     /// Sweep a specific chunk (called by GDSFPolicy::sweep via sweep_fn).
-    static bool sweep(long chunk_id) {
-        return tier().sweepChunk(chunk_id, noExtraPred).removed_any;
+    /// Returns the entries removed.
+    static size_t sweep(long chunk_id) {
+        return tier().sweepChunk(chunk_id, noExtraPred).removed;
     }
 
-    /// Sweep all chunks.
+    /// Forced pass of the sweep over every chunk (GDSFPolicy::sweepEveryChunk):
+    /// removes what a sweep removes, no more. Waits for the sweep in progress.
+    /// Returns the entries removed.
     static size_t purge() {
-        return tier().purgeAll(noExtraPred);
+        if constexpr (!Tier::kHasCleanup) {
+            return 0;
+        } else {
+            return cache::GDSFPolicy::instance().sweepEveryChunk(&sweep);
+        }
     }
 
     /// Prime L1 cache at startup.
@@ -570,7 +577,7 @@ private:
             State instance;
             Holder() {
                 instance.tier.enroll({
-                    .sweep_fn = +[](long chunk_id) -> bool {
+                    .sweep_fn = +[](long chunk_id) -> size_t {
                         return sweep(chunk_id);
                     },
                     .size_fn = +[]() -> size_t {

@@ -499,9 +499,9 @@ public:
     /// Prime the L1 cache: no-op without L1.
     static constexpr void warmup() noexcept {}
 
-    /// Sweep one L1 chunk: nothing to sweep without L1, returns false. Not public
+    /// Sweep one L1 chunk: nothing to sweep without L1, removes 0. Not public
     /// API (GDSFPolicy drives the real sweep); lets ListMixin::sweep compile.
-    static constexpr bool sweep(long) noexcept { return false; }
+    static constexpr size_t sweep(long) noexcept { return 0; }
 
     // =====================================================================
     // insert

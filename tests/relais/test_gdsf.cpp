@@ -19,6 +19,7 @@
  *  17. Eviction selectivity    — hot/cold, score formula
  *  19. Cross-repo sweep coordination
  * 19b. Budget                  — bounds the bytes the L1 holds, not the process
+ * 19c. purge()                 — a forced pass, excluded from a concurrent sweep
  *  20. Entry bytes             — the room an entry takes, stored or recomputed;
  *                                 the room a block takes, read from the allocator
  */
@@ -30,6 +31,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <map>
@@ -138,6 +140,13 @@ void resetRepos() {
     (TestInternals::resetRepoGDSFState<Repos>(), ...);
     TestInternals::resetGDSF();
 }
+
+/// Stops RuntimeThread's 100 ms read of the held bytes for its scope.
+struct PauseTickHook {
+    using RuntimeThread = jcailloux::relais::runtime::detail::RuntimeThread;
+    RuntimeThread::TickHook hook = RuntimeThread::on_tick.exchange(nullptr);
+    ~PauseTickHook() { RuntimeThread::on_tick.store(hook); }
+};
 
 /// Reset ALL test repos to ensure clean global threshold.
 /// Excludes GDSFRegRepo1/2/3 (tested for registration, must not be pre-registered).
@@ -1078,12 +1087,7 @@ TEST_CASE("GDSF - the budget bounds the bytes the L1 holds, not the process",
     }
 
     SECTION("[budget] a sweep reads the held bytes as it starts and as it ends") {
-        // Only the sweep reads them here.
-        using RuntimeThread = jcailloux::relais::runtime::detail::RuntimeThread;
-        struct PauseTickHook {
-            RuntimeThread::TickHook hook = RuntimeThread::on_tick.exchange(nullptr);
-            ~PauseTickHook() { RuntimeThread::on_tick.store(hook); }
-        } pause;
+        PauseTickHook pause;  // only the sweep reads them here
 
         // A histogram to place a threshold: one cycle under no pressure.
         for (long i = 0; i < policy.chunkCount(); ++i) policy.sweep();
@@ -1105,6 +1109,64 @@ TEST_CASE("GDSF - the budget bounds the bytes the L1 holds, not the process",
         CHECK(policy.threshold() > 0.0f);
         // What it evicted and freed is in what it reads as it ends.
         CHECK(TestInternals::budgetHeldBytes() == static_cast<uint64_t>(L1Ledger::sum()));
+    }
+
+    resetAllTestRepos();
+}
+
+
+// #############################################################################
+//
+//  19c. GDSF - purge() is excluded from a concurrent sweep
+//
+// #############################################################################
+//
+// purge() sweeps every chunk and writes the histogram the global sweep builds.
+// Run under TSan, a purge that ran alongside a sweep reports the race.
+
+TEST_CASE("GDSF - purge is a forced pass, excluded from a concurrent sweep",
+          "[integration][db][gdsf][purge][tsan]")
+{
+    TransactionGuard tx;
+    resetAllTestRepos();
+    auto& policy = GDSFPolicy::instance();
+
+    std::vector<int64_t> ids;
+    for (int i = 0; i < 64; ++i) {
+        ids.push_back(insertTestItem("excl_" + std::to_string(i), i));
+        REQUIRE(sync(GDSFItemRepo::find(ids.back())));
+    }
+    REQUIRE(GDSFItemRepo::size() == ids.size());
+
+    SECTION("[purge] run alongside sweeps, it waits for each") {
+        // Sweeps spaced as ticks space them: a pass waiting for one gets its turn.
+        std::atomic<bool> stop{false};
+        std::thread sweeper([&] {
+            while (!stop.load(std::memory_order_relaxed)) {
+                policy.sweep();
+                std::this_thread::sleep_for(std::chrono::microseconds{20});
+            }
+        });
+        for (int i = 0; i < 100; ++i) (void)GDSFItemRepo::purge();
+        stop.store(true, std::memory_order_relaxed);
+        sweeper.join();
+
+        // Under the budget the threshold stays 0: passes and sweeps age the
+        // counts, and evict nothing.
+        CHECK(policy.threshold() == 0.0f);
+        CHECK(GDSFItemRepo::size() == ids.size());
+    }
+
+    SECTION("[purge] it reads the held bytes as it ends") {
+        PauseTickHook pause;  // only the pass reads them here
+        policy.refreshHeldBytes();
+        const uint64_t before = TestInternals::budgetHeldBytes();
+
+        TestInternals::setThreshold(1e9f);  // every entry under it
+        CHECK(GDSFItemRepo::purge() == ids.size());
+        const int64_t after = jcailloux::relais::cache::detail::L1Ledger::sum();
+        REQUIRE(static_cast<uint64_t>(after) < before);  // evicted and freed
+        CHECK(TestInternals::budgetHeldBytes() == static_cast<uint64_t>(after));
     }
 
     resetAllTestRepos();

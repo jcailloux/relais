@@ -32,6 +32,7 @@
 #include <coroutine>
 #include <cstddef>
 #include <cstdint>
+#include <latch>
 #include <map>
 #include <optional>
 #include <set>
@@ -557,6 +558,38 @@ TEST_CASE("Ledger - threads that allocate and free each other's blocks", "[ledge
     CHECK(after.ledger == after.held);
 }
 
+// A thread that only sums the ledger, as RuntimeThread does, can still run
+// while static destructors free parlay's pool of thread ids: only an id it
+// holds keeps the pool alive until the thread ends. Seen from the ids: once
+// every free id is taken, a thread that sums takes a new one.
+TEST_CASE("Ledger - a thread that sums holds a parlay thread id", "[ledger][threads]")
+{
+    L1Ledger::add(0);  // the ledger exists: building it takes the builder an id
+    // Threads that each take an id and hold it: every free id is taken.
+    const auto ids = static_cast<std::ptrdiff_t>(parlay::num_thread_ids());
+    std::latch taken{ids};
+    std::latch release{1};
+    std::vector<std::thread> holders;
+    for (std::ptrdiff_t i = 0; i < ids; ++i) {
+        holders.emplace_back([&] {
+            (void)parlay::my_thread_id();
+            taken.count_down();
+            release.wait();
+        });
+    }
+    taken.wait();
+    const auto before = parlay::num_thread_ids();
+
+    std::size_t during = 0;
+    std::thread([&during] {
+        (void)L1Ledger::sum();
+        during = parlay::num_thread_ids();
+    }).join();
+    release.count_down();
+    for (auto& h : holders) h.join();
+    CHECK(during > before);
+}
+
 // =============================================================================
 // What the L1 keeps beside its entries
 // =============================================================================
@@ -671,7 +704,7 @@ TEST_CASE("Ledger - a list tracker counts what its lanes hold", "[ledger][beside
         Recording recording;
         drainAll(tracker->cutoff(generation));
         notify(0, 40);
-        tracker->drain(tracker->cutoff(generation));  // as a purge drains
+        drainAll(tracker->cutoff(generation));
     }
     balanced(base, "drained");  // left: the lanes' arrays, at their capacity
     CHECK(tracker->empty());

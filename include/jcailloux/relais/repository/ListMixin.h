@@ -204,7 +204,7 @@ class ListMixin : public Base {
             ListCacheType instance{listCacheConfig()};
             Holder() {
                 instance.tier().enroll({
-                    .sweep_fn = +[](long chunk_id) -> bool {
+                    .sweep_fn = +[](long chunk_id) -> size_t {
                         return listCache().sweep(chunk_id);
                     },
                     .size_fn = +[]() -> size_t {
@@ -522,23 +522,24 @@ public:
     // Cache management — unified entity + list cleanup
     // =========================================================================
 
-    /// Sweep a specific chunk on both entity and list caches.
-    /// Called by GDSFPolicy::sweep via sweep_fn — chunk_id is globally coordinated.
-    static bool sweep(long chunk_id) {
-        bool entity_cleaned = Base::sweep(chunk_id);
+    /// Sweep a specific chunk on both entity and list caches, each its own
+    /// entry in GDSFPolicy's registry. Returns the entries and pages removed.
+    static size_t sweep(long chunk_id) {
+        size_t removed = Base::sweep(chunk_id);
         if constexpr (kHasL1) {
-            return entity_cleaned | listCache().sweep(chunk_id);
+            removed += listCache().sweep(chunk_id);
         }
-        return entity_cleaned;
+        return removed;
     }
 
-    /// Purge all chunks on both entity and list caches.
+    /// Forced pass of the sweep over every chunk of both caches (see
+    /// LocalRepo::purge). Returns the entries and pages removed.
     static size_t purge() {
-        size_t entity_erased = Base::purge();
         if constexpr (kHasL1) {
-            return entity_erased + listCache().purge();
+            return cache::GDSFPolicy::instance().sweepEveryChunk(&sweep);
+        } else {
+            return Base::purge();
         }
-        return entity_erased;
     }
 
     /// Invalidate entity cache. L1 list cache uses lazy invalidation via ModificationTracker.

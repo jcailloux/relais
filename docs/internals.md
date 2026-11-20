@@ -296,6 +296,11 @@ not a global stop-the-world pass: the tier walks one chunk at a time, evicting
 expired entries (and, when GDSF is on, low-score entries against a byte target)
 so a sweep never holds a chunk locked longer than that chunk.
 
+`purge()` runs a forced pass: its repo's sweep on every chunk, excluded from the
+global sweep. It waits for the sweep in progress, and a global sweep due during
+the pass is skipped. It removes what a sweep removes, against the current
+threshold, and no more.
+
 ## Cache Flow on Operations
 
 ### Read: `find(id)`
@@ -828,8 +833,10 @@ erased. Cleanup is per-chunk, lock-light:
   *before* the chunk cleanup, so modifications added during cleanup are not
   prematurely drained. Two-phase: a `shared_lock` clears bits and collects drained
   indices, a `unique_lock` erases (taken only when there are removals).
-- `drain(cutoff_gen)` — erases every entry with `generation <= cutoff_gen` in one
-  pass; used by `purge()` after processing all chunks at once.
+
+Phase 2 erases the indices phase 1 collected, so no other erasure may run in
+between: only the sweep exclusion drains, whether a global sweep or the forced
+pass of `purge()`.
 
 ### Modification validation
 

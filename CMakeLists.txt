@@ -358,12 +358,15 @@ if(RELAIS_BUILD_TESTS)
             find_library(RELAIS_${allocator}_LIBRARY NAMES ${allocator})
             if(RELAIS_${allocator}_LIBRARY)
                 set(preload "LD_PRELOAD=${RELAIS_${allocator}_LIBRARY};RELAIS_TEST_ALLOCATOR=${allocator}")
-                add_test(NAME test_relais_gdsf_${allocator}
-                         COMMAND test_relais_gdsf "[block-bytes],[entry-bytes]")
-                set_tests_properties(test_relais_gdsf_${allocator} PROPERTIES
-                    ENVIRONMENT "${preload}"
-                    LABELS "relais;integration;db;gdsf;allocator"
-                    RESOURCE_LOCK "db")
+                # test_relais_gdsf runs under TSan in a TSan build (below).
+                if(NOT RELAIS_ENABLE_TSAN)
+                    add_test(NAME test_relais_gdsf_${allocator}
+                             COMMAND test_relais_gdsf "[block-bytes],[entry-bytes]")
+                    set_tests_properties(test_relais_gdsf_${allocator} PROPERTIES
+                        ENVIRONMENT "${preload}"
+                        LABELS "relais;integration;db;gdsf;allocator"
+                        RESOURCE_LOCK "db")
+                endif()
                 add_test(NAME test_relais_entry_layout_${allocator}
                          COMMAND test_relais_entry_layout)
                 set_tests_properties(test_relais_entry_layout_${allocator} PROPERTIES
@@ -412,6 +415,11 @@ if(RELAIS_BUILD_TESTS)
         target_compile_options(test_relais_dbprovider_log PRIVATE
             -fsanitize=thread -fno-omit-frame-pointer)
         target_link_options(test_relais_dbprovider_log PRIVATE -fsanitize=thread)
+        # purge() raced against the GDSF sweep: TSan validates the sweep
+        # exclusion over the histogram both write.
+        target_compile_options(test_relais_gdsf PRIVATE
+            -fsanitize=thread -fno-omit-frame-pointer)
+        target_link_options(test_relais_gdsf PRIVATE -fsanitize=thread)
         # NB: the cache-coherence suite is single-loop (one event-loop thread), so
         # its concurrency-relevant surface — the shared static L1 under concurrent
         # find/update/erase, and the coroutine resume chains — is TSan-validated by

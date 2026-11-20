@@ -25,6 +25,7 @@
  *  10. Concurrent list CRUD + list cache cleanup
  *  11a. ModificationTracker drains after concurrent storm
  *  11b. Progressive tracker reduction via trySweep
+ *  11c. purge() against concurrent sweeps, writes and reads
  *  15. Concurrent upsert on a shared assigned-PK key (+ upsert‖update‖erase)
  *  16. Store-through on one key, results handled out of commit order
  *  17. Store-through of identical writes coalesced in one batch
@@ -816,6 +817,56 @@ TEST_CASE("Concurrency - progressive tracker reduction",
         auto count_after = TestInternals::pendingModificationCount<TestArticleListRepo>();
         REQUIRE(count_after <= count_before);
     }
+}
+
+
+// #############################################################################
+//
+//  11c. purge() against concurrent sweeps, writes and reads
+//
+// #############################################################################
+//
+// purge() sweeps every chunk, excluded from the global sweep: the tracker's
+// drains never interleave, so no modification leaves the tracker before every
+// chunk has seen it. Once the storm is over, the cached page is the database's.
+
+TEST_CASE("Concurrency - purge against concurrent sweeps, writes and reads",
+          "[integration][db][concurrency][tsan][purge]")
+{
+    TransactionGuard tx;
+    TestInternals::resetListCacheState<TestArticleListRepo>();
+
+    auto userId = insertTestUser("conc_purge_author", "conc_purge@test.com", 0);
+    for (int i = 0; i < 10; ++i) {
+        insertTestArticle("purge_cat", userId, "Seed_" + std::to_string(i), i * 10);
+    }
+    auto q = makeArticleQuery("purge_cat");
+
+    parallel(NUM_THREADS, [&](int i) {
+        for (int j = 0; j < OPS_PER_THREAD; ++j) {
+            if (i == 0) {
+                trySweep<TestArticleListRepo>();
+            } else if (i == 1) {
+                (void)TestArticleListRepo::purge();
+            } else if (i % 2 == 0) {
+                sync(TestArticleListRepo::query(q));
+            } else {
+                sync(TestArticleListRepo::insert(makeTestArticle(
+                    "purge_cat", userId,
+                    "Purge_" + std::to_string(i) + "_" + std::to_string(j),
+                    static_cast<int32_t>(100 + i * OPS_PER_THREAD + j))));
+            }
+        }
+    });
+
+    auto ids = [](const auto& page) {
+        std::vector<int64_t> out;
+        for (const auto& article : page->items) out.push_back(article.id);
+        return out;
+    };
+    const auto cached = ids(sync(TestArticleListRepo::query(q)));
+    TestInternals::resetListCacheState<TestArticleListRepo>();
+    CHECK(cached == ids(sync(TestArticleListRepo::query(q))));
 }
 
 

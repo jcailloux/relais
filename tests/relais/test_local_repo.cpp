@@ -604,6 +604,26 @@ TEST_CASE("LocalRepo - FewChunks config",
     }
 }
 
+TEST_CASE("LocalRepo - purge returns the entries it removed",
+          "[integration][db][cached][cleanup][purge]")
+{
+    TransactionGuard tx;
+    TestInternals::resetEntityCacheState<ShortTTLTestItemRepo>();
+
+    // More entries than chunks: a count of the chunks that removed something
+    // would read less.
+    const auto n = 2 * static_cast<size_t>(
+        jcailloux::relais::cache::GDSFPolicy::instance().chunkCount());
+    for (auto id : insertTestItems(n)) sync(ShortTTLTestItemRepo::find(id));
+    REQUIRE(getCacheSize<ShortTTLTestItemRepo>() == n);
+
+    // CachedClock uses uint32_t seconds: worst-case quantization adds ~1s
+    waitForExpiration(std::chrono::milliseconds{2200});
+
+    CHECK(ShortTTLTestItemRepo::purge() == n);
+    CHECK(getCacheSize<ShortTTLTestItemRepo>() == 0);
+}
+
 /// No TTL: without GDSF compiled in, nothing to free, nothing to sweep.
 using BareTestItemRepo = Repo<TestItemEntity, "test:bare", test_config::BareL1>;
 

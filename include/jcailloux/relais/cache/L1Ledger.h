@@ -71,6 +71,11 @@ public:
     /// the threads that allocate or free have stopped; a moving value
     /// otherwise.
     [[nodiscard]] static int64_t sum() noexcept {
+        // The summing thread takes a parlay thread id, as an adding one does:
+        // its id holds parlay's pool of ids until the thread ends. A thread
+        // that still sums while static destructors run (RuntimeThread) would
+        // otherwise read the pool after it is freed.
+        (void)parlay::my_thread_id();
         int64_t total = 0;
         counters().for_each([&total](int64_t& c) {
             total += std::atomic_ref<int64_t>{c}.load(std::memory_order_relaxed);

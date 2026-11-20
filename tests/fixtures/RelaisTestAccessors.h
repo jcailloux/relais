@@ -172,11 +172,12 @@ struct TestInternals {
         }
     }
 
-    /// Full cleanup of list cache only (entity cache untouched).
-    /// Processes all chunks + drains modification tracker.
+    /// Forced pass of the list cache's sweep only (entity cache untouched),
+    /// under the sweep exclusion: every chunk swept, tracker drained.
     template<typename Repo>
     static size_t forceFullListCleanup() {
-        return Repo::listCache().purge();
+        return jcailloux::relais::cache::GDSFPolicy::instance().sweepEveryChunk(
+            +[](long chunk_id) -> size_t { return Repo::listCache().sweep(chunk_id); });
     }
 
     /// Call ModificationTracker::drainChunk() directly with a controlled cutoff and chunk identity.
@@ -184,13 +185,6 @@ struct TestInternals {
     template<typename Repo>
     static void cleanupModificationsWithCutoff(uint32_t cutoff_gen, uint8_t chunk_id) {
         Repo::listCache().modifications_.drainChunk(cutoff_gen, chunk_id);
-    }
-
-    /// Call ModificationTracker::drain() directly with a controlled cutoff.
-    /// Removes all modifications with generation <= cutoff_gen in one pass.
-    template<typename Repo>
-    static void drainModificationsWithCutoff(uint32_t cutoff_gen) {
-        Repo::listCache().modifications_.drain(cutoff_gen);
     }
 
     /// Read the current generation counter of a list cache.
@@ -401,6 +395,17 @@ struct TestInternals {
         return (Policy::kCleanupMask + 1)
             * static_cast<size_t>(Policy::instance().chunkCount());
     }
+
+    /// Holds the sweep exclusion for its scope, as a sweep in progress does.
+    struct HoldSweepExclusion {
+        HoldSweepExclusion() {
+            auto& flag = jcailloux::relais::cache::GDSFPolicy::instance().sweep_flag_;
+            while (flag.test_and_set(std::memory_order_acquire)) flag.wait(true);
+        }
+        ~HoldSweepExclusion() { jcailloux::relais::cache::GDSFPolicy::instance().releaseSweep(); }
+        HoldSweepExclusion(const HoldSweepExclusion&) = delete;
+        HoldSweepExclusion& operator=(const HoldSweepExclusion&) = delete;
+    };
 
     /// Reset per-repo GDSF state (avg_construction_time).
     template<typename Repo>

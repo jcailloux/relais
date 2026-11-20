@@ -318,13 +318,14 @@ public:
     };
 
     struct SweepResult {
-        bool removed_any = false;
-        long chunk_id = -1;
+        size_t removed = 0;  // entries removed from the map
+        long chunk_id = -1;  // -1: nothing to sweep on this tier
     };
 
     /// Sweep one chunk. chunk_id is determined by GDSFPolicy (global cursor).
     /// ExtraPred(key, meta, value, chunk_id) → bool adds domain-specific eviction.
-    /// Returns SweepResult with chunk_id for post-sweep operations (e.g., drainChunk).
+    /// Returns the entries removed, and chunk_id for post-sweep operations
+    /// (e.g., drainChunk).
     template<typename ExtraPred>
     SweepResult sweepChunk(long chunk_id, ExtraPred&& extra) {
         return sweepChunk(chunk_id, GDSFPolicy::instance().chunkCount(),
@@ -386,67 +387,7 @@ public:
                 }
             }
 
-            return SweepResult{removed > 0, chunk_id};
-        }
-    }
-
-    /// Sweep all chunks. ExtraPred(key, meta, value, chunk_id) → bool for domain-specific eviction.
-    template<typename ExtraPred>
-    size_t purgeAll(ExtraPred&& extra) {
-        if constexpr (!kHasCleanup) {
-            return 0;
-        } else {
-            auto& policy = GDSFPolicy::instance();
-            CleanupContext ctx{runtime::detail::CachedClock::now(),
-                               kHasGDSF ? policy.threshold() : 0.0f};
-
-            typename CleanupContext::GhostCandidates candidates;
-            typename CleanupContext::GhostDecays ghost_decays;
-            if constexpr (kHasGDSF) {
-                ctx.ghost_candidates = &candidates;
-                ctx.ghost_decays = &ghost_decays;
-            }
-
-            size_t removed = 0;
-
-            if constexpr (kHasGDSF) {
-                long n_chunks = policy.chunkCount();
-                for (long chunk_id = 0; chunk_id < n_chunks; ++chunk_id) {
-                    removed += map_.cleanup_chunk(chunk_id, n_chunks,
-                        [this, &ctx, &extra, chunk_id](const Key& key, auto te) {
-                            if (te.isGhost())
-                                return ghostCleanupPred(key, te, ctx);
-                            auto* ce = static_cast<typename Map::CacheEntry*>(
-                                te.template asReal<typename Map::EntryHeader>());
-                            return realCleanupPred(key, *ce, ctx)
-                                || extra(key, ce->metadata, ce->value, chunk_id);
-                        });
-                }
-            } else {
-                removed = map_.full_cleanup(
-                    [this, &ctx, &extra](const Key& key, auto te) {
-                        auto* ce = static_cast<typename Map::CacheEntry*>(
-                            te.template asReal<typename Map::EntryHeader>());
-                        return realCleanupPred(key, *ce, ctx)
-                            || extra(key, ce->metadata, ce->value, long{-1});
-                    });
-            }
-
-            if (removed > 0) map_.collect();
-
-            // Post-sweep: apply ghost decays + insertions
-            if constexpr (kHasGDSF) {
-                for (auto& gd : ghost_decays) {
-                    map_.update_ghost(gd.key, [&gd](TaggedEntry te) {
-                        return te.withGhostCount(gd.decayed_count);
-                    });
-                }
-                for (auto& gc : candidates) {
-                    map_.insert_ghost(gc.key, gc.count, gc.bytes, gc.flags);
-                }
-            }
-
-            return removed;
+            return SweepResult{removed, chunk_id};
         }
     }
 

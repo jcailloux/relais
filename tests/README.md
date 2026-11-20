@@ -206,6 +206,7 @@ Tests for `warmup()` priming cache infrastructure including L1 entity cache and 
 | `[list-cleanup]` | Concurrent list CRUD + unified `trySweep`/`purge` |
 | `[tracker-drain]` | `purge()` drains tracker to zero after concurrent storm |
 | `[tracker-progressive]` | Progressive tracker reduction via `trySweep()` |
+| `[purge]` | `purge()` against concurrent sweeps, writes and reads: the cached page is the database's afterwards |
 
 ### `config/test_l1_config` (Configuration)
 

@@ -11,6 +11,7 @@
  * - Filter matching: only pages matching the entity's filter values are affected
  * - ModificationTracker cleanup lifecycle
  * - Modification cutoff safety (cleanup/drain with time cutoff)
+ * - purge(): a forced pass of the sweep, which waits for the sweep in progress
  */
 
 #include <catch2/catch_test_macros.hpp>
@@ -23,6 +24,9 @@
 #include "jcailloux/relais/io/WhenAll.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <thread>
 
 using namespace relais_test;
 
@@ -905,25 +909,6 @@ TEST_CASE("[DeclListRepo] Modification cutoff safety",
         CHECK(TestInternals::pendingModificationCount<TestArticleListRepo>() == 1);
     }
 
-    SECTION("[cutoff] drain(cutoff) only removes pre-cutoff modifications") {
-        auto entity1 = makeArticle(9001, "tech", alice_id, "before_drain", 10);
-        TestArticleListRepo::notifyCreated(entity1);
-
-        // Capture generation after M1 as cutoff
-        auto cutoff = TestInternals::listCacheGeneration<TestArticleListRepo>();
-
-        auto entity2 = makeArticle(9002, "tech", alice_id, "after_drain", 20);
-        TestArticleListRepo::notifyCreated(entity2);
-
-        CHECK(TestInternals::pendingModificationCount<TestArticleListRepo>() == 2);
-
-        // Drain only modifications at or before cutoff generation
-        TestInternals::drainModificationsWithCutoff<TestArticleListRepo>(cutoff);
-
-        // M1: drained.  M2: still present
-        CHECK(TestInternals::pendingModificationCount<TestArticleListRepo>() == 1);
-    }
-
     SECTION("[cutoff] post-cutoff modification still invalidates cache entries") {
         // 1. Populate DB and cache a query
         for (int vc = 10; vc <= 50; vc += 10) {
@@ -951,8 +936,8 @@ TEST_CASE("[DeclListRepo] Modification cutoff safety",
         auto entity2 = makeArticle(9002, "tech", alice_id, "cutoff_new", 35);
         TestArticleListRepo::notifyCreated(entity2);
 
-        // 5. Drain only M1
-        TestInternals::drainModificationsWithCutoff<TestArticleListRepo>(cutoff);
+        // 5. Drain only M1, on every chunk
+        TestInternals::drainAllModificationChunks<TestArticleListRepo>(cutoff);
         CHECK(TestInternals::pendingModificationCount<TestArticleListRepo>() == 1);
 
         // 6. Re-query: M2 is still in tracker → cache invalidated → DB returns 6
@@ -1129,6 +1114,9 @@ using FewChunksArticleListRepo =
 /// 16 list chunks, against the policy's 8.
 using ManyChunksArticleListRepo = Repo<TestArticleEntity, "test:article:list:k16",
     jcailloux::relais::config::Local.with_l1_chunk_count_log2(4)>;
+/// Entities and pages expire after a second.
+using ShortTTLArticleListRepo =
+    Repo<TestArticleEntity, "test:article:list:short_ttl", test_config::ShortTTL>;
 
 /// makeViewCountQuery, for the descriptor of repo R.
 template<typename R>
@@ -1141,6 +1129,92 @@ auto viewCountQueryOf(std::string_view category, uint16_t limit) {
     return decl::seal<D>(std::move(p));
 }
 }  // namespace
+
+// #############################################################################
+//
+//  purge(): a forced pass of the sweep
+//
+// #############################################################################
+//
+// purge() runs the repo's sweep, entities and pages, on every chunk of the
+// policy, excluded from the global sweep. It removes what a sweep removes and
+// returns that count.
+
+TEST_CASE("[DeclListRepo] purge is a forced pass of the sweep",
+          "[integration][db][list][cleanup][purge]")
+{
+    TransactionGuard guard;
+    TestInternals::resetEntityCacheState<TestArticleListRepo>();
+    TestInternals::resetListCacheState<TestArticleListRepo>();
+
+    auto alice_id = insertTestUser("alice_purge", "alice_purge@test.com", 0);
+    insertTestArticle("tech", alice_id, "purge_tech", 10);
+    insertTestArticle("news", alice_id, "purge_news", 10);
+    auto q_tech = makeViewCountQuery("tech", 10);
+    auto q_news = makeViewCountQuery("news", 10);
+    REQUIRE(sync(TestArticleListRepo::query(q_tech))->size() == 1);
+    REQUIRE(sync(TestArticleListRepo::query(q_news))->size() == 1);
+    REQUIRE(TestArticleListRepo::listSize() == 2);
+
+    // Affects the tech page, not the news page.
+    TestArticleListRepo::notifyCreated(makeArticle(9201, "tech", alice_id, "purge_new", 20));
+    REQUIRE(TestInternals::pendingModificationCount<TestArticleListRepo>() == 1);
+
+    SECTION("it returns what it removed, and drains the tracker") {
+        CHECK(TestArticleListRepo::purge() == 1);
+        CHECK(TestArticleListRepo::listSize() == 1);
+        CHECK(TestInternals::pendingModificationCount<TestArticleListRepo>() == 0);
+    }
+
+    SECTION("it waits for the sweep in progress") {
+        std::atomic<bool> done{false};
+        size_t removed = 0;
+        std::thread purger;
+        {
+            TestInternals::HoldSweepExclusion sweep_in_progress;
+            purger = std::thread([&] {
+                removed = TestArticleListRepo::purge();
+                done.store(true, std::memory_order_release);
+            });
+            std::this_thread::sleep_for(std::chrono::milliseconds{100});
+            CHECK_FALSE(done.load(std::memory_order_acquire));
+            CHECK(TestArticleListRepo::listSize() == 2);
+        }
+        purger.join();
+        CHECK(removed == 1);
+        CHECK(TestArticleListRepo::listSize() == 1);
+    }
+}
+
+TEST_CASE("[DeclListRepo] purge counts the entities and the pages it removes",
+          "[integration][db][list][cleanup][purge]")
+{
+    using R = ShortTTLArticleListRepo;
+    TransactionGuard guard;
+    TestInternals::resetEntityCacheState<R>();
+    TestInternals::resetListCacheState<R>();
+
+    // More entities than chunks: a count of the chunks that removed something
+    // would read less.
+    auto alice_id = insertTestUser("alice_purge_ttl", "alice_purge_ttl@test.com", 0);
+    const auto n = 2 * static_cast<size_t>(
+        jcailloux::relais::cache::GDSFPolicy::instance().chunkCount());
+    for (size_t i = 0; i < n; ++i) {
+        auto id = insertTestArticle("tech", alice_id, "purge_ttl_" + std::to_string(i),
+                                    static_cast<int32_t>(i));
+        REQUIRE(sync(R::find(id)));
+    }
+    REQUIRE(R::size() == n);
+    REQUIRE(sync(R::query(viewCountQueryOf<R>("tech", 10)))->size() == std::min<size_t>(n, 10));
+    REQUIRE(R::listSize() == 1);
+
+    // CachedClock uses uint32_t seconds: worst-case quantization adds ~1s
+    waitForExpiration(std::chrono::milliseconds{2200});
+
+    CHECK(R::purge() == n + 1);
+    CHECK(R::size() == 0);
+    CHECK(R::listSize() == 0);
+}
 
 TEST_CASE("[DeclListRepo] Each list cache sweeps over its own chunk count",
           "[integration][db][list][sweep][chunks]")
