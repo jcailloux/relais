@@ -8,7 +8,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <limits>
 #include <tuple>
 #include <type_traits>
 #include <variant>
@@ -17,9 +16,10 @@
 #include <parlay_hash/unordered_map.h>
 #include <utils/epoch.h>
 
+#include "jcailloux/relais/cache/EntryLayout.h"
 #include "jcailloux/relais/cache/GDSFPolicy.h"
+#include "jcailloux/relais/cache/L1Ledger.h"
 #include "jcailloux/relais/cache/TaggedEntry.h"
-#include "jcailloux/relais/HeapBytes.h"
 
 #ifdef RELAIS_BUILDING_TESTS
 namespace relais_test { struct TestInternals; }
@@ -33,10 +33,6 @@ namespace jcailloux::relais::cache::detail {
 
 template<typename T>
 concept Mergeable = requires(T& a, const T& b) { a.mergeFrom(b); };
-
-/// An entry's byte count, kept in its header when that costs no space.
-struct StoredBytes { uint32_t bytes = 0; };
-struct NoStoredBytes {};
 
 // =============================================================================
 // Fast hashing — splitmix64 for integers, wyhash for strings/bytes
@@ -141,10 +137,12 @@ struct AutoHash<std::tuple<Ts...>> {
 // - epoch::EpochGuard (ticket-based) for thread-agnostic read protection
 // - Chunk-based partial cleanup for incremental eviction
 // - Optional ghost entries (HasGhost = true) via tagged pointers (zero allocation)
+// - With CountsBytes, the L1 ledger's accounting of every block it holds
 //
-// ParlayHash stores pair<K, TaggedEntry> directly in bucket buffers (trivially
-// copyable). TaggedEntry is 8 bytes: either a real pointer to a CacheEntry, or
-// ghost data encoded inline (bit 0 = ghost flag).
+// ParlayHash stores pair<K, TaggedEntry> directly in bucket buffers when K is
+// trivially copyable, and in a node behind a pointer otherwise (EntryLayout).
+// TaggedEntry is 8 bytes: either a real pointer to a CacheEntry, or ghost data
+// encoded inline (bit 0 = ghost flag).
 //
 // When HasGhost = false (default), all ghost code is eliminated at compile time.
 //
@@ -156,117 +154,29 @@ template<typename K, typename V, typename Metadata = std::monostate,
          bool CountsBytes = false,
          typename Hash = AutoHash<K>>
 class ChunkMap {
-    // The entry's layout with and without a stored byte count, to keep the
-    // count only where it fits in padding.
-    struct HeaderWithoutBytes { [[no_unique_address]] Metadata metadata; };
-    struct EntryWithoutBytes : HeaderWithoutBytes { V value; };
-    struct HeaderWithBytes {
-        [[no_unique_address]] Metadata metadata;
-        [[no_unique_address]] StoredBytes stored_bytes;
-    };
-    struct EntryWithBytes : HeaderWithBytes { V value; };
+    using Layout = EntryLayout<K, V, Metadata, CountsBytes, Hash>;
 
 public:
-    /// Whether entries are counted in bytes: set by a GDSF tier, the only
-    /// kind whose bytes the eviction budget reads.
-    static constexpr bool kCountsBytes = CountsBytes;
+    /// Whether entries are counted in bytes, and the L1 ledger told of every
+    /// block the map holds: set by a GDSF tier (see EntryLayout).
+    static constexpr bool kCountsBytes = Layout::kCountsBytes;
+    static constexpr bool kStoresBytes = Layout::kStoresBytes;
 
-    /// The byte count is stored in the header when that leaves the entry's
-    /// size unchanged, and recomputed from the value otherwise.
-    static constexpr bool kStoresBytes =
-        kCountsBytes && sizeof(EntryWithBytes) == sizeof(EntryWithoutBytes);
+    using EntryHeader = typename Layout::EntryHeader;
+    using CacheEntry = typename Layout::CacheEntry;
 
-    // Base: metadata accessible without downcast
-    struct EntryHeader {
-        [[no_unique_address]] Metadata metadata;
-        [[no_unique_address]] std::conditional_t<kStoresBytes, StoredBytes, NoStoredBytes>
-            stored_bytes{};
-    };
+    /// Bytes the pool asks for one entry beyond its value (see EntryLayout).
+    static constexpr size_t kEntryOverhead = Layout::kEntryOverhead;
 
-    // Real entry: inherits EntryHeader, adds value. Built only by the entry
-    // pool, inside its pool block (PooledEntry).
-    struct CacheEntry : EntryHeader {
-        V value;
-        CacheEntry(V v, Metadata m)
-            : EntryHeader{std::move(m)}, value(std::move(v)) {
-            if constexpr (kStoresBytes) {
-                this->stored_bytes.bytes = static_cast<uint32_t>(std::min<size_t>(
-                    heldBytes(), std::numeric_limits<uint32_t>::max()));
-            }
-        }
+    /// Whether parlay keeps each key behind a pointer (see EntryLayout).
+    static constexpr bool kIndirectKeys = Layout::kIndirectKeys;
 
-        /// The bytes this entry takes: read from the header, or recomputed by
-        /// heldBytes(). A cached value never changes (a write stores a new
-        /// entry), and a block keeps its size, so both give the same count for
-        /// the entry's whole life.
-        [[nodiscard]] size_t bytes() const {
-            if constexpr (kStoresBytes) return this->stored_bytes.bytes;
-            else return heldBytes();
-        }
+    /// The bytes an entry holding `v` would take, before it exists (see
+    /// EntryLayout). The entry's own count is CacheEntry::bytes().
+    [[nodiscard]] static size_t entryBytes(const V& v) { return Layout::entryBytes(v); }
 
-        /// The room the entry's blocks take, read on them: its pool block, and
-        /// the blocks its value owns.
-        [[nodiscard]] size_t heldBytes() const {
-            return relais::detail::blockBytes(sizeof(PooledEntry), block())
-                + relais::detail::heapBytes(value);
-        }
-
-        /// The pool block that holds this entry.
-        [[nodiscard]] const void* block() const {
-            return reinterpret_cast<const char*>(this) - kEntryOffset;
-        }
-    };
-
-    static_assert(sizeof(CacheEntry) == sizeof(EntryWithoutBytes),
-                  "a stored byte count must not make the entry bigger");
-
-private:
-    // What the epoch pool allocates for one entry: the entry, plus guard words
-    // around it when parlay checks its pool (EpochMemCheck, builds without NDEBUG).
-#ifdef EpochMemCheck
-    struct PooledEntry { long pad; std::atomic<long> head; CacheEntry entry; std::atomic<long> tail; };
-#else
-    struct PooledEntry { CacheEntry entry; };
-#endif
-
-    // Where the entry sits in its pool block: past the guard words, if any.
-    // CacheEntry has members in a base and in itself, so PooledEntry is not
-    // standard-layout, where offsetof is conditionally supported: GCC and Clang
-    // compute it, and warn.
-#if defined(__GNUC__)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Winvalid-offsetof"
-#endif
-    static constexpr size_t kEntryOffset = offsetof(PooledEntry, entry);
-#if defined(__GNUC__)
-#pragma GCC diagnostic pop
-#endif
-
-public:
-    /// Bytes the pool asks for one entry beyond its value, one malloc of
-    /// sizeof(PooledEntry) per entry:
-    ///   - the header: the metadata, and the stored byte count when it fits;
-    ///   - the padding that aligns the value after the header;
-    ///   - the pool's guard words, when parlay checks its pool.
-    static constexpr size_t kEntryOverhead = sizeof(PooledEntry) - sizeof(V);
-
-    /// Bytes a key takes in the table, beside its entry: parlay stores the key
-    /// and the entry's tagged pointer side by side in a bucket. Exact for a key
-    /// stored inline (K and TaggedEntry trivially copyable); a key parlay keeps
-    /// behind a pointer (std::string, std::tuple) also costs the node it points
-    /// to and the key's own heap, which this does not count.
-    static constexpr size_t kBucketSlotSize = sizeof(K) + sizeof(TaggedEntry);
-
-    /// The bytes an entry holding `v` would take, before it exists: the class
-    /// of its pool block (one malloc of sizeof(PooledEntry)), and the blocks
-    /// the value owns, which move into the entry with it. Admission and ghosts
-    /// weigh a value with it. The entry's own count, which the sweep, the score
-    /// and the eviction histogram read, is CacheEntry::bytes(): it reads the
-    /// pool block itself, which the allocator may have made larger than its
-    /// class.
-    [[nodiscard]] static size_t entryBytes(const V& v) {
-        return relais::detail::blockBytes(sizeof(PooledEntry)) + relais::detail::heapBytes(v);
-    }
+    /// The bytes `key` costs the table beside its entry (see EntryLayout).
+    [[nodiscard]] static size_t slotBytes(const K& key) { return Layout::slotBytes(key); }
 
     struct FindResult {
         TaggedEntry tagged{};
@@ -292,14 +202,14 @@ public:
         uint8_t ghostFlags() const { return tagged.ghostFlags(); }
     };
 
-    using MapType = parlay::parlay_unordered_map<K, TaggedEntry, Hash>;
+    using MapType = typename Layout::MapType;
     using hashed_key = typename MapType::hashed_key;
 
     static hashed_key make_key(const K& key) { return MapType::make_key(key); }
     static size_t get_hash(const hashed_key& k) { return MapType::get_hash(k); }
 
     explicit ChunkMap(long initial_size = 128)
-        : map_(*new MapType(initial_size, false, nullptr)) {}
+        : map_(makeMap(initial_size)) {}
 
     // ChunkMap instances are static singletons (LocalRepo::cache(),
     // ListCache::cache_). Their destruction happens during static cleanup
@@ -633,12 +543,44 @@ public:
     }
 
 private:
+    // What the map's pools report to the L1 ledger: each entry at its own
+    // count, each node of a key kept behind a pointer, each overflow link.
+    static constexpr epoch::pool_accounting<CacheEntry> kEntryAccounting{
+        &kL1Ledger, &Layout::weighEntry};
+    static constexpr epoch::pool_accounting<typename Layout::Node> kNodeAccounting{
+        &kL1Ledger, &Layout::weighNode};
+    static constexpr epoch::pool_accounting<typename Layout::Link> kLinkAccounting{
+        &kL1Ledger, &Layout::weighLink};
+
+    // The table, which reports its versions to the L1 ledger when entries are
+    // counted. Every map of one key type shares parlay's link and node pools;
+    // in a build with GDSF every tier counts, so the first map of a key type
+    // gives them their accounting before any map of that type allocates from
+    // them (a later map sets the same again). Allocated on the heap and never
+    // freed, like the entry pool (see ~ChunkMap).
+    static MapType& makeMap(long initial_size) {
+        if constexpr (kCountsBytes) {
+            auto& map = *new MapType(initial_size, false, &kL1Ledger);
+            map.m.link_pool->set_accounting(&kLinkAccounting);
+            if constexpr (kIndirectKeys) map.entries_.data_pool->set_accounting(&kNodeAccounting);
+            return map;
+        } else {
+            return *new MapType(initial_size, false, nullptr);
+        }
+    }
+
     // memory_pool allocated on the heap and intentionally never freed.
     // ChunkMap instances are static singletons; during static destruction
     // the epoch singleton may already be destroyed, and ~memory_pool calls
-    // get_epoch().update_epoch() which would crash.
+    // get_epoch().update_epoch() which would crash. With CountsBytes, it
+    // reports each entry to the L1 ledger from its construction to its
+    // destruction, retired or not.
     static epoch::memory_pool<CacheEntry>& shared_pool() {
-        static auto* p = new epoch::memory_pool<CacheEntry>();
+        static auto* p = [] {
+            auto* pool = new epoch::memory_pool<CacheEntry>();
+            if constexpr (kCountsBytes) pool->set_accounting(&kEntryAccounting);
+            return pool;
+        }();
         return *p;
     }
 

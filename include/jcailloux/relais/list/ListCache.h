@@ -17,6 +17,7 @@
 #include "jcailloux/relais/cache/GDSFPolicy.h"
 #include "jcailloux/relais/cache/TaggedEntry.h"
 #include "jcailloux/relais/runtime/CachedClock.h"
+#include "jcailloux/relais/HeapBytes.h"
 
 #ifdef RELAIS_BUILDING_TESTS
 namespace relais_test { struct TestInternals; }
@@ -164,6 +165,13 @@ struct ListCacheMetadataImpl : cache::detail::CacheMetadata<true, true> {
 
     ListCacheMetadataImpl(const ListCacheMetadataImpl&) = delete;
     ListCacheMetadataImpl& operator=(const ListCacheMetadataImpl&) = delete;
+
+    /// The bytes this metadata holds: the object, and the room of the blocks
+    /// its query owns (its copy of the cache key, its filter values and its
+    /// cursor), counted with the page's entry.
+    [[nodiscard]] size_t memoryUsage() const {
+        return sizeof(*this) + relais::detail::heapBytes(query);
+    }
 };
 
 // =============================================================================

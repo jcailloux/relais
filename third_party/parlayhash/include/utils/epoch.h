@@ -43,6 +43,8 @@
 // ***************************
 
 #include <atomic>
+#include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <functional>
 #include <ostream>
@@ -73,6 +75,32 @@
 // ***************************
 
 namespace epoch {
+
+  // ***************************
+  // Memory accounting
+  // ***************************
+  //
+  // An application that counts the memory it holds gives a pool (and a
+  // parlay_hash its table) a ledger. They then report each change of the
+  // bytes they hold, as the room each block takes at the allocator. Without
+  // a ledger, nothing is reported.
+
+  // Where the bytes go, and the room a block takes.
+  struct memory_ledger {
+    void (*add)(int64_t bytes);  // + on allocation, - on release
+    size_t (*room)(size_t requested, const void* block);
+  };
+
+  // What a memory_pool<T> reports to `ledger`:
+  //   - each block it allocates, from the value's construction to its
+  //     destruction, at the bytes `weigh` gives it (the block's room, and what
+  //     the value owns);
+  //   - the array of each retire list, which keeps its capacity.
+  template <typename T>
+  struct pool_accounting {
+    const memory_ledger* ledger;
+    size_t (*weigh)(const T& value, const void* block, size_t block_size);
+  };
 
   namespace internal {
 
@@ -338,10 +366,35 @@ private:
     long epoch; // epoch on last retire, updated on a retire
     long retire_count; // number of retires so far, reset on updating the epoch
     epoch_s::state e_state;
+    // each list's array as last reported: its capacity, and its room
+    size_t old_capacity = 0, old_room = 0;
+    size_t current_capacity = 0, current_room = 0;
     old_current() : epoch(0), retire_count(0), e_state(0) {}
   };
 
   std::vector<old_current> pools;
+
+  // Set once, before the pool's first allocation, to constant data: a
+  // relaxed load sees either nothing or the whole of it.
+  std::atomic<const pool_accounting<T>*> accounting_{nullptr};
+
+  // Reports the block of `value` to the ledger, if any: +weight once the
+  // value is built, -weight before it is destroyed.
+  void report_block(const T& value, wrapper* w, int64_t sign) {
+    if (const pool_accounting<T>* a = accounting_.load(std::memory_order_relaxed))
+      a->ledger->add(sign * (int64_t) a->weigh(value, w, sizeof(wrapper)));
+  }
+
+  // The current list moved to a larger array: reports the change of room. A
+  // list never shrinks (clear keeps the capacity), so nothing else changes it.
+  void report_current_list(old_current& pid) {
+    pid.current_capacity = pid.current.capacity();
+    const pool_accounting<T>* a = accounting_.load(std::memory_order_relaxed);
+    if (a == nullptr) return;
+    size_t room = a->ledger->room(pid.current_capacity * sizeof(wrapper*), pid.current.data());
+    a->ledger->add((int64_t) room - (int64_t) pid.current_room);
+    pid.current_room = room;
+  }
 
   // values used to check for corruption or double delete
   static constexpr long default_val = 10;
@@ -356,6 +409,7 @@ private:
   // destructs entries on a list
   void clear_list(std::vector<wrapper*>& lst) {
     for (wrapper* w : lst) {
+      report_block(w->value, w, -1);
       w->value.~T();
       free_wrapper(w);
     }
@@ -368,6 +422,8 @@ private:
     if (pid.epoch + delay < current) {
       clear_list(pid.old);
       std::swap(pid.old, pid.current);
+      std::swap(pid.old_capacity, pid.current_capacity);
+      std::swap(pid.old_room, pid.current_room);
       pid.epoch = current;
     }
     // a heuristic
@@ -423,11 +479,19 @@ private:
   // for backwards compatibility
   void acquire(T* p) { }
 
+  // Reports the pool's memory to `a` from now on (see pool_accounting). Set
+  // before the pool's first allocation: a block allocated before is never
+  // reported, and its release would be.
+  void set_accounting(const pool_accounting<T>* a) {
+    accounting_.store(a, std::memory_order_relaxed);
+  }
+
   template <typename ... Args>
   T* New(Args&&... args) {
     wrapper* x = allocate_wrapper();
     T* newv = &x->value;
     new (newv) T(std::forward<Args>(args)...);
+    report_block(*newv, x, +1);
     return newv;
   }
 
@@ -445,10 +509,12 @@ private:
     advance_epoch(i, pid);
     wrapper* w = wrapper_from_value(p);
     pid.current.push_back(w);
+    if (pid.current.capacity() != pid.current_capacity) report_current_list(pid);
   }
 
   // destructs and frees the object immediately
   void Delete(T* p) {
+    report_block(*p, wrapper_from_value(p), -1);
     p->~T();
     free_wrapper(wrapper_from_value(p));
   }

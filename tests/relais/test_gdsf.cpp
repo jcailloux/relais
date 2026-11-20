@@ -1674,7 +1674,7 @@ TEST_CASE("Entry bytes - one count per entry, stored or recomputed",
         GDSFNoTTLRepo::purge();
         auto ghost = TestInternals::getGhostData<GDSFNoTTLRepo>(id);
         REQUIRE(ghost.has_value());
-        CHECK(ghost->estimated_bytes == Tier::scoredBytes(entry_bytes));
+        CHECK(ghost->estimated_bytes == Tier::scoredBytes(id, entry_bytes));
         resetRepos<GDSFNoTTLRepo>();
     }
 
@@ -1691,8 +1691,8 @@ TEST_CASE("Entry bytes - one count per entry, stored or recomputed",
 
         using Map = TestInternals::EntityMap<GDSFGhostRepo>;
         using Tier = TestInternals::EntityTier<GDSFGhostRepo>;
-        CHECK(ghost->estimated_bytes == Tier::scoredBytes(Map::entryBytes(*v)));
-        CHECK(ghost->estimated_bytes == Map::entryBytes(*v) + Map::kBucketSlotSize);
+        CHECK(ghost->estimated_bytes == Tier::scoredBytes(id, Map::entryBytes(*v)));
+        CHECK(ghost->estimated_bytes == Map::entryBytes(*v) + Map::slotBytes(id));
         // Before the entry exists, its pool block weighs the class of its size.
         CHECK(Map::entryBytes(*v)
               == blockBytes(Map::kEntryOverhead + sizeof(TestItemEntity)) + heapBytes(*v));

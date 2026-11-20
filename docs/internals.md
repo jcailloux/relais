@@ -1104,8 +1104,9 @@ jcailloux::relais::config::               # CacheConfig, CacheLevel, UpdateStrat
 jcailloux::relais::entity::               # set/setNull/increment/decrement/nowPlus, guards, ordering
 jcailloux::relais::entity::detail::       # MappedEnumCodec, patch SQL extractors
 jcailloux::relais::cache::                # CacheView, MultiView, MetricsSnapshot, GDSFPolicy
-jcailloux::relais::cache::detail::        # CacheTier, ChunkMap, CacheMetadata, TaggedEntry,
-                                          # PendingLane, ScoreHistogram, counters
+jcailloux::relais::cache::detail::        # CacheTier, ChunkMap, EntryLayout, L1Ledger,
+                                          # CacheMetadata, TaggedEntry, PendingLane,
+                                          # ScoreHistogram, counters
 jcailloux::relais::list::                 # ListWrapper, SortDirection, SortSpec
 jcailloux::relais::list::detail::         # ListCache, ListCacheTraits, ModificationTracker, Cursor
 jcailloux::relais::list::spec::           # Filter, Sort, ListQueryParams, ListQuery, seal,

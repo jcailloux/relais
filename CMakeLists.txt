@@ -340,6 +340,10 @@ if(RELAIS_BUILD_TESTS)
     # Sees the entry pool's malloc calls: linked with --wrap=malloc.
     relais_add_test(test_relais_entry_layout  tests/relais/test_entry_layout.cpp        LABELS "relais;gdsf")
     target_link_options(test_relais_entry_layout PRIVATE -Wl,--wrap=malloc)
+    # Follows every block of the process against the L1 ledger: linked with
+    # --wrap=malloc, --wrap=calloc and --wrap=free. No database.
+    relais_add_test(test_relais_ledger        tests/relais/test_ledger.cpp              DEFINITIONS RELAIS_BUILDING_TESTS "RELAIS_GDSF_ENABLED=1" LABELS "relais;gdsf;ledger")
+    target_link_options(test_relais_ledger PRIVATE -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=free)
     # An entry's weight is read from the allocator in use: the tests that check
     # it run again under jemalloc and mimalloc, preloaded, when installed. Not
     # in a sanitizer build, whose runtime must be the first library loaded.
@@ -359,6 +363,11 @@ if(RELAIS_BUILD_TESTS)
                 set_tests_properties(test_relais_entry_layout_${allocator} PROPERTIES
                     ENVIRONMENT "${preload}"
                     LABELS "relais;gdsf;allocator")
+                add_test(NAME test_relais_ledger_${allocator}
+                         COMMAND test_relais_ledger)
+                set_tests_properties(test_relais_ledger_${allocator} PROPERTIES
+                    ENVIRONMENT "${preload}"
+                    LABELS "relais;gdsf;ledger;allocator")
             endif()
         endforeach()
     endif()
@@ -558,6 +567,7 @@ if(RELAIS_BUILD_TESTS)
             test_relais_gdsf
             test_relais_gdsf_disabled
             test_relais_entry_layout
+            test_relais_ledger
         COMMENT "Build all relais integration tests"
     )
 

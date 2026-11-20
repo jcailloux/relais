@@ -70,9 +70,9 @@ namespace parlay {
     static constexpr auto get_value = [] (const value_type& kv) {return kv.second;};
 
     unordered_map_internal(long n = 0, bool clear_at_end = default_clear_at_end,
-                           typename map::MemoryHook memory_hook = nullptr)
+                           const epoch::memory_ledger* ledger = nullptr)
       : entries_(Entries(clear_at_end)),
-	m(map(n+1, &entries_, clear_at_end, memory_hook)) {}
+	m(map(n+1, &entries_, clear_at_end, ledger)) {}
 
     iterator begin() { return m.begin();}
     iterator end() { return m.end();}

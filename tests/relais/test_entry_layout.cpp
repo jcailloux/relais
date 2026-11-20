@@ -20,19 +20,24 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <string>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 #include <malloc.h>
 
 #include <jcailloux/relais/cache/CacheMetadata.h>
 #include <jcailloux/relais/cache/ChunkMap.h>
+#include <jcailloux/relais/cache/EntryLayout.h>
 
 #include "fixtures/TestAllocator.h"
 #include "fixtures/generated/TestItemEntity.h"
 
 using jcailloux::relais::cache::detail::CacheMetadata;
 using jcailloux::relais::cache::detail::ChunkMap;
+using jcailloux::relais::cache::detail::PoolBlock;
+using jcailloux::relais::cache::detail::TaggedEntry;
 using jcailloux::relais::detail::blockBytes;
 using TestItemEntity = ::entity::generated::TestItemEntity;
 
@@ -175,4 +180,30 @@ TEST_CASE("Entry layout - an entry weighs the room its block takes", "[entry-lay
         using Map = ChunkMap<int64_t, Triple, CacheMetadata<true, false>, true, true>;
         check(std::type_identity<Map>{}, Triple{});
     }
+}
+
+TEST_CASE("Entry layout - a key kept behind a pointer takes one more block, its node",
+          "[entry-layout]")
+{
+    // parlay keeps a key that is not trivially copyable in a node of its own:
+    // the key and the entry's tagged pointer, in a block of its node pool,
+    // with the pool's guard words. The node is allocated after the entry.
+    using Map = ChunkMap<std::string, TestItemEntity, CacheMetadata<true, false>, true, true>;
+    using Node = std::pair<std::string, TaggedEntry>;
+    STATIC_REQUIRE(Map::kIndirectKeys);
+    STATIC_REQUIRE(sizeof(PoolBlock<Node>) == sizeof(std::string) + sizeof(TaggedEntry) + kPoolGuards);
+
+    auto& map = mapOf<Map>();
+    (void)map.upsert(std::string("warm"), TestItemEntity{}, {});  // the table and the pools are set up
+    const std::string key = "k";                                  // short: the node's copy owns no heap
+    Mallocs mallocs;
+    mallocs.sizes.reserve(16);
+    mallocs.blocks.reserve(16);
+    tl_mallocs = &mallocs;
+    tl_recording = true;
+    (void)map.upsert(key, TestItemEntity{}, {});
+    tl_recording = false;
+    tl_mallocs = nullptr;
+    CHECK(mallocs.sizes == std::vector<size_t>{Map::kEntryOverhead + sizeof(TestItemEntity),
+                                               sizeof(PoolBlock<Node>)});
 }

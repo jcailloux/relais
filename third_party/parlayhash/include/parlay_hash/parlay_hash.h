@@ -85,19 +85,17 @@ struct parlay_hash {
   // for delayed reclamation of links using an epoch-based collector
   epoch::memory_pool<link>* link_pool;
 
-  // Memory accounting hook — called with +delta on allocation, -delta on deallocation.
-  // Allows the embedding application to track ParlayHash's internal memory usage
-  // (overflow links, bucket arrays) independently of user-managed entry lifetimes.
-  using MemoryHook = void(*)(int64_t);
-  MemoryHook memory_hook_ = nullptr;
+  // Memory accounting (see epoch::memory_ledger): when set, each table
+  // version reports the room its blocks take, from its allocation to its
+  // release. The links are reported by their pool, once the application
+  // gives it accounting (epoch::pool_accounting): a retired link still holds
+  // its block until the pool frees it.
+  const epoch::memory_ledger* ledger_ = nullptr;
 
   link* new_link(const Entry& entry, link* l) {
-    auto* node = link_pool->New(entry, l);
-    if (memory_hook_) memory_hook_(static_cast<int64_t>(sizeof(link)));
-    return node;
+    return link_pool->New(entry, l);
   }
   void retire_link(link* l) {
-    if (memory_hook_) memory_hook_(-static_cast<int64_t>(sizeof(link)));
     link_pool->Retire(l);
   }
 
@@ -347,8 +345,18 @@ struct parlay_hash {
     bucket* buckets; // sequence of buckets
     //sequence<bucket> buckets; // sequence of buckets
     std::atomic<status>* block_status; // status of each block while copying
-    MemoryHook memory_hook_ = nullptr;
+    const epoch::memory_ledger* ledger_ = nullptr;
     int64_t charged_bytes_ = 0;
+
+    // Reports this version's three blocks to the ledger, if any: its
+    // buckets, its block statuses, and itself (allocated by new).
+    void charge(size_t status_count) {
+      if (ledger_ == nullptr) return;
+      charged_bytes_ = (int64_t) (ledger_->room(sizeof(bucket) * size, buckets)
+          + ledger_->room(sizeof(std::atomic<status>) * status_count, block_status)
+          + ledger_->room(sizeof(table_version), this));
+      ledger_->add(charged_bytes_);
+    }
 
     // The index of a key is the highest num_bits of the lowest
     // 48-bits of the hash value.  Using the highest num_bits ensures
@@ -362,7 +370,7 @@ struct parlay_hash {
       return &buckets[get_index(k)].v; }
 
     // initial table version, n indicating size
-    table_version(long n, MemoryHook hook = nullptr)
+    table_version(long n, const epoch::memory_ledger* ledger = nullptr)
       : next(nullptr),
 	finished_block_count(0),
 	num_bits(std::max<long>((long) std::ceil(std::log2(min_block_size-1)),
@@ -370,14 +378,12 @@ struct parlay_hash {
 	size(1ul << num_bits),
 	block_size(num_bits < 10 ? min_block_size : get_block_size(num_bits)),
 	overflow_size(get_overflow_size(num_bits)),
-	memory_hook_(hook)
+	ledger_(ledger)
     {
       //if (PrintGrow) std::cout << "initial size: " << size << std::endl;
       buckets = (bucket*) malloc(sizeof(bucket)*size);
       block_status = (std::atomic<status>*) malloc(sizeof(std::atomic<status>) * size/block_size);
-      charged_bytes_ = static_cast<int64_t>(sizeof(bucket)*size
-          + sizeof(std::atomic<status>) * size/block_size);
-      if (memory_hook_) memory_hook_(charged_bytes_);
+      charge(size/block_size);
       parallel_for(size, [&] (long i) { initialize(buckets[i]);});
       parallel_for(size/block_size, [&] (long i) { block_status[i] = Empty;});
     }
@@ -390,20 +396,18 @@ struct parlay_hash {
 	size(t->size * grow_factor),
 	block_size(get_block_size(num_bits)),
 	overflow_size(get_overflow_size(num_bits)),
-	memory_hook_(t->memory_hook_)
+	ledger_(t->ledger_)
     {
       buckets = (bucket*) malloc(sizeof(bucket)*size);
       std::memset(buckets, 0, sizeof(bucket)*size);
       block_status = (std::atomic<status>*) malloc(sizeof(std::atomic<status>) * size/min_block_size);
-      charged_bytes_ = static_cast<int64_t>(sizeof(bucket)*size
-          + sizeof(std::atomic<status>) * size/min_block_size);
-      if (memory_hook_) memory_hook_(charged_bytes_);
+      charge(size/min_block_size);
       for (long i = 0; i < size/min_block_size; i++)
         block_status[i] = Empty;
     }
 
     ~table_version() {
-      if (memory_hook_) memory_hook_(-charged_bytes_);
+      if (ledger_) ledger_->add(-charged_bytes_);
       free(buckets);
       free(block_status);
     }
@@ -590,7 +594,7 @@ struct parlay_hash {
     }
     // reinitialize
     if (reinitialize) {
-      current_table_version = new table_version(1, memory_hook_);
+      current_table_version = new table_version(1, ledger_);
       initial_table_version = current_table_version;
     }
   }
@@ -600,11 +604,11 @@ struct parlay_hash {
   // Creates initial table version for the given size.  The
   // clear_at_end allows to free up the epoch-based collector's
   // memory, and the scheduler.
-  // memory_hook: optional callback for tracking internal allocations.
+  // ledger: optional accounting of the table's memory (see ledger_).
   parlay_hash(long n, Entries* entries, bool clear_at_end = default_clear_at_end,
-              MemoryHook memory_hook = nullptr)
+              const epoch::memory_ledger* ledger = nullptr)
     : entries_(entries),
-      memory_hook_(memory_hook),
+      ledger_(ledger),
       clear_memory_and_scheduler_at_end(clear_at_end),
       sched_ref(clear_at_end ?
 		new parlay::scheduler_type(std::thread::hardware_concurrency()) :
@@ -612,7 +616,7 @@ struct parlay_hash {
       link_pool(clear_at_end ?
 		new epoch::memory_pool<link>() :
 		&epoch::get_default_pool<link>()),
-      current_table_version(new table_version(n, memory_hook)),
+      current_table_version(new table_version(n, ledger)),
       initial_table_version(current_table_version.load())
   { }
 

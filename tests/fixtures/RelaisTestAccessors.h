@@ -310,6 +310,17 @@ struct TestInternals {
         cache.pool_.clear();
     }
 
+    /// Free every retired block of a map's pools, from every thread's retire
+    /// list: its entries, parlay's links and, for keys kept behind a pointer,
+    /// its nodes (pools shared by the maps of one key type). Only safe while no
+    /// thread reads a map of that key type.
+    template<typename Map>
+    static void freeRetired(Map& map) {
+        map.pool_.clear();
+        map.map_.m.link_pool->clear();
+        if constexpr (Map::kIndirectKeys) map.map_.entries_.data_pool->clear();
+    }
+
     /// Read the chunk_id for a cached list entry (for bitmap skip testing).
     /// Computed by ChunkMap from the key (deterministic). Returns nullopt if not in cache.
     template<typename Repo>
@@ -466,7 +477,7 @@ struct TestInternals {
         if constexpr (requires { meta.access_count; }) {
             using TierType = std::remove_reference_t<decltype(Repo::tier())>;
             float avg_cost = Repo::avgConstructionTime();
-            return meta.computeScore(avg_cost, TierType::scoredBytes(ce->bytes()));
+            return meta.computeScore(avg_cost, TierType::scoredBytes(key, ce->bytes()));
         } else {
             return 0.0f;
         }
@@ -513,16 +524,6 @@ struct TestInternals {
     template<typename Repo>
     static void seedAvgConstructionTime(float us) {
         Repo::tier().avg_cost_us_.store(us, std::memory_order_relaxed);
-    }
-
-    /// Bucket slot size in bytes for a specific repo.
-    /// Ghost entries no longer carry a charge — the bucket slot is tracked
-    /// by the ParlayHash memory hook. This constant is exposed for test
-    /// assertions on histogram entries and score denominators.
-    template<typename Repo>
-    static constexpr size_t bucketSlotSize() {
-        using TierType = std::remove_reference_t<decltype(Repo::tier())>;
-        return TierType::kBucketSlotSize;
     }
 
 private:

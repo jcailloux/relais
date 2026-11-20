@@ -9,6 +9,7 @@
 #include <vector>
 #include <glaze/glaze.hpp>
 
+#include "jcailloux/relais/HeapBytes.h"
 #include "jcailloux/relais/list/SortDirection.h"
 
 namespace jcailloux::relais::list {
@@ -36,6 +37,12 @@ struct Cursor {
 
     [[nodiscard]] bool empty() const noexcept { return data.empty(); }
     [[nodiscard]] size_t size() const noexcept { return data.size(); }
+
+    /// The bytes this cursor holds: the object, and its bytes' array. Its
+    /// glz::meta encodes it, so heapBytes reads its heap from here.
+    [[nodiscard]] size_t memoryUsage() const {
+        return sizeof(*this) + relais::detail::heapBytes(data);
+    }
 
     [[nodiscard]] std::string encode() const {
         if (data.empty()) return "";

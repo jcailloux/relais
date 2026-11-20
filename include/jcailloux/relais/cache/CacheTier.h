@@ -65,7 +65,8 @@ concept Expirable = requires(const M& m, uint32_t now_sec) {
 //   - GDSFAware<Metadata>      → ghost entries, admission control, GDSF scoring
 //   - Expirable<Metadata>      → TTL expiration checks
 //
-// With GDSF, an entry is counted in bytes by Map::entryBytes (see ChunkMap).
+// With GDSF, an entry is counted in bytes (see EntryLayout), and every block
+// the L1 holds reported to the L1 ledger (see L1Ledger).
 //
 
 template<typename Key, typename Value, typename Metadata>
@@ -78,14 +79,12 @@ public:
 
     using Map = ChunkMap<Key, Value, Metadata, kHasGhosts, /*CountsBytes=*/kHasGDSF>;
 
-    /// Bytes a key takes in the table, beside its entry (see ChunkMap).
-    static constexpr size_t kBucketSlotSize = Map::kBucketSlotSize;
-
     /// The bytes an entry costs the cache, the denominator of its score: the
-    /// entry and its slot in the table. A value is weighed the same when it is
-    /// admitted, when it is swept, and when it waits as a ghost.
-    [[nodiscard]] static size_t scoredBytes(size_t entry_bytes) {
-        return entry_bytes + kBucketSlotSize;
+    /// entry, and what its key costs the table (Map::slotBytes). A value is
+    /// weighed the same when it is admitted, when it is swept, and when it
+    /// waits as a ghost.
+    [[nodiscard]] static size_t scoredBytes(const Key& key, size_t entry_bytes) {
+        return entry_bytes + Map::slotBytes(key);
     }
 
     // =========================================================================
@@ -684,7 +683,7 @@ private:
             auto& policy = GDSFPolicy::instance();
 
             // What the entry would cost (independent of ghost lookup)
-            uint32_t est_bytes = saturate32(scoredBytes(Map::entryBytes(*opt)));
+            uint32_t est_bytes = saturate32(scoredBytes(key, Map::entryBytes(*opt)));
             uint8_t est_flags = 0;
 
             // Lookup existing ghost — scoped to release EpochGuard before
@@ -789,12 +788,12 @@ private:
 
             // Score
             size_t entry_bytes = entry.bytes();
-            size_t scored = scoredBytes(entry_bytes);
+            size_t scored = scoredBytes(key, entry_bytes);
             float avg_cost = avg_cost_us_.load(std::memory_order_relaxed);
             float score = gdsf.computeScore(avg_cost, scored);
 
-            // Histogram: what evicting the entry frees. Its slot in the table
-            // stays, taken by a ghost or left in the bucket array.
+            // Histogram: what evicting the entry frees. Its key stays in the
+            // table, as a ghost or a free slot of the bucket array.
             GDSFPolicy::instance().recordEntry(score, entry_bytes);
 
             // TTL
@@ -827,7 +826,7 @@ private:
         uint32_t decayed = static_cast<uint32_t>(
             static_cast<float>(count) * dr);
         if (decayed == 0) {
-            GDSFPolicy::instance().recordEntry(0.0f, kBucketSlotSize);
+            GDSFPolicy::instance().recordEntry(0.0f, Map::slotBytes(key));
             return true;
         }
         if (ctx.ghost_decays) {
