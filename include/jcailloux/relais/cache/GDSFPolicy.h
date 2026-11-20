@@ -339,13 +339,33 @@ public:
     /// lets it go before its next sweep. Returns the entries removed.
     size_t sweepEveryChunk(size_t (*sweep_fn)(long chunk_id)) {
         auto exclusion = lockForPass();
-        size_t removed = 0;
-        for (long chunk_id = 0; chunk_id < config_.chunk_count; ++chunk_id) {
-            removed += sweep_fn(chunk_id);
+        return passLocked(sweep_fn);
+    }
+
+    /// Asks the maintenance thread for the forced pass of `sweep_fn` (see
+    /// sweepEveryChunk) and returns: the caller never waits for a sweep. A
+    /// request made while the pass of `sweep_fn` is queued asks for nothing
+    /// more; the thread takes the pass off the queue as it starts it, so a
+    /// request made during the pass asks for another, which sees what the
+    /// first one missed. The passes asked for go before the next sweep. None
+    /// is served once the thread is stopped.
+    /// Cost: a lock, a look over the queue (one slot per repo at most), and,
+    /// unless merged, a push, an increment and a notify.
+    void requestPass(size_t (*sweep_fn)(long chunk_id)) {
+        {
+            // The pass sees what was written before the request: the thread
+            // takes it under this lock.
+            std::lock_guard lock(passes_mu_);
+            if (std::find(pass_queue_.begin(), pass_queue_.end(), sweep_fn)
+                    != pass_queue_.end()) {
+                return;
+            }
+            pass_queue_.push_back(sweep_fn);
+            // Under passes_mu_: a pass in the queue is counted in requested_
+            // (see serveSweeps).
+            requested_.fetch_add(1, std::memory_order_release);
         }
-        // As a sweep ends: what the pass freed is seen by isOverBudget() at once.
-        refreshHeldBytes();
-        return removed;
+        requested_.notify_one();
     }
 
 #if RELAIS_ENABLE_METRICS
@@ -459,10 +479,25 @@ private:
         maintenance_ = std::jthread([this](std::stop_token stop) { serveSweeps(stop); });
     }
 
-    /// The maintenance thread: one global sweep per request, until stopped.
-    /// More than a cycle behind (a sweep per chunk), it drops the oldest
-    /// requests: each chunk is still swept once per cycle of ticks, and the
-    /// delay never exceeds one cycle.
+    /// The forced pass: sweep_fn on every chunk. The caller holds sweep_mu_.
+    size_t passLocked(size_t (*sweep_fn)(long chunk_id)) {
+        size_t removed = 0;
+        for (long chunk_id = 0; chunk_id < config_.chunk_count; ++chunk_id) {
+            removed += sweep_fn(chunk_id);
+        }
+        // As a sweep ends: what the pass freed is seen by isOverBudget() at once.
+        refreshHeldBytes();
+        return removed;
+    }
+
+    /// The maintenance thread, until stopped: the passes asked for (see
+    /// requestPass), then one global sweep per request. More than a cycle of
+    /// sweeps behind (a sweep per chunk), it drops the oldest requests: each
+    /// chunk is still swept once per cycle of ticks, and the delay never
+    /// exceeds one cycle.
+    ///
+    /// requested_ counts the sweeps and the passes asked for, served_ those
+    /// served: with no pass queued, their difference is the sweeps due.
     void serveSweeps(const std::stop_token& stop) {
         runtime::detail::nameThisThread("relais-sweep");
         // Holds parlay's pool of thread ids until the thread ends.
@@ -477,18 +512,38 @@ private:
             yieldToPasses();
             std::lock_guard exclusion(sweep_mu_);
             uint32_t served = served_.load(std::memory_order_relaxed);
-            const uint32_t due = requested_.load(std::memory_order_acquire);
-            if (due == served) continue;  // a reset dropped them
-            const auto cycle = static_cast<uint32_t>(config_.chunk_count);
-            if (due - served > cycle) served = due - cycle;
-            try {
-                sweepLocked();
-            } catch (...) {
-                // A sweep that fails (an allocation) is dropped, and the next
-                // one starts over: the thread must not end.
-                logSweepFailure();
+            size_t (*pass)(long) = nullptr;
+            uint32_t due;
+            {
+                std::lock_guard lock(passes_mu_);
+                if (!pass_queue_.empty()) {
+                    // Off the queue as it starts: a request from now on asks
+                    // for another pass.
+                    pass = pass_queue_.front();
+                    pass_queue_.erase(pass_queue_.begin());
+                }
+                due = requested_.load(std::memory_order_acquire);
             }
-            // Release: a thread that waits for this sweep sees its effects.
+            if (pass) {
+                try {
+                    (void)passLocked(pass);
+                } catch (...) {
+                    logSweepFailure("a requested sweep pass");
+                }
+            } else {
+                if (due == served) continue;  // a reset dropped them
+                const auto cycle = static_cast<uint32_t>(config_.chunk_count);
+                if (due - served > cycle) served = due - cycle;
+                try {
+                    sweepLocked();
+                } catch (...) {
+                    // A sweep that fails (an allocation) is dropped, and the
+                    // next one starts over: the thread must not end.
+                    logSweepFailure("a maintenance sweep");
+                }
+            }
+            // Release: a thread that waits for this sweep or pass sees its
+            // effects.
             served_.store(served + 1, std::memory_order_release);
             served_.notify_all();
         }
@@ -520,14 +575,14 @@ private:
 
     /// Called in a catch handler, on the maintenance thread. Logging may
     /// allocate: it never throws out of here.
-    static void logSweepFailure() noexcept {
+    static void logSweepFailure(const char* what) noexcept {
         try {
             try {
                 throw;
             } catch (const std::exception& e) {
-                RELAIS_LOG_ERROR << "relais: a maintenance sweep failed: " << e.what();
+                RELAIS_LOG_ERROR << "relais: " << what << " failed: " << e.what();
             } catch (...) {
-                RELAIS_LOG_ERROR << "relais: a maintenance sweep failed";
+                RELAIS_LOG_ERROR << "relais: " << what << " failed";
             }
         } catch (...) {}
     }
@@ -542,7 +597,7 @@ private:
     }
 
     /// Reset all global state for test isolation, between two sweeps. The
-    /// requests not served yet are dropped: none is pending after it.
+    /// sweeps and passes not served yet are dropped: none is pending after it.
     void reset() {
         auto exclusion = lockForPass();
         cached_threshold_.store(0.0f, std::memory_order_relaxed);
@@ -556,7 +611,11 @@ private:
 #if RELAIS_ENABLE_METRICS
         sweep_counters_.reset();
 #endif
-        served_.store(requested_.load(std::memory_order_relaxed), std::memory_order_release);
+        {
+            std::lock_guard lock(passes_mu_);
+            pass_queue_.clear();
+            served_.store(requested_.load(std::memory_order_relaxed), std::memory_order_release);
+        }
         served_.notify_all();
         // Registry and max_memory_ intentionally NOT cleared.
     }
@@ -596,10 +655,15 @@ private:
     // Forced passes waiting for sweep_mu_ (see lockForPass).
     std::atomic<uint32_t> passes_waiting_{0};
 
-    // Global sweeps requested by the ticks, and served by the maintenance
-    // thread. served_ changes under sweep_mu_ only.
+    // Global sweeps requested by the ticks, and passes by requestPass, served
+    // by the maintenance thread. served_ changes under sweep_mu_ only.
     std::atomic<uint32_t> requested_{0};
     std::atomic<uint32_t> served_{0};
+
+    // The passes asked for and not started, oldest first; one per sweep_fn at
+    // most. A push and its increment of requested_ are made under passes_mu_.
+    std::mutex passes_mu_;
+    std::vector<size_t (*)(long chunk_id)> pass_queue_;
 
     // The maintenance thread. The policy is never destroyed: the thread is
     // stopped by stopMaintenance() only.
@@ -617,8 +681,8 @@ public:
     /// Reset all global state for test isolation (test-only).
     void resetForTesting() { reset(); }
 
-    /// Waits until the maintenance thread has served the sweeps requested
-    /// before the call; at once if it does not run (test-only).
+    /// Waits until the maintenance thread has served the sweeps and the passes
+    /// requested before the call; at once if it does not run (test-only).
     void awaitSweeps() {
         const uint32_t due = requested_.load(std::memory_order_relaxed);
         {

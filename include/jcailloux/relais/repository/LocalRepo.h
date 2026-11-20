@@ -419,9 +419,24 @@ public:
         return tier().sweepChunk(chunk_id, noExtraPred).removed;
     }
 
-    /// Forced pass of the sweep over every chunk (GDSFPolicy::sweepEveryChunk):
-    /// removes what a sweep removes, no more. Waits for the sweep in progress.
-    /// Returns the entries removed.
+    /// Asks the maintenance thread for a forced pass of the sweep over every
+    /// chunk, and returns at once (GDSFPolicy::requestPass). The pass removes
+    /// what a sweep removes, no more. The requests made before it starts are
+    /// served by it; one made during it asks for another.
+    static void sweepAll() {
+        if constexpr (Tier::kHasCleanup) {
+            // Built here, not on the maintenance thread; enrolling the first
+            // tier starts that thread.
+            (void)tier();
+            cache::GDSFPolicy::instance().requestPass(&sweep);
+        }
+    }
+
+    /// The pass of sweepAll(), on the calling thread
+    /// (GDSFPolicy::sweepEveryChunk): it waits for the sweep in progress, then
+    /// pays for its own pass. Returns the entries removed. Removed in 5.0.
+    [[deprecated("use sweepAll(): purge() blocks the caller for a full sweep pass, "
+                 "and does not empty the cache")]]
     static size_t purge() {
         if constexpr (!Tier::kHasCleanup) {
             return 0;

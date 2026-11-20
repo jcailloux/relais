@@ -642,11 +642,6 @@ size_t getCacheSize() {
     return Repo::size();
 }
 
-template<typename Repo>
-void forcePurge() {
-    Repo::purge();
-}
-
 /// Waits for the sweeps the maintenance thread was asked for, then runs one
 /// global sweep on the calling thread.
 template<typename Repo>
@@ -654,9 +649,26 @@ void trySweep() {
     jcailloux::relais::cache::GDSFPolicy::instance().sweepNow();
 }
 
-/// Waits until the maintenance thread has served the sweeps requested so far.
+/// Waits until the maintenance thread has served the sweeps and the passes
+/// requested so far.
 inline void awaitSweeps() {
     jcailloux::relais::cache::GDSFPolicy::instance().awaitSweeps();
+}
+
+/// Asks for a full sweep pass of Repo (sweepAll) and waits until it is served.
+template<typename Repo>
+void sweepAllAndWait() {
+    Repo::sweepAll();
+    awaitSweeps();
+}
+
+/// purge(), deprecated: for the tests of purge() itself.
+template<typename Repo>
+size_t purgeDeprecated() {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+    return Repo::purge();
+#pragma GCC diagnostic pop
 }
 
 } // namespace relais_test

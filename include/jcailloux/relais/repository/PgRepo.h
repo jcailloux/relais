@@ -488,12 +488,18 @@ public:
     // L1 maintenance — neutral without an L1 tier
     // =====================================================================
     // LocalRepo hides these with the real L1 operations; without L1 there is
-    // nothing to count, purge or prime, so the API stays the same on every preset.
+    // nothing to count, sweep or prime, so the API stays the same on every preset.
 
     /// Number of L1 entries: always 0 without L1.
     [[nodiscard]] static constexpr size_t size() noexcept { return 0; }
 
-    /// Purge every L1 entry: nothing to purge without L1, returns 0.
+    /// Ask for a full sweep pass: nothing to sweep without L1.
+    static constexpr void sweepAll() noexcept {}
+
+    /// Deprecated, as on L1 (see LocalRepo::purge): nothing to sweep without
+    /// L1, returns 0. Removed in 5.0.
+    [[deprecated("use sweepAll(): purge() blocks the caller for a full sweep pass, "
+                 "and does not empty the cache")]]
     static constexpr size_t purge() noexcept { return 0; }
 
     /// Prime the L1 cache: no-op without L1.

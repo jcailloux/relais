@@ -25,6 +25,10 @@
 
 using namespace relais_test;
 
+// purge() is deprecated and stays in the API until 5.0: its signature is still
+// checked here.
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+
 // Detects whether a full UPDATE ... SET is generated for an entity. The
 // generator suppresses toUpdateParams (and SQL::update) when there is no
 // updatable column, so this is false for read-only views and all-PK junctions.
@@ -102,6 +106,10 @@ TEST_CASE("LocalRepo features", "[repository][compile][cached]") {
         REQUIRE(size == 0);  // empty at start
     }
 
+    SECTION("sweepAll") {
+        L1TestItemRepo::sweepAll();  // asks for a pass, returns
+    }
+
     SECTION("purge") {
         auto erased = L1TestItemRepo::purge();
         REQUIRE(erased == 0);  // empty cache
@@ -119,10 +127,12 @@ TEST_CASE("LocalRepo features", "[repository][compile][cached]") {
 TEMPLATE_TEST_CASE("L1 maintenance without L1 is neutral", "[repository][compile][maintenance]",
                    UncachedTestItemRepo, UncachedTestArticleRepo) {
     STATIC_REQUIRE(std::is_same_v<decltype(TestType::size()), size_t>);
+    STATIC_REQUIRE(std::is_same_v<decltype(TestType::sweepAll()), void>);
     STATIC_REQUIRE(std::is_same_v<decltype(TestType::purge()), size_t>);
     STATIC_REQUIRE(std::is_same_v<decltype(TestType::warmup()), void>);
 
     REQUIRE(TestType::size() == 0);
+    TestType::sweepAll();
     REQUIRE(TestType::purge() == 0);
     TestType::warmup();
     REQUIRE(TestType::size() == 0);
@@ -348,6 +358,7 @@ auto apiSignatures(const K& key, const E& ent, std::span<const K> ids) {
         Sig<"invalidate", decltype(R::invalidate(key))>,
         Sig<"invalidateMany", decltype(R::invalidateMany(ids))>,
         Sig<"size", decltype(R::size())>,
+        Sig<"sweepAll", decltype(R::sweepAll())>,
         Sig<"purge", decltype(R::purge())>,
         Sig<"warmup", decltype(R::warmup())>>{};
 
@@ -457,6 +468,7 @@ jr::io::Task<void> exerciseApi() {
     co_await R::invalidate(key);
     co_await R::invalidateMany(ids);
     (void)R::size();
+    R::sweepAll();
     (void)R::purge();
     R::warmup();
 

@@ -6,7 +6,7 @@
  *
  * Covers:
  *   1. Access count tracking   — find() bumps access_count by kCountScale
- *   2. Decay in cleanup        — purge() applies decay_rate to access_count
+ *   2. Decay in cleanup        — a sweep pass applies decay_rate to access_count
  *   3. Eviction decisions      — histogram-based threshold eviction
  *   4. Avg construction time   — EMA convergence
  *   5. Optional TTL            — TTL-based vs score-only eviction
@@ -19,7 +19,7 @@
  *  17. Eviction selectivity    — hot/cold, score formula
  *  19. Cross-repo sweep coordination
  * 19b. Budget                  — bounds the bytes the L1 holds, not the process
- * 19c. purge()                 — a forced pass, excluded from a concurrent sweep
+ * 19c. sweepAll() and purge()  — a forced pass, excluded from a concurrent sweep
  *  20. Entry bytes             — the room an entry takes, stored or recomputed;
  *                                 the room a block takes, read from the allocator
  */
@@ -237,7 +237,7 @@ TEST_CASE("GDSF - decay in cleanup",
     TransactionGuard tx;
     resetRepos<GDSFItemRepo>();
 
-    SECTION("[decay] purge() applies decay_rate to access_count") {
+    SECTION("[decay] a sweep pass applies decay_rate to access_count") {
         auto id = insertTestItem("decay_item", 10);
 
         // Populate + 10 cache hits
@@ -248,8 +248,8 @@ TEST_CASE("GDSF - decay in cleanup",
         uint32_t count_before = meta0->access_count;
         REQUIRE(count_before == 11 * GDSFScoreData::kCountScale);
 
-        // purge() applies inline decay: access_count *= decay_rate
-        GDSFItemRepo::purge();
+        // The pass applies inline decay: access_count *= decay_rate
+        sweepAllAndWait<GDSFItemRepo>();
 
         auto meta1 = TestInternals::getEntityGDSFMetadata<GDSFItemRepo>(id);
         REQUIRE(meta1.has_value());  // should survive (threshold = 0 on first sweep)
@@ -259,7 +259,7 @@ TEST_CASE("GDSF - decay in cleanup",
         REQUIRE(meta1->access_count == expected);
     }
 
-    SECTION("[decay] multiple purge cycles compound decay") {
+    SECTION("[decay] multiple sweep passes compound decay") {
         auto id = insertTestItem("multi_decay", 10);
 
         sync(GDSFItemRepo::find(id));
@@ -273,7 +273,7 @@ TEST_CASE("GDSF - decay in cleanup",
 
         // Apply 3 cleanup cycles
         for (int i = 0; i < 3; ++i) {
-            GDSFItemRepo::purge();
+            sweepAllAndWait<GDSFItemRepo>();
         }
 
         auto meta3 = TestInternals::getEntityGDSFMetadata<GDSFItemRepo>(id);
@@ -318,11 +318,11 @@ TEST_CASE("GDSF - eviction decisions",
         REQUIRE(score_high.has_value());
         REQUIRE(*score_high > *score_low);
 
-        // Set threshold between the two scores → purge evicts low, keeps high
+        // Set threshold between the two scores → the pass evicts low, keeps high
         float midpoint = (*score_low + *score_high) / 2.0f;
         TestInternals::setThreshold(midpoint);
 
-        GDSFItemRepo::purge();
+        sweepAllAndWait<GDSFItemRepo>();
 
         auto high_meta = TestInternals::getEntityGDSFMetadata<GDSFItemRepo>(id_high);
         REQUIRE(high_meta.has_value());
@@ -349,8 +349,8 @@ TEST_CASE("GDSF - eviction decisions",
         REQUIRE(before == 5);
 
         // Threshold defaults to 0 → nothing evicted
-        GDSFItemRepo::purge();
-        GDSFItemRepo::purge();
+        sweepAllAndWait<GDSFItemRepo>();
+        sweepAllAndWait<GDSFItemRepo>();
 
         size_t after = GDSFItemRepo::size();
         REQUIRE(after == before);
@@ -420,7 +420,7 @@ TEST_CASE("GDSF - optional TTL",
         waitForExpiration(std::chrono::milliseconds{2200});
 
         // Cleanup should evict despite high access count
-        GDSFShortTTLRepo::purge();
+        sweepAllAndWait<GDSFShortTTLRepo>();
 
         REQUIRE(GDSFShortTTLRepo::size() == 0);
     }
@@ -436,8 +436,8 @@ TEST_CASE("GDSF - optional TTL",
 
         // Cleanup: score-based only, no TTL eviction.
         // No memory pressure -> threshold = 0 -> no eviction
-        GDSFNoTTLRepo::purge();
-        GDSFNoTTLRepo::purge();
+        sweepAllAndWait<GDSFNoTTLRepo>();
+        sweepAllAndWait<GDSFNoTTLRepo>();
 
         // Entry should survive (high access count, no TTL, no memory pressure)
         REQUIRE(GDSFNoTTLRepo::size() == 1);
@@ -702,8 +702,8 @@ TEST_CASE("GDSF - ghost decay and suppression",
         REQUIRE(before.has_value());
         REQUIRE(before->access_count == GDSFScoreData::kCountScale);
 
-        // purge() applies ghostCleanupPredicate which decays
-        GDSFGhostRepo::purge();
+        // The pass applies ghostCleanupPredicate, which decays
+        sweepAllAndWait<GDSFGhostRepo>();
 
         auto after = TestInternals::getGhostData<GDSFGhostRepo>(id);
         REQUIRE(after.has_value());
@@ -719,7 +719,7 @@ TEST_CASE("GDSF - ghost decay and suppression",
         // Decay until counter reaches 0 (~16 iterations for kCountScale=16, dr=0.95)
         int iterations = 0;
         while (TestInternals::isGhostEntry<GDSFGhostRepo>(id)) {
-            GDSFGhostRepo::purge();
+            sweepAllAndWait<GDSFGhostRepo>();
             ++iterations;
             if (iterations > 100) break;  // safety
         }
@@ -728,14 +728,14 @@ TEST_CASE("GDSF - ghost decay and suppression",
         REQUIRE(iterations <= 20);  // 16 × 0.95^N → 0 in ~16 steps
     }
 
-    SECTION("[ghost-decay] ghost removed after full decay via purge") {
+    SECTION("[ghost-decay] ghost removed after full decay via sweep passes") {
         auto id = insertTestItem("ghost_decay_purge", 10);
         sync(GDSFGhostRepo::find(id));
         REQUIRE(TestInternals::isGhostEntry<GDSFGhostRepo>(id));
 
-        // Decay to 0 via purges
+        // Decay to 0 via sweep passes
         while (TestInternals::isGhostEntry<GDSFGhostRepo>(id)) {
-            GDSFGhostRepo::purge();
+            sweepAllAndWait<GDSFGhostRepo>();
         }
 
         REQUIRE_FALSE(TestInternals::isGhostEntry<GDSFGhostRepo>(id));
@@ -877,13 +877,13 @@ TEST_CASE("GDSF - eviction selectivity",
         REQUIRE(score_cold.has_value());
         REQUIRE(*score_hot > *score_cold);
 
-        // Set threshold between cold and hot scores → purge evicts cold only.
+        // Set threshold between cold and hot scores → the pass evicts cold only.
         // This directly tests GDSF selectivity without depending on the
         // eviction curve or the iterative sweep loop.
         float midpoint = (*score_cold + *score_hot) / 2.0f;
         TestInternals::setThreshold(midpoint);
 
-        GDSFPressureRepo::purge();
+        sweepAllAndWait<GDSFPressureRepo>();
 
         // Hot entry should survive (score > threshold)
         auto hot_meta = TestInternals::getEntityGDSFMetadata<GDSFPressureRepo>(hot_id);
@@ -971,13 +971,13 @@ TEST_CASE("GDSF - cross-repo sweep coordination",
             REQUIRE(meta->access_count == 11 * GDSFScoreData::kCountScale);
         }
 
-        // Global sweep (sweeps 1 chunk per repo) + purge (covers all chunks)
+        // Global sweep (sweeps 1 chunk per repo) + a pass (covers all chunks)
         policy.sweepNow();
-        GDSFCoordRepo1::purge();
-        GDSFCoordRepo2::purge();
+        sweepAllAndWait<GDSFCoordRepo1>();
+        sweepAllAndWait<GDSFCoordRepo2>();
 
         // Verify decay happened in BOTH repos
-        // After sweep + purge: entries decayed 1-2× (depending on chunk overlap)
+        // After sweep + pass: entries decayed 1-2× (depending on chunk overlap)
         for (auto id : ids1) {
             auto meta = TestInternals::getEntityGDSFMetadata<GDSFCoordRepo1>(id);
             REQUIRE(meta.has_value());
@@ -1117,15 +1117,17 @@ TEST_CASE("GDSF - the budget bounds the bytes the L1 holds, not the process",
 
 // #############################################################################
 //
-//  19c. GDSF - purge() is excluded from a concurrent sweep
+//  19c. GDSF - a forced pass is excluded from a concurrent sweep
 //
 // #############################################################################
 //
-// purge() sweeps every chunk and writes the histogram the global sweep builds.
-// Run under TSan, a purge that ran alongside a sweep reports the race.
+// A forced pass sweeps every chunk and writes the histogram the global sweep
+// builds: sweepAll() asks the maintenance thread for it, purge() runs it on the
+// calling thread. Run under TSan, a pass that ran alongside a sweep reports the
+// race.
 
-TEST_CASE("GDSF - purge is a forced pass, excluded from a concurrent sweep",
-          "[integration][db][gdsf][purge][tsan]")
+TEST_CASE("GDSF - a forced pass is excluded from a concurrent sweep",
+          "[integration][db][gdsf][purge][sweep-all][tsan]")
 {
     TransactionGuard tx;
     resetAllTestRepos();
@@ -1138,21 +1140,37 @@ TEST_CASE("GDSF - purge is a forced pass, excluded from a concurrent sweep",
     }
     REQUIRE(GDSFItemRepo::size() == ids.size());
 
+    // Sweeps spaced as ticks space them: a pass waiting for one gets its turn.
+    std::atomic<bool> stop{false};
+    auto sweeper = [&] {
+        while (!stop.load(std::memory_order_relaxed)) {
+            policy.sweepNow();
+            std::this_thread::sleep_for(std::chrono::microseconds{20});
+        }
+    };
+
     SECTION("[purge] run alongside sweeps, it waits for each") {
-        // Sweeps spaced as ticks space them: a pass waiting for one gets its turn.
-        std::atomic<bool> stop{false};
-        std::thread sweeper([&] {
-            while (!stop.load(std::memory_order_relaxed)) {
-                policy.sweepNow();
-                std::this_thread::sleep_for(std::chrono::microseconds{20});
-            }
-        });
-        for (int i = 0; i < 100; ++i) (void)GDSFItemRepo::purge();
+        std::thread sweeping(sweeper);
+        for (int i = 0; i < 100; ++i) (void)purgeDeprecated<GDSFItemRepo>();
         stop.store(true, std::memory_order_relaxed);
-        sweeper.join();
+        sweeping.join();
 
         // Under the budget the threshold stays 0: passes and sweeps age the
         // counts, and evict nothing.
+        CHECK(policy.threshold() == 0.0f);
+        CHECK(GDSFItemRepo::size() == ids.size());
+    }
+
+    SECTION("[sweep-all] its passes run alongside sweeps, one at a time") {
+        std::thread sweeping(sweeper);
+        for (int i = 0; i < 100; ++i) {
+            GDSFItemRepo::sweepAll();
+            std::this_thread::sleep_for(std::chrono::microseconds{50});
+        }
+        awaitSweeps();
+        stop.store(true, std::memory_order_relaxed);
+        sweeping.join();
+
         CHECK(policy.threshold() == 0.0f);
         CHECK(GDSFItemRepo::size() == ids.size());
     }
@@ -1163,7 +1181,20 @@ TEST_CASE("GDSF - purge is a forced pass, excluded from a concurrent sweep",
         const uint64_t before = TestInternals::budgetHeldBytes();
 
         TestInternals::setThreshold(1e9f);  // every entry under it
-        CHECK(GDSFItemRepo::purge() == ids.size());
+        CHECK(purgeDeprecated<GDSFItemRepo>() == ids.size());
+        const int64_t after = jcailloux::relais::cache::detail::L1Ledger::sum();
+        REQUIRE(static_cast<uint64_t>(after) < before);  // evicted and freed
+        CHECK(TestInternals::budgetHeldBytes() == static_cast<uint64_t>(after));
+    }
+
+    SECTION("[sweep-all] the pass reads the held bytes as it ends") {
+        PauseTickHook pause;  // only the pass reads them here
+        policy.refreshHeldBytes();
+        const uint64_t before = TestInternals::budgetHeldBytes();
+
+        TestInternals::setThreshold(1e9f);  // every entry under it
+        sweepAllAndWait<GDSFItemRepo>();
+        CHECK(GDSFItemRepo::size() == 0);
         const int64_t after = jcailloux::relais::cache::detail::L1Ledger::sum();
         REQUIRE(static_cast<uint64_t>(after) < before);  // evicted and freed
         CHECK(TestInternals::budgetHeldBytes() == static_cast<uint64_t>(after));
@@ -1885,13 +1916,13 @@ TEST_CASE("Entry bytes - one count per entry, stored or recomputed",
         // Kept: the histogram records what evicting the entry would free.
         TestInternals::setThreshold(0.0f);
         REQUIRE(TestInternals::buildingHistogramBytes() == 0);
-        GDSFNoTTLRepo::purge();
+        sweepAllAndWait<GDSFNoTTLRepo>();
         CHECK(TestInternals::buildingHistogramBytes() == entry_bytes);
         REQUIRE(TestInternals::entityEntryBytes<GDSFNoTTLRepo>(id).has_value());
 
         // Evicted: the ghost left behind weighs what admission weighed.
         TestInternals::setThreshold(1e9f);
-        GDSFNoTTLRepo::purge();
+        sweepAllAndWait<GDSFNoTTLRepo>();
         auto ghost = TestInternals::getGhostData<GDSFNoTTLRepo>(id);
         REQUIRE(ghost.has_value());
         CHECK(ghost->estimated_bytes == Tier::scoredBytes(id, entry_bytes));

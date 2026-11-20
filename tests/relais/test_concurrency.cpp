@@ -25,7 +25,7 @@
  *  10. Concurrent list CRUD + list cache cleanup
  *  11a. ModificationTracker drains after concurrent storm
  *  11b. Progressive tracker reduction via trySweep
- *  11c. purge() against concurrent sweeps, writes and reads
+ *  11c. sweepAll() and purge() against concurrent sweeps, writes and reads
  *  15. Concurrent upsert on a shared assigned-PK key (+ upsert‖update‖erase)
  *  16. Store-through on one key, results handled out of commit order
  *  17. Store-through of identical writes coalesced in one batch
@@ -566,9 +566,9 @@ TEST_CASE("Concurrency - cleanup during operations",
                     // One thread continuously triggers cleanup
                     trySweep<L1TestItemRepo>();
                 } else if (i == 1) {
-                    // One thread does full cleanup
+                    // One thread asks for full passes
                     if (j % 10 == 0) {
-                        forcePurge<L1TestItemRepo>();
+                        L1TestItemRepo::sweepAll();
                     }
                 } else {
                     // Others do reads and writes
@@ -584,6 +584,7 @@ TEST_CASE("Concurrency - cleanup during operations",
                 }
             }
         });
+        awaitSweeps();
 
         // All entities should still be accessible
         for (auto id : ids) {
@@ -625,11 +626,11 @@ TEST_CASE("Concurrency - list CRUD + list cache cleanup",
                     // Continuous cleanup (entity + list, unified)
                     trySweep<TestArticleListRepo>();
                 } else if (i == 1) {
-                    // Query + periodic full cleanup
+                    // Query + periodic full pass
                     sync(TestArticleListRepo::query(
                         makeArticleQuery("conc_lc")));
                     if (j % 10 == 0) {
-                        forcePurge<TestArticleListRepo>();
+                        TestArticleListRepo::sweepAll();
                     }
                 } else {
                     int op = rng() % 4;
@@ -672,6 +673,7 @@ TEST_CASE("Concurrency - list CRUD + list cache cleanup",
                 }
             }
         });
+        awaitSweeps();
 
         // Final query should work — no crash, no corruption
         auto result = sync(TestArticleListRepo::query(
@@ -693,7 +695,7 @@ TEST_CASE("Concurrency - tracker drains after concurrent storm",
     TransactionGuard tx;
     TestInternals::resetListCacheState<TestArticleListRepo>();
 
-    SECTION("[L1] purge drains all modifications to zero") {
+    SECTION("[L1] a forced pass drains all modifications to zero") {
         auto userId = insertTestUser("conc_drain_author", "conc_drain@test.com", 0);
 
         // Phase 1: insert modifications without concurrent cleanup (guaranteed pending)
@@ -822,16 +824,18 @@ TEST_CASE("Concurrency - progressive tracker reduction",
 
 // #############################################################################
 //
-//  11c. purge() against concurrent sweeps, writes and reads
+//  11c. sweepAll() and purge() against concurrent sweeps, writes and reads
 //
 // #############################################################################
 //
-// purge() sweeps every chunk, excluded from the global sweep: the tracker's
-// drains never interleave, so no modification leaves the tracker before every
-// chunk has seen it. Once the storm is over, the cached page is the database's.
+// A forced pass sweeps every chunk, excluded from the global sweep, whether
+// the maintenance thread runs it (sweepAll) or the caller (purge): the
+// tracker's drains never interleave, so no modification leaves the tracker
+// before every chunk has seen it. Once the storm is over, the cached page is
+// the database's.
 
-TEST_CASE("Concurrency - purge against concurrent sweeps, writes and reads",
-          "[integration][db][concurrency][tsan][purge]")
+TEST_CASE("Concurrency - forced passes against concurrent sweeps, writes and reads",
+          "[integration][db][concurrency][tsan][purge][sweep-all]")
 {
     TransactionGuard tx;
     TestInternals::resetListCacheState<TestArticleListRepo>();
@@ -847,7 +851,8 @@ TEST_CASE("Concurrency - purge against concurrent sweeps, writes and reads",
             if (i == 0) {
                 trySweep<TestArticleListRepo>();
             } else if (i == 1) {
-                (void)TestArticleListRepo::purge();
+                if (j % 2 == 0) TestArticleListRepo::sweepAll();
+                else (void)purgeDeprecated<TestArticleListRepo>();
             } else if (i % 2 == 0) {
                 sync(TestArticleListRepo::query(q));
             } else {
@@ -858,6 +863,7 @@ TEST_CASE("Concurrency - purge against concurrent sweeps, writes and reads",
             }
         }
     });
+    awaitSweeps();
 
     auto ids = [](const auto& page) {
         std::vector<int64_t> out;

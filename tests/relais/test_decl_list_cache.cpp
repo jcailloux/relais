@@ -11,7 +11,9 @@
  * - Filter matching: only pages matching the entity's filter values are affected
  * - ModificationTracker cleanup lifecycle
  * - Modification cutoff safety (cleanup/drain with time cutoff)
- * - purge(): a forced pass of the sweep, which waits for the sweep in progress
+ * - sweepAll(): asks the maintenance thread for a forced pass of the sweep,
+ *   and returns; purge(): that pass on the caller, which waits for the sweep
+ *   in progress
  */
 
 #include <catch2/catch_test_macros.hpp>
@@ -1134,13 +1136,54 @@ auto viewCountQueryOf(std::string_view category, uint16_t limit) {
 
 // #############################################################################
 //
-//  purge(): a forced pass of the sweep
+//  sweepAll() and purge(): a forced pass of the sweep
 //
 // #############################################################################
 //
-// purge() runs the repo's sweep, entities and pages, on every chunk of the
-// policy, excluded from the global sweep. It removes what a sweep removes and
-// returns that count.
+// The pass runs the repo's sweep, entities and pages, on every chunk of the
+// policy, excluded from the global sweep. It removes what a sweep removes.
+// sweepAll() asks the maintenance thread for it and returns; purge() runs it on
+// the calling thread and returns its count.
+
+TEST_CASE("[DeclListRepo] sweepAll asks for a forced pass of the sweep, and returns",
+          "[integration][db][list][cleanup][sweep-all]")
+{
+    TransactionGuard guard;
+    TestInternals::resetEntityCacheState<TestArticleListRepo>();
+    TestInternals::resetListCacheState<TestArticleListRepo>();
+
+    auto alice_id = insertTestUser("alice_sweep_all", "alice_sweep_all@test.com", 0);
+    insertTestArticle("tech", alice_id, "sweep_all_tech", 10);
+    insertTestArticle("news", alice_id, "sweep_all_news", 10);
+    REQUIRE(sync(TestArticleListRepo::query(makeViewCountQuery("tech", 10)))->size() == 1);
+    REQUIRE(sync(TestArticleListRepo::query(makeViewCountQuery("news", 10)))->size() == 1);
+    REQUIRE(TestArticleListRepo::listSize() == 2);
+
+    // Affects the tech page, not the news page.
+    TestArticleListRepo::notifyCreated(makeArticle(9202, "tech", alice_id, "sweep_all_new", 20));
+    REQUIRE(TestInternals::pendingModificationCount<TestArticleListRepo>() == 1);
+
+    SECTION("once served, the pass removed the page and drained the tracker") {
+        TestArticleListRepo::sweepAll();
+        awaitSweeps();
+        CHECK(TestArticleListRepo::listSize() == 1);
+        CHECK(TestInternals::pendingModificationCount<TestArticleListRepo>() == 0);
+    }
+
+    SECTION("it returns while the sweep in progress holds the exclusion") {
+        {
+            TestInternals::HoldSweepExclusion sweep_in_progress;
+            const auto t0 = std::chrono::steady_clock::now();
+            TestArticleListRepo::sweepAll();
+            CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds{100});
+            std::this_thread::sleep_for(std::chrono::milliseconds{50});
+            CHECK(TestArticleListRepo::listSize() == 2);  // the pass waits
+        }
+        awaitSweeps();
+        CHECK(TestArticleListRepo::listSize() == 1);
+        CHECK(TestInternals::pendingModificationCount<TestArticleListRepo>() == 0);
+    }
+}
 
 TEST_CASE("[DeclListRepo] purge is a forced pass of the sweep",
           "[integration][db][list][cleanup][purge]")
@@ -1163,7 +1206,7 @@ TEST_CASE("[DeclListRepo] purge is a forced pass of the sweep",
     REQUIRE(TestInternals::pendingModificationCount<TestArticleListRepo>() == 1);
 
     SECTION("it returns what it removed, and drains the tracker") {
-        CHECK(TestArticleListRepo::purge() == 1);
+        CHECK(purgeDeprecated<TestArticleListRepo>() == 1);
         CHECK(TestArticleListRepo::listSize() == 1);
         CHECK(TestInternals::pendingModificationCount<TestArticleListRepo>() == 0);
     }
@@ -1175,7 +1218,7 @@ TEST_CASE("[DeclListRepo] purge is a forced pass of the sweep",
         {
             TestInternals::HoldSweepExclusion sweep_in_progress;
             purger = std::thread([&] {
-                removed = TestArticleListRepo::purge();
+                removed = purgeDeprecated<TestArticleListRepo>();
                 done.store(true, std::memory_order_release);
             });
             std::this_thread::sleep_for(std::chrono::milliseconds{100});
@@ -1213,7 +1256,7 @@ TEST_CASE("[DeclListRepo] purge counts the entities and the pages it removes",
     // CachedClock uses uint32_t seconds: worst-case quantization adds ~1s
     waitForExpiration(std::chrono::milliseconds{2200});
 
-    CHECK(R::purge() == n + 1);
+    CHECK(purgeDeprecated<R>() == n + 1);
     CHECK(R::size() == 0);
     CHECK(R::listSize() == 0);
 }

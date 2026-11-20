@@ -584,9 +584,8 @@ TEST_CASE("LocalRepo - FewChunks config",
         auto sizeBefore = getCacheSize<FewChunksTestItemRepo>();
         CHECK(sizeBefore >= 3);
 
-        // Full cleanup: non-expired entries are NOT erased
-        auto erased = FewChunksTestItemRepo::purge();
-        CHECK(erased == 0);
+        // Full pass: non-expired entries are NOT erased
+        sweepAllAndWait<FewChunksTestItemRepo>();
         CHECK(getCacheSize<FewChunksTestItemRepo>() == sizeBefore);
     }
 
@@ -602,6 +601,26 @@ TEST_CASE("LocalRepo - FewChunks config",
         REQUIRE(result != nullptr);
         CHECK(result->name == "Trigger");
     }
+}
+
+TEST_CASE("LocalRepo - sweepAll removes the expired entries of every chunk",
+          "[integration][db][cached][cleanup][sweep-all]")
+{
+    TransactionGuard tx;
+    TestInternals::resetEntityCacheState<ShortTTLTestItemRepo>();
+
+    // More entries than chunks: a pass that missed a chunk would leave some.
+    const auto n = 2 * static_cast<size_t>(
+        jcailloux::relais::cache::GDSFPolicy::instance().chunkCount());
+    for (auto id : insertTestItems(n)) sync(ShortTTLTestItemRepo::find(id));
+    REQUIRE(getCacheSize<ShortTTLTestItemRepo>() == n);
+
+    // CachedClock uses uint32_t seconds: worst-case quantization adds ~1s
+    waitForExpiration(std::chrono::milliseconds{2200});
+
+    ShortTTLTestItemRepo::sweepAll();
+    awaitSweeps();
+    CHECK(getCacheSize<ShortTTLTestItemRepo>() == 0);
 }
 
 TEST_CASE("LocalRepo - purge returns the entries it removed",
@@ -620,7 +639,7 @@ TEST_CASE("LocalRepo - purge returns the entries it removed",
     // CachedClock uses uint32_t seconds: worst-case quantization adds ~1s
     waitForExpiration(std::chrono::milliseconds{2200});
 
-    CHECK(ShortTTLTestItemRepo::purge() == n);
+    CHECK(purgeDeprecated<ShortTTLTestItemRepo>() == n);
     CHECK(getCacheSize<ShortTTLTestItemRepo>() == 0);
 }
 

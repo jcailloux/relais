@@ -242,8 +242,9 @@ struct CohEnv {
 };
 
 // Clear the items table + L1 so each case starts clean (no TransactionGuard).
-// purge() only sweeps *expired* entries, so a true reset needs the unconditional
-// test-only clear (the static L1 is shared across cases of the same repo).
+// A sweep pass only removes *expired* entries, so a true reset needs the
+// unconditional test-only clear (the static L1 is shared across cases of the
+// same repo).
 static void clearL1() {
     relais_test::TestInternals::resetEntityCacheState<CohItemL1>();
 }

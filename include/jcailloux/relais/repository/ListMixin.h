@@ -535,13 +535,26 @@ public:
         return removed;
     }
 
-    /// Forced pass of the sweep over every chunk of both caches (see
-    /// LocalRepo::purge). Returns the entries and pages removed.
+    /// Asks for a forced pass of the sweep over every chunk of both caches,
+    /// and returns at once (see LocalRepo::sweepAll).
+    static void sweepAll() {
+        if constexpr (kHasL1) {
+            // Built here, not on the maintenance thread.
+            (void)Base::tier();
+            (void)listCache();
+            cache::GDSFPolicy::instance().requestPass(&sweep);
+        }
+    }
+
+    /// The pass of sweepAll() over both caches, on the calling thread (see
+    /// LocalRepo::purge). Returns the entries and pages removed. Removed in 5.0.
+    [[deprecated("use sweepAll(): purge() blocks the caller for a full sweep pass, "
+                 "and does not empty the cache")]]
     static size_t purge() {
         if constexpr (kHasL1) {
             return cache::GDSFPolicy::instance().sweepEveryChunk(&sweep);
         } else {
-            return Base::purge();
+            return 0;
         }
     }
 

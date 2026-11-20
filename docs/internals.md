@@ -303,10 +303,14 @@ time, evicting expired entries (and, when GDSF is on, low-score entries against
 a byte target), so a sweep never holds a chunk locked longer than that chunk.
 One sweep runs at a time for the whole process (`sweep_mu_`).
 
-`purge()` runs a forced pass on the calling thread: its repo's sweep on every
-chunk, under the same exclusion. It waits for the sweep in progress, and the
-maintenance thread lets it go before its next sweep. It removes what a sweep
-removes, against the current threshold, and no more.
+A forced pass is a repo's sweep on every chunk, under the same exclusion. It
+removes what a sweep removes, against the current threshold, and no more.
+`sweepAll()` asks the maintenance thread for it and returns. The thread serves
+the passes asked for before its next sweep. A request made before the pass
+starts is served by it; one made during the pass asks for another, which sees
+what the first one missed. `purge()`, deprecated, runs the pass on the calling
+thread: it waits for the sweep in progress, and the maintenance thread lets it
+go before its next sweep.
 
 ## Cache Flow on Operations
 
@@ -842,8 +846,8 @@ erased. Cleanup is per-chunk, lock-light:
   indices, a `unique_lock` erases (taken only when there are removals).
 
 Phase 2 erases the indices phase 1 collected, so no other erasure may run in
-between: only the sweep exclusion drains, whether a global sweep or the forced
-pass of `purge()`.
+between: only the sweep exclusion drains, whether a global sweep or a forced
+pass (`sweepAll()`, `purge()`).
 
 ### Modification validation
 

@@ -11,6 +11,11 @@
  *   4. A forced pass waiting for a sweep goes before the next one
  *   5. A sweep that throws is dropped, the next ones are served
  *   6. A reset drops the sweeps not served yet
+ *   7. A requested pass returns at once, and goes before the next sweep
+ *   8. Two requests made before the pass starts ask for one pass
+ *   9. A request made during the pass asks for another
+ *  10. A pass that throws is dropped, the next sweeps are served
+ *  11. A reset drops the passes not served yet
  */
 
 #include <catch2/catch_test_macros.hpp>
@@ -318,4 +323,154 @@ TEST_CASE("Maintenance - a reset drops the sweeps not served yet",
     GDSFPolicy::instance().awaitSweeps();
 
     CHECK(Probe::taken().size() == 1);
+}
+
+// #############################################################################
+//
+//  7. A requested pass returns at once, and goes before the next sweep
+//
+// #############################################################################
+
+namespace {
+void requestPass() { GDSFPolicy::instance().requestPass(&Probe::sweep); }
+}  // namespace
+
+TEST_CASE("Maintenance - a requested pass returns at once, and goes before the next sweep",
+          "[maintenance][sweep-all]")
+{
+    Probe probe;
+    Probe::hold.store(true);
+    tick(2 * ticksPerSweep());  // two sweeps: the first is held
+    REQUIRE(Probe::awaitEntered(1));
+
+    const auto t0 = std::chrono::steady_clock::now();
+    requestPass();
+    const auto request_time = std::chrono::steady_clock::now() - t0;
+    // The probe holds the sweep for 2 s: a request that waited for it would
+    // last as long.
+    CHECK(request_time < 100ms);
+    Probe::hold.store(false);
+    GDSFPolicy::instance().awaitSweeps();
+
+    // The held sweep, the pass over every chunk, then the second sweep, all on
+    // the maintenance thread.
+    const auto sweeps = Probe::taken();
+    REQUIRE(sweeps.size() == 2 + chunkCount());
+    CHECK(sweeps.front().chunk == 0);
+    for (size_t i = 0; i < chunkCount(); ++i) {
+        CHECK(sweeps[1 + i].chunk == static_cast<long>(i));
+    }
+    CHECK(sweeps.back().chunk == 1);
+    for (const auto& sweep : sweeps) CHECK(sweep.thread == sweeps.front().thread);
+    CHECK(sweeps.front().thread != std::this_thread::get_id());
+}
+
+// #############################################################################
+//
+//  8. Two requests made before the pass starts ask for one pass
+//
+// #############################################################################
+
+TEST_CASE("Maintenance - two requests made before the pass starts ask for one pass",
+          "[maintenance][sweep-all]")
+{
+    Probe probe;
+    Probe::hold.store(true);
+    tick(ticksPerSweep());  // one sweep, held: the pass cannot start
+    REQUIRE(Probe::awaitEntered(1));
+
+    requestPass();
+    requestPass();
+    Probe::hold.store(false);
+    GDSFPolicy::instance().awaitSweeps();
+
+    CHECK(Probe::taken().size() == 1 + chunkCount());
+}
+
+// #############################################################################
+//
+//  9. A request made during the pass asks for another
+//
+// #############################################################################
+
+TEST_CASE("Maintenance - a request made during the pass asks for another",
+          "[maintenance][sweep-all]")
+{
+    Probe probe;
+    Probe::hold.store(true);
+    requestPass();  // starts at once, held on its first chunk
+    REQUIRE(Probe::awaitEntered(1));
+
+    requestPass();  // the second pass sweeps what the first may have missed
+    Probe::hold.store(false);
+    GDSFPolicy::instance().awaitSweeps();
+
+    const auto sweeps = Probe::taken();
+    REQUIRE(sweeps.size() == 2 * chunkCount());
+    for (size_t i = 0; i < sweeps.size(); ++i) {
+        CHECK(sweeps[i].chunk == static_cast<long>(i % chunkCount()));
+    }
+}
+
+// #############################################################################
+//
+//  10. A pass that throws is dropped, the next sweeps are served
+//
+// #############################################################################
+
+TEST_CASE("Maintenance - a pass that throws is logged, and the next sweeps are served",
+          "[maintenance][sweep-all]")
+{
+    namespace log = jcailloux::relais::log;
+    const auto previous = log::getCallback();
+    log::setCallback(&countErrors);
+    g_errors_logged.store(0);
+    {
+        Probe probe;
+        Probe::throws.store(1);
+
+        requestPass();
+        GDSFPolicy::instance().awaitSweeps();
+        CHECK(Probe::taken().size() == 1);  // the pass ends on the chunk that throws
+
+        tick(TestInternals::sweepCycleTicks());
+        GDSFPolicy::instance().awaitSweeps();
+        CHECK(Probe::taken().size() == 1 + chunkCount());
+    }
+    log::setCallback(previous);
+    CHECK(g_errors_logged.load() == 1);
+}
+
+// #############################################################################
+//
+//  11. A reset drops the passes not served yet
+//
+// #############################################################################
+
+TEST_CASE("Maintenance - a reset drops the passes not served yet",
+          "[maintenance][sweep-all]")
+{
+    Probe probe;
+    Probe::hold.store(true);
+    tick(ticksPerSweep());  // one sweep, held: the pass waits
+    REQUIRE(Probe::awaitEntered(1));
+    requestPass();
+
+    // Waits for the held sweep, and goes before the pass.
+    std::thread reset([] { GDSFPolicy::instance().resetForTesting(); });
+    const auto deadline = std::chrono::steady_clock::now() + 2s;
+    while (TestInternals::passesWaiting() == 0
+           && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(1ms);
+    }
+    REQUIRE(TestInternals::passesWaiting() == 1);
+    Probe::hold.store(false);
+    reset.join();
+    GDSFPolicy::instance().awaitSweeps();
+    CHECK(Probe::taken().size() == 1);
+
+    // Not merged with the pass dropped: a new request is served.
+    requestPass();
+    GDSFPolicy::instance().awaitSweeps();
+    CHECK(Probe::taken().size() == 1 + chunkCount());
 }

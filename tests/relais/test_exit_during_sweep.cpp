@@ -56,7 +56,7 @@ size_t noEntries() { return 0; }
 int main() {
     static Sentinel sentinel;
 
-    (void)Repo::purge();  // builds the repository's state: entities and list
+    Repo::warmup();  // builds the repository's state: entities and list
     GDSFPolicy::instance().enroll({&slowSweep, &noEntries, "test:slow"});
 
     for (size_t i = 0; i <= GDSFPolicy::kCleanupMask; ++i) {

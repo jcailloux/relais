@@ -94,7 +94,7 @@ TEST_CASE("L1 Config - l1_ttl",
 
         // CachedClock uses uint32_t seconds: worst-case quantization adds ~1s
         waitForExpiration(std::chrono::milliseconds{2200});
-        forcePurge<TTL1sRepo>();
+        sweepAllAndWait<TTL1sRepo>();
 
         // Cache should be empty after cleanup
         REQUIRE(getCacheSize<TTL1sRepo>() == 0);
@@ -127,7 +127,7 @@ TEST_CASE("L1 Config - l1_ttl",
         waitForExpiration(std::chrono::milliseconds{2200});
 
         // GDSF: cleanup evicts TTL-expired entries
-        forcePurge<TTL1sRepo>();
+        sweepAllAndWait<TTL1sRepo>();
 
         // Expired entry evicted → DB fetch
         auto item = sync(TTL1sRepo::find(id));
