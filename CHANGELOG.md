@@ -39,6 +39,11 @@
   libevent or `poll(2)` take a few lines each, and one more system call per
   query than an adapter. `io::EpollIoContext` gains the `fd()` and `poll()`
   this is built on.
+- **`Repo::sweepAll()`** asks relais's maintenance thread for a pass of the L1
+  sweep over the whole repository, entity and list caches, and returns at once.
+  The pass removes what a sweep removes: expired entries, pages a write has
+  invalidated, and, in a GDSF build, entries scored below the eviction
+  threshold. It does not empty the cache. Without L1, it does nothing.
 
 ### Changed
 
@@ -65,6 +70,14 @@
   the thread relais runs on, and drop relais's pending timers once it has
   left.
 
+### Deprecated
+
+- **`purge()`**: use `sweepAll()`. It runs the same pass on the calling thread,
+  which it blocks for the whole pass. Despite its name and the 4.0
+  documentation, it never emptied the cache. It keeps its signature until 5.0,
+  which removes it. `sweepAll()` returns nothing: neither the count of entries
+  removed, nor a way to wait for the pass.
+
 ### Fixed
 
 - **A connection waited until `acquire_timeout`, then failed, when libpq
@@ -87,6 +100,30 @@
   connections. They now wait for it, each query bounded by its timeouts.
   `stop()` could also hang, when a worker went back to sleep before it saw the
   stop request.
+- **A request could wait for a sweep of the L1 cache.** One database read in a
+  few hundred swept an eighth of the L1 on the thread that made it, and every
+  request of that loop waited for it: up to hundreds of milliseconds on a cache
+  of millions of entries. The sweep now runs on a background thread of
+  relais's, `relais-sweep`, which starts with the first repository that has
+  something to sweep (an `l1_ttl`, or GDSF).
+- **Under glibc, relais stalled the allocator every 100 ms** once a repository
+  had an L1 cache, GDSF or not: it read the heap's statistics (`mallinfo2`),
+  which holds up every thread that allocates meanwhile, for 6 to 25 ms at
+  340 MB of heap and over 200 ms at 1.4 GB. relais no longer queries the
+  allocator.
+- **The L1 memory budget (`RELAIS_L1_MAX_MEMORY`, GDSF builds) did not measure
+  the cache.** It read the process's heap: under mimalloc, or any allocator but
+  glibc and jemalloc, it read nothing and never evicted; elsewhere, memory
+  outside the cache counted against it, and could make the sweep evict the
+  whole cache. It now counts the bytes the L1 holds, the same under any
+  allocator. **Review its value**: a budget sized for the process now goes to
+  the cache alone. `docs/caching.md` says what it counts and how to size it.
+- **GDSF weighed some entities as lighter than they are.** Their size, which
+  `Entity::memoryUsage()` reports, left out `json_field` members and the
+  strings of a `text[]`, so a heavy entity was kept before lighter ones. Every
+  member now counts, at the room its blocks take.
+- **`purge()` could race with a concurrent sweep**, and a list page then served
+  a stale result until its `l1_ttl`. It now waits for the sweep in progress.
 
 ## [4.0.0] - 2026-10-22
 

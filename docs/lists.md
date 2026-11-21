@@ -425,9 +425,9 @@ per-entity check is the `lo == hi` special case of this range check.
 This fast-path is **filter-aware and never-miss**: it prunes only groups the
 predicate provably cannot affect (EQ-different / IN-disjoint; an absent
 constraint is a wildcard that matches). It is **always** taken — there is no
-`purgeAll` fallback for large sets. `eraseWhere` appends its `RangeModification`
-on **every** call, even at zero rows deleted — the fast-path fires
-unconditionally.
+fallback to clearing the list cache for large sets. `eraseWhere` appends its
+`RangeModification` on **every** call, even at zero rows deleted — the fast-path
+fires unconditionally.
 
 **`invalidateWhere`** does *not* touch the list tier at all. It resolves the
 matching rows (`SELECT … WHERE pred`, so its entity tier is O(rows)) and evicts
@@ -455,7 +455,7 @@ size_t n = co_await CommentRepo::countWhere({.post_id = id});
 ## List methods
 
 A list-enabled repo adds `query()` and `listSize()`, and its L1 maintenance
-calls (`purge`/`warmup`) cover both the entity and list caches;
+calls (`sweepAll`/`warmup`) cover both the entity and list caches;
 `ListDescriptorType` is the alias you pass to `parseListQuery*<…>` and the
 builder. Exact signatures and the full set of `Repo` list aliases are in
 [api-reference.md › Repository API](api-reference.md#repository-api) and

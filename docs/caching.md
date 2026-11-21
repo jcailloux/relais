@@ -52,15 +52,15 @@ migration, manual SQL) — see [Several instances](#several-instances). Expiry i
 read), or by the maintenance sweep, which a background thread of relais's runs over
 one chunk of the cache every few hundred entries read from the database. A key
 written once and never read again lingers until one of them reaches it.
+`Repo::sweepAll()` asks that thread for a sweep of every chunk of the repository.
 `with_l1_ttl(0s)` disables time expiry entirely.
 
 **2. Memory budget + GDSF (`RELAIS_L1_MAX_MEMORY`) — compile-time opt-in.**
-Size-aware GDSF eviction (score = frequency × cost ÷ entry size, evicts when over budget) and
-the `RELAIS_L1_MAX_MEMORY` ceiling are **off unless you build with
+Size-aware GDSF eviction (score = frequency × cost ÷ entry size) and the
+`RELAIS_L1_MAX_MEMORY` budget are **off unless you build with
 `-DRELAIS_GDSF_ENABLED=1`** (the CMake option defaults `OFF`). In a default build
-the budget env var is read but never consulted, GDSF never admits/scores/evicts,
-and the insertion-driven sweep never runs — TTL is the only bound. With GDSF
-enabled, the budget is a hard ceiling enforced by proactive eviction:
+the budget env var is read but never consulted, and GDSF never admits, scores or
+evicts: TTL is the only bound.
 
 ```bash
 RELAIS_L1_MAX_MEMORY=536870912   # 512 MiB (GDSF builds only); unset/0/invalid = unlimited
@@ -72,12 +72,59 @@ The footgun, by build mode:
 |---|---|---|
 | default (no GDSF) | `> 0` | Bounded by TTL + access pattern (lazy expiry on lookup; cold entries linger) |
 | default (no GDSF) | **`0`** | **Unbounded — nothing evicts, nothing expires** ⚠️ (the budget does nothing) |
-| `-DRELAIS_GDSF_ENABLED=1` | `> 0` | Bounded by budget (GDSF proactive eviction); TTL trims staleness on top |
-| `-DRELAIS_GDSF_ENABLED=1` | `0` | Bounded by budget (GDSF) only |
+| `-DRELAIS_GDSF_ENABLED=1` | `> 0` | Held at the budget by GDSF eviction; TTL trims staleness on top |
+| `-DRELAIS_GDSF_ENABLED=1` | `0` | Held at the budget by GDSF eviction only |
 
 So in a **default build**, keep `l1_ttl > 0` — it is the only thing bounding L1.
-To cap L1 by *memory* (a hard ceiling with proactive eviction), build with
-`-DRELAIS_GDSF_ENABLED=1` and set `RELAIS_L1_MAX_MEMORY`.
+To bound L1 by *memory*, build with `-DRELAIS_GDSF_ENABLED=1` and set
+`RELAIS_L1_MAX_MEMORY`.
+
+#### What the budget counts
+
+The budget bounds **the bytes the L1 holds**. relais counts them itself, as it
+allocates and frees them, so the count is the same under glibc, jemalloc,
+mimalloc or any other allocator:
+
+- entity entries and list pages, each block at the room it takes at the
+  allocator (its size class and header), until it is freed: an entry evicted
+  while a reader still holds it stays counted;
+- the hash table: its bucket arrays, overflow links, and the nodes of string or
+  composite keys;
+- what the cache keeps beside its entries: the modifications tracked for list
+  pages, and the bookkeeping of the reads and writes in flight.
+
+A miss read by `find()` that would take the L1 over the budget is served
+without being cached, and while the L1 holds more than the budget, the
+maintenance sweeps evict the lowest-scored entries until it holds less. The
+sweeps follow the reads from the database, one every few hundred entries read:
+what `findMany()`, list pages and writes store in between can take the L1 over
+the budget until the next sweeps. The budget is the level eviction holds the L1
+at, not a limit on each allocation.
+
+#### Sizing the budget
+
+relais bounds what its cache holds, never the process: cap the process with the
+kernel (systemd's `MemoryHigh=`/`MemoryMax=`, or the cgroup's
+`memory.high`/`memory.max`), and size the budget under that cap. Two things lie
+between the budget and the memory the process holds for the cache:
+
+- **Fragmentation**: free room inside the allocator's pages that the next
+  requests cannot use. Measured at up to 3 % of the L1's bytes, under glibc,
+  jemalloc and mimalloc: 2M entries of mixed sizes filled from four threads,
+  half of them evicted, then replaced by entries twice as large.
+- **Memory freed but kept**: the allocator keeps what an eviction frees for the
+  next allocations, so the process's memory does not drop; the cache reuses it
+  as it fills again. The process holds, for the cache, the most the L1 has held.
+
+Hence:
+
+```
+budget ≈ 0.95 × (process memory cap − memory the process uses besides the cache)
+```
+
+Then check it once under the real load: at steady state, the process's memory
+(its cgroup's `memory.current`) should stay under the cap, with room for the
+bytes stored between two sweeps.
 
 ## Presets
 
@@ -88,7 +135,7 @@ To cap L1 by *memory* (a hard ceiling with proactive eviction), build with
 
 Switching preset never breaks compilation: every `Repo` method has the same
 signature, return type included, on both presets. Without L1, the L1
-maintenance calls (`size`/`purge`/`warmup`) return `0` or do nothing.
+maintenance calls (`size`/`sweepAll`/`warmup`) return `0` or do nothing.
 
 ### Composing
 

@@ -93,10 +93,11 @@ flight have ended.
   loop opens its own connections: total = loops × per-loop maximum, to keep under
   the database's `max_connections`.
 - The L1 cache, its clock and its memory budget are process-wide. Two
-  background threads of relais's keep them: `relais-clock` refreshes the clock
-  and the budget every 100 ms, `relais-sweep` runs the cache's maintenance
-  sweeps, off the threads that serve requests (names as Linux shows them). They
-  start with the first repository that caches; nothing to start or wire.
+  background threads of relais's keep them: `relais-clock` refreshes the clock,
+  and the bytes the budget compares, every 100 ms; `relais-sweep` runs the
+  cache's maintenance sweeps, off the threads that serve requests (names as
+  Linux shows them). They start with the first repository that caches; nothing
+  to start or wire.
 
 ## Write ordering
 

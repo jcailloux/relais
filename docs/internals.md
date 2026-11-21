@@ -13,7 +13,7 @@ This document describes the internal architecture of relais for contributors and
 
 1. [Repository Mixin Chain](#repository-mixin-chain) — method-hiding tower, `CacheLayerSelector`/`MixinStack`, conditional layer selection
 2. [Configuration System — CacheConfig NTTP](#configuration-system--cacheconfig-nttp) — compile-time config plumbing
-3. [L1 Cache: CacheTier](#l1-cache-cachetier) — RAM tier over ChunkMap: by-value storage, singleton, TTL, cleanup
+3. [L1 Cache: CacheTier](#l1-cache-cachetier) — RAM tier over ChunkMap: by-value storage, singleton, TTL, cleanup, byte budget
 4. [Cache Flow on Operations](#cache-flow-on-operations) — read/delete/write paths, uncertain writes
 5. [ListMixin — Automatic List Caching](#listmixin--automatic-list-caching) — detection, descriptor augmentation, interception
 6. [InvalidationMixin — Cross-Repository Invalidation](#invalidationmixin--cross-repository-invalidation) — the four mechanisms, propagation
@@ -311,6 +311,27 @@ starts is served by it; one made during the pass asks for another, which sees
 what the first one missed. `purge()`, deprecated, runs the pass on the calling
 thread: it waits for the sweep in progress, and the maintenance thread lets it
 go before its next sweep.
+
+### Byte budget: L1Ledger
+
+In a GDSF build, the budget compares the bytes the L1 holds, which
+`cache::detail::L1Ledger` (`cache/L1Ledger.h`) counts where each block is
+allocated and freed, at the room it takes at the allocator (`blockBytes()`, read
+on the block). That covers the entries (entry pool), the nodes of indirect keys
+and the overflow links (parlay's pools), each version of the table (parlay keeps
+every version until `clear()`, which a `ChunkMap` never calls), the pools'
+retire lists, and what the L1 keeps beside its entries, whose containers count
+their own blocks (`LedgerAllocator`). A retired block stays counted until the
+epoch frees it. Nothing queries the allocator.
+
+The ledger keeps one counter per thread, on its own cache line and written by
+that thread only: a relaxed load and store, about a nanosecond. `sum()` walks
+them. `GDSFPolicy::refreshHeldBytes()` reads the sum at the start and end of
+each sweep, and every 100 ms on `RuntimeThread`; between two reads,
+`isOverBudget()` adds the bytes admitted since. An entry's GDSF score weighs the
+bytes its eviction gives back (`CacheTier::scoredBytes`): its pool block and
+value, and what its key costs the table (its share of the buckets, and the node
+of an indirect key). What no entry owns is in the total and in no score.
 
 ## Cache Flow on Operations
 

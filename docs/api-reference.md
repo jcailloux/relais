@@ -171,7 +171,7 @@ static Task<void> invalidateWhere(Pred pred);
 - **semantics**: `eraseWhere` deletes matching rows then evicts the entities + one filter-aware predicate list invalidation (O(1)). `invalidateWhere` resolves the set via `SELECT … WHERE pred` and evicts the entities only (oracle `invalidateWhere(P) ≡ invalidateMany(ids)`).
 - **availability**: any `Cfg`; the list-invalidation portion is active only when the entity has a `ListDescriptor` and the preset is `Local`.
 
-> **Never `purgeAll` on invalidation.** Batch and predicate paths point-evict the exact affected keys; unrelated hot entries are untouched.
+> **Never a cache-wide clear on invalidation.** Batch and predicate paths point-evict the exact affected keys; unrelated hot entries are untouched.
 
 ### List
 
@@ -192,7 +192,8 @@ Present only when the entity declares a `ListDescriptor` (the `ListMixin` layer)
 | `name()` | `const char*` (constexpr) | The compile-time repo name. |
 | `config` | `static constexpr CacheConfig` | The `Cfg` NTTP (data member, not a call). |
 | `size()` | `size_t` | L1 entity-cache entry count; `0` without L1. |
-| `purge()` | `size_t` | Clear the L1 entity (and list) caches; returns entries removed, `0` without L1. |
+| `sweepAll()` | `void` | Asks relais's maintenance thread for a pass of the L1 sweep over every chunk of the entity (and list) caches, and returns at once. The pass removes what a sweep removes: expired entries and pages, pages a write has invalidated, and, in a GDSF build, entries scored below the eviction threshold. It does not empty the cache. A call made while the repository's pass waits to start adds nothing to it. No-op without L1. |
+| `purge()` | `size_t` | **Deprecated**, removed in 5.0: use `sweepAll()`. Runs the same pass on the calling thread, which it blocks for the whole pass; returns the entries removed, `0` without L1. It does not empty the cache. |
 | `warmup()` | `void` | Prime the L1 entity (and list) caches at startup; no-op without L1. |
 
 ```cpp
@@ -302,7 +303,7 @@ Each preset is an `inline constexpr CacheConfig`. Fields not listed take the str
 
 ### Environment: `RELAIS_L1_MAX_MEMORY`
 
-The L1 memory budget (in **bytes**) is read **once**, at first construction of the process-wide `GDSFPolicy`, from the `RELAIS_L1_MAX_MEMORY` environment variable. A positive integer sets the budget; unset or non-positive means **no limit** (`maxMemory() == 0`). When the estimated live L1 heap would exceed the budget, GDSF eviction is triggered on the cache-miss admission path.
+The L1 memory budget (in **bytes**) is read **once**, at first construction of the process-wide `GDSFPolicy`, from the `RELAIS_L1_MAX_MEMORY` environment variable. A positive integer sets the budget; unset or non-positive means **no limit** (`maxMemory() == 0`). It bounds the bytes the L1 holds, as relais counts them whatever the allocator: entries and list pages at the room their blocks take, until they are freed, the hash table with the nodes of its keys, and what the cache keeps beside its entries. It bounds nothing else in the process. A miss read by `find()` that would take the L1 over the budget is not cached, and while the L1 holds more, the maintenance sweeps evict the lowest-scored entries. What it counts and how to size it: [caching.md › What the budget counts](caching.md#what-the-budget-counts).
 
 The budget acts only when GDSF eviction is compiled in: CMake option `RELAIS_GDSF_ENABLED` (default `OFF`), set before relais is added to the build. `cache::GDSFPolicy` (`cache/GDSFPolicy.h`) exposes it:
 

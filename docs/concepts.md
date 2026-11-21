@@ -108,8 +108,8 @@ is handled.
 **Staleness is bounded by timing, never by scope.** The cross-target invalidation of
 batch and predicate writes propagates detached (fire-and-forget), so a dependent
 cache can lag the source by a few milliseconds — but relais never over-invalidates:
-eviction is always *point-targeted* at the exact affected keys (never `purgeAll`),
-so a write to one entity never flushes unrelated hot entries. L1 is per process:
+eviction is always *point-targeted* at the exact affected keys (never a cache-wide
+clear), so a write to one entity never flushes unrelated hot entries. L1 is per process:
 another instance sees a write once its own entry expires (`l1_ttl`) — see
 [caching.md › Several instances](caching.md#several-instances).
 

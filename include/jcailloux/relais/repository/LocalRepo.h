@@ -383,7 +383,7 @@ public:
     }
 
     /// Batch invalidation common path — L1 entity tier: point-evict L1 (one per
-    /// key, never purgeAll). The L1 entity tier has no deferred work.
+    /// key, never a cache-wide clear). The L1 entity tier has no deferred work.
     template<bool WithLists = true>
     static io::Task<void> invalidateManyCritical(std::span<const E> entities) {
         for (const auto& e : entities) evict(e.key());
