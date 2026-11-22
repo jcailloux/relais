@@ -2868,6 +2868,43 @@ TEST_CASE("notes: the pass evicts what a settled note touches, then drops it",
     clearL1();
 }
 
+// The pass evicts a chunk's touched copies, then clears the chunk's bit: a
+// copy its scan misses is served from then on. The table grows between the
+// scan's range and its reads, in the pass's first chunk; enough rows that the
+// chunk holds several touched copies.
+TEST_CASE("notes: a growth of the table during the pass skips no copy",
+          "[coherence][settle][notes][integration][growth]") {
+    CohEnv env(1s);
+    resetItems(env);
+    std::vector<int64_t> touched;
+    for (int i = 0; i < 200; ++i) touched.push_back(env.seedItem("note-grow", 1));
+    for (auto id : touched) REQUIRE(cachedValue(env, id) == 1);
+
+    auto& map = TI::entityMapOf<CohItemL1>();
+    const long before = map.num_buckets();
+    bool grown = false;
+    long after = 0;
+    TI::onScanStart(map, [&](long scanned) {
+        if (grown || scanned != 0) return;
+        grown = true;
+        after = TI::growTable(map, [](long i) { return int64_t{-1} - i; },
+                              item(0, "note-grow-filler", 0));
+    });
+    TI::noteRowsChanged<CohItemL1>(nullptr, nameIs("note-grow"));
+    REQUIRE(pumpUntil(env, [] { return TI::rowNoteCount<CohItemL1>() == 0; }, 2s));
+    TI::onScanStart(map, {});
+    REQUIRE(grown);
+    REQUIRE(after > before);
+
+    long served = 0;
+    for (auto id : touched) {
+        probeSet(env, id, 2);
+        if (cachedValue(env, id) != 2) ++served;
+    }
+    CHECK(served == 0);
+    clearL1();
+}
+
 TEST_CASE("notes: without a note, a hit checks nothing",
           "[coherence][settle][notes][integration]") {
     CohEnv env(1s);

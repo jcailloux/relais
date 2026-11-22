@@ -22,6 +22,7 @@
 #include "jcailloux/relais/cache/TaggedEntry.h"
 
 #ifdef RELAIS_BUILDING_TESTS
+#include <functional>
 namespace relais_test { struct TestInternals; }
 #endif
 
@@ -442,22 +443,29 @@ public:
     // Chunk-based cleanup
     // =========================================================================
 
+    // A scan reads one table version, loaded once under its guard: the range
+    // it computes on that version names the same keys until it ends, since a
+    // bucket copied meanwhile to a larger version is followed into the buckets
+    // it was split into (see MapType::current_version). A chunk is a prefix
+    // of the key's hash as long as the version has n_chunks buckets or more.
+
     /// Cleanup a specific chunk of buckets. Pred: bool(const K&, TaggedEntry).
     /// Returns number of entries removed.
     template<typename Pred>
     size_t cleanup_chunk(long chunk, long n_chunks, Pred&& pred) {
-        long nb = map_.num_buckets();
-        long chunk_size = (nb + n_chunks - 1) / n_chunks;
-        long start = chunk * chunk_size;
-        long end = std::min(start + chunk_size, nb);
-
         // The keys to remove, copied out of the table: counted while held.
         LedgerList<K, kCountsBytes> to_remove;
         {
             auto guard = epoch::EpochGuard::acquire();
+            auto* tv = map_.current_version();
+            const long nb = MapType::num_buckets(tv);
+            const long chunk_size = (nb + n_chunks - 1) / n_chunks;
+            const long start = chunk * chunk_size;
+            const long end = std::min(start + chunk_size, nb);
+            scanStarts(chunk);
             for (long i = start; i < end; ++i) {
-                map_.prefetch_bucket(i + 1);
-                map_.for_each_bucket(i, [&](const K& key, TaggedEntry te) {
+                MapType::prefetch_bucket(tv, i + 1);
+                MapType::for_each_bucket(tv, i, [&](const K& key, TaggedEntry te) {
                     if (pred(key, te)) to_remove.push_back(key);
                 });
             }
@@ -487,13 +495,15 @@ public:
     /// Cleanup all buckets. Returns total entries removed.
     template<typename Pred>
     size_t full_cleanup(Pred&& pred) {
-        long nb = map_.num_buckets();
         LedgerList<K, kCountsBytes> to_remove;
         {
             auto guard = epoch::EpochGuard::acquire();
+            auto* tv = map_.current_version();
+            const long nb = MapType::num_buckets(tv);
+            scanStarts(-1);
             for (long i = 0; i < nb; ++i) {
-                map_.prefetch_bucket(i + 1);
-                map_.for_each_bucket(i, [&](const K& key, TaggedEntry te) {
+                MapType::prefetch_bucket(tv, i + 1);
+                MapType::for_each_bucket(tv, i, [&](const K& key, TaggedEntry te) {
                     if (pred(key, te)) to_remove.push_back(key);
                 });
             }
@@ -510,10 +520,12 @@ public:
     template<typename Fn>
     void for_each(Fn&& fn) {
         auto guard = epoch::EpochGuard::acquire();
-        long nb = map_.num_buckets();
+        auto* tv = map_.current_version();
+        const long nb = MapType::num_buckets(tv);
+        scanStarts(-1);
         for (long i = 0; i < nb; ++i) {
-            map_.prefetch_bucket(i + 1);
-            map_.for_each_bucket(i, fn);
+            MapType::prefetch_bucket(tv, i + 1);
+            MapType::for_each_bucket(tv, i, fn);
         }
     }
 
@@ -531,11 +543,12 @@ public:
     /// Returns -1 if key is not found.
     long key_chunk(const K& key, long n_chunks) {
         auto guard = epoch::EpochGuard::acquire();
-        long nb = map_.num_buckets();
-        long chunk_size = (nb + n_chunks - 1) / n_chunks;
+        auto* tv = map_.current_version();
+        const long nb = MapType::num_buckets(tv);
+        const long chunk_size = (nb + n_chunks - 1) / n_chunks;
         for (long i = 0; i < nb; ++i) {
             bool found = false;
-            map_.for_each_bucket(i, [&](const K& k, TaggedEntry) {
+            MapType::for_each_bucket(tv, i, [&](const K& k, TaggedEntry) {
                 if (k == key) found = true;
             });
             if (found) return i / chunk_size;
@@ -585,6 +598,15 @@ private:
         return *p;
     }
 
+    // Test builds: runs once a scan holds its version and its range, before
+    // it reads a bucket; `chunk` is the chunk scanned, -1 for the whole table.
+    void scanStarts([[maybe_unused]] long chunk) {
+#ifdef RELAIS_BUILDING_TESTS
+        if (const auto* hook = scan_hook_.load(std::memory_order_acquire))
+            (*hook)(this, chunk);
+#endif
+    }
+
     MapType& map_;
     epoch::memory_pool<CacheEntry>& pool_ = shared_pool();
     std::atomic<long> cleanup_cursor_{0};
@@ -592,6 +614,10 @@ private:
     std::atomic<long> live_count_{0};
 
 #ifdef RELAIS_BUILDING_TESTS
+    // One hook for every map of this type, given the map scanned: outside
+    // the object, so that a test build lays the map out as a release build.
+    using ScanHook = std::function<void(const ChunkMap*, long)>;
+    static inline std::atomic<const ScanHook*> scan_hook_{nullptr};
     friend struct ::relais_test::TestInternals;
 #endif
 };

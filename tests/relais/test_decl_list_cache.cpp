@@ -1057,6 +1057,52 @@ TEST_CASE("[DeclListRepo] Bitmap skip optimization",
     }
 }
 
+// The sweep of a chunk checks its pages against the modifications, then
+// clears the chunk's bit in each: a page the scan misses is never checked
+// again, by a later sweep or by a read. The table grows between the scan's
+// range and its reads; the page must still be found, and dropped.
+TEST_CASE("[DeclListRepo] A table growth during a sweep skips no page",
+          "[integration][db][list][skip][growth]")
+{
+    TransactionGuard guard;
+    TestInternals::resetListCacheState<TestArticleListRepo>();
+
+    auto alice_id = insertTestUser("alice_grow", "alice_grow@test.com", 0);
+    for (int vc = 10; vc <= 50; vc += 10) {
+        insertTestArticle("tech", alice_id, "grow_" + std::to_string(vc), vc);
+    }
+
+    auto q = makeViewCountQuery("tech", 10);
+    REQUIRE(sync(TestArticleListRepo::query(q))->size() == 5);
+    auto chunk = TestInternals::getListEntryChunkId<TestArticleListRepo>(q.cacheKey());
+    REQUIRE(chunk.has_value());
+
+    // A new article the page would hold: the modification touches it.
+    insertTestArticle("tech", alice_id, "grow_trigger", 35);
+    TestArticleListRepo::notifyCreated(makeArticle(9002, "tech", alice_id, "grow_trigger", 35));
+    REQUIRE(TestInternals::pendingModificationCount<TestArticleListRepo>() == 1);
+
+    auto& map = TestInternals::listMapOf<TestArticleListRepo>();
+    auto page = map.find(q.cacheKey()).asReal()->value;
+    const long before = map.num_buckets();
+    bool grown = false;
+    long after = 0;
+    TestInternals::onScanStart(map, [&](long scanned) {
+        if (grown || scanned != static_cast<long>(*chunk)) return;
+        grown = true;
+        after = TestInternals::growTable(map,
+            [](long i) { return "\x01grow:" + std::to_string(i); }, page);
+    });
+    TestInternals::forceFullListCleanup<TestArticleListRepo>();
+    TestInternals::onScanStart(map, {});
+    REQUIRE(grown);
+    REQUIRE(after > before);
+    CHECK(TestInternals::pendingModificationCount<TestArticleListRepo>() == 0);
+
+    // Dropped by the sweep: read again, with the new article.
+    CHECK(sync(TestArticleListRepo::query(q))->size() == 6);
+}
+
 // #############################################################################
 //
 //  Maintenance sweep: driven by memory growth, with or without GDSF

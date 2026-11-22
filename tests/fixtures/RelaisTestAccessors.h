@@ -12,15 +12,18 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
 #include <span>
+#include <thread>
 #include <vector>
 #include <jcailloux/relais/cache/GDSFPolicy.h>
 #include <jcailloux/relais/io/Task.h>
 #include <jcailloux/relais/io/pg/SettleTicket.h>
+#include <jcailloux/relais/repository/RowMatch.h>
 
 namespace relais_test {
 
@@ -324,6 +327,53 @@ struct TestInternals {
         map.pool_.clear();
         map.map_.m.link_pool->clear();
         if constexpr (Map::kIndirectKeys) map.map_.entries_.data_pool->clear();
+    }
+
+    /// The table of a repo's entity tier, and of its list tier.
+    template<typename Repo>
+    static auto& entityMapOf() { return Repo::cache(); }
+    template<typename Repo>
+    static auto& listMapOf() { return Repo::listCache().tier_.map(); }
+
+    /// Runs `hook(chunk)` each time a scan of `map` starts on the calling
+    /// thread, once the scan holds its table version and its range: `chunk`
+    /// is the chunk it scans, -1 for the whole table. Scans of other maps, or
+    /// on other threads (the maintenance thread), skip it. An empty hook
+    /// removes it. One hook per map type at a time.
+    template<typename Map>
+    static void onScanStart(Map& map, std::function<void(long)> hook) {
+        using Hook = typename Map::ScanHook;
+        // Every hook installed stays allocated, and reachable, to the end: a
+        // scan that loaded the previous one may still be running it.
+        static auto& kept = *new std::vector<std::unique_ptr<const Hook>>();
+        const Hook* installed = nullptr;
+        if (hook) {
+            kept.push_back(std::make_unique<const Hook>(
+                [&map, hook = std::move(hook), thread = std::this_thread::get_id()](
+                    const Map* scanned, long chunk) {
+                    if (scanned == &map && std::this_thread::get_id() == thread) hook(chunk);
+                }));
+            installed = kept.back().get();
+        }
+        Map::scan_hook_.store(installed, std::memory_order_release);
+    }
+
+    /// Grows the table of `map` by one version, from inside a scan if need
+    /// be: stores copies of `value` under the keys filler(0), filler(1), ...
+    /// (a key already present is left alone) until the copy to the larger
+    /// version completes, then removes them. Returns the buckets after, or -1
+    /// if the table did not grow.
+    template<typename Map, typename Filler, typename V>
+    static long growTable(Map& map, Filler&& filler, const V& value) {
+        auto* before = map.map_.current_version();
+        std::vector<std::decay_t<decltype(filler(0L))>> placed;
+        for (long i = 0; map.map_.current_version() == before && i < 10'000'000; ++i) {
+            auto key = filler(i);
+            if (map.insert(key, value)) placed.push_back(std::move(key));
+        }
+        for (const auto& key : placed) map.remove(key);
+        auto* after = map.map_.current_version();
+        return after == before ? -1 : Map::MapType::num_buckets(after);
     }
 
     /// Read the chunk_id for a cached list entry (for bitmap skip testing).

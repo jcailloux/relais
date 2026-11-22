@@ -186,15 +186,35 @@ namespace parlay {
     iterator erase(iterator pos) { return m.erase(pos); }
     size_t erase(const K& k) { return m.erase(Entry::make_key(k)); }
 
-    // Iterate entries in a single bucket. Callback: f(const K&, V&)
-    // Caller must hold EpochGuard. Safe during resize (follows forwarded buckets).
+    // relais addition: scans over one table version.
+    //
+    // A scan loads the current version once, under its epoch guard, and
+    // reads every bucket through it. A bucket copied since to a larger
+    // version holds a forwarded marker: for_each_bucket follows it into the
+    // grow_factor buckets the copy split it into, so the scan visits the keys
+    // of the range it computed on its version, whatever growth completes
+    // meanwhile. Loading the current version again per bucket would not: once
+    // a growth completes, bucket i of the larger version holds other keys.
+    using table_version = typename map::table_version;
+
+    table_version* current_version() { return m.current_table(); }
+
+    static long num_buckets(const table_version* t) { return (long) t->size; }
+
+    // Iterate the entries of bucket i of version t. Callback: f(const K&, V&).
+    // The caller holds an epoch guard taken before it loaded t.
     template<typename F>
-    void for_each_bucket(long i, F&& f) {
-        auto* tv = m.current_table();
-        map::for_each_bucket_rec(tv, i, [&](const auto& entry) {
+    static void for_each_bucket(table_version* t, long i, F&& f) {
+        map::for_each_bucket_rec(t, i, [&](const auto& entry) {
             auto& [k, v] = entry.get_entry();
             f(k, v);
         });
+    }
+
+    // Prefetch bucket i of version t (sequential scans).
+    static void prefetch_bucket(const table_version* t, long i) {
+        if (i < (long) t->size)
+            __builtin_prefetch(&t->buckets[i].v, 0, 3);
     }
 
     // Number of buckets in current table version.
@@ -210,13 +230,6 @@ namespace parlay {
     void prefetch_for(const hashed_key& k) {
         auto* t = m.current_table();
         __builtin_prefetch(&t->buckets[t->get_index(k)].v, 0, 3);
-    }
-
-    // Prefetch by raw bucket index (for sequential iteration / cleanup loops).
-    void prefetch_bucket(long i) {
-        auto* t = m.current_table();
-        if (i < t->size)
-            __builtin_prefetch(&t->buckets[i].v, 0, 3);
     }
 
     // Iterate all entries with unpacked (K&, V&). Runs inside with_epoch.

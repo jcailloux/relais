@@ -124,6 +124,11 @@
   member now counts, at the room its blocks take.
 - **`purge()` could race with a concurrent sweep**, and a list page then served
   a stale result until its `l1_ttl`. It now waits for the sweep in progress.
+- **A list page, or an entity's copy after an uncertain write, could be served
+  stale until it expired or left the cache**, when the L1 table grew during a
+  sweep.
+- **Removing an entry from L1 could read freed memory**, and crash, when it
+  raced a growth of the L1 table, in a repository keyed by an integer.
 
 ## [4.0.0] - 2026-10-22
 
