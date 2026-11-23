@@ -14,6 +14,8 @@
  *  10. ScoreHistogram          — record, thresholdForBytes, mergeEMA
  *  12. Access count persistence — mergeFrom on upsert with kUpdatePenalty
  *  14. Ghost admission control — ghost/promotion/counter bumps
+ * 14b. One admission for every fill — find(), findMany() and a list page
+ *                                 take the same decision on the same state
  *  16. Ghost decay and suppression — decay, removal
  * 16b. size() live count excludes ghosts
  *  17. Eviction selectivity    — hot/cold, score formula
@@ -34,9 +36,11 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <memory>
 #include <set>
+#include <span>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -674,6 +678,182 @@ TEST_CASE("GDSF - ghost admission control",
 
     // Cleanup
     resetRepos<GDSFGhostRepo>();
+}
+
+
+// #############################################################################
+//
+//  14b. GDSF - one admission for every fill from the database
+//
+// #############################################################################
+//
+// find(), findMany() and a list page read from the database go through the
+// same admission: on the same state, each path stores or ghosts the same way,
+// takes the ghost's count when it stores, and ticks the sweep the same way.
+
+namespace {
+
+namespace list_spec = jcailloux::relais::list::spec;
+using AdmissionPageParams = list_spec::ListQueryParams<TestArticleListDecl>;
+
+/// The page of the articles of `category`, by view count, descending.
+auto admissionPage(const std::string& category) {
+    AdmissionPageParams p;
+    p.limit = 10;
+    p.filters.get<"category">() = category;
+    p.sort = jcailloux::relais::list::SortSpec<size_t>{
+        1, jcailloux::relais::list::SortDirection::Desc};
+    return list_spec::seal<TestArticleListDecl>(std::move(p));
+}
+
+/// What the L1 holds under a key.
+struct HeldSlot {
+    enum Kind { absent, ghost, entry };
+    Kind kind = absent;
+    uint32_t count = 0;
+    bool operator==(const HeldSlot&) const = default;
+};
+
+template<typename Map, typename K>
+HeldSlot heldSlot(Map& map, const K& key) {
+    auto r = map.find(key);
+    if (!r) return {};
+    if (r.isGhost()) return {HeldSlot::ghost, r.ghostCount()};
+    return {HeldSlot::entry, r.asReal()->metadata.gdsfData().rawCount()};
+}
+
+} // namespace
+
+template<>
+struct Catch::StringMaker<HeldSlot> {
+    static std::string convert(const HeldSlot& h) {
+        static constexpr const char* kKinds[] = {"absent", "ghost", "entry"};
+        return std::string(kKinds[h.kind]) + "(" + std::to_string(h.count) + ")";
+    }
+};
+
+TEST_CASE("GDSF - every fill from the database passes the same admission",
+          "[integration][db][gdsf][ghost][admission]")
+{
+    TransactionGuard tx;
+    auto& policy = GDSFPolicy::instance();
+    resetRepos<GDSFGhostRepo>();
+    TestInternals::resetListCacheState<TestArticleListRepo>();
+    struct Restore {
+        ~Restore() {
+            GDSFPolicy::instance().configure({.max_memory = kTestMaxMemory});
+            TestInternals::setThreshold(0.0f);
+        }
+    } restore;
+
+    // One key per path: find(), two rows of one findMany(), a page.
+    const int64_t find_id = insertTestItem("admission_find", 1);
+    const std::vector<int64_t> many_ids = {insertTestItem("admission_many_a", 2),
+                                           insertTestItem("admission_many_b", 3)};
+    const auto author = insertTestUser("admission_author", "admission@test.com", 0);
+    for (int vc = 10; vc <= 30; vc += 10)
+        insertTestArticle("admission", author, "admission_" + std::to_string(vc), vc);
+    const auto page = admissionPage("admission");
+    const std::string page_key = page.cacheKey();
+
+    auto& items = TestInternals::entityMapOf<GDSFGhostRepo>();
+    auto& pages = TestInternals::listMapOf<TestArticleListRepo>();
+    auto held = [&] {
+        return std::array{heldSlot(items, find_id), heldSlot(items, many_ids[0]),
+                          heldSlot(items, many_ids[1]), heldSlot(pages, page_key)};
+    };
+    auto allHeld = [](HeldSlot::Kind kind, uint32_t count) {
+        return std::array<HeldSlot, 4>{{{kind, count}, {kind, count}, {kind, count}, {kind, count}}};
+    };
+
+    // One read on each path, each served with its value, stored or not.
+    auto readAll = [&] {
+        auto one = sync(GDSFGhostRepo::find(find_id));
+        REQUIRE(one);
+        CHECK(one->name == "admission_find");
+        auto many = sync(GDSFGhostRepo::findMany(std::span<const int64_t>(many_ids)));
+        REQUIRE(many.size() == 2);
+        REQUIRE(many.has(0));
+        REQUIRE(many.has(1));
+        CHECK(many[0]->name == "admission_many_a");
+        CHECK(many[1]->name == "admission_many_b");
+        auto rows = sync(TestArticleListRepo::query(page));
+        REQUIRE(rows);
+        CHECK(rows->size() == 3);
+    };
+    // The ticks each path counted over `read`: find, findMany (two rows), page.
+    auto ticksOf = [&](auto&& read) {
+        const uint32_t before = TestInternals::sweepTicks();
+        read();
+        return TestInternals::sweepTicks() - before;
+    };
+    auto readTicks = [&] {
+        return std::array{
+            ticksOf([&] { REQUIRE(sync(GDSFGhostRepo::find(find_id))); }),
+            ticksOf([&] { (void)sync(GDSFGhostRepo::findMany(std::span<const int64_t>(many_ids))); }),
+            ticksOf([&] { REQUIRE(sync(TestArticleListRepo::query(page))); })};
+    };
+    constexpr uint32_t kOne = GDSFScoreData::kCountScale;
+
+    SECTION("[admission] a score below the threshold ghosts the fill on every path") {
+        TestInternals::setThreshold(std::numeric_limits<float>::max());
+
+        readAll();
+        CHECK(held() == allHeld(HeldSlot::ghost, kOne));
+        CHECK(GDSFGhostRepo::size() == 0);
+        CHECK(TestInternals::listCacheSize<TestArticleListRepo>() == 0);
+
+        // Read again, still below: each ghost counts the access.
+        readAll();
+        CHECK(held() == allHeld(HeldSlot::ghost, 2 * kOne));
+        CHECK(GDSFGhostRepo::size() == 0);
+        CHECK(TestInternals::listCacheSize<TestArticleListRepo>() == 0);
+    }
+
+    SECTION("[admission] a ghost read again is stored with its count on every path") {
+        TestInternals::setThreshold(std::numeric_limits<float>::max());
+        readAll();
+        REQUIRE(held() == allHeld(HeldSlot::ghost, kOne));
+
+        TestInternals::setThreshold(0.0f);
+        readAll();
+        CHECK(held() == allHeld(HeldSlot::entry, 2 * kOne));
+        CHECK(GDSFGhostRepo::size() == 3);
+        CHECK(TestInternals::listCacheSize<TestArticleListRepo>() == 1);
+    }
+
+    SECTION("[admission] over the budget, no path stores its fill") {
+        TestInternals::setThreshold(0.0f);
+        policy.configure({.max_memory = 1});  // no room for anything
+        REQUIRE(policy.isOverBudget());
+
+        readAll();
+        CHECK(held() == allHeld(HeldSlot::ghost, kOne));
+        // Qualified, but still no room: each ghost counts the access.
+        readAll();
+        CHECK(held() == allHeld(HeldSlot::ghost, 2 * kOne));
+        CHECK(GDSFGhostRepo::size() == 0);
+        CHECK(TestInternals::listCacheSize<TestArticleListRepo>() == 0);
+    }
+
+    SECTION("[admission] every path ticks the sweep the same way") {
+        // A newcomer ghosted: one tick per key.
+        TestInternals::setThreshold(std::numeric_limits<float>::max());
+        CHECK(readTicks() == std::array<uint32_t, 3>{1, 2, 1});
+        // A ghost read again without qualifying: no tick.
+        CHECK(readTicks() == std::array<uint32_t, 3>{0, 0, 0});
+        // A ghost that qualifies but finds no room: one tick per key (demand).
+        TestInternals::setThreshold(0.0f);
+        policy.configure({.max_memory = 1});
+        CHECK(readTicks() == std::array<uint32_t, 3>{1, 2, 1});
+        // Stored: one tick per key.
+        policy.configure({.max_memory = kTestMaxMemory});
+        CHECK(readTicks() == std::array<uint32_t, 3>{1, 2, 1});
+        CHECK(held() == allHeld(HeldSlot::entry, 4 * kOne));
+    }
+
+    resetRepos<GDSFGhostRepo>();
+    TestInternals::resetListCacheState<TestArticleListRepo>();
 }
 
 

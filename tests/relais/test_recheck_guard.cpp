@@ -9,14 +9,19 @@
  *   - bump() makes changed() true for that key (write detected);
  *   - a bump on a DIFFERENT key sharing the slot also trips changed()
  *     (collision = pessimistic miss, NEVER a missed write → never stale);
- *   - a bump on a key in another slot does NOT trip changed() (independence).
+ *   - a bump on a key in another slot does NOT trip changed() (independence);
+ *   - a fill's gate (FillGate) holds around its store in the cache: a write
+ *     during the fetch leaves the value uncached, a write between the first
+ *     check and the store evicts it again.
  */
 
 #include <cstdint>
 #include <optional>
+#include <string>
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "jcailloux/relais/cache/CacheTier.h"
 #include "jcailloux/relais/repository/RecheckGuard.h"
 
 using jcailloux::relais::detail::RecheckGuard;
@@ -94,4 +99,44 @@ TEST_CASE("RecheckGuard - disjoint slots are independent", "[recheck]") {
 TEST_CASE("RecheckGuard - slot count is the configured power of two", "[recheck]") {
     STATIC_REQUIRE(Guard::kSlots == 4);
     STATIC_REQUIRE(RecheckGuard<"rg_big", int64_t, 12>::kSlots == 4096);
+}
+
+TEST_CASE("RecheckGuard - a fill's gate holds around its store", "[recheck][fill]") {
+    using Metadata = jcailloux::relais::cache::detail::CacheMetadata<false, false>;
+    using Tier = jcailloux::relais::cache::detail::CacheTier<int64_t, std::string, Metadata>;
+    static Tier& tier = *new Tier();  // reachable for the process, as a repository's tier
+    const int64_t key = 5005;
+    tier.evict(key);
+    const auto meta = [] { return Metadata{}; };
+    const auto snap = Guard::snapshot(key);
+
+    SECTION("no write: stored") {
+        std::string v = "fresh";
+        auto hit = tier.admitFill(key, v, std::nullopt, meta, Guard::FillGate{key, snap});
+        REQUIRE(hit);
+        CHECK(*hit.value == "fresh");
+        CHECK(tier.find(key));
+    }
+
+    SECTION("a write during the fetch: not stored, the value left to the caller") {
+        Guard::bump(key);
+        std::string v = "straddled";
+        auto hit = tier.admitFill(key, v, std::nullopt, meta, Guard::FillGate{key, snap});
+        CHECK_FALSE(hit);
+        CHECK(v == "straddled");
+        CHECK_FALSE(tier.find(key));
+    }
+
+    SECTION("a write between the first check and the store: evicted again") {
+        // The metadata is built after the first check, right before the store.
+        std::string v = "raced";
+        auto hit = tier.admitFill(key, v, std::nullopt,
+                                  [&] { Guard::bump(key); return Metadata{}; },
+                                  Guard::FillGate{key, snap});
+        REQUIRE(hit);
+        CHECK(*hit.value == "raced");  // still readable through the hit's guard
+        CHECK_FALSE(tier.find(key));
+    }
+
+    tier.evict(key);
 }

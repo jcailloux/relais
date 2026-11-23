@@ -129,6 +129,10 @@
   sweep.
 - **Removing an entry from L1 could read freed memory**, and crash, when it
   raced a growth of the L1 table, in a repository keyed by an integer.
+- **`findMany()` and list pages stored what they read past the L1 memory
+  budget** (GDSF builds). They now pass the same admission as `find()`: over
+  the budget, or below the eviction threshold, a row or a page is returned
+  without being cached, and its next reads count toward its admission.
 
 ## [4.0.0] - 2026-10-22
 

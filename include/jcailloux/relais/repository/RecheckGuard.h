@@ -86,6 +86,19 @@ struct RecheckGuard {
         return changed(id, snap);
     }
 
+    /// The recheck of a fill whose fetch started at `snap`, as the cache's
+    /// admission takes it (CacheTier::admitFill, which places the fence
+    /// between the store and the second check): the slot has not moved,
+    /// before the store and again after it. `id` must outlive the fill.
+    struct FillGate {
+        const Key& id;
+        uint64_t snap;
+
+        bool admits() const { return !changed(id, snap); }
+        template<typename Value, typename Metadata>
+        bool keeps(const Value&, const Metadata&) const { return !changed(id, snap); }
+    };
+
     /// Bump on every confirmed mutation (create/update/patch/erase/invalidate).
     /// Synchronous, write-only, monotonic. The fence orders the bump before the
     /// writer's evict that follows (see changed()).

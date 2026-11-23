@@ -319,44 +319,37 @@ public:
         return generation_.load(std::memory_order_seq_cst);
     }
 
-    /// Store result for a query with optional sort bounds and construction cost.
-    /// `fetch_gen` is generation(), read before the page was fetched: every
-    /// modification notified since must be able to invalidate it. A page read
-    /// from the database reflects every modification notified before (they
-    /// are notified after their commit). Returns epoch-guarded ResultView pointing to the stored
-    /// entry (still readable if the entry is evicted again right away).
+    /// Store a page read from the database, through the admission every fill
+    /// passes (see CacheTier::admitFill), with optional sort bounds and its
+    /// construction cost (the tier's cost sample). `fetch_gen` is
+    /// generation(), read before the page was fetched: every modification
+    /// notified since must be able to invalidate it. A page read from the
+    /// database reflects every modification notified before (they are notified
+    /// after their commit). Returns an epoch-guarded ResultView on the stored
+    /// entry (still readable if the entry is evicted again right away), or on
+    /// the page served uncached when the admission declines it.
     ///
     /// Stamping the page at put time instead would let a modification notified
     /// during the fetch pass for older than the page. And the chunk sweep may
     /// have processed such a modification before the store (bit cleared, or
     /// entry drained), so lazy validation would never see it either. Hence the
-    /// check after the store: if modifications were notified during the fetch,
-    /// the page is kept only when each of them is still tracked and none affects
-    /// it. A modification notified after the reload below is covered by lazy
-    /// validation and by the sweep, which sees this store (seq_cst fence here,
-    /// seq_cst generation bump, seq_cst cutoff read and fence in sweep()).
+    /// check after the store (FetchGate::keeps): if modifications were notified
+    /// during the fetch, the page is kept only when each of them is still
+    /// tracked and none affects it. A modification notified after that check's
+    /// reload is covered by lazy validation and by the sweep, which sees this
+    /// store (the seq_cst fence admitFill places before the check, seq_cst
+    /// generation bump, seq_cst cutoff read and fence in sweep()).
     ResultView put(const Query& query, Result result, uint32_t fetch_gen,
                    SortBounds bounds = {}, float construction_time_us = 0.0f) {
-        const auto& key = query.cacheKey();
-        uint32_t now_sec = runtime::detail::CachedClock::now();
-
-        MetadataImpl meta(
-            query, fetch_gen, now_sec + config_.default_ttl_sec, bounds,
-            static_cast<uint16_t>(result.items.size()),
-            construction_time_us);
-
-        auto hit = tier_.store(key, std::move(result), std::move(meta));
-
-        std::atomic_thread_fence(std::memory_order_seq_cst);
-        uint32_t current = generation_.load(std::memory_order_seq_cst);
-        if (current != fetch_gen
-            && straddledModificationsAffect(*hit.meta, *hit.value, fetch_gen, current)) {
-            tier_.evictIfSame(key, hit.value);
-        }
-
-        tier_.recordCost(construction_time_us);
-        Tier::tickSweep();
-
+        auto hit = tier_.admitFill(query.cacheKey(), result, construction_time_us,
+            [&] {
+                const uint32_t now_sec = runtime::detail::CachedClock::now();
+                return MetadataImpl(query, fetch_gen, now_sec + config_.default_ttl_sec, bounds,
+                                    static_cast<uint16_t>(result.items.size()),
+                                    construction_time_us);
+            },
+            FetchGate{*this, fetch_gen});
+        if (!hit) hit = tier_.transientHit(std::move(result));
         return ResultView(hit.value, std::move(hit.guard));
     }
 
@@ -510,6 +503,22 @@ private:
     // =========================================================================
     // Validation logic
     // =========================================================================
+
+    /// The recheck of a page fill (see CacheTier::AlwaysAdmit): nothing to
+    /// check before the store; once stored, the page stays unless a
+    /// modification notified since `fetch_gen` affects it or cannot be checked
+    /// (see put).
+    struct FetchGate {
+        const ListCache& cache;
+        uint32_t fetch_gen;
+
+        static constexpr bool admits() noexcept { return true; }
+        bool keeps(const Result& page, const MetadataImpl& meta) const {
+            const uint32_t current = cache.generation_.load(std::memory_order_seq_cst);
+            return current == fetch_gen
+                || !cache.straddledModificationsAffect(meta, page, fetch_gen, current);
+        }
+    };
 
     /// Modifications (fetch_gen, current] were notified while the page was
     /// fetched: true if one of them affects it, or cannot be checked. Every

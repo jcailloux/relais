@@ -6,11 +6,14 @@
 #include <atomic>
 #include <bit>
 #include <cassert>
+#include <chrono>
 #include <coroutine>
 #include <cstdint>
 #include <exception>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -163,9 +166,9 @@ public:
     // Store / evict
     // =========================================================================
 
-    /// Upsert value + metadata. Returns Hit pointing to the stored entry.
-    /// Does NOT tick the sweep counter: a caller storing what it read from the
-    /// database calls tickSweep() (fetchAndAdmit does).
+    /// Upsert value + metadata, without admission: the store of a write.
+    /// Returns Hit pointing to the stored entry. Does NOT tick the sweep
+    /// counter. A value read from the database goes through admitFill instead.
     Hit store(const Key& key, Value&& v, Metadata m) {
         auto hk = Map::make_key(key);
         auto r = map_.upsert(hk, std::move(v), std::move(m));
@@ -203,9 +206,117 @@ public:
         });
     }
 
+    /// The recheck a value read from the database passes, in two checks
+    /// around its store (see admitFill). admits(), before the store: false
+    /// sends the value to the caller uncached (a write landed during the
+    /// fetch). keeps(value, metadata), once it is stored and behind a seq_cst
+    /// fence: false evicts the entry again (a write landed between the first
+    /// check and the store). AlwaysAdmit, the default, has nothing to recheck:
+    /// no fence, no second check.
+    struct AlwaysAdmit {
+        static constexpr bool admits() noexcept { return true; }
+        static constexpr bool keeps(const Value&, const Metadata&) noexcept { return true; }
+    };
+
+    /// The admission of a value read from the database, one decision for
+    /// every fill (find, findMany, a list page):
+    ///   1. the gate's first check (see AlwaysAdmit);
+    ///   2. with GDSF: the count the entry would start from (its ghost's,
+    ///      raised by this access); the score it would have after the next
+    ///      decay, against the eviction threshold (it would survive the next
+    ///      sweep); and the room the budget leaves. A value that fails either
+    ///      is not stored: a newcomer leaves a ghost, which counts its next
+    ///      accesses;
+    ///   3. a tick of the maintenance sweep, when the value is stored, when a
+    ///      newcomer is ghosted, or when a ghost qualifies but finds no room
+    ///      (demand for room); a ghost read again without qualifying ticks
+    ///      nothing;
+    ///   4. the store, which takes the ghost's count, then the gate's second
+    ///      check.
+    ///
+    /// Returns the stored entry, `v` moved from; or an empty Hit, `v` left
+    /// intact, which the caller serves uncached its own way (transientHit, or
+    /// a view that owns it). `cost_us`, when given, is blended into the tier's
+    /// cost estimate once the gate admits the value, before its score is
+    /// computed. `make_meta()` builds the entry's metadata, only once the
+    /// value is to be stored.
+    template<typename MakeMeta, typename Gate = AlwaysAdmit>
+    Hit admitFill(const Key& key, Value& v, std::optional<float> cost_us,
+                  MakeMeta&& make_meta, const Gate& gate = {}) {
+        if (!gate.admits()) return {};
+
+        [[maybe_unused]] uint32_t count = 0;
+        [[maybe_unused]] bool has_ghost = false;
+        if constexpr (kHasGDSF) {
+            if (cost_us) recordCost(*cost_us);
+            auto& policy = GDSFPolicy::instance();
+
+            // What the entry would cost (independent of the ghost lookup).
+            const uint32_t est_bytes = saturate32(scoredBytes(key, Map::entryBytes(v)));
+            constexpr uint8_t est_flags = 0;
+
+            // Scoped: the guard the lookup holds keeps what a concurrent sweep
+            // retires allocated, and counted by the L1 ledger, until released.
+            {
+                auto ghost = map_.find(key);
+                has_ghost = ghost && ghost.isGhost();
+                count = (has_ghost ? ghost.ghostCount() : 0) + GDSFScoreData::kCountScale;
+                if (has_ghost) {
+                    map_.update_ghost(key, [count, est_bytes](TaggedEntry te) {
+                        return te.withGhostCount(count).withGhostBytes(est_bytes, est_flags);
+                    });
+                }
+            }
+
+            const float avg_cost = avg_cost_us_.load(std::memory_order_relaxed);
+            const float score = static_cast<float>(count) * policy.decayRate() * avg_cost
+                              / static_cast<float>(std::max(est_bytes, uint32_t{1}));
+            const bool qualifies = score >= policy.threshold();
+            if (!qualifies || policy.isOverBudget(est_bytes)) {
+                if (!has_ghost) {
+                    map_.insert_ghost(key, count, est_bytes, est_flags);
+                    tickSweep();
+                } else if (qualifies) {
+                    tickSweep();
+                }
+                return {};
+            }
+            tickSweep();
+            policy.recordAdmission(est_bytes);
+        } else {
+            tickSweep();
+        }
+
+        auto meta = make_meta();  // before the store moves `v` away
+        auto hk = Map::make_key(key);
+        auto r = map_.upsert(hk, std::move(v), std::move(meta));
+        if constexpr (kHasGDSF) {
+            if (has_ghost) {
+                r.entry()->metadata.gdsfData().access_count.store(
+                    count, std::memory_order_relaxed);
+            }
+        }
+        auto* ce = r.asReal();
+
+        // The first check is a check-then-act: a write on another thread can
+        // land and evict between it and the store, and the store then outlives
+        // the evict. The second check, after the store, closes the gap: either
+        // it sees the write and removes this entry (only this one: a newer
+        // store is kept), or the write comes after the store and its eviction,
+        // sequenced after it, finds the entry. The fence orders the store
+        // before the gate's reload; the write carries the matching fence after
+        // it is published. The returned Hit's guard keeps the value readable.
+        if constexpr (!std::is_same_v<Gate, AlwaysAdmit>) {
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            if (!gate.keeps(std::as_const(ce->value), std::as_const(ce->metadata)))
+                evictIfSame(key, &ce->value);
+        }
+        return Hit{&ce->value, &ce->metadata, std::move(r.guard), Map::get_hash(hk)};
+    }
+
     /// Return a value to the caller WITHOUT caching it — kept alive by the
-    /// returned EpochGuard in the transient pool. Used when the recheck
-    /// rejects a fill (a mutation straddled the fetch) or a store-through.
+    /// returned EpochGuard in the transient pool. Used when a fill is not
+    /// stored (see admitFill) or a store-through is refused.
     Hit transientHit(Value&& v) {
         auto guard = epoch::EpochGuard::acquire();
         auto* ptr = transientPool().New(std::move(v));
@@ -217,26 +328,16 @@ public:
     // Cold path — async, deduped, GDSF admission
     // =========================================================================
 
-    /// Always-admit gate — the default when the caller imposes no read-fill
-    /// recheck (e.g. uncached fetches that have no generation counter).
-    struct AlwaysAdmit {
-        bool operator()() const noexcept { return true; }
-    };
-
     /// Find in cache or fetch asynchronously. Coalescences concurrent misses.
     ///
     /// Fetcher: () -> Task<optional<Value>>
     /// MetaBuilder: (const Value&, float elapsed_us) -> Metadata
-    /// AdmitGate: () -> bool — evaluated right before the store, and again
-    ///   right after it. False before: the fetched value goes to the caller
-    ///   WITHOUT being cached (the read-fill recheck: a mutation landed during
-    ///   the fetch). False after: the entry just stored is evicted again (a
-    ///   mutation landed between the check and the store). Defaults to
-    ///   always-admit.
+    /// AdmitGate: the recheck of the fill (see AlwaysAdmit), always-admit by
+    ///   default.
     ///
-    /// Returns Hit pointing to the cached entry, or empty if not found.
-    /// When GDSF has admission pressure, the entry may be ghosted instead
-    /// of cached (returned via transient pool in that case).
+    /// Returns Hit pointing to the cached entry, or empty if not found. A
+    /// value the admission does not store (see admitFill) is returned through
+    /// the transient pool.
     template<typename Fetcher, typename MetaBuilder, typename AdmitGate = AlwaysAdmit>
     io::Task<Hit> findOrFetch(const Key& key, Fetcher&& f, MetaBuilder&& mb,
                               AdmitGate gate = {}) {
@@ -627,119 +728,26 @@ private:
     // Fetch + admission
     // =========================================================================
 
-    /// Second half of the read-fill recheck, once the fetched value is stored.
-    /// The gate checked before the store is a check-then-act: a writer on
-    /// another thread can bump and evict between that check and the store, and
-    /// the store then outlives the evict. Re-evaluating the gate after the
-    /// store closes the gap: either it sees the bump and removes this entry
-    /// (only this one: a newer store-through is kept), or the bump comes after
-    /// the store and the writer's evict, sequenced after its bump, removes it.
-    /// The fence orders the store before the reload; the writer's bump carries
-    /// the matching fence. The returned Hit's guard keeps the value readable.
-    /// Nothing to recheck (not even the fence) without a gate.
-    template<typename AdmitGate>
-    void recheckStored(const Key& key, const Value* stored, AdmitGate& gate) {
-        if constexpr (!std::is_same_v<AdmitGate, AlwaysAdmit>) {
-            std::atomic_thread_fence(std::memory_order_seq_cst);
-            if (!gate()) evictIfSame(key, stored);
-        }
-    }
-
+    /// The miss path of findOrFetch: the fetch, then the admission every fill
+    /// passes (admitFill). The fetch's wall time is the cost sample.
     template<typename Fetcher, typename MetaBuilder, typename AdmitGate>
     io::Task<Hit> fetchAndAdmit(const Key& key, Fetcher&& f, MetaBuilder&& mb,
                                 AdmitGate gate) {
+        std::chrono::steady_clock::time_point start{};
+        if constexpr (kHasGDSF) start = std::chrono::steady_clock::now();
+        auto opt = co_await f();
+        if (!opt) co_return Hit{};
+
+        float elapsed_us = 0.0f;
         if constexpr (kHasGDSF) {
-            auto start = std::chrono::steady_clock::now();
-            auto opt = co_await f();
-            if (!opt) co_return Hit{};
-
-            // Read-fill recheck: a mutation landed during the fetch → the value
-            // may be stale; return it but do not pollute the cache.
-            if (!gate()) co_return transientHit(std::move(*opt));
-
-            auto elapsed_us = static_cast<float>(
+            elapsed_us = static_cast<float>(
                 std::chrono::duration_cast<std::chrono::microseconds>(
                     std::chrono::steady_clock::now() - start).count());
-            recordCost(elapsed_us);
-
-            auto& policy = GDSFPolicy::instance();
-
-            // What the entry would cost (independent of ghost lookup)
-            uint32_t est_bytes = saturate32(scoredBytes(key, Map::entryBytes(*opt)));
-            uint8_t est_flags = 0;
-
-            // Lookup existing ghost — scoped: the guard it holds keeps what
-            // a concurrent sweep retires allocated, and counted by the L1
-            // ledger, until it is released.
-            uint32_t count;
-            bool has_ghost;
-            {
-                auto ghost_result = map_.find(key);
-                has_ghost = ghost_result && ghost_result.isGhost();
-                if (has_ghost) {
-                    uint32_t old_count = ghost_result.ghostCount();
-                    count = old_count + GDSFScoreData::kCountScale;
-                    map_.update_ghost(key, [count, est_bytes, est_flags](TaggedEntry te) {
-                        return te.withGhostCount(count).withGhostBytes(est_bytes, est_flags);
-                    });
-                } else {
-                    count = GDSFScoreData::kCountScale;
-                }
-            }
-
-            // Admission gate: anticipated score after next decay must clear
-            // the current eviction threshold (i.e. the entry would survive
-            // the next sweep), and the heap must have room. Otherwise we
-            // ghost — fresh candidates start tracked but unmaterialized.
-            float avg_cost = avg_cost_us_.load(std::memory_order_relaxed);
-            float score = static_cast<float>(count) * policy.decayRate() * avg_cost / static_cast<float>(std::max(est_bytes, uint32_t{1}));
-            bool qualifies = score >= policy.threshold();
-
-            if (qualifies && !policy.isOverBudget(est_bytes)) {
-                // === CACHE (or PROMOTE from ghost) ===
-                policy.tickInsertion();
-                policy.recordAdmission(est_bytes);
-                auto meta = mb(*opt, elapsed_us);
-                auto r = map_.upsert(Map::make_key(key), std::move(*opt), std::move(meta));
-                if (has_ghost) {
-                    r.entry()->metadata.gdsfData().access_count.store(
-                        count, std::memory_order_relaxed);
-                }
-                auto* ce = r.asReal();
-                recheckStored(key, &ce->value, gate);
-                co_return Hit{&ce->value, &ce->metadata, std::move(r.guard)};
-            } else {
-                // === GHOST (create or keep) ===
-                if (!has_ghost) {
-                    // New ghost: first appearance — always tick (maintenance).
-                    map_.insert_ghost(key, count, est_bytes, est_flags);
-                    policy.tickInsertion();
-                } else if (qualifies) {
-                    // Existing ghost re-accessed and qualified, but no room:
-                    // tick to signal genuine demand for cache space.
-                    policy.tickInsertion();
-                }
-                // Return via transient pool
-                auto guard = epoch::EpochGuard::acquire();
-                auto* ptr = transientPool().New(std::move(*opt));
-                transientPool().Retire(ptr);
-                co_return Hit{ptr, nullptr, std::move(guard)};
-            }
-        } else {
-            // Non-GDSF path
-            auto opt = co_await f();
-            if (!opt) co_return Hit{};
-
-            // Read-fill recheck (see GDSF branch).
-            if (!gate()) co_return transientHit(std::move(*opt));
-
-            tickSweep();
-            auto meta = mb(*opt, 0.0f);
-            auto r = map_.upsert(Map::make_key(key), std::move(*opt), std::move(meta));
-            auto* ce = r.asReal();
-            recheckStored(key, &ce->value, gate);
-            co_return Hit{&ce->value, &ce->metadata, std::move(r.guard)};
         }
+        auto hit = admitFill(key, *opt, elapsed_us,
+                             [&] { return mb(std::as_const(*opt), elapsed_us); }, gate);
+        if (hit) co_return hit;
+        co_return transientHit(std::move(*opt));
     }
 
     /// A byte count as a uint32_t, saturated.

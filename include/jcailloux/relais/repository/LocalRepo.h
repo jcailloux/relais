@@ -65,6 +65,8 @@ class LocalRepo : public PgRepo<E, Name, Cfg, Key> {
 
     /// Read-fill recheck guard (one static slot array per Name/Key/SlotsLog2).
     using Recheck = RecheckGuard<Name, Key, Cfg.recheck_slots_log2>;
+    /// The recheck a fill from the database passes (see CacheTier::admitFill).
+    using FillGate = typename Recheck::FillGate;
 
     /// Rows an uncertain write may have changed (see noteRowsChanged).
     using Notes = detail::RowNotes<E, Key, Cfg.l1_chunk_count_log2, Tier::kHasGDSF>;
@@ -800,7 +802,7 @@ private:
     // =========================================================================
 
     /// Slow path for find(): L1 miss -> dedup -> DB -> cache.
-    /// Snapshot the recheck slot at fetch-start; the admit gate skips the L1
+    /// Snapshot the recheck slot at fetch-start; the fill gate skips the L1
     /// store if a mutation landed during the fetch (read-fill recheck).
     static io::Task<cache::CacheView<E>> findSlow(const Key& id) {
         uint64_t snap = Recheck::snapshot(id);
@@ -810,7 +812,7 @@ private:
                 co_return co_await Base::findRaw(id);
             },
             [](const E&, float) -> Metadata { return buildMetadata(); },
-            [&id, snap]() { return !Recheck::changed(id, snap); }
+            FillGate{id, snap}
         );
         if (hit.meta) exemptIfNoted(id, *hit.value, snap);
         if (hit) {
@@ -829,7 +831,7 @@ private:
                 co_return co_await Base::findRaw(id);
             },
             [](const E&, float) -> Metadata { return buildMetadata(); },
-            [&id, snap]() { return !Recheck::changed(id, snap); }
+            FillGate{id, snap}
         );
         if (hit.meta) exemptIfNoted(id, *hit.value, snap);
         if (hit) co_return hit.value->json();
@@ -847,7 +849,7 @@ private:
                 co_return co_await Base::findRaw(id);
             },
             [](const E&, float) -> Metadata { return buildMetadata(); },
-            [&id, snap]() { return !Recheck::changed(id, snap); }
+            FillGate{id, snap}
         );
         if (hit.meta) exemptIfNoted(id, *hit.value, snap);
         if (hit) co_return hit.value->binary();
@@ -855,10 +857,11 @@ private:
     }
 
     /// Miss path for findMany: fetch the L1 misses from the database (one ANY),
-    /// force-insert each into L1 — same as the single-find
-    /// fetch path in the non-GDSF build — and point the view at the fresh slots.
-    /// The batch guard is held across the await so both the pre-await L1 hits
-    /// and the freshly stored misses stay valid. Absent ids keep their nullptr.
+    /// pass each row through the admission every fill passes, as find() does
+    /// (CacheTier::admitFill), and point the view at the stored entries or at
+    /// the rows it keeps itself. The batch guard is held across the await so
+    /// both the pre-await L1 hits and the freshly stored misses stay valid.
+    /// Absent ids keep their nullptr.
     static io::Task<cache::MultiView<E>> findManySlow(
         epoch::EpochGuard guard,
         std::vector<Key> unique,
@@ -879,26 +882,25 @@ private:
 
         cache::MultiView<E> view(slot.size());
         view.setGuard(std::move(guard));
-        // Worst case: every miss straddled a mutation and is parked un-cached.
+        // Worst case: no miss is stored, each kept by the view.
         view.reserveOwned(missU.size());
 
         for (size_t j = 0; j < missU.size(); ++j) {
             if (!fetched[j]) continue;
-            if (!Recheck::changed(missIds[j], snaps[j])) {
-                Tier::tickSweep();
-                auto hit = tier().store(unique[missU[j]], std::move(*fetched[j]),
-                                        buildMetadata());
-                // A mutation between the check and the store: evict this entry
-                // again. The view's guard keeps the value readable.
-                if (Recheck::changedAfterStore(missIds[j], snaps[j]))
-                    tier().evictIfSame(missIds[j], hit.value);
-                else
-                    exemptIfNoted(missIds[j], *hit.value, snaps[j]);
+            const Key& id = missIds[j];
+            // One fetch for many keys: no cost sample for the tier's estimate.
+            auto hit = tier().admitFill(id, *fetched[j], std::nullopt,
+                                        [] { return buildMetadata(); },
+                                        FillGate{id, snaps[j]});
+            if (hit) {
+                // Evicted again if a write landed right after the store: the
+                // view's guard keeps the value readable.
+                exemptIfNoted(id, *hit.value, snaps[j]);
                 uniqueHit[missU[j]] = static_cast<const E*>(hit.value);
             } else {
-                // A mutation straddled the batch fetch → return the value to
-                // the caller (mono/batch parity) but do NOT cache it. Parked in
-                // the view's owned_, kept alive by the view itself.
+                // Not stored (a write straddled the fetch, or the admission
+                // declined it): returned to the caller all the same (mono/batch
+                // parity), kept alive by the view itself.
                 uniqueHit[missU[j]] = view.adoptValue(std::move(*fetched[j]));
             }
         }
