@@ -144,6 +144,12 @@
   (GDSF builds), and with its expired entries, since only reads from the
   database brought on a sweep. Every write that stores its row in L1 now counts
   toward the next sweep, as a read does.
+- **The next sweeps evicted again what a sweep had evicted** while a reader
+  still held a view of it (GDSF builds): an evicted entry is freed only once no
+  reader holds it, and it counted against the memory budget until then. With
+  views held across a database round trip, the L1 fell well under its budget.
+  The budget now counts what the L1 caches: an entry leaves the count as it is
+  evicted, and a value served without being cached does not count.
 
 ## [4.0.0] - 2026-10-22
 

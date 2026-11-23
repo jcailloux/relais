@@ -20,8 +20,9 @@
  * 16b. size() live count excludes ghosts
  *  17. Eviction selectivity    — hot/cold, score formula
  *  19. Cross-repo sweep coordination
- * 19b. Budget                  — bounds the bytes the L1 holds, not the process;
- *                                 held under a load of writes alone too
+ * 19b. Budget                  — bounds the bytes the L1 caches, not the process;
+ *                                 held under a load of writes alone too; what a
+ *                                 sweep evicts leaves the count before it is freed
  * 19c. sweepAll() and purge()  — a forced pass, excluded from a concurrent sweep
  *  20. Entry bytes             — the room an entry takes, stored or recomputed;
  *                                 the room a block takes, read from the allocator
@@ -1187,11 +1188,11 @@ TEST_CASE("GDSF - cross-repo sweep coordination",
 
 // #############################################################################
 //
-//  19b. GDSF - the budget bounds the bytes the L1 holds
+//  19b. GDSF - the budget bounds the bytes the L1 caches
 //
 // #############################################################################
 
-TEST_CASE("GDSF - the budget bounds the bytes the L1 holds, not the process",
+TEST_CASE("GDSF - the budget bounds the bytes the L1 caches, not the process",
           "[integration][db][gdsf][budget]")
 {
     using L1Ledger = jcailloux::relais::cache::detail::L1Ledger;
@@ -1204,18 +1205,21 @@ TEST_CASE("GDSF - the budget bounds the bytes the L1 holds, not the process",
         ~RestoreBudget() { GDSFPolicy::instance().configure({.max_memory = kTestMaxMemory}); }
     } restore;
 
+    // What the L1 caches, as the budget counts it: what it holds in transit
+    // (served uncached, or evicted and not freed yet) aside.
+    auto cached = [] { return L1Ledger::read().cached(); };
     constexpr size_t kEntries = 32;
-    const int64_t base = L1Ledger::sum();
+    const int64_t base = cached();
     for (size_t i = 0; i < kEntries; ++i) {
         sync(GDSFItemRepo::find(insertTestItem("budget_" + std::to_string(i),
                                                static_cast<int32_t>(i))));
     }
     REQUIRE(GDSFItemRepo::size() == kEntries);
-    const int64_t held = L1Ledger::sum();
+    const int64_t held = cached();
     REQUIRE(held > base);
 
     SECTION("[budget] memory the L1 does not hold evicts nothing") {
-        // Room for what the L1 holds and 1 MiB more; the process holds far more.
+        // Room for what the L1 caches and 1 MiB more; the process holds far more.
         policy.configure({.max_memory = static_cast<size_t>(held) + (size_t{1} << 20)});
         constexpr size_t kBuffer = size_t{64} << 20;
         auto buffer = std::make_unique<char[]>(kBuffer);
@@ -1235,7 +1239,7 @@ TEST_CASE("GDSF - the budget bounds the bytes the L1 holds, not the process",
         CHECK(GDSFItemRepo::size() == kEntries + 1);
     }
 
-    SECTION("[budget] the bytes the L1 holds beyond it are evicted") {
+    SECTION("[budget] the bytes the L1 caches beyond it are evicted") {
         // Room for half the entries: the same cache is now over budget.
         policy.configure({.max_memory = static_cast<size_t>(base + (held - base) / 2)});
 
@@ -1278,7 +1282,7 @@ TEST_CASE("GDSF - the budget bounds the bytes the L1 holds, not the process",
         // what this load retires.
         writeCycles(1);
         REQUIRE(GDSFItemRepo::size() == kEntries + 1);
-        const int64_t loaded = L1Ledger::sum();
+        const int64_t loaded = cached();
 
         // Over budget by a quarter of the entries: the same load brings the L1
         // back under it. An evicted entry leaves a ghost, which costs less.
@@ -1286,10 +1290,10 @@ TEST_CASE("GDSF - the budget bounds the bytes the L1 holds, not the process",
         policy.configure({.max_memory = budget});
         writeCycles(4);
         CHECK(GDSFItemRepo::size() < kEntries);
-        CHECK(L1Ledger::sum() < static_cast<int64_t>(budget));
+        CHECK(cached() < static_cast<int64_t>(budget));
     }
 
-    SECTION("[budget] the held bytes are read again every 100 ms, sweep or not") {
+    SECTION("[budget] the cached bytes are read again every 100 ms, sweep or not") {
         policy.configure({.max_memory = static_cast<size_t>(base + (held - base) / 2)});
         policy.sweepNow();  // reads the ledger; an empty histogram evicts nothing
         REQUIRE(policy.isOverBudget());
@@ -1297,37 +1301,107 @@ TEST_CASE("GDSF - the budget bounds the bytes the L1 holds, not the process",
         // The cache empties; no sweep runs: RuntimeThread reads it.
         TestInternals::resetEntityCacheState<GDSFItemRepo>();
         TestInternals::clearEntityCachePools<GDSFItemRepo>();
-        REQUIRE(L1Ledger::sum() < base + (held - base) / 2);
+        REQUIRE(cached() < base + (held - base) / 2);
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
         while (policy.isOverBudget() && std::chrono::steady_clock::now() < deadline)
             std::this_thread::sleep_for(std::chrono::milliseconds{5});
         CHECK_FALSE(policy.isOverBudget());
     }
 
-    SECTION("[budget] a sweep reads the held bytes as it starts and as it ends") {
+    SECTION("[budget] a sweep reads the cached bytes as it starts and as it ends") {
         PauseTickHook pause;  // only the sweep reads them here
 
         // A histogram to place a threshold: one cycle under no pressure.
         for (long i = 0; i < policy.chunkCount(); ++i) policy.sweepNow();
         REQUIRE(policy.threshold() == 0.0f);
-        const int64_t before = L1Ledger::sum();
-        REQUIRE(TestInternals::budgetHeldBytes() == static_cast<uint64_t>(before));
+        const int64_t before = cached();
+        REQUIRE(TestInternals::budgetCacheBytes() == static_cast<uint64_t>(before));
 
         // More entries, which no refresh has read yet.
         for (size_t i = 0; i < kEntries; ++i) {
             sync(GDSFItemRepo::find(insertTestItem("budget_more_" + std::to_string(i),
                                                    static_cast<int32_t>(i))));
         }
-        const int64_t after = L1Ledger::sum();
-        REQUIRE(TestInternals::budgetHeldBytes() == static_cast<uint64_t>(before));
+        const int64_t after = cached();
+        REQUIRE(TestInternals::budgetCacheBytes() == static_cast<uint64_t>(before));
 
         // Room for half of them: over budget only on what the sweep reads as it starts.
         policy.configure({.max_memory = static_cast<size_t>(before + (after - before) / 2)});
         policy.sweepNow();
         CHECK(policy.threshold() > 0.0f);
-        // What it evicted and freed is in what it reads as it ends.
-        CHECK(TestInternals::budgetHeldBytes() == static_cast<uint64_t>(L1Ledger::sum()));
+        // What it evicted is out of what it reads as it ends.
+        CHECK(TestInternals::budgetCacheBytes() == static_cast<uint64_t>(cached()));
     }
+
+    resetAllTestRepos();
+}
+
+
+TEST_CASE("GDSF - what a sweep evicts leaves the budget's count before it is freed",
+          "[gdsf][budget][transit]")
+{
+    using L1Ledger = jcailloux::relais::cache::detail::L1Ledger;
+
+    auto& policy = GDSFPolicy::instance();
+    resetAllTestRepos();
+    struct RestoreBudget {
+        ~RestoreBudget() { GDSFPolicy::instance().configure({.max_memory = kTestMaxMemory}); }
+    } restore;
+    PauseTickHook pause;  // only the sweeps read the cached bytes here
+
+    // Entries written, not read from the database: all of one score, so that a
+    // sweep over budget evicts its whole chunk.
+    policy.refreshCacheBytes();
+    const uint64_t empty = TestInternals::budgetCacheBytes();
+    constexpr int64_t kEntries = 800;
+    {
+        // The sweeps the writes ask for run once they are written.
+        TestInternals::HoldSweepExclusion hold;
+        for (int64_t i = 1; i <= kEntries; ++i) {
+            TestInternals::putInCache<GDSFItemRepo>(i, makeTestItem("transit_" + std::to_string(i),
+                                                                    static_cast<int32_t>(i), "", true, i));
+        }
+    }
+    awaitSweeps();
+    // A histogram to place a threshold: one cycle under no pressure.
+    for (long i = 0; i < policy.chunkCount(); ++i) policy.sweepNow();
+    REQUIRE(GDSFItemRepo::size() == static_cast<size_t>(kEntries));
+    // Nothing retired waits: what the sweeps evict from now on is all of the
+    // transit that comes.
+    TestInternals::freeRetired(TestInternals::entityMapOf<GDSFItemRepo>());
+    policy.refreshCacheBytes();
+    const uint64_t full = TestInternals::budgetCacheBytes();
+    const uint64_t transit_before = policy.transitBytes();
+    REQUIRE(full > empty);
+
+    // Over budget by a quarter of a chunk (entries and the table's growth):
+    // one sweep's eviction brings the cache back under it.
+    const uint64_t chunk = (full - empty) / static_cast<uint64_t>(policy.chunkCount());
+    policy.configure({.max_memory = static_cast<size_t>(full - chunk / 4)});
+
+    {
+        // A reader holds the epoch through every sweep: nothing they evict is
+        // freed meanwhile.
+        auto reader = epoch::EpochGuard::acquire();
+
+        policy.sweepNow();
+        const size_t kept = GDSFItemRepo::size();
+        REQUIRE(kept < static_cast<size_t>(kEntries));
+        CHECK_FALSE(policy.isOverBudget());
+        CHECK(policy.transitBytes() > transit_before);
+        CHECK(L1Ledger::sum() > static_cast<int64_t>(policy.maxMemory()));  // still held
+
+        // The rest of the cycle sees the cache under the budget: none of it
+        // evicts again for what the first sweep evicted.
+        for (long i = 1; i < policy.chunkCount(); ++i) policy.sweepNow();
+        CHECK(GDSFItemRepo::size() == kept);
+        CHECK(policy.threshold() == 0.0f);
+    }
+
+    // Freed, out of transit.
+    TestInternals::freeRetired(TestInternals::entityMapOf<GDSFItemRepo>());
+    policy.refreshCacheBytes();
+    CHECK(policy.transitBytes() == transit_before);
 
     resetAllTestRepos();
 }
@@ -1393,29 +1467,29 @@ TEST_CASE("GDSF - a forced pass is excluded from a concurrent sweep",
         CHECK(GDSFItemRepo::size() == ids.size());
     }
 
-    SECTION("[purge] it reads the held bytes as it ends") {
+    SECTION("[purge] it reads the cached bytes as it ends") {
         PauseTickHook pause;  // only the pass reads them here
-        policy.refreshHeldBytes();
-        const uint64_t before = TestInternals::budgetHeldBytes();
+        policy.refreshCacheBytes();
+        const uint64_t before = TestInternals::budgetCacheBytes();
 
         TestInternals::setThreshold(1e9f);  // every entry under it
         CHECK(purgeDeprecated<GDSFItemRepo>() == ids.size());
-        const int64_t after = jcailloux::relais::cache::detail::L1Ledger::sum();
-        REQUIRE(static_cast<uint64_t>(after) < before);  // evicted and freed
-        CHECK(TestInternals::budgetHeldBytes() == static_cast<uint64_t>(after));
+        const int64_t after = jcailloux::relais::cache::detail::L1Ledger::read().cached();
+        REQUIRE(static_cast<uint64_t>(after) < before);  // evicted
+        CHECK(TestInternals::budgetCacheBytes() == static_cast<uint64_t>(after));
     }
 
-    SECTION("[sweep-all] the pass reads the held bytes as it ends") {
+    SECTION("[sweep-all] the pass reads the cached bytes as it ends") {
         PauseTickHook pause;  // only the pass reads them here
-        policy.refreshHeldBytes();
-        const uint64_t before = TestInternals::budgetHeldBytes();
+        policy.refreshCacheBytes();
+        const uint64_t before = TestInternals::budgetCacheBytes();
 
         TestInternals::setThreshold(1e9f);  // every entry under it
         sweepAllAndWait<GDSFItemRepo>();
         CHECK(GDSFItemRepo::size() == 0);
-        const int64_t after = jcailloux::relais::cache::detail::L1Ledger::sum();
-        REQUIRE(static_cast<uint64_t>(after) < before);  // evicted and freed
-        CHECK(TestInternals::budgetHeldBytes() == static_cast<uint64_t>(after));
+        const int64_t after = jcailloux::relais::cache::detail::L1Ledger::read().cached();
+        REQUIRE(static_cast<uint64_t>(after) < before);  // evicted
+        CHECK(TestInternals::budgetCacheBytes() == static_cast<uint64_t>(after));
     }
 
     resetAllTestRepos();

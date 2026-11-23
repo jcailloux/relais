@@ -96,10 +96,15 @@ namespace epoch {
   //     destruction, at the bytes `weigh` gives it (the block's room, and what
   //     the value owns);
   //   - the array of each retire list, which keeps its capacity.
+  // And to `transit`, if set, the blocks a worker retires while it weighs its
+  // retires (see memory_pool::weigh_retires), at the same weight, from their
+  // retire to their destruction: the part of what `ledger` counts that is on
+  // its way out.
   template <typename T>
   struct pool_accounting {
     const memory_ledger* ledger;
     size_t (*weigh)(const T& value, const void* block, size_t block_size);
+    const memory_ledger* transit = nullptr;
   };
 
   namespace internal {
@@ -369,6 +374,10 @@ private:
     // each list's array as last reported: its capacity, and its room
     size_t old_capacity = 0, old_room = 0;
     size_t current_capacity = 0, current_room = 0;
+    // what each list holds as reported to the transit ledger: the blocks
+    // retired while the worker weighed its retires
+    int64_t old_transit = 0, current_transit = 0;
+    bool weighs = false;  // see weigh_retires
     old_current() : epoch(0), retire_count(0), e_state(0) {}
   };
 
@@ -396,6 +405,24 @@ private:
     pid.current_room = room;
   }
 
+  // A block a weighing worker retires: in transit until it is destroyed.
+  void report_transit(old_current& pid, const T& value, wrapper* w) {
+    const pool_accounting<T>* a = accounting_.load(std::memory_order_relaxed);
+    if (a == nullptr || a->transit == nullptr) return;
+    int64_t weight = (int64_t) a->weigh(value, w, sizeof(wrapper));
+    a->transit->add(weight);
+    pid.current_transit += weight;
+  }
+
+  // A list about to be cleared: what it holds in transit leaves it, before
+  // its blocks go. A reading in between counts them as cached for an
+  // instant: it errs toward more, never less.
+  void release_transit(int64_t& list_transit) {
+    if (list_transit == 0) return;
+    accounting_.load(std::memory_order_relaxed)->transit->add(-list_transit);
+    list_transit = 0;
+  }
+
   // values used to check for corruption or double delete
   static constexpr long default_val = 10;
   static constexpr long deleted_val = 55;
@@ -420,10 +447,12 @@ private:
     int delay = 0;
     long current = get_epoch().get_current();
     if (pid.epoch + delay < current) {
+      release_transit(pid.old_transit);
       clear_list(pid.old);
       std::swap(pid.old, pid.current);
       std::swap(pid.old_capacity, pid.current_capacity);
       std::swap(pid.old_room, pid.current_room);
+      std::swap(pid.old_transit, pid.current_transit);
       pid.epoch = current;
     }
     // a heuristic
@@ -510,6 +539,15 @@ private:
     wrapper* w = wrapper_from_value(p);
     pid.current.push_back(w);
     if (pid.current.capacity() != pid.current_capacity) report_current_list(pid);
+    if (pid.weighs) report_transit(pid, *p, w);
+  }
+
+  // From now on, while `on`, what the calling worker retires is reported to
+  // the transit ledger until destroyed (see pool_accounting). What it retired
+  // meanwhile stays reported until destroyed, whatever the setting. Returns
+  // the previous setting.
+  bool weigh_retires(bool on) {
+    return std::exchange(pools[worker_id()].weighs, on);
   }
 
   // destructs and frees the object immediately
@@ -538,7 +576,9 @@ private:
   void clear() {
     get_epoch().update_epoch();
     for (int i=0; i < num_workers(); i++) {
+      release_transit(pools[i].old_transit);
       clear_list(pools[i].old);
+      release_transit(pools[i].current_transit);
       clear_list(pools[i].current);
     }
   }

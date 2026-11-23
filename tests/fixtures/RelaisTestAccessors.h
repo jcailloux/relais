@@ -329,6 +329,16 @@ struct TestInternals {
         if constexpr (Map::kIndirectKeys) map.map_.entries_.data_pool->clear();
     }
 
+    /// Free what the calling thread retired from a map's pools and no epoch
+    /// still protects, as the epoch frees it (two advances): its entries,
+    /// parlay's links and, for keys kept behind a pointer, its nodes.
+    template<typename Map>
+    static void reclaimRetired(Map& map) {
+        map.pool_.reclaim();
+        map.map_.m.link_pool->reclaim();
+        if constexpr (Map::kIndirectKeys) map.map_.entries_.data_pool->reclaim();
+    }
+
     /// The table of a repo's entity tier, and of its list tier.
     template<typename Repo>
     static auto& entityMapOf() { return Repo::cache(); }
@@ -594,10 +604,10 @@ struct TestInternals {
             t, std::memory_order_relaxed);
     }
 
-    /// The bytes the L1 holds as the GDSF budget compares them: what its last
+    /// The bytes the L1 caches as the GDSF budget compares them: what its last
     /// refresh read on the ledger (test-only).
-    static uint64_t budgetHeldBytes() {
-        return jcailloux::relais::cache::GDSFPolicy::instance().held_bytes_.load(
+    static uint64_t budgetCacheBytes() {
+        return jcailloux::relais::cache::GDSFPolicy::instance().cache_bytes_.load(
             std::memory_order_relaxed);
     }
 

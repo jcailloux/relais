@@ -481,8 +481,10 @@ public:
 
             if (removed > 0) map_.reclaim();
 
-            // Post-sweep: apply ghost decays + insertions
+            // Post-sweep: apply ghost decays + insertions. The buckets they
+            // rewrite are retired in transit, as the evictions are.
             if constexpr (kHasGDSF) {
+                auto in_transit = map_.retiresInTransit();
                 for (auto& gd : ghost_decays) {
                     // update_ghost runs under its caller's guard: during a
                     // growth, it copies buckets and walks overflow links that
@@ -609,11 +611,13 @@ public:
     /// Transient pool for values returned without caching (ghost REJECT path).
     /// With GDSF, each value is counted from its construction to its release,
     /// once no reader holds it: its pool block, read on it, and what it owns.
+    /// The L1 holds it and does not cache it: counted in transit besides (see
+    /// L1Ledger), as are the pool's retire lists.
     epoch::memory_pool<Value>& transientPool() {
         static auto* p = [] {
             auto* pool = new epoch::memory_pool<Value>();
             if constexpr (kHasGDSF) {
-                static constexpr epoch::pool_accounting<Value> kAccounting{&kL1Ledger, &weighTransient};
+                static constexpr epoch::pool_accounting<Value> kAccounting{&kL1HeldInTransit, &weighTransient};
                 pool->set_accounting(&kAccounting);
             }
             return pool;

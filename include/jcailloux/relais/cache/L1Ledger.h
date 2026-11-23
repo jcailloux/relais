@@ -46,42 +46,73 @@ namespace jcailloux::relais::cache::detail {
 // A retired block not yet freed (an epoch still open) stays counted: it still
 // holds its memory. Only tiers that count bytes (GDSF) report to it.
 //
+// Part of it is in transit: held, not cached. The values a tier served
+// without storing them (their pool and its retire lists, while they live),
+// and what a sweep gives up (its evictions, the buckets its ghost pass
+// rewrites), from its retire to its release (see ChunkMap::RetiresInTransit),
+// are counted a second time, apart: the bytes the L1 caches are what it holds
+// less what is in transit. A block retired by a write stays counted as cached
+// until it is freed: it errs toward more, and a write pays nothing for it.
+//
 // Not counted: what is set up once and lives as long as the process (the
 // registry of repositories, the histogram, the column facts, each thread's
 // buffers and counters), and what a request holds while it runs (coroutine
 // frames, a database result, an exception in flight).
 //
-// One counter per thread, on its own cache line, written only by that thread:
-// an update is a relaxed load and store, never a read-modify-write, so it
-// costs about a nanosecond and moves no line between cores. A block freed on
-// another thread than the one that allocated it makes counters negative: only
-// the sum means something. A thread that ends hands its counter to the next
-// thread that takes its id, so nothing is lost. The sum walks one line per
-// thread, off the request path.
+// Two counters per thread, the bytes held and the bytes in transit, on the
+// thread's own cache line, written only by that thread: an update is a
+// relaxed load and store, never a read-modify-write, so it costs about a
+// nanosecond and moves no line between cores. A block freed on another thread
+// than the one that allocated it makes counters negative: only the sums mean
+// something. A thread that ends hands its counters to the next thread that
+// takes its id, so nothing is lost. A reading walks one line per thread, off
+// the request path.
 class L1Ledger {
 public:
-    /// Adds `bytes` (negative on a release) to the calling thread's counter.
-    static void add(int64_t bytes) noexcept {
-        std::atomic_ref<int64_t> counter{counters().get()};
-        counter.store(counter.load(std::memory_order_relaxed) + bytes,
-                      std::memory_order_relaxed);
+    /// Adds `bytes` (negative on a release) to the bytes the calling thread
+    /// counts as held.
+    static void add(int64_t bytes) noexcept { bump(counters().get().held, bytes); }
+
+    /// Adds `bytes` (negative on a release) to the bytes the calling thread
+    /// counts in transit: held, and counted as held besides.
+    static void addTransit(int64_t bytes) noexcept { bump(counters().get().transit, bytes); }
+
+    /// add() and addTransit() at once: a block held in transit from its
+    /// allocation to its release.
+    static void addHeldInTransit(int64_t bytes) noexcept {
+        Counters& c = counters().get();
+        bump(c.held, bytes);
+        bump(c.transit, bytes);
     }
 
-    /// The bytes the L1 holds: the sum of every thread's counter. Exact once
-    /// the threads that allocate or free have stopped; a moving value
-    /// otherwise.
-    [[nodiscard]] static int64_t sum() noexcept {
-        // The summing thread takes a parlay thread id, as an adding one does:
+    /// Both sums, read in one walk.
+    struct Reading {
+        int64_t held = 0;     // the bytes the L1 holds
+        int64_t transit = 0;  // the part of them it does not cache
+        /// The bytes the L1 caches.
+        [[nodiscard]] int64_t cached() const noexcept { return held - transit; }
+    };
+
+    /// The sums of every thread's counters. Exact once the threads that
+    /// allocate or free have stopped; moving values otherwise, each read on
+    /// its own: a block that enters or leaves transit meanwhile can be read in
+    /// one sum and not yet in the other.
+    [[nodiscard]] static Reading read() noexcept {
+        // The reading thread takes a parlay thread id, as an adding one does:
         // its id holds parlay's pool of ids until the thread ends. A thread
-        // that still sums while static destructors run (RuntimeThread) would
+        // that still reads while static destructors run (RuntimeThread) would
         // otherwise read the pool after it is freed.
         (void)parlay::my_thread_id();
-        int64_t total = 0;
-        counters().for_each([&total](int64_t& c) {
-            total += std::atomic_ref<int64_t>{c}.load(std::memory_order_relaxed);
+        Reading r;
+        counters().for_each([&r](Counters& c) {
+            r.held += std::atomic_ref<int64_t>{c.held}.load(std::memory_order_relaxed);
+            r.transit += std::atomic_ref<int64_t>{c.transit}.load(std::memory_order_relaxed);
         });
-        return total;
+        return r;
     }
+
+    /// The bytes the L1 holds (see read).
+    [[nodiscard]] static int64_t sum() noexcept { return read().held; }
 
     /// The room a block of n requested bytes takes, read on it.
     static size_t room(size_t n, const void* block) noexcept {
@@ -89,15 +120,33 @@ public:
     }
 
 private:
+    struct Counters {
+        int64_t held = 0;
+        int64_t transit = 0;
+    };
+
+    static void bump(int64_t& counter, int64_t bytes) noexcept {
+        std::atomic_ref<int64_t> c{counter};
+        c.store(c.load(std::memory_order_relaxed) + bytes, std::memory_order_relaxed);
+    }
+
     // Never freed: a block released during static destruction still reports.
-    static parlay::ThreadSpecific<int64_t>& counters() {
-        static auto* c = new parlay::ThreadSpecific<int64_t>();
+    static parlay::ThreadSpecific<Counters>& counters() {
+        static auto* c = new parlay::ThreadSpecific<Counters>();
         return *c;
     }
 };
 
 /// The L1 ledger, as parlay's pools and table report to it.
 inline constexpr epoch::memory_ledger kL1Ledger{&L1Ledger::add, &L1Ledger::room};
+
+/// The bytes in transit, as a pool reports what a sweep retires (see
+/// epoch::pool_accounting).
+inline constexpr epoch::memory_ledger kL1Transit{&L1Ledger::addTransit, &L1Ledger::room};
+
+/// A pool whose every block is in transit while it lives: the values a tier
+/// serves without storing them.
+inline constexpr epoch::memory_ledger kL1HeldInTransit{&L1Ledger::addHeldInTransit, &L1Ledger::room};
 
 // =============================================================================
 // LedgerAllocator — a container's blocks, counted as it allocates them

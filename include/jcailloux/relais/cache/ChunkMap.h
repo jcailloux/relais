@@ -471,11 +471,7 @@ public:
             }
         }
 
-        size_t removed = 0;
-        for (const auto& key : to_remove) {
-            if (remove(key)) ++removed;
-        }
-        return removed;
+        return removeAll(to_remove);
     }
 
     /// Advance the round-robin cursor and return the chunk index.
@@ -508,11 +504,7 @@ public:
                 });
             }
         }
-        size_t removed = 0;
-        for (const auto& key : to_remove) {
-            if (remove(key)) ++removed;
-        }
-        return removed;
+        return removeAll(to_remove);
     }
 
     /// Visit every entry, read-only, under one epoch guard.
@@ -528,6 +520,40 @@ public:
             MapType::for_each_bucket(tv, i, fn);
         }
     }
+
+    /// While it lives, what the calling thread retires from this map's pools
+    /// (its entries, parlay's links and nodes) is no longer cached, but held
+    /// until the epoch frees it, which a reader that holds a guard can delay
+    /// past the next sweeps: counted in transit until then (see L1Ledger).
+    /// For what a sweep gives up: its evictions, and the buckets its ghost
+    /// pass rewrites. Each block retired meanwhile is read once more; no
+    /// retire outside its scope pays for it.
+    class RetiresInTransit {
+    public:
+        explicit RetiresInTransit(ChunkMap& map) : map_(map) {
+            if constexpr (kCountsBytes) {
+                entries_ = map_.pool_.weigh_retires(true);
+                links_ = map_.map_.m.link_pool->weigh_retires(true);
+                if constexpr (kIndirectKeys) nodes_ = map_.map_.entries_.data_pool->weigh_retires(true);
+            }
+        }
+        ~RetiresInTransit() {
+            if constexpr (kCountsBytes) {
+                map_.pool_.weigh_retires(entries_);
+                map_.map_.m.link_pool->weigh_retires(links_);
+                if constexpr (kIndirectKeys) map_.map_.entries_.data_pool->weigh_retires(nodes_);
+            }
+        }
+        RetiresInTransit(const RetiresInTransit&) = delete;
+        RetiresInTransit& operator=(const RetiresInTransit&) = delete;
+
+    private:
+        ChunkMap& map_;
+        // The settings it found, restored as it ends: scopes nest.
+        bool entries_ = false, links_ = false, nodes_ = false;
+    };
+
+    [[nodiscard]] RetiresInTransit retiresInTransit() { return RetiresInTransit{*this}; }
 
     /// Force a GC cycle on the epoch pool.
     void collect() {
@@ -558,13 +584,27 @@ public:
 
 private:
     // What the map's pools report to the L1 ledger: each entry at its own
-    // count, each node of a key kept behind a pointer, each overflow link.
+    // count, each node of a key kept behind a pointer, each overflow link;
+    // and what a sweep gives up, in transit until freed (see
+    // RetiresInTransit).
     static constexpr epoch::pool_accounting<CacheEntry> kEntryAccounting{
-        &kL1Ledger, &Layout::weighEntry};
+        &kL1Ledger, &Layout::weighEntry, &kL1Transit};
     static constexpr epoch::pool_accounting<typename Layout::Node> kNodeAccounting{
-        &kL1Ledger, &Layout::weighNode};
+        &kL1Ledger, &Layout::weighNode, &kL1Transit};
     static constexpr epoch::pool_accounting<typename Layout::Link> kLinkAccounting{
-        &kL1Ledger, &Layout::weighLink};
+        &kL1Ledger, &Layout::weighLink, &kL1Transit};
+
+    /// Removes the keys a cleanup selected; returns how many it removed. What
+    /// it retires is in transit until freed (see RetiresInTransit): the bytes
+    /// the L1 caches drop as the keys go.
+    size_t removeAll(const LedgerList<K, kCountsBytes>& keys) {
+        auto in_transit = retiresInTransit();
+        size_t removed = 0;
+        for (const auto& key : keys) {
+            if (remove(key)) ++removed;
+        }
+        return removed;
+    }
 
     // The table, which reports its versions to the L1 ledger when entries are
     // counted. Every map of one key type shares parlay's link and node pools;

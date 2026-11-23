@@ -24,6 +24,10 @@
  * tier serves without storing them, the fetches in flight (coroutines held
  * at a gate, the test's own frames out of the record) and what a sweep
  * collects in its chunk, read while it sweeps.
+ *
+ * The part of it in transit, held and not cached, is counted apart: the
+ * values a tier serves without storing them, and what a cleanup removes until
+ * the epoch frees it.
  */
 
 #include <catch2/catch_test_macros.hpp>
@@ -851,6 +855,7 @@ TEST_CASE("Ledger - a value served without being stored is counted until freed",
     std::array<ItemTier::Hit, 64> items;
     std::array<PageTier::Hit, 24> pages;
     Reading base = readNow();
+    const L1Ledger::Reading before = L1Ledger::read();
 
     {
         Recording recording;
@@ -862,6 +867,10 @@ TEST_CASE("Ledger - a value served without being stored is counted until freed",
         }
     }
     CHECK(balanced(base, "served").held > 0);
+    // Held, in transit: none of it is cached.
+    const L1Ledger::Reading served = L1Ledger::read();
+    CHECK(served.transit - before.transit == served.held - before.held);
+    CHECK(served.cached() == before.cached());
 
     {
         Recording recording;
@@ -870,7 +879,120 @@ TEST_CASE("Ledger - a value served without being stored is counted until freed",
         tier<ItemTier>().transientPool().clear();
         tier<PageTier>().transientPool().clear();
     }
-    balanced(base, "freed");  // left: the retire lists' arrays
+    balanced(base, "freed");  // left: the retire lists' arrays, in transit as well
+    const L1Ledger::Reading freed = L1Ledger::read();
+    CHECK(freed.transit - before.transit == freed.held - before.held);
+    CHECK(freed.cached() == before.cached());
+}
+
+TEST_CASE("Ledger - what a cleanup removes is in transit until the epoch frees it",
+          "[ledger][transit]")
+{
+    warmUp();
+    // Keys in the bucket and keys behind a pointer: an entry, and a node, per
+    // key removed.
+    Keys k = makeKeys(70'000'000, 3000, 0, 0, 800, 0);
+    {
+        Recording recording;
+        storeAll(k, 0);
+        // The retire lists hold nothing more: what the epoch frees next is
+        // what the cleanup retires.
+        TestInternals::freeRetired(tier<ItemTier>().map());
+        TestInternals::freeRetired(tier<PageTier>().map());
+    }
+    auto removes = [](const auto& key) { return seedOf(key) % 3 == 0; };
+    int64_t entry_bytes = 0;  // the entries it removes, at their own count
+    for (int64_t key : k.items) {
+        if (removes(key)) entry_bytes += static_cast<int64_t>(tier<ItemTier>().map().find(key).asReal()->bytes());
+    }
+    for (const auto& key : k.pages) {
+        if (removes(key)) entry_bytes += static_cast<int64_t>(tier<PageTier>().map().find(key).asReal()->bytes());
+    }
+    REQUIRE(entry_bytes > 0);
+    Reading base = readNow();
+    const L1Ledger::Reading before = L1Ledger::read();
+
+    // A reader holds the epoch: nothing the cleanup retires can be freed.
+    std::optional<epoch::EpochGuard> reader{epoch::EpochGuard::acquire()};
+    {
+        Recording recording;
+        constexpr long kChunks = 4;
+        for (long c = 0; c < kChunks; ++c) {
+            (void)tier<ItemTier>().evictInChunk(c, kChunks, [&](const int64_t& key, const auto&) {
+                return removes(key);
+            });
+            (void)tier<PageTier>().evictInChunk(c, kChunks, [&](const std::string& key, const auto&) {
+                return removes(key);
+            });
+        }
+    }
+    balanced(base, "removed");
+    const L1Ledger::Reading removed = L1Ledger::read();
+    const int64_t in_transit = removed.transit - before.transit;
+    // Every entry removed is in transit, with the nodes and links retired
+    // with it; still held, out of the cached bytes.
+    CHECK(in_transit >= entry_bytes);
+    CHECK(removed.held >= before.held);
+    CHECK(removed.cached() <= before.cached() - entry_bytes);
+
+    reader.reset();
+    {
+        Recording recording;
+        TestInternals::reclaimRetired(tier<ItemTier>().map());
+        TestInternals::reclaimRetired(tier<PageTier>().map());
+    }
+    balanced(base, "freed");
+    const L1Ledger::Reading freed = L1Ledger::read();
+    // What the epoch freed is what was in transit, and leaves it; the cached
+    // bytes dropped once, as the keys went.
+    CHECK(removed.held - freed.held == in_transit);
+    CHECK(freed.transit == before.transit);
+    CHECK(freed.cached() == removed.cached());
+}
+
+TEST_CASE("Ledger - the buckets a sweep's ghost pass rewrites are in transit until freed",
+          "[ledger][transit]")
+{
+    warmUp();
+    // Keys behind a pointer: a ghost's decay writes its key and count in a
+    // new node, and retires the old one.
+    Keys k = makeKeys(80'000'000, 0, 0, 0, 600, 0);
+    {
+        Recording recording;
+        insertGhosts(k);
+        TestInternals::freeRetired(tier<PageTier>().map());
+    }
+    Reading base = readNow();
+    const L1Ledger::Reading before = L1Ledger::read();
+    const long ghosts = tier<PageTier>().map().totalEntries();
+
+    // A reader holds the epoch; a sweep under no pressure decays the ghosts
+    // and evicts nothing.
+    std::optional<epoch::EpochGuard> reader{epoch::EpochGuard::acquire()};
+    TestInternals::setThreshold(0.0f);
+    {
+        Recording recording;
+        constexpr long kChunks = 4;
+        for (long c = 0; c < kChunks; ++c) {
+            (void)tier<PageTier>().sweepChunk(c, kChunks, [](const auto&, auto&, auto&, long) { return false; });
+        }
+    }
+    balanced(base, "decayed");
+    REQUIRE(tier<PageTier>().map().totalEntries() == ghosts);
+    const L1Ledger::Reading decayed = L1Ledger::read();
+    const int64_t in_transit = decayed.transit - before.transit;
+    CHECK(in_transit > 0);
+
+    reader.reset();
+    {
+        Recording recording;
+        TestInternals::reclaimRetired(tier<PageTier>().map());
+    }
+    balanced(base, "freed");
+    const L1Ledger::Reading freed = L1Ledger::read();
+    CHECK(decayed.held - freed.held == in_transit);
+    CHECK(freed.transit == before.transit);
+    CHECK(freed.cached() == decayed.cached());
 }
 
 namespace {
