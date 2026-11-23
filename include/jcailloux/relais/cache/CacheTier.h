@@ -479,6 +479,10 @@ public:
 
             // Post-sweep: apply ghost decays + insertions
             if constexpr (kHasGDSF) {
+                // update_ghost runs under its caller's guard: during a growth,
+                // it copies buckets and walks overflow links that writers
+                // retire meanwhile.
+                auto guard = epoch::EpochGuard::acquire();
                 for (auto& gd : ghost_decays) {
                     map_.update_ghost(gd.key, [&gd](TaggedEntry te) {
                         return te.withGhostCount(gd.decayed_count);

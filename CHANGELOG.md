@@ -106,6 +106,8 @@
   of millions of entries. The sweep now runs on a background thread of
   relais's, `relais-sweep`, which starts with the first repository that has
   something to sweep (an `l1_ttl`, or GDSF).
+- **A sweep of the L1 cache could read freed memory, and crash**, when the L1
+  table grew meanwhile (GDSF builds).
 - **Under glibc, relais stalled the allocator every 100 ms** once a repository
   had an L1 cache, GDSF or not: it read the heap's statistics (`mallinfo2`),
   which holds up every thread that allocates meanwhile, for 6 to 25 ms at
