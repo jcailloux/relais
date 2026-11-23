@@ -475,9 +475,8 @@ protected:
             static_cast<const E*>(hit.value), std::move(hit.guard));
     }
 
-    /// Put entity in cache (copy). Returns Hit for flexible use.
-    /// No tick — the sweep counter is driven by fetch paths (DB misses),
-    /// not by local cache mutations (update, insert via API).
+    /// Put entity in cache (copy), as a write stores its row: no admission,
+    /// one tick (see CacheTier::store). Returns Hit for flexible use.
     static typename Tier::Hit putInCache(const Key& key, const E& src,
         uint32_t now_sec = runtime::detail::CachedClock::now())
     {

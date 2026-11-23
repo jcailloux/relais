@@ -242,10 +242,12 @@ public:
 
     /// Tick the global insertion counter. Every kCleanupMask+1 ticks, asks the
     /// maintenance thread for a global sweep and returns: the sweep never runs
-    /// on the ticking thread. Three tick sources:
-    ///   - Real L1 insertion (under budget) — maintenance sweeps
-    ///   - New ghost creation (over budget, first appearance) — tracking
+    /// on the ticking thread. Tick sources (see CacheTier::tickSweep):
+    ///   - Entry stored: a fill admitted from the database, or a write, which
+    ///     the budget does not gate — maintenance sweeps
+    ///   - New ghost (a fill not admitted, key seen first) — tracking
     ///   - Qualified ghost re-access (over budget, score ≥ threshold) — eviction demand
+    ///   - List modification tracked
     void tickInsertion() {
         if (kCleanupFrequencyLog2 > 0
                 && (insertion_counter_.fetch_add(1, std::memory_order_relaxed)

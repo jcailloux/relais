@@ -140,6 +140,10 @@
   budget** (GDSF builds). They now pass the same admission as `find()`: over
   the budget, or below the eviction threshold, a row or a page is returned
   without being cached, and its next reads count toward its admission.
+- **A load that only wrote kept growing the L1 cache**: past its memory budget
+  (GDSF builds), and with its expired entries, since only reads from the
+  database brought on a sweep. Every write that stores its row in L1 now counts
+  toward the next sweep, as a read does.
 
 ## [4.0.0] - 2026-10-22
 

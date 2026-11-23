@@ -20,7 +20,8 @@
  * 16b. size() live count excludes ghosts
  *  17. Eviction selectivity    — hot/cold, score formula
  *  19. Cross-repo sweep coordination
- * 19b. Budget                  — bounds the bytes the L1 holds, not the process
+ * 19b. Budget                  — bounds the bytes the L1 holds, not the process;
+ *                                 held under a load of writes alone too
  * 19c. sweepAll() and purge()  — a forced pass, excluded from a concurrent sweep
  *  20. Entry bytes             — the room an entry takes, stored or recomputed;
  *                                 the room a block takes, read from the allocator
@@ -1249,6 +1250,43 @@ TEST_CASE("GDSF - the budget bounds the bytes the L1 holds, not the process",
         for (long i = 0; i < 4 * policy.chunkCount() && GDSFItemRepo::size() == kEntries; ++i)
             policy.sweepNow();
         CHECK(GDSFItemRepo::size() < kEntries);
+    }
+
+    SECTION("[budget] a load of writes alone brings the L1 back under it") {
+        // Writes to one row, stored as a write stores it: nothing is read from
+        // the database, and the cache does not grow. A cycle of writes asks
+        // for one sweep per chunk, served once the cycle is written: no sweep
+        // runs beside a write, and no backlog grows past a cycle (it would
+        // drop sweeps).
+        constexpr int64_t kHot = -1;  // no row has it
+        const auto hot = makeTestItem("budget_hot", 0, "", true, kHot);
+        auto writeCycles = [&](int cycles) {
+            for (int cycle = 0; cycle < cycles; ++cycle) {
+                {
+                    TestInternals::HoldSweepExclusion hold;
+                    for (size_t i = 0; i < TestInternals::sweepCycleTicks(); ++i)
+                        TestInternals::putInCache<GDSFItemRepo>(kHot, hot);
+                }
+                awaitSweeps();
+            }
+            // What the sweeps evicted and what the writes replaced, freed.
+            TestInternals::freeRetired(TestInternals::entityMapOf<GDSFItemRepo>());
+        };
+
+        // Under the budget, the load evicts nothing. The retire lists it fills
+        // keep their arrays, which the ledger counts: measured once they hold
+        // what this load retires.
+        writeCycles(1);
+        REQUIRE(GDSFItemRepo::size() == kEntries + 1);
+        const int64_t loaded = L1Ledger::sum();
+
+        // Over budget by a quarter of the entries: the same load brings the L1
+        // back under it. An evicted entry leaves a ghost, which costs less.
+        const auto budget = static_cast<size_t>(loaded - (held - base) / 4);
+        policy.configure({.max_memory = budget});
+        writeCycles(4);
+        CHECK(GDSFItemRepo::size() < kEntries);
+        CHECK(L1Ledger::sum() < static_cast<int64_t>(budget));
     }
 
     SECTION("[budget] the held bytes are read again every 100 ms, sweep or not") {

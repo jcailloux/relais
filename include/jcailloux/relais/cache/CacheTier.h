@@ -167,20 +167,24 @@ public:
     // =========================================================================
 
     /// Upsert value + metadata, without admission: the store of a write.
-    /// Returns Hit pointing to the stored entry. Does NOT tick the sweep
-    /// counter. A value read from the database goes through admitFill instead.
+    /// Returns Hit pointing to the stored entry. Ticks the sweep counter, as a
+    /// fill does: a load that only writes is swept all the same, back under
+    /// the budget and rid of its expired entries. A value read from the
+    /// database goes through admitFill instead.
     Hit store(const Key& key, Value&& v, Metadata m) {
         auto hk = Map::make_key(key);
         auto r = map_.upsert(hk, std::move(v), std::move(m));
         auto* ce = r.asReal();
+        // After the store: the sweep this tick may ask for sees the entry.
+        tickSweep();
         return Hit{&ce->value, &ce->metadata, std::move(r.guard),
                     Map::get_hash(hk)};
     }
 
     /// Count one addition of memory toward the maintenance sweep, which the
     /// maintenance thread runs on one chunk every few hundred ticks: a store
-    /// read from the database, or a list modification tracked. A tier with
-    /// nothing to sweep pays nothing.
+    /// read from the database or written, or a list modification tracked. A
+    /// tier with nothing to sweep pays nothing.
     static void tickSweep() {
         if constexpr (kHasCleanup) GDSFPolicy::instance().tickInsertion();
     }

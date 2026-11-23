@@ -646,9 +646,10 @@ TEST_CASE("LocalRepo - purge returns the entries it removed",
 /// No TTL: without GDSF compiled in, nothing to free, nothing to sweep.
 using BareTestItemRepo = Repo<TestItemEntity, "test:bare", test_config::BareL1>;
 
-TEST_CASE("LocalRepo - stores from the database drive the maintenance sweep",
+TEST_CASE("LocalRepo - every store drives the maintenance sweep, read or written",
           "[integration][db][cached][cleanup][sweep]")
 {
+    using ItemF = TestItemEntity::Field;
     TransactionGuard tx;
     TestInternals::resetEntityCacheState<ShortTTLTestItemRepo>();
 
@@ -687,6 +688,67 @@ TEST_CASE("LocalRepo - stores from the database drive the maintenance sweep",
 
         sync(L1TestItemRepo::find(ids[0]));  // hit
         CHECK(TestInternals::sweepTicks() == before + bare + 3);
+    }
+
+    SECTION("[sweep] a load of writes alone frees an expired copy") {
+        // A copy a write stored, never read again.
+        auto id = insertTestItem("expires", 1);
+        REQUIRE(sync(ShortTTLTestItemRepo::patch(id, set<ItemF::value>(2))));
+        REQUIRE(getCacheSize<ShortTTLTestItemRepo>() == 1);
+
+        // CachedClock uses uint32_t seconds: worst-case quantization adds ~1s
+        waitForExpiration(std::chrono::milliseconds{2200});
+
+        // A cycle of writes to one other row, stored as a write stores it:
+        // nothing is read from the database. The sweeps they ask for run once
+        // the cycle is written, not beside a write.
+        constexpr int64_t kHot = -1;  // no row has it
+        const auto hot = makeTestItem("hot", 0, "", true, kHot);
+        {
+            TestInternals::HoldSweepExclusion hold;
+            for (size_t i = 0; i < TestInternals::sweepCycleTicks(); ++i)
+                TestInternals::putInCache<ShortTTLTestItemRepo>(kHot, hot);
+        }
+
+        awaitSweeps();  // the maintenance thread sweeps the cycle
+        // Only the row written is left. Not read before: a read of the
+        // expired copy would remove it too.
+        CHECK(getCacheSize<ShortTTLTestItemRepo>() == 1);
+        CHECK(TestInternals::getFromCache<ShortTTLTestItemRepo>(kHot));
+    }
+
+    SECTION("[sweep] each write that stores its row counts once, on a tier with something to sweep") {
+        constexpr uint32_t bare = jcailloux::relais::cache::GDSFPolicy::enabled ? 1 : 0;
+        auto ticksOf = [](auto&& write) {
+            const auto before = TestInternals::sweepTicks();
+            write();
+            return TestInternals::sweepTicks() - before;
+        };
+        const auto ids = insertTestItems(2);
+        // Keys the caller assigns: none of the other tests use them.
+        constexpr int64_t kAkeyA = 7300001, kAkeyB = 7300002;
+
+        // Stored through: one tick each.
+        CHECK(ticksOf([&] { REQUIRE(sync(L1TestItemRepo::patch(ids[0], set<ItemF::value>(2)))); }) == 1);
+        CHECK(ticksOf([&] {
+            (void)sync(WriteThroughTestItemRepo::update(ids[0], makeTestItem("wt", 3, "", true, ids[0])));
+        }) == 1);
+        CHECK(ticksOf([&] { REQUIRE(sync(L1TestAssignedKeyRepo::insert(makeTestAssignedKey(kAkeyA, 1)))); }) == 1);
+        CHECK(ticksOf([&] { REQUIRE(sync(L1TestAssignedKeyRepo::upsert(makeTestAssignedKey(kAkeyA, 2)))); }) == 1);
+        CHECK(ticksOf([&] { REQUIRE(sync(L1TestAssignedKeyRepo::upsert(makeTestAssignedKey(kAkeyB, 1)))); }) == 1);
+
+        // Nothing stored: no tick.
+        CHECK(ticksOf([&] {
+            (void)sync(L1TestItemRepo::update(ids[0], makeTestItem("lazy", 4, "", true, ids[0])));
+        }) == 0);  // evicts; the next read fetches it
+        CHECK(ticksOf([&] { REQUIRE(sync(L1TestItemRepo::insert(makeTestItem("fresh", 5)))); }) == 0);
+        CHECK(ticksOf([&] { (void)sync(L1TestItemRepo::erase(ids[0])); }) == 0);
+
+        // Without GDSF compiled in, a tier without TTL has nothing to sweep.
+        CHECK(ticksOf([&] { REQUIRE(sync(BareTestItemRepo::patch(ids[1], set<ItemF::value>(6)))); }) == bare);
+
+        TestInternals::evict<L1TestAssignedKeyRepo>(kAkeyA);
+        TestInternals::evict<L1TestAssignedKeyRepo>(kAkeyB);
     }
 }
 
