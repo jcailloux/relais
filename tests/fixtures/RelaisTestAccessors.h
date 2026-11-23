@@ -376,6 +376,13 @@ struct TestInternals {
         return after == before ? -1 : Map::MapType::num_buckets(after);
     }
 
+    /// True while the table of `map` grows: the larger version exists, and
+    /// some buckets are still to be copied to it (each write copies a block).
+    template<typename Map>
+    static bool growing(Map& map) {
+        return map.map_.current_version()->next.load() != nullptr;
+    }
+
     /// Read the chunk_id for a cached list entry (for bitmap skip testing).
     /// Computed by ChunkMap from the key (deterministic). Returns nullopt if not in cache.
     template<typename Repo>

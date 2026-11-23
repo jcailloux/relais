@@ -3,7 +3,12 @@
 //   - Remove runs entirely within one epoch (see Remove);
 //   - unordered_map.h scans a given table version, loaded once per scan,
 //     instead of the current version per bucket (see current_version there);
-//   - the _in_epoch variants run under a guard their caller already holds.
+//   - the _in_epoch variants run under a guard their caller already holds;
+//   - Upsert copies the state of the bucket it rewrites in place after it
+//     follows a forwarded bucket into the next version, not before (upstream
+//     writes the forwarded marker it copied into the next version's bucket:
+//     that bucket's entries are lost, and its next copy reads the marker as
+//     a list).
 
 #ifndef PARLAY_HASH_H_
 #define PARLAY_HASH_H_
@@ -816,9 +821,9 @@ struct parlay_hash {
       int delay = 200;
       while (true) {
 	auto [s, tag] = b->ll();
-	state out_s = s;
 	copy_if_needed(ht, idx);
 	check_bucket_and_state(ht, key, b, s, tag, idx);
+	state out_s = s;
 	long len = s.buffer_cnt();
 	bool cont = false;
 	for (long i = 0; i < std::min(len, buffer_size); i++) {
@@ -886,9 +891,9 @@ struct parlay_hash {
     int delay = 200;
     while (true) {
       auto [s, tag] = b->ll();
-      state out_s = s;
       copy_if_needed(ht, idx);
       check_bucket_and_state(ht, key, b, s, tag, idx);
+      state out_s = s;
       long len = s.buffer_cnt();
       bool cont = false;
       for (long i = 0; i < std::min(len, buffer_size); i++) {

@@ -129,6 +129,11 @@
   sweep.
 - **Removing an entry from L1 could read freed memory**, and crash, when it
   raced a growth of the L1 table, in a repository keyed by an integer.
+- **An L1 entry rewritten while the L1 table grew could lose the entries
+  sharing its slot**, and a later growth could crash the process. Those
+  entries read as absent until stored again, and the memory they held was
+  never freed. A write could hit it in any build; in GDSF builds, the sweep
+  as well.
 - **`findMany()` and list pages stored what they read past the L1 memory
   budget** (GDSF builds). They now pass the same admission as `find()`: over
   the budget, or below the eviction threshold, a row or a page is returned

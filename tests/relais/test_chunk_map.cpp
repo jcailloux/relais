@@ -12,6 +12,8 @@
  *     table grows between that computation and its reads: a chunk scan its
  *     chunk's keys (a prefix of their hash) and no other, a whole-table scan
  *     every key;
+ *   - a key rewritten in place while the table grows keeps the other keys of
+ *     its bucket, through that growth and the next;
  *   - removals raced against inserts that grow the table keep the live count
  *     exact (run under the sanitizers of the build).
  *
@@ -297,6 +299,61 @@ TEST_CASE("ChunkMap - a whole-table scan visits every key though the table grows
         }
         CHECK(even_left == 0);
         CHECK(odd_gone == 0);
+    }
+}
+
+// A write that rewrites a key in place reads the key's bucket in the version
+// it starts from. Once that bucket is copied to the larger version, the write
+// follows it there and rewrites the copy, which other keys share. Every key is
+// rewritten while the table grows, each write copying a block of buckets on
+// its way: some find their bucket copied already. The next growth copies every
+// bucket again.
+TEST_CASE("ChunkMap - keys rewritten in place while the table grows are all kept",
+          "[chunkmap][growth]") {
+    // Inserts fillers until the table grows: the larger version exists, and
+    // buckets are still to be copied to it.
+    auto startGrowth = [](Map& map) {
+        for (long i = 0; !TI::growing(map) && i < 10'000'000; ++i) map.insert(filler(i), 0);
+        REQUIRE(TI::growing(map));
+    };
+    auto rewriteWhileGrowing = [&](Map& map, auto&& rewrite, auto&& holds) {
+        startGrowth(map);
+        const long before = map.num_buckets();
+        for (int64_t k = 0; k < kKeys; ++k) rewrite(k);
+        REQUIRE_FALSE(TI::growing(map));   // the rewrites copied every block
+        REQUIRE(map.num_buckets() > before);
+
+        auto lost = [&] {
+            long n = 0;
+            for (int64_t k = 0; k < kKeys; ++k)
+                if (!holds(k)) ++n;
+            return n;
+        };
+        REQUIRE(lost() == 0);
+        REQUIRE(TI::growTable(map, filler, 0) > 0);
+        CHECK(lost() == 0);
+    };
+
+    SECTION("upsert over a real entry") {
+        static Map map;
+        fill(map);
+        rewriteWhileGrowing(
+            map, [](int64_t k) { map.upsert(k, 1); },
+            [](int64_t k) {
+                auto r = map.find(k);
+                return r.asReal() && valueOf(r.asReal()) == 1;
+            });
+    }
+
+    SECTION("update_ghost") {
+        static Map map;
+        for (int64_t k = 0; k < kKeys; ++k) REQUIRE(map.insert_ghost(k, 1, 64, 0));
+        rewriteWhileGrowing(
+            map, [](int64_t k) { map.update_ghost(k, bumpGhost); },
+            [](int64_t k) {
+                auto r = map.find(k);
+                return r.isGhost() && r.ghostCount() == 2;
+            });
     }
 }
 
