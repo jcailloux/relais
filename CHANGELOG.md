@@ -150,6 +150,11 @@
   views held across a database round trip, the L1 fell well under its budget.
   The budget now counts what the L1 caches: an entry leaves the count as it is
   evicted, and a value served without being cached does not count.
+- **What the L1 let go of could stay allocated long after a sweep**: the
+  entries writes replaced or removed, and the values served without being
+  cached. Each sweep that removed entries, expired or evicted, held their
+  release back further: after a busy spell, for thousands of writes and reads
+  to come. Sweeps no longer delay it.
 
 ## [4.0.0] - 2026-10-22
 

@@ -1,6 +1,7 @@
 /**
  * test_chunk_map.cpp
- * Pure unit tests for ChunkMap mutations — no DB, no event loop.
+ * Pure unit tests for ChunkMap mutations, and the epoch reclamation under it —
+ * no DB, no event loop.
  *
  * The contract under test:
  *   - remove_if tests and removes in one step: a failing predicate leaves the
@@ -15,7 +16,9 @@
  *   - a key rewritten in place while the table grows keeps the other keys of
  *     its bucket, through that growth and the next;
  *   - removals raced against inserts that grow the table keep the live count
- *     exact (run under the sanitizers of the build).
+ *     exact (run under the sanitizers of the build);
+ *   - after full epoch updates, however many, a thread that retires frees
+ *     again within a scan of the announcements and a step.
  *
  * Maps are function-local statics: ChunkMap never frees its table (it is meant
  * to be a static singleton), so a static keeps it reachable for leak checkers.
@@ -397,4 +400,54 @@ TEST_CASE("ChunkMap - removals raced against growth read no freed block",
         if (map.find(k)) ++present;
     CHECK(map.size() == present);
     CHECK(map.num_buckets() > 4);
+}
+
+namespace {
+
+/// Counts its destructions: the pool destroys a block as it frees it.
+struct Freed {
+    static inline long count = 0;
+    ~Freed() { ++count; }
+};
+
+}  // namespace
+
+// A thread frees what it retired once the epoch has advanced past the epoch
+// of its list. Between full updates, Retire advances the epoch in steps: one
+// every 10 retires, each checking the announcements of 8 workers, and the
+// step after the last one advances it. A full update (reclaim, collect)
+// advances it at once, as a sweep does twice in each L1 it removes from. One
+// thread retires alone here: what it frees depends on its own retires only.
+TEST_CASE("epoch - after full epoch updates, a thread frees what it retires within a scan and a step",
+          "[chunkmap][epoch]") {
+    epoch::memory_pool<Freed> pool;
+    auto& ep = epoch::internal::get_epoch();
+    constexpr long kStep = 10;
+    auto retiresUntilFree = [&] {
+        const long before = Freed::count;
+        long n = 0;
+        while (Freed::count == before && n < 1'000'000) {
+            pool.Retire(pool.New());
+            ++n;
+        }
+        return n;
+    };
+
+    // The lists turn over; the next count starts right after a free. The
+    // thread has its worker id from its first retire on.
+    for (long i = 0; i < 100'000; ++i) pool.Retire(pool.New());
+    const long scan = kStep * ((epoch::internal::num_workers() + 7) / 8 + 1);
+    REQUIRE(retiresUntilFree() <= scan);
+
+    for (int updates : {0, 1, 2, 20, 200}) {
+        INFO(updates << " full updates, a scan of " << scan << " retires");
+        const long epoch_before = ep.get_current();
+        for (int u = 0; u < updates; ++u) ep.update_epoch();
+        REQUIRE(ep.get_current() == epoch_before + updates);  // no reader held it
+        // Frees the list retired before the updates, if any.
+        pool.Retire(pool.New());
+        const long n = retiresUntilFree();
+        if (updates == 0) CHECK(n <= scan);
+        else CHECK(n <= scan + kStep);
+    }
 }

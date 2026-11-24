@@ -1,3 +1,10 @@
+// Vendored from cmuparlay's parlayhash (MIT, see LICENSE) and changed for
+// relais. Among the changes, one that alters when retired blocks are freed:
+//   - update_epoch_steps starts a new scan from the current epoch when a full
+//     update_epoch advanced it meanwhile (upstream catches up one epoch per
+//     scan of the announcements, and advances nothing meanwhile: after K full
+//     updates, no thread frees what it retires for K + 1 scans, not one).
+
 // ***************************
 // Epoch-based memory reclamation
 // Supports:
@@ -263,8 +270,19 @@ struct alignas(64) epoch_s {
     if (prev_state != current_state)
       return current_state;
     size_t i = current_state >> 48;
-    if (i == 0) epoch_barrier();
     size_t current_e = ((1ul << 48) - 1) & current_state;
+    // A full update_epoch advances current_epoch, not this state. Catching up
+    // one epoch per scan would advance nothing for as many scans as full
+    // updates ran, each scan checking again what an update already checked:
+    // a new scan starts from the current epoch instead.
+    size_t e = (size_t) get_current();
+    if (current_e < e) {
+      state new_state = e;  // from the first worker on
+      if (epoch_state.compare_exchange_strong(current_state, new_state))
+        return new_state;
+      return current_state;
+    }
+    if (i == 0) epoch_barrier();
     size_t workers = num_workers();
     if (i == workers) {
       // Scan only allocated tickets (high-water mark) before incrementing epoch
